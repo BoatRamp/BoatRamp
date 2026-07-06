@@ -1,0 +1,62 @@
+# cargo-deny configuration. Run `just deny` (or `cargo deny check`).
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # Both advisories below are "unmaintained" notices (not vulnerabilities) on
+  # transitive deps pulled in via slatedb -> foyer (its block cache); we don't
+  # depend on either directly and no safe upgrade exists. Revisit when
+  # foyer/slatedb drop them.
+  "RUSTSEC-2024-0436", # paste: compile-time-only proc-macro, archived upstream
+  "RUSTSEC-2025-0141", # bincode 1.3.3: development ceased; 1.3.3 is "complete"
+
+  # rustls-pemfile: unmaintained (folded into rustls-pki-types). Transitive via
+  # the TLS stacks below; no direct dep. Drops out when they bump.
+  "RUSTSEC-2025-0134",
+
+  # rustls-webpki cert/CRL edge cases, fixed in >=0.103.10 — which reqwest
+  # already uses (0.103.13). The flagged older lines are pinned transitively and
+  # can't be bumped here: 0.102.8 via libsql -> hyper-rustls 0.25/rustls 0.22,
+  # 0.101.7 via the aws-sdk (s3 feature) -> rustls 0.21. Limited impact (the
+  # advisories note an attacker must compromise a trusted issuing authority).
+  # Revisit when libsql / aws-sdk move to rustls 0.23.
+  "RUSTSEC-2026-0049", # CRL distribution-point matching
+  "RUSTSEC-2026-0098", # name constraints for URI names
+  "RUSTSEC-2026-0099", # name constraints with wildcard names
+  "RUSTSEC-2026-0104", # panic in CRL parsing
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The internal workspace crates are referenced by path (no version), which the
+# wildcard check would otherwise flag.
+allow-wildcard-paths = true
+
+[licenses]
+version = 2
+# Permissive licenses we are happy to depend on. Add more as the tree grows
+# (run `cargo deny check licenses` to see what is needed).
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "BSL-1.0",
+  "0BSD",
+  "CC0-1.0",
+  "MPL-2.0",
+  # Permissive data license (e.g. bundled CA / IANA data sets).
+  "CDLA-Permissive-2.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

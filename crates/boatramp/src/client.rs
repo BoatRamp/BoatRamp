@@ -1,0 +1,379 @@
+//! Shared helpers for the HTTP-client subcommands (sync, deployments, rollback).
+
+use std::collections::BTreeMap;
+
+use boatramp_core::config::SiteConfig;
+use boatramp_core::deploy::{DeploymentList, Manifest};
+use boatramp_core::domain_verify::DomainVerification;
+use serde::{Deserialize, Serialize};
+
+use crate::config::ProjectConfig;
+
+/// A failure talking to the boatramp control-plane API.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// No server URL was configured (pass `--server` or set `publish.server`).
+    #[error("no server configured; pass --server or set publish.server")]
+    NoServer,
+    /// No site was configured (pass `--site` or set `publish.site`).
+    #[error("no site configured; pass --site or set publish.site")]
+    NoSite,
+    /// An HTTP request to the control plane failed.
+    #[error("control-plane request: {0}")]
+    Http(#[from] reqwest::Error),
+}
+
+/// `client` module result: a control-plane API call; `Err` is [`ClientError`].
+type Result<T> = std::result::Result<T, ClientError>;
+
+/// Resolve the API token from `BOATRAMP_TOKEN` or `publish.token`.
+pub fn token(config: &ProjectConfig) -> Option<String> {
+    std::env::var("BOATRAMP_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| config.publish.token.clone())
+}
+
+/// Build an HTTP client that sends `Authorization: Bearer <token>` when present.
+pub fn http_client(token: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(token) = token {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+    }
+    builder.build().unwrap_or_default()
+}
+
+/// Resolve the server base URL from a flag, falling back to config.
+pub fn resolve_server(server: Option<String>, config: &ProjectConfig) -> Result<String> {
+    let server = server
+        .or_else(|| config.publish.server.clone())
+        .ok_or(ClientError::NoServer)?;
+    Ok(server.trim_end_matches('/').to_string())
+}
+
+/// Resolve the (server base URL, site) target from flags, falling back to config.
+pub fn resolve_target(
+    server: Option<String>,
+    site: Option<String>,
+    config: &ProjectConfig,
+) -> Result<(String, String)> {
+    let server = resolve_server(server, config)?;
+    let site = site
+        .or_else(|| config.publish.site.clone())
+        .ok_or(ClientError::NoSite)?;
+    Ok((server, site))
+}
+
+/// Fetch the manifest for a specific deployment id.
+pub async fn fetch_manifest(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    id: &str,
+) -> Result<Manifest> {
+    Ok(client
+        .get(format!("{server}/api/sites/{site}/deployments/{id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Fetch a site's deployment list (current + history).
+pub async fn fetch_deployments(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+) -> Result<DeploymentList> {
+    Ok(client
+        .get(format!("{server}/api/sites/{site}/deployments"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Fetch a site's config (server returns defaults if unset).
+pub async fn fetch_site_config(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+) -> Result<SiteConfig> {
+    Ok(client
+        .get(format!("{server}/api/sites/{site}/config"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Replace a site's config.
+pub async fn put_site_config(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    config: &SiteConfig,
+) -> Result<()> {
+    client
+        .put(format!("{server}/api/sites/{site}/config"))
+        .json(config)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// Percent-encode a host for use as a URL path segment. Hostnames are
+/// `[a-z0-9.-]` plus a leading `*.` for wildcards; only `*` needs escaping.
+fn host_segment(host: &str) -> String {
+    host.replace('*', "%2A")
+}
+
+/// The result of a `domain verify` check (mirrors the server's `CheckResult`).
+#[derive(Debug, Deserialize)]
+pub struct VerificationCheck {
+    pub verification: DomainVerification,
+    pub passed: bool,
+    pub attached: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// Start (or fetch the existing) ownership challenge for a host.
+pub async fn start_domain_verification(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    host: &str,
+    method: Option<&str>,
+) -> Result<DomainVerification> {
+    let mut url = format!(
+        "{server}/api/sites/{site}/domains/{}/verification",
+        host_segment(host)
+    );
+    if let Some(method) = method {
+        url.push_str(&format!("?method={method}"));
+    }
+    Ok(client
+        .post(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Run the ownership check for a host; on success the server attaches it.
+pub async fn check_domain_verification(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    host: &str,
+) -> Result<VerificationCheck> {
+    Ok(client
+        .post(format!(
+            "{server}/api/sites/{site}/domains/{}/verification/check",
+            host_segment(host)
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Drop a host's ownership challenge (when detaching the host).
+pub async fn remove_domain_verification(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    host: &str,
+) -> Result<()> {
+    client
+        .delete(format!(
+            "{server}/api/sites/{site}/domains/{}/verification",
+            host_segment(host)
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// List all ownership challenges for a site (pending and verified).
+pub async fn list_domain_verifications(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+) -> Result<Vec<DomainVerification>> {
+    Ok(client
+        .get(format!("{server}/api/sites/{site}/domain-verifications"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Activate a deployment id for a site (the atomic switch / rollback).
+pub async fn activate(client: &reqwest::Client, server: &str, site: &str, id: &str) -> Result<()> {
+    client
+        .post(format!(
+            "{server}/api/sites/{site}/deployments/{id}/activate"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// Point a named alias at a deployment id.
+pub async fn set_alias(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    name: &str,
+    id: &str,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct SetAlias<'a> {
+        id: &'a str,
+    }
+    client
+        .put(format!("{server}/api/sites/{site}/aliases/{name}"))
+        .json(&SetAlias { id })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// List a site's named aliases (`name → deployment id`).
+pub async fn list_aliases(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+) -> Result<BTreeMap<String, String>> {
+    Ok(client
+        .get(format!("{server}/api/sites/{site}/aliases"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Remove a named alias.
+pub async fn remove_alias(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    name: &str,
+) -> Result<()> {
+    client
+        .delete(format!("{server}/api/sites/{site}/aliases/{name}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// One captured guest log line (a subset of the server's `logs::LogEntry`; the
+/// `ts_ms` field is present in the response but not needed for the tail).
+#[derive(Debug, Deserialize)]
+pub struct LogEntry {
+    pub seq: u64,
+    pub stream: String,
+    pub line: String,
+}
+
+/// The logs endpoint response.
+#[derive(Debug, Deserialize)]
+pub struct LogsResponse {
+    pub entries: Vec<LogEntry>,
+    pub dropped: u64,
+}
+
+/// Fetch captured guest logs for a site: the most recent `limit` lines with
+/// `seq > after`, optionally filtered to one `stream` (`stdout`/`stderr`).
+pub async fn fetch_logs(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    limit: usize,
+    after: u64,
+    stream: Option<&str>,
+) -> Result<LogsResponse> {
+    let mut url = format!("{server}/api/sites/{site}/_boatramp/logs?limit={limit}&after={after}");
+    if let Some(stream) = stream {
+        url.push_str("&stream=");
+        url.push_str(stream);
+    }
+    Ok(client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Fetch a site's operator handler stats (raw JSON: handler invocation counters,
+/// consumer backlog/dead-letters, live stream connections).
+pub async fn fetch_handler_stats(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+) -> Result<serde_json::Value> {
+    Ok(client
+        .get(format!("{server}/api/sites/{site}/_boatramp/handlers"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Run a dead-letter operation (`purge` or `redrive`) on a consumer `topic`
+/// (scope-relative; `alias` for a background-alias consumer). Returns the number
+/// of dead-lettered messages affected (`POST …/_boatramp/dlq`).
+pub async fn operate_dlq(
+    client: &reqwest::Client,
+    server: &str,
+    site: &str,
+    topic: &str,
+    alias: Option<&str>,
+    action: &str,
+) -> Result<usize> {
+    #[derive(Serialize)]
+    struct Request<'a> {
+        topic: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        alias: Option<&'a str>,
+        action: &'a str,
+    }
+    #[derive(Deserialize)]
+    struct DlqResponse {
+        affected: usize,
+    }
+    let resp: DlqResponse = client
+        .post(format!("{server}/api/sites/{site}/_boatramp/dlq"))
+        .json(&Request {
+            topic,
+            alias,
+            action,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(resp.affected)
+}

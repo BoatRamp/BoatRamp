@@ -1,0 +1,7 @@
+# systemd sysusers.d snippet: the dedicated `boatramp` system
+# user + group the service runs as. Install as
+# /usr/lib/sysusers.d/boatramp.conf; `systemd-sysusers` (run by the DEB/RPM
+# maintainer scripts) creates it idempotently.
+#
+#Type Name     ID  GECOS             Home dir           Shell
+u     boatramp -   "boatramp server" /var/lib/boatramp  /usr/sbin/nologin

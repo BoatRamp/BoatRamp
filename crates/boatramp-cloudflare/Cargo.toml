@@ -1,0 +1,19 @@
+[package]
+name = "boatramp-cloudflare"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Cloudflare (CF Containers) compute backend for boatramp: map a ComputeSpec to a CF Container behind the edge Worker. The live deploy is declarative, via wrangler."
+
+[dependencies]
+boatramp-core.workspace = true
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

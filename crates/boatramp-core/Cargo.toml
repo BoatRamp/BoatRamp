@@ -1,0 +1,67 @@
+[package]
+name = "boatramp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core domain types, streaming storage trait, pluggable KV, and content-addressed deploys for boatramp"
+
+[features]
+# COSE/CWT control-plane tokens (RFC 8392/9052) + Cedar authorization:
+# mint / verify / authorize over the `boatramp_types::authz` vocabulary. Native-only;
+# pulls `coset`/`ciborium` (token format), `p256`/`ed25519-dalek` (ES256 default +
+# Ed25519 sign/verify), and `cedar-policy` (the authorization decision). Off by
+# default so the lean build and the wasm32 edge target stay free of it. The decision
+# logic is unit-tested (incl. a Cedar-vs-oracle differential gate); the live
+# multi-node revocation round-trip is exercised against a running cluster.
+authz = [
+  "dep:coset",
+  "dep:ciborium",
+  "dep:p256",
+  "dep:ed25519-dalek",
+  "dep:rand_core",
+  "dep:base64",
+  "dep:cedar-policy",
+]
+
+[dependencies]
+# The shared, wasm-clean type + routing/config layer (re-exported below so
+# `boatramp_core::config`/`::route`/… keep working).
+boatramp-types.workspace = true
+bytes.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Compute guest-IP pool (`ipam`): CIDR math for the per-node VM/container IP pool.
+ipnet.workspace = true
+sha2.workspace = true
+hex.workspace = true
+lru.workspace = true
+getrandom.workspace = true
+
+# COSE/CWT tokens + Cedar authorization (`authz` feature). Optional, native only.
+coset = { version = "0.3", optional = true }
+ciborium = { version = "0.2", optional = true }
+p256 = { version = "0.13", features = [
+  "ecdsa",
+  "pkcs8",
+  "pem",
+], optional = true }
+ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+base64 = { workspace = true, optional = true }
+cedar-policy = { version = "4", optional = true }
+
+# On `wasm32-unknown-unknown`, `getrandom` (token generation in auth/
+# domain_verify) needs its `js` backend to compile — it has no default RNG
+# source there. Other targets (native,
+# wasm32-wasi) are unaffected.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

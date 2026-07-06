@@ -1,0 +1,29 @@
+/* boatramp documentation — light theme tweaks layered on mdBook's `navy`. */
+
+:root {
+    --sidebar-width: 17rem;
+    --content-max-width: 48rem;
+}
+
+/* Slightly tighter, more readable code blocks. */
+pre code {
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+
+/* Make the leading blockquotes (used as callouts on several pages) read as
+   notes rather than long quotations. */
+blockquote {
+    border-inline-start: 3px solid var(--quote-border, #4a5568);
+    background: var(--quote-bg, rgba(0, 0, 0, 0.025));
+    padding: 0.6em 1em;
+    margin: 1em 0;
+}
+
+/* Comfortable spacing for the many reference tables. */
+table {
+    margin: 1em 0;
+}
+table th {
+    font-weight: 600;
+}

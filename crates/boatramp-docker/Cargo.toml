@@ -1,0 +1,21 @@
+[package]
+name = "boatramp-docker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Remote-Docker compute backend for boatramp: run workloads on an existing Docker daemon via the Engine API (bollard). Cross-platform client."
+
+[dependencies]
+boatramp-core.workspace = true
+async-trait.workspace = true
+bollard.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+# `docker_live` integration test (self-skips without a daemon) needs a runtime.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+boatramp-types.workspace = true

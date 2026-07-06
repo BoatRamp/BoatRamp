@@ -1,0 +1,41 @@
+// The boatramp `sql` capability interfaces, vendored for the guest. These must
+// match the host's definitions in boatramp-handlers (crates/boatramp-handlers/
+// wit/world.wit) exactly so the component links against the engine's binding.
+package boatramp:handlers;
+
+interface sql-types {
+  variant value {
+    null,
+    boolean(bool),
+    integer(s64),
+    %float(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  record row {
+    values: list<value>,
+  }
+
+  record query-result {
+    columns: list<string>,
+    rows: list<row>,
+  }
+
+  variant error {
+    syntax(string),
+    constraint(string),
+    other(string),
+  }
+}
+
+interface sql-query {
+  use sql-types.{value, query-result, error};
+
+  resource database {
+    query: func(statement: string, params: list<value>) -> result<query-result, error>;
+    execute: func(statement: string, params: list<value>) -> result<u64, error>;
+  }
+
+  open: func(name: string) -> result<database, error>;
+}

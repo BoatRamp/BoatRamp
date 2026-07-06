@@ -1,0 +1,143 @@
+// boatramp host bindings. Each capability the handler engine offers a guest is
+// a standard WASI interface, vendored under `deps/` and pinned deliberately
+// (standard interfaces only). bindgen! generates the
+// host side per world; the implementations live in `src/bindings/`.
+package boatramp:handlers;
+
+/// The key/value capability: `wasi:keyvalue` store + atomics + batch, backed by
+/// boatramp's `KvStore` with a per-site key prefix.
+world keyvalue-host {
+  include wasi:keyvalue/imports@0.2.0-draft;
+}
+
+/// The blob capability: `wasi:blobstore`, backed by boatramp's `Storage` with a
+/// per-site container prefix (`hblob/{site}/`).
+world blobstore-host {
+  include wasi:blobstore/imports@0.2.0-draft;
+}
+
+/// Value types for the `sql` capability. Kept deliberately small and
+/// engine-agnostic (a wasi:sql-shaped vocabulary); richer SQL
+/// types are surfaced to the guest as `text`.
+interface sql-types {
+  /// A bound parameter or returned cell.
+  variant value {
+    null,
+    boolean(bool),
+    integer(s64),
+    %float(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  /// One result row, column order matching `query-result.columns`.
+  record row {
+    values: list<value>,
+  }
+
+  /// The rows a `query` returned.
+  record query-result {
+    columns: list<string>,
+    rows: list<row>,
+  }
+
+  /// Why a statement failed.
+  variant error {
+    /// The statement could not be parsed/planned.
+    syntax(string),
+    /// A constraint (unique, type, ...) was violated.
+    constraint(string),
+    /// Any other backend error.
+    other(string),
+  }
+}
+
+/// The `sql` capability. A site may be bound several **named** databases (the
+/// operator maps each name to a backend — possibly different engines, e.g. a
+/// local `cache` and a shared `main`); `open` selects one. The host wraps each
+/// invocation in one transaction *per opened database*, committing them on a
+/// successful response and rolling them back on trap/error.
+/// They are independent transactions — there is no cross-database atomicity.
+interface sql-query {
+  use sql-types.{value, query-result, error};
+
+  /// A handle to one of the site's named databases.
+  resource database {
+    /// Run a row-returning statement (e.g. `SELECT`). Parameter placeholders
+    /// use SQLite syntax (`?1`, `?2`, …); `params` bind them positionally.
+    query: func(statement: string, params: list<value>) -> result<query-result, error>;
+
+    /// Run a non-row statement (`INSERT`/`UPDATE`/`DELETE`/DDL); `params` bind
+    /// placeholders. Returns the number of affected rows (0 for DDL).
+    execute: func(statement: string, params: list<value>) -> result<u64, error>;
+  }
+
+  /// Open one of the site's databases by the name the operator bound (the empty
+  /// string is the default database). Fails if no database was granted under
+  /// that name.
+  open: func(name: string) -> result<database, error>;
+
+  /// Open a database for **read-only** use. Where the operator has configured a
+  /// read replica, the handle's transaction is routed to it (reads → replica,
+  /// writes → primary), so read-heavy handlers can offload
+  /// the primary. A replica may lag, so reads are eventually consistent;
+  /// `execute` (a write) on this handle is rejected by the read endpoint. With
+  /// no replica configured this behaves exactly like `open`.
+  open-read-only: func(name: string) -> result<database, error>;
+}
+
+/// The sql capability world.
+world sql-host {
+  import sql-query;
+}
+
+/// Value types for the `wasi:messaging`-shaped capability. Deliberately small:
+/// a message is a topic + opaque bytes. Topics are
+/// namespaced by the host per (site, alias) with preview isolation — a guest
+/// only ever names topics relative to its own namespace.
+interface messaging-types {
+  /// A delivered message: the (guest-relative) topic and its payload.
+  record message {
+    topic: string,
+    data: list<u8>,
+  }
+
+  /// Why a messaging operation failed.
+  variant error {
+    /// The capability was not granted to this handler.
+    access-denied,
+    /// Any other backend error.
+    other(string),
+  }
+}
+
+/// The producer half: publish a message to a topic. Imported by request
+/// handlers and consumers alike (whatever the site grants `wasi:messaging`).
+interface messaging-producer {
+  use messaging-types.{error};
+
+  /// Publish `data` to `topic` (host-namespaced). Returns once durably enqueued.
+  publish: func(topic: string, data: list<u8>) -> result<_, error>;
+}
+
+/// The consumer half: the host calls `handle` once per delivered message. A
+/// consumer component exports this; the dispatcher invokes it under the handler
+/// limits regime, acking on `ok` and redelivering (eventually dead-lettering)
+/// on `err`/trap.
+interface messaging-handler {
+  use messaging-types.{message, error};
+
+  /// Process one message. `ok` acks; `err` (or a trap) triggers redelivery.
+  handle: func(msg: message) -> result<_, error>;
+}
+
+/// The producer capability world (imported into request handlers).
+world messaging-host {
+  import messaging-producer;
+}
+
+/// A message-consumer component: it may publish, and it must handle deliveries.
+world consumer {
+  import messaging-producer;
+  export messaging-handler;
+}

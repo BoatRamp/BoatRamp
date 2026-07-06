@@ -1,0 +1,12 @@
+// Example WebAssembly *consumer* guest: exports the boatramp messaging `handle`
+// (invoked by the dispatcher once per delivered message) and imports
+// wasi:keyvalue so a test can observe deliveries (a counter). Built to a
+// component with `cargo build --release --target wasm32-wasip2`; consumed as a
+// fixture exercising the engine's consumer dispatch + at-least-once semantics.
+package boatramp:caps-example;
+
+world consumer {
+  export boatramp:handlers/messaging-handler;
+  import wasi:keyvalue/store@0.2.0-draft;
+  import wasi:keyvalue/atomics@0.2.0-draft;
+}

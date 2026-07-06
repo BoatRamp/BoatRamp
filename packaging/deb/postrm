@@ -1,0 +1,12 @@
+#!/bin/sh
+# cargo-deb maintainer script: reload systemd after removal.
+# Deliberately does NOT delete /var/lib/boatramp (published sites, KV, certs, mesh
+# keys) or the boatramp user on purge — state is precious; the operator removes it
+# explicitly. Documented in packaging/README.md.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

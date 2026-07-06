@@ -1,0 +1,45 @@
+[package]
+name = "boatramp-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pluggable streaming blob backends and KV stores for boatramp"
+
+[features]
+default = ["fs"]
+fs = []
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:bytes"]
+cloudflare-kv = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+# Durable embedded KV: transactional LSM over an object_store backend.
+slatedb = ["dep:slatedb", "dep:bytes"]
+# The SQL backend for the handler `sql` binding (impl `boatramp_core::sql`):
+# libsql (SQLite-compatible) — an embedded file per site (single-node) or a
+# namespace per site on a shared sqld primary (cluster, read-replicable). One
+# backend; the single-node/cluster split is config, not a backend choice.
+sql = ["dep:libsql", "dep:reqwest", "tokio/sync"]
+# A bounded local read-through cache over any `Storage`:
+# clustered/CF nodes front the shared object store with a hot-blob cache.
+cache = ["dep:lru", "dep:bytes"]
+
+[dependencies]
+boatramp-core.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true
+
+bytes = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+slatedb = { workspace = true, optional = true }
+libsql = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

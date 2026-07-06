@@ -1,0 +1,95 @@
+name: CI
+
+# Fast per-push / per-PR gate: a default-feature build (fs + SlateDB) — no wasmtime,
+# openraft, cedar, rolldown or aws-sdk to compile, so it finishes quickly. The full
+# --all-features clippy + test and the reproducible `nix flake check` run in the
+# nightly workflow (.github/workflows/nightly.yml), or on demand via its
+# workflow_dispatch. Feature-gated code is therefore covered nightly, not per-push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A persistent cache can corrupt incremental state when a run is cancelled
+  # mid-build; disable it (no benefit on a fresh CI checkout anyway).
+  CARGO_INCREMENTAL: "0"
+  # CI never debugs the binaries; dropping debug info keeps the target dir small.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  lint-test:
+    name: lint · test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # First-party code uses typed `thiserror` error enums only — the `anyhow`
+      # crate is banned. It stays a *transitive* dep, so this is a source +
+      # manifest guard (a cargo-deny ban would be infeasible).
+      - name: Ban the anyhow crate
+        run: |
+          set -eo pipefail
+          if grep -rnI --include='*.rs' -e 'anyhow' crates/; then
+            echo "::error::the 'anyhow' crate is banned — use typed thiserror error enums"
+            exit 1
+          fi
+          if grep -rn --include=Cargo.toml -e '\banyhow\b' crates/ Cargo.toml; then
+            echo "::error::a Cargo.toml reintroduced the 'anyhow' dependency"
+            exit 1
+          fi
+
+      # A transitive TLS backend (aws-lc-rs) can want cmake/nasm. Both are
+      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
+      # unless they're genuinely missing.
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Default features only (fs + SlateDB). The feature-gated backends
+      # (tls / s3 / cluster / handlers / signers / …) are clippy'd + tested nightly.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Typos
+        uses: crate-ci/typos@master
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Bans, licenses, sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+      # Advisories are reported but non-blocking: some transitive dependencies
+      # carry unmaintained/DoS notices with no upstream fix yet (tracked in
+      # deny.toml). Surfacing them keeps them visible without gating every PR.
+      - name: Advisories (non-blocking)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true
+        with:
+          command: check advisories

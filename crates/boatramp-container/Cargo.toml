@@ -1,0 +1,56 @@
+[package]
+name = "boatramp-container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native Linux container backend for boatramp tier-2 compute: the self-jail sandbox plan + veth networking"
+
+[dependencies]
+boatramp-types.workspace = true
+serde.workspace = true
+# Async runtime + IO. Cross-platform: the guest-log sink (`logsink`) drains the
+# worker's stdout/stderr over tokio pipes + an mpsc channel, and is unit-tested
+# on every host. `sync` = the log mpsc; `time` = the health-probe timeout.
+tokio = { workspace = true, features = ["sync", "time"] }
+# Guest-log lines are mirrored to the structured tracing sink.
+tracing.workspace = true
+
+# The self-jail worker (`worker`, Linux-only) applies the sandbox plan with real
+# syscalls (no external `unshare`/`nsenter`/`capsh`): `nix` for namespaces /
+# mounts / pivot_root / hostname / uid-gid / exec, `caps` for capability drop,
+# `seccompiler` (Firecracker's seccomp compiler) + `syscalls` (name→number) to
+# compile + install the allow-list filter.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = [
+  "sched",
+  "mount",
+  "process",
+  "hostname",
+  "user",
+  "signal",
+  "fs",
+] }
+caps = "0.5"
+seccompiler = "0.4"
+syscalls = "0.6"
+# veth/bridge/netns wiring over netlink (no `ip` shell-outs).
+rtnetlink = "0.14"
+futures = "0.3"
+# The `ContainerBackend` (ComputeBackend impl): the trait + Storage staging + the
+# shared IpPool live in core; rootfs tar unpack via tar+flate2. Linux-only (it
+# re-execs the self-jail worker + does netns setup), so kept with the other
+# target-linux deps rather than behind a portable feature.
+boatramp-core.workspace = true
+async-trait.workspace = true
+tar.workspace = true
+flate2.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# Build an in-memory rootfs blob stream for the `materialize` staging test.
+bytes.workspace = true

@@ -1,0 +1,81 @@
+# boatramp — hardened systemd service unit.
+#
+# Ships with the DEB/RPM/Nix packages and is installable by hand:
+#   install -Dm644 boatramp.service /etc/systemd/system/boatramp.service
+#   systemctl daemon-reload && systemctl enable --now boatramp
+#
+# The hardening below is tuned for the DEFAULT profile — static hosting, wasm
+# handlers, TLS, and the cluster client. The Linux **compute execution** backends
+# (microVM/container: /dev/kvm, namespaces, mounts) need MORE than this sandbox
+# allows; relax the specific knobs via a drop-in (`systemctl edit boatramp`), not
+# by editing this file — see the block at the end.
+
+[Unit]
+Description=boatramp — streaming-first static hosting + edge compute
+Documentation=https://github.com/BoatRamp/BoatRamp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/boatramp serve --config /etc/boatramp/boatramp.cfg
+Restart=on-failure
+RestartSec=2s
+
+# Run as the dedicated system user (created by the sysusers snippet), never root.
+User=boatramp
+Group=boatramp
+
+# Persistent state (KV, blobs, ACME cache, mesh identity keys) — owned by the
+# service user, 0750. systemd creates + chowns it; `WorkingDirectory` anchors it.
+StateDirectory=boatramp
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/boatramp
+ReadWritePaths=/var/lib/boatramp
+
+# Bind :80/:443 without running as root (the only capability the default needs).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# ---- Sandbox (safe for the static/handler/TLS/cluster profile) ----
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+
+# NOTE: `MemoryDenyWriteExecute=yes` breaks the wasm handler JIT (wasmtime maps
+# W->X). Leave it off while handlers are enabled; a handler-less static/TLS node
+# may add it via a drop-in.
+
+# ---- Compute backends (microVM / container execution) ----
+# These are Linux-only and privileged; the default sandbox above blocks them. To
+# run compute workloads on this node, add a drop-in with `systemctl edit boatramp`:
+#
+#   [Service]
+#   PrivateDevices=no
+#   DeviceAllow=/dev/kvm rw
+#   DeviceAllow=/dev/net/tun rw
+#   RestrictNamespaces=no
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   SystemCallFilter=@system-service @sandbox @mount
+
+[Install]
+WantedBy=multi-user.target

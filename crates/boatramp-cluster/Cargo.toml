@@ -1,0 +1,71 @@
+[package]
+name = "boatramp-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp self-hosted cluster mode: embedded Raft over the KvStore"
+
+[features]
+default = []
+# The embedded-Raft cluster coordinator (heavy: pulls openraft). Off by default
+# so single-node builds stay zero-dependency. Carries both
+# the control-plane `KvStore` facade and the messaging coordinator (the leader
+# applies `claim` atomically).
+raft = ["dep:openraft", "dep:tokio", "dep:bytes", "dep:thiserror"]
+# The HTTP transport for the Raft peer mesh (real multi-node clusters): a
+# reqwest client + axum handlers serializing the openraft RPCs, secured by
+# RFC 7250 raw-public-key mutual TLS 1.3 (mesh identity).
+http = [
+  "raft",
+  "dep:reqwest",
+  "dep:axum",
+  "dep:tokio",
+  "dep:rustls",
+  "dep:aws-lc-rs",
+  "dep:tokio-rustls",
+  "dep:zeroize",
+]
+
+[dependencies]
+boatramp-core.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+openraft = { version = "0.9", optional = true, features = [
+  "serde",
+  "storage-v2",
+] }
+tokio = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+# Mesh identity + RFC 7250 raw-public-key mutual TLS. `rustls`
+# default features carry the `aws_lc_rs` provider (RPK + the X25519MLKEM768
+# hybrid group) and re-export `pki_types`; `aws-lc-rs` is used directly for
+# Ed25519 keygen; `zeroize` backs the non-loggable private-key type.
+rustls = { workspace = true, optional = true }
+aws-lc-rs = { version = "1.17", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+zeroize = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "net",
+] }
+# Serializes the multi-node cluster tests: each spins its own multi-worker
+# runtime, so running them concurrently oversubscribes the CPU and starves the
+# Raft election timers (spurious elections → flaky leadership). `#[serial]` runs
+# them one at a time.
+serial_test = "3"
+# Serves the mesh routers over mutual TLS in the multi-node acceptance tests.
+axum-server = { version = "0.8", features = ["tls-rustls"] }

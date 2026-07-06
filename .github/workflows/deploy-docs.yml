@@ -1,0 +1,89 @@
+name: Deploy docs
+
+# Publish the mdBook docs to the live boatramp instance at docs.boatramp.dev and
+# purge the Cloudflare cache. Content-only: this does NOT rebuild/redeploy the fly
+# image (that's `just fly-image`, run when the boatramp binary itself changes).
+#
+# No-ops (stays green) until configured. Set these repo secrets to activate:
+#   BOATRAMP_DEPLOY_TOKEN  — a publisher token for site `docs` (`boatramp token create`)
+#   CF_ZONE_ID             — the boatramp.dev Cloudflare zone id
+#   CF_PURGE_TOKEN         — a Cloudflare token scoped to Cache Purge on that zone
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: build + sync
+    runs-on: ubuntu-latest
+    steps:
+      # Until the docs instance + secrets exist, skip the whole job (green no-op).
+      - name: Configured?
+        id: cfg
+        env:
+          BOATRAMP_TOKEN: ${{ secrets.BOATRAMP_DEPLOY_TOKEN }}
+        run: |
+          if [ -n "${BOATRAMP_TOKEN:-}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "BOATRAMP_DEPLOY_TOKEN unset — docs deploy not configured yet; skipping."
+          fi
+
+      - if: steps.cfg.outputs.ready == 'true'
+        uses: actions/checkout@v5
+
+      - name: Install mdBook
+        if: steps.cfg.outputs.ready == 'true'
+        env:
+          MDBOOK_VERSION: "0.5.2"
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - if: steps.cfg.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.cfg.outputs.ready == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the boatramp CLI
+        if: steps.cfg.outputs.ready == 'true'
+        run: cargo build --release -p boatramp
+
+      - name: Build the book
+        if: steps.cfg.outputs.ready == 'true'
+        run: mdbook build docs
+
+      - name: Publish to boatramp + purge Cloudflare cache
+        if: steps.cfg.outputs.ready == 'true'
+        env:
+          BOATRAMP_TOKEN: ${{ secrets.BOATRAMP_DEPLOY_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_PURGE_TOKEN: ${{ secrets.CF_PURGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./target/release/boatramp sync docs/book \
+            --server https://docs.boatramp.dev --site docs -m "${GITHUB_SHA::7}"
+          if [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_PURGE_TOKEN:-}" ]; then
+            curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+              -H "Authorization: Bearer ${CF_PURGE_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data '{"purge_everything":true}' >/dev/null
+            echo "Cloudflare cache purged."
+          else
+            echo "CF_ZONE_ID/CF_PURGE_TOKEN unset — skipped cache purge."
+          fi

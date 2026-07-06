@@ -1,0 +1,109 @@
+name: Nightly
+
+# The heavy, comprehensive sweep, split out of per-push CI because on a stock
+# runner these take ~80 min (all-features) and ~175 min (nix) — too slow to gate
+# every push. Runs daily, or on demand (Run workflow ▸).
+#   • lint · test (all features) — clippy + test across every cargo feature
+#   • nix flake check            — reproducible workspace clippy + NixOS-service VM
+on:
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  lint-test:
+    name: lint · test (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Stock runners ship ~14 GB free — not enough for a debug `--all-features`
+      # build of this workspace. Reclaim the preinstalled toolchains we don't use
+      # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      # Compiling all features (wasmtime, cranelift, cedar, openraft, …) peaks above
+      # the runner's 7 GB RAM and rustc gets OOM-killed. A big swapfile on the roomy
+      # /mnt disk absorbs the spikes.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      # aws-lc-rs (pulled by the `tls` / `s3` features) needs cmake + nasm. Both are
+      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
+      # unless they're genuinely missing.
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+
+  nix:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The flake check compiles the whole workspace + a NixOS VM into /nix/store
+      # on the runner's cramped root disk. Reclaim the preinstalled toolchains
+      # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      # The flake check compiles the whole workspace + a NixOS VM; peak memory
+      # exceeds the runner's 7 GB and the build gets OOM-killed (signal 9). Swap on
+      # the roomy /mnt disk absorbs the spikes (paired with `--cores` below).
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/flakehub-cache-action@main
+      # `--max-jobs 1` serializes the heavy derivations (the workspace clippy check
+      # and the NixOS-VM package build are each a full compile) so two never run at
+      # once; `--cores 2` caps cargo's `-j` inside each build so a burst of parallel
+      # rustc can't blow past RAM+swap.
+      - name: Flake check
+        run: nix flake check --print-build-logs --max-jobs 1 --cores 2

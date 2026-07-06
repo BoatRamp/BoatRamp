@@ -1,0 +1,8 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+# wasm32-wasip2 lets us build WebAssembly component guests (the `handlers`
+# engine's fixtures + examples). wasm32-unknown-unknown is the Cloudflare edge
+# Worker target (workers-rs), which reuses `boatramp-types` (routing/config).
+# Both additive — the default native build is unaffected.
+targets = ["wasm32-wasip2", "wasm32-unknown-unknown"]

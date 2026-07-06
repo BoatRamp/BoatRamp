@@ -1,0 +1,29 @@
+// The boatramp `wasi:messaging`-shaped capability interfaces, vendored for the
+// guest. These must match the host's definitions in boatramp-handlers
+// (crates/boatramp-handlers/wit/world.wit) exactly so the component links
+// against the engine's binding.
+package boatramp:handlers;
+
+interface messaging-types {
+  record message {
+    topic: string,
+    data: list<u8>,
+  }
+
+  variant error {
+    access-denied,
+    other(string),
+  }
+}
+
+interface messaging-producer {
+  use messaging-types.{error};
+
+  publish: func(topic: string, data: list<u8>) -> result<_, error>;
+}
+
+interface messaging-handler {
+  use messaging-types.{message, error};
+
+  handle: func(msg: message) -> result<_, error>;
+}

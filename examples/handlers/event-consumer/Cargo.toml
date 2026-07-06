@@ -1,0 +1,20 @@
+# Example WebAssembly *consumer* guest: exports the boatramp
+# messaging `handle` and imports wasi:keyvalue, exercising the engine's consumer
+# dispatch + at-least-once semantics end-to-end. Built to a component with
+# `cargo build --release --target wasm32-wasip2`; consumed as a fixture by the
+# `boatramp-handlers` engine tests. Excluded from the workspace (targets wasm).
+[package]
+name = "boatramp-example-event-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+strip = true

@@ -1,0 +1,7 @@
+# systemd tmpfiles.d snippet: ensure the config + state dirs
+# exist with the right ownership before first start (belt-and-suspenders alongside
+# the unit's StateDirectory=). Install as /usr/lib/tmpfiles.d/boatramp.conf.
+#
+#Type Path               Mode User     Group    Age Argument
+d     /etc/boatramp      0755 root     root     -   -
+d     /var/lib/boatramp  0750 boatramp boatramp -   -

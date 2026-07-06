@@ -1,0 +1,27 @@
+[book]
+title = "boatramp"
+description = "A self-hosted, streaming-first alternative to Vercel for publishing static sites, Wasm handlers, and private services — a web server, an HTTP API, and a CLI in one binary."
+authors = ["Giacomo Cariello"]
+language = "en"
+src = "src"
+
+[build]
+# Keep the generated site out of the design docs that live in docs/*.md.
+build-dir = "book"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+# Served at the root of the custom domain (docs.boatramp.dev), so site-url is "/".
+# Prefixes the 404 page's asset links + the search index base.
+site-url = "/"
+git-repository-url = "https://github.com/BoatRamp/BoatRamp"
+edit-url-template = "https://github.com/BoatRamp/BoatRamp/edit/main/docs/{path}"
+additional-css = ["theme/custom.css"]
+
+[output.html.search]
+enable = true
+
+[output.html.fold]
+enable = true
+level = 1

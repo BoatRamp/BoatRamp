@@ -1,0 +1,84 @@
+[package]
+name = "boatramp-console"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["Giacomo Cariello <info@giacomocariello.com>"]
+repository = "https://github.com/BoatRamp/BoatRamp"
+description = "boatramp web management console — a Yew (CSR) Wasm SPA over the control-plane API"
+# Workspace-excluded (root Cargo.toml `exclude`): this crate ONLY builds for
+# `wasm32-unknown-unknown` (via Trunk), so it carries its own Cargo.lock and is
+# never pulled into the host `cargo build --workspace`.
+
+[dependencies]
+# Shared wire types — every API payload deserializes into these so the console
+# can't drift from the server. By path: the console is not
+# a workspace member, so it cannot use the `workspace` dependency table.
+boatramp-types = { path = "../boatramp-types" }
+
+# UI framework (CSR mode) + routing.
+yew = { version = "0.21", features = ["csr"] }
+yew-router = "0.18"
+
+# HTTP — the `ApiClient` Bearer wrapper.
+gloo-net = { version = "0.6", features = ["http", "json"] }
+# sessionStorage mirror for the token + polling timers.
+gloo-storage = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen-futures = "0.4"
+
+# OIDC Authorization-Code + PKCE: the challenge is a sync
+# SHA-256 (`sha2`), the verifier/state are random bytes (`getrandom` with the
+# `js` feature, the same wasm-clean path `boatramp-types` uses), and both are
+# base64url-encoded without padding (`base64`, `URL_SAFE_NO_PAD`). All three are
+# sync + wasm-clean and compatible with the pinned wasm-bindgen.
+sha2 = "0.10"
+getrandom = { version = "0.2", features = ["js"] }
+base64 = "0.22"
+
+# Pinned to match `pkgs.wasm-bindgen-cli` (nixpkgs: 0.2.121). The CLI and the
+# crate MUST be the same version or `trunk build` fails the schema check.
+# Bump both together.
+wasm-bindgen = "=0.2.121"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "Window",
+  "Location",
+  "History",
+  "Storage",
+  "Event",
+  "EventTarget",
+  "InputEvent",
+  "HtmlInputElement",
+  "HtmlTextAreaElement",
+  "HtmlSelectElement",
+  # Fetch-based SSE streaming for the live log tail (EventSource can't carry the
+  # Bearer token; fetch + a ReadableStream reader can).
+  "Request",
+  "RequestInit",
+  "Response",
+  "Headers",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "AbortController",
+  "AbortSignal",
+  "TextDecoder",
+] }
+gloo-dialogs = "0.2"
+
+# Surface Rust panics in the browser console during development.
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+# Smaller Wasm: optimize for size, fat LTO, no unwinding.
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1

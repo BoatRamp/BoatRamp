@@ -1,0 +1,12 @@
+# Keep the Docker build context lean: the multi-stage build compiles from
+# source inside the image, so host build artifacts and VCS/state must not be
+# shipped into the context.
+/target
+**/target
+.git
+result
+result-*
+/cloudflare
+**/*.wasm
+crates/boatramp-console/dist
+docs/book

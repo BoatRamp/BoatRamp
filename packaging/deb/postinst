@@ -1,0 +1,20 @@
+#!/bin/sh
+# cargo-deb maintainer script: create the boatramp system user +
+# state/config dirs from the sysusers/tmpfiles snippets, then reload systemd. The
+# service is NOT auto-enabled — the operator runs `systemctl enable --now boatramp`
+# after editing /etc/boatramp/boatramp.cfg.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        systemd-sysusers /usr/lib/sysusers.d/boatramp.conf >/dev/null 2>&1 || true
+    fi
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/boatramp.conf >/dev/null 2>&1 || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

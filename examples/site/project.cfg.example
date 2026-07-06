@@ -1,0 +1,83 @@
+// Copy to `project.cfg` at the root of your project folder. Read by
+// `boatramp sync`, `build`, `bundle`, and `validate`. RON format.
+//
+// `routing` is folded into the (immutable) deployment manifest and is NOT served
+// as a public asset. Validate the whole file with `boatramp validate`.
+//
+// Pattern semantics (redirects / rewrites / headers):
+//   :name  one path segment, captured        (/old/:slug)
+//   *      any chars except '/'  (one segment)
+//   **     any chars incl. '/'   (the "splat"; at most one per pattern)
+//   Targets expand :name and :splat — e.g. from "/old/:slug" to "/new/:slug".
+//   Note: paths are rooted, so `*.js` matches nothing; use `**.js`.
+//
+// Every section is optional; omit what you don't need.
+(
+    // Where to publish. server/site can also come from --server/--site or
+    // BOATRAMP_SERVER/BOATRAMP_SITE; the token is best left to BOATRAMP_TOKEN.
+    publish: (
+        server: "http://127.0.0.1:8080",
+        site: "my-site",
+        // token: "…",   // prefer the BOATRAMP_TOKEN environment variable
+    ),
+
+    // Optional build step run before publishing — any toolchain works (vite,
+    // webpack, esbuild, astro, …). boatramp shells out to it; `sync` then
+    // publishes `output`.
+    build: (
+        command: "npm run build",
+        output: "dist",
+    ),
+
+    // Optional embedded bundler (`bundler` feature) — an alternative to `build`.
+    // bundle: ( outdir: "dist", js: ["src/main.js"], css: ["src/style.css"] ),
+
+    // Deploy-scoped routing config, folded into the manifest.
+    routing: (
+        // Directory-index candidates, tried in order. Default ["index.html"].
+        index: ["index.html"],
+
+        // Map extensionless URLs to .html (/about -> /about.html).
+        clean_urls: false,
+
+        // Always | Never | Preserve.
+        trailing_slash: Preserve,
+
+        // Status code -> error document.
+        error_documents: { 404: "/404.html" },
+
+        // First match wins. Default status is 308 (permanent, method-preserving).
+        redirects: [
+            (from: "/old/:slug", to: "/new/:slug", status: 308),
+        ],
+
+        // Internal rewrite (relative `to`) or proxy (absolute `to`). First match wins.
+        rewrites: [
+            // (from: "/api/**", to: "https://backend.example/:splat"),  // proxy
+            // (from: "/**", to: "/index.html", status: 200),            // SPA fallback
+        ],
+
+        // All matching rules apply, in order.
+        headers: [
+            (matches: "/**", set: { "X-Frame-Options": "DENY" }),
+            (matches: "**.js", set: { "Cache-Control": "public, max-age=31536000, immutable" }),
+        ],
+
+        // Default Cache-Control for responses not covered by a header rule.
+        cache: ( default: "public, max-age=0, must-revalidate" ),
+
+        // Extension -> MIME overrides.
+        mime_overrides: { ".webmanifest": "application/manifest+json" },
+
+        // WebAssembly handlers (deploy-scoped; the server needs the `handlers`
+        // feature). See docs/src/guide/handlers.md.
+        // handlers: [
+        //     ( route: "/api/**", component: "api.wasm",
+        //       methods: ["GET", "POST"],
+        //       imports: ["sql", "wasi:keyvalue"] ),
+        // ],
+        // consumers: [ ( topic: "emails", component: "mailer.wasm", imports: ["sql"] ) ],
+        // crons: [ ( schedule: "0 * * * *", route: "/api/rollup" ) ],
+        // streams: [ ( route: "/sse/events", topics: ["events"] ) ],
+    ),
+)

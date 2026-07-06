@@ -1,0 +1,191 @@
+# boatramp release pipeline, hand-rolled — no cargo-dist: it doesn't own our
+# Nix + distro-package surface and adds a framework on the critical path. Each target
+# builds on its **native** GitHub runner (so macOS/Windows are real hosts, not a
+# cross-compile of aws-lc-rs), packages the binary + generated completions/man +
+# licenses, and the release job assembles SHA256SUMS + a provenance attestation.
+#
+# Tag `vX.Y.Z` to release. GHCR image is built reproducibly via the Nix flake.
+# Distro packages (.deb/.rpm) + the Homebrew tap bump are folded in as a
+# fast-follow (metadata already lives in crates/boatramp/Cargo.toml + packaging/).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual dry run against a ref (no publish) for pipeline changes.
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release + upload assets
+  packages: write # push the GHCR image
+  id-token: write # OIDC for provenance attestation
+  attestations: write
+
+env:
+  # Full set on Linux (incl. the cfg-gated Linux compute backends); the portable
+  # core on macOS/Windows (compute *execution* is Linux-only).
+  LINUX_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,http3,acme-dns,bundler,oidc"
+  PORTABLE_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,bundler,oidc"
+
+jobs:
+  build:
+    name: build · ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, kind: linux }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, kind: linux }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, kind: unix }
+          - { os: macos-14, target: aarch64-apple-darwin, kind: unix }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # aws-lc-rs (pulled by tls/s3) needs nasm on Windows; cmake is preinstalled
+      # on the GitHub runners.
+      - name: Install NASM (Windows)
+        if: matrix.kind == 'windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build
+        shell: bash
+        run: |
+          features="${PORTABLE_FEATURES}"
+          [ "${{ matrix.kind }}" = "linux" ] && features="${LINUX_FEATURES}"
+          cargo build -p boatramp --release --locked \
+            --target ${{ matrix.target }} --features "$features"
+
+      - name: Assemble archive (binary + completions + man + docs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="target/${{ matrix.target }}/release"
+          bin="boatramp"; [ "${{ matrix.kind }}" = "windows" ] && bin="boatramp.exe"
+          stage="dist/boatramp-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "$bindir/$bin" "$stage/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          # Generated payload — the binary describes its own flags.
+          if [ "${{ matrix.kind }}" != "windows" ]; then
+            mkdir -p "$stage/completions"
+            for sh in bash zsh fish; do "$bindir/$bin" completions "$sh" > "$stage/completions/boatramp.$sh"; done
+            "$bindir/$bin" man > "$stage/boatramp.1"
+          else
+            "$bindir/$bin" completions powershell > "$stage/boatramp.ps1"
+          fi
+
+      - name: Pack + checksum
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          name="boatramp-${{ matrix.target }}"
+          if [ "${{ matrix.kind }}" = "windows" ]; then
+            7z a "${name}.zip" "$name" >/dev/null; asset="${name}.zip"
+          else
+            tar -cJf "${name}.tar.xz" "$name"; asset="${name}.tar.xz"
+          fi
+          # Portable sha256 (Linux: sha256sum; macOS: shasum).
+          if command -v sha256sum >/dev/null; then sha256sum "$asset" > "${asset}.sha256";
+          else shasum -a 256 "$asset" > "${asset}.sha256"; fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boatramp-${{ matrix.target }}
+          path: |
+            dist/${{ steps.pack.outputs.asset }}
+            dist/${{ steps.pack.outputs.asset }}.sha256
+          retention-days: 5
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+
+      - name: Assemble SHA256SUMS + collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp artifacts/boatramp-*.tar.xz artifacts/boatramp-*.zip release/ 2>/dev/null || true
+          cp packaging/install/install.sh packaging/install/install.ps1 release/
+          ( cd release && cat ../artifacts/*.sha256 | sed 's# .*/# #' > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "release/boatramp-*"
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/boatramp-*.tar.xz
+            release/boatramp-*.zip
+            release/SHA256SUMS
+            release/install.sh
+            release/install.ps1
+          generate_release_notes: true
+
+  container:
+    name: GHCR images (base + cloudflare, Nix)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Building the boatramp binaries through Nix is disk- and memory-heavy on a
+      # stock runner (see the CI `nix` job): reclaim unused toolchains + add swap.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | nix run nixpkgs#skopeo -- login ghcr.io -u ${{ github.actor }} --password-stdin
+      # Two reproducible Nix images, built on the runner arch (a multi-arch manifest
+      # joins the aarch64 image in a fast-follow — needs an arm64 Nix builder):
+      #   base       → ghcr.io/<owner>/boatramp             (fs + SlateDB)
+      #   cloudflare → ghcr.io/<owner>/boatramp-cloudflare   (R2 + KV)
+      - name: Build + push images
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          base="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for variant in container container-cloudflare; do
+            repo="$base"
+            [ "$variant" = "container-cloudflare" ] && repo="${base}-cloudflare"
+            nix build ".#${variant}" --max-jobs 1 --cores 2 \
+              --print-build-logs --out-link "image-${variant}.tar.gz"
+            nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:${tag}"
+            nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:latest"
+          done

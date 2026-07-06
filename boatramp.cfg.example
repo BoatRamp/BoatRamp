@@ -1,0 +1,130 @@
+// Copy to `boatramp.cfg` and adjust — the boatramp **server** config, read by
+// `boatramp serve`. RON format. Every value can also be passed as a CLI flag or
+// environment variable, which take precedence. The whole file is optional:
+// `boatramp serve` runs with sane defaults without it.
+(
+    // Server defaults (flags/env override these).
+    serve: (
+        // Bind address. Default 127.0.0.1:8080.
+        addr: "0.0.0.0:8080",
+
+        // Data directory for the filesystem backends (blobs + KV). Default ./data.
+        data_dir: "/var/lib/boatramp",
+
+        // Token root key for control-plane auth. Generate with
+        // `boatramp auth init`. An issuing node sets the private key; a
+        // verify-only node sets just the public key. REQUIRED for a non-loopback
+        // bind like the `0.0.0.0` above: omitting both disables auth, and under
+        // the default `multi-tenant` posture boatramp then refuses to start on a
+        // public address. For local dev, bind 127.0.0.1 or use the
+        // `dev` security profile.
+        // auth_root_private_key: "…hex…",
+        // auth_root_public_key: "…hex…",
+
+        // Reject blob uploads larger than this many bytes (default: unlimited).
+        // max_upload_bytes: 104857600,
+
+        // Serve this site for a Host matching no domain, instead of 404.
+        // default_site: "my-site",
+
+        // Require a control-plane token to view deployment previews.
+        // protect_previews: true,
+    ),
+
+    // Operator security posture. Optional; absent ⇒ the strict `multi-tenant`
+    // default (untrusted site writers + untrusted network). This section is
+    // operator-only — it is never part of site config, so a `site-write`
+    // principal can't relax it. Inspect the resolved posture with
+    // `boatramp security explain`.
+    // security: (
+    //     // Profile preset: "multi-tenant" (default, strict), "single-tenant"
+    //     // (relaxed for one operator who owns every site), "dev" (loopback-
+    //     // loose), or a name defined under `profiles` below.
+    //     profile: "multi-tenant",
+    //
+    //     // Individual knobs override the profile (knobs are the source of
+    //     // truth; profiles are sugar). Byte caps: 0 = unlimited.
+    //     overrides: (
+    //         // allow_unauthenticated_public_bind: false,
+    //         // max_upload_bytes: 104857600,               // 100 MiB
+    //         // allow_site_unix_upstreams: false,          // gateway unix: sockets
+    //         // allow_site_private_upstreams: false,       // gateway → private IPs
+    //         // max_handler_blob_bytes: 67108864,          // 64 MiB
+    //         // max_component_bytes: 67108864,             // 64 MiB
+    //         // oidc_require_audience: true,
+    //         // domain_verify_allow_private: false,
+    //         // allow_shared_kernel_compute: false,        // untrusted ⇒ VM-only
+    //         // ratelimit_fail_open: false,
+    //     ),
+    //
+    //     // Custom named profiles: each is a set of overrides layered over the
+    //     // strict multi-tenant baseline; select one via `profile` above.
+    //     // profiles: {
+    //     //     "ci": ( allow_unauthenticated_public_bind: true ),
+    //     // },
+    // ),
+
+    // Secrets at rest: wrap cluster-managed cert private keys so
+    // they are never cleartext in the replicated control plane. Absent ⇒ keys
+    // stored cleartext.
+    // secrets: (
+    //     // "local" (machine-local AES-256-GCM KEK) or "vault" (Vault Transit).
+    //     envelope: "local",
+    //     // Local KEK file (auto-generated 0600). CLUSTER: the SAME file must be
+    //     // on every node (wrapped certs replicate) — distribute it, or use Vault.
+    //     // kek_file: "/var/lib/boatramp/secrets/kek",
+    //     // For envelope: "vault" — the token comes from the environment, never
+    //     // this file:
+    //     // vault: (
+    //     //     addr: "https://vault:8200",
+    //     //     key: "boatramp-certs",       // a Transit key
+    //     //     token_env: "VAULT_TOKEN",    // env var holding the token
+    //     // ),
+    // ),
+
+    // WebAssembly handler runtime (`handlers` feature). Optional.
+    // handlers: (
+    //     // Opt-in wasmtime pooling allocator: faster instantiation, but a large
+    //     // up-front virtual-memory reservation. Benchmark before enabling.
+    //     pooling: false,
+    //     bindings: (
+    //         // The `sql` binding. Omit for single-node (a per-site embedded
+    //         // libsql file under <data-dir>/handlers-sql). Set `url` for a
+    //         // shared sqld cluster (a namespace per site).
+    //         sql: (
+    //             // dir: "/var/lib/boatramp/handlers-sql",
+    //             // url: "http://sqld:8080",
+    //             // admin_url: "http://sqld:9090",
+    //             // token_env: "BOATRAMP_SQL_TOKEN",
+    //             // preview_mode: "empty",   // empty | branch | shared
+    //         ),
+    //     ),
+    // ),
+
+    // Self-hosted cluster mode (`cluster` feature). Optional; one node per host.
+    // The peer mesh runs over RFC 7250 raw-public-key **mutual TLS**:
+    // each node auto-generates an Ed25519 identity and logs its public key at
+    // startup — put each node's `pubkey` in the `peers` map below (the genesis
+    // trust set). A non-loopback `listen` refuses to start without it.
+    // cluster: (
+    //     node_id: 1,
+    //     listen: "0.0.0.0:7000",          // the Raft peer mesh (not serve.addr)
+    //     bootstrap: true,                 // set on exactly ONE node at bring-up
+    //     voters: [1, 2, 3],               // voting quorum; others join as learners
+    //     peers: {                         // url + mesh pubkey (from each node's log)
+    //         "1": (url: "https://10.0.0.1:7000", pubkey: "…hex…"),
+    //         "2": (url: "https://10.0.0.2:7000", pubkey: "…hex…"),
+    //         "3": (url: "https://10.0.0.3:7000", pubkey: "…hex…"),
+    //     },
+    //     // store_dir: "/var/lib/boatramp/raft",   // durable per-node Raft store
+    //     // mesh: (
+    //     //     key_file: "/var/lib/boatramp/mesh/identity.key",  // 0600, auto-gen
+    //     //     key_rotation: "30d",       // auto key rotation cadence
+    //     //     join_token_ttl: "1h",      // single-use join token TTL
+    //     //     // Gate mesh client-writes behind a control-plane cluster-write
+    //     //     // capability. Needs the token root private key on every
+    //     //     // node; off ⇒ mesh trust alone authorizes writes.
+    //     //     gate_client_writes: true,
+    //     // ),
+    // ),
+)

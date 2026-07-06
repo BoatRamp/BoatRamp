@@ -1,0 +1,153 @@
+[package]
+name = "boatramp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp HTTP server + API library (streaming static-site publishing)"
+
+[features]
+# WebAssembly handler dispatch in the serving pipeline. Heavy
+# (pulls the wasmtime engine via boatramp-handlers); off by default so the
+# static server stays lean. The CLI enables it through its own `handlers` flag.
+handlers = [
+  "dep:boatramp-handlers",
+  "boatramp-handlers/engine",
+  "boatramp-handlers/sql",
+  "boatramp-handlers/messaging",
+  "dep:chrono",
+]
+
+# DNS-TXT domain ownership verification. Pulls a resolver (hickory)
+# for the public-DNS TXT lookup; off by default so the lean build verifies via
+# the HTTP-token method (no extra dependency). The verification logic is always
+# compiled and tested — this gates only the live resolver.
+domain-verify-dns = ["dep:hickory-resolver"]
+
+# OIDC bearer-JWT control-plane auth. Pulls `jsonwebtoken`; off by
+# default so the lean build carries only single/multi-token auth. The verify
+# logic is unit-tested; fetching the live JWKS is exercised only in live testing.
+oidc = ["dep:jsonwebtoken"]
+
+# On-the-fly response compression, runtime-opt-in per site.
+# Pulls pure-Rust gzip/brotli stream encoders; off by default (the precompressed-
+# variant path needs no extra dependency).
+compression = ["dep:async-compression", "dep:tokio-util"]
+
+# HTTP/3 (QUIC) serving: a third listener transport feeding
+# the same router. Pulls quinn + h3; off by default. The QUIC handshake is
+# exercised only in live testing (no in-process round-trip).
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:tower"]
+
+# External token signer backends: the control-plane root key
+# lives outside the process (KMS/HSM/Vault). The REST backends (Vault/GCP/Azure)
+# reuse the in-tree `reqwest`; AWS pulls the KMS SDK; PKCS#11 pulls `cryptoki`.
+# All off by default (the `local` in-process signer needs no feature). The
+# request/response + signature-format logic is unit-tested; the live round-trip
+# is exercised only in integration testing.
+signer-vault = []
+signer-gcp = []
+signer-azure = []
+signer-aws = ["dep:aws-config", "dep:aws-sdk-kms"]
+signer-pkcs11 = ["dep:cryptoki"]
+
+[dependencies]
+# COSE/CWT + Cedar is the control-plane credential model — always on
+# for the server (it is the native binary's auth; `boatramp-core` keeps it opt-in
+# for library/wasm cleanliness).
+boatramp-core = { workspace = true, features = ["authz"] }
+# `time` + `sync` (beyond the workspace defaults) for the bounded shutdown drain
+# in `serve` (in-flight requests finish under a deadline).
+tokio = { workspace = true, features = ["time", "sync"] }
+# `ws` adds the WebSocket upgrade + extractor for the bidirectional stream
+# endpoint (WebSocket fan-out).
+axum = { workspace = true, features = ["ws"] }
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+hex.workspace = true
+# AES-256-GCM for the local-KEK secrets-at-rest envelope. Same provider the
+# mesh + rustls already use.
+aws-lc-rs = "1.17"
+# Implementing the core `DomainProbe` trait (domain ownership verification).
+async-trait.workspace = true
+
+# Public-DNS TXT resolver for the `domain-verify-dns` feature (DNS ownership
+# method). Optional; the HTTP-token method needs no resolver.
+hickory-resolver = { version = "0.24", optional = true }
+
+# JWT verification for the `oidc` control-plane auth feature. Optional.
+jsonwebtoken = { version = "9", optional = true }
+
+# On-the-fly response compression (`compression` feature): pure-Rust gzip +
+# brotli stream encoders over the body stream. Optional.
+async-compression = { version = "0.4", default-features = false, features = [
+  "tokio",
+  "gzip",
+  "brotli",
+], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+
+# HTTP/3 (`http3` feature): QUIC endpoint + the HTTP/3 layer + the rustls config
+# the QUIC crypto is built from. All optional.
+quinn = { version = "0.11", optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+rustls = { version = "0.23", optional = true }
+# Calling the router as a `tower::Service` (oneshot) for each HTTP/3 request.
+tower = { version = "0.5", features = ["util"], optional = true }
+# Error enums (the OIDC verifier's error type).
+thiserror.workspace = true
+
+# External signer backends (optional). AWS KMS reuses the workspace `aws-config`
+# (already in the tree for s3) + the KMS SDK; PKCS#11 uses `cryptoki` (a thin,
+# audited binding). Vault/GCP/Azure are REST over the in-tree `reqwest`.
+aws-config = { workspace = true, optional = true }
+aws-sdk-kms = { version = "1", features = [
+  "behavior-version-latest",
+], optional = true }
+cryptoki = { version = "0.7", optional = true }
+
+boatramp-handlers = { workspace = true, optional = true }
+# Byte buffers for the serving path (multipart/byteranges part headers) + the
+# handler/gateway body plumbing.
+bytes.workspace = true
+# hyper (client+http1) + hyper-util + http-body-util back the gateway's
+# unix-socket upstreams and the handler body plumbing. Already
+# in the tree via reqwest, so exposing them directly is cheap.
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
+# Wall-clock decomposition for the cron scheduler (already in the tree).
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+], optional = true }
+
+[dev-dependencies]
+boatramp-core = { workspace = true }
+# P-256 for the signer backends' unit tests (building SPKI/DER fixtures). Already
+# in the tree via `boatramp-core[authz]`; exposing it directly is cheap.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# The SQL backend (libsql), for the handler `sql` e2e conformance test (gated
+# on the `handlers` feature).
+boatramp-storage = { workspace = true, features = ["sql"] }
+tower = { version = "0.5", features = ["util"] }
+hex.workspace = true
+sha2.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+# A hyper HTTP/1 *server* for the unix-socket mock upstream in the gateway
+# conformance test (the non-test build only needs the client).
+hyper = { workspace = true, features = ["server", "http1"] }
+# A real WebSocket client for the WebSocket fan-out conformance test (already
+# in the tree via axum's `ws` feature; plain ws://, no TLS features needed).
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+  "connect",
+] }

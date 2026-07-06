@@ -1,0 +1,70 @@
+name: Deploy image
+
+# Build the base container image (`nix build .#container`, Linux-only) and deploy
+# it to the fly.io docs app (docs.boatramp.dev). Manual — run when the boatramp
+# binary itself changes; docs *content* is published separately by deploy-docs.yml
+# (`boatramp sync`). Requires the FLY_API_TOKEN repo secret (`fly tokens create
+# deploy`). Deploying applies any staged fly secrets (root key, bootstrap secret).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: build + deploy (fly.io)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # `nix build .#container` compiles the boatramp binary into /nix/store;
+      # reclaim the runner's preinstalled toolchains + add swap (see the CI notes).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/flakehub-cache-action@main
+
+      # The base image is default-features (no wasmtime/openraft/cranelift), so it
+      # doesn't need the memory throttle the all-features nix job uses — run at full
+      # parallelism (swap above still covers any spike).
+      - name: Build the base image
+        run: nix build .#container --print-build-logs --out-link image.tar.gz
+
+      - name: Push to fly registry + deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Use the runner's preinstalled docker + the official flyctl installer,
+          # NOT `nix run` — fetching those tools through the GitHub-Actions-cache-
+          # backed Nix cache gets rate-limited (HTTP 418) and fails the push.
+          curl -fsSL https://fly.io/install.sh | sh
+          export PATH="$HOME/.fly/bin:$PATH"
+          app=boatramp-docs
+          tag="$(git rev-parse --short HEAD)"
+          repo="registry.fly.io/${app}"
+          img="$(docker load < image.tar.gz | sed -nE 's/^Loaded image: //p' | head -1)"
+          echo "loaded image: $img"
+          docker tag "$img" "${repo}:${tag}"
+          flyctl auth docker
+          docker push "${repo}:${tag}"
+          flyctl deploy --app "$app" --image "${repo}:${tag}"

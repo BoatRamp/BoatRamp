@@ -1,0 +1,19 @@
+# Example WebAssembly handler guest. Built to a `wasi:http`
+# component with `cargo build --release --target wasm32-wasip2`; consumed as a
+# fixture by the `boatramp-handlers` engine tests. Excluded from the workspace
+# (it targets wasm, not the host).
+[package]
+name = "boatramp-example-http-200"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+strip = true

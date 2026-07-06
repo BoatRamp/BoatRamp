@@ -1,0 +1,59 @@
+[package]
+name = "boatramp-acme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp wildcard TLS via ACME DNS-01 + a pluggable DNS-provider layer"
+
+[features]
+default = []
+# The ACME DNS-01 issuance driver (instant-acme + a CSR via rcgen). Heavy; off
+# by default so a build that only needs the DNS abstraction stays lean.
+acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio", "dep:thiserror"]
+# DNS providers, each behind its own feature so its client deps are optional.
+cloudflare = ["dep:reqwest", "dep:serde_json"]
+route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
+oci = ["dep:reqwest", "dep:serde_json", "dep:rsa"]
+
+[dependencies]
+async-trait.workspace = true
+serde = { workspace = true }
+tracing.workspace = true
+base64.workspace = true
+sha2.workspace = true
+
+# Optional, feature-gated.
+tokio = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+instant-acme = { version = "0.7", optional = true }
+rcgen = { version = "0.13", optional = true }
+thiserror = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-route53 = { version = "1", features = [
+  "behavior-version-latest",
+], optional = true }
+ring = { version = "0.17", optional = true }
+rsa = { version = "0.9", optional = true, features = ["sha2"] }
+pkcs8 = { version = "0.10", optional = true, features = ["pem"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "process",
+  "time",
+] }
+serde_json.workspace = true
+# The Pebble DNS-01 integration test (tests/pebble_dns01.rs, `#[ignore]`d):
+# reqwest drives the challtestsrv management API + the directory readiness
+# probe; rcgen mints the local CA + Pebble's server cert; tempfile holds them.
+reqwest = { workspace = true }
+rcgen = "0.13"
+tempfile = "3"
+# Install a process crypto provider for instant-acme's hyper-rustls client.
+rustls = { workspace = true }

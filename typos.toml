@@ -1,0 +1,24 @@
+# Configuration for the `typos` spell checker.
+# https://github.com/crate-ci/typos
+
+[default.extend-words]
+# `mke2fs` is the e2fsprogs tool name; not a typo of "make".
+mke = "mke"
+# `THR` = the 8250 UART Transmit Holding Register (embedded VMM serial).
+THR = "THR"
+# `ExtINT`/`EXTINT` = the APIC External Interrupt delivery mode (MP table).
+EXTINT = "EXTINT"
+ExtINT = "ExtINT"
+# `COSE`/`cose` = CBOR Object Signing and Encryption (RFC 9052) + the `coset`
+# crate / `cose.rs` module (the authz token format). Not a typo of "case".
+COSE = "COSE"
+Cose = "Cose"
+cose = "cose"
+# `HashiCorp` — the vendor of Vault (the `signer-vault` backend); a proper noun,
+# not a typo of "Hash".
+Hashi = "Hashi"
+
+[files]
+# Lockfiles and vendored third-party WIT (upstream WASI definitions, copied
+# verbatim — their spelling is not ours to "fix").
+extend-exclude = ["Cargo.lock", "flake.lock", "examples/handlers/*/wit/**"]

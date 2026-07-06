@@ -1,0 +1,44 @@
+# fly.toml — boatramp serving its own docs at https://docs.boatramp.dev.
+#
+# Safe to commit publicly: this is configuration, not secrets. The one secret —
+# the control-plane root key — is set out-of-band and injected at runtime:
+#   fly secrets set BOATRAMP_AUTH_ROOT_PRIVATE_KEY=<hex>
+# (done by `just fly-provision` in the uchron-devops repo); it never appears here.
+#
+# No Dockerfile: the image is the flake's `.#container` (base: fs + SlateDB), built
+# + pushed to fly's registry by `just fly-image` and selected with
+# `fly deploy --image`. Docs *content* is published separately with `boatramp sync`
+# (`just deploy-docs` / the deploy-docs workflow) — no image redeploy needed.
+
+app = "boatramp-docs"
+primary_region = "ams"
+
+[env]
+BOATRAMP_ADDR = "0.0.0.0:8080"
+BOATRAMP_DATA_DIR = "/data"
+# This app only hosts the docs, so serve the "docs" site for any Host.
+BOATRAMP_DEFAULT_SITE = "docs"
+
+[http_service]
+internal_port = 8080
+force_https = true
+# Cloudflare fronts + caches the site, so the origin sleeps between the rare
+# cache-miss / post-purge requests. Scale to zero; fly resumes on demand.
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 0
+
+[http_service.concurrency]
+type = "requests"
+soft_limit = 200
+hard_limit = 250
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"
+
+# Persistent state (blobs + SlateDB metadata). The base image runs as root so it
+# can own this mount. The volume is created by `just fly-provision`.
+[mounts]
+source = "boatramp_data"
+destination = "/data"

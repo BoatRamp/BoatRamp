@@ -1,0 +1,150 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/boatramp-types",
+  "crates/boatramp-core",
+  "crates/boatramp-storage",
+  "crates/boatramp-server",
+  "crates/boatramp-handlers",
+  "crates/boatramp-acme",
+  "crates/boatramp-cluster",
+  "crates/boatramp-firecracker",
+  "crates/boatramp-container",
+  "crates/boatramp-docker",
+  "crates/boatramp-cloudflare",
+  "crates/boatramp",
+]
+# WebAssembly guest examples/fixtures target wasm32-wasip2, not the host triple,
+# so they are built separately — not workspace members.
+# `boatramp-console` is the Yew (CSR) web console: it ONLY builds for
+# wasm32-unknown-unknown (via Trunk), so it is excluded too — `cargo
+# build/test --workspace` on the host must not try to build it.
+exclude = [
+  "examples/handlers/http-200",
+  "examples/handlers/kv-counter",
+  "examples/handlers/sql-counter",
+  "examples/handlers/event-consumer",
+  "crates/boatramp-console",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["Giacomo Cariello <info@giacomocariello.com>"]
+repository = "https://github.com/BoatRamp/BoatRamp"
+
+[workspace.dependencies]
+boatramp-types = { path = "crates/boatramp-types", version = "0.1.0" }
+boatramp-core = { path = "crates/boatramp-core", version = "0.1.0" }
+boatramp-storage = { path = "crates/boatramp-storage", version = "0.1.0" }
+boatramp-server = { path = "crates/boatramp-server", version = "0.1.0" }
+boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.1.0" }
+boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.1.0" }
+boatramp-acme = { path = "crates/boatramp-acme", version = "0.1.0" }
+boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.1.0" }
+boatramp-container = { path = "crates/boatramp-container", version = "0.1.0" }
+boatramp-docker = { path = "crates/boatramp-docker", version = "0.1.0" }
+boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.1.0" }
+
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "fs",
+  "io-util",
+  "io-std",
+  "net",
+  "process",
+  "signal",
+] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
+# Async Docker Engine API client for the remote-docker compute backend.
+bollard = "0.17"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = "0.7"
+clap = { version = "4", features = ["derive", "env"] }
+# Shell-completion + man-page generation for the `completions` / `man` subcommands:
+# the payload distro/Homebrew/Nix packages install.
+clap_complete = "4"
+clap_mangen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+lru = "0.16"
+walkdir = "2"
+toml = "0.8"
+ron = "0.10"
+regex = "1"
+getrandom = "0.2"
+# Password hashing for visitor HTTP Basic auth (argon2id). Pure Rust → compiles
+# to wasm32 (unlike a C-backed hash), and the modern recommended password hash.
+argon2 = "0.5"
+ipnet = "2"
+base64 = "0.22"
+
+brotli = "7"
+flate2 = "1"
+# tar reader for the OCI→ext4 rootfs build, behind the
+# `boatramp-firecracker/build` feature.
+tar = "0.4"
+
+# TLS (compiled only with the `tls` feature).
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls-acme = { version = "0.15", features = ["axum", "tokio"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "stream",
+  "json",
+] }
+
+# S3 backend (compiled only with `--features s3`).
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+
+# Durable embedded KV: transactional LSM over object storage (local fs, S3/R2,
+# GCS, ...). Compiled only with the `slatedb` feature.
+slatedb = "0.13"
+
+# The SQL backend for the handler `sql` binding (a `boatramp-storage` backend
+# behind the `sql` feature). libsql = SQLite-compatible; an embedded local file
+# (single-node) or remote/embedded-replica to a shared sqld primary (cluster).
+# Drop the heavy replication/sync default features.
+libsql = { version = "0.9", default-features = false, features = [
+  "core",
+  "remote",
+  "tls",
+] }
+
+# Embedded bundler (compiled only with `--features bundler`).
+rolldown = "1.1"
+lightningcss = "1.0.0-alpha.71"
+
+# WebAssembly handler component validation (compiled only with `--features
+# handlers`). Pinned together; bump deliberately.
+wit-component = "0.252"
+wit-parser = "0.252"
+
+# WebAssembly handler engine (compiled only with the handler `engine` feature).
+wasmtime = { version = "30", features = ["component-model", "async"] }
+wasmtime-wasi = "30"
+wasmtime-wasi-http = "30"
+wasmtime-wasi-io = "30"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+# Tokio IO adapter (`TokioIo`) for driving a hyper client conn over a
+# `tokio::net::UnixStream` — the gateway's unix-socket upstreams.
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[profile.release]
+lto = "thin"
+strip = true

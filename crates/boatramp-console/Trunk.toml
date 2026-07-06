@@ -1,0 +1,29 @@
+# Trunk build config for the boatramp console (Yew CSR).
+#
+# Tailwind runs Node-free via the standalone CLI as a pre-build hook: it reads
+# `styles/input.css` + scans the Rust/HTML sources for utility classes and emits
+# `styles/tailwind.css`, which `index.html` references and Trunk then hashes
+# into `dist/`. The CLI binary comes from the Nix devShell (`pkgs.tailwindcss`).
+
+[build]
+target = "index.html"
+
+[[hooks]]
+stage = "pre_build"
+command = "tailwindcss"
+command_arguments = [
+  "--input",
+  "styles/input.css",
+  "--output",
+  "styles/tailwind.css",
+  "--config",
+  "tailwind.config.js",
+  "--minify",
+]
+
+[serve]
+# `trunk serve` for local dev proxies /api to a running boatramp server so the
+# SPA can hit the real control-plane same-origin (no CORS). Adjust as needed.
+[[serve.proxy]]
+backend = "http://127.0.0.1:8080/api"
+rewrite = "/api/"
