@@ -2,9 +2,9 @@
 //!
 //! NS1 addresses a record by its full path `/v1/zones/{zone}/{fqdn}/{type}`, so
 //! there is no record id and no list filter: `upsert` GETs that path to see if
-//! the record exists, then `PUT`s (create) or `POST`s (update); `delete` DELETEs
-//! it (404 = already gone). Record data is an `answers` array — a single answer
-//! here (one value per `DnsRecord`); the DNS-01 wildcard path needs exactly one.
+//! the record exists, then `PUT`s (create) or `POST`s (update); `delete` removes
+//! it with a `DELETE` (404 = already gone). Record data is an `answers` array — a
+//! single answer here (one value per `DnsRecord`); the DNS-01 wildcard needs one.
 //! Names are full FQDNs (no relativizing). CNAME data is normalized to a
 //! trailing-dot FQDN. Construction is pure + unit-tested; round-trip is a live seam.
 
