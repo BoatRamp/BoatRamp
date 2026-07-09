@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use boatramp_acme::acme::CertRequest;
-use boatramp_acme::{preview_record, preview_wildcard, PreviewTarget};
+use boatramp_acme::{domain_record, preview_record, preview_wildcard, PreviewTarget};
 
 use crate::acme_dns::{build_provider, obtain_or_load, DnsProviderKind};
 use crate::config::ProjectConfig;
@@ -54,6 +54,23 @@ enum DnsCommand {
         #[arg(long, default_value_t = 120)]
         ttl: u32,
     },
+    /// Point a **verified** custom domain (apex or sub-domain) at this server by
+    /// upserting its A/AAAA/CNAME record via the provider. Verify ownership first
+    /// (`boatramp domain add/verify`) — never point a host you don't control.
+    ConfigureDomain {
+        /// DNS provider (`manual` prints the record to create by hand).
+        #[arg(long, value_enum)]
+        provider: DnsProviderKind,
+        /// The custom hostname, e.g. `www.example.com` or the apex `example.com`.
+        host: String,
+        /// Where it points: an IPv4/IPv6 address (→ A/AAAA) or another hostname
+        /// (→ CNAME; invalid at a true apex — use an address there).
+        #[arg(long)]
+        target: String,
+        /// Record TTL (seconds).
+        #[arg(long, default_value_t = 300)]
+        ttl: u32,
+    },
     /// Issue (or renew) the `*.deploy.<host>` wildcard certificate via ACME
     /// DNS-01, into the cert cache `boatramp serve --tls acme-dns` reads.
     Cert {
@@ -88,6 +105,22 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
             provider.upsert(&record).await?;
             println!(
                 "configured {} {} -> {}",
+                record.kind.as_str(),
+                record.name,
+                record.value
+            );
+        }
+        DnsCommand::ConfigureDomain {
+            provider,
+            host,
+            target,
+            ttl,
+        } => {
+            let provider = build_provider(provider).await?;
+            let record = domain_record(&host, &parse_target(&target), ttl);
+            provider.upsert(&record).await?;
+            println!(
+                "pointed {} {} -> {}",
                 record.kind.as_str(),
                 record.name,
                 record.value

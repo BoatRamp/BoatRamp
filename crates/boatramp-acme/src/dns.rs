@@ -114,10 +114,9 @@ pub enum PreviewTarget {
     Cname(String),
 }
 
-/// The single DNS record that makes a site's preview wildcard host resolve to
-/// `target` (the "auto-config" record).
-pub fn preview_record(site_host: &str, target: &PreviewTarget, ttl: u32) -> DnsRecord {
-    let name = preview_wildcard(site_host);
+/// The DNS record that points `name` at `target` — the record kind follows the
+/// target (address → `A`/`AAAA`, hostname → `CNAME`).
+fn record_at(name: String, target: &PreviewTarget, ttl: u32) -> DnsRecord {
     match target {
         PreviewTarget::Ipv4(ip) => DnsRecord {
             kind: RecordKind::A,
@@ -138,6 +137,21 @@ pub fn preview_record(site_host: &str, target: &PreviewTarget, ttl: u32) -> DnsR
             ttl,
         },
     }
+}
+
+/// The single DNS record that makes a site's preview wildcard host resolve to
+/// `target` (the "auto-config" record).
+pub fn preview_record(site_host: &str, target: &PreviewTarget, ttl: u32) -> DnsRecord {
+    record_at(preview_wildcard(site_host), target, ttl)
+}
+
+/// The single DNS record that points a **verified custom host** (an apex or a
+/// sub-domain) at `target` — the custom-domain analogue of [`preview_record`].
+/// `host` becomes the record name verbatim (a trailing dot is trimmed); the kind
+/// follows the target. A `CNAME` is invalid at a true apex, so point apex hosts
+/// at an address target (`A`/`AAAA`).
+pub fn domain_record(host: &str, target: &PreviewTarget, ttl: u32) -> DnsRecord {
+    record_at(host.trim_end_matches('.').to_string(), target, ttl)
 }
 
 /// Which operation a [`ManualDnsProvider`] recorded.
@@ -244,6 +258,29 @@ mod tests {
             300,
         );
         assert_eq!(c.kind, RecordKind::Cname);
+        assert_eq!(c.value, "lb.example.net");
+    }
+
+    #[test]
+    fn domain_record_points_an_exact_host() {
+        // Apex host at an address → A at the apex name (no wildcard prefix).
+        let a = domain_record(
+            "example.com",
+            &PreviewTarget::Ipv4("203.0.113.7".parse().unwrap()),
+            300,
+        );
+        assert_eq!(a.kind, RecordKind::A);
+        assert_eq!(a.name, "example.com");
+        assert_eq!(a.value, "203.0.113.7");
+
+        // Sub-domain at a hostname → CNAME; a trailing dot on the host is trimmed.
+        let c = domain_record(
+            "www.example.com.",
+            &PreviewTarget::Cname("lb.example.net".into()),
+            60,
+        );
+        assert_eq!(c.kind, RecordKind::Cname);
+        assert_eq!(c.name, "www.example.com");
         assert_eq!(c.value, "lb.example.net");
     }
 

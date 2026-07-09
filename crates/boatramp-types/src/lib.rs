@@ -15,6 +15,7 @@ pub mod compute;
 pub mod config;
 pub mod cron;
 pub mod deploy;
+pub mod dns_managed;
 pub mod domain_verify;
 pub mod error;
 pub mod file;
