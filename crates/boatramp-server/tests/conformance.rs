@@ -360,6 +360,25 @@ async fn index_clean_urls_and_security_header() {
 }
 
 #[tokio::test]
+async fn by_name_route_admin_prefix_and_legacy_alias() {
+    // The going-forward `/_sites/<name>/` admin route and the deprecated
+    // `/sites/<name>/` alias both serve the same by-name content.
+    let deploy = seed().await;
+    let (status, _, body) = send(&deploy, get("/_sites/test/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>");
+
+    let (status, _, body) = send(&deploy, get("/_sites/test/about")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>about</h1>");
+
+    // Legacy alias still works (with a one-time deprecation warning).
+    let (status, _, body) = send(&deploy, get("/sites/test/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>");
+}
+
+#[tokio::test]
 async fn redirect_and_custom_404() {
     let deploy = seed().await;
     let (status, headers, _) = send(&deploy, get("/sites/test/old")).await;
@@ -3523,6 +3542,154 @@ async fn unmatched_host_without_default_is_404() {
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---- implicit host routing (first-label / sole-site) -----------------------
+
+/// Publish and activate a one-file site named `site` whose `/` serves `body`.
+async fn publish_site(deploy: &DeployStore, site: &str, body: &'static [u8]) {
+    let hash = sha256_hex(body);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(body)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let (_h, entry) = file(body, Some("text/html"));
+    let mut files = BTreeMap::new();
+    files.insert("index.html".to_string(), entry);
+    let manifest = Manifest {
+        files,
+        config: DeployConfig::default(),
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy.activate(site, &id).await.unwrap();
+}
+
+/// A `GET /` against `app` with the given `Host`, returning `(status, body)`.
+async fn get_host(app: axum::Router, host: &'static str) -> (StatusCode, Vec<u8>) {
+    let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    req.headers_mut()
+        .insert(header::HOST, host.parse().unwrap());
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, body)
+}
+
+#[tokio::test]
+async fn implicit_first_label_routes_to_named_site() {
+    // Two sites, implicit routing on: the first host label names a served site,
+    // resolved at root with no domain registered (`blog.localhost` → site `blog`).
+    let deploy = seed().await; // site "test" (home)
+    publish_site(&deploy, "blog", b"<h1>blog</h1>").await;
+    let app = router_with(
+        deploy.clone(),
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions {
+            implicit_routing: true,
+            ..Default::default()
+        },
+    );
+
+    let (status, body) = get_host(app.clone(), "blog.localhost").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>blog</h1>");
+
+    let (status, body) = get_host(app.clone(), "test.localhost").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>");
+
+    // A label that names no site 404s — implicit routing is not a wildcard.
+    let (status, _) = get_host(app, "ghost.localhost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn implicit_sole_site_served_at_root() {
+    // One site, implicit on, no default_site: an unmatched host (whose label names
+    // no site) still serves the sole site — the zero-config single-site case.
+    let deploy = seed().await; // only "test"
+    let app = router_with(
+        deploy.clone(),
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions {
+            implicit_routing: true,
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_host(app, "random.example").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>");
+
+    // Publishing a second site turns the sole-site default off (ambiguous): an
+    // unmatched, non-site-label host now 404s.
+    publish_site(&deploy, "blog", b"<h1>blog</h1>").await;
+    let app = router_with(
+        deploy.clone(),
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions {
+            implicit_routing: true,
+            ..Default::default()
+        },
+    );
+    let (status, _) = get_host(app, "random.example").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn implicit_routing_off_is_strict() {
+    // The strict (multi-tenant) default ⇒ implicit_routing false: a site's name as
+    // a host label does not resolve; only an explicit domain / default_site do.
+    let deploy = seed().await; // site "test"
+    let app = router_with(
+        deploy,
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions::default(),
+    );
+    let (status, _) = get_host(app, "test.localhost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn explicit_domain_beats_implicit_first_label() {
+    // Precedence: a registered domain wins over first-label routing, even when the
+    // label names a different site. `blog.example.com` is registered to "test", so
+    // it serves "test" — not the site literally named "blog".
+    let deploy = seed().await; // "test" (home)
+    publish_site(&deploy, "blog", b"<h1>blog</h1>").await;
+    deploy
+        .set_site_config(
+            "test",
+            &SiteConfig {
+                domains: DomainConfig {
+                    primary: Some("blog.example.com".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let app = router_with(
+        deploy,
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions {
+            implicit_routing: true,
+            ..Default::default()
+        },
+    );
+    let (status, body) = get_host(app, "blog.example.com").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>", "explicit domain wins over the label");
 }
 
 // ---- configurable WAF ------------------------------------------------------
