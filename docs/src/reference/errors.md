@@ -49,7 +49,7 @@ deepest `caused by:` line.
 
 `boatramp validate` (and `sync`, which validates first) reports config problems
 against `project.cfg` before anything is published — a bad route pattern, an
-unknown handler import, an unparseable cron schedule, or a credential-shaped value
+unknown handler import, an unparsable cron schedule, or a credential-shaped value
 in a handler `env`. These fail at deploy time, not request time:
 
 ```text
