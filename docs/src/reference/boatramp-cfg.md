@@ -95,6 +95,7 @@ Override knobs (byte caps: `0` = unlimited):
 | `domain_verify_allow_private` | Allow domain-verification probes to private hosts. |
 | `allow_shared_kernel_compute` | Permit container (shared-kernel) compute; off ⇒ microVM only. |
 | `ratelimit_fail_open` | Serve rather than reject if the rate-limit store is unavailable. |
+| `allow_implicit_routing` | Resolve an unmatched host to a site without a registered domain (first-label `<site>.host` / sole site). Off under `multi-tenant`; a loopback bind enables it regardless. See [addressing](../explanation/addressing.md). |
 
 See [Choose & inspect a security posture](../how-to/security-posture.md) and
 [The security posture model](../explanation/security-posture.md).

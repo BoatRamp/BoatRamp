@@ -52,10 +52,12 @@ activated my-site -> 3b1c9f0a
 
 ## 4. Load it
 
-Fetch the site. Every site answers on `/sites/<name>/`:
+Fetch the site at the server's root. It is the only site you have published, so
+boatramp serves it at `/` — the same place it will answer once you put it on a
+real domain:
 
 ```sh
-curl http://127.0.0.1:8080/sites/my-site/
+curl http://127.0.0.1:8080/
 ```
 
 ```text
@@ -64,7 +66,9 @@ curl http://127.0.0.1:8080/sites/my-site/
 <h1>It works.</h1>
 ```
 
-You have published and served your first site.
+You have published and served your first site. Once you publish a second site,
+you address each one by host — see
+[How a request reaches your site](../explanation/addressing.md).
 
 ## 5. Change and republish
 

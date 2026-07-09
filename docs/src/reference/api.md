@@ -8,7 +8,8 @@ the [CLI reference](./cli.md) maps each command onto them.
 ## Conventions
 
 - **Base path.** Every control-plane endpoint is under `/api`. Public serving
-  (`/sites/*`, `/healthz`) is a separate, unauthenticated surface.
+  (host-routed content, `/_sites/*`, `/healthz`) is a separate, unauthenticated
+  surface.
 - **Authentication.** A bearer token in `Authorization: Bearer <token>`. Every
   `/api/*` request is authenticated and authorized, except the handful gated by
   their own single-use credential (bootstrap, join, OIDC exchange). The exact
@@ -116,5 +117,6 @@ limit) is applied per-site inside the serving handlers.
 | --- | --- | --- |
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/readyz` | Readiness. |
-| any | `/sites/*` | Serve site content (virtualhost-routed). |
+| any | `/` (host-routed) | Serve site content, selected by `Host` — see [How a request reaches your site](../explanation/addressing.md). |
+| any | `/_sites/<name>/*` | Serve a site by name (admin/testing). `/sites/<name>/*` is a deprecated alias. |
 | `GET` | `/_deploy/*` | Serve a deployment by id (an unguessable content-hash capability). |

@@ -50,6 +50,7 @@
 - [Storage, KV, and KvStore's three roles](./explanation/storage.md)
 - [Cache coherence](./explanation/cache-coherence.md)
 - [The request pipeline](./explanation/request-pipeline.md)
+- [How a request reaches your site](./explanation/addressing.md)
 - [Authentication & authorization](./explanation/auth-model.md)
 - [The security posture model](./explanation/security-posture.md)
 - [Compute: handlers vs containers vs microVMs](./explanation/compute-model.md)

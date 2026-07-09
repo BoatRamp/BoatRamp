@@ -103,7 +103,7 @@ Publish to any node — writes forward to the leader — and read from another:
 
 ```sh
 boatramp sync ./dist --site my-site --server https://10.0.0.1:8080
-curl https://10.0.0.3:8080/sites/my-site/     # served from node-3's applied state
+curl https://10.0.0.3:8080/_sites/my-site/    # by name from node-3's applied state
 ```
 
 ## Certificates in a cluster

@@ -85,8 +85,11 @@ activated my-site -> 8c1f2a3d — handler /hello
 
 ## 5. Call the route
 
+`my-site` is the only site on this server, so it answers at the root — call the
+handler's route directly:
+
 ```sh
-curl http://127.0.0.1:8080/sites/my-site/hello
+curl http://127.0.0.1:8080/hello
 ```
 
 ```text
