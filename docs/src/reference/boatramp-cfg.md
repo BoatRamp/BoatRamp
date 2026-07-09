@@ -1,0 +1,1 @@
+# boatramp.cfg schema

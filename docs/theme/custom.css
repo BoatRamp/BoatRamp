@@ -1,8 +1,11 @@
 /* boatramp documentation — light theme tweaks layered on mdBook's `navy`. */
 
 :root {
-    --sidebar-width: 17rem;
-    --content-max-width: 48rem;
+    /* Wider than mdBook's defaults (sidebar 300px / content 750px): the nav
+       labels are long ("Auto-DNS & Custom Domains") and the pages are dense with
+       code blocks and reference tables that need room. */
+    --sidebar-width: 20rem;
+    --content-max-width: 60rem;
 }
 
 /* Slightly tighter, more readable code blocks. */

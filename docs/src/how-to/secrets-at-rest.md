@@ -1,0 +1,1 @@
+# Encrypt secrets at rest
