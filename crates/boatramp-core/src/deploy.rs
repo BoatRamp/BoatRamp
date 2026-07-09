@@ -478,6 +478,64 @@ impl DeployStore {
         Ok(())
     }
 
+    // ---- managed-DNS ledger (records boatramp pointed at the server) ----------
+
+    /// The managed-DNS ledger for `(site, host)`, if boatramp has pointed it.
+    pub async fn get_managed_dns(
+        &self,
+        site: &str,
+        host: &str,
+    ) -> Result<Option<crate::dns_managed::ManagedDns>, DeployError> {
+        match self
+            .kv
+            .get(&crate::dns_managed::dnsmanaged_key(site, host))
+            .await?
+        {
+            Some(bytes) => Ok(Some(crate::dns_managed::ManagedDns::from_json(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record (create/replace) the managed-DNS ledger entry for a host.
+    pub async fn set_managed_dns(
+        &self,
+        site: &str,
+        ledger: &crate::dns_managed::ManagedDns,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .put(
+                &crate::dns_managed::dnsmanaged_key(site, &ledger.host),
+                ledger.to_json()?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a host's managed-DNS ledger entry (after its records are retracted).
+    pub async fn remove_managed_dns(&self, site: &str, host: &str) -> Result<(), DeployError> {
+        self.kv
+            .delete(&crate::dns_managed::dnsmanaged_key(site, host))
+            .await?;
+        Ok(())
+    }
+
+    /// All managed-DNS ledger entries for `site` (the reconcile sweep reads these
+    /// to retract records whose host is no longer attached).
+    pub async fn list_managed_dns(
+        &self,
+        site: &str,
+    ) -> Result<Vec<crate::dns_managed::ManagedDns>, DeployError> {
+        let prefix = crate::dns_managed::dnsmanaged_site_prefix(site);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                out.push(crate::dns_managed::ManagedDns::from_json(&bytes)?);
+            }
+        }
+        out.sort_by(|a, b| a.host.cmp(&b.host));
+        Ok(out)
+    }
+
     /// Start (or restart) an ownership challenge for `(site, host)`.
     ///
     /// Returns the existing challenge if one is already pending under the same
@@ -1328,6 +1386,47 @@ mod tests {
         async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
             Ok(Vec::new())
         }
+    }
+
+    #[tokio::test]
+    async fn managed_dns_ledger_round_trip_and_retract() {
+        use crate::dns_managed::{ManagedDns, ManagedRecord};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store
+            .get_managed_dns("blog", "www.example.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        let ledger = ManagedDns::new(
+            "www.example.com",
+            "cloudflare",
+            vec![ManagedRecord {
+                kind: "A".into(),
+                name: "www.example.com".into(),
+                value: "203.0.113.7".into(),
+                ttl: 300,
+            }],
+            10,
+        );
+        store.set_managed_dns("blog", &ledger).await.unwrap();
+        // Lookup normalizes the host, so a differently-cased/dotted query hits it.
+        assert_eq!(
+            store
+                .get_managed_dns("blog", "WWW.example.com.")
+                .await
+                .unwrap(),
+            Some(ledger.clone())
+        );
+        assert_eq!(store.list_managed_dns("blog").await.unwrap(), vec![ledger]);
+
+        store
+            .remove_managed_dns("blog", "www.example.com")
+            .await
+            .unwrap();
+        assert!(store.list_managed_dns("blog").await.unwrap().is_empty());
     }
 
     #[tokio::test]

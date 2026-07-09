@@ -1471,17 +1471,15 @@ async fn cluster_refresh_certs(
     Ok(entries)
 }
 
-/// Parse the `--acme-dns-provider` value.
+/// Parse the `--acme-dns-provider` value into a provider kind, using the
+/// `ValueEnum` spellings + aliases so **every** built-in provider (all ten) is
+/// selectable at serve time — exactly as for the `dns` subcommand (the old
+/// hand-rolled match knew only four).
 #[cfg(feature = "acme-dns")]
 fn parse_dns_provider(value: &str) -> Result<crate::acme_dns::DnsProviderKind> {
-    use crate::acme_dns::DnsProviderKind;
-    Ok(match value {
-        "manual" => DnsProviderKind::Manual,
-        "cloudflare" => DnsProviderKind::Cloudflare,
-        "route53" => DnsProviderKind::Route53,
-        "oci" => DnsProviderKind::Oci,
-        other => return Err(Error::UnknownDnsProvider(other.to_string())),
-    })
+    use clap::ValueEnum;
+    crate::acme_dns::DnsProviderKind::from_str(value, true)
+        .map_err(|_| Error::UnknownDnsProvider(value.to_string()))
 }
 
 /// Serve HTTPS with ACME **DNS-01** certificates (wildcards included). Obtains

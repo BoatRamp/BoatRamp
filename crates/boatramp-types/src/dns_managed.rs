@@ -91,6 +91,37 @@ impl ManagedDns {
     }
 }
 
+/// The DNS reconcile actions for one site's custom domains.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcilePlan {
+    /// Verified + attached hosts to (re)assert the A/CNAME for (idempotent).
+    pub to_point: Vec<String>,
+    /// Hosts with a ledger entry but no longer attached — retract their records.
+    pub to_retract: Vec<String>,
+}
+
+/// Plan the leader-only DNS reconcile for one site. `verified` is the set of
+/// hosts currently verified + attached to the site; `managed` is the set of
+/// hosts that already have a ledger entry. Every verified host is (re)pointed
+/// (upsert is idempotent, so this self-heals drift); every managed-but-no-longer-
+/// verified host is retracted. Hosts are compared normalized, so a wildcard and
+/// its base don't churn.
+pub fn plan_reconcile(verified: &[String], managed: &[String]) -> ReconcilePlan {
+    use std::collections::BTreeSet;
+    let verified: BTreeSet<String> = verified
+        .iter()
+        .map(|h| crate::domain_verify::normalize_host(h))
+        .collect();
+    let managed: BTreeSet<String> = managed
+        .iter()
+        .map(|h| crate::domain_verify::normalize_host(h))
+        .collect();
+    ReconcilePlan {
+        to_point: verified.iter().cloned().collect(),
+        to_retract: managed.difference(&verified).cloned().collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +158,23 @@ mod tests {
         assert_eq!(ledger.host, "example.com");
         assert_eq!(ledger.version, crate::SCHEMA_VERSION);
         assert_eq!(ledger.provider, "route53");
+    }
+
+    #[test]
+    fn plan_points_verified_and_retracts_orphans() {
+        let plan = plan_reconcile(
+            &["a.example.com".into(), "b.example.com".into()],
+            &["b.example.com".into(), "old.example.com".into()],
+        );
+        assert_eq!(plan.to_point, vec!["a.example.com", "b.example.com"]);
+        assert_eq!(plan.to_retract, vec!["old.example.com"]);
+    }
+
+    #[test]
+    fn plan_normalizes_before_comparing() {
+        // A wildcard verified host and its managed base normalize equal → no churn.
+        let plan = plan_reconcile(&["*.Example.com".into()], &["example.com".into()]);
+        assert_eq!(plan.to_point, vec!["example.com"]);
+        assert!(plan.to_retract.is_empty());
     }
 }
