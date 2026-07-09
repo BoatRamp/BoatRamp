@@ -23,6 +23,7 @@ ns1 = ["dep:reqwest", "dep:serde_json"]
 dnsimple = ["dep:reqwest", "dep:serde_json"]
 gcp-dns = ["dep:reqwest", "dep:serde_json"]
 azure-dns = ["dep:reqwest", "dep:serde_json"]
+akamai = ["dep:reqwest", "dep:serde_json", "dep:hmac"]
 
 [dependencies]
 async-trait.workspace = true
@@ -45,6 +46,8 @@ aws-sdk-route53 = { version = "1", features = [
 ring = { version = "0.17", optional = true }
 rsa = { version = "0.9", optional = true, features = ["sha2"] }
 pkcs8 = { version = "0.10", optional = true, features = ["pem"] }
+# EdgeGrid (Akamai) request signing: HMAC-SHA256 over the sha2/base64 already present.
+hmac = { version = "0.12", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

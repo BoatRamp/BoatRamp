@@ -44,6 +44,9 @@ pub mod gcp_dns;
 #[cfg(feature = "azure-dns")]
 pub mod azure_dns;
 
+#[cfg(feature = "akamai")]
+pub mod akamai;
+
 pub use dns::{
     acme_challenge_name, dns01_txt_value, preview_record, preview_wildcard, DnsError, DnsOp,
     DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,

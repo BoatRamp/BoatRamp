@@ -82,6 +82,9 @@ pub enum DnsProviderKind {
     /// `AZURE_DNS_ZONE`, `AZURE_ACCESS_TOKEN`).
     #[value(name = "azure-dns", alias = "azure")]
     AzureDns,
+    /// Akamai Edge DNS (`AKAMAI_HOST`, `AKAMAI_CLIENT_TOKEN`,
+    /// `AKAMAI_CLIENT_SECRET`, `AKAMAI_ACCESS_TOKEN`, `AKAMAI_ZONE`).
+    Akamai,
 }
 
 fn env(var: &str) -> Result<String> {
@@ -142,6 +145,13 @@ pub async fn build_provider(kind: DnsProviderKind) -> Result<Box<dyn DnsProvider
             env("AZURE_RESOURCE_GROUP")?,
             env("AZURE_DNS_ZONE")?,
             env("AZURE_ACCESS_TOKEN")?,
+        )),
+        DnsProviderKind::Akamai => Box::new(boatramp_acme::akamai::AkamaiDns::new(
+            env("AKAMAI_HOST")?,
+            env("AKAMAI_CLIENT_TOKEN")?,
+            env("AKAMAI_CLIENT_SECRET")?,
+            env("AKAMAI_ACCESS_TOKEN")?,
+            env("AKAMAI_ZONE")?,
         )),
     })
 }
