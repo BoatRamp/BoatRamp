@@ -24,11 +24,14 @@ For wildcards (including the preview host), use DNS-01 with a provider:
 ```sh
 boatramp serve --tls acme-dns \
   --acme-domain example.com --acme-wildcard-preview \
-  --acme-dns-provider cloudflare        # or route53 | oci | manual
+  --acme-dns-provider cloudflare        # one of ten providers, or manual
 ```
 
-Provider credentials come from the environment — see `boatramp dns --help`. The
-`boatramp dns` subcommand also helps preview and apply the required records.
+Any of the ten built-in providers works here (cloudflare, route53, oci,
+digitalocean, hetzner, ns1, dnsimple, gcp-dns, azure-dns, akamai) plus `manual`.
+Provider credentials come from the environment — see
+[Auto-DNS & Custom Domains](./auto-dns.md) for the full list and for pointing
+custom domains at your server.
 
 ## Transport security headers
 

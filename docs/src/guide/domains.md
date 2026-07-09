@@ -24,6 +24,10 @@ boatramp domain ls                                   # attached + pending
 
 Until a host is verified it never enters routing and never requests a cert.
 
+With a managed-DNS provider configured, `domain add --auto --provider <name>`
+publishes the DNS-TXT challenge and verifies it for you — see
+[Auto-DNS & Custom Domains](./auto-dns.md).
+
 ## Wildcards and canonical hosts
 
 - A `*.example.com` entry matches by suffix at any depth; an exact match always

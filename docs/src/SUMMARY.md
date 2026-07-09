@@ -14,6 +14,7 @@
 - [Configuration](./guide/configuration.md)
 - [Domains & Virtualhosts](./guide/domains.md)
 - [TLS & HTTPS](./guide/tls.md)
+- [Auto-DNS & Custom Domains](./guide/auto-dns.md)
 - [Access Control & WAF](./guide/access-control.md)
 - [Authentication](./guide/authentication.md)
 - [Caching & Compression](./guide/caching.md)
