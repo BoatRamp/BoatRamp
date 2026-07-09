@@ -54,6 +54,8 @@ acme-dns = [
   "boatramp-acme/hetzner",
   "boatramp-acme/ns1",
   "boatramp-acme/dnsimple",
+  "boatramp-acme/gcp-dns",
+  "boatramp-acme/azure-dns",
 ]
 # Embedded, in-process Rust bundler for the `bundle` subcommand: Rolldown for
 # JS/TS (tree-shake + minify) and lightningcss for CSS (`@import` inline +

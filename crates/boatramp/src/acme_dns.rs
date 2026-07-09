@@ -75,6 +75,13 @@ pub enum DnsProviderKind {
     Ns1,
     /// DNSimple (`DNSIMPLE_ACCOUNT_ID`, `DNSIMPLE_ZONE`, `DNSIMPLE_TOKEN`).
     Dnsimple,
+    /// Google Cloud DNS (`GCP_DNS_PROJECT`, `GCP_DNS_ZONE`, `GCP_ACCESS_TOKEN`).
+    #[value(name = "gcp-dns", alias = "gcp")]
+    GcpDns,
+    /// Azure DNS (`AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`,
+    /// `AZURE_DNS_ZONE`, `AZURE_ACCESS_TOKEN`).
+    #[value(name = "azure-dns", alias = "azure")]
+    AzureDns,
 }
 
 fn env(var: &str) -> Result<String> {
@@ -124,6 +131,17 @@ pub async fn build_provider(kind: DnsProviderKind) -> Result<Box<dyn DnsProvider
             env("DNSIMPLE_ACCOUNT_ID")?,
             env("DNSIMPLE_ZONE")?,
             env("DNSIMPLE_TOKEN")?,
+        )),
+        DnsProviderKind::GcpDns => Box::new(boatramp_acme::gcp_dns::GcpDns::new(
+            env("GCP_DNS_PROJECT")?,
+            env("GCP_DNS_ZONE")?,
+            env("GCP_ACCESS_TOKEN")?,
+        )),
+        DnsProviderKind::AzureDns => Box::new(boatramp_acme::azure_dns::AzureDns::new(
+            env("AZURE_SUBSCRIPTION_ID")?,
+            env("AZURE_RESOURCE_GROUP")?,
+            env("AZURE_DNS_ZONE")?,
+            env("AZURE_ACCESS_TOKEN")?,
         )),
     })
 }

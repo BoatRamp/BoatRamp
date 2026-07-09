@@ -38,6 +38,12 @@ pub mod ns1;
 #[cfg(feature = "dnsimple")]
 pub mod dnsimple;
 
+#[cfg(feature = "gcp-dns")]
+pub mod gcp_dns;
+
+#[cfg(feature = "azure-dns")]
+pub mod azure_dns;
+
 pub use dns::{
     acme_challenge_name, dns01_txt_value, preview_record, preview_wildcard, DnsError, DnsOp,
     DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,

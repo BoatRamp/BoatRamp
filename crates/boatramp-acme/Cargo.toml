@@ -21,6 +21,8 @@ digitalocean = ["dep:reqwest", "dep:serde_json"]
 hetzner = ["dep:reqwest", "dep:serde_json"]
 ns1 = ["dep:reqwest", "dep:serde_json"]
 dnsimple = ["dep:reqwest", "dep:serde_json"]
+gcp-dns = ["dep:reqwest", "dep:serde_json"]
+azure-dns = ["dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 async-trait.workspace = true
