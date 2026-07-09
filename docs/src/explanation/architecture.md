@@ -11,7 +11,15 @@ binary:
 | `boatramp-handlers` | The wasmtime engine + host bindings for Wasm components. |
 | `boatramp-acme` | ACME (incl. DNS-01) + the `DnsProvider` abstraction. |
 | `boatramp-cluster` | openraft integration: `RaftKv`, `RaftMessaging`, persistence, membership. |
+| `boatramp-firecracker` | The microVM compute backend: an embedded rust-vmm VMM and an external-Firecracker driver, with snapshot/restore. |
+| `boatramp-container` | The container compute backend: a jailed worker with namespaces, cgroups, and a seccomp filter. |
+| `boatramp-docker` | The remote-Docker compute backend. |
+| `boatramp-cloudflare` | The Cloudflare Containers compute backend + edge-Worker generator. |
 | `boatramp` | The CLI (`serve`, `sync`, `domain`, …) and deploy generators. |
+
+The `ComputeBackend` trait, scheduler, and reconcile loop live in
+`boatramp-core::compute`; each backend above is a separate, capability-detected
+crate. See [Compute: handlers vs containers vs microVMs](./compute-model.md).
 
 ## Two kinds of data
 
@@ -49,4 +57,4 @@ edge and the origin route identically.
 The same commands and config run on a single node, a self-hosted Raft cluster,
 or Cloudflare Containers. Environment differences hide behind the `Storage` /
 `KvStore` / `Messaging` trait seams, not in the UX. See
-[Deployment](../deployment/single-node.md).
+[Deployment topologies](./topologies.md).
