@@ -53,6 +53,16 @@ boatramp dns configure-domain www.example.com --provider cloudflare --target lb.
 
 An IPv4/IPv6 literal becomes an `A`/`AAAA`; anything else becomes a `CNAME`.
 
+Add `--proxied` to route the record through Cloudflare's edge (cache / WAF / edge
+TLS). It is Cloudflare-only, chosen **per domain** (not a global switch), applies
+only to address/CNAME records, and forces the automatic TTL Cloudflare requires
+for proxied records:
+
+```bash
+boatramp dns configure-domain docs.example.com \
+  --provider cloudflare --target app.fly.dev --proxied
+```
+
 ## Automate ownership verification
 
 `domain add --auto` closes the DNS-TXT verification loop for you: it publishes the

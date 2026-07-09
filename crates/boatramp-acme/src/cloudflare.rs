@@ -19,6 +19,10 @@ pub struct CloudflareDns {
     api_base: String,
     token: String,
     zone_id: String,
+    /// Proxy address/CNAME records through Cloudflare (orange-cloud). Per
+    /// provider instance, so it is set per-invocation (e.g. `dns
+    /// configure-domain --proxied`) — never globally; TXT is never proxied.
+    proxied: bool,
 }
 
 impl CloudflareDns {
@@ -30,6 +34,7 @@ impl CloudflareDns {
             api_base: DEFAULT_API_BASE.to_string(),
             token: token.into(),
             zone_id: zone_id.into(),
+            proxied: false,
         }
     }
 
@@ -39,19 +44,38 @@ impl CloudflareDns {
         self
     }
 
+    /// Proxy this instance's address/CNAME upserts through Cloudflare
+    /// (orange-cloud: cache/WAF/edge TLS). TXT records are never proxied.
+    pub fn with_proxied(mut self, proxied: bool) -> Self {
+        self.proxied = proxied;
+        self
+    }
+
     /// `…/zones/{zone}/dns_records` (the collection endpoint).
     fn records_url(&self) -> String {
         format!("{}/zones/{}/dns_records", self.api_base, self.zone_id)
     }
 
-    /// The JSON body for a create/replace of `record`.
-    fn record_body(record: &DnsRecord) -> serde_json::Value {
-        serde_json::json!({
+    /// The JSON body for a create/replace of `record`. When this instance is
+    /// `proxied`, address/CNAME records get `proxied: true` (and the automatic
+    /// TTL Cloudflare requires for proxied records); TXT is never proxied.
+    fn record_body(&self, record: &DnsRecord) -> serde_json::Value {
+        let mut body = serde_json::json!({
             "type": record.kind.as_str(),
             "name": record.name,
             "content": record.value,
             "ttl": record.ttl,
-        })
+        });
+        if self.proxied
+            && matches!(
+                record.kind,
+                RecordKind::A | RecordKind::Aaaa | RecordKind::Cname
+            )
+        {
+            body["proxied"] = serde_json::json!(true);
+            body["ttl"] = serde_json::json!(1); // proxied records must use automatic TTL
+        }
+        body
     }
 
     /// Find the id of an existing `(type, name)` record (the first match), or
@@ -99,7 +123,7 @@ struct ListRecord {
 #[async_trait]
 impl DnsProvider for CloudflareDns {
     async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
-        let body = Self::record_body(record);
+        let body = self.record_body(record);
         let existing = self.find_record_id(record, false).await?;
         let request = match &existing {
             Some(id) => self
@@ -158,7 +182,7 @@ mod tests {
 
     #[test]
     fn record_body_shape() {
-        let body = CloudflareDns::record_body(&DnsRecord {
+        let body = CloudflareDns::new("z", "t").record_body(&DnsRecord {
             kind: RecordKind::Txt,
             name: "_acme-challenge.example.com".into(),
             value: "abc".into(),
@@ -168,5 +192,32 @@ mod tests {
         assert_eq!(body["name"], "_acme-challenge.example.com");
         assert_eq!(body["content"], "abc");
         assert_eq!(body["ttl"], 60);
+        // Not proxied by default, and never a `proxied` key when off.
+        assert!(body.get("proxied").is_none());
+    }
+
+    #[test]
+    fn proxied_applies_to_address_and_cname_only() {
+        let cf = CloudflareDns::new("z", "t").with_proxied(true);
+
+        // A CNAME gets proxied + automatic TTL.
+        let cname = cf.record_body(&DnsRecord {
+            kind: RecordKind::Cname,
+            name: "docs.example.com".into(),
+            value: "app.fly.dev".into(),
+            ttl: 300,
+        });
+        assert_eq!(cname["proxied"], true);
+        assert_eq!(cname["ttl"], 1);
+
+        // A TXT is never proxied, even on a proxied instance.
+        let txt = cf.record_body(&DnsRecord {
+            kind: RecordKind::Txt,
+            name: "_acme-challenge.example.com".into(),
+            value: "abc".into(),
+            ttl: 60,
+        });
+        assert!(txt.get("proxied").is_none());
+        assert_eq!(txt["ttl"], 60);
     }
 }

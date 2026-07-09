@@ -9,7 +9,7 @@ use std::time::Duration;
 use boatramp_acme::acme::CertRequest;
 use boatramp_acme::{domain_record, preview_record, preview_wildcard, PreviewTarget};
 
-use crate::acme_dns::{build_provider, obtain_or_load, DnsProviderKind};
+use crate::acme_dns::{build_provider, build_provider_opts, obtain_or_load, DnsProviderKind};
 use crate::config::ProjectConfig;
 
 /// A failure in the `dns` subcommand.
@@ -70,6 +70,10 @@ enum DnsCommand {
         /// Record TTL (seconds).
         #[arg(long, default_value_t = 300)]
         ttl: u32,
+        /// Proxy the record through Cloudflare (orange-cloud: cache/WAF/edge TLS).
+        /// Cloudflare-only; ignored by other providers, and forces automatic TTL.
+        #[arg(long)]
+        proxied: bool,
     },
     /// Issue (or renew) the `*.deploy.<host>` wildcard certificate via ACME
     /// DNS-01, into the cert cache `boatramp serve --tls acme-dns` reads.
@@ -115,15 +119,17 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
             host,
             target,
             ttl,
+            proxied,
         } => {
-            let provider = build_provider(provider).await?;
+            let provider = build_provider_opts(provider, proxied).await?;
             let record = domain_record(&host, &parse_target(&target), ttl);
             provider.upsert(&record).await?;
             println!(
-                "pointed {} {} -> {}",
+                "pointed {} {} -> {}{}",
                 record.kind.as_str(),
                 record.name,
-                record.value
+                record.value,
+                if proxied { " (proxied)" } else { "" }
             );
         }
         DnsCommand::Cert {
