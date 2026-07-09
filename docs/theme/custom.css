@@ -3,9 +3,14 @@
 :root {
     /* Wider than mdBook's defaults (sidebar 300px / content 750px): the nav
        labels are long ("Auto-DNS & Custom Domains") and the pages are dense with
-       code blocks and reference tables that need room. */
-    --sidebar-width: 20rem;
-    --content-max-width: 60rem;
+       code blocks and reference tables that need room.
+
+       Drive the *target* width (not --sidebar-width directly) so the theme's
+       responsive `--sidebar-width: min(--sidebar-target-width, 80vw)` clamp is
+       preserved on narrow viewports. 24rem ≈ 384px, comfortably fitting the
+       longest nav labels on two lines instead of three. */
+    --sidebar-target-width: 24rem;
+    --content-max-width: 62rem;
 }
 
 /* Slightly tighter, more readable code blocks. */
