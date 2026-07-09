@@ -365,7 +365,10 @@ pub fn build_server_config(entries: Vec<(String, IssuedCert)>) -> Result<rustls:
 /// the same `entries`, sharing one SNI resolver. `IssuedCert`
 /// isn't `Clone`, so this is how the h3 listener gets the same dynamic ACME certs
 /// — and the caller swaps the quinn config on renewal exactly as the TCP path
-/// reloads.
+/// reloads. Only the HTTP/3 serve path needs the paired config, so it is gated
+/// on `http3` (matching its call sites) — without that feature a lone `acme-dns`
+/// build would see it as dead.
+#[cfg(feature = "http3")]
 pub fn build_server_configs(
     entries: Vec<(String, IssuedCert)>,
 ) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
@@ -384,6 +387,7 @@ pub fn build_server_configs(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "http3")]
     #[test]
     fn build_server_configs_sets_h3_alpn() {
         // rustls 0.23 needs a process crypto provider before building a config
