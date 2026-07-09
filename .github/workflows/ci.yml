@@ -1,10 +1,22 @@
 name: CI
 
-# Fast per-push / per-PR gate: a default-feature build (fs + SlateDB) — no wasmtime,
-# openraft, cedar, rolldown or aws-sdk to compile, so it finishes quickly. The full
-# --all-features clippy + test and the reproducible `nix flake check` run in the
-# nightly workflow (.github/workflows/nightly.yml), or on demand via its
-# workflow_dispatch. Feature-gated code is therefore covered nightly, not per-push.
+# Fast per-push / per-PR gate, split into parallel jobs so intra-day feedback is
+# quick:
+#   • quick   — instant source checks (fmt, typos, anyhow ban): no workspace
+#               compile, so a format nit or typo fails within seconds instead of
+#               behind a multi-minute clippy build.
+#   • clippy  — workspace clippy, default features.
+#   • test    — workspace tests, default features.
+#   • deny    — cargo-deny bans/licenses/sources (+ non-blocking advisories).
+# clippy and test are the two full workspace compiles; running them as separate
+# jobs lets them build concurrently on separate runners instead of one after the
+# other, roughly halving the critical path versus the old single-job pipeline.
+#
+# Default features only (fs + SlateDB) — no wasmtime/openraft/cedar/rolldown/
+# aws-sdk to build, so each job is quick. The full --all-features clippy + test
+# and the reproducible `nix flake check` run in the nightly workflow
+# (.github/workflows/nightly.yml), or on demand via its workflow_dispatch;
+# feature-gated code is therefore covered nightly, not per-push.
 on:
   push:
     branches: [main]
@@ -24,8 +36,8 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  lint-test:
-    name: lint · test (default features)
+  quick:
+    name: fmt · typos · bans
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -45,6 +57,23 @@ jobs:
             exit 1
           fi
 
+      # rustfmt only — no workspace build, so this lane stays sub-minute.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Typos
+        uses: crate-ci/typos@master
+
+  clippy:
+    name: clippy (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
       # A transitive TLS backend (aws-lc-rs) can want cmake/nasm. Both are
       # preinstalled on the runner, so skip apt (and its flaky third-party repos)
       # unless they're genuinely missing.
@@ -58,23 +87,39 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --all --check
+        with:
+          key: clippy
 
       # Default features only (fs + SlateDB). The feature-gated backends
-      # (tls / s3 / cluster / handlers / signers / …) are clippy'd + tested nightly.
+      # (tls / s3 / cluster / handlers / signers / …) are clippy'd nightly.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  test:
+    name: test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
       - name: Test
         run: cargo test --workspace
-
-      - name: Typos
-        uses: crate-ci/typos@master
 
   deny:
     name: cargo-deny
