@@ -8,7 +8,9 @@ the backend as soon as the pipeline resolves it.
 ## The order
 
 1. **Host → site.** The `Host` header selects the site (virtualhost routing),
-   with an optional default site for an unmatched host.
+   with an optional default site for an unmatched host. The full set of ways a
+   request is matched to a site is in
+   [How a request reaches your site](./addressing.md).
 2. **Transport.** HTTPS redirect and HSTS, proxy-aware through
    `X-Forwarded-Proto` from a trusted proxy.
 3. **Access control.** WAF, then IP rules, then rate limit, then basic auth — the

@@ -88,6 +88,7 @@ well. Full option list: [boatramp.cfg schema](../reference/boatramp-cfg.md).
 ## Next steps
 
 - [Bootstrap authentication & mint tokens](./auth-bootstrap.md)
+- [How a request reaches your site](../explanation/addressing.md)
 - [Attach a custom domain](./custom-domain.md)
 - [Back up & restore](./backup.md)
 - [Observe: logs, metrics, health, stats](./observe.md)

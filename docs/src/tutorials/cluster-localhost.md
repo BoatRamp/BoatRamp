@@ -86,11 +86,12 @@ Publish to node 1 and read the same content from node 3:
 
 ```sh
 boatramp sync ./site --site my-site --server https://127.0.0.1:8001
-curl https://127.0.0.1:8003/sites/my-site/
+curl https://127.0.0.1:8003/
 ```
 
-The page served from node 3 is the deployment you published to node 1 — the write
-replicated through Raft.
+`my-site` is the only site, so every node serves it at the root. The page served
+from node 3 is the deployment you published to node 1 — the write replicated
+through Raft.
 
 ## 5. Watch it survive a leader loss
 

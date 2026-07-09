@@ -281,6 +281,12 @@ pub struct ServerOptions {
     /// Site to serve for a `Host` that matches no domain, instead of `404`.
     /// `None` keeps the 404 default.
     pub default_site: Option<String>,
+    /// Resolve an unmatched `Host` to a site **without** an explicit domain
+    /// registration — by first host label (`<site>.host`), or, when exactly one
+    /// site is served, as the sole site. The effective gate (posture knob OR a
+    /// loopback bind), computed by `serve`. `false` (the default) keeps the
+    /// strict behavior: an unmatched host resolves only to `default_site` or 404.
+    pub implicit_routing: bool,
     /// Require a valid control-plane token to view a deployment **preview**
     /// (`/_deploy/<id>/…` and `<id>.deploy.<host>`) — the
     /// `previews.protect` setting. Off by default (previews are unguessable capability
@@ -338,6 +344,13 @@ struct ServedOverTls(bool);
 /// host fallback can serve it for an otherwise-unmatched `Host`.
 #[derive(Clone, Default)]
 struct DefaultSite(Option<Arc<str>>);
+
+/// Whether the host fallback may resolve an unmatched `Host` to a site without an
+/// explicit domain registration (first-label `<site>.host`, or the sole served
+/// site). Carried as an extension; the effective gate is resolved by `serve`
+/// (posture knob OR loopback bind). `false` = strict (default_site or 404 only).
+#[derive(Clone, Copy, Default)]
+struct ImplicitRouting(bool);
 
 /// Preview-access policy, carried as an extension so the preview handlers can
 /// require a token when `protect` is set.
@@ -450,6 +463,7 @@ pub fn router_with(
     // `X-Forwarded-Proto` isn't from a trusted proxy.
     let served_over_tls = ServedOverTls(options.served_over_tls);
     let default_site = DefaultSite(options.default_site.map(Arc::from));
+    let implicit_routing = ImplicitRouting(options.implicit_routing);
     let preview_policy = PreviewPolicy {
         protect: options.protect_previews,
     };
@@ -598,6 +612,9 @@ pub fn router_with(
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Explicit by-name admin/testing route. `/_sites/<name>/…` is the
+        // going-forward name; `/sites/<name>/…` is a deprecated alias (warns once).
+        .route("/_sites/*rest", any(serve_sites))
         .route("/sites/*rest", any(serve_sites))
         .route("/_deploy/*rest", get(serve_preview))
         .fallback(serve_by_host)
@@ -617,6 +634,9 @@ pub fn router_with(
         .layer(Extension(upload_guard))
         // The catch-all site for unmatched hosts; `None` → 404.
         .layer(Extension(default_site))
+        // Whether an unmatched host may resolve implicitly (first-label / sole
+        // site); gated to dev/single-tenant/loopback by `serve`.
+        .layer(Extension(implicit_routing))
         // Preview-access policy + an Auth handle the preview handlers consult
         // when previews are token-gated.
         .layer(Extension(preview_policy))
@@ -1909,9 +1929,25 @@ struct Visitor<'a> {
     limiter: &'a dyn RateLimitStore,
 }
 
-/// Serve under the explicit `/sites/<site>/...` route (admin/testing). The
-/// catch-all captures `<site>` or `<site>/<path...>`. Accepts any method so a
-/// proxy rewrite can forward non-`GET` requests.
+/// Warn (once per process) that the legacy `/sites/<name>/…` prefix was hit,
+/// pointing at the going-forward `/_sites/<name>/…` name.
+fn warn_legacy_sites_prefix_once() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "the `/sites/<name>/` serving prefix is deprecated; use \
+             `/_sites/<name>/` (an admin/testing route), or serve the site \
+             at root via host routing"
+        );
+    }
+}
+
+/// Serve under the explicit by-name admin/testing route:
+/// `/_sites/<site>/...` (the going-forward name) or the deprecated
+/// `/sites/<site>/...` alias. The catch-all captures `<site>` or
+/// `<site>/<path...>`. Accepts any method so a proxy rewrite can forward
+/// non-`GET` requests. This route is not host-routed and does not serve a
+/// root-mounted site — for that, use host routing (see the addressing docs).
 async fn serve_sites(
     State(deploy): State<DeployStore>,
     Extension(limiter): Extension<Arc<dyn RateLimitStore>>,
@@ -1920,10 +1956,14 @@ async fn serve_sites(
     request: Request,
 ) -> Response {
     let raw = request.uri().path();
-    let rest = raw
-        .strip_prefix("/sites/")
-        .unwrap_or("")
-        .trim_start_matches('/');
+    let rest = if let Some(rest) = raw.strip_prefix("/_sites/") {
+        rest.trim_start_matches('/')
+    } else {
+        warn_legacy_sites_prefix_once();
+        raw.strip_prefix("/sites/")
+            .unwrap_or("")
+            .trim_start_matches('/')
+    };
     let (site, path) = rest.split_once('/').unwrap_or((rest, ""));
     if site.is_empty() {
         return not_found();
@@ -1956,6 +1996,7 @@ async fn serve_by_host(
     Extension(limiter): Extension<Arc<dyn RateLimitStore>>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Extension(default_site): Extension<DefaultSite>,
+    Extension(implicit): Extension<ImplicitRouting>,
     Extension(preview_policy): Extension<PreviewPolicy>,
     Extension(preview_auth): Extension<Auth>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -2011,26 +2052,79 @@ async fn serve_by_host(
             )
             .await
         }
-        // Unmatched host: serve the configured catch-all site, else 404.
-        Ok(None) => match &default_site.0 {
-            Some(site) => {
-                let visitor = Visitor {
-                    peer: peer.ip(),
-                    limiter: limiter.as_ref(),
-                };
-                serve_request(
-                    &deploy,
-                    site,
-                    &request_path,
-                    request,
-                    &visitor,
-                    &handlers,
-                    true,
-                )
-                .await
+        // Unmatched host. Resolution order (each step lower priority than an
+        // explicit `domain`/`wildcard` match above):
+        //   (A) implicit first-label routing — `<site>.host` names a served site;
+        //   the configured catch-all `default_site` (explicit operator intent);
+        //   (B) implicit sole-site routing — exactly one site is served.
+        // (A)/(B) run only when `implicit` is on (dev / single-tenant / a loopback
+        // bind), so a public multi-tenant host never resolves to a site by name.
+        Ok(None) => {
+            // (A) First host label naming a served site wins over the generic
+            // catch-all: `blog.localhost` → site `blog` at root, zero DNS.
+            if implicit.0 {
+                let label = host.split('.').next().unwrap_or("");
+                if !label.is_empty() && matches!(deploy.current_id(label).await, Ok(Some(_))) {
+                    let visitor = Visitor {
+                        peer: peer.ip(),
+                        limiter: limiter.as_ref(),
+                    };
+                    return serve_request(
+                        &deploy,
+                        label,
+                        &request_path,
+                        request,
+                        &visitor,
+                        &handlers,
+                        true,
+                    )
+                    .await;
+                }
             }
-            None => not_found(),
-        },
+            match &default_site.0 {
+                Some(site) => {
+                    let visitor = Visitor {
+                        peer: peer.ip(),
+                        limiter: limiter.as_ref(),
+                    };
+                    serve_request(
+                        &deploy,
+                        site,
+                        &request_path,
+                        request,
+                        &visitor,
+                        &handlers,
+                        true,
+                    )
+                    .await
+                }
+                // (B) No explicit catch-all: implicitly serve the sole site, so a
+                // fresh single-site server answers at the bare host/root.
+                None => {
+                    if implicit.0 {
+                        if let Ok(sites) = deploy.list_sites().await {
+                            if let [only] = sites.as_slice() {
+                                let visitor = Visitor {
+                                    peer: peer.ip(),
+                                    limiter: limiter.as_ref(),
+                                };
+                                return serve_request(
+                                    &deploy,
+                                    only,
+                                    &request_path,
+                                    request,
+                                    &visitor,
+                                    &handlers,
+                                    true,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    not_found()
+                }
+            }
+        }
         Err(err) => deploy_error_response(err),
     }
 }

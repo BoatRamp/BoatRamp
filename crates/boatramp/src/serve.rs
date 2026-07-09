@@ -617,6 +617,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         .addr
         .or(serve_cfg.addr)
         .unwrap_or_else(|| "127.0.0.1:8080".parse().expect("valid default addr"));
+    // Implicit host routing (first-label `<site>.host` / sole-site at root) is a
+    // dev / single-operator convenience: enable it when the posture allows, or
+    // unconditionally on a loopback bind (only local clients reach it, so there
+    // is no host-spoofing exposure). Strict `multi-tenant` on a public bind keeps
+    // it off, so an unmatched host resolves only to `default_site` or 404.
+    options.implicit_routing = options.posture.allow_implicit_routing || addr.ip().is_loopback();
     let data_dir = args
         .data_dir
         .clone()

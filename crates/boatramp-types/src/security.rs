@@ -97,6 +97,7 @@ impl SecurityProfile {
                 domain_verify_allow_private: false,
                 allow_shared_kernel_compute: false,
                 ratelimit_fail_open: false,
+                allow_implicit_routing: false,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -109,6 +110,7 @@ impl SecurityProfile {
                 domain_verify_allow_private: true,
                 allow_shared_kernel_compute: true,
                 ratelimit_fail_open: false,
+                allow_implicit_routing: true,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -121,6 +123,7 @@ impl SecurityProfile {
                 domain_verify_allow_private: true,
                 allow_shared_kernel_compute: true,
                 ratelimit_fail_open: true,
+                allow_implicit_routing: true,
             },
         }
     }
@@ -154,6 +157,12 @@ pub struct PostureOverrides {
     pub allow_shared_kernel_compute: Option<bool>,
     /// Fail **open** (allow) instead of closed when the rate-limit KV is unreadable.
     pub ratelimit_fail_open: Option<bool>,
+    /// Serve a site at root for an unmatched `Host` **without** an explicit domain
+    /// registration — either by first host label (`<site>.localhost`) or, when
+    /// exactly one site is served, as the sole site. A dev/single-operator
+    /// convenience; off under `multi-tenant` so a public host can never
+    /// implicitly resolve to a site. A loopback bind enables it regardless.
+    pub allow_implicit_routing: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -250,6 +259,11 @@ impl SecurityConfig {
             p.ratelimit_fail_open.to_string(),
             o.ratelimit_fail_open.is_some(),
         );
+        row(
+            "allow_implicit_routing",
+            p.allow_implicit_routing.to_string(),
+            o.allow_implicit_routing.is_some(),
+        );
         Ok(out)
     }
 }
@@ -280,6 +294,10 @@ pub struct SecurityPosture {
     pub allow_shared_kernel_compute: bool,
     /// Fail open instead of closed on rate-limit KV errors.
     pub ratelimit_fail_open: bool,
+    /// Resolve an unmatched `Host` to a site without an explicit domain
+    /// registration (first-label `<site>.host` or the sole served site). Off
+    /// under `multi-tenant`; a loopback bind enables it regardless.
+    pub allow_implicit_routing: bool,
 }
 
 impl Default for SecurityPosture {
@@ -320,6 +338,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.ratelimit_fail_open {
         base.ratelimit_fail_open = v;
     }
+    if let Some(v) = o.allow_implicit_routing {
+        base.allow_implicit_routing = v;
+    }
     base
 }
 
@@ -347,6 +368,7 @@ mod tests {
         assert!(!p.domain_verify_allow_private);
         assert!(!p.allow_shared_kernel_compute);
         assert!(!p.ratelimit_fail_open);
+        assert!(!p.allow_implicit_routing);
         assert_eq!(p.max_upload_bytes, MT_MAX_UPLOAD);
     }
 
@@ -367,6 +389,7 @@ mod tests {
         assert!(!p.oidc_require_audience);
         assert_eq!(p.max_upload_bytes, 0); // unlimited
         assert!(p.ratelimit_fail_open);
+        assert!(p.allow_implicit_routing);
     }
 
     #[test]

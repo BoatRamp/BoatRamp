@@ -1,10 +1,10 @@
 # Attach a custom domain
 
-A site always answers on `/sites/<name>/…`. To serve it on a hostname of your
-own — `app.example.com` — you attach that host to the site. boatramp routes a
-host only after you prove you control it, so attaching is a two-step task: start
-verification, then verify. For how hosts are matched and resolved, see
-[Core concepts](../explanation/concepts.md).
+To serve a site on a hostname of your own — `app.example.com` — you attach that
+host to the site, and it answers at that host's root. boatramp routes a host only
+after you prove you control it, so attaching is a two-step task: start
+verification, then verify. For every way a request is matched to a site, see
+[How a request reaches your site](../explanation/addressing.md).
 
 ## Before you start
 
