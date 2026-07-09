@@ -50,6 +50,7 @@ acme-dns = [
   "boatramp-acme/cloudflare",
   "boatramp-acme/route53",
   "boatramp-acme/oci",
+  "boatramp-acme/digitalocean",
 ]
 # Embedded, in-process Rust bundler for the `bundle` subcommand: Rolldown for
 # JS/TS (tree-shake + minify) and lightningcss for CSS (`@import` inline +

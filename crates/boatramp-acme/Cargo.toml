@@ -17,6 +17,7 @@ acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio", "dep:thiserror"]
 cloudflare = ["dep:reqwest", "dep:serde_json"]
 route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
 oci = ["dep:reqwest", "dep:serde_json", "dep:rsa"]
+digitalocean = ["dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 async-trait.workspace = true

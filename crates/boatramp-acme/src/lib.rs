@@ -26,6 +26,9 @@ pub mod route53;
 #[cfg(feature = "oci")]
 pub mod oci;
 
+#[cfg(feature = "digitalocean")]
+pub mod digitalocean;
+
 pub use dns::{
     acme_challenge_name, dns01_txt_value, preview_record, preview_wildcard, DnsError, DnsOp,
     DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,

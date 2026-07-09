@@ -66,6 +66,9 @@ pub enum DnsProviderKind {
     /// Oracle Cloud (`OCI_REGION`, `OCI_ZONE`, `OCI_KEY_ID`,
     /// `OCI_PRIVATE_KEY_FILE`).
     Oci,
+    /// DigitalOcean (`DIGITALOCEAN_DOMAIN`, `DIGITALOCEAN_TOKEN`).
+    #[value(name = "digitalocean", alias = "do")]
+    DigitalOcean,
 }
 
 fn env(var: &str) -> Result<String> {
@@ -95,6 +98,12 @@ pub async fn build_provider(kind: DnsProviderKind) -> Result<Box<dyn DnsProvider
                 )
                 .map_err(|e| Error::Oci(e.to_string()))?,
             )
+        }
+        DnsProviderKind::DigitalOcean => {
+            Box::new(boatramp_acme::digitalocean::DigitalOceanDns::new(
+                env("DIGITALOCEAN_DOMAIN")?,
+                env("DIGITALOCEAN_TOKEN")?,
+            ))
         }
     })
 }
