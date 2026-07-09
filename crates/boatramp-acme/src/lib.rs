@@ -29,6 +29,15 @@ pub mod oci;
 #[cfg(feature = "digitalocean")]
 pub mod digitalocean;
 
+#[cfg(feature = "hetzner")]
+pub mod hetzner;
+
+#[cfg(feature = "ns1")]
+pub mod ns1;
+
+#[cfg(feature = "dnsimple")]
+pub mod dnsimple;
+
 pub use dns::{
     acme_challenge_name, dns01_txt_value, preview_record, preview_wildcard, DnsError, DnsOp,
     DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,

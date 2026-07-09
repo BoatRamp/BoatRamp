@@ -18,6 +18,9 @@ cloudflare = ["dep:reqwest", "dep:serde_json"]
 route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
 oci = ["dep:reqwest", "dep:serde_json", "dep:rsa"]
 digitalocean = ["dep:reqwest", "dep:serde_json"]
+hetzner = ["dep:reqwest", "dep:serde_json"]
+ns1 = ["dep:reqwest", "dep:serde_json"]
+dnsimple = ["dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 async-trait.workspace = true

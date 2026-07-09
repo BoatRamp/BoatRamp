@@ -69,6 +69,12 @@ pub enum DnsProviderKind {
     /// DigitalOcean (`DIGITALOCEAN_DOMAIN`, `DIGITALOCEAN_TOKEN`).
     #[value(name = "digitalocean", alias = "do")]
     DigitalOcean,
+    /// Hetzner DNS (`HETZNER_ZONE_ID`, `HETZNER_ZONE`, `HETZNER_DNS_TOKEN`).
+    Hetzner,
+    /// NS1 / IBM (`NS1_ZONE`, `NS1_API_KEY`).
+    Ns1,
+    /// DNSimple (`DNSIMPLE_ACCOUNT_ID`, `DNSIMPLE_ZONE`, `DNSIMPLE_TOKEN`).
+    Dnsimple,
 }
 
 fn env(var: &str) -> Result<String> {
@@ -105,6 +111,20 @@ pub async fn build_provider(kind: DnsProviderKind) -> Result<Box<dyn DnsProvider
                 env("DIGITALOCEAN_TOKEN")?,
             ))
         }
+        DnsProviderKind::Hetzner => Box::new(boatramp_acme::hetzner::HetznerDns::new(
+            env("HETZNER_ZONE_ID")?,
+            env("HETZNER_ZONE")?,
+            env("HETZNER_DNS_TOKEN")?,
+        )),
+        DnsProviderKind::Ns1 => Box::new(boatramp_acme::ns1::Ns1Dns::new(
+            env("NS1_ZONE")?,
+            env("NS1_API_KEY")?,
+        )),
+        DnsProviderKind::Dnsimple => Box::new(boatramp_acme::dnsimple::DnsimpleDns::new(
+            env("DNSIMPLE_ACCOUNT_ID")?,
+            env("DNSIMPLE_ZONE")?,
+            env("DNSIMPLE_TOKEN")?,
+        )),
     })
 }
 
