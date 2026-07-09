@@ -2064,9 +2064,7 @@ async fn serve_by_host(
             // catch-all: `blog.localhost` → site `blog` at root, zero DNS.
             if implicit.0 {
                 let label = host.split('.').next().unwrap_or("");
-                if !label.is_empty()
-                    && matches!(deploy.current_id(label).await, Ok(Some(_)))
-                {
+                if !label.is_empty() && matches!(deploy.current_id(label).await, Ok(Some(_))) {
                     let visitor = Visitor {
                         peer: peer.ip(),
                         limiter: limiter.as_ref(),

@@ -3689,7 +3689,10 @@ async fn explicit_domain_beats_implicit_first_label() {
     );
     let (status, body) = get_host(app, "blog.example.com").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"<h1>home</h1>", "explicit domain wins over the label");
+    assert_eq!(
+        body, b"<h1>home</h1>",
+        "explicit domain wins over the label"
+    );
 }
 
 // ---- configurable WAF ------------------------------------------------------
