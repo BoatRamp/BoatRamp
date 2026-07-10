@@ -52,9 +52,10 @@ jobs:
             | sha256sum -c -
 
       - name: Verify ES256 signature under the strict production bar
-        env:
-          BOATRAMP_RELEASE_KERNEL: rel/boatramp-vmlinux-x86_64
         run: |
+          # cargo runs the test with CWD = the package dir, so the kernel path
+          # must be absolute (realpath), not relative to the repo root.
+          export BOATRAMP_RELEASE_KERNEL="$(realpath rel/boatramp-vmlinux-x86_64)"
           export BOATRAMP_RELEASE_SHA256="$(cat rel/boatramp-vmlinux-x86_64.sha256)"
           export BOATRAMP_RELEASE_SIG="$(cat rel/boatramp-vmlinux-x86_64.sig)"
           cargo test -p boatramp-core --features authz \
