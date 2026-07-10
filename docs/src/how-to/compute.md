@@ -15,20 +15,31 @@ Enable compute by adding a `compute:` section to `boatramp.cfg` (see the
 ## Provision a kernel
 
 Every workload boots in a microVM, which needs a **kernel** as well as a root
-filesystem. `--kernel` takes the content-addressed **blob hash of an uncompressed
-Linux kernel (`vmlinux`)**; the server fetches that blob and boots it. You supply
-a Firecracker-compatible `vmlinux` — build one, or use a released microVM kernel —
-and provision it once, shared across every workload:
+filesystem. Supply a Firecracker-compatible uncompressed Linux kernel (`vmlinux`)
+— build one, or use a released microVM kernel — provisioned once and shared across
+every workload.
+
+`--kernel` (like `--rootfs`) accepts any of three forms: a **local file**, a
+**URL**, or a **blob hash** already in the store. Point it straight at a file or
+URL and the CLI uploads it for you:
 
 ```sh
-# Upload the kernel as a content-addressed blob; the hash is its key.
-hash=$(sha256sum vmlinux | cut -d' ' -f1)
-curl -f -H "Authorization: Bearer $BOATRAMP_TOKEN" \
-  --data-binary @vmlinux "$BOATRAMP_SERVER/api/blobs/$hash"
-echo "kernel blob: $hash"    # pass this to --kernel
+boatramp compute build web --image nginx:1.27 --kernel ./vmlinux --port 80
+# or a URL:
+boatramp compute build web --image nginx:1.27 \
+  --kernel https://example.com/vmlinux-6.1 --port 80
 ```
 
-Then reference `$hash` as `--kernel` below.
+To upload a kernel once and reuse its hash across commands, use
+[`blob put`](../reference/cli.md#boatramp-blob):
+
+```sh
+boatramp blob put ./vmlinux
+```
+
+```text
+1a2b3c4d…    # the content-address; pass it as --kernel 1a2b3c4d…
+```
 
 ## Deploy a container image
 

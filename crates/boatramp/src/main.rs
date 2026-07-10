@@ -28,6 +28,7 @@ mod access;
 mod acme_dns;
 mod alias;
 mod authcmd;
+mod blob;
 mod build;
 mod bundle;
 mod client;
@@ -106,6 +107,8 @@ enum Command {
     Gateway(gateway::GatewayArgs),
     /// Manage Firecracker microVM compute workloads.
     Compute(compute::ComputeArgs),
+    /// Upload a file as a content-addressed blob (e.g. a microVM kernel).
+    Blob(blob::BlobArgs),
     /// Configure DNS + issue wildcard preview certs (requires `--features acme-dns`).
     #[cfg(feature = "acme-dns")]
     Dns(dns::DnsArgs),
@@ -311,6 +314,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Auth(args) => authcmd::run(args, &config).await?,
         Command::Gateway(args) => gateway::run(args, &config).await?,
         Command::Compute(args) => compute::run(args, &config).await?,
+        Command::Blob(args) => blob::run(args, &config).await?,
         #[cfg(feature = "acme-dns")]
         Command::Dns(args) => dns::run(args, &config).await?,
         Command::Logs(args) => logs::run(args, &config).await?,

@@ -60,6 +60,9 @@ pub enum CliError {
     /// The `compute` command.
     #[error(transparent)]
     Compute(#[from] crate::compute::Error),
+    /// The `blob` command.
+    #[error(transparent)]
+    Blob(#[from] crate::blob::Error),
     /// The `logs` / `stats` commands.
     #[error(transparent)]
     Logs(#[from] crate::logs::Error),
