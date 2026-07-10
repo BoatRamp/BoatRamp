@@ -40,6 +40,7 @@ mod cluster_tls;
 mod completions;
 mod compute;
 mod config;
+mod config_cmd;
 mod dlq;
 #[cfg(feature = "acme-dns")]
 mod dns;
@@ -109,6 +110,8 @@ enum Command {
     Compute(compute::ComputeArgs),
     /// Upload a file as a content-addressed blob (e.g. a microVM kernel).
     Blob(blob::BlobArgs),
+    /// Read/change the dynamic daemon config (get/set/rollback/apply, no restart).
+    Config(config_cmd::ConfigArgs),
     /// Configure DNS + issue wildcard preview certs (requires `--features acme-dns`).
     #[cfg(feature = "acme-dns")]
     Dns(dns::DnsArgs),
@@ -315,6 +318,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Gateway(args) => gateway::run(args, &config).await?,
         Command::Compute(args) => compute::run(args, &config).await?,
         Command::Blob(args) => blob::run(args, &config).await?,
+        Command::Config(args) => config_cmd::run(args, &config).await?,
         #[cfg(feature = "acme-dns")]
         Command::Dns(args) => dns::run(args, &config).await?,
         Command::Logs(args) => logs::run(args, &config).await?,

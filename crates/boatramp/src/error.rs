@@ -63,6 +63,9 @@ pub enum CliError {
     /// The `blob` command.
     #[error(transparent)]
     Blob(#[from] crate::blob::Error),
+    /// The `config` command.
+    #[error(transparent)]
+    ConfigCmd(#[from] crate::config_cmd::Error),
     /// The `logs` / `stats` commands.
     #[error(transparent)]
     Logs(#[from] crate::logs::Error),
