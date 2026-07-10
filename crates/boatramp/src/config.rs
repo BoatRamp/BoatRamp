@@ -194,6 +194,15 @@ pub struct ComputeConfig {
     pub kernel_allowed_hashes: Vec<String>,
 }
 
+/// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
+/// half lives as the `KERNEL_SIGNING_KEY` Actions secret in
+/// [`BoatRamp/boatramp-vmlinux`](https://github.com/BoatRamp/boatramp-vmlinux).
+/// Shipped as a default trust anchor so the first-party signed `boatramp-vmlinux`
+/// verifies out of the box under the strict posture. An operator can replace
+/// `kernel_signing_pubkeys` to trust only their own keys.
+pub const BOATRAMP_KERNEL_SIGNING_PUBKEY: &str =
+    "es256:02c4e4af2e9cba6ba6745c513f193622e6674a8b2d0187ebea5612f5b46a7eade4";
+
 impl Default for ComputeConfig {
     fn default() -> Self {
         Self {
@@ -201,7 +210,9 @@ impl Default for ComputeConfig {
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,
             mem_mib: 0,
-            kernel_signing_pubkeys: Vec::new(),
+            kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
+            // The allow-listed hash + default kernel URL are baked once the first
+            // signed `boatramp-vmlinux` release exists (its content hash).
             kernel_allowed_hashes: Vec::new(),
         }
     }
