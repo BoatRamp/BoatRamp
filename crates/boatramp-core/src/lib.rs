@@ -38,7 +38,8 @@ pub mod sql;
 // `boatramp_core::config`/`::route`/`::matcher`/`::domain_verify`/… paths are
 // unchanged. (`compute` is its own module above — it re-exports the types layer.)
 pub use boatramp_types::{
-    access, authz, config, cron, dns_managed, domain_verify, gateway, matcher, route, security, waf,
+    access, authz, config, cron, daemon_config, dns_managed, domain_verify, gateway, matcher,
+    route, security, waf,
 };
 pub use boatramp_types::{schema_version, SCHEMA_VERSION};
 
