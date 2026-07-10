@@ -266,7 +266,8 @@ impl std::fmt::Debug for PostureKernelVerifier {
 
 #[cfg(target_os = "linux")]
 impl boatramp_firecracker::KernelVerifier for PostureKernelVerifier {
-    fn verify(&self, bytes: &[u8], expected_hash: &str) -> Result<(), String> {
+    // Fully-qualified: this module aliases `Result<T>` to its own error type.
+    fn verify(&self, bytes: &[u8], expected_hash: &str) -> std::result::Result<(), String> {
         // The only signature we trust for this hash is the one on the current
         // fleet default kernel (the operator-vetted kernel); any other hash has no
         // signature source and fails the strict bar.
