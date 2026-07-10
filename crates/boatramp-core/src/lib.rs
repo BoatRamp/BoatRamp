@@ -29,6 +29,9 @@ pub mod deploy;
 pub mod error;
 /// Per-node guest-IP pool shared by the VMM (tap) + container (veth) backends.
 pub mod ipam;
+/// Posture-scaled kernel-trust verification (needs the `authz` signing primitives).
+#[cfg(feature = "authz")]
+pub mod kernel_trust;
 pub mod kv;
 pub mod messaging;
 pub mod mode;

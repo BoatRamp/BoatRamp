@@ -390,8 +390,10 @@ impl TokenPublicKey {
     }
 
     /// Verify a raw signature over `tbs`. Anti-malleability: ES256 uses the fixed
-    /// `r‖s` form, Ed25519 uses `verify_strict`.
-    fn verify(&self, tbs: &[u8], sig: &[u8]) -> Result<(), TokenError> {
+    /// `r‖s` form, Ed25519 uses `verify_strict`. Public so other subsystems (e.g.
+    /// the kernel-trust check) can verify a detached signature with the same
+    /// pinned-algorithm primitives.
+    pub fn verify(&self, tbs: &[u8], sig: &[u8]) -> Result<(), TokenError> {
         match self {
             TokenPublicKey::Es256(vk) => {
                 use p256::ecdsa::signature::Verifier as _;
