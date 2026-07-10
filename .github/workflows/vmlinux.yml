@@ -61,7 +61,9 @@ jobs:
         # a future feature-graph slip can't silently regress to a vacuous green.
         run: |
           set -o pipefail
-          sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$BOATRAMP_TEST_KERNEL" \
+          # timeout-bounded: a failed live test can leak a VM subprocess whose
+          # cleanup hangs; cap it so the step fails fast instead of running ~40min.
+          timeout -k 30 900 sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$BOATRAMP_TEST_KERNEL" \
             cargo test -p boatramp-firecracker --features build,backend,embedded \
             --test embedded_backend_live -- --ignored --nocapture 2>&1 | tee boot-test.log
           if ! grep -qE 'running [1-9][0-9]* tests?' boot-test.log; then
