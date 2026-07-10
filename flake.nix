@@ -241,13 +241,20 @@
                   hash = "sha256-OR2NSY+J5Ws5G+XqSnUB68RObQlDMeyqve/tHaayipY=";
                 };
                 # `linuxManualConfig` uses the Firecracker config as the kernel's
-                # `.config` verbatim (reconciled against the vanilla 6.1 tree via the
-                # kernel's own oldconfig); no modules/debug_info ⇒ a small vmlinux.
-                micro = pkgs.linuxManualConfig {
+                # `.config` verbatim; no modules/debug_info ⇒ a small vmlinux.
+                # nixpkgs only keeps `vmlinux` (in a `dev` output) for MODULAR
+                # kernels; this one has CONFIG_MODULES off, so copy the uncompressed
+                # ELF into $out ourselves (fixupPhase then strips it — still
+                # Elf::load-able). `$buildRoot` is the exported out-of-tree build dir.
+                micro = (pkgs.linuxManualConfig {
                   inherit (pkgs.linux_6_1) version src;
                   configfile = fcConfig;
                   allowImportFromDerivation = true;
-                };
+                }).overrideAttrs (old: {
+                  postInstall = (old.postInstall or "") + ''
+                    cp "$buildRoot/vmlinux" "$out/vmlinux"
+                  '';
+                });
               in
               # `micro.dev or micro`: linuxManualConfig may not expose a `dev`
               # output, so fall back to the default output and locate the vmlinux
