@@ -132,6 +132,41 @@ mod tests {
         );
     }
 
+    /// Release gate: verify a **shipped** kernel artifact clears the strict
+    /// production bar (content-hash pin + allow-list + ES256/Ed25519 signature).
+    /// Env-driven + `#[ignore]`d so it runs only in the release-boot workflow,
+    /// which points it at the downloaded `boatramp-vmlinux-<arch>` + its `.sig` +
+    /// the built-in signing pubkey:
+    /// `BOATRAMP_RELEASE_KERNEL` (path), `BOATRAMP_RELEASE_SHA256`,
+    /// `BOATRAMP_RELEASE_SIG` (hex), `BOATRAMP_RELEASE_PUBKEY` (`<alg>:<hex>`).
+    #[test]
+    #[ignore = "verifies a downloaded release kernel; needs BOATRAMP_RELEASE_* env"]
+    fn released_kernel_verifies_under_strict() {
+        let (Ok(path), Ok(sha256), Ok(sig), Ok(pubkey)) = (
+            std::env::var("BOATRAMP_RELEASE_KERNEL"),
+            std::env::var("BOATRAMP_RELEASE_SHA256"),
+            std::env::var("BOATRAMP_RELEASE_SIG"),
+            std::env::var("BOATRAMP_RELEASE_PUBKEY"),
+        ) else {
+            eprintln!("SKIP: set BOATRAMP_RELEASE_{{KERNEL,SHA256,SIG,PUBKEY}}");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read release kernel");
+        let kref = KernelRef {
+            source: "release".into(),
+            sha256: sha256.trim().to_string(),
+            sig: Some(sig.trim().to_string()),
+        };
+        verify_kernel(
+            &bytes,
+            &kref,
+            true,
+            &[pubkey.trim().to_string()],
+            &[sha256.trim().to_string()],
+        )
+        .expect("release kernel must clear the strict verify-before-boot bar");
+    }
+
     #[tokio::test]
     async fn strict_accepts_valid_signature_rejects_wrong_key() {
         let bytes = b"a microvm vmlinux";

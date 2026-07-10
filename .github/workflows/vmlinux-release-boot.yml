@@ -1,0 +1,76 @@
+name: microVM release kernel — verify & boot
+
+# The release-artifact re-boot gate: download a PUBLISHED boatramp-vmlinux release,
+# verify its content hash + ES256 signature against the built-in signing key
+# (the exact production verify-before-boot bar), then actually boot it on KVM.
+# This validates the *shipped* kernel end-to-end — distinct from vmlinux.yml, which
+# builds + boots a kernel from source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "boatramp-vmlinux release tag to gate"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: read
+
+env:
+  # The built-in BOATRAMP_KERNEL_SIGNING_PUBKEY (crates/boatramp/src/config.rs).
+  # The release must verify against this exact key or the gate fails.
+  BOATRAMP_RELEASE_PUBKEY: "es256:02c4e4af2e9cba6ba6745c513f193622e6674a8b2d0187ebea5612f5b46a7eade4"
+
+jobs:
+  verify-and-boot:
+    name: verify + boot the released kernel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Confirm KVM is available
+        run: test -e /dev/kvm && ls -l /dev/kvm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Download the released kernel + .sha256 + .sig
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R BoatRamp/boatramp-vmlinux \
+            -p 'boatramp-vmlinux-x86_64' \
+            -p 'boatramp-vmlinux-x86_64.sha256' \
+            -p 'boatramp-vmlinux-x86_64.sig' \
+            -D rel --clobber
+          ls -l rel/
+
+      - name: Verify content hash (verify-before-boot, always)
+        run: |
+          cd rel
+          printf '%s  boatramp-vmlinux-x86_64\n' "$(cat boatramp-vmlinux-x86_64.sha256)" \
+            | sha256sum -c -
+
+      - name: Verify ES256 signature under the strict production bar
+        env:
+          BOATRAMP_RELEASE_KERNEL: rel/boatramp-vmlinux-x86_64
+        run: |
+          export BOATRAMP_RELEASE_SHA256="$(cat rel/boatramp-vmlinux-x86_64.sha256)"
+          export BOATRAMP_RELEASE_SIG="$(cat rel/boatramp-vmlinux-x86_64.sig)"
+          cargo test -p boatramp-core --features authz \
+            kernel_trust::tests::released_kernel_verifies_under_strict -- --ignored --nocapture
+
+      - name: Host build deps (mke2fs for the scratch rootfs)
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Boot a microVM from the RELEASED kernel (scratch-image live test)
+        run: |
+          set -o pipefail
+          KERNEL="$(realpath rel/boatramp-vmlinux-x86_64)"
+          sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$KERNEL" \
+            cargo test -p boatramp-firecracker --features build,backend,embedded \
+            --test embedded_backend_live -- --ignored --nocapture 2>&1 | tee boot.log
+          if ! grep -qE 'running [1-9][0-9]* tests?' boot.log; then
+            echo "::error::release boot ran 0 tests — embedded backend cfg'd out" >&2
+            exit 1
+          fi
