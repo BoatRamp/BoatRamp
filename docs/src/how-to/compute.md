@@ -12,6 +12,24 @@ backend where the host allows it, and a microVM backend where `/dev/kvm` exists.
 Enable compute by adding a `compute:` section to `boatramp.cfg` (see the
 [schema](../reference/boatramp-cfg.md#compute)).
 
+## Provision a kernel
+
+Every workload boots in a microVM, which needs a **kernel** as well as a root
+filesystem. `--kernel` takes the content-addressed **blob hash of an uncompressed
+Linux kernel (`vmlinux`)**; the server fetches that blob and boots it. You supply
+a Firecracker-compatible `vmlinux` — build one, or use a released microVM kernel —
+and provision it once, shared across every workload:
+
+```sh
+# Upload the kernel as a content-addressed blob; the hash is its key.
+hash=$(sha256sum vmlinux | cut -d' ' -f1)
+curl -f -H "Authorization: Bearer $BOATRAMP_TOKEN" \
+  --data-binary @vmlinux "$BOATRAMP_SERVER/api/blobs/$hash"
+echo "kernel blob: $hash"    # pass this to --kernel
+```
+
+Then reference `$hash` as `--kernel` below.
+
 ## Deploy a container image
 
 `compute build` takes an OCI image reference, builds an ext4 root filesystem from
