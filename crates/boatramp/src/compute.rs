@@ -1,8 +1,8 @@
 //! The `compute` subcommand: define/list/remove Firecracker microVM workloads.
 //! The control plane is uniform (runs anywhere); only execution
-//! needs a KVM node. `set` references rootfs/kernel **blob hashes** already in
-//! the store (upload them like any blob); building an `ext4` rootfs from an OCI
-//! image is done by `compute build`.
+//! needs a KVM node. `set` takes a rootfs + kernel as a **blob hash, a local
+//! file, or a URL** (a file/URL is uploaded for you, like `blob put`); building
+//! an `ext4` rootfs from an OCI image is done by `compute build`.
 
 use std::collections::BTreeMap;
 
@@ -61,14 +61,14 @@ enum ComputeCommand {
         /// Workload name.
         name: String,
     },
-    /// Create or update a workload from already-pushed rootfs/kernel blobs.
+    /// Create or update a workload from a rootfs + kernel (blob hash, file, or URL).
     Set {
         /// Workload name.
         name: String,
-        /// Blob hash of the ext4 rootfs image.
+        /// ext4 rootfs image: a blob hash, a local file, or a URL (file/URL is uploaded).
         #[arg(long)]
         rootfs: String,
-        /// Blob hash of the vmlinux kernel.
+        /// vmlinux kernel: a blob hash, a local file, or a URL (file/URL is uploaded).
         #[arg(long)]
         kernel: String,
         /// Virtual CPUs.
@@ -111,7 +111,7 @@ enum ComputeCommand {
         /// OCI image reference, e.g. `nginx:1.27` or `ghcr.io/owner/app:tag`.
         #[arg(long)]
         image: String,
-        /// Blob hash of the vmlinux kernel (provision it once, shared).
+        /// vmlinux kernel: a blob hash, a local file, or a URL (provision once, shared).
         #[arg(long)]
         kernel: String,
         /// Size of the ext4 rootfs image (MiB).
@@ -249,6 +249,9 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             isolation,
             regions,
         } => {
+            // `--rootfs` / `--kernel` accept a blob hash, a local file, or a URL.
+            let rootfs = client::resolve_artifact(&http, &server, &rootfs).await?;
+            let kernel = client::resolve_artifact(&http, &server, &kernel).await?;
             let spec = build_spec(
                 rootfs,
                 kernel,
@@ -305,9 +308,10 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             )
             .await
             .map_err(|e| Error::RootfsBuild(e.to_string()))?;
-            // Hash + upload it as a content-addressed blob (streamed).
-            let rootfs = hash_file(&out).await?;
-            upload_blob(&http, &server, &rootfs, &out).await?;
+            // `--kernel` accepts a blob hash, a local file, or a URL.
+            let kernel = client::resolve_artifact(&http, &server, &kernel).await?;
+            // Hash + upload the freshly built rootfs as a content-addressed blob.
+            let rootfs = client::put_file_blob(&http, &server, &out).await?;
             let _ = std::fs::remove_file(&out);
             eprintln!("rootfs blob {rootfs} uploaded");
             let spec = build_spec(
@@ -401,38 +405,4 @@ async fn put_workload(
         .json()
         .await?;
     Ok(resp["spec"].as_str().unwrap_or("").to_string())
-}
-
-/// Stream-hash a file to its `sha256` hex (the blob's content-address).
-async fn hash_file(path: &std::path::Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).
-async fn upload_blob(
-    http: &reqwest::Client,
-    server: &str,
-    hash: &str,
-    path: &std::path::Path,
-) -> Result<()> {
-    let file = tokio::fs::File::open(path).await?;
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-    http.put(format!("{server}/api/blobs/{hash}"))
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
 }

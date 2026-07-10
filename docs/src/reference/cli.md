@@ -48,6 +48,7 @@ flags unique to each command:
 | [`auth`](#boatramp-auth) | Generate/inspect the root key; edit the RBAC policy. |
 | [`gateway`](#boatramp-gateway) | Publish a private service through the reverse-proxy gateway. |
 | [`compute`](#boatramp-compute) | Manage microVM compute workloads. |
+| [`blob`](#boatramp-blob) | Upload a file as a content-addressed blob. |
 | [`dns`](#boatramp-dns) | Configure DNS and issue wildcard preview certs (`acme-dns` feature). |
 | [`logs`](#boatramp-logs) | Tail a site's captured guest stdout/stderr. |
 | [`stats`](#boatramp-stats) | Show handler stats, consumer lag, and dead letters. |
@@ -323,9 +324,9 @@ Manage Firecracker microVM compute workloads. See
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rootfs <blob-hash>` | — | Blob hash of the ext4 rootfs image (`set` only). Required. |
+| `--rootfs <hash\|file\|url>` | — | The ext4 rootfs image (`set` only). A blob hash, a local file, or a URL (file/URL is uploaded for you). Required. |
 | `--image <ref>` | — | OCI image to build a rootfs from (`build` only). Required. |
-| `--kernel <blob-hash>` | — | Blob hash of the vmlinux kernel the microVM boots. Required. See [the kernel note](#the-kernel-blob). |
+| `--kernel <hash\|file\|url>` | — | The vmlinux kernel the microVM boots — a blob hash, a local file, or a URL. Required. See [the kernel note](#the-kernel-blob). |
 | `--size-mib <n>` | `1024` | ext4 rootfs image size (`build` only). |
 | `--port <n>` | — | In-guest TCP port the app listens on. Required. |
 | `--vcpus <n>` | `1` | Virtual CPUs. |
@@ -340,12 +341,22 @@ Manage Firecracker microVM compute workloads. See
 
 ### The kernel blob
 
-`--kernel` takes the **content-addressed blob hash of an uncompressed Linux
-kernel (`vmlinux`)** that the microVM boots — Firecracker and the embedded VMM
-boot a kernel plus an ext4 rootfs. The server fetches that blob from the store and
-boots it. You supply a Firecracker-compatible `vmlinux` (build one, or use a
-released microVM kernel) and provision it once, shared across workloads. See
-[Run a container or microVM](../how-to/compute.md) for provisioning.
+A microVM boots an **uncompressed Linux kernel (`vmlinux`)** plus an ext4 rootfs.
+`--kernel` accepts a local file, a URL, or the content-addressed **blob hash** of
+a kernel already uploaded; a file or URL is uploaded for you, and the server
+fetches the blob and boots it. Supply a Firecracker-compatible `vmlinux` (build
+one, or use a released microVM kernel) and provision it once, shared across
+workloads. See [Run a container or microVM](../how-to/compute.md).
+
+## `boatramp blob`
+
+Upload a file as a content-addressed blob — the general way to provision an
+artifact (a microVM kernel, a prebuilt rootfs) that another command references by
+hash.
+
+| Sub-action | Description |
+| --- | --- |
+| `put <file>` | Upload a file as a blob; prints its hash (the key to pass to `compute set --kernel/--rootfs`). |
 
 ## `boatramp dns`
 

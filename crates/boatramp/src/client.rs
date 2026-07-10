@@ -21,6 +21,9 @@ pub enum ClientError {
     /// An HTTP request to the control plane failed.
     #[error("control-plane request: {0}")]
     Http(#[from] reqwest::Error),
+    /// Reading a local artifact (kernel/rootfs/blob) file failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// `client` module result: a control-plane API call; `Err` is [`ClientError`].
@@ -376,4 +379,139 @@ pub async fn operate_dlq(
         .json()
         .await?;
     Ok(resp.affected)
+}
+
+// ---- content-addressed blobs (kernels, rootfs images, …) -------------------
+
+/// Whether `s` is a bare content-address: a 64-char lowercase hex SHA-256, as
+/// printed by [`hash_file`] / `blob put`. Distinguishes an existing blob hash
+/// from a file path or URL in an artifact reference.
+pub fn is_blob_hash(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Stream-hash a file to its `sha256` hex (the blob's content-address).
+pub async fn hash_file(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).
+/// Idempotent: re-uploading an existing blob is a no-op server-side.
+pub async fn upload_blob(
+    http: &reqwest::Client,
+    server: &str,
+    hash: &str,
+    path: &std::path::Path,
+) -> Result<()> {
+    let file = tokio::fs::File::open(path).await?;
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    http.put(format!("{server}/api/blobs/{hash}"))
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// Hash a local file and upload it as a blob; returns its content-address.
+pub async fn put_file_blob(
+    http: &reqwest::Client,
+    server: &str,
+    path: &std::path::Path,
+) -> Result<String> {
+    let hash = hash_file(path).await?;
+    upload_blob(http, server, &hash, path).await?;
+    Ok(hash)
+}
+
+/// Resolve an **artifact reference** — a `--kernel` / `--rootfs` value — to a blob
+/// hash the server can stage. Accepts three forms:
+/// - a 64-hex content-address ⇒ used as-is (assumed already uploaded);
+/// - an `http(s)://` URL ⇒ downloaded to a temp file, then hashed + uploaded;
+/// - anything else ⇒ a local file path, hashed + uploaded.
+pub async fn resolve_artifact(http: &reqwest::Client, server: &str, value: &str) -> Result<String> {
+    if is_blob_hash(value) {
+        return Ok(value.to_string());
+    }
+    if value.starts_with("http://") || value.starts_with("https://") {
+        use tokio::io::AsyncWriteExt;
+        // Stream the URL to a temp file, then hash + upload it like a local file.
+        let mut resp = http.get(value).send().await?.error_for_status()?;
+        let tmp = std::env::temp_dir().join(format!("boatramp-artifact-{}", sanitize(value)));
+        let mut out = tokio::fs::File::create(&tmp).await?;
+        while let Some(chunk) = resp.chunk().await? {
+            out.write_all(&chunk).await?;
+        }
+        out.flush().await?;
+        drop(out);
+        let hash = put_file_blob(http, server, &tmp).await?;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Ok(hash);
+    }
+    put_file_blob(http, server, std::path::Path::new(value)).await
+}
+
+/// A filesystem-safe temp-name fragment derived from a URL (last path segment).
+fn sanitize(url: &str) -> String {
+    url.rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("download")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_hash_detection_is_exact() {
+        let hash = "a".repeat(64);
+        assert!(is_blob_hash(&hash), "64 lowercase hex is a blob hash");
+        assert!(is_blob_hash(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        // Not hashes: wrong length, uppercase, path, URL, non-hex.
+        assert!(!is_blob_hash(&"a".repeat(63)));
+        assert!(!is_blob_hash(&"a".repeat(65)));
+        assert!(
+            !is_blob_hash(&"A".repeat(64)),
+            "uppercase is treated as a path, not a hash"
+        );
+        assert!(!is_blob_hash("./vmlinux"));
+        assert!(!is_blob_hash("https://example.com/vmlinux"));
+        assert!(!is_blob_hash(&"g".repeat(64)), "g is not a hex digit");
+    }
+
+    #[test]
+    fn sanitize_url_to_temp_fragment() {
+        assert_eq!(
+            sanitize("https://example.com/path/vmlinux-6.1.bin"),
+            "vmlinux-6.1.bin"
+        );
+        assert_eq!(sanitize("https://example.com/a b?c=d"), "a_b_c_d");
+        assert_eq!(sanitize("https://example.com/"), "example.com");
+    }
 }
