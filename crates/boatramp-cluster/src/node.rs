@@ -136,6 +136,10 @@ pub struct ClusterParams {
     /// leader's `ClientWriteAuthz` admits it. `None` ⇒ none
     /// attached (mesh trust alone; single-binary / tests).
     pub cluster_write_capability: Option<String>,
+    /// Extra post-apply observers registered alongside the built-in mesh-trust
+    /// one — e.g. a daemon-config observer that reloads a node's live config when
+    /// a replicated `daemon/*` write is applied (push convergence, no polling).
+    pub extra_observers: Vec<Arc<dyn crate::raft::ApplyObserver>>,
 }
 
 /// A fully-wired cluster node: the Raft handle, the serving-path facades, and
@@ -367,6 +371,7 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
         storage,
         mesh,
         cluster_write_capability,
+        extra_observers,
     } = params;
     // The live trust set (shared with the TLS verifiers) — mutated by the apply
     // observer as trust changes replicate; hydrated from durable state below.
@@ -411,11 +416,16 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
     // Durable Raft log + state machine over the node-local store. The state
     // machine mirrors committed `mesh/trust/*` writes into the live trust set.
     let log = PersistentLogStore::new(durable_kv.clone());
-    let sm = PersistentStateMachine::new(durable_kv)
+    let mut sm = PersistentStateMachine::new(durable_kv)
         .await?
         .with_observer(Arc::new(MeshTrustObserver {
             trust: trust.clone(),
         }));
+    // Caller-supplied observers (e.g. daemon-config reload on `daemon/*`) fire on
+    // every apply/snapshot alongside the mesh-trust one.
+    for observer in extra_observers {
+        sm = sm.with_observer(observer);
+    }
     // Durable state is authoritative on restart: if a trust set was persisted,
     // hydrate the live set from it (config was only the genesis seed).
     let durable_keys = sm.list_prefix(crate::mesh::TRUST_PREFIX).await;
@@ -635,6 +645,7 @@ mod tests {
                 storage: storage.clone(),
                 mesh: tls[&id].clone(),
                 cluster_write_capability: None,
+                extra_observers: Vec::new(),
             })
             .await
             .unwrap();
@@ -748,6 +759,7 @@ mod tests {
                 storage: storage.clone(),
                 mesh: tls[&id].clone(),
                 cluster_write_capability: None,
+                extra_observers: Vec::new(),
             })
             .await
             .unwrap();
@@ -829,6 +841,7 @@ mod tests {
             storage: storage.clone(),
             mesh: mesh1.clone(),
             cluster_write_capability: None,
+            extra_observers: Vec::new(),
         })
         .await
         .unwrap();
@@ -866,6 +879,7 @@ mod tests {
             storage,
             mesh: mesh1b.clone(),
             cluster_write_capability: None,
+            extra_observers: Vec::new(),
         })
         .await
         .unwrap();
@@ -925,6 +939,7 @@ mod tests {
                 storage: storage.clone(),
                 mesh: mesh.clone(),
                 cluster_write_capability: None,
+                extra_observers: Vec::new(),
             })
             .await
             .unwrap();
@@ -1032,6 +1047,7 @@ mod tests {
                 storage: storage.clone(),
                 mesh: mesh.clone(),
                 cluster_write_capability: None,
+                extra_observers: Vec::new(),
             })
             .await
             .unwrap();
@@ -1139,6 +1155,7 @@ mod tests {
                 storage: storage.clone(),
                 mesh: mesh.clone(),
                 cluster_write_capability: None,
+                extra_observers: Vec::new(),
             })
             .await
             .unwrap();

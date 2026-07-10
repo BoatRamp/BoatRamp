@@ -356,13 +356,13 @@ struct ImplicitRouting(bool);
 /// operational values through [`effective`](Self::effective); the daemon-config
 /// API and the SIGHUP handler [`reload`](Self::reload) it from the store, so a
 /// change converges without a restart.
-/// Backstop interval for re-resolving the dynamic daemon config. Convergence is
-/// **notification-driven**: a local write applies immediately, and a SIGHUP or a
-/// shared-store changelog invalidation of `daemon/*` wakes an immediate reload via
-/// [`DaemonRuntime::notify_reload`]. This long tick only backstops the one path
-/// not yet hooked to a notification — a Raft **follower** applying a leader's
-/// replicated write — so it converges within this bound even absent a poke.
-const DAEMON_RELOAD_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Defensive backstop interval for re-resolving the dynamic daemon config.
+/// Convergence is **fully notification-driven** — a local write applies
+/// immediately; a SIGHUP, a shared-store changelog invalidation of `daemon/*`, or
+/// a Raft apply of a replicated `daemon/*` write each wakes an immediate reload via
+/// [`DaemonRuntime::notify_reload`]. This long tick is only a safety net against a
+/// missed wake; it is not the convergence mechanism.
+const DAEMON_RELOAD_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub struct DaemonRuntime {
     baseline: boatramp_core::daemon_config::ConfigBaseline,

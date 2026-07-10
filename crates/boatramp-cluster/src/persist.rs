@@ -269,10 +269,11 @@ struct SmInner {
 pub struct PersistentStateMachine {
     kv: Arc<dyn KvStore>,
     inner: Arc<Mutex<SmInner>>,
-    /// Optional post-apply hook: fed the raw mutations of every committed batch
-    /// so a subsystem can mirror applied keys into its own view (the mesh trust
-    /// set tracks `mesh/trust/*`). See [`crate::raft::ApplyObserver`].
-    observer: Option<Arc<dyn crate::raft::ApplyObserver>>,
+    /// Post-apply hooks: each is fed the raw mutations of every committed batch so
+    /// a subsystem can mirror applied keys into its own view (the mesh trust set
+    /// tracks `mesh/trust/*`; the daemon-config runtime reloads on `daemon/*`).
+    /// See [`crate::raft::ApplyObserver`].
+    observers: Vec<Arc<dyn crate::raft::ApplyObserver>>,
 }
 
 impl PersistentStateMachine {
@@ -295,14 +296,15 @@ impl PersistentStateMachine {
         Ok(Self {
             kv,
             inner: Arc::new(Mutex::new(inner)),
-            observer: None,
+            observers: Vec::new(),
         })
     }
 
     /// Attach a post-apply [`ApplyObserver`](crate::raft::ApplyObserver) (set
     /// before the state machine is handed to Raft, so no apply is missed).
+    /// Repeatable — every registered observer sees each apply/reset.
     pub fn with_observer(mut self, observer: Arc<dyn crate::raft::ApplyObserver>) -> Self {
-        self.observer = Some(observer);
+        self.observers.push(observer);
         self
     }
 
@@ -439,9 +441,10 @@ impl RaftStateMachine<TypeConfig> for PersistentStateMachine {
             ));
         }
         self.kv.write_batch(batch).await.map_err(e_write_sm)?;
-        // The state is durable; now mirror the trust-set mutations into memory.
-        if let Some(observer) = &self.observer {
-            if !raw_muts.is_empty() {
+        // The state is durable; now let each observer mirror the applied mutations
+        // into its live view (mesh trust set; a daemon-config reload; …).
+        if !raw_muts.is_empty() {
+            for observer in &self.observers {
                 observer.on_apply(&raw_muts);
             }
         }
@@ -504,12 +507,13 @@ impl RaftStateMachine<TypeConfig> for PersistentStateMachine {
         inner.last_applied = payload.last_applied;
         inner.last_membership = payload.last_membership;
         inner.data = payload.data;
-        // A snapshot replaces local state wholesale — reconcile the trust set
-        // against the new applied key set (a catching-up node learns who to
-        // trust from the snapshot, not the log).
-        if let Some(observer) = &self.observer {
+        // A snapshot replaces local state wholesale — let each observer reconcile
+        // against the new applied key set (trust set; daemon-config reload; …).
+        if !self.observers.is_empty() {
             let keys: Vec<String> = inner.data.keys().cloned().collect();
-            observer.on_reset(&keys);
+            for observer in &self.observers {
+                observer.on_reset(&keys);
+            }
         }
         Ok(())
     }

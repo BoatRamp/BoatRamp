@@ -1035,6 +1035,31 @@ fn build_cert_envelope(
     build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))
 }
 
+/// Reloads this node's dynamic daemon-config runtime whenever a replicated
+/// `daemon/*` write is applied to the Raft state machine — push convergence for
+/// cluster followers and the leader through ordinary log replication, no polling.
+#[cfg(feature = "cluster")]
+struct DaemonConfigObserver(Arc<boatramp_server::DaemonRuntime>);
+
+#[cfg(feature = "cluster")]
+impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
+    fn on_apply(&self, muts: &[boatramp_core::kv::WriteOp]) {
+        use boatramp_core::kv::WriteOp;
+        let touched = muts.iter().any(|m| match m {
+            WriteOp::Put(k, _) | WriteOp::Delete(k) => k.starts_with("daemon/"),
+        });
+        if touched {
+            self.0.notify_reload();
+        }
+    }
+
+    fn on_reset(&self, keys: &[String]) {
+        if keys.iter().any(|k| k.starts_with("daemon/")) {
+            self.0.notify_reload();
+        }
+    }
+}
+
 #[cfg(feature = "cluster")]
 #[allow(clippy::too_many_arguments)]
 async fn run_cluster(
@@ -1105,6 +1130,16 @@ async fn run_cluster(
         tracing::info!("cluster: mesh client-write gating enabled");
     }
 
+    // Dynamic daemon-config runtime: a cluster ApplyObserver wakes an immediate
+    // reload on every replicated `daemon/*` apply, so leader and followers converge
+    // by push (through ordinary log replication) with no polling.
+    let daemon_runtime = Arc::new(boatramp_server::DaemonRuntime::new(
+        boatramp_server::config_baseline(&options),
+    ));
+    options.daemon_runtime = Some(daemon_runtime.clone());
+    let daemon_observer: Arc<dyn boatramp_cluster::raft::ApplyObserver> =
+        Arc::new(DaemonConfigObserver(daemon_runtime));
+
     let node = Arc::new(
         build_node(ClusterParams {
             node_id: cluster_cfg.node_id,
@@ -1116,6 +1151,7 @@ async fn run_cluster(
             storage: storage.clone(),
             mesh: mesh_tls.clone(),
             cluster_write_capability: write_capability,
+            extra_observers: vec![daemon_observer],
         })
         .await?,
     );
@@ -1190,7 +1226,9 @@ async fn run_cluster(
     if args.cluster_rate_limit || config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
         options.cluster_rate_limit_kv = Some(kv.clone());
     }
-    spawn_sighup_reload(kv.clone());
+    // SIGHUP also force-reloads the daemon config (the ApplyObserver already
+    // handles replicated `daemon/*` writes; this is the manual override).
+    spawn_sighup_reload(kv.clone(), options.daemon_runtime.clone());
     let cluster_serve_cfg = config.serve.clone().unwrap_or_default();
     let auth = configure_auth(
         cluster_serve_cfg.signer.as_ref(),
