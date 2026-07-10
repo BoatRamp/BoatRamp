@@ -1,4 +1,8 @@
-# fly.toml — boatramp serving its own docs at https://docs.boatramp.dev.
+# fly.toml — a generic boatramp instance dogfooding boatramp itself: it hosts
+# multiple sites, routed by Host —
+#   docs.boatramp.dev → site "docs" (published from this repo, deploy-docs.yml)
+#   boatramp.dev      → site "www"  (published from ../boatramp-website, its own CI)
+# Cloudflare fronts both; the origin scales to zero between cache misses.
 #
 # Safe to commit publicly: this is configuration, not secrets. The one secret —
 # the control-plane root key — is set out-of-band and injected at runtime:
@@ -7,17 +11,18 @@
 #
 # No Dockerfile: the image is the flake's `.#container` (base: fs + SlateDB), built
 # + pushed to fly's registry by `just fly-image` and selected with
-# `fly deploy --image`. Docs *content* is published separately with `boatramp sync`
-# (`just deploy-docs` / the deploy-docs workflow) — no image redeploy needed.
+# `fly deploy --image`. Site *content* is published separately with `boatramp sync`
+# (per-site, from each site's own repo) — no image redeploy needed.
 
-app = "boatramp-docs"
+app = "boatramp"
 primary_region = "ams"
 
 [env]
 BOATRAMP_ADDR = "0.0.0.0:8080"
 BOATRAMP_DATA_DIR = "/data"
-# This app only hosts the docs, so serve the "docs" site for any Host.
-BOATRAMP_DEFAULT_SITE = "docs"
+# Fallback for a Host matching no registered domain; the real domains
+# (docs.boatramp.dev / boatramp.dev) route to their sites explicitly.
+BOATRAMP_DEFAULT_SITE = "www"
 
 [http_service]
 internal_port = 8080
