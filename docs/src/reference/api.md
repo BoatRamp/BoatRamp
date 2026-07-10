@@ -118,5 +118,5 @@ limit) is applied per-site inside the serving handlers.
 | `GET` | `/healthz` | Liveness. |
 | `GET` | `/readyz` | Readiness. |
 | any | `/` (host-routed) | Serve site content, selected by `Host` — see [How a request reaches your site](../explanation/addressing.md). |
-| any | `/_sites/<name>/*` | Serve a site by name (admin/testing). `/sites/<name>/*` is a deprecated alias. |
+| any | `/_sites/<name>/*` | Serve a site by name (admin/testing). |
 | `GET` | `/_deploy/*` | Serve a deployment by id (an unguessable content-hash capability). |
