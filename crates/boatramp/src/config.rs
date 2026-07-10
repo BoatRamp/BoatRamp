@@ -181,6 +181,17 @@ pub struct ComputeConfig {
     pub vcpus: u32,
     /// Memory (MiB) this node advertises as schedulable (`0` ⇒ a 1 GiB default).
     pub mem_mib: u32,
+    /// **Static** kernel-signing public keys (`"<alg>:<hex>"`) — the trust anchor
+    /// for the posture-scaled kernel bar. Under `multi-tenant`, a dynamically-
+    /// selected default kernel must carry a signature verifying against one of
+    /// these. Host-access-gated (never in the KV tier); changing it needs a
+    /// restart. Empty ⇒ no kernel may be signed-verified (strict posture then
+    /// accepts none).
+    pub kernel_signing_pubkeys: Vec<String>,
+    /// **Static** allow-list of kernel content hashes (sha256 hex) a dynamic
+    /// default may select under `multi-tenant`. Host-access-gated. Empty ⇒ no
+    /// kernel is allow-listed.
+    pub kernel_allowed_hashes: Vec<String>,
 }
 
 impl Default for ComputeConfig {
@@ -190,6 +201,8 @@ impl Default for ComputeConfig {
             subnet: "10.0.0.0/24".to_string(),
             vcpus: 0,
             mem_mib: 0,
+            kernel_signing_pubkeys: Vec::new(),
+            kernel_allowed_hashes: Vec::new(),
         }
     }
 }

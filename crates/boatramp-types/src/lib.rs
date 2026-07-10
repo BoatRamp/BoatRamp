@@ -14,6 +14,7 @@ pub mod cert;
 pub mod compute;
 pub mod config;
 pub mod cron;
+pub mod daemon_config;
 pub mod deploy;
 pub mod dns_managed;
 pub mod domain_verify;

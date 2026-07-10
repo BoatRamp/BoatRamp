@@ -787,6 +787,114 @@ impl DeployStore {
         Ok(())
     }
 
+    // ---- Dynamic daemon config --------------------------------------------
+
+    /// The `daemon/current` pointer key → the active generation hash.
+    const DAEMON_CURRENT_KEY: &'static str = "daemon/current";
+    /// The `daemon/history` key → JSON array of prior generation hashes (rollback).
+    const DAEMON_HISTORY_KEY: &'static str = "daemon/history";
+    /// How many prior generations the rollback ring retains.
+    const DAEMON_HISTORY_MAX: usize = 20;
+
+    /// The immutable, content-addressed body: `daemonconfig/<hash>` → the
+    /// [`DaemonConfig`](crate::daemon_config::DaemonConfig) JSON.
+    fn daemon_config_blob_key(hash: &str) -> String {
+        format!("daemonconfig/{hash}")
+    }
+
+    /// The active daemon-config **generation** (the `daemon/current` hash), if any.
+    /// This is the value nodes report so an operator can confirm convergence.
+    pub async fn daemon_config_generation(&self) -> Result<Option<String>, DeployError> {
+        Ok(self
+            .kv
+            .get(Self::DAEMON_CURRENT_KEY)
+            .await?
+            .map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// The active dynamic daemon config, if any (`None` = none set ⇒ the server
+    /// runs on the pure file baseline).
+    pub async fn get_daemon_config(
+        &self,
+    ) -> Result<Option<crate::daemon_config::DaemonConfig>, DeployError> {
+        let Some(hash) = self.daemon_config_generation().await? else {
+            return Ok(None);
+        };
+        match self.kv.get(&Self::daemon_config_blob_key(&hash)).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            // Dangling pointer (body GC'd) reads as unset → baseline.
+            None => Ok(None),
+        }
+    }
+
+    /// The rollback history (oldest → newest prior generation hashes; excludes the
+    /// current generation).
+    pub async fn daemon_config_history(&self) -> Result<Vec<String>, DeployError> {
+        match self.kv.get(Self::DAEMON_HISTORY_KEY).await? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Store a new daemon config: write the content-addressed body, push the
+    /// current generation onto the bounded history, and flip the `daemon/current`
+    /// pointer — all as one atomic batch. **The caller validates first** (the
+    /// server route runs [`DaemonConfig::validate`](crate::daemon_config::DaemonConfig::validate)
+    /// before this). Returns the new generation hash.
+    pub async fn set_daemon_config(
+        &self,
+        config: &crate::daemon_config::DaemonConfig,
+    ) -> Result<String, DeployError> {
+        let body = serde_json::to_vec(config)?;
+        let hash = sha256_hex(&body);
+        let mut history = self.daemon_config_history().await?;
+        if let Some(current) = self.daemon_config_generation().await? {
+            if current != hash {
+                history.push(current);
+                if history.len() > Self::DAEMON_HISTORY_MAX {
+                    let overflow = history.len() - Self::DAEMON_HISTORY_MAX;
+                    history.drain(0..overflow);
+                }
+            }
+        }
+        let ops = vec![
+            WriteOp::Put(Self::daemon_config_blob_key(&hash), body),
+            WriteOp::Put(
+                Self::DAEMON_HISTORY_KEY.to_string(),
+                serde_json::to_vec(&history)?,
+            ),
+            WriteOp::Put(
+                Self::DAEMON_CURRENT_KEY.to_string(),
+                hash.clone().into_bytes(),
+            ),
+        ];
+        self.kv.write_batch(ops).await?;
+        Ok(hash)
+    }
+
+    /// Roll back to the previous generation: pop the history and flip the pointer,
+    /// atomically. Returns the hash rolled back to, or `None` if there is no
+    /// history. Reverting past the last dynamic config falls back to the file
+    /// baseline (which already booted successfully — the known-good floor).
+    pub async fn rollback_daemon_config(&self) -> Result<Option<String>, DeployError> {
+        let mut history = self.daemon_config_history().await?;
+        let Some(prev) = history.pop() else {
+            return Ok(None);
+        };
+        let ops = vec![
+            WriteOp::Put(
+                Self::DAEMON_HISTORY_KEY.to_string(),
+                serde_json::to_vec(&history)?,
+            ),
+            WriteOp::Put(
+                Self::DAEMON_CURRENT_KEY.to_string(),
+                prev.clone().into_bytes(),
+            ),
+        ];
+        self.kv.write_batch(ops).await?;
+        Ok(Some(prev))
+    }
+
     // ---- Compute workloads ------------------------------------------------
 
     /// Store an immutable, content-addressed [`ComputeSpec`](crate::compute::ComputeSpec)
@@ -1667,6 +1775,48 @@ mod tests {
     fn store() -> DeployStore {
         use crate::kv::MemoryKv;
         DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()))
+    }
+
+    #[tokio::test]
+    async fn daemon_config_store_round_trips_and_rolls_back() {
+        use crate::daemon_config::DaemonConfig;
+        let s = store();
+        // None set → baseline.
+        assert!(s.get_daemon_config().await.unwrap().is_none());
+        assert!(s.daemon_config_generation().await.unwrap().is_none());
+
+        // Set gen 1.
+        let g1cfg = DaemonConfig {
+            default_site: Some("one".into()),
+            ..Default::default()
+        };
+        let g1 = s.set_daemon_config(&g1cfg).await.unwrap();
+        assert_eq!(
+            s.daemon_config_generation().await.unwrap().as_deref(),
+            Some(g1.as_str())
+        );
+        assert_eq!(s.get_daemon_config().await.unwrap().unwrap(), g1cfg);
+        assert!(s.daemon_config_history().await.unwrap().is_empty());
+
+        // Set gen 2 → gen 1 goes to history.
+        let g2cfg = DaemonConfig {
+            default_site: Some("two".into()),
+            ..Default::default()
+        };
+        let g2 = s.set_daemon_config(&g2cfg).await.unwrap();
+        assert_ne!(g1, g2);
+        assert_eq!(s.daemon_config_history().await.unwrap(), vec![g1.clone()]);
+
+        // Rollback → back to gen 1.
+        let rolled = s.rollback_daemon_config().await.unwrap();
+        assert_eq!(rolled.as_deref(), Some(g1.as_str()));
+        assert_eq!(
+            s.daemon_config_generation().await.unwrap().as_deref(),
+            Some(g1.as_str())
+        );
+        assert_eq!(s.get_daemon_config().await.unwrap().unwrap(), g1cfg);
+        // No further history → rollback is a no-op signal.
+        assert!(s.rollback_daemon_config().await.unwrap().is_none());
     }
 
     #[tokio::test]

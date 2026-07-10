@@ -68,9 +68,10 @@ enum ComputeCommand {
         /// ext4 rootfs image: a blob hash, a local file, or a URL (file/URL is uploaded).
         #[arg(long)]
         rootfs: String,
-        /// vmlinux kernel: a blob hash, a local file, or a URL (file/URL is uploaded).
+        /// vmlinux kernel: a blob hash, a local file, or a URL (file/URL is
+        /// uploaded). Omit to use the node's configured default kernel.
         #[arg(long)]
-        kernel: String,
+        kernel: Option<String>,
         /// Virtual CPUs.
         #[arg(long, default_value_t = 1)]
         vcpus: u32,
@@ -111,9 +112,10 @@ enum ComputeCommand {
         /// OCI image reference, e.g. `nginx:1.27` or `ghcr.io/owner/app:tag`.
         #[arg(long)]
         image: String,
-        /// vmlinux kernel: a blob hash, a local file, or a URL (provision once, shared).
+        /// vmlinux kernel: a blob hash, a local file, or a URL (provision once,
+        /// shared). Omit to use the node's configured default kernel.
         #[arg(long)]
-        kernel: String,
+        kernel: Option<String>,
         /// Size of the ext4 rootfs image (MiB).
         #[arg(long, default_value_t = 1024)]
         size_mib: u64,
@@ -251,7 +253,10 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
         } => {
             // `--rootfs` / `--kernel` accept a blob hash, a local file, or a URL.
             let rootfs = client::resolve_artifact(&http, &server, &rootfs).await?;
-            let kernel = client::resolve_artifact(&http, &server, &kernel).await?;
+            let kernel = match kernel {
+                Some(k) => client::resolve_artifact(&http, &server, &k).await?,
+                None => String::new(), // empty ⇒ the node substitutes its default
+            };
             let spec = build_spec(
                 rootfs,
                 kernel,
@@ -309,7 +314,10 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             .await
             .map_err(|e| Error::RootfsBuild(e.to_string()))?;
             // `--kernel` accepts a blob hash, a local file, or a URL.
-            let kernel = client::resolve_artifact(&http, &server, &kernel).await?;
+            let kernel = match kernel {
+                Some(k) => client::resolve_artifact(&http, &server, &k).await?,
+                None => String::new(), // empty ⇒ the node substitutes its default
+            };
             // Hash + upload the freshly built rootfs as a content-addressed blob.
             let rootfs = client::put_file_blob(&http, &server, &out).await?;
             let _ = std::fs::remove_file(&out);
