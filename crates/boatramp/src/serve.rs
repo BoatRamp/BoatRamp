@@ -243,12 +243,25 @@ const COMPUTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// that isn't the current signed default, has no signature source and so **fails
 /// closed** under strict: the kernel does not boot.
 #[cfg(target_os = "linux")]
-#[derive(Debug)]
 struct PostureKernelVerifier {
     strict: bool,
     signing_keys: Vec<String>,
     allowed_hashes: Vec<String>,
     daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
+}
+
+// `KernelVerifier` requires `Debug`, but `DaemonRuntime` isn't `Debug` (it holds a
+// lock + a `Notify`); summarise instead of recursing into it.
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for PostureKernelVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostureKernelVerifier")
+            .field("strict", &self.strict)
+            .field("signing_keys", &self.signing_keys.len())
+            .field("allowed_hashes", &self.allowed_hashes.len())
+            .field("has_daemon", &self.daemon.is_some())
+            .finish()
+    }
 }
 
 #[cfg(target_os = "linux")]
