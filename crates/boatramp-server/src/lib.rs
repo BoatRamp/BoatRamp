@@ -340,17 +340,80 @@ pub struct ServerOptions {
 #[derive(Clone, Copy)]
 struct ServedOverTls(bool);
 
-/// The configured catch-all site, carried as an extension so the
-/// host fallback can serve it for an otherwise-unmatched `Host`.
-#[derive(Clone, Default)]
-struct DefaultSite(Option<Arc<str>>);
-
 /// Whether the host fallback may resolve an unmatched `Host` to a site without an
 /// explicit domain registration (first-label `<site>.host`, or the sole served
 /// site). Carried as an extension; the effective gate is resolved by `serve`
 /// (posture knob OR loopback bind). `false` = strict (default_site or 404 only).
 #[derive(Clone, Copy, Default)]
 struct ImplicitRouting(bool);
+
+/// Holds the live, resolved [`EffectiveConfig`] (`file baseline ⊕ dynamic
+/// overrides`) plus the active generation hash. Request handlers read the current
+/// operational values through [`effective`](Self::effective); the daemon-config
+/// API and the SIGHUP handler [`reload`](Self::reload) it from the store, so a
+/// change converges without a restart.
+pub struct DaemonRuntime {
+    baseline: boatramp_core::daemon_config::ConfigBaseline,
+    state: std::sync::RwLock<DaemonState>,
+}
+
+struct DaemonState {
+    effective: Arc<boatramp_core::daemon_config::EffectiveConfig>,
+    generation: Option<String>,
+}
+
+impl DaemonRuntime {
+    /// Build with the file baseline; the effective config starts equal to the
+    /// baseline (no dynamic override) until [`reload`](Self::reload) runs.
+    fn new(baseline: boatramp_core::daemon_config::ConfigBaseline) -> Self {
+        let effective =
+            Arc::new(boatramp_core::daemon_config::DaemonConfig::default().resolve(&baseline));
+        Self {
+            baseline,
+            state: std::sync::RwLock::new(DaemonState {
+                effective,
+                generation: None,
+            }),
+        }
+    }
+
+    /// The current effective operational config.
+    pub fn effective(&self) -> Arc<boatramp_core::daemon_config::EffectiveConfig> {
+        self.state
+            .read()
+            .expect("daemon config lock")
+            .effective
+            .clone()
+    }
+
+    /// The active generation hash (the `daemon/current` content address), or
+    /// `None` when running on the pure file baseline.
+    pub fn generation(&self) -> Option<String> {
+        self.state
+            .read()
+            .expect("daemon config lock")
+            .generation
+            .clone()
+    }
+
+    /// The file baseline (+ static ceilings) a write is validated against.
+    pub fn baseline(&self) -> &boatramp_core::daemon_config::ConfigBaseline {
+        &self.baseline
+    }
+
+    /// Re-resolve `baseline ⊕ stored dynamic config` and hot-swap the live values.
+    /// Called after a write and on SIGHUP.
+    pub async fn reload(&self, deploy: &DeployStore) -> Result<(), DeployError> {
+        let cfg = deploy.get_daemon_config().await?.unwrap_or_default();
+        let generation = deploy.daemon_config_generation().await?;
+        let effective = Arc::new(cfg.resolve(&self.baseline));
+        *self.state.write().expect("daemon config lock") = DaemonState {
+            effective,
+            generation,
+        };
+        Ok(())
+    }
+}
 
 /// Preview-access policy, carried as an extension so the preview handlers can
 /// require a token when `protect` is set.
@@ -462,7 +525,27 @@ pub fn router_with(
     // The listener's own scheme, for deriving the request scheme when
     // `X-Forwarded-Proto` isn't from a trusted proxy.
     let served_over_tls = ServedOverTls(options.served_over_tls);
-    let default_site = DefaultSite(options.default_site.map(Arc::from));
+    // The dynamic daemon-config runtime: file baseline ⊕ stored overrides, hot-
+    // swapped on a write or SIGHUP. Built before `options` fields are moved; the
+    // posture's upload cap is the ceiling a dynamic override may not exceed.
+    let daemon = Arc::new(DaemonRuntime::new(
+        boatramp_core::daemon_config::ConfigBaseline {
+            default_site: options.default_site.clone(),
+            protect_previews: options.protect_previews,
+            max_upload_bytes: options.limits.max_upload_bytes.unwrap_or(0),
+            upload_idle_timeout_secs: options.limits.upload_idle_timeout.map(|d| d.as_secs()),
+            max_concurrent_uploads: options.limits.max_concurrent_uploads.map(|n| n as u64),
+            cluster_rate_limit: options.cluster_rate_limit_kv.is_some(),
+            compute_vcpus: 0,
+            compute_mem_mib: 0,
+            max_upload_ceiling: posture.max_upload_bytes,
+            max_concurrent_uploads_ceiling: None,
+            posture,
+        },
+    ));
+    // A deploy handle for the daemon-config startup reload, captured before
+    // `deploy` is moved into the router state below.
+    let daemon_init_deploy = deploy.clone();
     let implicit_routing = ImplicitRouting(options.implicit_routing);
     let preview_policy = PreviewPolicy {
         protect: options.protect_previews,
@@ -552,6 +635,13 @@ pub fn router_with(
             "/api/authz/policy",
             get(get_authz_policy).put(put_authz_policy),
         )
+        // Dynamic daemon config — validated + committed on the leader, replicated,
+        // hot-swapped without a restart. Admin-scoped (deny-safe `Right::required`).
+        .route(
+            "/api/daemon/config",
+            get(get_daemon_config).put(put_daemon_config),
+        )
+        .route("/api/daemon/config/rollback", post(rollback_daemon_config))
         // Self-identity: any valid token may read its own roles.
         .route("/api/auth/whoami", get(auth_whoami))
         // Compute workloads — the control plane is uniform; only
@@ -630,8 +720,6 @@ pub fn router_with(
         // Operational upload limits (size / idle / concurrency), enforced in the
         // blob-upload handler. Unlimited by default.
         .layer(Extension(upload_guard))
-        // The catch-all site for unmatched hosts; `None` → 404.
-        .layer(Extension(default_site))
         // Whether an unmatched host may resolve implicitly (first-label / sole
         // site); gated to dev/single-tenant/loopback by `serve`.
         .layer(Extension(implicit_routing))
@@ -654,6 +742,18 @@ pub fn router_with(
     let app = app.layer(Extension(posture));
     // The listener's connection scheme.
     let app = app.layer(Extension(served_over_tls));
+    // The dynamic daemon-config runtime, for the API + request-path reads. Load
+    // any stored config once at startup (fresh servers stay on the baseline).
+    tokio::spawn({
+        let daemon = daemon.clone();
+        let deploy = daemon_init_deploy;
+        async move {
+            if let Err(err) = daemon.reload(&deploy).await {
+                tracing::warn!(%err, "initial daemon-config load failed; using file baseline");
+            }
+        }
+    });
+    let app = app.layer(Extension(daemon));
     app
         // Structured access log wraps every route (public + API).
         .layer(axum::middleware::from_fn(access_log))
@@ -872,8 +972,14 @@ pub async fn shutdown_signal() {
     tracing::info!("shutdown signal received; draining");
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+/// Liveness probe. Also reports the active daemon-config **generation** hash so an
+/// operator can confirm every node in a cluster converged to the same config
+/// (`ok` alone = running on the pure file baseline).
+async fn healthz(Extension(daemon): Extension<Arc<DaemonRuntime>>) -> String {
+    match daemon.generation() {
+        Some(gen) => format!("ok gen={gen}"),
+        None => "ok".to_string(),
+    }
 }
 
 /// Readiness probe: `200 ready` when the metadata backend answers, else `503`.
@@ -1652,6 +1758,68 @@ async fn put_authz_policy(
     }
 }
 
+/// GET the active dynamic daemon config + its generation hash.
+async fn get_daemon_config(
+    State(deploy): State<DeployStore>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
+) -> Response {
+    match deploy.get_daemon_config().await {
+        Ok(cfg) => Json(serde_json::json!({
+            "generation": daemon.generation(),
+            "config": cfg.unwrap_or_default(),
+        }))
+        .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// PUT a new dynamic daemon config: validate against the file baseline (ceilings +
+/// tighten-only ratchet), store it, and hot-swap the local runtime. Other nodes
+/// converge via Raft replication + their SIGHUP/changelog reload.
+async fn put_daemon_config(
+    State(deploy): State<DeployStore>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
+    Json(cfg): Json<boatramp_core::daemon_config::DaemonConfig>,
+) -> Response {
+    if let Err(err) = cfg.validate(daemon.baseline()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid daemon config: {err}\n"),
+        )
+            .into_response();
+    }
+    match deploy.set_daemon_config(&cfg).await {
+        Ok(generation) => {
+            if let Err(err) = daemon.reload(&deploy).await {
+                return deploy_error_response(err);
+            }
+            Json(serde_json::json!({ "generation": generation })).into_response()
+        }
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Roll the dynamic daemon config back to the previous generation, and hot-swap.
+async fn rollback_daemon_config(
+    State(deploy): State<DeployStore>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
+) -> Response {
+    match deploy.rollback_daemon_config().await {
+        Ok(Some(generation)) => {
+            if let Err(err) = daemon.reload(&deploy).await {
+                return deploy_error_response(err);
+            }
+            Json(serde_json::json!({ "generation": generation })).into_response()
+        }
+        Ok(None) => (
+            StatusCode::CONFLICT,
+            "no prior daemon config to roll back to\n",
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
 /// List all compute workloads.
 async fn list_compute(State(deploy): State<DeployStore>) -> Response {
     match deploy.list_compute_workloads().await {
@@ -1975,13 +2143,16 @@ async fn serve_by_host(
     State(deploy): State<DeployStore>,
     Extension(limiter): Extension<Arc<dyn RateLimitStore>>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
-    Extension(default_site): Extension<DefaultSite>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
     Extension(implicit): Extension<ImplicitRouting>,
     Extension(preview_policy): Extension<PreviewPolicy>,
     Extension(preview_auth): Extension<Auth>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
+    // The catch-all site is read live from the daemon-config runtime, so a
+    // `config set default_site …` takes effect without a restart.
+    let effective = daemon.effective();
     let Some(host) = request
         .headers()
         .get(header::HOST)
@@ -2061,7 +2232,7 @@ async fn serve_by_host(
                     .await;
                 }
             }
-            match &default_site.0 {
+            match effective.default_site.as_deref() {
                 Some(site) => {
                     let visitor = Visitor {
                         peer: peer.ip(),

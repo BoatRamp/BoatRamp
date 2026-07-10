@@ -3693,6 +3693,89 @@ async fn explicit_domain_beats_implicit_first_label() {
     );
 }
 
+// ---- dynamic daemon config -------------------------------------------------
+
+#[tokio::test]
+async fn daemon_config_default_site_hot_swaps() {
+    let deploy = seed().await; // site "test" serves <h1>home</h1>
+    let app = router_with(
+        deploy.clone(),
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions::default(),
+    );
+    // Baseline: an unmatched host 404s (no default_site configured).
+    assert_eq!(
+        get_host(app.clone(), "nope.example").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // PUT a dynamic default_site → 200 with a generation.
+    let body = serde_json::json!({ "version": 1, "default_site": "test" }).to_string();
+    let mut put = Request::builder()
+        .method("PUT")
+        .uri("/api/daemon/config")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    put.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let resp = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Hot-swapped: the same running server now serves the default site — no restart.
+    let (status, body) = get_host(app.clone(), "nope.example").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>");
+
+    // /healthz reports the config generation hash (convergence signal).
+    let mut hz = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    hz.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let hzresp = app.oneshot(hz).await.unwrap();
+    let hzbody = to_bytes(hzresp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    assert!(
+        hzbody.starts_with(b"ok gen="),
+        "healthz reports the generation, got {:?}",
+        String::from_utf8_lossy(&hzbody)
+    );
+}
+
+#[tokio::test]
+async fn daemon_config_rejects_ceiling_violation() {
+    // A dynamic upload cap above the posture ceiling is rejected (validate-before-
+    // commit), leaving the stored config unchanged.
+    let deploy = seed().await;
+    let options = ServerOptions {
+        // multi-tenant posture ⇒ a finite max_upload_bytes ceiling.
+        posture: boatramp_core::security::SecurityProfile::MultiTenant.preset(),
+        ..Default::default()
+    };
+    let app = router_with(
+        deploy,
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        options,
+    );
+    let body = serde_json::json!({ "version": 1, "max_upload_bytes": 0 }).to_string(); // 0 = unlimited > ceiling
+    let mut put = Request::builder()
+        .method("PUT")
+        .uri("/api/daemon/config")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    put.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let resp = app.oneshot(put).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ---- configurable WAF ------------------------------------------------------
 
 #[tokio::test]
