@@ -127,7 +127,7 @@ mod tests {
         );
         // Allow-listed but unsigned → rejected.
         assert_eq!(
-            verify_kernel(bytes, &kref, true, &[], &[kref.sha256.clone()]).unwrap_err(),
+            verify_kernel(bytes, &kref, true, &[], std::slice::from_ref(&kref.sha256)).unwrap_err(),
             KernelTrustError::Unsigned
         );
     }
@@ -142,7 +142,7 @@ mod tests {
         let kref = kref_for(bytes, Some(hex::encode(&sig)));
 
         // Right key + allow-listed → boots.
-        assert!(verify_kernel(bytes, &kref, true, &[pubkey], &[hash.clone()]).is_ok());
+        assert!(verify_kernel(bytes, &kref, true, &[pubkey], std::slice::from_ref(&hash)).is_ok());
 
         // A different key does not verify the signature → rejected (anti-swap: an
         // admin who sets a kernel we didn't sign can't boot it under strict).
