@@ -249,17 +249,18 @@
                   allowImportFromDerivation = true;
                 };
               in
+              # `micro.dev or micro`: linuxManualConfig may not expose a `dev`
+              # output, so fall back to the default output and locate the vmlinux
+              # ELF wherever the kernel install placed it.
               pkgs.runCommand "boatramp-vmlinux" { } ''
                 mkdir -p "$out"
-                if [ -f "${micro.dev}/vmlinux" ]; then
-                  cp "${micro.dev}/vmlinux" "$out/vmlinux"
-                elif [ -f "${micro}/vmlinux" ]; then
-                  cp "${micro}/vmlinux" "$out/vmlinux"
-                else
-                  echo "vmlinux ELF not found in kernel outputs — adjust the derivation" >&2
-                  find "${micro}" "${micro.dev}" \( -name 'vmlinux' -o -name 'bzImage' \) >&2 || true
+                v="$(find ${micro} ${micro.dev or micro} -name vmlinux -type f 2>/dev/null | head -1)"
+                if [ -z "$v" ]; then
+                  echo "vmlinux ELF not found in kernel outputs:" >&2
+                  find ${micro} ${micro.dev or micro} -maxdepth 2 >&2 || true
                   exit 1
                 fi
+                cp "$v" "$out/vmlinux"
               '';
 
             # ---- Web console (`nix build .#console`) ------------------------
