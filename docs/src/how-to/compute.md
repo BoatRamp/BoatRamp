@@ -45,14 +45,27 @@ boatramp blob put ./vmlinux
 
 You do not have to pass `--kernel` on every workload. A node has a **fleet default
 kernel** — a [dynamic setting](../reference/daemon-config.md) you change without a
-restart:
+restart. boatramp distributes a first-party signed microVM kernel
+([`boatramp-vmlinux`](https://github.com/BoatRamp/boatramp-vmlinux/releases)); set
+it up once by uploading the released `vmlinux` as a blob and pointing the default
+kernel at that content hash:
 
 ```sh
-boatramp config set compute.default_kernel '{"source":"…","sha256":"…","sig":"…"}'
+# 1. fetch the signed release + upload the kernel as a content-addressed blob
+curl -fsSLO https://github.com/BoatRamp/boatramp-vmlinux/releases/latest/download/boatramp-vmlinux-x86_64
+boatramp blob put boatramp-vmlinux-x86_64        # prints the blob hash == its sha256
+
+# 2. point the fleet default at it (source = the blob hash; sha256 + sig from the release)
+boatramp config set compute.default_kernel '{
+  "source": "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974",
+  "sha256": "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974",
+  "sig":    "94c868398299ce156a9522c8caac839e8489cf6e3ac05b9ec7a496ef964fa1e3e66aa151ab4334379406f338616bd867a3350f567a57f12787517ff0554f9a14"
+}'
 ```
 
-A workload that omits `--kernel` uses that default. Changing the default retargets
-**new** microVMs and reboots; in-flight guests keep their kernel until they cycle.
+`source` is the **blob hash** the backend stages (not the release URL). A workload
+that omits `--kernel` uses this default. Changing it retargets **new** microVMs and
+reboots; in-flight guests keep their kernel until they cycle.
 
 The kernel is **verified before boot**, scaled by the [security posture](./security-posture.md):
 

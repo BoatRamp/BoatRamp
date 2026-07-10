@@ -160,7 +160,7 @@ microVM where `/dev/kvm` exists).
 | `vcpus` | integer | detect | vCPUs this node advertises as schedulable (`0` = detect). |
 | `mem_mib` | integer | `1024` | Memory (MiB) advertised as schedulable (`0` = 1 GiB). |
 | `kernel_signing_pubkeys` | list | boatramp's built-in key | **Static** trust anchors (`"<alg>:<hex>"`) for the strict-posture kernel bar; a signed default kernel must verify against one. |
-| `kernel_allowed_hashes` | list | `[]` | **Static** allow-list of kernel content hashes a dynamic default may select under `multi-tenant`. |
+| `kernel_allowed_hashes` | list | the released `boatramp-vmlinux` hash | **Static** allow-list of kernel content hashes a dynamic default may select under `multi-tenant`. Ships pre-seeded with the first-party signed release so it verifies out of the box; replace it to allow only your own kernels. |
 
 The kernel-signing keys and hash allow-list are static (host-access-gated) trust
 anchors — the fleet **default kernel** itself is a

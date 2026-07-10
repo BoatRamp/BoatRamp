@@ -211,9 +211,14 @@ impl Default for ComputeConfig {
             vcpus: 0,
             mem_mib: 0,
             kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
-            // The allow-listed hash + default kernel URL are baked once the first
-            // signed `boatramp-vmlinux` release exists (its content hash).
-            kernel_allowed_hashes: Vec::new(),
+            // The first-party signed `boatramp-vmlinux` release (v0.2.0 — a minimal
+            // Firecracker microVM config, ~39 MB, serial-boot-validated in CI). Its
+            // content hash is allow-listed so it clears the strict-posture kernel
+            // bar out of the box when an operator selects it as the fleet
+            // `compute.default_kernel`. Bump this on each new signed release.
+            kernel_allowed_hashes: vec![
+                "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
+            ],
         }
     }
 }
