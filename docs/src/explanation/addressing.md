@@ -90,9 +90,6 @@ or `fetch('/api')` — breaks here: those URLs resolve against the origin root, 
 the `/_sites/blog/` prefix. Use host routing (or the single-site default) to serve
 such a site; reach for `/_sites/<name>` only for by-name inspection.
 
-> **Deprecated:** the older `/sites/<name>/…` prefix is a deprecated alias for
-> `/_sites/<name>/…` and still works for now. Prefer `/_sites/`.
-
 ## Sub-path mounts
 
 Serving a site under a deliberate sub-path (for a site *built* with a matching

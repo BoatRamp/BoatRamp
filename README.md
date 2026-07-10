@@ -91,8 +91,8 @@ boatramp serve                      # listens on 127.0.0.1:8080
 # 2. Publish a folder as a new atomic deployment and switch to it.
 boatramp sync ./public --server http://127.0.0.1:8080 --site my-site
 
-# 3. It's live.
-curl http://127.0.0.1:8080/sites/my-site/
+# 3. It's live — the only site, so it answers at the root.
+curl http://127.0.0.1:8080/
 ```
 
 Re-running `sync` on an unchanged tree uploads nothing. Change one file and only
@@ -235,7 +235,7 @@ environment differences live behind backends, never in the UX.
 ```
 boatramp sync                          boatramp serve
 ─────────────                          ──────────────
-walk dir, hash files (streamed)        GET /sites/<site>/<path>
+walk dir, hash files (streamed)        GET /  (host-routed) · /_sites/<site>/<path>
         │                                      │
         ▼  POST manifest                       ▼  resolve current → manifest → hash
 server: store manifest, report missing server: stream blob from Storage
