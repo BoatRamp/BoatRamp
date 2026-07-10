@@ -5,20 +5,19 @@
        labels are long ("Auto-DNS & Custom Domains") and the pages are dense with
        code blocks and reference tables that need room.
 
-       The theme derives `--sidebar-width` from `min(--sidebar-target-width,
-       80vw)` and its resize JS also rewrites `--sidebar-target-width` at runtime,
-       so overriding the *target* alone doesn't stick. Set `--sidebar-width`
-       directly (nothing else writes it) so the width is a stable ~350px. Keep
-       `--sidebar-target-width` in sync so the collapse/expand transform matches. */
-    --sidebar-width: 22rem; /* ~352px */
-    --sidebar-target-width: 22rem;
-    --content-max-width: 62rem;
+       NOTE: mdBook sets `html { font-size: 62.5% }`, so 1rem = 10px here — use px
+       to avoid the 1.6× surprise. The theme derives `--sidebar-width` from
+       `min(--sidebar-target-width, 80vw)` and its resize JS rewrites the target at
+       runtime, so set `--sidebar-width` directly (nothing else writes it). */
+    --sidebar-width: 350px;
+    --sidebar-target-width: 350px;
+    --content-max-width: 900px;
 }
 
 /* Belt and suspenders: pin the element width too, so a runtime inline
    `--sidebar-target-width` from the resize handle can never shrink it. */
 .sidebar {
-    width: 22rem !important;
+    width: 350px !important;
 }
 
 /* Slightly tighter, more readable code blocks. */
