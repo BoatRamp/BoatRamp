@@ -159,5 +159,15 @@ microVM where `/dev/kvm` exists).
 | `subnet` | string | `10.0.0.0/24` | Guest IP subnet. |
 | `vcpus` | integer | detect | vCPUs this node advertises as schedulable (`0` = detect). |
 | `mem_mib` | integer | `1024` | Memory (MiB) advertised as schedulable (`0` = 1 GiB). |
+| `kernel_signing_pubkeys` | list | boatramp's built-in key | **Static** trust anchors (`"<alg>:<hex>"`) for the strict-posture kernel bar; a signed default kernel must verify against one. |
+| `kernel_allowed_hashes` | list | `[]` | **Static** allow-list of kernel content hashes a dynamic default may select under `multi-tenant`. |
 
-See [Run a container or microVM](../how-to/compute.md).
+The kernel-signing keys and hash allow-list are static (host-access-gated) trust
+anchors — the fleet **default kernel** itself is a
+[dynamic setting](./daemon-config.md) (`compute.default_kernel`), changeable
+without a restart but verified against these anchors at boot. See
+[Run a container or microVM](../how-to/compute.md#the-kernel-and-its-trust).
+
+Note: `vcpus`, `mem_mib`, and the default kernel are also settable at runtime via
+[`boatramp config`](./daemon-config.md) — the `boatramp.cfg` values are the
+baseline a dynamic override layers over.

@@ -49,6 +49,7 @@ flags unique to each command:
 | [`gateway`](#boatramp-gateway) | Publish a private service through the reverse-proxy gateway. |
 | [`compute`](#boatramp-compute) | Manage microVM compute workloads. |
 | [`blob`](#boatramp-blob) | Upload a file as a content-addressed blob. |
+| [`config`](#boatramp-config) | Read/change the dynamic daemon config (no restart). |
 | [`dns`](#boatramp-dns) | Configure DNS and issue wildcard preview certs (`acme-dns` feature). |
 | [`logs`](#boatramp-logs) | Tail a site's captured guest stdout/stderr. |
 | [`stats`](#boatramp-stats) | Show handler stats, consumer lag, and dead letters. |
@@ -357,6 +358,26 @@ hash.
 | Sub-action | Description |
 | --- | --- |
 | `put <file>` | Upload a file as a blob; prints its hash (the key to pass to `compute set --kernel/--rootfs`). |
+
+## `boatramp config`
+
+Read and change the **dynamic daemon config** — operational knobs that converge
+fleet-wide without a restart. See the
+[dynamic daemon config reference](./daemon-config.md) and
+[the configuration model](../explanation/config-model.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `get [key]` | Print the active config + its generation, or one key's value. |
+| `set <key> <value>` | Set one dynamic key (`null`/`unset` clears it); converges fleet-wide, validated server-side. |
+| `rollback` | Revert to the previous generation. |
+| `apply -f <file>` | Replace the whole dynamic config from a JSON file. |
+| `list` | List the dynamic (runtime-settable) keys. |
+| `describe <key>` | A key's change class (`dynamic` vs `restart`). |
+
+`config set` on a `restart`-class key (a trust anchor, posture, or listener
+setting) fails with a pointer to `boatramp.cfg` rather than silently doing
+nothing.
 
 ## `boatramp dns`
 

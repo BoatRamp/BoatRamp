@@ -41,6 +41,34 @@ boatramp blob put ./vmlinux
 1a2b3c4d…    # the content-address; pass it as --kernel 1a2b3c4d…
 ```
 
+## The kernel and its trust
+
+You do not have to pass `--kernel` on every workload. A node has a **fleet default
+kernel** — a [dynamic setting](../reference/daemon-config.md) you change without a
+restart:
+
+```sh
+boatramp config set compute.default_kernel '{"source":"…","sha256":"…","sig":"…"}'
+```
+
+A workload that omits `--kernel` uses that default. Changing the default retargets
+**new** microVMs and reboots; in-flight guests keep their kernel until they cycle.
+
+The kernel is **verified before boot**, scaled by the [security posture](./security-posture.md):
+
+- **Always:** the kernel bytes must hash to the pinned `sha256` — a mismatch never
+  boots.
+- **`multi-tenant` (strict):** the hash must be on the static
+  `[compute].kernel_allowed_hashes` allow-list **and** carry a signature verifying
+  against a static `[compute].kernel_signing_pubkeys` key. So an admin token can
+  only *select* a kernel the host operator pre-vetted and signed — never introduce
+  a new one.
+- **`single-tenant` / `dev`:** a verified hash pin suffices.
+
+boatramp ships a first-party signing public key built in, so the signed default
+kernel it distributes verifies out of the box. `boatramp security explain` shows
+the resolved kernel-trust bar.
+
 ## Deploy a container image
 
 `compute build` takes an OCI image reference, builds an ext4 root filesystem from

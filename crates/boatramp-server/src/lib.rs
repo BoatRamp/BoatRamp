@@ -5908,10 +5908,20 @@ async fn operator_logs_stream(
 async fn prometheus_metrics(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
 ) -> Response {
-    // Without the handlers feature nothing is appended, so `body` is not mutated.
-    #[cfg_attr(not(feature = "handlers"), allow(unused_mut))]
     let mut body = srvmetrics::server_metrics().render_prometheus();
+    // The active dynamic-config generation, as an info gauge whose `generation`
+    // label is the `daemon/current` content address (`none` on the pure file
+    // baseline). Scraping it across a cluster shows whether every node converged.
+    let generation = daemon.generation().unwrap_or_else(|| "none".to_string());
+    body.push_str(
+        "# HELP boatramp_daemon_config_info Active dynamic daemon-config generation.\n\
+         # TYPE boatramp_daemon_config_info gauge\n",
+    );
+    body.push_str(&format!(
+        "boatramp_daemon_config_info{{generation=\"{generation}\"}} 1\n"
+    ));
     #[cfg(feature = "handlers")]
     if let Some(inner) = handlers.inner.as_ref() {
         body.push_str(&inner.metrics.render_prometheus());
