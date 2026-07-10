@@ -1,0 +1,59 @@
+name: microVM kernel + live boot
+
+# Builds the reproducible `boatramp-vmlinux` microVM kernel and runs the
+# `#[ignore]`d live VMM boot tests against it on a KVM-capable runner — the
+# validation the fast CI can't do (it has no /dev/kvm and no kernel).
+#
+# GitHub-hosted `ubuntu-latest` exposes /dev/kvm (nested virtualization), so the
+# embedded-VMM scratch-image test can actually boot a guest here. Manual + nightly
+# (the build + boot is minutes, not seconds).
+#
+# STATUS: first cut. The kernel derivation (flake `#vmlinux`) and this job need to
+# converge on CI — a Linux kernel build/boot can't be validated on the dev host.
+# Iterate the `structuredExtraConfig` until the scratch-image test boots green,
+# then wire signing + publish (see PLAN-dynamic-config S4).
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 5 * * *" # nightly, after the main nightly job
+
+permissions:
+  contents: read
+
+jobs:
+  vmlinux:
+    name: build kernel + boot a microVM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Confirm KVM is available
+        run: |
+          test -e /dev/kvm && echo "kvm present" || (echo "no /dev/kvm on this runner" && exit 1)
+          ls -l /dev/kvm
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build the microVM kernel
+        run: |
+          nix build .#vmlinux --print-build-logs
+          echo "BOATRAMP_TEST_KERNEL=$(realpath result/vmlinux)" >> "$GITHUB_ENV"
+          file "$(realpath result/vmlinux)"
+
+      - name: Host build deps (mke2fs for the scratch rootfs)
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Boot a microVM from the built kernel (scratch-image live test)
+        # The scratch-image test builds its own ext4 rootfs, so it needs only the
+        # kernel + /dev/kvm + CAP_NET_ADMIN (root) + mke2fs. Run as root for the
+        # tap/bridge setup the backend performs.
+        run: |
+          sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$BOATRAMP_TEST_KERNEL" \
+            cargo test -p boatramp-firecracker --features build \
+            --test embedded_backend_live -- --ignored --nocapture

@@ -222,6 +222,46 @@
             # so the default build stays free of heavy native dependencies.
             default = boatrampBase;
 
+            # ---- Reproducible microVM kernel (`nix build .#vmlinux`) --------
+            # The uncompressed `vmlinux` ELF the embedded VMM boots via
+            # `linux-loader` (`Elf::load`). virtio-mmio/blk/net + ext4 are compiled
+            # IN (no modules, no initrd) to match the backend's `pci=off
+            # root=/dev/vda` + virtio-MMIO cmdline. This is the artifact CI signs +
+            # ships as `boatramp-vmlinux` (see PLAN-dynamic-config S4); the base LTS
+            # is pinned deliberately and bumped per release for kernel-CVE cadence.
+            # NOTE: the kernel config + output path are validated in CI
+            # (.github/workflows/vmlinux.yml) — a kernel build/boot can't run on the
+            # dev host, so iterate `structuredExtraConfig` there until it boots.
+            vmlinux =
+              let
+                micro = pkgs.linux_6_12.override {
+                  structuredExtraConfig = with lib.kernel; {
+                    VIRTIO = yes;
+                    VIRTIO_MMIO = yes;
+                    VIRTIO_BLK = yes;
+                    VIRTIO_NET = yes;
+                    VIRTIO_PCI = yes;
+                    VIRTIO_CONSOLE = yes;
+                    EXT4_FS = yes;
+                    SERIAL_8250 = yes;
+                    SERIAL_8250_CONSOLE = yes;
+                  };
+                  ignoreConfigErrors = true;
+                };
+              in
+              pkgs.runCommand "boatramp-vmlinux" { } ''
+                mkdir -p "$out"
+                if [ -f "${micro.dev}/vmlinux" ]; then
+                  cp "${micro.dev}/vmlinux" "$out/vmlinux"
+                elif [ -f "${micro}/vmlinux" ]; then
+                  cp "${micro}/vmlinux" "$out/vmlinux"
+                else
+                  echo "vmlinux ELF not found in kernel outputs — adjust the derivation" >&2
+                  find "${micro}" "${micro.dev}" \( -name 'vmlinux' -o -name 'bzImage' \) >&2 || true
+                  exit 1
+                fi
+              '';
+
             # ---- Web console (`nix build .#console`) ------------------------
             # The Yew (CSR) SPA, built to wasm32 + bundled by Trunk via crane's
             # `buildTrunkPackage`. The console crate is excluded
