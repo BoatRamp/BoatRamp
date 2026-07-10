@@ -310,6 +310,34 @@ fn describe(key: &str) {
     }
 }
 
+/// The dynamic keys + a one-line note.
+const DYNAMIC_KEYS: &[(&str, &str)] = &[
+    ("default_site", "catch-all site for an unmatched Host"),
+    ("protect_previews", "require a token to view previews"),
+    ("max_upload_bytes", "upload cap (≤ the posture ceiling)"),
+    ("upload_idle_timeout_secs", "abort a stalled upload"),
+    ("max_concurrent_uploads", "cap simultaneous uploads"),
+    ("cluster_rate_limit", "rate-limit via the shared KV"),
+    ("compute.vcpus", "advertised schedulable vCPUs"),
+    ("compute.mem_mib", "advertised schedulable memory (MiB)"),
+    (
+        "compute.default_kernel",
+        "fleet default microVM kernel (KernelRef JSON)",
+    ),
+    (
+        "posture.oidc_require_audience",
+        "tighten-only: require an OIDC audience",
+    ),
+    (
+        "posture.ratelimit_fail_open",
+        "tighten-only: fail closed (set false)",
+    ),
+    (
+        "posture.allow_shared_kernel_compute",
+        "tighten-only: forbid shared-kernel (set false)",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,31 +390,3 @@ mod tests {
         assert!(read_key(&cfg, "default_site").unwrap().contains("unset"));
     }
 }
-
-/// The dynamic keys + a one-line note.
-const DYNAMIC_KEYS: &[(&str, &str)] = &[
-    ("default_site", "catch-all site for an unmatched Host"),
-    ("protect_previews", "require a token to view previews"),
-    ("max_upload_bytes", "upload cap (≤ the posture ceiling)"),
-    ("upload_idle_timeout_secs", "abort a stalled upload"),
-    ("max_concurrent_uploads", "cap simultaneous uploads"),
-    ("cluster_rate_limit", "rate-limit via the shared KV"),
-    ("compute.vcpus", "advertised schedulable vCPUs"),
-    ("compute.mem_mib", "advertised schedulable memory (MiB)"),
-    (
-        "compute.default_kernel",
-        "fleet default microVM kernel (KernelRef JSON)",
-    ),
-    (
-        "posture.oidc_require_audience",
-        "tighten-only: require an OIDC audience",
-    ),
-    (
-        "posture.ratelimit_fail_open",
-        "tighten-only: fail closed (set false)",
-    ),
-    (
-        "posture.allow_shared_kernel_compute",
-        "tighten-only: forbid shared-kernel (set false)",
-    ),
-];
