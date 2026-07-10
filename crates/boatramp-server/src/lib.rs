@@ -1908,9 +1908,27 @@ struct PutComputeResponse {
 /// state (replicas/placement) — the atomic activation pointer.
 async fn put_compute(
     State(deploy): State<DeployStore>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
     Path(name): Path<String>,
-    Json(request): Json<PutComputeRequest>,
+    Json(mut request): Json<PutComputeRequest>,
 ) -> Response {
+    // A workload that omits its kernel uses the node's fleet **default kernel**
+    // (from dynamic daemon config). Substituted at set time; the kernel is
+    // verified against the posture bar at boot. No kernel and no default ⇒ a clear
+    // error rather than a cryptic backend failure.
+    if request.spec.kernel.is_empty() {
+        match daemon.effective().default_kernel.as_ref() {
+            Some(k) => request.spec.kernel = k.source.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "workload has no kernel and no default kernel is configured; set one \
+                     with `boatramp config set compute.default_kernel …`\n",
+                )
+                    .into_response()
+            }
+        }
+    }
     let spec_hash = match deploy.put_compute_spec(&request.spec).await {
         Ok(hash) => hash,
         Err(err) => return deploy_error_response(err),
