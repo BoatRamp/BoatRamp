@@ -224,29 +224,29 @@
 
             # ---- Reproducible microVM kernel (`nix build .#vmlinux`) --------
             # The uncompressed `vmlinux` ELF the embedded VMM boots via
-            # `linux-loader` (`Elf::load`). virtio-mmio/blk/net + ext4 are compiled
-            # IN (no modules, no initrd) to match the backend's `pci=off
-            # root=/dev/vda` + virtio-MMIO cmdline. This is the artifact CI signs +
-            # ships as `boatramp-vmlinux` (see PLAN-dynamic-config S4); the base LTS
-            # is pinned deliberately and bumped per release for kernel-CVE cadence.
-            # NOTE: the kernel config + output path are validated in CI
-            # (.github/workflows/vmlinux.yml) — a kernel build/boot can't run on the
-            # dev host, so iterate `structuredExtraConfig` there until it boots.
+            # `linux-loader` (`Elf::load`). Built from **Firecracker's own microVM
+            # kernel config** (pinned) rather than the full nixpkgs config: minimal,
+            # **no modules, no debug_info** (so the vmlinux is a few MB, not ~380),
+            # with virtio-mmio/blk/net + ext4 + 8250 console compiled IN — matching
+            # the backend's `pci=off root=/dev/vda` + virtio-MMIO cmdline. This is the
+            # artifact CI signs + ships as `boatramp-vmlinux` (PLAN-dynamic-config
+            # S4). Base LTS 6.1 matches the config; bumped per release for CVE cadence.
+            # NOTE: build + boot are validated in CI (.github/workflows/vmlinux.yml) —
+            # they can't run on the dev host.
             vmlinux =
               let
-                micro = pkgs.linux_6_12.override {
-                  structuredExtraConfig = with lib.kernel; {
-                    VIRTIO = yes;
-                    VIRTIO_MMIO = yes;
-                    VIRTIO_BLK = yes;
-                    VIRTIO_NET = yes;
-                    VIRTIO_PCI = yes;
-                    VIRTIO_CONSOLE = yes;
-                    EXT4_FS = yes;
-                    SERIAL_8250 = yes;
-                    SERIAL_8250_CONSOLE = yes;
-                  };
-                  ignoreConfigErrors = true;
+                # Firecracker's published microVM guest config, pinned to a release.
+                fcConfig = pkgs.fetchurl {
+                  url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.10.1/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config";
+                  hash = "sha256-OR2NSY+J5Ws5G+XqSnUB68RObQlDMeyqve/tHaayipY=";
+                };
+                # `linuxManualConfig` uses the Firecracker config as the kernel's
+                # `.config` verbatim (reconciled against the vanilla 6.1 tree via the
+                # kernel's own oldconfig); no modules/debug_info ⇒ a small vmlinux.
+                micro = pkgs.linuxManualConfig {
+                  inherit (pkgs.linux_6_1) version src;
+                  configfile = fcConfig;
+                  allowImportFromDerivation = true;
                 };
               in
               pkgs.runCommand "boatramp-vmlinux" { } ''
