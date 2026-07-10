@@ -6,18 +6,12 @@
        code blocks and reference tables that need room.
 
        NOTE: mdBook sets `html { font-size: 62.5% }`, so 1rem = 10px here — use px
-       to avoid the 1.6× surprise. The theme derives `--sidebar-width` from
-       `min(--sidebar-target-width, 80vw)` and its resize JS rewrites the target at
-       runtime, so set `--sidebar-width` directly (nothing else writes it). */
-    --sidebar-width: 350px;
+       to avoid the 1.6× surprise. Setting the *target* is enough: the theme
+       computes `--sidebar-width = min(--sidebar-target-width, 80vw)`, so the
+       sidebar is 350px and only caps below a ~440px viewport, and drag-to-resize
+       still works. */
     --sidebar-target-width: 350px;
     --content-max-width: 900px;
-}
-
-/* Belt and suspenders: pin the element width too, so a runtime inline
-   `--sidebar-target-width` from the resize handle can never shrink it. */
-.sidebar {
-    width: 350px !important;
 }
 
 /* Slightly tighter, more readable code blocks. */
