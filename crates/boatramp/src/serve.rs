@@ -234,6 +234,51 @@ const COMPUTE_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_se
 /// snapshotted + parked. A requested workload is woken on demand.
 const COMPUTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The posture-scaled kernel-trust gate wired into the compute backends: it runs
+/// [`boatramp_core::kernel_trust::verify_kernel`] on the staged kernel right
+/// before boot. The always-on check is the content hash; under the strict
+/// (multi-tenant) posture it additionally requires the pinned hash to be on the
+/// static allow-list and to carry a signature — sourced from the **live fleet
+/// default kernel** — verifying against a static signing key. No daemon, or a hash
+/// that isn't the current signed default, has no signature source and so **fails
+/// closed** under strict: the kernel does not boot.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PostureKernelVerifier {
+    strict: bool,
+    signing_keys: Vec<String>,
+    allowed_hashes: Vec<String>,
+    daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
+}
+
+#[cfg(target_os = "linux")]
+impl boatramp_firecracker::KernelVerifier for PostureKernelVerifier {
+    fn verify(&self, bytes: &[u8], expected_hash: &str) -> Result<(), String> {
+        // The only signature we trust for this hash is the one on the current
+        // fleet default kernel (the operator-vetted kernel); any other hash has no
+        // signature source and fails the strict bar.
+        let sig = self
+            .daemon
+            .as_ref()
+            .and_then(|d| d.effective().default_kernel.clone())
+            .filter(|dk| dk.sha256 == expected_hash)
+            .and_then(|dk| dk.sig);
+        let kref = boatramp_core::daemon_config::KernelRef {
+            source: expected_hash.to_string(),
+            sha256: expected_hash.to_string(),
+            sig,
+        };
+        boatramp_core::kernel_trust::verify_kernel(
+            bytes,
+            &kref,
+            self.strict,
+            &self.signing_keys,
+            &self.allowed_hashes,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// Build this node's compute [`BackendRegistry`] + scheduler [`Node`] inventory
 /// from the optional `[compute]` config. Backends
 /// are **capability-detected**: a reachable Docker daemon ⇒ `docker`; Linux ⇒ the
@@ -245,6 +290,8 @@ async fn build_compute(
     storage: std::sync::Arc<dyn boatramp_core::Storage>,
     data_dir: &std::path::Path,
     node_id: u64,
+    strict: bool,
+    daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
 ) -> (
     boatramp_core::compute::BackendRegistry,
     boatramp_core::compute::Node,
@@ -303,6 +350,14 @@ async fn build_compute(
         ) {
             (Ok(self_exe), Ok(pool)) => {
                 let gateway = pool.gateway().to_string();
+                // Verify-before-boot gate for every kernel this backend stages.
+                let verifier: Arc<dyn boatramp_firecracker::KernelVerifier> =
+                    Arc::new(PostureKernelVerifier {
+                        strict,
+                        signing_keys: cfg.kernel_signing_pubkeys.clone(),
+                        allowed_hashes: cfg.kernel_allowed_hashes.clone(),
+                        daemon: daemon.clone(),
+                    });
                 match boatramp_firecracker::EmbeddedVmmBackend::new(
                     storage.clone(),
                     self_exe, // re-exec'd as `__vmm-run` per VM (jailed subprocess)
@@ -310,6 +365,7 @@ async fn build_compute(
                     cfg.bridge.clone(),
                     gateway,
                     &cfg.subnet,
+                    verifier,
                 ) {
                     Ok(vmm) => {
                         backends.insert("vmm-embedded".to_string(), std::sync::Arc::new(vmm));
@@ -325,6 +381,8 @@ async fn build_compute(
     }
 
     let _ = (&storage, data_dir); // used only on Linux (container / VMM backends)
+    #[cfg(not(target_os = "linux"))]
+    let _ = (strict, &daemon); // the kernel-trust verifier is wired on Linux only
 
     let free_vcpus = if cfg.vcpus > 0 {
         cfg.vcpus
@@ -709,7 +767,15 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // the "leader". Backends are built from the `[compute]` config + capability
     // detection; a no-op when none are registered. Detached for the server's life.
     let (compute_backends, compute_node) =
-        build_compute(config.compute.as_ref(), compute_storage, &data_dir, 0).await;
+        build_compute(
+            config.compute.as_ref(),
+            compute_storage,
+            &data_dir,
+            0,
+            !posture.allow_shared_kernel_compute,
+            options.daemon_runtime.clone(),
+        )
+        .await;
     let _reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -1273,6 +1339,8 @@ async fn run_cluster(
             compute_storage,
             &data_dir,
             cluster_cfg.node_id,
+            !options.posture.allow_shared_kernel_compute,
+            options.daemon_runtime.clone(),
         )
         .await;
         let _reconcile = boatramp_server::spawn_compute_reconcile(

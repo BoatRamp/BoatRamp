@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use boatramp_core::compute::{Artifact, ComputeBackend, ComputeSpec, LaunchRequest};
 use boatramp_core::{GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_firecracker::embedded_backend::EmbeddedVmmBackend;
+use boatramp_firecracker::HashOnlyVerifier;
 
 /// A blob backend that's never used — `launch` is fed a `VmImages` artifact made
 /// from local file paths, so `materialize`/`Storage::get` are bypassed.
@@ -132,6 +133,7 @@ async fn launches_pings_and_stops_a_microvm() {
         BRIDGE.to_string(),
         GATEWAY.to_string(),
         SUBNET,
+        Arc::new(HashOnlyVerifier),
     )
     .expect("build backend");
 
@@ -265,6 +267,7 @@ async fn serves_an_oci_workload_end_to_end() {
         BRIDGE2.to_string(),
         GATEWAY2.to_string(),
         SUBNET2,
+        Arc::new(HashOnlyVerifier),
     )
     .expect("build backend");
 
@@ -382,6 +385,7 @@ async fn serves_a_shell_less_scratch_image() {
         BRIDGE3.to_string(),
         GATEWAY3.to_string(),
         SUBNET3,
+        Arc::new(HashOnlyVerifier),
     )
     .expect("build backend");
 
@@ -497,6 +501,7 @@ async fn snapshots_and_restores_a_serving_workload() {
         BRIDGE4.to_string(),
         GATEWAY4.to_string(),
         SUBNET4,
+        Arc::new(HashOnlyVerifier),
     )
     .expect("build backend");
 
@@ -656,6 +661,7 @@ async fn persistent_volume_survives_a_restart() {
         BRIDGE5.to_string(),
         GATEWAY5.to_string(),
         SUBNET5,
+        Arc::new(HashOnlyVerifier),
     )
     .expect("build backend");
 

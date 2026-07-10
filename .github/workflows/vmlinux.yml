@@ -53,7 +53,18 @@ jobs:
         # The scratch-image test builds its own ext4 rootfs, so it needs only the
         # kernel + /dev/kvm + CAP_NET_ADMIN (root) + mke2fs. Run as root for the
         # tap/bridge setup the backend performs.
+        #
+        # The `embedded_backend_live` file is gated on `embedded` + `backend`; the
+        # scratch-image test additionally needs `build`. Enabling all three is what
+        # makes the test compile in — with `build` alone the file is cfg'd out and
+        # the step passes on **0 tests**. So we also assert a test actually ran, so
+        # a future feature-graph slip can't silently regress to a vacuous green.
         run: |
+          set -o pipefail
           sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$BOATRAMP_TEST_KERNEL" \
-            cargo test -p boatramp-firecracker --features build \
-            --test embedded_backend_live -- --ignored --nocapture
+            cargo test -p boatramp-firecracker --features build,backend,embedded \
+            --test embedded_backend_live -- --ignored --nocapture 2>&1 | tee boot-test.log
+          if ! grep -qE 'running [1-9][0-9]* tests?' boot-test.log; then
+            echo "::error::boot test ran 0 tests — the embedded backend was cfg'd out (feature graph regressed)" >&2
+            exit 1
+          fi

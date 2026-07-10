@@ -84,6 +84,14 @@ pub mod backend;
 #[cfg(all(feature = "backend", unix))]
 pub use backend::VmmBackend;
 
+// Verify-before-boot: the trust gate a staged kernel clears before it is loaded
+// into a guest. The trait + relaxed hash-only verifier live here (no auth deps);
+// the posture-scaled signature-checking impl lives in the server.
+#[cfg(feature = "backend")]
+pub mod kernel_verify;
+#[cfg(feature = "backend")]
+pub use kernel_verify::{HashOnlyVerifier, KernelVerifier};
+
 // The embedded VMM `ComputeBackend` impl: runs each replica as an
 // in-process `EmbeddedVmm` instead of an external `firecracker` process. Needs
 // both `backend` (the trait + async runtime) and `embedded` (the KVM runtime);

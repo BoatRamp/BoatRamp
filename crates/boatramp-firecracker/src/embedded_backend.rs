@@ -218,13 +218,16 @@ pub struct EmbeddedVmmBackend {
     ipam: Mutex<IpPool>,
     /// Running VMs, keyed by [`vm_id`].
     running: Mutex<HashMap<String, RunningVm>>,
+    /// Verify-before-boot gate: the staged kernel must clear it before it loads.
+    verifier: Arc<dyn crate::KernelVerifier>,
 }
 
 impl EmbeddedVmmBackend {
     /// Build an embedded VMM backend: stage blobs from `storage` under `data_dir`,
     /// attach taps to `bridge` (whose address `gateway` the guests route through),
     /// hand out guest IPs from `subnet` (e.g. `10.0.0.0/24`), and run each VM by
-    /// re-execing `self_exe` (this binary) as [`VMM_RUN_SUBCOMMAND`].
+    /// re-execing `self_exe` (this binary) as [`VMM_RUN_SUBCOMMAND`]. Every staged
+    /// kernel clears `verifier` (verify-before-boot) before a guest is launched.
     pub fn new(
         storage: Arc<dyn Storage>,
         self_exe: PathBuf,
@@ -232,6 +235,7 @@ impl EmbeddedVmmBackend {
         bridge: String,
         gateway: String,
         subnet: &str,
+        verifier: Arc<dyn crate::KernelVerifier>,
     ) -> Result<Self, BackendError> {
         let ipam = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
         Ok(Self {
@@ -242,6 +246,7 @@ impl EmbeddedVmmBackend {
             gateway,
             ipam: Mutex::new(ipam),
             running: Mutex::new(HashMap::new()),
+            verifier,
         })
     }
 
@@ -660,6 +665,17 @@ impl ComputeBackend for EmbeddedVmmBackend {
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
         let rootfs_path = self.stage_blob(&spec.rootfs, "rootfs", ".ext4").await?;
         let kernel_path = self.stage_blob(&spec.kernel, "kernels", "").await?;
+        // Verify-before-boot: the staged kernel is ring-0 code, so it clears the
+        // posture bar (content hash — always; allow-list + signature under strict)
+        // before any guest loads it. A failure aborts materialize; nothing boots.
+        let kernel_bytes = tokio::fs::read(&kernel_path)
+            .await
+            .map_err(|e| BackendError::Materialize(format!("read staged kernel: {e}")))?;
+        self.verifier
+            .verify(&kernel_bytes, &spec.kernel)
+            .map_err(|e| {
+                BackendError::Materialize(format!("kernel failed verify-before-boot: {e}"))
+            })?;
         Ok(Artifact::VmImages {
             rootfs_path,
             kernel_path,
