@@ -612,10 +612,8 @@ pub fn router_with(
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        // Explicit by-name admin/testing route. `/_sites/<name>/…` is the
-        // going-forward name; `/sites/<name>/…` is a deprecated alias (warns once).
+        // Explicit by-name admin/testing route: `/_sites/<name>/…`.
         .route("/_sites/*rest", any(serve_sites))
-        .route("/sites/*rest", any(serve_sites))
         .route("/_deploy/*rest", get(serve_preview))
         .fallback(serve_by_host)
         .with_state(deploy)
@@ -1929,25 +1927,11 @@ struct Visitor<'a> {
     limiter: &'a dyn RateLimitStore,
 }
 
-/// Warn (once per process) that the legacy `/sites/<name>/…` prefix was hit,
-/// pointing at the going-forward `/_sites/<name>/…` name.
-fn warn_legacy_sites_prefix_once() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            "the `/sites/<name>/` serving prefix is deprecated; use \
-             `/_sites/<name>/` (an admin/testing route), or serve the site \
-             at root via host routing"
-        );
-    }
-}
-
-/// Serve under the explicit by-name admin/testing route:
-/// `/_sites/<site>/...` (the going-forward name) or the deprecated
-/// `/sites/<site>/...` alias. The catch-all captures `<site>` or
-/// `<site>/<path...>`. Accepts any method so a proxy rewrite can forward
-/// non-`GET` requests. This route is not host-routed and does not serve a
-/// root-mounted site — for that, use host routing (see the addressing docs).
+/// Serve under the explicit by-name admin/testing route `/_sites/<site>/...`.
+/// The catch-all captures `<site>` or `<site>/<path...>`. Accepts any method so a
+/// proxy rewrite can forward non-`GET` requests. This route is not host-routed and
+/// does not serve a root-mounted site — for that, use host routing (see the
+/// addressing docs).
 async fn serve_sites(
     State(deploy): State<DeployStore>,
     Extension(limiter): Extension<Arc<dyn RateLimitStore>>,
@@ -1956,14 +1940,10 @@ async fn serve_sites(
     request: Request,
 ) -> Response {
     let raw = request.uri().path();
-    let rest = if let Some(rest) = raw.strip_prefix("/_sites/") {
-        rest.trim_start_matches('/')
-    } else {
-        warn_legacy_sites_prefix_once();
-        raw.strip_prefix("/sites/")
-            .unwrap_or("")
-            .trim_start_matches('/')
-    };
+    let rest = raw
+        .strip_prefix("/_sites/")
+        .unwrap_or("")
+        .trim_start_matches('/');
     let (site, path) = rest.split_once('/').unwrap_or((rest, ""));
     if site.is_empty() {
         return not_found();
@@ -1973,7 +1953,7 @@ async fn serve_sites(
         peer: peer.ip(),
         limiter: limiter.as_ref(),
     };
-    // The explicit `/sites/<name>/` admin/testing route is not host-routed, so
+    // The explicit `/_sites/<name>/` admin/testing route is not host-routed, so
     // transport/canonical redirects don't apply.
     serve_request(
         &deploy,
@@ -1989,7 +1969,7 @@ async fn serve_sites(
 
 /// Virtualhost fallback: resolve the site from the `Host` header, serve the
 /// request path. Catches everything not matched by `/healthz`, `/api/*`, or the
-/// explicit `/sites/*` route.
+/// explicit `/_sites/*` route.
 #[allow(clippy::too_many_arguments)] // axum extractors, not a real parameter list
 async fn serve_by_host(
     State(deploy): State<DeployStore>,
@@ -4277,7 +4257,7 @@ async fn dispatch_handler(
     // request mutation the host makes beyond the URI; no application semantics.
     set_forwarded_headers(&mut request, client_ip);
     // The guest sees the *site-relative* path via a well-formed absolute URI
-    // (wasi:http needs scheme + authority); the public `/sites/<site>/…` prefix
+    // (wasi:http needs scheme + authority); the public `/_sites/<site>/…` prefix
     // and host routing are the server's concern, not the handler's.
     rewrite_request_uri(&mut request, request_path);
     // Handlers must be enabled for the site (deny by default).
@@ -4388,7 +4368,7 @@ fn set_forwarded_headers(request: &mut Request, client_ip: IpAddr) {
 }
 
 /// Rewrite a request's URI to an absolute `http://{authority}{site-relative
-/// path}{?query}` so the handler sees its own path (not the `/sites/<site>/…`
+/// path}{?query}` so the handler sees its own path (not the `/_sites/<site>/…`
 /// or host-routed form) and `wasi:http` gets a well-formed request.
 #[cfg(feature = "handlers")]
 fn rewrite_request_uri(request: &mut Request, request_path: &str) {

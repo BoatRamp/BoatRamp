@@ -348,21 +348,20 @@ fn post(uri: &str) -> Request<Body> {
 #[tokio::test]
 async fn index_clean_urls_and_security_header() {
     let deploy = seed().await;
-    let (status, headers, body) = send(&deploy, get("/sites/test/")).await;
+    let (status, headers, body) = send(&deploy, get("/_sites/test/")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"<h1>home</h1>");
     assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 
     // clean URL: /about -> about.html
-    let (status, _, body) = send(&deploy, get("/sites/test/about")).await;
+    let (status, _, body) = send(&deploy, get("/_sites/test/about")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"<h1>about</h1>");
 }
 
 #[tokio::test]
-async fn by_name_route_admin_prefix_and_legacy_alias() {
-    // The going-forward `/_sites/<name>/` admin route and the deprecated
-    // `/sites/<name>/` alias both serve the same by-name content.
+async fn by_name_route_serves_site() {
+    // Sites are reachable by name at `/_sites/<name>/…` (admin/testing).
     let deploy = seed().await;
     let (status, _, body) = send(&deploy, get("/_sites/test/")).await;
     assert_eq!(status, StatusCode::OK);
@@ -372,20 +371,19 @@ async fn by_name_route_admin_prefix_and_legacy_alias() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"<h1>about</h1>");
 
-    // Legacy alias still works (with a one-time deprecation warning).
-    let (status, _, body) = send(&deploy, get("/sites/test/")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"<h1>home</h1>");
+    // The old `/sites/<name>/` prefix is gone (no legacy alias).
+    let (status, _, _) = send(&deploy, get("/sites/test/")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn redirect_and_custom_404() {
     let deploy = seed().await;
-    let (status, headers, _) = send(&deploy, get("/sites/test/old")).await;
+    let (status, headers, _) = send(&deploy, get("/_sites/test/old")).await;
     assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
     assert_eq!(headers[header::LOCATION], "/new");
 
-    let (status, _, body) = send(&deploy, get("/sites/test/does-not-exist")).await;
+    let (status, _, body) = send(&deploy, get("/_sites/test/does-not-exist")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, b"<h1>nope</h1>"); // custom error document
 }
@@ -393,10 +391,10 @@ async fn redirect_and_custom_404() {
 #[tokio::test]
 async fn conditional_304() {
     let deploy = seed().await;
-    let (_, headers, _) = send(&deploy, get("/sites/test/")).await;
+    let (_, headers, _) = send(&deploy, get("/_sites/test/")).await;
     let etag = headers[header::ETAG].to_str().unwrap().to_string();
 
-    let mut req = get("/sites/test/");
+    let mut req = get("/_sites/test/");
     req.headers_mut()
         .insert(header::IF_NONE_MATCH, etag.parse().unwrap());
     let (status, _, body) = send(&deploy, req).await;
@@ -407,7 +405,7 @@ async fn conditional_304() {
 #[tokio::test]
 async fn range_206_and_416() {
     let deploy = seed().await;
-    let mut req = get("/sites/test/big.txt");
+    let mut req = get("/_sites/test/big.txt");
     req.headers_mut()
         .insert(header::RANGE, "bytes=0-9".parse().unwrap());
     let (status, headers, body) = send(&deploy, req).await;
@@ -415,7 +413,7 @@ async fn range_206_and_416() {
     assert_eq!(body.len(), 10);
     assert_eq!(headers[header::CONTENT_RANGE], "bytes 0-9/100");
 
-    let mut req = get("/sites/test/big.txt");
+    let mut req = get("/_sites/test/big.txt");
     req.headers_mut()
         .insert(header::RANGE, "bytes=500-600".parse().unwrap());
     let (status, _, _) = send(&deploy, req).await;
@@ -425,7 +423,7 @@ async fn range_206_and_416() {
 #[tokio::test]
 async fn multi_range_206_multipart_byteranges() {
     let deploy = seed().await; // big.txt is 100 bytes
-    let mut req = get("/sites/test/big.txt");
+    let mut req = get("/_sites/test/big.txt");
     req.headers_mut()
         .insert(header::RANGE, "bytes=0-9,20-29,90-".parse().unwrap());
     let (status, headers, body) = send(&deploy, req).await;
@@ -946,14 +944,14 @@ async fn gateway_bridges_websocket_upgrade() {
 async fn compression_negotiation_and_header_rules() {
     let deploy = seed().await;
     // No Accept-Encoding -> identity, with the header-rule cache-control.
-    let (status, headers, body) = send(&deploy, get("/sites/test/app.js")).await;
+    let (status, headers, body) = send(&deploy, get("/_sites/test/app.js")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, JS_IDENTITY);
     assert_eq!(headers[header::CACHE_CONTROL], "immutable");
     assert_eq!(headers[header::VARY], "accept-encoding");
 
     // Accept-Encoding: br -> serve the br variant blob.
-    let mut req = get("/sites/test/app.js");
+    let mut req = get("/_sites/test/app.js");
     req.headers_mut()
         .insert(header::ACCEPT_ENCODING, "br".parse().unwrap());
     let (status, headers, body) = send(&deploy, req).await;
@@ -965,7 +963,7 @@ async fn compression_negotiation_and_header_rules() {
 #[tokio::test]
 async fn non_get_to_static_is_405() {
     let deploy = seed().await;
-    let (status, headers, _) = send(&deploy, post("/sites/test/")).await;
+    let (status, headers, _) = send(&deploy, post("/_sites/test/")).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(headers[header::ALLOW], "GET, HEAD");
 }
@@ -1133,7 +1131,7 @@ async fn control_plane_requires_token() {
     assert_eq!(status, StatusCode::OK);
 
     // Public serving is never token-gated.
-    let (status, _, _) = send(&deploy, get("/sites/test/")).await;
+    let (status, _, _) = send(&deploy, get("/_sites/test/")).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -1405,7 +1403,7 @@ async fn access_control_basic_auth_and_ip() {
         .await
         .unwrap();
 
-    let (status, headers, _) = send(&deploy, get("/sites/test/")).await;
+    let (status, headers, _) = send(&deploy, get("/_sites/test/")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(headers[header::WWW_AUTHENTICATE]
         .to_str()
@@ -1414,7 +1412,7 @@ async fn access_control_basic_auth_and_ip() {
 
     // With credentials -> 200.
     let creds = base64_encode("u:p");
-    let mut req = get("/sites/test/");
+    let mut req = get("/_sites/test/");
     req.headers_mut().insert(
         header::AUTHORIZATION,
         format!("Basic {creds}").parse().unwrap(),
@@ -1443,7 +1441,7 @@ async fn access_control_basic_auth_and_ip() {
     let (status, _, _) = send_as(
         &deploy,
         Auth::disabled(),
-        get("/sites/test/"),
+        get("/_sites/test/"),
         [127, 0, 0, 1],
     )
     .await;
@@ -1542,7 +1540,7 @@ async fn handler_route_dispatches_through_engine() {
     for expected in ["hits=1\n", "hits=2\n"] {
         let mut req = Request::builder()
             .method("GET")
-            .uri("/sites/blog/count")
+            .uri("/_sites/blog/count")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut()
@@ -1688,7 +1686,7 @@ async fn activation_during_traffic_drops_no_requests() {
         handles.push(tokio::spawn(async move {
             let mut req = Request::builder()
                 .method("GET")
-                .uri("/sites/blog/count")
+                .uri("/_sites/blog/count")
                 .body(Body::empty())
                 .unwrap();
             req.extensions_mut()
@@ -2185,7 +2183,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
     for expected in ["rows=1\n", "rows=2\n"] {
         let mut req = Request::builder()
             .method("GET")
-            .uri("/sites/blog/count")
+            .uri("/_sites/blog/count")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut()
@@ -2284,7 +2282,7 @@ async fn per_site_timeout_cap_applies() {
 
     let mut req = Request::builder()
         .method("GET")
-        .uri("/sites/blog/loop")
+        .uri("/_sites/blog/loop")
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
@@ -2356,7 +2354,7 @@ async fn stream_route_fans_out_text_and_binary_events() {
 
     let mut req = Request::builder()
         .method("GET")
-        .uri("/sites/blog/events")
+        .uri("/_sites/blog/events")
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
@@ -2461,7 +2459,7 @@ async fn stream_per_site_connection_cap_returns_503() {
         async move {
             let mut req = Request::builder()
                 .method("GET")
-                .uri("/sites/blog/events")
+                .uri("/_sites/blog/events")
                 .body(Body::empty())
                 .unwrap();
             req.extensions_mut()
@@ -2550,7 +2548,7 @@ async fn websocket_stream_fans_out_and_publishes() {
     // observable (live broadcast only delivers post-subscribe messages).
     let mut ingest = log.subscribe("blog/ingest", None);
 
-    let url = format!("ws://127.0.0.1:{port}/sites/blog/ws");
+    let url = format!("ws://127.0.0.1:{port}/_sites/blog/ws");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("websocket connects");
@@ -2761,7 +2759,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
     // Drive one handler invocation (records an http metric).
     let mut req = Request::builder()
         .method("GET")
-        .uri("/sites/blog/count")
+        .uri("/_sites/blog/count")
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
@@ -2885,7 +2883,7 @@ async fn guest_logs_captured_and_served() {
     // Invoke the handler; it prints to stdout + stderr before responding.
     let mut req = Request::builder()
         .method("GET")
-        .uri("/sites/blog/log")
+        .uri("/_sites/blog/log")
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
@@ -3093,7 +3091,7 @@ async fn handler_env_injected_host_env_not_inherited() {
 
     let mut req = Request::builder()
         .method("GET")
-        .uri("/sites/blog/env")
+        .uri("/_sites/blog/env")
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
@@ -3295,7 +3293,7 @@ async fn cache_control_smart_defaults_for_assets_and_html() {
     deploy.activate("fp", &id).await.unwrap();
 
     // Fingerprinted asset → immutable, no config or header rule needed.
-    let (status, headers, _) = send(&deploy, get("/sites/fp/assets/app.a1b2c3d4.js")).await;
+    let (status, headers, _) = send(&deploy, get("/_sites/fp/assets/app.a1b2c3d4.js")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers[header::CACHE_CONTROL],
@@ -3303,7 +3301,7 @@ async fn cache_control_smart_defaults_for_assets_and_html() {
     );
 
     // HTML entry → must-revalidate so a new deploy is picked up.
-    let (status, headers, _) = send(&deploy, get("/sites/fp/index.html")).await;
+    let (status, headers, _) = send(&deploy, get("/_sites/fp/index.html")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers[header::CACHE_CONTROL],
@@ -3804,7 +3802,7 @@ async fn oversized_variant_is_not_served() {
         .unwrap();
     deploy.activate("v", &id).await.unwrap();
 
-    let mut req = get("/sites/v/a.js");
+    let mut req = get("/_sites/v/a.js");
     req.headers_mut()
         .insert(header::ACCEPT_ENCODING, "br".parse().unwrap());
     let (status, headers, body) = send(&deploy, req).await;

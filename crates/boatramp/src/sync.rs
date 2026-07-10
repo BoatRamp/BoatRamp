@@ -225,7 +225,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
         .error_for_status()?;
 
     println!("activated {site} -> {}", created.id);
-    println!("now serving {server}/sites/{site}/");
+    println!("now serving {server}/_sites/{site}/");
     println!("immutable preview: {server}/_deploy/{}/", created.id);
     Ok(())
 }
