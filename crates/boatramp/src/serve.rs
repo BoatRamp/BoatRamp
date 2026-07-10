@@ -664,9 +664,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     if cluster_rate_limit {
         options.cluster_rate_limit_kv = Some(kv_backend.clone());
     }
-    spawn_sighup_reload(kv.clone());
+    // The dynamic daemon-config runtime, built here so SIGHUP and the shared-store
+    // changelog can **wake** an immediate reload (push-driven convergence) rather
+    // than relying on the runtime's backstop tick.
+    let daemon_runtime = Arc::new(boatramp_server::DaemonRuntime::new(
+        boatramp_server::config_baseline(&options),
+    ));
+    options.daemon_runtime = Some(daemon_runtime.clone());
+    spawn_sighup_reload(kv.clone(), Some(daemon_runtime.clone()));
     if let Some(changelog) = changelog {
-        spawn_cache_poller(changelog, kv.clone());
+        spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()));
     }
     let auth = configure_auth(
         serve_cfg.signer.as_ref(),
@@ -753,7 +760,11 @@ const CHANGELOG_RETENTION_SECS: u64 = 60;
 /// second, pop the keys peers changed; periodically trim the feed; and every few
 /// minutes do a full flush as the gap backstop (rare, so no thundering herd).
 /// Detached for the server's lifetime.
-fn spawn_cache_poller(changelog: Arc<Changelog>, cache: Arc<dyn KvStore>) {
+fn spawn_cache_poller(
+    changelog: Arc<Changelog>,
+    cache: Arc<dyn KvStore>,
+    daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
+) {
     use std::time::Duration;
     tokio::spawn(async move {
         let poll = Duration::from_secs(1);
@@ -766,6 +777,12 @@ fn spawn_cache_poller(changelog: Arc<Changelog>, cache: Arc<dyn KvStore>) {
             let changed = changelog.poll(&mut cursor).await;
             if !changed.is_empty() {
                 cache.invalidate_keys(&changed);
+                // A peer wrote dynamic daemon config → wake an immediate reload.
+                if let Some(daemon) = &daemon {
+                    if changed.iter().any(|k| k.starts_with("daemon/")) {
+                        daemon.notify_reload();
+                    }
+                }
             }
             since_trim += poll;
             if since_trim >= Duration::from_secs(30) {
@@ -787,7 +804,7 @@ fn spawn_cache_poller(changelog: Arc<Changelog>, cache: Arc<dyn KvStore>) {
 /// signal (e.g. after another node wrote new config to the shared/replicated
 /// store). No-op on non-Unix. Detached for the server's lifetime.
 #[cfg(unix)]
-fn spawn_sighup_reload(kv: Arc<dyn KvStore>) {
+fn spawn_sighup_reload(kv: Arc<dyn KvStore>, daemon: Option<Arc<boatramp_server::DaemonRuntime>>) {
     tokio::spawn(async move {
         let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
             Ok(sig) => sig,
@@ -798,13 +815,21 @@ fn spawn_sighup_reload(kv: Arc<dyn KvStore>) {
         };
         while hup.recv().await.is_some() {
             kv.invalidate_cache();
+            // Wake an immediate daemon-config reload (push, not the backstop tick).
+            if let Some(daemon) = &daemon {
+                daemon.notify_reload();
+            }
             tracing::info!("SIGHUP: invalidated config cache (next reads reload from the store)");
         }
     });
 }
 
 #[cfg(not(unix))]
-fn spawn_sighup_reload(_kv: Arc<dyn KvStore>) {}
+fn spawn_sighup_reload(
+    _kv: Arc<dyn KvStore>,
+    _daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
+) {
+}
 
 /// In a TLS mode, spawn a detached plain-HTTP listener on `addr` that
 /// 308-redirects every request to HTTPS (dual-listener). Fire and

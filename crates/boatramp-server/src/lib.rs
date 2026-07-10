@@ -332,6 +332,10 @@ pub struct ServerOptions {
     /// scheme when `X-Forwarded-Proto` can't be trusted. Default
     /// `false` (plain HTTP).
     pub served_over_tls: bool,
+    /// A pre-built dynamic daemon-config runtime. `serve` supplies one (built via
+    /// [`config_baseline`] + [`DaemonRuntime::new`]) so it can wake it on
+    /// SIGHUP / changelog; `None` (tests, embedders) ⇒ the router builds its own.
+    pub daemon_runtime: Option<Arc<DaemonRuntime>>,
 }
 
 /// The listener's own connection scheme (`true` = `https`), carried as an
@@ -352,9 +356,20 @@ struct ImplicitRouting(bool);
 /// operational values through [`effective`](Self::effective); the daemon-config
 /// API and the SIGHUP handler [`reload`](Self::reload) it from the store, so a
 /// change converges without a restart.
+/// Backstop interval for re-resolving the dynamic daemon config. Convergence is
+/// **notification-driven**: a local write applies immediately, and a SIGHUP or a
+/// shared-store changelog invalidation of `daemon/*` wakes an immediate reload via
+/// [`DaemonRuntime::notify_reload`]. This long tick only backstops the one path
+/// not yet hooked to a notification — a Raft **follower** applying a leader's
+/// replicated write — so it converges within this bound even absent a poke.
+const DAEMON_RELOAD_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct DaemonRuntime {
     baseline: boatramp_core::daemon_config::ConfigBaseline,
     state: std::sync::RwLock<DaemonState>,
+    /// Woken (by SIGHUP / changelog / a local write) to trigger an immediate
+    /// reload instead of waiting for the backstop tick.
+    reload: tokio::sync::Notify,
 }
 
 struct DaemonState {
@@ -362,10 +377,31 @@ struct DaemonState {
     generation: Option<String>,
 }
 
+/// The daemon-config file baseline derived from [`ServerOptions`] (the resolved
+/// `boatramp.cfg`). `serve` uses this to build a [`DaemonRuntime`] it can wake on
+/// SIGHUP/changelog; the posture's upload cap is the ceiling a dynamic override
+/// may not exceed.
+pub fn config_baseline(options: &ServerOptions) -> boatramp_core::daemon_config::ConfigBaseline {
+    boatramp_core::daemon_config::ConfigBaseline {
+        default_site: options.default_site.clone(),
+        protect_previews: options.protect_previews,
+        max_upload_bytes: options.limits.max_upload_bytes.unwrap_or(0),
+        upload_idle_timeout_secs: options.limits.upload_idle_timeout.map(|d| d.as_secs()),
+        max_concurrent_uploads: options.limits.max_concurrent_uploads.map(|n| n as u64),
+        cluster_rate_limit: options.cluster_rate_limit_kv.is_some(),
+        compute_vcpus: 0,
+        compute_mem_mib: 0,
+        max_upload_ceiling: options.posture.max_upload_bytes,
+        max_concurrent_uploads_ceiling: None,
+        posture: options.posture,
+    }
+}
+
 impl DaemonRuntime {
     /// Build with the file baseline; the effective config starts equal to the
-    /// baseline (no dynamic override) until [`reload`](Self::reload) runs.
-    fn new(baseline: boatramp_core::daemon_config::ConfigBaseline) -> Self {
+    /// baseline (no dynamic override) until [`reload`](Self::reload) runs. `serve`
+    /// builds this (via [`config_baseline`]) so it can wake it on SIGHUP/changelog.
+    pub fn new(baseline: boatramp_core::daemon_config::ConfigBaseline) -> Self {
         let effective =
             Arc::new(boatramp_core::daemon_config::DaemonConfig::default().resolve(&baseline));
         Self {
@@ -374,7 +410,15 @@ impl DaemonRuntime {
                 effective,
                 generation: None,
             }),
+            reload: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Wake an immediate re-resolve from the store. Called by the SIGHUP handler,
+    /// the shared-store changelog poller (when a `daemon/*` key changed), and after
+    /// a local write — so convergence is push-driven, not poll-driven.
+    pub fn notify_reload(&self) {
+        self.reload.notify_one();
     }
 
     /// The current effective operational config.
@@ -525,24 +569,13 @@ pub fn router_with(
     // The listener's own scheme, for deriving the request scheme when
     // `X-Forwarded-Proto` isn't from a trusted proxy.
     let served_over_tls = ServedOverTls(options.served_over_tls);
-    // The dynamic daemon-config runtime: file baseline ⊕ stored overrides, hot-
-    // swapped on a write or SIGHUP. Built before `options` fields are moved; the
-    // posture's upload cap is the ceiling a dynamic override may not exceed.
-    let daemon = Arc::new(DaemonRuntime::new(
-        boatramp_core::daemon_config::ConfigBaseline {
-            default_site: options.default_site.clone(),
-            protect_previews: options.protect_previews,
-            max_upload_bytes: options.limits.max_upload_bytes.unwrap_or(0),
-            upload_idle_timeout_secs: options.limits.upload_idle_timeout.map(|d| d.as_secs()),
-            max_concurrent_uploads: options.limits.max_concurrent_uploads.map(|n| n as u64),
-            cluster_rate_limit: options.cluster_rate_limit_kv.is_some(),
-            compute_vcpus: 0,
-            compute_mem_mib: 0,
-            max_upload_ceiling: posture.max_upload_bytes,
-            max_concurrent_uploads_ceiling: None,
-            posture,
-        },
-    ));
+    // The dynamic daemon-config runtime: file baseline ⊕ stored overrides. When
+    // `serve` supplies one (so it can wake it on SIGHUP/changelog) we use it; else
+    // (tests, embedders) we build one from the options' baseline.
+    let daemon = options
+        .daemon_runtime
+        .clone()
+        .unwrap_or_else(|| Arc::new(DaemonRuntime::new(config_baseline(&options))));
     // A deploy handle for the daemon-config startup reload, captured before
     // `deploy` is moved into the router state below.
     let daemon_init_deploy = deploy.clone();
@@ -742,14 +775,22 @@ pub fn router_with(
     let app = app.layer(Extension(posture));
     // The listener's connection scheme.
     let app = app.layer(Extension(served_over_tls));
-    // The dynamic daemon-config runtime, for the API + request-path reads. Load
-    // any stored config once at startup (fresh servers stay on the baseline).
+    // The dynamic daemon-config runtime, for the API + request-path reads.
+    // Convergence is notification-driven: an immediate reload at startup, then on
+    // every `notify_reload()` (SIGHUP / changelog / local write), with a long
+    // backstop tick for the Raft-follower path that isn't hooked to a notification.
     tokio::spawn({
         let daemon = daemon.clone();
         let deploy = daemon_init_deploy;
         async move {
-            if let Err(err) = daemon.reload(&deploy).await {
-                tracing::warn!(%err, "initial daemon-config load failed; using file baseline");
+            loop {
+                if let Err(err) = daemon.reload(&deploy).await {
+                    tracing::debug!(%err, "daemon-config reload failed; keeping current");
+                }
+                tokio::select! {
+                    _ = daemon.reload.notified() => {}
+                    _ = tokio::time::sleep(DAEMON_RELOAD_BACKSTOP) => {}
+                }
             }
         }
     });
@@ -2145,14 +2186,17 @@ async fn serve_by_host(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Extension(daemon): Extension<Arc<DaemonRuntime>>,
     Extension(implicit): Extension<ImplicitRouting>,
-    Extension(preview_policy): Extension<PreviewPolicy>,
     Extension(preview_auth): Extension<Auth>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    // The catch-all site is read live from the daemon-config runtime, so a
-    // `config set default_site …` takes effect without a restart.
+    // Catch-all site + preview protection are read live from the daemon-config
+    // runtime, so `config set default_site …` / `protect_previews …` take effect
+    // without a restart.
     let effective = daemon.effective();
+    let preview_policy = PreviewPolicy {
+        protect: effective.protect_previews,
+    };
     let Some(host) = request
         .headers()
         .get(header::HOST)
@@ -2699,11 +2743,14 @@ fn too_many_requests() -> Response {
 async fn serve_preview(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
-    Extension(preview_policy): Extension<PreviewPolicy>,
+    Extension(daemon): Extension<Arc<DaemonRuntime>>,
     Extension(preview_auth): Extension<Auth>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
+    let preview_policy = PreviewPolicy {
+        protect: daemon.effective().protect_previews,
+    };
     if let Some(blocked) = preview_auth_gate(preview_policy, &preview_auth, request.headers()).await
     {
         return blocked;
