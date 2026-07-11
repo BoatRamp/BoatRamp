@@ -99,6 +99,7 @@ impl SecurityProfile {
                 allow_shared_kernel_compute: false,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: false,
+                require_pop: false,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -113,6 +114,7 @@ impl SecurityProfile {
                 allow_shared_kernel_compute: true,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: true,
+                require_pop: false,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -127,6 +129,7 @@ impl SecurityProfile {
                 allow_shared_kernel_compute: true,
                 ratelimit_fail_open: true,
                 allow_implicit_routing: true,
+                require_pop: false,
             },
         }
     }
@@ -174,6 +177,11 @@ pub struct PostureOverrides {
     /// convenience; off under `multi-tenant` so a public host can never
     /// implicitly resolve to a site. A loopback bind enables it regardless.
     pub allow_implicit_routing: Option<bool>,
+    /// Require **every** control-plane token to carry a holder key (`cnf`) and to
+    /// present a valid per-request proof-of-possession (DPoP-style). Off by default
+    /// (a `cnf` token *always* requires a proof regardless — this knob additionally
+    /// bans plain bearer tokens fleet-wide, so a leaked bearer alone is inert).
+    pub require_pop: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -280,6 +288,11 @@ impl SecurityConfig {
             p.allow_implicit_routing.to_string(),
             o.allow_implicit_routing.is_some(),
         );
+        row(
+            "require_pop",
+            p.require_pop.to_string(),
+            o.require_pop.is_some(),
+        );
         Ok(out)
     }
 }
@@ -317,6 +330,9 @@ pub struct SecurityPosture {
     /// registration (first-label `<site>.host` or the sole served site). Off
     /// under `multi-tenant`; a loopback bind enables it regardless.
     pub allow_implicit_routing: bool,
+    /// Require every control-plane token to be `cnf`-bound and PoP-proven
+    /// (fleet-wide holder-key enforcement). Off by default.
+    pub require_pop: bool,
 }
 
 impl Default for SecurityPosture {
@@ -363,6 +379,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.allow_implicit_routing {
         base.allow_implicit_routing = v;
     }
+    if let Some(v) = o.require_pop {
+        base.require_pop = v;
+    }
     base
 }
 
@@ -392,7 +411,34 @@ mod tests {
         assert!(!p.allow_shared_kernel_compute);
         assert!(!p.ratelimit_fail_open);
         assert!(!p.allow_implicit_routing);
+        assert!(!p.require_pop);
         assert_eq!(p.max_upload_bytes, MT_MAX_UPLOAD);
+    }
+
+    #[test]
+    fn require_pop_defaults_off_everywhere_and_overrides() {
+        // Off in every built-in preset (per-token opt-in is issuing a `cnf` token).
+        for profile in [
+            SecurityProfile::MultiTenant,
+            SecurityProfile::SingleTenant,
+            SecurityProfile::Dev,
+        ] {
+            assert!(!profile.preset().require_pop, "{}", profile.as_str());
+        }
+        // An explicit override turns fleet-wide enforcement on.
+        let cfg = SecurityConfig {
+            overrides: PostureOverrides {
+                require_pop: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.resolve().unwrap().require_pop);
+        assert!(cfg
+            .explain()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains("require_pop") && l.contains("true") && l.contains("override")));
     }
 
     #[test]

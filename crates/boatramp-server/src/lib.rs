@@ -338,6 +338,13 @@ pub struct ServerOptions {
     /// scheme when `X-Forwarded-Proto` can't be trusted. Default
     /// `false` (plain HTTP).
     pub served_over_tls: bool,
+    /// The fleet's **canonical public origin** (e.g. `https://cp.example.com`) that
+    /// a per-request PoP proof must be bound to (`aud`). Set from `[serve]
+    /// pop_origin` in `boatramp.cfg`. Compared against a proof's bound origin —
+    /// **never** derived from a `Host`/`X-Forwarded-*` header. A holder-bound
+    /// (`cnf`) token cannot be used against a server that has not configured this
+    /// (its proof can't be verified, so the request is rejected).
+    pub pop_origin: Option<String>,
     /// A pre-built dynamic daemon-config runtime. `serve` supplies one (built via
     /// [`config_baseline`] + [`DaemonRuntime::new`]) so it can wake it on
     /// SIGHUP / changelog; `None` (tests, embedders) ⇒ the router builds its own.
@@ -572,6 +579,11 @@ pub fn router_with(
     // The resolved security posture rides as an extension for the gateway /
     // proxy / domain-verify / upload paths (the hardening knobs).
     let posture = options.posture;
+    // Bind the auth layer's per-request PoP enforcement: the fleet's canonical
+    // origin (the proof's required `aud`) and whether every token must be
+    // holder-bound (`require_pop`). A holder-bound (`cnf`) token always requires a
+    // valid proof regardless of the knob (enforced in `Auth::authorize`).
+    let auth = auth.with_pop(options.pop_origin.clone(), posture.require_pop);
     // The listener's own scheme, for deriving the request scheme when
     // `X-Forwarded-Proto` isn't from a trusted proxy.
     let served_over_tls = ServedOverTls(options.served_over_tls);

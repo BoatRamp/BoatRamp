@@ -544,6 +544,11 @@ pub struct ServeConfig {
     pub http_redirect_addr: Option<SocketAddr>,
     /// Site to serve for a `Host` matching no domain, instead of 404.
     pub default_site: Option<String>,
+    /// The fleet's canonical public origin (e.g. `https://cp.example.com`) that a
+    /// per-request proof-of-possession must bind to (`aud`). Required for
+    /// holder-bound (`cnf`/PoP) tokens to be usable — a proof's origin is compared
+    /// against this value, never against a `Host`/`X-Forwarded-*` header.
+    pub pop_origin: Option<String>,
     /// Require a valid control-plane token to view deployment previews.
     pub protect_previews: bool,
     /// Rate-limit cluster-wide via the control-plane KV instead of per node.

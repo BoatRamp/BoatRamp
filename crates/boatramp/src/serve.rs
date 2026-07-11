@@ -598,6 +598,13 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_DEFAULT_SITE")]
     default_site: Option<String>,
 
+    /// The fleet's canonical public origin (e.g. `https://cp.example.com`) that a
+    /// per-request proof-of-possession must bind to. Required for holder-bound
+    /// (`cnf`/PoP) tokens; compared against a proof's origin, never a request
+    /// header. Flag/env > `serve.pop_origin`.
+    #[arg(long, env = "BOATRAMP_POP_ORIGIN")]
+    pop_origin: Option<String>,
+
     /// Rate-limit cluster-wide via the control-plane KV (shared fixed-window)
     /// instead of per-node in-process buckets. Meaningful with a shared/
     /// replicated KV; adds a KV round-trip per limited request. Flag/env >
@@ -683,6 +690,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     let mut options = boatramp_server::ServerOptions {
         limits: args.server_limits(&serve_cfg, &posture),
         default_site: args.default_site.clone().or(serve_cfg.default_site.clone()),
+        pop_origin: args.pop_origin.clone().or(serve_cfg.pop_origin.clone()),
         protect_previews: args.protect_previews || serve_cfg.protect_previews,
         posture,
         // The listener terminates TLS in any non-`Off` mode; used to derive the

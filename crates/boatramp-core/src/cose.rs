@@ -67,7 +67,7 @@ const CLAIM_BH: &str = "bh";
 /// replay without a (CAS-less, expensive) fleet-wide `jti` cache.
 pub const POP_WINDOW_SECS: u64 = 60;
 /// Clock skew tolerated for a proof minted slightly in the future, in seconds.
-const POP_SKEW_SECS: u64 = 30;
+pub const POP_SKEW_SECS: u64 = 30;
 
 /// Text claim key for the holder key (RFC 8747 `cnf`, here the holder's public key
 /// `"<alg>:<hex>"`): the key that may mint the next delegation block. Present only
@@ -924,13 +924,14 @@ pub async fn mint_pop(
 /// `br_kind = "pop"` + freshness (`iat` within [`POP_WINDOW_SECS`], not
 /// [`POP_SKEW_SECS`] in the future) + every bound fact (`htm`/`htp`/`aud`/`ath`,
 /// and `bh` — which must match, present-or-absent, the server's `expected.bh`).
-/// IO-free; a `jti` replay check (if any) is the caller's job.
+/// On success returns the proof's `jti` (its `cti`, hex) so the caller can run a
+/// node-local replay check. IO-free; the replay check itself is the caller's job.
 pub fn verify_pop(
     proof: &str,
     holder_public: &TokenPublicKey,
     now_unix: u64,
     expected: &PopClaims,
-) -> Result<(), TokenError> {
+) -> Result<String, TokenError> {
     let claims = verify_envelope(proof, holder_public)?;
 
     let kind = text_claim(&claims, CLAIM_KIND).and_then(|v| match v {
@@ -971,7 +972,8 @@ pub fn verify_pop(
     if text(CLAIM_BH) != expected.bh {
         return Err(TokenError::Claims("PoP proof body-hash mismatch".into()));
     }
-    Ok(())
+    // The proof's `jti` (its `cti`) — the caller's replay handle.
+    claim_cti(&claims)
 }
 
 /// Decode a presented credential into its ordered blocks (raw tagged
