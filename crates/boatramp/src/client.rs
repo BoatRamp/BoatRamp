@@ -38,6 +38,13 @@ pub fn token(config: &ProjectConfig) -> Option<String> {
 }
 
 /// Build an HTTP client that sends `Authorization: Bearer <token>` when present.
+///
+/// When `BOATRAMP_SERVER_PUBKEY` is set (the raw-public-key SPKI hex that
+/// `boatramp serve --tls rpk` prints), the client **pins** the control plane to
+/// that RFC 7250 identity — so the operator reaches an `--tls rpk` server over an
+/// encrypted, authenticated channel with no ACME/tunnel/proxy, on day zero. A
+/// malformed pin is ignored (falls back to normal WebPKI TLS) rather than
+/// silently disabling verification.
 pub fn http_client(token: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
     if let Some(token) = token {
@@ -45,6 +52,19 @@ pub fn http_client(token: Option<&str>) -> reqwest::Client {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(reqwest::header::AUTHORIZATION, value);
             builder = builder.default_headers(headers);
+        }
+    }
+    if let Ok(hex) = std::env::var("BOATRAMP_SERVER_PUBKEY") {
+        // The pinned rustls config's type is only inferred (never named), so the
+        // CLI needs no direct `rustls` dep — `use_preconfigured_tls` takes `Any`.
+        // The single logical control-plane peer is id `0`.
+        if let Ok(spki) = boatramp_rpktls::parse_public_key(hex.trim()) {
+            let trust = boatramp_rpktls::TrustSet::from_map(std::collections::BTreeMap::from([(
+                0u64, spki,
+            )]));
+            if let Ok(config) = boatramp_rpktls::client_config_server_auth(trust, 0) {
+                builder = builder.use_preconfigured_tls(config);
+            }
         }
     }
     builder.build().unwrap_or_default()

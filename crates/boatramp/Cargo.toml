@@ -22,7 +22,7 @@ cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
 # object_store backend.
 slatedb = ["boatramp-storage/slatedb"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
-tls = ["dep:axum-server", "dep:rustls-acme", "dep:rustls", "dep:rustls-pemfile", "dep:boatramp-rpktls"]
+tls = ["dep:axum-server", "dep:rustls-acme", "dep:rustls", "dep:rustls-pemfile"]
 # DNS-TXT domain-ownership verification (`domain add --method dns`): resolve the
 # `_boatramp-verify.<host>` TXT over public DNS. Needed to verify a host that
 # points at this same instance (e.g. a self-hosted domain behind fly/Cloudflare,
@@ -107,8 +107,10 @@ cluster = [
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
-# RFC 7250 RPK mutual-TLS primitives, for the `--tls rpk` bootstrap listener.
-boatramp-rpktls = { workspace = true, optional = true }
+# RFC 7250 RPK primitives: the `--tls rpk` bootstrap listener (server, `tls`
+# feature) AND client-side server-key pinning (always available, so the CLI can
+# talk to an `--tls rpk` control plane without the `tls`/serve feature).
+boatramp-rpktls.workspace = true
 # The OCI→ext4 rootfs build for `boatramp compute build` +
 # the in-process embedded-VMM `ComputeBackend`. `embedded` only pulls its
 # Linux/KVM deps on Linux (the backend module is `target_os = "linux"`-gated), so
@@ -164,6 +166,8 @@ wit-parser = { workspace = true, optional = true }
 # Generate a self-signed cert/key in the cluster-TLS bridge tests (avoids
 # embedding a base64 fixture). Already in the tree via boatramp-acme `acme`.
 rcgen = "0.13"
+# A trivial router for the `--tls rpk` client-pinning integration test.
+axum.workspace = true
 
 # ---------------------------------------------------------------------------
 # OS-native package metadata. Version / license / description /
