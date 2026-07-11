@@ -738,6 +738,13 @@ pub fn router_with(
         // Explicit by-name admin/testing route: `/_sites/<name>/…`.
         .route("/_sites/*rest", any(serve_sites))
         .route("/_deploy/*rest", get(serve_preview))
+        // Domain-ownership self-serve: serve a pending HTTP challenge token
+        // before host routing, so an unattached host can verify itself. An
+        // explicit route, so it wins over the `serve_by_host` fallback.
+        .route(
+            "/.well-known/boatramp-domain-verification/:token",
+            get(serve_domain_challenge),
+        )
         .fallback(serve_by_host)
         .with_state(deploy)
         .layer(Extension(rate_limiter))
@@ -1298,11 +1305,50 @@ async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<Str
 }
 
 /// Set a site's [`SiteConfig`] (rebuilds its host → site index).
+///
+/// A domain only enters routing once its ownership is proven. A host **newly
+/// added** through this raw config write (rather than the verify→attach flow)
+/// must therefore already carry a verified challenge, or a site-writer could
+/// squat an unowned host by simply listing it. Hosts already on the site — and
+/// any non-domain edit — pass untouched, so the ordinary `access`/`gateway`
+/// config edits (which read-modify-write the current config) are unaffected.
 async fn put_site_config(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
     Json(config): Json<SiteConfig>,
 ) -> Response {
+    let current = match deploy.get_site_config(&site).await {
+        Ok(c) => c.unwrap_or_default(),
+        Err(err) => return deploy_error_response(err),
+    };
+    let existing: std::collections::BTreeSet<String> = current
+        .domains
+        .exact_hosts()
+        .map(str::to_string)
+        .chain(current.domains.wildcards.iter().cloned())
+        .collect();
+    let added = config
+        .domains
+        .exact_hosts()
+        .map(str::to_string)
+        .chain(config.domains.wildcards.iter().cloned())
+        .filter(|host| !existing.contains(host));
+    for host in added {
+        match deploy.is_domain_verified(&site, &host).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "{host} is not verified for {site}; run \
+                         `boatramp domain add {host} --site {site}` first\n"
+                    ),
+                )
+                    .into_response()
+            }
+            Err(err) => return deploy_error_response(err),
+        }
+    }
     match deploy.set_site_config(&site, &config).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
@@ -2194,6 +2240,50 @@ async fn serve_sites(
     .await
 }
 
+/// Serve a pending **HTTP domain-ownership challenge** from the edge, *before*
+/// host routing — the fix for the verify-before-attach chicken-and-egg. A host
+/// pointed at this server but not yet attached to any site (so it would
+/// otherwise fall through to `default_site` and 404 its own challenge) fetches
+/// its token here, letting `domain verify` succeed with no prior deploy. Returns
+/// the token for a matching `(Host, token)` pending HTTP challenge, else `404`.
+///
+/// Gated by the `domain_verify_self_serve` posture knob (on by default). It only
+/// ever echoes back a random token to the very host that owns the pending
+/// challenge, so it leaks nothing and needs no auth (like an ACME http-01
+/// challenge). Mounted on both the main router and the `:80` redirect router, so
+/// the plain-HTTP probe is answered directly instead of 308-redirected to an
+/// HTTPS endpoint that may have no cert yet.
+async fn serve_domain_challenge(
+    State(deploy): State<DeployStore>,
+    Extension(posture): Extension<boatramp_core::security::SecurityPosture>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !posture.domain_verify_self_serve {
+        return not_found();
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(strip_port)
+    else {
+        return not_found();
+    };
+    match deploy
+        .find_pending_http_challenge(host, &token, now_unix())
+        .await
+    {
+        Ok(Some(v)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            v.token,
+        )
+            .into_response(),
+        Ok(None) => not_found(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
 /// Virtualhost fallback: resolve the site from the `Host` header, serve the
 /// request path. Catches everything not matched by `/healthz`, `/api/*`, or the
 /// explicit `/_sites/*` route.
@@ -2622,12 +2712,27 @@ fn redirect_to(target: &str) -> Response {
 }
 
 /// A standalone router for a plain `:80` listener that permanently redirects
-/// every request to its HTTPS equivalent. Bound
-/// alongside the HTTPS listener so plain-HTTP visitors are upgraded even when
-/// boatramp terminates TLS itself. ACME challenges use ALPN-01/DNS-01, so this
-/// listener is redirect-only (no `/.well-known/acme-challenge` to serve).
-pub fn http_redirect_router() -> Router {
-    Router::new().fallback(redirect_http_to_https)
+/// every request to its HTTPS equivalent. Bound alongside the HTTPS listener so
+/// plain-HTTP visitors are upgraded even when boatramp terminates TLS itself.
+///
+/// It does serve one thing directly rather than redirecting: the HTTP
+/// domain-ownership challenge (`/.well-known/boatramp-domain-verification/…`).
+/// That probe arrives on plain `:80` for a host that may have no cert yet, so a
+/// 308 to HTTPS would bounce it to an endpoint that can't answer — the token
+/// must be served here. (ACME's own challenges use ALPN-01/DNS-01, so there is
+/// no `/.well-known/acme-challenge` to serve.)
+pub fn http_redirect_router(
+    deploy: DeployStore,
+    posture: boatramp_core::security::SecurityPosture,
+) -> Router {
+    Router::new()
+        .route(
+            "/.well-known/boatramp-domain-verification/:token",
+            get(serve_domain_challenge),
+        )
+        .fallback(redirect_http_to_https)
+        .with_state(deploy)
+        .layer(Extension(posture))
 }
 
 /// 308-redirect any request to `https://<host><path-and-query>` (308 preserves
@@ -4447,6 +4552,8 @@ fn deploy_error_response(err: DeployError) -> Response {
         }
         DeployError::HashMismatch { .. } => StatusCode::BAD_REQUEST,
         DeployError::Incomplete(_) => StatusCode::CONFLICT,
+        // A host already claimed by another site — refuse the overwrite.
+        DeployError::Conflict(_) => StatusCode::CONFLICT,
         // An ambiguous preview-id prefix is not a usable capability → not found.
         DeployError::Ambiguous(_) => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

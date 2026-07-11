@@ -1,8 +1,19 @@
 //! The `domain` subcommand: attach/detach hostnames to a site for virtualhost
-//! routing. Attaching a custom domain is gated on **ownership verification**:
-//! `domain add` starts a challenge, `domain verify` proves it and
-//! — only then — attaches the host to the site's `SiteConfig` (so it routes and
-//! becomes eligible for ACME).
+//! routing. Attaching a custom domain is gated on **ownership verification**.
+//!
+//! `domain add` starts a challenge and, when there is no manual step left, goes
+//! all the way — verifies and attaches in one command:
+//!
+//! * a host that **already resolves to this server** verifies over HTTP
+//!   immediately (the server serves its own challenge token from the edge, so no
+//!   prior deploy is needed — the fix for the attach chicken-and-egg);
+//! * `--provider` publishes the DNS-TXT challenge for you, waits for it to
+//!   resolve, and attaches.
+//!
+//! Otherwise (a live domain still pointing elsewhere, or `--no-wait`) it prints
+//! the challenge to publish and you finish with `domain verify`. Attachment only
+//! ever happens after ownership is proven — so the host routes and becomes
+//! eligible for ACME.
 
 use clap::Subcommand;
 
@@ -21,15 +32,15 @@ pub enum Error {
     /// Resolving the target or talking to the control plane failed.
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
-    /// An `--auto` verification-dance problem (no provider, timeout, or the
-    /// `acme-dns` feature is absent from this build).
+    /// A `--provider` verification-dance problem (timeout, or the `acme-dns`
+    /// feature is absent from this build).
     #[error("{0}")]
     Auto(String),
-    /// Building the DNS provider for `--auto` failed (missing credential env var).
+    /// Building the DNS provider for `--provider` failed (missing credential env var).
     #[cfg(feature = "acme-dns")]
     #[error(transparent)]
     Provider(#[from] crate::acme_dns::Error),
-    /// Publishing the challenge TXT during `--auto` failed.
+    /// Publishing the challenge TXT during `--provider` failed.
     #[cfg(feature = "acme-dns")]
     #[error(transparent)]
     Dns(#[from] boatramp_acme::DnsError),
@@ -55,8 +66,12 @@ pub struct DomainArgs {
 
 #[derive(Debug, Subcommand)]
 enum DomainCommand {
-    /// Start ownership verification for a hostname (use `*.example.com` for a
-    /// wildcard). Prints the challenge to publish; run `domain verify` after.
+    /// Verify ownership of a hostname and attach it to the site (use
+    /// `*.example.com` for a wildcard).
+    ///
+    /// If the host already resolves to this server it is verified + attached in
+    /// one step; otherwise the challenge to publish is printed and you finish
+    /// with `domain verify`.
     Add {
         /// Hostname or `*.`-prefixed wildcard.
         host: String,
@@ -64,16 +79,18 @@ enum DomainCommand {
         /// publishes a TXT record (needs a server built with `domain-verify-dns`).
         #[arg(long, default_value = "http")]
         method: String,
-        /// Automatically publish the DNS-TXT challenge via `--provider`
+        /// Managed-DNS provider (e.g. `cloudflare`, `digitalocean`, `route53`).
+        /// When set, boatramp publishes the `_boatramp-verify` TXT for you
         /// (credentials from the environment; needs a build with `acme-dns`),
-        /// poll until it resolves, and attach — no manual DNS edit. Forces the
-        /// `dns` method and writes only the `_boatramp-verify` TXT (never points
-        /// the host at this server; that stays an explicit, post-verify step).
-        #[arg(long)]
-        auto: bool,
-        /// DNS provider for `--auto`, e.g. `cloudflare`, `digitalocean`, `route53`.
+        /// waits for it to resolve, and attaches — no manual DNS edit. Implies
+        /// `--method dns` and writes only the `_boatramp-verify` TXT, never the
+        /// host's A/CNAME (that stays an explicit, post-verify step).
         #[arg(long)]
         provider: Option<String>,
+        /// Only start the challenge and print instructions — skip the immediate
+        /// verify+attach. Use when the host doesn't resolve here yet.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Check a hostname's verification challenge; on success it is attached.
     Verify {
@@ -99,21 +116,64 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
         DomainCommand::Add {
             host,
             method,
-            auto,
             provider,
+            no_wait,
         } => {
-            if auto {
-                return add_auto(&http, &server, &site, &host, provider.as_deref()).await;
+            // A managed-DNS provider does the whole dance (publish TXT → poll →
+            // attach) itself.
+            if let Some(provider) = provider.as_deref() {
+                return add_auto(&http, &server, &site, &host, Some(provider)).await;
             }
             let verification =
                 client::start_domain_verification(&http, &server, &site, &host, Some(&method))
                     .await?;
             if verification.verified {
-                println!("{host} is already verified for {site}");
-                println!("run `boatramp domain verify {host}` to (re)attach it");
-            } else {
-                println!("started {} verification for {host}\n", verification.method);
-                println!("{}", verification.instructions());
+                // Ownership already proven earlier — (re)attach it now.
+                let result =
+                    client::check_domain_verification(&http, &server, &site, &host).await?;
+                if result.attached {
+                    println!("{host} is already verified and attached to {site}");
+                } else {
+                    println!("{host} is already verified for {site}");
+                    println!("run `boatramp domain verify {host}` to attach it");
+                }
+                return Ok(());
+            }
+            println!("started {} verification for {host}\n", verification.method);
+            println!("{}", verification.instructions());
+
+            // Auto-continue only when there's no manual step left: an HTTP
+            // challenge for a host that already resolves here is served by this
+            // server, so a single `domain add` verifies + attaches. A DNS
+            // challenge (or `--no-wait`) always has a manual publish step, so we
+            // stop after printing the instructions.
+            let http_self_serve =
+                verification.method == boatramp_core::domain_verify::VerificationMethod::Http;
+            if no_wait || !http_self_serve {
+                println!("\nthen run `boatramp domain verify {host}`");
+                return Ok(());
+            }
+            println!("\nchecking whether {host} already resolves here…");
+            match client::check_domain_verification(&http, &server, &site, &host).await {
+                Ok(result) if result.passed && result.attached => {
+                    println!("✓ verified {host} and attached it to {site}");
+                }
+                Ok(result) if result.passed => {
+                    println!("✓ verified {host}; run `boatramp domain verify {host}` to attach");
+                }
+                Ok(result) => {
+                    let detail = result
+                        .detail
+                        .unwrap_or_else(|| "not reachable here yet".into());
+                    println!("not verified yet ({detail})");
+                    println!("complete the step above, then run `boatramp domain verify {host}`");
+                }
+                // A probe/transport error before the host is set up is expected —
+                // guide the operator on rather than failing the command.
+                Err(_) => {
+                    println!("not reachable here yet");
+                    println!("complete the step above, then run `boatramp domain verify {host}`");
+                }
             }
             Ok(())
         }
@@ -152,7 +212,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
     }
 }
 
-/// The `--auto` verification dance: publish the DNS-TXT challenge through the
+/// The `--provider` verification dance: publish the DNS-TXT challenge through the
 /// provider, poll the server's ownership check until the record resolves, and
 /// attach. It writes **only** the `_boatramp-verify` TXT — never the host's
 /// A/CNAME — so ownership is proven before anything is pointed at this server.
@@ -171,9 +231,8 @@ async fn add_auto(
 
     use crate::acme_dns::{build_provider, DnsProviderKind};
 
-    let provider_name = provider.ok_or_else(|| {
-        Error::Auto("`--auto` needs `--provider <name>` (e.g. cloudflare)".into())
-    })?;
+    let provider_name = provider
+        .ok_or_else(|| Error::Auto("missing `--provider <name>` (e.g. cloudflare)".into()))?;
     let kind = DnsProviderKind::from_str(provider_name, true)
         .map_err(|e| Error::Auto(format!("unknown --provider `{provider_name}`: {e}")))?;
 
@@ -227,7 +286,7 @@ async fn add_auto(
 }
 
 /// Without the `acme-dns` feature there is no bundled DNS provider to publish the
-/// challenge with, so `--auto` is unavailable.
+/// challenge with, so `--provider` is unavailable.
 #[cfg(not(feature = "acme-dns"))]
 async fn add_auto(
     _http: &reqwest::Client,
@@ -237,7 +296,7 @@ async fn add_auto(
     _provider: Option<&str>,
 ) -> Result<()> {
     Err(Error::Auto(
-        "`--auto` requires a build with `--features acme-dns`".into(),
+        "`--provider` requires a build with `--features acme-dns`".into(),
     ))
 }
 

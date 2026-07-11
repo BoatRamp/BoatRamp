@@ -95,6 +95,7 @@ impl SecurityProfile {
                 max_component_bytes: MT_MAX_COMPONENT,
                 oidc_require_audience: true,
                 domain_verify_allow_private: false,
+                domain_verify_self_serve: true,
                 allow_shared_kernel_compute: false,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: false,
@@ -108,6 +109,7 @@ impl SecurityProfile {
                 max_component_bytes: ST_MAX_COMPONENT,
                 oidc_require_audience: true,
                 domain_verify_allow_private: true,
+                domain_verify_self_serve: true,
                 allow_shared_kernel_compute: true,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: true,
@@ -121,6 +123,7 @@ impl SecurityProfile {
                 max_component_bytes: 0,
                 oidc_require_audience: false,
                 domain_verify_allow_private: true,
+                domain_verify_self_serve: true,
                 allow_shared_kernel_compute: true,
                 ratelimit_fail_open: true,
                 allow_implicit_routing: true,
@@ -153,6 +156,14 @@ pub struct PostureOverrides {
     pub oidc_require_audience: Option<bool>,
     /// Permit HTTP domain-verification probes to private/loopback/metadata hosts.
     pub domain_verify_allow_private: Option<bool>,
+    /// Serve pending HTTP ownership challenges at
+    /// `/.well-known/boatramp-domain-verification/<token>` directly from the edge
+    /// (before host routing), so a host pointed at this server verifies itself
+    /// without a prior deploy — the fix for the domain-attach chicken-and-egg. On
+    /// by default in every profile (it only ever returns a random token to a host
+    /// with a matching pending challenge); an operator can disable it to require
+    /// out-of-band token placement instead.
+    pub domain_verify_self_serve: Option<bool>,
     /// Permit scheduling untrusted workloads onto shared-kernel compute backends.
     pub allow_shared_kernel_compute: Option<bool>,
     /// Fail **open** (allow) instead of closed when the rate-limit KV is unreadable.
@@ -250,6 +261,11 @@ impl SecurityConfig {
             o.domain_verify_allow_private.is_some(),
         );
         row(
+            "domain_verify_self_serve",
+            p.domain_verify_self_serve.to_string(),
+            o.domain_verify_self_serve.is_some(),
+        );
+        row(
             "allow_shared_kernel_compute",
             p.allow_shared_kernel_compute.to_string(),
             o.allow_shared_kernel_compute.is_some(),
@@ -290,6 +306,9 @@ pub struct SecurityPosture {
     pub oidc_require_audience: bool,
     /// Permit HTTP domain-verification probes to private hosts.
     pub domain_verify_allow_private: bool,
+    /// Serve pending HTTP ownership challenges from the edge before host routing
+    /// (the domain-attach chicken-and-egg fix).
+    pub domain_verify_self_serve: bool,
     /// Permit untrusted workloads on shared-kernel compute backends.
     pub allow_shared_kernel_compute: bool,
     /// Fail open instead of closed on rate-limit KV errors.
@@ -332,6 +351,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.domain_verify_allow_private {
         base.domain_verify_allow_private = v;
     }
+    if let Some(v) = o.domain_verify_self_serve {
+        base.domain_verify_self_serve = v;
+    }
     if let Some(v) = o.allow_shared_kernel_compute {
         base.allow_shared_kernel_compute = v;
     }
@@ -366,6 +388,7 @@ mod tests {
         assert!(!p.allow_site_private_upstreams);
         assert!(p.oidc_require_audience);
         assert!(!p.domain_verify_allow_private);
+        assert!(p.domain_verify_self_serve);
         assert!(!p.allow_shared_kernel_compute);
         assert!(!p.ratelimit_fail_open);
         assert!(!p.allow_implicit_routing);

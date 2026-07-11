@@ -93,6 +93,7 @@ Override knobs (byte caps: `0` = unlimited):
 | `max_component_bytes` | Wasm component size cap. |
 | `oidc_require_audience` | Require an `aud` claim on OIDC exchange. |
 | `domain_verify_allow_private` | Allow domain-verification probes to private hosts. |
+| `domain_verify_self_serve` | Serve pending HTTP ownership challenges from the edge (before host routing) so an unattached host can verify itself. On by default; disable to require out-of-band token placement. |
 | `allow_shared_kernel_compute` | Permit container (shared-kernel) compute; off ⇒ microVM only. |
 | `ratelimit_fail_open` | Serve rather than reject if the rate-limit store is unavailable. |
 | `allow_implicit_routing` | Resolve an unmatched host to a site without a registered domain (first-label `<site>.host` / sole site). Off under `multi-tenant`; a loopback bind enables it regardless. See [addressing](../explanation/addressing.md). |

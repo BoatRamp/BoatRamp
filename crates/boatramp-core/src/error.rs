@@ -94,6 +94,12 @@ pub enum DeployError {
     /// A deployment-id prefix matched more than one deployment.
     #[error("ambiguous deployment id prefix: {0}")]
     Ambiguous(String),
+
+    /// A host is already claimed by a different site — refusing to overwrite the
+    /// routing index would let one site hijack another's domain. Surfaced as a
+    /// `409 Conflict`.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl From<serde_json::Error> for DeployError {

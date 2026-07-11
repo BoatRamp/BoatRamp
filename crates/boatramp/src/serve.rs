@@ -814,7 +814,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     #[cfg(feature = "tls")]
     if !matches!(args.tls, TlsMode::Off) {
         if let Some(redirect_addr) = args.http_redirect_addr.or(serve_cfg.http_redirect_addr) {
-            spawn_http_redirect(redirect_addr);
+            spawn_http_redirect(redirect_addr, deploy.clone(), posture);
         }
     }
     let serve_result = match args.tls {
@@ -912,15 +912,22 @@ fn spawn_sighup_reload(
 }
 
 /// In a TLS mode, spawn a detached plain-HTTP listener on `addr` that
-/// 308-redirects every request to HTTPS (dual-listener). Fire and
-/// forget: it dies with the process; bind failures are logged, not fatal, so a
-/// missing privilege on `:80` doesn't take down the HTTPS server. Uses
-/// `axum_server` (the same plain/TLS server stack the TLS modes use).
+/// 308-redirects every request to HTTPS (dual-listener) — except the HTTP
+/// domain-ownership challenge, which it serves directly so an unattached host
+/// can verify itself over plain `:80` before it has a cert. Fire and forget: it
+/// dies with the process; bind failures are logged, not fatal, so a missing
+/// privilege on `:80` doesn't take down the HTTPS server. Uses `axum_server`
+/// (the same plain/TLS server stack the TLS modes use).
 #[cfg(feature = "tls")]
-fn spawn_http_redirect(addr: SocketAddr) {
+fn spawn_http_redirect(
+    addr: SocketAddr,
+    deploy: DeployStore,
+    posture: boatramp_core::security::SecurityPosture,
+) {
     tokio::spawn(async move {
         tracing::info!(%addr, "serving HTTP→HTTPS redirect listener");
-        let service = boatramp_server::http_redirect_router().into_make_service();
+        let service =
+            boatramp_server::http_redirect_router(deploy, posture).into_make_service();
         if let Err(err) = axum_server::bind(addr).serve(service).await {
             tracing::error!(%addr, %err, "HTTP redirect listener failed");
         }

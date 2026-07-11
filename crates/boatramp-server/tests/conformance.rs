@@ -3393,22 +3393,156 @@ async fn activate_is_visible_immediately_through_cache() {
 
 #[tokio::test]
 async fn http_redirect_router_upgrades_to_https() {
+    use boatramp_core::domain_verify::VerificationMethod;
+    use boatramp_core::security::SecurityPosture;
     use boatramp_server::http_redirect_router;
 
-    let app = http_redirect_router();
+    // A pending HTTP challenge on a host attached to no site (created near "now"
+    // so it is within the challenge TTL when the handler checks it).
+    let deploy = seed().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let v = deploy
+        .start_domain_verification("docs", "docs.example", VerificationMethod::Http, now)
+        .await
+        .unwrap();
+
+    let app = http_redirect_router(deploy, SecurityPosture::default());
+
+    // A normal request is 308-upgraded to HTTPS (port stripped, path+query kept).
     let mut req = Request::builder()
         .uri("/path?q=1")
         .body(Body::empty())
         .unwrap();
     req.headers_mut()
         .insert(header::HOST, "example.com:8080".parse().unwrap());
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
-    // Port stripped; scheme upgraded; path + query preserved.
     assert_eq!(
         resp.headers()[header::LOCATION],
         "https://example.com/path?q=1"
     );
+
+    // …but the domain-ownership challenge is served directly on :80 (never
+    // redirected), so an unattached host can verify before it has a cert.
+    let mut req = Request::builder()
+        .uri(format!(
+            "/.well-known/boatramp-domain-verification/{}",
+            v.token
+        ))
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert(header::HOST, "docs.example".parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), v.token.as_bytes());
+}
+
+/// The self-serve edge route on the **main** router: a pending HTTP challenge is
+/// served before host routing, so a host that isn't attached to any site (and
+/// would otherwise fall through to the default site and 404 its own challenge)
+/// verifies itself. Wrong tokens and DNS-method challenges are never served.
+#[tokio::test]
+async fn self_serve_domain_challenge_before_host_routing() {
+    use boatramp_core::domain_verify::VerificationMethod;
+
+    let deploy = seed().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let v = deploy
+        .start_domain_verification("docs", "docs.example", VerificationMethod::Http, now)
+        .await
+        .unwrap();
+
+    // Matching (Host, token) → 200 + the token, ahead of the `serve_by_host`
+    // fallback (which would have served the default site / 404).
+    let mut req = Request::builder()
+        .uri(format!(
+            "/.well-known/boatramp-domain-verification/{}",
+            v.token
+        ))
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert(header::HOST, "docs.example".parse().unwrap());
+    let (status, _, body) = send(&deploy, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, v.token.as_bytes());
+
+    // A wrong token for the same host → 404 (never leaks the real token).
+    let mut req = Request::builder()
+        .uri("/.well-known/boatramp-domain-verification/deadbeefdeadbeefdeadbeefdeadbeef")
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert(header::HOST, "docs.example".parse().unwrap());
+    let (status, _, _) = send(&deploy, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A DNS-method challenge is never served over the HTTP edge route.
+    let dv = deploy
+        .start_domain_verification("d2", "dns.example", VerificationMethod::Dns, now)
+        .await
+        .unwrap();
+    let mut req = Request::builder()
+        .uri(format!(
+            "/.well-known/boatramp-domain-verification/{}",
+            dv.token
+        ))
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert(header::HOST, "dns.example".parse().unwrap());
+    let (status, _, _) = send(&deploy, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A raw `PUT /config` that introduces a **new** domain is refused until that
+/// domain's ownership is verified — so a site-writer can't squat an unowned
+/// host by listing it directly (the verify→attach flow stays the only way in).
+#[tokio::test]
+async fn put_config_gate_requires_verified_new_domain() {
+    use boatramp_core::domain_verify::VerificationMethod;
+
+    let deploy = seed().await;
+    let (auth, token) = token_auth(&[GrantedRole::scoped("publisher", "docs")]).await;
+
+    let put_config = |token: &str| {
+        let body = serde_json::json!({ "domains": { "primary": "unowned.example" } });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/sites/docs/config")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        with_bearer(req, token)
+    };
+
+    // Unverified → 403.
+    let (status, _, _) = send_as(&deploy, auth.clone(), put_config(&token), [127, 0, 0, 1]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Prove ownership, then the same PUT is accepted.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    deploy
+        .start_domain_verification("docs", "unowned.example", VerificationMethod::Http, now)
+        .await
+        .unwrap();
+    deploy
+        .mark_domain_verified("docs", "unowned.example")
+        .await
+        .unwrap();
+    let (status, _, _) = send_as(&deploy, auth, put_config(&token), [127, 0, 0, 1]).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 // ---- OIDC → token exchange -------------------------------------------------

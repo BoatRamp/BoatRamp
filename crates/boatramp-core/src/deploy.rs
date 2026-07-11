@@ -95,12 +95,23 @@ fn is_blob_key(key: &str) -> bool {
 pub struct DeployStore {
     storage: Arc<dyn Storage>,
     kv: Arc<dyn KvStore>,
+    /// Serializes host-claim read-modify-writes on the domain routing index
+    /// (`set_site_config` / `attach_verified_domain`), so a `domain/<host>`
+    /// mapping can't be checked-then-overwritten across an `await` and one site
+    /// can't race in to hijack another's domain. Process-local: airtight on a
+    /// single node; a Raft cluster needs the same as a consensus-level
+    /// conditional (noted on [`set_site_config`](Self::set_site_config)).
+    domain_claim_lock: Arc<futures::lock::Mutex<()>>,
 }
 
 impl DeployStore {
     /// Build a deploy store over a blob `storage` and a metadata `kv`.
     pub fn new(storage: Arc<dyn Storage>, kv: Arc<dyn KvStore>) -> Self {
-        Self { storage, kv }
+        Self {
+            storage,
+            kv,
+            domain_claim_lock: Arc::new(futures::lock::Mutex::new(())),
+        }
     }
 
     /// Readiness probe: confirm the metadata backend is reachable with a cheap
@@ -354,11 +365,48 @@ impl DeployStore {
     /// the shared-mode invalidation surface is the pointer, not the body. The
     /// whole change (drop old index, write body, flip pointer, write new index)
     /// commits as one atomic batch.
+    ///
+    /// **Host uniqueness (hijack guard):** a host — or wildcard suffix — already
+    /// mapped to a *different* site is refused with [`DeployError::Conflict`]
+    /// rather than silently overwritten. Without this, any site-writer could
+    /// point another site's live domain at their own site (last-writer-wins
+    /// takeover). The read-check and the write are serialized by a process-local
+    /// lock so they can't be interleaved across an `await`. This is airtight on a
+    /// single node; a Raft cluster holds it per node, and a cross-node claim race
+    /// would additionally need a consensus-level conditional apply — a documented
+    /// follow-up, not reachable in the dominant single-node topology.
     pub async fn set_site_config(
         &self,
         site: &str,
         config: &SiteConfig,
     ) -> Result<(), DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
+        self.set_site_config_locked(site, config).await
+    }
+
+    /// [`set_site_config`](Self::set_site_config) assuming the domain-claim lock
+    /// is **already held** — so [`attach_verified_domain`](Self::attach_verified_domain)
+    /// can extend a config under the same lock without re-entering it (the lock
+    /// is not reentrant).
+    async fn set_site_config_locked(
+        &self,
+        site: &str,
+        config: &SiteConfig,
+    ) -> Result<(), DeployError> {
+        // Refuse any host/wildcard already claimed by another site before writing
+        // anything (the hijack guard). A host this site already owns, or one that
+        // is unclaimed, passes.
+        for host in config.domains.exact_hosts() {
+            self.ensure_host_claimable(&Self::domain_key(host), host, site)
+                .await?;
+        }
+        for wildcard in &config.domains.wildcards {
+            if let Some(suffix) = wildcard.strip_prefix("*.") {
+                self.ensure_host_claimable(&Self::wildcard_key(suffix), wildcard, site)
+                    .await?;
+            }
+        }
+
         let body = config.to_json()?;
         let hash = sha256_hex(&body);
 
@@ -391,6 +439,27 @@ impl DeployStore {
             }
         }
         self.kv.write_batch(ops).await?;
+        Ok(())
+    }
+
+    /// Error with [`DeployError::Conflict`] if index `key` (a `domain/<host>` or
+    /// `wildcard/<suffix>` entry) is already held by a site other than `site`.
+    /// `label` is the host as written, for the message. Must be called with the
+    /// domain-claim lock held.
+    async fn ensure_host_claimable(
+        &self,
+        key: &str,
+        label: &str,
+        site: &str,
+    ) -> Result<(), DeployError> {
+        if let Some(bytes) = self.kv.get(key).await? {
+            let owner = String::from_utf8_lossy(&bytes);
+            if owner != site {
+                return Err(DeployError::Conflict(format!(
+                    "{label} is already attached to site `{owner}`"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -462,6 +531,37 @@ impl DeployStore {
         }
         out.sort_by(|a, b| a.host.cmp(&b.host));
         Ok(out)
+    }
+
+    /// Find a **pending HTTP** ownership challenge matching `(host, token)`
+    /// across every site — the lookup behind the self-serve edge route
+    /// `/.well-known/boatramp-domain-verification/<token>`. Matches on the
+    /// normalized host, the HTTP method, an exact token match, and a non-expired
+    /// challenge (`now_unix` gates the TTL), so a host pointed at this server can
+    /// prove ownership before it is attached and deployed — closing the
+    /// verify-before-attach chicken-and-egg. Returns the challenge so the caller
+    /// can echo its token back.
+    pub async fn find_pending_http_challenge(
+        &self,
+        host: &str,
+        token: &str,
+        now_unix: u64,
+    ) -> Result<Option<DomainVerification>, DeployError> {
+        let host = crate::domain_verify::normalize_host(host);
+        for key in self.kv.list_prefix("domainverify/").await? {
+            let Some(bytes) = self.kv.get(&key).await? else {
+                continue;
+            };
+            let v = DomainVerification::from_json(&bytes)?;
+            if v.method == VerificationMethod::Http
+                && v.host == host
+                && v.matches(token)
+                && !v.is_expired(now_unix)
+            {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
     }
 
     async fn put_domain_verification(
@@ -620,6 +720,10 @@ impl DeployStore {
                 "{host} is not verified for {site}; run domain verification first"
             )));
         }
+        // Hold the claim lock across the whole read-modify-write so a concurrent
+        // attach (to this site or another) can't interleave between our read and
+        // the index write. `set_site_config_locked` runs under the same lock.
+        let _claim = self.domain_claim_lock.lock().await;
         let mut config = self.get_site_config(site).await?.unwrap_or_default();
         let domains = &mut config.domains;
         if let Some(suffix) = host.strip_prefix("*.") {
@@ -637,7 +741,7 @@ impl DeployStore {
                 domains.aliases.push(host);
             }
         }
-        self.set_site_config(site, &config).await?;
+        self.set_site_config_locked(site, &config).await?;
         Ok(config)
     }
 
@@ -1574,23 +1678,21 @@ mod tests {
 
     #[tokio::test]
     async fn site_config_is_content_addressed_and_dedups() {
-        use crate::config::{DomainConfig, SiteConfig};
+        use crate::config::SiteConfig;
         use crate::kv::MemoryKv;
 
         let kv = Arc::new(MemoryKv::new());
         let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
 
-        let cfg = SiteConfig {
-            domains: DomainConfig {
-                primary: Some("a.example".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        // Distinguish the sites by a *non-domain* field: two sites can't share a
+        // domain (the host-uniqueness guard refuses it), but they can share an
+        // identical body — which is what this test is about.
+        let mut cfg = SiteConfig::default();
+        cfg.security.https_redirect = true;
         // Two different sites with identical config dedup to one body blob.
         store.set_site_config("s1", &cfg).await.unwrap();
         let mut cfg2 = cfg.clone();
-        cfg2.domains.primary = Some("b.example".into());
+        cfg2.security.https_redirect = false;
         store.set_site_config("s2", &cfg2).await.unwrap();
         store.set_site_config("s3", &cfg).await.unwrap(); // identical to s1
 
@@ -1601,23 +1703,21 @@ mod tests {
         assert_eq!(pointers.len(), 3);
 
         // Round-trips.
-        assert_eq!(
+        assert!(
             store
                 .get_site_config("s1")
                 .await
                 .unwrap()
                 .unwrap()
-                .domains
-                .primary
-                .as_deref(),
-            Some("a.example")
+                .security
+                .https_redirect
         );
         assert_eq!(store.get_site_config("missing").await.unwrap(), None);
 
         // Editing s1 flips its pointer and orphans its old body; GC reclaims it
         // (s3 still references it, so it survives until s3 changes too).
         let mut edited = cfg.clone();
-        edited.security.https_redirect = true;
+        edited.security.frame_options = Some("DENY".into());
         store.set_site_config("s1", &edited).await.unwrap();
         store.collect_garbage(true).await.unwrap();
         // s1's old body is still referenced by s3 → not collected.
@@ -1637,16 +1737,14 @@ mod tests {
                 .security
                 .https_redirect
         );
-        assert_eq!(
-            store
+        assert!(
+            !store
                 .get_site_config("s2")
                 .await
                 .unwrap()
                 .unwrap()
-                .domains
-                .primary
-                .as_deref(),
-            Some("b.example")
+                .security
+                .https_redirect
         );
     }
 
@@ -1770,6 +1868,152 @@ mod tests {
             .is_domain_verified("blog", "example.com")
             .await
             .unwrap());
+    }
+
+    /// The host-uniqueness hijack guard: a host already routed to one site cannot
+    /// be claimed by another — neither via `attach_verified_domain` nor via a
+    /// direct `set_site_config` — so a site-writer can't steal another's domain.
+    #[tokio::test]
+    async fn host_cannot_be_hijacked_across_sites() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::domain_verify::VerificationMethod;
+
+        let store = store();
+
+        // Site `a` legitimately verifies + attaches `shared.example`.
+        store
+            .start_domain_verification("a", "shared.example", VerificationMethod::Http, 100)
+            .await
+            .unwrap();
+        store.mark_domain_verified("a", "shared.example").await.unwrap();
+        store
+            .attach_verified_domain("a", "shared.example")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_site_by_host("shared.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
+
+        // Site `b` verifies the same host (imagine control briefly changed hands,
+        // or a stale challenge) and tries to attach — it must be refused, not
+        // silently steal the live mapping.
+        store
+            .start_domain_verification("b", "shared.example", VerificationMethod::Http, 200)
+            .await
+            .unwrap();
+        store.mark_domain_verified("b", "shared.example").await.unwrap();
+        let err = store
+            .attach_verified_domain("b", "shared.example")
+            .await
+            .expect_err("second site must not hijack an attached host");
+        assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
+
+        // The direct config path is guarded too (this is what a raw
+        // `PUT /config` with a stolen domain would hit).
+        let stolen = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("shared.example".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = store
+            .set_site_config("b", &stolen)
+            .await
+            .expect_err("set_site_config must refuse another site's host");
+        assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
+
+        // The original owner is untouched.
+        assert_eq!(
+            store
+                .resolve_site_by_host("shared.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
+
+        // Re-writing the *same* site's own config (no owner change) is fine — the
+        // guard only fires across sites.
+        let readd = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("shared.example".into()),
+                aliases: vec!["www.shared.example".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store.set_site_config("a", &readd).await.unwrap();
+        assert_eq!(
+            store
+                .resolve_site_by_host("www.shared.example")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
+    }
+
+    /// The self-serve edge lookup: a pending HTTP challenge is found by
+    /// (host, token), and only then — not for the wrong token/host, a DNS
+    /// challenge, or an expired one.
+    #[tokio::test]
+    async fn self_serve_challenge_lookup_matches_pending_http_only() {
+        use crate::domain_verify::{VerificationMethod, CHALLENGE_TTL_SECS};
+
+        let store = store();
+        let v = store
+            .start_domain_verification("docs", "docs.example", VerificationMethod::Http, 1_000)
+            .await
+            .unwrap();
+
+        // Exact (host, token) within the TTL → found.
+        let found = store
+            .find_pending_http_challenge("docs.example", &v.token, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(found.as_ref().map(|f| f.token.clone()), Some(v.token.clone()));
+        // A trailing dot / uppercase host still normalizes to a match.
+        assert!(store
+            .find_pending_http_challenge("Docs.Example.", &v.token, 1_000)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Wrong token, wrong host → no match (never leaks another host's token).
+        assert!(store
+            .find_pending_http_challenge("docs.example", "not-the-token", 1_000)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .find_pending_http_challenge("other.example", &v.token, 1_000)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Past the TTL → refused (a stale token can't be redeemed forever).
+        assert!(store
+            .find_pending_http_challenge("docs.example", &v.token, 1_000 + CHALLENGE_TTL_SECS + 1)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A DNS-method challenge is never served over the HTTP edge route.
+        let dv = store
+            .start_domain_verification("dns-site", "dns.example", VerificationMethod::Dns, 1_000)
+            .await
+            .unwrap();
+        assert!(store
+            .find_pending_http_challenge("dns.example", &dv.token, 1_000)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     fn store() -> DeployStore {

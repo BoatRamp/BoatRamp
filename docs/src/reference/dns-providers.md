@@ -8,7 +8,7 @@ reads.
 Credentials are read from the environment only — never from a config file. The
 same `--provider` names apply in every DNS command surface:
 `boatramp dns --provider <name>`, `boatramp serve --acme-dns-provider <name>`,
-and `boatramp domain add --auto --provider <name>`.
+and `boatramp domain add --provider <name>`.
 
 ## Providers
 

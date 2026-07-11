@@ -2,83 +2,105 @@
 
 To serve a site on a hostname of your own — `app.example.com` — you attach that
 host to the site, and it answers at that host's root. boatramp routes a host only
-after you prove you control it, so attaching is a two-step task: start
-verification, then verify. For every way a request is matched to a site, see
+after you prove you control it. For every way a request is matched to a site, see
 [How a request reaches your site](../explanation/addressing.md).
+
+`domain add` does as much as it can in one step: when the host already resolves to
+this server, it verifies over HTTP and attaches immediately — no prior deploy, no
+manual token juggling. When there's still a manual step (a live domain pointing
+elsewhere), it prints the challenge and you finish with `domain verify`.
 
 ## Before you start
 
-- A published site to attach the host to.
-- Control of the host: either the ability to serve a file on it (HTTP), or
-  access to its DNS zone (DNS TXT).
+- A site to attach the host to.
+- Control of the host: it either already points at this server, or you can serve
+  a file on it (HTTP), or you have access to its DNS zone (DNS TXT).
 - For the DNS-TXT method, a server built with the `domain-verify-dns` feature.
 
-## 1. Start verification
+## The common case: the host already points here
 
-Pick the method that matches the access you have, and run `domain add`. It
-records the host as pending and prints the challenge to publish:
+If `app.example.com` already resolves to this boatramp server (its A/CNAME points
+at the box, e.g. right after you cut a CNAME over to it), a single command
+verifies and attaches it:
 
 ```sh
-boatramp domain add app.example.com --method http
+boatramp domain add app.example.com
 ```
 
 ```text
-domain app.example.com — pending (http)
-publish token 7f3c9a2e… at:
-  /.well-known/boatramp-domain-verification/7f3c9a2e…
-then run: boatramp domain verify app.example.com
+started http verification for app.example.com
+
+Serve this token, then run `boatramp domain verify app.example.com`:
+  GET http://app.example.com/.well-known/boatramp-domain-verification/7f3c9a2e…
+  body: 7f3c9a2e…
+
+checking whether app.example.com already resolves here…
+✓ verified app.example.com and attached it to my-site
 ```
 
-- **HTTP token** proves you control what the host serves *right now*. Serve the
-  printed token under `/.well-known/boatramp-domain-verification/<token>` on the
-  host. Works in every build.
-- **DNS TXT** proves you control the host's DNS zone, even while the host still
-  points somewhere else — the method to use when migrating a live domain. Choose
-  it with `--method dns`:
+boatramp serves its own challenge token from the edge (before host routing), so a
+host pointed at the server proves ownership over HTTP with **no prior deploy** —
+this is what removes the old "the host 404s its own challenge" chicken-and-egg.
+The host now routes and is eligible for a certificate.
+
+## Migrating a live domain (still pointing elsewhere)
+
+When the host still serves live traffic from somewhere else, prove ownership over
+DNS *before* you cut anything over. If a managed-DNS provider is configured, one
+command publishes the `_boatramp-verify` TXT, waits for it to resolve, and
+attaches — it never touches the host's A/CNAME:
+
+```sh
+boatramp domain add app.example.com --provider cloudflare
+```
+
+See [Automate DNS with a provider](../how-to/auto-dns.md). Without a provider, add
+the TXT record yourself and verify in two steps:
 
 ```sh
 boatramp domain add app.example.com --method dns
+# add the printed _boatramp-verify.<host> TXT to your zone, then:
+boatramp domain verify app.example.com
+```
+
+Because DNS proves zone control while the host still points away, you can verify
+and attach first, then cut the A/CNAME over when you're ready.
+
+## Serving the token yourself (HTTP, host elsewhere)
+
+If you'd rather prove control by serving a file — and the host isn't pointed here
+yet — start the challenge, place the token, then verify. `--no-wait` skips the
+immediate self-check when you know there's a manual step:
+
+```sh
+boatramp domain add app.example.com --no-wait
 ```
 
 ```text
-domain app.example.com — pending (dns)
-publish TXT record:
-  _boatramp-verify.app.example.com  TXT  "7f3c9a2e…"
-then run: boatramp domain verify app.example.com
+started http verification for app.example.com
+
+Serve this token, then run `boatramp domain verify app.example.com`:
+  GET http://app.example.com/.well-known/boatramp-domain-verification/7f3c9a2e…
+  body: 7f3c9a2e…
+
+then run `boatramp domain verify app.example.com`
 ```
 
-A pending host does not route and cannot request a certificate until it passes.
-
-## 2. Publish the challenge
-
-Publish exactly what `domain add` printed:
-
-- **HTTP** — make the site (or any server on the host) return the token body at
-  the `/.well-known/boatramp-domain-verification/<token>` path.
-- **DNS** — add the `_boatramp-verify.<host>` TXT record to the zone and wait
-  for it to propagate.
-
-If a managed-DNS provider is configured, skip this step: pass `--auto --provider
-<name>` to `domain add` and boatramp publishes the DNS-TXT record and verifies it
-for you. See [Automate DNS with a provider](../how-to/auto-dns.md).
-
-## 3. Verify and attach
-
-Run `domain verify`. It checks the challenge and, on success, attaches the host
-to the site so it starts routing:
+Serve the token body at that path on the host, then:
 
 ```sh
 boatramp domain verify app.example.com
 ```
 
 ```text
-domain app.example.com — verified (http), attached to site my-site
+verified app.example.com and attached it to my-site
 ```
 
-If the check fails, the host stays pending. Confirm the token file resolves, or
-that the TXT record has propagated, then run `domain verify` again.
+If the check fails the host stays pending — confirm the token resolves (or the TXT
+record has propagated) and run `domain verify` again. A pending host does not route
+and cannot request a certificate.
 
-## 4. Confirm the attachment
+## Confirm the attachment
 
 List the site's domains to see what routes and what is still pending:
 
@@ -87,8 +109,11 @@ boatramp domain ls
 ```
 
 ```text
-app.example.com   attached   my-site   http
-beta.example.com  pending     —        dns
+app.example.com   (primary)
+beta.example.com
+
+pending verification:
+  gamma.example.com  (dns, unverified)
 ```
 
 ## Remove a domain
@@ -101,7 +126,7 @@ boatramp domain rm app.example.com
 ```
 
 ```text
-domain app.example.com — removed
+detached app.example.com from my-site
 ```
 
 ## Next: get a certificate

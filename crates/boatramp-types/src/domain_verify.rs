@@ -29,6 +29,14 @@ pub const HTTP_WELL_KNOWN_PREFIX: &str = "/.well-known/boatramp-domain-verificat
 /// DNS record-name prefix for the TXT method (joined to the base host).
 pub const DNS_RECORD_PREFIX: &str = "_boatramp-verify";
 
+/// How long a **pending** (unverified) challenge stays valid, in seconds
+/// (7 days). After this the self-serve edge route and `domain verify` stop
+/// honoring it, so a stale token can't be redeemed indefinitely; the operator
+/// re-runs `domain add` for a fresh one. A *verified* record never expires — it
+/// records proven ownership — and a `created_at_unix` of `0` (unstamped) is
+/// treated as non-expiring.
+pub const CHALLENGE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// How a domain's ownership is proven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -143,6 +151,18 @@ impl DomainVerification {
         S: AsRef<str>,
     {
         values.into_iter().any(|v| self.matches(v.as_ref()))
+    }
+
+    /// Whether this challenge has passed its validity window at `now_unix`.
+    /// Only meaningful while unverified: a verified record (proven ownership)
+    /// never expires, and an unstamped `created_at_unix` of `0` is treated as
+    /// non-expiring. See [`CHALLENGE_TTL_SECS`]. Computed from `created_at_unix`
+    /// (no stored expiry field — the schema is pinned at v1).
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        if self.verified || self.created_at_unix == 0 {
+            return false;
+        }
+        now_unix.saturating_sub(self.created_at_unix) > CHALLENGE_TTL_SECS
     }
 
     /// Operator-facing setup instructions for this challenge.
@@ -328,6 +348,24 @@ mod tests {
         let v = fixed(VerificationMethod::Http);
         let bytes = v.to_json().unwrap();
         assert_eq!(DomainVerification::from_json(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn pending_challenge_expires_after_ttl() {
+        let v = fixed(VerificationMethod::Http); // created_at_unix = 100, unverified
+        assert!(!v.is_expired(100));
+        assert!(!v.is_expired(100 + CHALLENGE_TTL_SECS));
+        assert!(v.is_expired(100 + CHALLENGE_TTL_SECS + 1));
+
+        // A verified record never expires (it records proven ownership).
+        let mut verified = v.clone();
+        verified.verified = true;
+        assert!(!verified.is_expired(100 + CHALLENGE_TTL_SECS + 10_000));
+
+        // An unstamped (created_at_unix = 0) record is treated as non-expiring.
+        let mut unstamped = v.clone();
+        unstamped.created_at_unix = 0;
+        assert!(!unstamped.is_expired(u64::MAX));
     }
 
     #[tokio::test]

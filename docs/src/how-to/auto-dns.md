@@ -16,25 +16,26 @@ Credentials are read from the environment only, never from a config file.
 
 ## Verify ownership automatically
 
-`domain add --auto` closes the ownership-verification loop for you. It publishes
-the `_boatramp-verify.<host>` TXT record through the provider, polls until the
-record resolves, attaches the host, then retracts the challenge record:
+Passing `--provider` to `domain add` closes the ownership-verification loop for
+you. It publishes the `_boatramp-verify.<host>` TXT record through the provider,
+polls until the record resolves, attaches the host, then retracts the challenge
+record:
 
 ```sh
-boatramp domain add app.example.com --auto --provider cloudflare
+boatramp domain add app.example.com --provider cloudflare
 ```
 
 ```text
-publishing _boatramp-verify.app.example.com TXT via cloudflare
-waiting for it to resolve… resolved
+published _boatramp-verify.app.example.com TXT for app.example.com; waiting for it to resolve...
 verified app.example.com and attached it to my-site
 ```
 
-`--auto` writes **only** the ownership-proof TXT — never the host's `A`, `AAAA`,
-or `CNAME`. Verification always happens before the host is pointed or served, so
-boatramp cannot be induced to point or serve a hostname you have not proven you
-control. Without `--auto`, `domain add` prints the record to publish by hand and
-you run `domain verify` afterward.
+`--provider` writes **only** the ownership-proof TXT — never the host's `A`,
+`AAAA`, or `CNAME`. Verification always happens before the host is pointed or
+served, so boatramp cannot be induced to point or serve a hostname you have not
+proven you control. Without a provider, `domain add` verifies over HTTP if the
+host already resolves here, otherwise prints the record to publish by hand so you
+can run `domain verify` afterward.
 
 ## Point the domain at your server
 

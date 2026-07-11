@@ -192,7 +192,7 @@ Attach/detach hostnames to a site (virtualhost routing). See
 
 | Sub-action | Description |
 | --- | --- |
-| `add <host>` | Start ownership verification (use `*.example.com` for a wildcard). |
+| `add <host>` | Verify ownership and attach (use `*.example.com` for a wildcard). Verifies + attaches in one step when the host already resolves here; otherwise prints the challenge to finish with `verify`. |
 | `verify <host>` | Check the challenge; on success the host is attached. |
 | `rm <host>` | Detach a hostname and drop its verification. |
 | `ls` | List the site's hostnames and pending verifications. |
@@ -202,8 +202,8 @@ Attach/detach hostnames to a site (virtualhost routing). See
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--method <http\|dns>` | `http` | Serve a token file (`http`) or publish a TXT record (`dns`, needs `domain-verify-dns`). |
-| `--auto` | — | Publish the DNS-TXT challenge via `--provider`, poll, and attach. Forces `dns`. |
-| `--provider <name>` | — | DNS provider for `--auto` (e.g. `cloudflare`, `route53`). |
+| `--provider <name>` | — | Managed-DNS provider (e.g. `cloudflare`, `route53`): publish the `_boatramp-verify` TXT, poll, and attach — no manual DNS edit. Implies `--method dns`; needs `acme-dns`. |
+| `--no-wait` | — | Only start the challenge and print instructions; skip the immediate verify+attach self-check. |
 
 ## `boatramp alias`
 
