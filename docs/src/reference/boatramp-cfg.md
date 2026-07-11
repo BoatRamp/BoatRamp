@@ -36,6 +36,7 @@ Top-level sections, all optional:
 | `max_upload_bytes` | integer | unlimited | Reject blob uploads larger than this. |
 | `default_site` | string | — | Site served for a `Host` matching no domain, instead of `404`. |
 | `protect_previews` | bool | `false` | Require a control-plane token to view `/_deploy` previews. |
+| `pop_origin` | string | — | The fleet's canonical public origin (e.g. `https://cp.example.com`) a per-request proof-of-possession must bind (`aud`). Required for holder-bound (`cnf`/PoP) tokens; compared against the proof, never a `Host`/`X-Forwarded-*` header. Env `BOATRAMP_POP_ORIGIN`. See [PoP-bind a token](../how-to/pop-tokens.md). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
 > disabled. Under the default `multi-tenant` posture, `serve` refuses to start
@@ -97,6 +98,7 @@ Override knobs (byte caps: `0` = unlimited):
 | `allow_shared_kernel_compute` | Permit container (shared-kernel) compute; off ⇒ microVM only. |
 | `ratelimit_fail_open` | Serve rather than reject if the rate-limit store is unavailable. |
 | `allow_implicit_routing` | Resolve an unmatched host to a site without a registered domain (first-label `<site>.host` / sole site). Off under `multi-tenant`; a loopback bind enables it regardless. See [addressing](../explanation/addressing.md). |
+| `require_pop` | Require **every** control-plane token to be holder-bound (`cnf`) and present a valid per-request proof-of-possession. Off by default (a `cnf` token always requires a proof regardless; this knob additionally bans plain bearer tokens fleet-wide). Needs `pop_origin` set. See [PoP-bind a token](../how-to/pop-tokens.md). |
 
 See [Choose & inspect a security posture](../how-to/security-posture.md) and
 [The security posture model](../explanation/security-posture.md).

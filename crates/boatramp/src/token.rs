@@ -72,6 +72,13 @@ enum TokenCommand {
         /// of the matching private key can `token attenuate` it offline.
         #[arg(long)]
         holder_pub: Option<String>,
+        /// Make the token **PoP-bound** (DPoP): generate a fresh holder keypair,
+        /// mint the token against its public half (`cnf`), and print the holder
+        /// **private** key as `BOATRAMP_TOKEN_HOLDER_KEY` so the client can sign a
+        /// per-request proof. A leaked token alone is then inert without this key.
+        /// Also set `BOATRAMP_POP_ORIGIN` to the server's `[serve] pop_origin`.
+        #[arg(long, conflicts_with = "holder_pub")]
+        pop: bool,
     },
     /// Mint the FIRST control-plane token on a fresh deploy by presenting the
     /// single-use bootstrap secret (`BOATRAMP_BOOTSTRAP_SECRET`) — no admin token
@@ -239,23 +246,49 @@ pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<()> {
             roles,
             ttl_secs,
             holder_pub,
+            pop,
         } => {
+            // `--pop`: generate a holder keypair and bind the token to its public
+            // half; the printed private key is the per-request signing key.
+            let pop_holder = pop.then(|| {
+                boatramp_core::cose::LocalSigner::generate(boatramp_core::cose::TokenAlg::Es256)
+            });
+            let holder_pubkey = match &pop_holder {
+                Some(holder) => {
+                    use boatramp_core::cose::Signer;
+                    Some(holder.public_key().to_hex())
+                }
+                None => holder_pub,
+            };
             let response: CreateResponse = http
                 .post(format!("{server}/api/tokens"))
                 .json(&CreateRequest {
                     label,
                     roles,
                     ttl_secs,
-                    holder_pubkey: holder_pub,
+                    holder_pubkey,
                 })
                 .send()
                 .await?
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", response.token);
-            eprintln!("id: {}", response.id);
-            eprintln!("store the token now — it cannot be recovered");
+            if let Some(holder) = pop_holder {
+                // Print both secrets as ready-to-export shell lines (matching
+                // `auth init`), guidance to stderr.
+                println!("BOATRAMP_TOKEN={}", response.token);
+                println!("BOATRAMP_TOKEN_HOLDER_KEY={}", holder.private_hex());
+                eprintln!("id: {}", response.id);
+                eprintln!(
+                    "PoP-bound token. Also set BOATRAMP_POP_ORIGIN to the server's \
+                     [serve] pop_origin so the client binds the right origin."
+                );
+                eprintln!("store both secrets now — they cannot be recovered");
+            } else {
+                println!("{}", response.token);
+                eprintln!("id: {}", response.id);
+                eprintln!("store the token now — it cannot be recovered");
+            }
         }
         TokenCommand::Attenuate { .. }
         | TokenCommand::Bootstrap { .. }

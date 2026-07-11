@@ -22,6 +22,7 @@
 - [Bootstrap authentication & mint tokens](./how-to/auth-bootstrap.md)
 - [Reach the control plane on day zero (RPK TLS)](./how-to/bootstrap-tls.md)
 - [Make a scoped CI deploy token](./how-to/ci-token.md)
+- [PoP-bind a control-plane token (DPoP)](./how-to/pop-tokens.md)
 - [Sign in with OIDC](./how-to/oidc.md)
 - [Hold the signing key in a KMS/HSM/Vault](./how-to/external-signer.md)
 - [Restrict visitor access](./how-to/visitor-access.md)
