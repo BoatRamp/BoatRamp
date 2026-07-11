@@ -72,11 +72,13 @@ pub enum Error {
     #[cfg(feature = "cluster")]
     #[error("[cluster.peers] key {0:?} is not a node id (u64)")]
     BadPeerId(String),
-    /// Loading the mesh identity, parsing a peer pubkey, or building the mesh TLS
-    /// config failed.
-    #[cfg(feature = "cluster")]
+    /// A raw-public-key TLS error — building the peer-mesh identity/config
+    /// (`cluster`) or the `--tls rpk` bootstrap identity/config (`tls`). Both use
+    /// the same RPK stack (`boatramp_rpktls`), so `mesh::MeshError` is an alias of
+    /// `RpkError` and they share one `From` here (a second would collide).
+    #[cfg(any(feature = "cluster", feature = "tls"))]
     #[error(transparent)]
-    Mesh(#[from] boatramp_cluster::mesh::MeshError),
+    RpkTls(#[from] boatramp_rpktls::RpkError),
     /// Refusing to serve the peer mesh on a non-loopback address with no trust set
     /// configured — that would expose an unauthenticated control plane.
     /// Add each peer's `pubkey` to `[cluster.peers]`.
@@ -185,10 +187,6 @@ pub enum Error {
     #[cfg(feature = "tls")]
     #[error(transparent)]
     Rustls(#[from] rustls::Error),
-    /// An RPK bootstrap-TLS identity / config error (`--tls rpk`).
-    #[cfg(feature = "tls")]
-    #[error(transparent)]
-    Rpk(#[from] boatramp_rpktls::RpkError),
     /// A cluster-managed-cert refresh error (replicated cert store).
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
     #[error(transparent)]
@@ -1405,7 +1403,7 @@ async fn run_cluster(
             .http_redirect_addr
             .or_else(|| config.serve.as_ref().and_then(|s| s.http_redirect_addr));
         if let Some(redirect_addr) = redirect {
-            spawn_http_redirect(redirect_addr);
+            spawn_http_redirect(redirect_addr, deploy.clone(), options.posture);
         }
     }
     let serve_result = match args.tls {
@@ -1414,6 +1412,9 @@ async fn run_cluster(
             .map_err(Error::Serve),
         TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
+        // Raw-public-key control channel: a self-signed RPK identity the client
+        // pins — no cluster cert management needed, so it serves like single-node.
+        TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
         // Cluster-managed certs: the leader issues + stores in the
         // replicated control plane; every node serves the replicated cert.
         #[cfg(feature = "acme-dns")]
