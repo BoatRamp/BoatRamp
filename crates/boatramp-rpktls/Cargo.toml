@@ -1,0 +1,23 @@
+[package]
+name = "boatramp-rpktls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "RFC 7250 raw-public-key mutual TLS 1.3 primitives (Ed25519 identity, pin-based live trust set, rustls server/client configs) — the transport under boatramp's cluster mesh and control-plane bootstrap TLS"
+
+[dependencies]
+# `rustls` default features carry the `aws_lc_rs` provider (raw public keys + the
+# X25519MLKEM768 PQ-hybrid group) and re-export `pki_types`; `aws-lc-rs` is used
+# directly for Ed25519 keygen; `zeroize` backs the non-loggable private-key type.
+rustls = { workspace = true }
+aws-lc-rs = "1.17"
+zeroize = "1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Drives real localhost handshakes in the tests.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-rustls = "0.26"
