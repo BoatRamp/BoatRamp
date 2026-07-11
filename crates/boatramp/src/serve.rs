@@ -2105,7 +2105,7 @@ async fn serve_rpk(
     deploy: DeployStore,
     auth: boatramp_server::Auth,
     handlers: boatramp_server::HandlerRuntime,
-    options: boatramp_server::ServerOptions,
+    mut options: boatramp_server::ServerOptions,
     data_dir: &Path,
 ) -> Result<()> {
     install_crypto_provider();
@@ -2113,6 +2113,35 @@ async fn serve_rpk(
     let key_file = data_dir.join("controlplane-tls.key");
     let identity = boatramp_rpktls::RpkIdentity::load_or_generate(&key_file)?;
     let fingerprint = identity.public_key_hex();
+
+    // If this node holds the root signing key, mint a root-signed attestation of
+    // this TLS identity and serve it at `/.well-known/boatramp-bootstrap-identity`
+    // so a client can pin *only* the root key and learn the TLS key from the
+    // attestation. A verify-only node (no issuer) skips it; the client then pins
+    // the printed identity directly with `--server-pubkey`.
+    if let Some(signer) = options.issuer.clone() {
+        // A year: the attested key is stable across restarts (persisted key file);
+        // rotating the identity re-mints a fresh attestation on next boot.
+        const ATTESTATION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match boatramp_core::cose::mint_attestation(
+            &fingerprint,
+            ATTESTATION_TTL_SECS,
+            now,
+            signer.as_ref(),
+        )
+        .await
+        {
+            Ok(att) => options.bootstrap_attestation = Some(att),
+            Err(err) => {
+                tracing::warn!(%err, "could not mint the bootstrap-TLS attestation; --root-pubkey pinning unavailable")
+            }
+        }
+    }
+
     // No client-auth trust set: the client authenticates with a bearer token, not
     // a client cert (that is the mutual-`cnf` binding of a later stage).
     let rpk = boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());

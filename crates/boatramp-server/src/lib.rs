@@ -305,6 +305,12 @@ pub struct ServerOptions {
     /// `501`. Compared by SHA-256, single-use (rotating the secret re-enables it);
     /// unset once bootstrapped.
     pub bootstrap_secret: Option<String>,
+    /// A **bootstrap-TLS identity attestation** (base64url `COSE_Sign1`) served at
+    /// `GET /.well-known/boatramp-bootstrap-identity` — the root key vouching for
+    /// this node's `--tls rpk` control-plane TLS public key, so a client pinning
+    /// only the root key can learn + pin the TLS identity. Set by `serve` under
+    /// `--tls rpk` when an issuer is present; `None` ⇒ the route returns `404`.
+    pub bootstrap_attestation: Option<String>,
     /// The cluster mesh control hook, wired in cluster mode over
     /// `ClusterNode`. Backs `POST /api/cluster/join` + `/rotate-key`; `None`
     /// (single-node) ⇒ those routes return `501`.
@@ -589,6 +595,7 @@ pub fn router_with(
     // and exchange handlers.
     let issuer = Issuer(options.issuer.clone());
     let bootstrap = BootstrapGate::new(options.bootstrap_secret.as_deref());
+    let bootstrap_attestation = options.bootstrap_attestation.clone();
     // The mesh join admitter, for `POST /api/cluster/join`.
     let mesh_control = MeshControlHandle(options.mesh_control.clone());
     #[cfg(feature = "oidc")]
@@ -745,8 +752,16 @@ pub fn router_with(
             "/.well-known/boatramp-domain-verification/:token",
             get(serve_domain_challenge),
         )
+        // Bootstrap-TLS identity: the root-key-signed attestation of this node's
+        // `--tls rpk` control-plane TLS key, so a client pinning only the root key
+        // can learn + pin the TLS identity. `404` when no attestation is set.
+        .route(
+            "/.well-known/boatramp-bootstrap-identity",
+            get(serve_bootstrap_identity),
+        )
         .fallback(serve_by_host)
         .with_state(deploy)
+        .layer(Extension(BootstrapAttestation(bootstrap_attestation)))
         .layer(Extension(rate_limiter))
         .merge(api)
         // The handler runtime (engine + per-site binding backends) rides as an
@@ -2264,6 +2279,29 @@ async fn serve_sites(
         false,
     )
     .await
+}
+
+/// The root-key-signed bootstrap-TLS identity attestation (base64url
+/// `COSE_Sign1`), carried as an extension for [`serve_bootstrap_identity`].
+#[derive(Clone)]
+struct BootstrapAttestation(Option<String>);
+
+/// `GET /.well-known/boatramp-bootstrap-identity` — serve the root-key attestation
+/// of this node's `--tls rpk` control-plane TLS key. Public + unauthenticated: a
+/// signed statement that reveals nothing (the TLS public key is already presented
+/// in the handshake). A client pinning only the root key verifies it (root
+/// signature + validity), extracts the attested TLS key, and pins it. `404` when
+/// no attestation is set (not `--tls rpk`, or a verify-only node with no issuer).
+async fn serve_bootstrap_identity(Extension(att): Extension<BootstrapAttestation>) -> Response {
+    match att.0 {
+        Some(a) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            a,
+        )
+            .into_response(),
+        None => not_found(),
+    }
 }
 
 /// Serve a pending **HTTP domain-ownership challenge** from the edge, *before*

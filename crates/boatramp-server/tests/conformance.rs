@@ -3545,6 +3545,44 @@ async fn put_config_gate_requires_verified_new_domain() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// The bootstrap-TLS identity endpoint serves the root-key attestation verbatim
+/// and unauthenticated when set, and `404`s when not (`--tls rpk` off / no issuer).
+#[tokio::test]
+async fn bootstrap_identity_endpoint_serves_the_attestation() {
+    let deploy = seed().await;
+    let get_att = |opts: ServerOptions| {
+        let deploy = deploy.clone();
+        async move {
+            let mut req = Request::builder()
+                .uri("/.well-known/boatramp-bootstrap-identity")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+            let resp = router_with(deploy, Auth::disabled(), HandlerRuntime::disabled(), opts)
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+            (status, body)
+        }
+    };
+
+    // With an attestation set → 200 + the blob verbatim.
+    let (status, body) = get_att(ServerOptions {
+        bootstrap_attestation: Some("attestation-blob-abc".into()),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"attestation-blob-abc");
+
+    // Without one → 404.
+    let (status, _) = get_att(ServerOptions::default()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ---- OIDC → token exchange -------------------------------------------------
 
 #[cfg(feature = "oidc")]

@@ -43,6 +43,9 @@ pub const KIND_JOIN: &str = "join";
 pub const KIND_CLUSTER_WRITE: &str = "cluster-write";
 /// Token kind: a delegation (attenuation) block within a presented chain.
 pub const KIND_DELEGATION: &str = "delegation";
+/// Token kind: a bootstrap-TLS identity attestation — the root key vouching that
+/// a given control-plane RPK TLS public key is this fleet's (`--tls rpk`).
+pub const KIND_BOOTSTRAP_TLS: &str = "bootstrap-tls";
 
 /// Text claim key for the holder key (RFC 8747 `cnf`, here the holder's public key
 /// `"<alg>:<hex>"`): the key that may mint the next delegation block. Present only
@@ -520,6 +523,73 @@ pub async fn mint_join(
         )
         .build();
     sign_claims(claims, signer).await
+}
+
+/// Mint a **bootstrap-TLS identity attestation**: a `COSE_Sign1` CWT signed by
+/// the root key binding a control-plane RPK TLS public key (`br_pubkey`, SPKI
+/// hex) with `br_kind = "bootstrap-tls"` and a validity window (`iat`/`exp`). A
+/// `--tls rpk` client that trusts only the root public key fetches this,
+/// verifies the root signature + window, and pins the attested TLS key — so an
+/// operator pins one anchor (the root key) for the whole fleet, and TLS-identity
+/// rotation needs no client change (a fresh attestation is re-minted + re-served).
+pub async fn mint_attestation(
+    tls_pubkey_hex: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_BOOTSTRAP_TLS.to_string()),
+        )
+        .text_claim(
+            CLAIM_PUBKEY.to_string(),
+            CborValue::Text(tls_pubkey_hex.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify a bootstrap-TLS attestation against the root `public` at `now_unix`:
+/// signature + alg pin + TTL + `br_kind = "bootstrap-tls"`, returning the
+/// attested control-plane TLS public key (SPKI hex). A role/join token presented
+/// here is rejected on the kind check (domain separation).
+pub fn verify_attestation(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<String, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    check_exp(&claims, now_unix)?;
+    let mut kind = String::new();
+    let mut pubkey_hex: Option<String> = None;
+    for (name, value) in &claims.rest {
+        if let coset::cwt::ClaimName::Text(t) = name {
+            match t.as_str() {
+                CLAIM_KIND => {
+                    if let CborValue::Text(k) = value {
+                        kind = k.clone();
+                    }
+                }
+                CLAIM_PUBKEY => {
+                    if let CborValue::Text(k) = value {
+                        pubkey_hex = Some(k.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if kind != KIND_BOOTSTRAP_TLS {
+        return Err(TokenError::Claims("not a bootstrap-tls attestation".into()));
+    }
+    pubkey_hex.ok_or_else(|| TokenError::Claims("attestation has no pubkey".into()))
 }
 
 /// A random 16-byte revocation/single-use id (`cti`).
@@ -1075,6 +1145,35 @@ mod tests {
         assert!(matches!(
             verify_join(&token, &stranger.public_key(), NOW),
             Err(TokenError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn attestation_round_trips_and_rejects_tamper_expiry_and_kind() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let public = root.public_key();
+        let tls_spki = "302a300506032b6570032100deadbeefdeadbeefdeadbeefdeadbeef";
+
+        // Round-trip: the attested TLS key comes back.
+        let att = mint_attestation(tls_spki, 3600, NOW, &root).await.unwrap();
+        assert_eq!(verify_attestation(&att, &public, NOW + 60).unwrap(), tls_spki);
+
+        // Past the validity window → rejected.
+        assert!(matches!(
+            verify_attestation(&att, &public, NOW + 4000),
+            Err(TokenError::Expired)
+        ));
+
+        // A different (non-root) key can't verify it.
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_attestation(&att, &stranger.public_key(), NOW).is_err());
+
+        // A join token (same signer) is not accepted as an attestation — the
+        // `br_kind` domain separation rejects it.
+        let join = mint_join(1, tls_spki, 3600, NOW, &root).await.unwrap();
+        assert!(matches!(
+            verify_attestation(&join, &public, NOW + 60),
+            Err(TokenError::Claims(_))
         ));
     }
 
