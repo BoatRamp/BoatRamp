@@ -20,6 +20,7 @@
 - [Wildcard certs with DNS-01](./how-to/wildcard-dns01.md)
 - [Automate DNS with a provider](./how-to/auto-dns.md)
 - [Bootstrap authentication & mint tokens](./how-to/auth-bootstrap.md)
+- [Reach the control plane on day zero (RPK TLS)](./how-to/bootstrap-tls.md)
 - [Make a scoped CI deploy token](./how-to/ci-token.md)
 - [Sign in with OIDC](./how-to/oidc.md)
 - [Hold the signing key in a KMS/HSM/Vault](./how-to/external-signer.md)

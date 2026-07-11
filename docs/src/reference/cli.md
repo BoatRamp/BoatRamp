@@ -26,6 +26,7 @@ flags unique to each command:
 | --- | --- | --- |
 | `--server <url>` | `BOATRAMP_SERVER` | Server base URL (overrides `publish.server`). |
 | `--site <name>` | `BOATRAMP_SITE` | Target site (overrides `publish.site`). |
+| — | `BOATRAMP_SERVER_PUBKEY` | Pin the control plane to a `--tls rpk` server's raw public key (the hex it prints at startup). See [Reach the control plane on day zero](../how-to/bootstrap-tls.md). |
 
 ## Commands
 
@@ -104,7 +105,7 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--tls <off\|custom\|acme\|acme-dns>` | `off` | TLS mode (HTTPS needs the `tls` feature). |
+| `--tls <off\|custom\|acme\|acme-dns\|rpk>` | `off` | TLS mode (HTTPS needs the `tls` feature). `rpk` = a pinned raw-public-key control channel; see [Reach the control plane on day zero](../how-to/bootstrap-tls.md). |
 | `--tls-cert <path>` / `--tls-key <path>` | — | Certificate + key for `--tls custom`. |
 | `--acme-domain <domain>` | — | Domain to issue for (repeatable). |
 | `--acme-directory <url>` | Let's Encrypt production | ACME directory URL. |
