@@ -1304,6 +1304,16 @@ async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<Str
     }
 }
 
+/// Canonicalize a site-config domain entry for the verify-gate diff: fold case
+/// and any trailing dot, but keep an exact host distinct from a `*.` wildcard
+/// (they are different routing entities that must not collapse together).
+fn canon_domain_entry(host: &str) -> String {
+    match host.strip_prefix("*.") {
+        Some(base) => format!("*.{}", base.trim().trim_end_matches('.').to_ascii_lowercase()),
+        None => host.trim().trim_end_matches('.').to_ascii_lowercase(),
+    }
+}
+
 /// Set a site's [`SiteConfig`] (rebuilds its host → site index).
 ///
 /// A domain only enters routing once its ownership is proven. A host **newly
@@ -1321,18 +1331,23 @@ async fn put_site_config(
         Ok(c) => c.unwrap_or_default(),
         Err(err) => return deploy_error_response(err),
     };
+    // Diff on the *canonical* host form (case/trailing-dot folded, wildcard `*.`
+    // preserved) so it agrees with the normalizing verification lookup — else a
+    // case-variant of an already-attached host reads as "newly added" and a
+    // never-verified variant could be laundered in.
     let existing: std::collections::BTreeSet<String> = current
         .domains
         .exact_hosts()
-        .map(str::to_string)
-        .chain(current.domains.wildcards.iter().cloned())
+        .map(canon_domain_entry)
+        .chain(current.domains.wildcards.iter().map(|w| canon_domain_entry(w)))
         .collect();
-    let added = config
+    let added: Vec<String> = config
         .domains
         .exact_hosts()
-        .map(str::to_string)
-        .chain(config.domains.wildcards.iter().cloned())
-        .filter(|host| !existing.contains(host));
+        .map(canon_domain_entry)
+        .chain(config.domains.wildcards.iter().map(|w| canon_domain_entry(w)))
+        .filter(|host| !existing.contains(host))
+        .collect();
     for host in added {
         match deploy.is_domain_verified(&site, &host).await {
             Ok(true) => {}

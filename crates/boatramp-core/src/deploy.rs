@@ -75,6 +75,16 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Canonicalize a routing host: trimmed, no trailing dot, lower-cased. Host names
+/// are case-insensitive and a trailing dot is a legal FQDN form, so the routing
+/// index — and the host-uniqueness guard that protects it — must key on one
+/// canonical form. Otherwise a case- or dot-variant (`Example.com`, `example.com.`)
+/// would write a *second* `domain/<host>` entry and slip past the hijack guard,
+/// then route real traffic when a client sends that exact `Host`.
+fn canon_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Whether `key` is a sharded blob key (`ab/<64 hex>`). Used so GC never
 /// touches objects it did not write, even in a shared bucket.
 fn is_blob_key(key: &str) -> bool {
@@ -328,11 +338,11 @@ impl DeployStore {
     }
 
     fn domain_key(host: &str) -> String {
-        format!("domain/{host}")
+        format!("domain/{}", canon_host(host))
     }
 
     fn wildcard_key(suffix: &str) -> String {
-        format!("wildcard/{suffix}")
+        format!("wildcard/{}", canon_host(suffix))
     }
 
     fn domain_verification_key(site: &str, host: &str) -> String {
@@ -467,7 +477,10 @@ impl DeployStore {
     /// suffixes from most specific to least (so `*.example.com` matches
     /// `a.b.example.com`).
     pub async fn resolve_site_by_host(&self, host: &str) -> Result<Option<String>, DeployError> {
-        let host = host.trim();
+        // Canonicalize once so the `Host` a client sends matches the canonical
+        // key written by `set_site_config` regardless of case / trailing dot.
+        let host = canon_host(host);
+        let host = host.as_str();
         if let Some(bytes) = self.kv.get(&Self::domain_key(host)).await? {
             return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
         }
@@ -1957,6 +1970,55 @@ mod tests {
                 .as_deref(),
             Some("a")
         );
+    }
+
+    /// The hijack guard folds case + trailing dot: a variant-cased or
+    /// dot-suffixed host can't write a second routing key past the guard, and
+    /// routing resolves any casing to the one owner.
+    #[tokio::test]
+    async fn host_uniqueness_is_case_and_dot_insensitive() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::domain_verify::VerificationMethod;
+
+        let store = store();
+        // Site `a` legitimately attaches `example.com`.
+        store
+            .start_domain_verification("a", "example.com", VerificationMethod::Http, 100)
+            .await
+            .unwrap();
+        store.mark_domain_verified("a", "example.com").await.unwrap();
+        store
+            .attach_verified_domain("a", "example.com")
+            .await
+            .unwrap();
+
+        // Site `b` tries to claim case / trailing-dot variants of the same host.
+        for variant in ["Example.COM", "example.com.", "EXAMPLE.com."] {
+            let cfg = SiteConfig {
+                domains: DomainConfig {
+                    primary: Some(variant.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let err = store
+                .set_site_config("b", &cfg)
+                .await
+                .expect_err("variant claim must be refused");
+            assert!(
+                matches!(err, DeployError::Conflict(_)),
+                "variant {variant:?} must Conflict, got {err:?}"
+            );
+        }
+
+        // Routing folds case + trailing dot to the one owner.
+        for h in ["example.com", "Example.com", "EXAMPLE.COM", "example.com."] {
+            assert_eq!(
+                store.resolve_site_by_host(h).await.unwrap().as_deref(),
+                Some("a"),
+                "host {h:?} must resolve to site a"
+            );
+        }
     }
 
     /// The self-serve edge lookup: a pending HTTP challenge is found by

@@ -154,13 +154,21 @@ impl DomainVerification {
     }
 
     /// Whether this challenge has passed its validity window at `now_unix`.
-    /// Only meaningful while unverified: a verified record (proven ownership)
-    /// never expires, and an unstamped `created_at_unix` of `0` is treated as
-    /// non-expiring. See [`CHALLENGE_TTL_SECS`]. Computed from `created_at_unix`
-    /// (no stored expiry field — the schema is pinned at v1).
+    /// Computed from `created_at_unix` (no stored expiry field — the schema is
+    /// pinned at v1):
+    ///
+    /// * a **verified** record (proven ownership) never expires — including one
+    ///   with an unstamped `created_at_unix` of `0`;
+    /// * a **pending** record with `created_at_unix == 0` is treated as expired,
+    ///   so an unstamped challenge can never be redeemed via the self-serve route
+    ///   (the grace applies only to verified records, not pending ones);
+    /// * otherwise it expires [`CHALLENGE_TTL_SECS`] after `created_at_unix`.
     pub fn is_expired(&self, now_unix: u64) -> bool {
-        if self.verified || self.created_at_unix == 0 {
+        if self.verified {
             return false;
+        }
+        if self.created_at_unix == 0 {
+            return true;
         }
         now_unix.saturating_sub(self.created_at_unix) > CHALLENGE_TTL_SECS
     }
@@ -362,10 +370,16 @@ mod tests {
         verified.verified = true;
         assert!(!verified.is_expired(100 + CHALLENGE_TTL_SECS + 10_000));
 
-        // An unstamped (created_at_unix = 0) record is treated as non-expiring.
-        let mut unstamped = v.clone();
-        unstamped.created_at_unix = 0;
-        assert!(!unstamped.is_expired(u64::MAX));
+        // An unstamped *pending* record is treated as expired, so it can never be
+        // redeemed via the self-serve route.
+        let mut unstamped_pending = v.clone();
+        unstamped_pending.created_at_unix = 0;
+        assert!(unstamped_pending.is_expired(0));
+
+        // …but an unstamped *verified* record (proven ownership) still never expires.
+        let mut unstamped_verified = unstamped_pending.clone();
+        unstamped_verified.verified = true;
+        assert!(!unstamped_verified.is_expired(u64::MAX));
     }
 
     #[tokio::test]

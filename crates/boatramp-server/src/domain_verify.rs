@@ -53,6 +53,11 @@ impl ServerDomainProbe {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent("boatramp-domain-verify")
+            // Never follow redirects: a challenge token is served directly (200),
+            // and the resolve-once address pin only covers the first hop — a 3xx
+            // to a different host would be re-resolved via the system resolver,
+            // defeating the SSRF guard (e.g. a redirect to 169.254.169.254).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default();
         Self {
@@ -98,6 +103,8 @@ impl ServerDomainProbe {
             .timeout(Duration::from_secs(10))
             .user_agent("boatramp-domain-verify")
             .resolve(&host, addr)
+            // No redirects — the pin is first-hop only (see `new`).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| VerifyError::Probe(e.to_string()))
     }
