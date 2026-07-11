@@ -185,6 +185,10 @@ pub enum Error {
     #[cfg(feature = "tls")]
     #[error(transparent)]
     Rustls(#[from] rustls::Error),
+    /// An RPK bootstrap-TLS identity / config error (`--tls rpk`).
+    #[cfg(feature = "tls")]
+    #[error(transparent)]
+    Rpk(#[from] boatramp_rpktls::RpkError),
     /// A cluster-managed-cert refresh error (replicated cert store).
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
     #[error(transparent)]
@@ -458,6 +462,12 @@ enum TlsMode {
     /// HTTPS with ACME **DNS-01** certificates, incl. wildcard preview certs
     /// (requires `--features acme-dns`).
     AcmeDns,
+    /// HTTPS with a **raw-public-key** (RFC 7250) identity the client pins — an
+    /// encrypted, server-authenticated control channel with no ACME, tunnel, or
+    /// TLS-terminating proxy (requires `--features tls`). The client authenticates
+    /// with a bearer token; the identity printed at startup is pinned client-side
+    /// with `--server-pubkey`. For a first-boot / bare-metal control plane.
+    Rpk,
 }
 
 /// Arguments for `boatramp serve`.
@@ -824,6 +834,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         TlsMode::Custom => serve_custom(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::Acme => serve_acme(&args, addr, deploy, auth, handlers, options).await,
         TlsMode::AcmeDns => serve_acme_dns(&args, addr, deploy, auth, handlers, options).await,
+        TlsMode::Rpk => serve_rpk(&args, addr, deploy, auth, handlers, options, &data_dir).await,
     };
     // Graceful shutdown: force a final flush of the metadata store (SHUT-1).
     if let Err(e) = kv_handle.flush().await {
@@ -2076,6 +2087,53 @@ async fn serve_custom(
     Ok(())
 }
 
+/// Serve the control-plane over **RFC 7250 raw-public-key TLS** (`--tls rpk`):
+/// present a persisted control-plane RPK identity the client pins, with the
+/// client authenticating via a bearer token (a server-authenticated channel). No
+/// ACME, tunnel, or TLS-terminating proxy — an encrypted first-boot / bare-metal
+/// control plane.
+///
+/// The identity is a dedicated `<data-dir>/controlplane-tls.key` (Ed25519,
+/// `0600`), **not** the root auth key: the root key may be remote/async
+/// (KMS/HSM) while rustls needs a local synchronous signing key, and
+/// cross-protocol key reuse is poor hygiene. The public-key fingerprint is
+/// logged + printed at startup so the operator can pin it (`--server-pubkey`).
+#[cfg(feature = "tls")]
+async fn serve_rpk(
+    _args: &ServeArgs,
+    addr: SocketAddr,
+    deploy: DeployStore,
+    auth: boatramp_server::Auth,
+    handlers: boatramp_server::HandlerRuntime,
+    options: boatramp_server::ServerOptions,
+    data_dir: &Path,
+) -> Result<()> {
+    install_crypto_provider();
+
+    let key_file = data_dir.join("controlplane-tls.key");
+    let identity = boatramp_rpktls::RpkIdentity::load_or_generate(&key_file)?;
+    let fingerprint = identity.public_key_hex();
+    // No client-auth trust set: the client authenticates with a bearer token, not
+    // a client cert (that is the mutual-`cnf` binding of a later stage).
+    let rpk = boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());
+    let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rpk.server_auth()?));
+
+    tracing::info!(%addr, pubkey = %fingerprint, "serving HTTPS (RPK bootstrap TLS)");
+    // The identity is public (not a secret); print it so the operator can copy it
+    // to the client's `--server-pubkey`.
+    println!("control-plane RPK TLS identity — pin the client with:\n  --server-pubkey {fingerprint}");
+
+    #[cfg(feature = "handlers")]
+    let _scheduler = handlers.spawn_scheduler(deploy.clone());
+    let handle = spawn_tls_shutdown();
+    let app = boatramp_server::router_with(deploy, auth, handlers, options);
+    axum_server::bind_rustls(addr, config)
+        .handle(handle)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await?;
+    Ok(())
+}
+
 /// Load a PEM cert chain + private key as DER, for the HTTP/3 (quinn) listener.
 #[cfg(feature = "http3")]
 fn load_cert_chain_and_key(
@@ -2209,6 +2267,19 @@ async fn serve_acme(
     _auth: boatramp_server::Auth,
     _handlers: boatramp_server::HandlerRuntime,
     _options: boatramp_server::ServerOptions,
+) -> Result<()> {
+    Err(Error::NoTlsSupport)
+}
+
+#[cfg(not(feature = "tls"))]
+async fn serve_rpk(
+    _args: &ServeArgs,
+    _addr: SocketAddr,
+    _deploy: DeployStore,
+    _auth: boatramp_server::Auth,
+    _handlers: boatramp_server::HandlerRuntime,
+    _options: boatramp_server::ServerOptions,
+    _data_dir: &Path,
 ) -> Result<()> {
     Err(Error::NoTlsSupport)
 }

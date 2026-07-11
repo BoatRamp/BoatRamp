@@ -820,6 +820,27 @@ mod tests {
     }
 
     #[test]
+    fn load_or_generate_persists_and_reloads_owner_only() {
+        let dir = std::env::temp_dir().join(format!("rpktls-load-{}", std::process::id()));
+        let path = dir.join("controlplane-tls.key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First call generates + persists; the second returns the SAME key.
+        let a = RpkIdentity::load_or_generate(&path).unwrap();
+        let b = RpkIdentity::load_or_generate(&path).unwrap();
+        assert_eq!(a.public_key(), b.public_key());
+
+        // The key file is owner-only (`0600`) on unix — it holds a private key.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "key file must be owner read/write only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn identity_roundtrips_and_never_logs_the_key() {
         let id = RpkIdentity::generate().unwrap();
         // The public key is stable across a save/load of the private key.
