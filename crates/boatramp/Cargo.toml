@@ -105,7 +105,15 @@ cluster = [
 # `Function`) whose YAML the binary emits (`operator crds|manifests`). One image,
 # one version — the operator is the same binary that serves. Off by default; pulls
 # the heavy kube-rs + k8s-openapi tree only for a k8s build.
-operator = ["dep:kube", "dep:k8s-openapi", "dep:schemars", "dep:serde_yaml"]
+operator = [
+  "dep:kube",
+  "dep:k8s-openapi",
+  "dep:schemars",
+  "dep:serde_yaml",
+  # kube talks to the apiserver over rustls; the workspace pulls both aws-lc-rs
+  # and ring, so a provider must be installed explicitly (as `serve` does).
+  "dep:rustls",
+]
 
 [dependencies]
 # COSE/CWT + Cedar auth is always built into the binary: the CLI

@@ -43,6 +43,10 @@ struct Ctx {
 
 /// Run the controller until the process is signalled.
 pub async fn run(args: RunArgs) -> Result<()> {
+    // kube talks to the apiserver over rustls; the workspace pulls both aws-lc-rs
+    // and ring, so rustls can't auto-select a provider — install aws-lc-rs (the
+    // workspace default, matching `serve`). Idempotent; ignore an already-set one.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // In-cluster config (a mounted ServiceAccount) or a local kubeconfig — kube
     // picks whichever is present, so the same binary runs in-cluster and locally.
     let client = Client::try_default().await?;
