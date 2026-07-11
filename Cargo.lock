@@ -1233,6 +1233,7 @@ dependencies = [
  "boatramp-docker",
  "boatramp-firecracker",
  "boatramp-handlers",
+ "boatramp-rpktls",
  "boatramp-server",
  "boatramp-storage",
  "brotli 7.0.0",

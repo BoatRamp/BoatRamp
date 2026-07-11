@@ -22,7 +22,7 @@ cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
 # object_store backend.
 slatedb = ["boatramp-storage/slatedb"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
-tls = ["dep:axum-server", "dep:rustls-acme", "dep:rustls", "dep:rustls-pemfile"]
+tls = ["dep:axum-server", "dep:rustls-acme", "dep:rustls", "dep:rustls-pemfile", "dep:boatramp-rpktls"]
 # OIDC bearer-JWT control-plane auth: verify `serve` against an
 # OIDC issuer's JWKS. Enables the server's `oidc` feature.
 oidc = ["boatramp-server/oidc"]
@@ -102,6 +102,8 @@ cluster = [
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
+# RFC 7250 RPK mutual-TLS primitives, for the `--tls rpk` bootstrap listener.
+boatramp-rpktls = { workspace = true, optional = true }
 # The OCI→ext4 rootfs build for `boatramp compute build` +
 # the in-process embedded-VMM `ComputeBackend`. `embedded` only pulls its
 # Linux/KVM deps on Linux (the backend module is `target_os = "linux"`-gated), so

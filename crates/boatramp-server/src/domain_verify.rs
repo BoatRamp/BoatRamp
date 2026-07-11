@@ -131,21 +131,56 @@ impl DomainProbe for ServerDomainProbe {
     }
 
     async fn fetch_http(&self, url: &str) -> Result<String, VerifyError> {
-        // Reject / pin the target before connecting.
-        let client = self.pinned_client_for(url).await?;
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| VerifyError::Probe(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| VerifyError::Probe(e.to_string()))?;
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| VerifyError::Probe(e.to_string()))?;
-        // A token is tiny; cap what we read so a bogus host can't stream forever.
-        Ok(body.chars().take(4096).collect())
+        // Follow redirects **manually**, re-validating every hop — a
+        // TLS-terminating platform (fly, Cloudflare, a reverse proxy) commonly
+        // 301/308s `:80→:443`, and the token then lives on `:443`. Each hop goes
+        // back through `pinned_client_for`, which resolves the target, refuses a
+        // non-global address, and pins to it — so following a redirect can't be
+        // turned into an SSRF to `169.254.169.254`/localhost/internal (the reason
+        // the reqwest clients set `redirect::Policy::none()`; we do the hops here
+        // with per-hop validation, like ACME HTTP-01).
+        const MAX_HOPS: usize = 5;
+        let mut current = url.to_string();
+        for _ in 0..=MAX_HOPS {
+            let client = self.pinned_client_for(&current).await?;
+            let resp = client
+                .get(&current)
+                .send()
+                .await
+                .map_err(|e| VerifyError::Probe(e.to_string()))?;
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        VerifyError::Probe(format!("redirect {} without a Location", resp.status()))
+                    })?;
+                // Resolve a relative `Location` against the current URL.
+                let next = reqwest::Url::parse(&current)
+                    .and_then(|base| base.join(location))
+                    .map_err(|e| VerifyError::Probe(format!("bad redirect Location: {e}")))?;
+                if !matches!(next.scheme(), "http" | "https") {
+                    return Err(VerifyError::Probe(format!(
+                        "refusing non-HTTP redirect to {next}"
+                    )));
+                }
+                current = next.into();
+                continue;
+            }
+            let resp = resp
+                .error_for_status()
+                .map_err(|e| VerifyError::Probe(e.to_string()))?;
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| VerifyError::Probe(e.to_string()))?;
+            // A token is tiny; cap what we read so a bogus host can't stream forever.
+            return Ok(body.chars().take(4096).collect());
+        }
+        Err(VerifyError::Probe(format!(
+            "too many redirects (more than {MAX_HOPS})"
+        )))
     }
 }
 
@@ -345,5 +380,57 @@ mod tests {
             msg.contains("non-global"),
             "rejection should name the non-global refusal, got: {msg}"
         );
+    }
+
+    /// The probe follows a `:80→:443`-style redirect (here a plain 302 to another
+    /// path) to fetch the token — so a host behind a TLS-terminating platform that
+    /// redirects to HTTPS still verifies. `allow_private` lets the loopback test
+    /// server through the SSRF guard (each hop is still resolved + `is_global_ip`-
+    /// checked in production).
+    #[tokio::test]
+    async fn http_probe_follows_a_redirect_to_the_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    // Keep-alive: handle each request on the connection.
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let resp = if req.contains("GET /redirect") {
+                            "HTTP/1.1 302 Found\r\nLocation: /token\r\nContent-Length: 0\r\n\r\n"
+                                .to_string()
+                        } else {
+                            let body = "verify-token-xyz";
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                    }
+                });
+            }
+        });
+
+        let probe = ServerDomainProbe::new(true);
+        let body = probe
+            .fetch_http(&format!("http://127.0.0.1:{port}/redirect"))
+            .await
+            .expect("the redirect must be followed to the token");
+        assert_eq!(body, "verify-token-xyz");
     }
 }

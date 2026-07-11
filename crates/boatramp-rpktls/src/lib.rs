@@ -508,6 +508,33 @@ pub fn client_config(
         .with_client_cert_resolver(Arc::new(RpkClientKeyResolver(presented.clone()))))
 }
 
+/// A **server-authenticated** server config: presents `presented`'s raw public
+/// key but requires **no client certificate** — for a channel where the client
+/// authenticates at a higher layer (e.g. a bearer token), such as the
+/// control-plane bootstrap TLS listener. TLS 1.3 + PQ-hybrid only.
+pub fn server_config_server_auth(presented: &PresentedKey) -> Result<ServerConfig, RpkError> {
+    let provider = rpk_provider();
+    Ok(ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(RpkServerKeyResolver(presented.clone()))))
+}
+
+/// A **server-authenticated** client config for dialing `peer`: pins the server
+/// to one of the keys the live `trust` set holds for `peer`, and presents **no
+/// client certificate**. The pairing dialer for [`server_config_server_auth`].
+/// TLS 1.3 + PQ-hybrid only.
+pub fn client_config_server_auth(trust: TrustSet, peer: PeerId) -> Result<ClientConfig, RpkError> {
+    let provider = rpk_provider();
+    let algs = provider.signature_verification_algorithms;
+    let verifier = Arc::new(RpkServerVerifier { trust, peer, algs });
+    Ok(ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
 /// A node's RPK TLS context: its own identity (swappable on rotation), the live
 /// key it presents, and the shared live trust set. Hands out the server config
 /// and per-peer client configs, all reading the live presented key + trust set —
@@ -568,9 +595,16 @@ impl RpkTls {
             .public_key_hex()
     }
 
-    /// The rustls config for this node's listener.
+    /// The rustls config for this node's listener (mutual auth).
     pub fn server(&self) -> Result<ServerConfig, RpkError> {
         server_config(&self.presented, self.trust.clone())
+    }
+
+    /// A **server-authenticated** listener config that presents this node's key
+    /// without requiring a client certificate — for the control-plane bootstrap
+    /// TLS mode, where the client authenticates with a bearer token.
+    pub fn server_auth(&self) -> Result<ServerConfig, RpkError> {
+        server_config_server_auth(&self.presented)
     }
 
     /// The rustls config for dialing `peer`, verifying against the live keys the
@@ -725,6 +759,64 @@ mod tests {
 
         let server_ok = server_task.await.unwrap_or(false);
         client_ok && server_ok
+    }
+
+    /// A one-way (server-authenticated) handshake: the server presents its key
+    /// with no client-cert requirement; the client pins the server for `peer` and
+    /// sends no client cert. Returns whether the handshake + round-trip succeeded.
+    async fn handshake_server_auth(server: &RpkIdentity, client_trust: TrustSet, peer: PeerId) -> bool {
+        let server_pk = PresentedKey::from_identity(server).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config_server_auth(&server_pk).unwrap()));
+        let connector = TlsConnector::from(Arc::new(
+            client_config_server_auth(client_trust, peer).unwrap(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            match acceptor.accept(tcp).await {
+                Ok(mut tls) => {
+                    let mut buf = [0u8; 4];
+                    tls.read_exact(&mut buf).await.ok();
+                    tls.write_all(b"pong").await.ok();
+                    tls.flush().await.ok();
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        let name = ServerName::try_from("rpk").unwrap();
+        let client_ok = async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut tls = connector.connect(name, tcp).await.map_err(|_| ())?;
+            tls.write_all(b"ping").await.map_err(|_| ())?;
+            tls.flush().await.map_err(|_| ())?;
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.map_err(|_| ())?;
+            Ok::<_, ()>(&buf == b"pong")
+        }
+        .await
+        .unwrap_or(false);
+        server_task.await.unwrap_or(false) && client_ok
+    }
+
+    #[tokio::test]
+    async fn server_auth_pins_server_without_client_cert() {
+        let server = RpkIdentity::generate().unwrap();
+        let stranger = RpkIdentity::generate().unwrap();
+        // The client pins the server's key for peer 1 → connects, no client cert.
+        let trust = TrustSet::from_map(BTreeMap::from([(1, server.public_key().to_vec())]));
+        assert!(
+            handshake_server_auth(&server, trust, 1).await,
+            "a pinned server must be accepted by a client presenting no cert"
+        );
+        // The client pins the WRONG key for peer 1 → server rejected.
+        let wrong = TrustSet::from_map(BTreeMap::from([(1, stranger.public_key().to_vec())]));
+        assert!(
+            !handshake_server_auth(&server, wrong, 1).await,
+            "a wrong pinned server key must be rejected"
+        );
     }
 
     #[test]
