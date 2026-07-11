@@ -13,9 +13,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::{watcher, Controller};
 use kube::{Client, Resource};
@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::crd::{BoatRampCluster, BoatRampClusterStatus, ClusterMode};
-use super::{resources, Error, Result};
+use super::{membership, resources, Error, Result};
 
 /// The server-side-apply field manager: the operator owns the fields it sets.
 const FIELD_MANAGER: &str = "boatramp-operator";
@@ -137,11 +137,67 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
         }
     }
 
-    // K2 records that the workloads are applied; K3 computes real membership +
-    // quorum + readiness from the live pods.
-    update_status(&Api::<BoatRampCluster>::namespaced(client.clone(), &ns), &name, &brc).await?;
+    // Observe the pods, and — in cluster mode — plan the next quorum-safe Raft
+    // membership transition (K3 core). Executing it needs the cluster membership
+    // API (`GET /api/cluster/members` + promote/remove), which is the K3b companion;
+    // until it lands the operator plans + reports but does not yet execute.
+    let pods = observe_pods(client, &ns, &name).await?;
+    let ready = pods.iter().filter(|p| p.ready).count() as u32;
+    if brc.spec.mode == ClusterMode::Cluster {
+        // TODO(K3b): fetch the live Raft configuration from the cluster API instead
+        // of the empty set (which keeps the planner in its safe "await bootstrap"
+        // state) and execute the returned action (mint join token / promote / remove).
+        let members: Vec<membership::Member> = Vec::new();
+        match membership::plan_next(brc.spec.replicas, &pods, &members) {
+            Some(action) => tracing::info!(
+                ?action,
+                "membership: next transition planned (executor lands in K3b)"
+            ),
+            None => tracing::debug!("membership: converged, or awaiting quorum/bootstrap"),
+        }
+    }
+
+    let phase = if ready >= brc.spec.replicas {
+        "Ready"
+    } else {
+        "Reconciling"
+    };
+    update_status(
+        &Api::<BoatRampCluster>::namespaced(client.clone(), &ns),
+        &name,
+        &brc,
+        phase,
+    )
+    .await?;
 
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// List the cluster's pods and derive [`membership::PodState`]s: the StatefulSet
+/// ordinal (the Raft node id) + whether `/readyz` currently passes.
+async fn observe_pods(
+    client: &Client,
+    ns: &str,
+    instance: &str,
+) -> Result<Vec<membership::PodState>> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let lp = ListParams::default().labels(&format!("app.kubernetes.io/instance={instance}"));
+    let pods = api.list(&lp).await?;
+    Ok(pods
+        .into_iter()
+        .filter_map(|pod| {
+            let name = pod.metadata.name.as_deref()?;
+            let ordinal = name.rsplit('-').next()?.parse::<u32>().ok()?;
+            let ready = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| {
+                    cs.iter().any(|c| c.type_ == "Ready" && c.status == "True")
+                });
+            Some(membership::PodState { ordinal, ready })
+        })
+        .collect())
 }
 
 /// Server-side-apply a child object (idempotent; the operator owns its fields).
@@ -165,9 +221,14 @@ where
 }
 
 /// Record the reconcile in the CR's `.status` subresource.
-async fn update_status(api: &Api<BoatRampCluster>, name: &str, brc: &BoatRampCluster) -> Result<()> {
+async fn update_status(
+    api: &Api<BoatRampCluster>,
+    name: &str,
+    brc: &BoatRampCluster,
+    phase: &str,
+) -> Result<()> {
     let status = BoatRampClusterStatus {
-        phase: Some("Reconciling".to_string()),
+        phase: Some(phase.to_string()),
         observed_generation: brc.metadata.generation,
         ..Default::default()
     };
