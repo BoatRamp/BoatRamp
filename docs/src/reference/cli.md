@@ -124,6 +124,7 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 | `--upload-idle-timeout-secs <n>` | `BOATRAMP_UPLOAD_IDLE_TIMEOUT` | — | Abort an upload idle this long. |
 | `--max-concurrent-uploads <n>` | `BOATRAMP_MAX_CONCURRENT_UPLOADS` | — | Cap simultaneous uploads. |
 | `--default-site <name>` | `BOATRAMP_DEFAULT_SITE` | — | Site served for an unmatched `Host` (see [addressing](../explanation/addressing.md)). |
+| `--pop-origin <url>` | `BOATRAMP_POP_ORIGIN` | — | Canonical origin a per-request proof-of-possession must bind. Required for holder-bound (`cnf`/PoP) tokens. See [PoP-bind a token](../how-to/pop-tokens.md). |
 | `--protect-previews` | `BOATRAMP_PROTECT_PREVIEWS` | `false` | Require a token to view `/_deploy` previews. |
 | `--cluster-rate-limit` | `BOATRAMP_CLUSTER_RATE_LIMIT` | `false` | Rate-limit cluster-wide via the KV, not per node. |
 | `--shared-cache-coherence` | `BOATRAMP_SHARED_CACHE_COHERENCE` | `false` | Keep the config cache coherent across processes sharing one KV. |
@@ -252,6 +253,7 @@ Manage control-plane API tokens. See
 | `--role <role>` | Role, repeatable: `<role>` (global) or `<role>:<site>` (scoped). Required. |
 | `--ttl-secs <n>` | Time-to-live in seconds (omit for no expiry). |
 | `--holder-pub <alg:hex>` | Make the token delegatable: embed this holder public key as the `cnf`. |
+| `--pop` | Make the token PoP-bound: generate a holder keypair, mint against its public half, and print `BOATRAMP_TOKEN` + `BOATRAMP_TOKEN_HOLDER_KEY` exports. Conflicts with `--holder-pub`. See [PoP-bind a token](../how-to/pop-tokens.md). |
 
 `attenuate` flags:
 

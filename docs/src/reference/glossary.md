@@ -82,6 +82,10 @@ Vault, or a PKCS#11 HSM. See [external signer](../how-to/external-signer.md).
 **Delegation / attenuation** — narrowing a token offline into a further-scoped
 child, with no server round-trip. A child can only add restrictions.
 
+**Proof-of-possession (PoP / DPoP)** — a token bound to a holder key (`cnf`) whose
+private half never travels with the token; the client signs a fresh per-request
+proof, so a leaked token alone is inert. See [PoP-bind a token](../how-to/pop-tokens.md).
+
 ## Storage & topology
 
 **Storage / KvStore** — the two backend seams: `Storage` for blobs, `KvStore` for
