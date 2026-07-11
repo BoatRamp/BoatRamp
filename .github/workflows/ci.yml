@@ -2,21 +2,25 @@ name: CI
 
 # Fast per-push / per-PR gate, split into parallel jobs so intra-day feedback is
 # quick:
-#   • quick   — instant source checks (fmt, typos, anyhow ban): no workspace
-#               compile, so a format nit or typo fails within seconds instead of
-#               behind a multi-minute clippy build.
-#   • clippy  — workspace clippy, default features.
-#   • test    — workspace tests, default features.
-#   • deny    — cargo-deny bans/licenses/sources (+ non-blocking advisories).
+#   • quick          — instant source checks (fmt, typos, anyhow ban): no
+#                       workspace compile, so a format nit or typo fails within
+#                       seconds instead of behind a multi-minute clippy build.
+#   • clippy         — workspace clippy, default features.
+#   • feature-clippy — clippy the CLI's cfg-gated `serve` dispatch under the
+#                      cluster+tls+acme-dns feature union (a light slice of
+#                      --all-features) so a feature-combination regression fails
+#                      the PR gate, not only nightly.
+#   • test           — workspace tests, default features.
+#   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
 # clippy and test are the two full workspace compiles; running them as separate
 # jobs lets them build concurrently on separate runners instead of one after the
 # other, roughly halving the critical path versus the old single-job pipeline.
 #
-# Default features only (fs + SlateDB) — no wasmtime/openraft/cedar/rolldown/
-# aws-sdk to build, so each job is quick. The full --all-features clippy + test
-# and the reproducible `nix flake check` run in the nightly workflow
-# (.github/workflows/nightly.yml), or on demand via its workflow_dispatch;
-# feature-gated code is therefore covered nightly, not per-push.
+# Per-push compiles are default features only (fs + SlateDB) plus the light
+# feature-clippy slice — no wasmtime/openraft-heavy union, so each job is quick.
+# The full --all-features clippy + test and the reproducible `nix flake check` run
+# in the nightly workflow (.github/workflows/nightly.yml), or on demand via its
+# workflow_dispatch; the heaviest feature-gated code is therefore covered nightly.
 on:
   push:
     branches: [main]
@@ -94,9 +98,45 @@ jobs:
           key: clippy
 
       # Default features only (fs + SlateDB). The feature-gated backends
-      # (tls / s3 / cluster / handlers / signers / …) are clippy'd nightly.
+      # (tls / s3 / cluster / handlers / signers / …) are clippy'd nightly; the
+      # `serve`-dispatch feature union is covered by `feature-clippy` below.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  feature-clippy:
+    name: clippy (serve feature union)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # `tls` pulls aws-lc-rs (cmake/nasm); both are preinstalled on the runner.
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-clippy
+
+      # The CLI's `serve` dispatch is cfg-gated per TLS/cluster feature — the
+      # `match args.tls` arms and the `serve::Error` `#[from]` variants differ by
+      # feature. Default-features CI can't see those combinations, so a
+      # feature-union regression (a missing `TlsMode::Rpk` arm, a colliding
+      # `From<RpkError>`/`From<MeshError>`) previously only surfaced nightly. Clippy
+      # the `cluster + tls + acme-dns` union of just the `boatramp` crate per-push
+      # to catch it in the PR gate. This is a light slice — no wasmtime/handlers, no
+      # cloud-signer SDKs, no s3/compute — so it stays quick; the full
+      # `--all-features` clippy + test remains the nightly backstop.
+      - name: Clippy (cluster + tls + acme-dns)
+        run: cargo clippy -p boatramp --features cluster,tls,acme-dns --all-targets -- -D warnings
 
   test:
     name: test (default features)
