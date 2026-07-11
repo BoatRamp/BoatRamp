@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use aws_lc_rs::signature::Ed25519KeyPair;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -535,6 +535,83 @@ pub fn client_config_server_auth(trust: TrustSet, peer: PeerId) -> Result<Client
         .with_no_client_auth())
 }
 
+/// A dialer verifier that **accepts any** presented raw public key and records
+/// its SPKI into a shared slot — **trust-on-first-use, no pinning**. Only for the
+/// one-shot fetch of a root-signed attestation in the `--root-pubkey` bootstrap,
+/// after which the caller verifies the fetched attestation (root signature) names
+/// the recorded key. Never use for real traffic — it authenticates nothing.
+#[derive(Debug)]
+struct CapturingServerVerifier {
+    captured: Arc<Mutex<Option<Vec<u8>>>>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for CapturingServerVerifier {
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        // Record the presented SPKI DER, accept unconditionally (TOFU).
+        *self.captured.lock().expect("capture slot") = Some(end_entity.as_ref().to_vec());
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature_with_raw_key(
+            message,
+            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
+            dss,
+            &self.algs,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// A client config that accepts **any** presented raw public key (TOFU) and
+/// records its SPKI into `captured` — for the one-shot attestation fetch of the
+/// `--root-pubkey` bootstrap. It provides **no** server authentication on its
+/// own: the caller MUST verify the fetched attestation (root signature) names the
+/// captured key before trusting anything. Presents no client cert. TLS 1.3 + PQ.
+pub fn client_config_capturing(
+    captured: Arc<Mutex<Option<Vec<u8>>>>,
+) -> Result<ClientConfig, RpkError> {
+    let provider = rpk_provider();
+    let algs = provider.signature_verification_algorithms;
+    let verifier = Arc::new(CapturingServerVerifier { captured, algs });
+    Ok(ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
 /// A node's RPK TLS context: its own identity (swappable on rotation), the live
 /// key it presents, and the shared live trust set. Hands out the server config
 /// and per-peer client configs, all reading the live presented key + trust set —
@@ -799,6 +876,33 @@ mod tests {
         .await
         .unwrap_or(false);
         server_task.await.unwrap_or(false) && client_ok
+    }
+
+    #[tokio::test]
+    async fn capturing_client_records_the_presented_key() {
+        let server = RpkIdentity::generate().unwrap();
+        let server_spki = server.public_key().to_vec();
+        let captured = Arc::new(Mutex::new(None));
+
+        let server_pk = PresentedKey::from_identity(&server).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config_server_auth(&server_pk).unwrap()));
+        let connector =
+            TlsConnector::from(Arc::new(client_config_capturing(captured.clone()).unwrap()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(tcp).await;
+        });
+        let name = ServerName::try_from("rpk").unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        connector.connect(name, tcp).await.expect("TOFU accepts any key");
+        let _ = server_task.await;
+
+        // The capturing verifier recorded exactly the server's presented SPKI, so
+        // the caller can now verify the attestation names it.
+        assert_eq!(captured.lock().unwrap().as_deref(), Some(server_spki.as_slice()));
     }
 
     #[tokio::test]

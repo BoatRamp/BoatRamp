@@ -68,8 +68,27 @@ handshake is TLS 1.3 with the `X25519MLKEM768` post-quantum-hybrid group.
 - On a platform that terminates TLS for you (fly.io, Cloudflare), you don't need
   this — run `--tls off` behind the platform's edge.
 
-> **Coming next:** an attestation-based path (`--root-pubkey`) where the client
-> pins only your **root** key once and learns each node's TLS identity from a
-> root-signed attestation served at
-> `/.well-known/boatramp-bootstrap-identity` — one anchor for the whole fleet.
-> The server already serves that attestation under `--tls rpk`.
+## Pin only the root key (one anchor for the fleet)
+
+Copying each node's TLS key doesn't scale. Instead, pin only the key you already
+trust — your **control-plane root key** — and let the server prove its TLS
+identity. Under `--tls rpk`, an issuing node mints a **root-signed attestation**
+of its TLS key and serves it (unauthenticated, a signed blob) at
+`/.well-known/boatramp-bootstrap-identity`. Resolve it to a pin with `auth pin`:
+
+```sh
+boatramp auth pin --server https://cp.example.com:8443 \
+  --root-pubkey es256:03f6047fda…      # your root PUBLIC key (auth pubkey / init)
+```
+
+```text
+verified https://cp.example.com:8443 against the root key. Export this to pin it:
+BOATRAMP_SERVER_PUBKEY=302a300506032b6570032100…
+```
+
+It connects trust-on-first-use (recording the key the server presents), fetches
+the attestation, verifies the **root signature + validity**, and confirms the
+attestation names the presented key — placing no trust in the server until the
+root signature checks out. Export the printed `BOATRAMP_SERVER_PUBKEY` and you're
+pinned. Rotating a node's TLS identity re-mints a fresh attestation, so the same
+root anchor keeps working with no client change.

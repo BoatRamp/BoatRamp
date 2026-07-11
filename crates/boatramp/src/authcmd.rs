@@ -43,6 +43,10 @@ pub enum Error {
     /// Serializing the policy to JSON for display failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// The `--tls rpk` bootstrap attestation could not be fetched/verified, or it
+    /// did not match the key the server presented.
+    #[error("bootstrap attestation: {0}")]
+    Attestation(String),
 }
 
 /// `authcmd` module result; `Err` is [`Error`].
@@ -68,6 +72,16 @@ enum AuthCommand {
         /// The root private key (`<alg>:<hex>`), e.g. from `auth init`.
         #[arg(long, env = "BOATRAMP_AUTH_ROOT_PRIVATE_KEY")]
         private_key: String,
+    },
+    /// Resolve a `--tls rpk` server's TLS pin from your **root** public key: fetch
+    /// the root-signed bootstrap attestation, verify it, and print the
+    /// `BOATRAMP_SERVER_PUBKEY` to export — so you pin only the one root anchor and
+    /// learn each node's TLS identity from its attestation.
+    Pin {
+        /// The control-plane **root** public key (`<alg>:<hex>`) — the anchor you
+        /// already trust (from `auth pubkey` / `auth init`).
+        #[arg(long, env = "BOATRAMP_ROOT_PUBKEY")]
+        root_pubkey: String,
     },
     /// Manage the RBAC policy (`authz/policy`).
     #[command(subcommand)]
@@ -115,8 +129,67 @@ pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<()> {
                 .map_err(|e| Error::InvalidPrivateKey(e.to_string()))?;
             println!("{}", signer.public_key().to_hex());
         }
+        AuthCommand::Pin { root_pubkey } => run_pin(args.server, root_pubkey, config).await?,
         AuthCommand::Policy(command) => run_policy(command, args.server, config).await?,
     }
+    Ok(())
+}
+
+/// Resolve a `--tls rpk` server's TLS pin from the operator's root public key.
+/// Connects trust-on-first-use (capturing the presented key), fetches the
+/// root-signed attestation, verifies it under the root key, and confirms it names
+/// the presented key — then prints the pin. No trust is placed in the server
+/// until the root signature checks out.
+async fn run_pin(server: Option<String>, root_pubkey: String, config: &ProjectConfig) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    let server = client::resolve_server(server, config)?;
+    let root = boatramp_core::cose::TokenPublicKey::from_hex(root_pubkey.trim())
+        .map_err(|e| Error::Attestation(format!("invalid --root-pubkey: {e}")))?;
+
+    // Fetch the attestation over a TOFU connection that records the presented key.
+    let captured = Arc::new(Mutex::new(None));
+    let tls = boatramp_rpktls::client_config_capturing(captured.clone())
+        .map_err(|e| Error::Attestation(e.to_string()))?;
+    let http = reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()?;
+    let attestation = http
+        .get(format!("{server}/.well-known/boatramp-bootstrap-identity"))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|_| {
+            Error::Attestation(format!(
+                "{server} served no bootstrap attestation (is it `--tls rpk` with a root key?)"
+            ))
+        })?
+        .text()
+        .await?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let attested_hex = boatramp_core::cose::verify_attestation(attestation.trim(), &root, now)
+        .map_err(|e| Error::Attestation(format!("root signature/validity failed: {e}")))?;
+
+    // The attestation must name the key the server actually presented on the wire.
+    let attested = boatramp_rpktls::parse_public_key(&attested_hex)
+        .map_err(|e| Error::Attestation(e.to_string()))?;
+    let presented = captured
+        .lock()
+        .expect("capture slot")
+        .clone()
+        .ok_or_else(|| Error::Attestation("server presented no key".into()))?;
+    if presented != attested {
+        return Err(Error::Attestation(
+            "the attestation does not match the key the server presented".into(),
+        ));
+    }
+
+    eprintln!("verified {server} against the root key. Export this to pin it:");
+    println!("BOATRAMP_SERVER_PUBKEY={attested_hex}");
     Ok(())
 }
 
