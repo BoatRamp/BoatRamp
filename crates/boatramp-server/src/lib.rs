@@ -533,6 +533,28 @@ pub trait MeshControl: Send + Sync {
     /// longer authenticate) and drop it from the quorum. `Err` is a
     /// human-readable failure.
     async fn revoke(&self, node: u64) -> Result<(), String>;
+
+    /// The current Raft membership (voters + learners), for the Kubernetes
+    /// operator's membership reconciler. `caught_up` is meaningful only on the
+    /// leader; hit the leader for a promote decision.
+    async fn members(&self) -> Result<Vec<MeshMember>, String>;
+
+    /// Promote a caught-up learner `node` to a voter (leader-only; a no-op on a
+    /// follower). `Err` is a human-readable failure.
+    async fn promote(&self, node: u64) -> Result<(), String>;
+}
+
+/// One node's Raft membership, reported by `GET /api/cluster/members`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshMember {
+    /// The node id.
+    pub node: u64,
+    /// `true` ⇒ a voter (counts toward quorum); `false` ⇒ a learner.
+    pub voter: bool,
+    /// Whether a learner has caught up to the leader's log (ready to promote).
+    pub caught_up: bool,
+    /// Whether this node is the current leader.
+    pub leader: bool,
 }
 
 /// The mesh control hook, carried as an extension for the join/rotate handlers.
@@ -679,6 +701,10 @@ pub fn router_with(
         .route("/api/cluster/rotate-key", post(cluster_rotate_key))
         // Revoke a node from the mesh. Admin-scoped (deny-safe default).
         .route("/api/cluster/revoke", post(cluster_revoke))
+        // List the Raft membership + promote a caught-up learner (the Kubernetes
+        // operator's scale reconciler). Admin-scoped (deny-safe default).
+        .route("/api/cluster/members", get(cluster_members))
+        .route("/api/cluster/promote", post(cluster_promote))
         .route("/api/prune", get(prune_report).post(prune_delete))
         .route("/api/scrub", post(scrub_blobs))
         .route("/api/certs", get(cert_status))
@@ -1743,6 +1769,59 @@ async fn cluster_revoke(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("revocation failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// List the current Raft membership (`GET /api/cluster/members`) — voters +
+/// learners with catch-up + leader flags. Admin-scoped (the deny-safe
+/// `Right::required` default). `501` on a non-cluster node. The Kubernetes
+/// operator reconciles this against the desired replica count.
+async fn cluster_members(Extension(mesh_control): Extension<MeshControlHandle>) -> Response {
+    let Some(control) = mesh_control.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this node is not a cluster node\n",
+        )
+            .into_response();
+    };
+    match control.members().await {
+        Ok(members) => Json(members).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("listing membership failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PromoteRequest {
+    /// The node id (a caught-up learner) to promote to a voter.
+    node_id: u64,
+}
+
+/// Promote a caught-up learner to a voter (`POST /api/cluster/promote`) — the
+/// scale-up completion step the operator drives once a joined node has caught up.
+/// Leader-only server-side (a no-op on a follower). Admin-scoped. `501` on a
+/// non-cluster node.
+async fn cluster_promote(
+    Extension(mesh_control): Extension<MeshControlHandle>,
+    Json(request): Json<PromoteRequest>,
+) -> Response {
+    let Some(control) = mesh_control.0 else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "this node is not a cluster node\n",
+        )
+            .into_response();
+    };
+    match control.promote(request.node_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("promotion failed: {err}\n"),
         )
             .into_response(),
     }
@@ -6292,6 +6371,12 @@ mod tests {
             Ok("cafe".to_string())
         }
         async fn revoke(&self, _node: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn members(&self) -> Result<Vec<MeshMember>, String> {
+            Ok(Vec::new())
+        }
+        async fn promote(&self, _node: u64) -> Result<(), String> {
             Ok(())
         }
     }

@@ -1015,6 +1015,24 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
     async fn revoke(&self, node: u64) -> std::result::Result<(), String> {
         self.0.revoke(node).await.map_err(|e| e.to_string())
     }
+
+    async fn members(&self) -> std::result::Result<Vec<boatramp_server::MeshMember>, String> {
+        Ok(self
+            .0
+            .members()
+            .into_iter()
+            .map(|m| boatramp_server::MeshMember {
+                node: m.node,
+                voter: m.voter,
+                caught_up: m.caught_up,
+                leader: m.leader,
+            })
+            .collect())
+    }
+
+    async fn promote(&self, node: u64) -> std::result::Result<(), String> {
+        self.0.promote(node).await.map_err(|e| e.to_string())
+    }
 }
 
 /// Verifies a mesh client-write **cluster-write capability**: the

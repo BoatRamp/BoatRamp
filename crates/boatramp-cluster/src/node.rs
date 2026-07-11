@@ -358,6 +358,73 @@ impl ClusterNode {
             .nodes()
             .any(|(id, _)| *id == node)
     }
+
+    /// The current Raft membership as this node sees it — every voter + learner,
+    /// each with whether it is caught up (a learner ready to promote) and whether
+    /// it is the leader. Used by the Kubernetes operator's membership reconciler
+    /// (`GET /api/cluster/members`) to plan quorum-safe transitions.
+    ///
+    /// `caught_up` is meaningful only on the **leader** (which tracks each node's
+    /// replicated log index); on a follower every learner reports `false`, so the
+    /// operator promotes only against a leader's view.
+    pub fn members(&self) -> Vec<MemberInfo> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        let membership = m.membership_config.membership();
+        let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
+        let leader = m.current_leader;
+        let last_log = m.last_log_index.unwrap_or(0);
+        // On the leader, `replication` maps each node to its matched log id.
+        let replication = m.replication.clone();
+        membership
+            .nodes()
+            .map(|(id, _)| {
+                let node = *id;
+                let voter = voters.contains(&node);
+                // Voters are, by definition, caught up enough to vote. A learner is
+                // caught up when the leader has replicated (nearly) all its log to it.
+                let caught_up = voter
+                    || replication
+                        .as_ref()
+                        .and_then(|r| r.get(&node).copied().flatten())
+                        .is_some_and(|matched| matched.index + CAUGHT_UP_SLACK >= last_log);
+                MemberInfo {
+                    node,
+                    voter,
+                    caught_up,
+                    leader: Some(node) == leader,
+                }
+            })
+            .collect()
+    }
+
+    /// Promote a caught-up learner `node` to a voter (leader-only; a no-op on a
+    /// follower, which cannot change membership). Idempotent: promoting an existing
+    /// voter is a no-op.
+    pub async fn promote(&self, node: NodeId) -> Result<(), BootstrapError> {
+        if self.is_leader() && !self.is_voter(node) {
+            add_voter(&self.raft, node).await?;
+        }
+        Ok(())
+    }
+}
+
+/// How far a learner's replicated log may trail the leader's last log and still
+/// count as caught up (replication is a moving target; an exact match is racy).
+const CAUGHT_UP_SLACK: u64 = 10;
+
+/// One node's Raft membership, as reported by [`ClusterNode::members`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberInfo {
+    /// The node id.
+    pub node: NodeId,
+    /// Whether it is a voter (counts toward quorum); `false` ⇒ a learner.
+    pub voter: bool,
+    /// Whether it has replicated (nearly) the whole log — a learner ready to
+    /// promote. Meaningful only on the leader.
+    pub caught_up: bool,
+    /// Whether it is the current leader.
+    pub leader: bool,
 }
 
 /// Assemble a cluster node from `params`: durable stores, consensus + HTTP mesh,
