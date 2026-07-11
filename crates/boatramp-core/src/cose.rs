@@ -46,6 +46,28 @@ pub const KIND_DELEGATION: &str = "delegation";
 /// Token kind: a bootstrap-TLS identity attestation — the root key vouching that
 /// a given control-plane RPK TLS public key is this fleet's (`--tls rpk`).
 pub const KIND_BOOTSTRAP_TLS: &str = "bootstrap-tls";
+/// Token kind: a **per-request proof-of-possession** (DPoP-style), signed by a
+/// token's holder (`cnf`) key to bind one request to that holder — so a leaked
+/// bearer token alone can't be replayed.
+pub const KIND_POP: &str = "pop";
+
+/// PoP claim: the bound HTTP method (upper-case).
+const CLAIM_HTM: &str = "htm";
+/// PoP claim: the bound request path (canonicalized; not the full URL — the host
+/// is not trustworthy behind a proxy, so the *origin* is bound via `aud` instead).
+const CLAIM_HTP: &str = "htp";
+/// PoP claim: hex SHA-256 of the presented access token — binds the proof to that
+/// specific token (a stolen proof can't be paired with a different token).
+const CLAIM_ATH: &str = "ath";
+/// PoP claim: hex SHA-256 of the request body — present on write requests with a
+/// body (so a captured proof can't authorize a swapped payload).
+const CLAIM_BH: &str = "bh";
+
+/// How long a PoP proof stays fresh, in seconds. Tight on purpose: it bounds
+/// replay without a (CAS-less, expensive) fleet-wide `jti` cache.
+pub const POP_WINDOW_SECS: u64 = 60;
+/// Clock skew tolerated for a proof minted slightly in the future, in seconds.
+const POP_SKEW_SECS: u64 = 30;
 
 /// Text claim key for the holder key (RFC 8747 `cnf`, here the holder's public key
 /// `"<alg>:<hex>"`): the key that may mint the next delegation block. Present only
@@ -736,6 +758,11 @@ pub struct VerifiedChain {
     pub exp: Option<u64>,
     /// The intersected narrowing caveats to enforce at authorization time.
     pub caveats: Caveats,
+    /// The **terminal** holder key (`cnf`) of the presented credential — the leaf
+    /// delegate's key, or the token's own for a plain token; `None` for a
+    /// non-holder-bound token. A per-request PoP proof must verify against *this*
+    /// key (not the root's), so channel/replay binding follows delegation.
+    pub leaf_cnf: Option<String>,
 }
 
 /// Append a **restrict-only** delegation block to a credential, signed by the
@@ -830,7 +857,121 @@ pub fn verify_credential(
         cti: root.cti,
         exp: effective_exp,
         caveats,
+        // After the walk, `parent_cnf` holds the terminal block's declared holder
+        // key (or the root's, for a plain token) — the leaf a PoP proof binds to.
+        leaf_cnf: parent_cnf,
     })
+}
+
+/// The bound facts of a per-request **proof-of-possession** (DPoP-style). The
+/// client signs these with the token's holder (`cnf`) key; the server rebuilds
+/// them from the actual request + its configured origin and verifies the proof
+/// against the credential's [`leaf_cnf`](VerifiedChain::leaf_cnf).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopClaims {
+    /// HTTP method, upper-case (`GET`, `PUT`, …).
+    pub htm: String,
+    /// Request path, canonicalized by [`canon_pop_path`].
+    pub htp: String,
+    /// The fleet's configured canonical origin (e.g. `https://cp.example.com`).
+    /// Bound so a captured proof can't be relayed to a different origin — compared
+    /// to the server's *config*, never to a `Host`/`X-Forwarded-*` header.
+    pub aud: String,
+    /// Hex SHA-256 of the presented access token.
+    pub ath: String,
+    /// Hex SHA-256 of the request body — `Some` on write requests with a body.
+    pub bh: Option<String>,
+}
+
+/// Canonicalize a request path for PoP binding: exactly one leading slash, no
+/// trailing slash (except root). Applied identically on both sides so the compare
+/// can't silently mismatch (availability) or be loosened into a bypass.
+pub fn canon_pop_path(path: &str) -> String {
+    let trimmed = path.trim().trim_start_matches('/').trim_end_matches('/');
+    format!("/{trimmed}")
+}
+
+/// Hex SHA-256 of `bytes` — the encoding used for the `ath`/`bh` PoP bindings.
+pub fn pop_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Mint a per-request PoP proof (a `br_kind = "pop"` `COSE_Sign1`), signed by the
+/// holder key, binding `claims` to this request. `now_unix` stamps `iat`
+/// (freshness) and a random `jti` (`cti`) is added. Returned base64url.
+pub async fn mint_pop(
+    claims: &PopClaims,
+    holder: &dyn Signer,
+    now_unix: u64,
+) -> Result<String, TokenError> {
+    let mut builder = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .audience(claims.aud.clone())
+        .text_claim(CLAIM_KIND.to_string(), CborValue::Text(KIND_POP.to_string()))
+        .text_claim(CLAIM_HTM.to_string(), CborValue::Text(claims.htm.clone()))
+        .text_claim(CLAIM_HTP.to_string(), CborValue::Text(claims.htp.clone()))
+        .text_claim(CLAIM_ATH.to_string(), CborValue::Text(claims.ath.clone()));
+    if let Some(bh) = &claims.bh {
+        builder = builder.text_claim(CLAIM_BH.to_string(), CborValue::Text(bh.clone()));
+    }
+    sign_claims(builder.build(), holder).await
+}
+
+/// Verify a per-request PoP proof against `holder_public` (the credential's
+/// [`leaf_cnf`](VerifiedChain::leaf_cnf)) at `now_unix`: signature + alg pin +
+/// `br_kind = "pop"` + freshness (`iat` within [`POP_WINDOW_SECS`], not
+/// [`POP_SKEW_SECS`] in the future) + every bound fact (`htm`/`htp`/`aud`/`ath`,
+/// and `bh` — which must match, present-or-absent, the server's `expected.bh`).
+/// IO-free; a `jti` replay check (if any) is the caller's job.
+pub fn verify_pop(
+    proof: &str,
+    holder_public: &TokenPublicKey,
+    now_unix: u64,
+    expected: &PopClaims,
+) -> Result<(), TokenError> {
+    let claims = verify_envelope(proof, holder_public)?;
+
+    let kind = text_claim(&claims, CLAIM_KIND).and_then(|v| match v {
+        CborValue::Text(t) => Some(t.as_str()),
+        _ => None,
+    });
+    if kind != Some(KIND_POP) {
+        return Err(TokenError::Claims("not a PoP proof".into()));
+    }
+
+    let iat = match claims.issued_at {
+        Some(Timestamp::WholeSeconds(s)) => s.max(0) as u64,
+        _ => return Err(TokenError::Claims("PoP proof has no iat".into())),
+    };
+    if iat > now_unix.saturating_add(POP_SKEW_SECS)
+        || now_unix.saturating_sub(iat) > POP_WINDOW_SECS
+    {
+        return Err(TokenError::Expired);
+    }
+
+    let text = |name| {
+        text_claim(&claims, name).and_then(|v| match v {
+            CborValue::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+    };
+    if text(CLAIM_HTM).as_deref() != Some(expected.htm.as_str())
+        || text(CLAIM_HTP).as_deref() != Some(expected.htp.as_str())
+        || claims.audience.as_deref() != Some(expected.aud.as_str())
+        || text(CLAIM_ATH).as_deref() != Some(expected.ath.as_str())
+    {
+        return Err(TokenError::Claims(
+            "PoP proof does not match the request".into(),
+        ));
+    }
+    // The body binding must match present-or-absent: a proof binding a body on a
+    // bodiless request (or vice versa) is rejected.
+    if text(CLAIM_BH) != expected.bh {
+        return Err(TokenError::Claims("PoP proof body-hash mismatch".into()));
+    }
+    Ok(())
 }
 
 /// Decode a presented credential into its ordered blocks (raw tagged
@@ -1305,6 +1446,101 @@ mod tests {
         let plain = verify_credential(&token, &root_pub, NOW + 60).unwrap();
         assert!(plain.caveats.is_empty());
         assert_eq!(plain.roles, vec![GrantedRole::global("admin")]);
+    }
+
+    #[tokio::test]
+    async fn verified_chain_exposes_the_leaf_cnf() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let root_pub = root.public_key();
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+
+        // A delegatable token's leaf_cnf is its own holder key.
+        let token =
+            delegatable_root(&root, &holder.public_key(), vec![GrantedRole::global("admin")]).await;
+        assert_eq!(
+            verify_credential(&token, &root_pub, NOW).unwrap().leaf_cnf,
+            Some(holder.public_key().to_hex())
+        );
+
+        // A plain (non-delegatable) token has no leaf_cnf.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let plain = mint(&claims(), &signer).await.unwrap();
+        assert_eq!(
+            verify_credential(&plain, &signer.public_key(), NOW)
+                .unwrap()
+                .leaf_cnf,
+            None
+        );
+
+        // A delegated chain's leaf_cnf is the *last* delegate's key, not the root's.
+        let d2 = LocalSigner::generate(TokenAlg::Es256);
+        let chain = attenuate(
+            &token,
+            &holder,
+            &Caveats::default(),
+            Some(&d2.public_key()),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verify_credential(&chain, &root_pub, NOW).unwrap().leaf_cnf,
+            Some(d2.public_key().to_hex())
+        );
+    }
+
+    #[tokio::test]
+    async fn pop_proof_binds_the_request_and_rejects_mismatch() {
+        let holder = LocalSigner::generate(TokenAlg::Es256);
+        let public = holder.public_key();
+        let ath = pop_sha256_hex(b"the-access-token-string");
+        let want = PopClaims {
+            htm: "PUT".into(),
+            htp: canon_pop_path("/api/sites/x/config/"),
+            aud: "https://cp.example.com".into(),
+            ath: ath.clone(),
+            bh: Some(pop_sha256_hex(b"{\"body\":1}")),
+        };
+        assert_eq!(want.htp, "/api/sites/x/config"); // canonicalized
+
+        let proof = mint_pop(&want, &holder, NOW).await.unwrap();
+        assert!(verify_pop(&proof, &public, NOW + 5, &want).is_ok());
+
+        // Wrong holder key → rejected.
+        let other = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_pop(&proof, &other.public_key(), NOW + 5, &want).is_err());
+
+        // Past the freshness window / too far in the future → Expired.
+        assert!(matches!(
+            verify_pop(&proof, &public, NOW + POP_WINDOW_SECS + 5, &want),
+            Err(TokenError::Expired)
+        ));
+        assert!(matches!(
+            verify_pop(&proof, &public, NOW - POP_SKEW_SECS - 5, &want),
+            Err(TokenError::Expired)
+        ));
+
+        // Each bound fact mismatch (incl. body present-vs-absent) → rejected.
+        for bad in [
+            PopClaims { htm: "GET".into(), ..want.clone() },
+            PopClaims { htp: "/api/sites/y/config".into(), ..want.clone() },
+            PopClaims { aud: "https://evil.example.com".into(), ..want.clone() },
+            PopClaims { ath: pop_sha256_hex(b"other-token"), ..want.clone() },
+            PopClaims { bh: Some(pop_sha256_hex(b"swapped")), ..want.clone() },
+            PopClaims { bh: None, ..want.clone() },
+        ] {
+            assert!(
+                verify_pop(&proof, &public, NOW + 5, &bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+
+        // A role token is not a PoP proof (br_kind domain separation).
+        let role = mint(&claims(), &holder).await.unwrap();
+        assert!(matches!(
+            verify_pop(&role, &public, NOW, &want),
+            Err(TokenError::Claims(_))
+        ));
     }
 
     #[tokio::test]
