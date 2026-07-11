@@ -38,12 +38,12 @@ pub mod mptable;
 // The embedded VMM KVM runtime: brings up an in-process microVM from the
 // `embedded` layout. Linux + `/dev/kvm` only, behind the `embedded` feature; the
 // live boot is the `compute-live` seam.
-#[cfg(all(target_os = "linux", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "embedded"))]
 pub mod embedded_vmm;
 // The embedded VMM's MMIO device manager: routes vCPU MMIO exits to the
 // per-device transports + services notified queues. Linux + `embedded`; the
 // routing/notify dispatch is mock-tested, the live run-loop wiring is the seam.
-#[cfg(all(target_os = "linux", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "embedded"))]
 pub mod device_manager;
 // The embedded VMM's virtio-block device backend: serves the guest's disk
 // over the virtqueue bridge. Linux + `embedded` feature; unit-tested via a mock
@@ -52,16 +52,16 @@ pub mod executor;
 pub mod net;
 #[cfg(feature = "build")]
 pub mod oci;
-#[cfg(all(target_os = "linux", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "embedded"))]
 pub mod virtio_block;
 // The embedded VMM's virtio-net device backend: bridges guest frames to a
 // host tap over the virtqueue bridge. Linux + `embedded`; mock-tested.
-#[cfg(all(target_os = "linux", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "embedded"))]
 pub mod virtio_net;
 // A host tap device: `/dev/net/tun` + `TUNSETIFF` for the embedded VMM's
 // virtio-net. Linux + `embedded`; opening it needs `CAP_NET_ADMIN`, so the live
 // wiring is the `compute-live` seam.
-#[cfg(all(target_os = "linux", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "embedded"))]
 pub mod tap;
 // The embedded VMM's seccomp sandbox: a default-deny run-loop syscall
 // allow-list that confines the VM thread. The list is pure + unit-tested
@@ -71,7 +71,7 @@ pub mod embedded_seccomp;
 // The embedded VMM's snapshot/restore state (scale-to-zero): capture a paused
 // microVM's full vCPU + chip state (the guest RAM streams separately). Linux +
 // `embedded`; the live snapshot→restore→resume cycle is the `compute-live` seam.
-#[cfg(all(target_os = "linux", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "embedded"))]
 pub mod embedded_snapshot;
 // The virtio-MMIO transport register protocol: pure state machine, the
 // foundation for the embedded VMM's virtio devices. Cross-platform + unit-tested.
@@ -96,9 +96,9 @@ pub use kernel_verify::{HashOnlyVerifier, KernelVerifier};
 // in-process `EmbeddedVmm` instead of an external `firecracker` process. Needs
 // both `backend` (the trait + async runtime) and `embedded` (the KVM runtime);
 // Linux + `/dev/kvm`. The orchestration is pure-testable; the boot is the seam.
-#[cfg(all(target_os = "linux", feature = "backend", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "backend", feature = "embedded"))]
 pub mod embedded_backend;
-#[cfg(all(target_os = "linux", feature = "backend", feature = "embedded"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "backend", feature = "embedded"))]
 pub use embedded_backend::EmbeddedVmmBackend;
 
 pub use config::{FcMachine, MachineResources};

@@ -355,10 +355,12 @@ async fn build_compute(
         },
         Err(e) => tracing::warn!(%e, "current_exe for container backend"),
     }
-    // Embedded VMM backend (Linux + `/dev/kvm`): in-process microVMs, no external
-    // `firecracker` binary — the strongest isolation when KVM is available. Like
-    // the container backend it enslaves each tap to `cfg.bridge` (assumed set up).
-    #[cfg(target_os = "linux")]
+    // Embedded VMM backend (Linux + x86_64 + `/dev/kvm`): in-process microVMs, no
+    // external `firecracker` binary — the strongest isolation when KVM is available.
+    // Like the container backend it enslaves each tap to `cfg.bridge` (assumed set
+    // up). The embedded VMM is KVM-x86-specific, so this is x86_64-only; boatramp
+    // still serves on linux/aarch64 (with the container backend, no embedded VMM).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if std::path::Path::new("/dev/kvm").exists() {
         match (
             std::env::current_exe(),
@@ -397,8 +399,10 @@ async fn build_compute(
     }
 
     let _ = (&storage, data_dir); // used only on Linux (container / VMM backends)
-    #[cfg(not(target_os = "linux"))]
-    let _ = (strict, &daemon); // the kernel-trust verifier is wired on Linux only
+    // The kernel-trust verifier is wired only for the embedded VMM (x86_64 Linux);
+    // silence `strict`/`daemon` everywhere else (non-Linux and linux/aarch64).
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = (strict, &daemon);
 
     let free_vcpus = if cfg.vcpus > 0 {
         cfg.vcpus

@@ -176,8 +176,11 @@ fn run() -> Result<(), CliError> {
     }
     // A re-exec'd `boatramp __vmm-run <json>` is the embedded VMM backend's jailed
     // per-VM worker: it builds + runs one microVM in this (separate-address-space)
-    // process, then drops caps + installs seccomp. No Tokio runtime needed.
-    #[cfg(target_os = "linux")]
+    // process, then drops caps + installs seccomp. No Tokio runtime needed. The
+    // embedded VMM is x86_64-KVM-only, so this worker exists only there (boatramp
+    // still builds + runs on linux/aarch64 — e.g. Graviton/Ampere k8s nodes —
+    // without the embedded compute backend).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if std::env::args().nth(1).as_deref()
         == Some(boatramp_firecracker::embedded_backend::VMM_RUN_SUBCOMMAND)
     {
@@ -233,8 +236,9 @@ fn run_sandbox() -> Result<(), CliError> {
 /// The embedded VMM backend's jailed per-VM worker (`boatramp __vmm-run <json>`):
 /// build + run one microVM in this process (separate address space), then drop
 /// caps + install seccomp. Runs until the guest exits or the process is killed
-/// (the backend's `stop` SIGKILLs it). `json` is the [`WorkerConfig`].
-#[cfg(target_os = "linux")]
+/// (the backend's `stop` SIGKILLs it). `json` is the [`WorkerConfig`]. x86_64-only
+/// (the embedded VMM is KVM-x86-specific).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run_vmm_worker(json: Option<String>) -> Result<(), CliError> {
     use boatramp_firecracker::embedded_backend::{run_jailed_worker, WorkerConfig};
     let json = json.ok_or(CliError::VmmMissingConfig)?;
