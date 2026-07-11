@@ -352,6 +352,17 @@ impl DeployStore {
         )
     }
 
+    /// Index key mapping an **HTTP challenge** `(host, token)` → its site, so the
+    /// unauthenticated self-serve edge route is an O(1) lookup rather than an O(N)
+    /// scan of every site's challenges (a flood-amplification vector). The token
+    /// is a 128-bit random, so carrying it in the key is safe.
+    fn http_challenge_index_key(host: &str, token: &str) -> String {
+        format!(
+            "httpchallenge/{}/{token}",
+            crate::domain_verify::normalize_host(host)
+        )
+    }
+
     /// A site's [`SiteConfig`], if it has been set. Reads the `site/<site>`
     /// pointer, then the immutable `siteconfig/<hash>` body it names.
     pub async fn get_site_config(&self, site: &str) -> Result<Option<SiteConfig>, DeployError> {
@@ -561,20 +572,29 @@ impl DeployStore {
         now_unix: u64,
     ) -> Result<Option<DomainVerification>, DeployError> {
         let host = crate::domain_verify::normalize_host(host);
-        for key in self.kv.list_prefix("domainverify/").await? {
-            let Some(bytes) = self.kv.get(&key).await? else {
-                continue;
-            };
-            let v = DomainVerification::from_json(&bytes)?;
-            if v.method == VerificationMethod::Http
-                && v.host == host
-                && v.matches(token)
-                && !v.is_expired(now_unix)
-            {
-                return Ok(Some(v));
-            }
+        // O(1): the `(host, token)` index names the owning site directly. Then
+        // load and **fully re-validate** the challenge — so a stale index entry
+        // (left by a method change / new token) can never serve the wrong thing.
+        let Some(site_bytes) = self
+            .kv
+            .get(&Self::http_challenge_index_key(&host, token))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let site = String::from_utf8_lossy(&site_bytes).into_owned();
+        let Some(v) = self.get_domain_verification(&site, &host).await? else {
+            return Ok(None);
+        };
+        if v.method == VerificationMethod::Http
+            && v.host == host
+            && v.matches(token)
+            && !v.is_expired(now_unix)
+        {
+            Ok(Some(v))
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     async fn put_domain_verification(
@@ -582,12 +602,21 @@ impl DeployStore {
         site: &str,
         verification: &DomainVerification,
     ) -> Result<(), DeployError> {
-        self.kv
-            .put(
-                &Self::domain_verification_key(site, &verification.host),
-                verification.to_json()?,
-            )
-            .await?;
+        let mut ops = vec![WriteOp::Put(
+            Self::domain_verification_key(site, &verification.host),
+            verification.to_json()?,
+        )];
+        // Maintain the self-serve `(host, token)` index for HTTP challenges. A
+        // stale entry left by a later method/token change is harmless — the
+        // lookup re-validates the loaded challenge — so no delete-on-replace is
+        // needed here.
+        if verification.method == VerificationMethod::Http {
+            ops.push(WriteOp::Put(
+                Self::http_challenge_index_key(&verification.host, &verification.token),
+                site.as_bytes().to_vec(),
+            ));
+        }
+        self.kv.write_batch(ops).await?;
         Ok(())
     }
 
@@ -705,12 +734,17 @@ impl DeployStore {
         site: &str,
         host: &str,
     ) -> Result<bool, DeployError> {
-        let key = Self::domain_verification_key(site, host);
-        let existed = self.kv.get(&key).await?.is_some();
-        if existed {
-            self.kv.delete(&key).await?;
+        let Some(v) = self.get_domain_verification(site, host).await? else {
+            return Ok(false);
+        };
+        let mut ops = vec![WriteOp::Delete(Self::domain_verification_key(site, host))];
+        if v.method == VerificationMethod::Http {
+            ops.push(WriteOp::Delete(Self::http_challenge_index_key(
+                &v.host, &v.token,
+            )));
         }
-        Ok(existed)
+        self.kv.write_batch(ops).await?;
+        Ok(true)
     }
 
     /// Attach a verified `host` to the site's [`SiteConfig`] so it routes by
@@ -731,6 +765,21 @@ impl DeployStore {
         if !self.is_domain_verified(site, host).await? {
             return Err(DeployError::NotFound(format!(
                 "{host} is not verified for {site}; run domain verification first"
+            )));
+        }
+        // A wildcard needs the stronger DNS proof — an HTTP token at the base host
+        // proves control of one name, not the whole subtree (ACME requires DNS-01
+        // for a wildcard cert for the same reason).
+        if host.trim_start().starts_with("*.")
+            && self
+                .get_domain_verification(site, host)
+                .await?
+                .map(|v| v.method)
+                != Some(VerificationMethod::Dns)
+        {
+            return Err(DeployError::Conflict(format!(
+                "wildcard {host} must be verified via DNS \
+                 (an HTTP token proves only the base host, not the subtree)"
             )));
         }
         // Hold the claim lock across the whole read-modify-write so a concurrent
@@ -2076,6 +2125,77 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// A wildcard can only be attached with DNS proof; an HTTP token at the base
+    /// host is refused. And a stale HTTP self-serve index entry (left by a later
+    /// method change) never serves the wrong challenge — the lookup re-validates.
+    #[tokio::test]
+    async fn wildcard_requires_dns_and_stale_index_is_safe() {
+        use crate::domain_verify::VerificationMethod;
+
+        let store = store();
+
+        // HTTP-verify the base host, then try to attach the wildcard → refused.
+        let http = store
+            .start_domain_verification("s", "*.example.com", VerificationMethod::Http, 100)
+            .await
+            .unwrap();
+        store.mark_domain_verified("s", "*.example.com").await.unwrap();
+        let err = store
+            .attach_verified_domain("s", "*.example.com")
+            .await
+            .expect_err("wildcard with only HTTP proof must be refused");
+        assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
+
+        // Drop it and re-verify via DNS → the wildcard now attaches. This replaces
+        // the record (the old HTTP token's self-serve index entry is dropped on
+        // remove), and re-proves via DNS.
+        store
+            .remove_domain_verification("s", "*.example.com")
+            .await
+            .unwrap();
+        // The removed HTTP token is no longer self-servable.
+        assert!(store
+            .find_pending_http_challenge("example.com", &http.token, 100)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .start_domain_verification("s", "*.example.com", VerificationMethod::Dns, 200)
+            .await
+            .unwrap();
+        store.mark_domain_verified("s", "*.example.com").await.unwrap();
+        let cfg = store
+            .attach_verified_domain("s", "*.example.com")
+            .await
+            .unwrap();
+        assert_eq!(cfg.domains.wildcards, vec!["*.example.com".to_string()]);
+
+        // Stale-index safety: an HTTP challenge whose record is later switched to
+        // DNS (without removal) leaves a dangling token index; the lookup loads
+        // the current (DNS) record and refuses to serve the old HTTP token.
+        let h2 = store
+            .start_domain_verification("s2", "host.example", VerificationMethod::Http, 300)
+            .await
+            .unwrap();
+        assert!(store
+            .find_pending_http_challenge("host.example", &h2.token, 300)
+            .await
+            .unwrap()
+            .is_some());
+        store
+            .start_domain_verification("s2", "host.example", VerificationMethod::Dns, 300)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_pending_http_challenge("host.example", &h2.token, 300)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale HTTP index must not serve a token whose record is now DNS"
+        );
     }
 
     fn store() -> DeployStore {

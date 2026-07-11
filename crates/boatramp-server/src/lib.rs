@@ -1349,19 +1349,30 @@ async fn put_site_config(
         .filter(|host| !existing.contains(host))
         .collect();
     for host in added {
-        match deploy.is_domain_verified(&site, &host).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    format!(
-                        "{host} is not verified for {site}; run \
-                         `boatramp domain add {host} --site {site}` first\n"
-                    ),
-                )
-                    .into_response()
-            }
+        let verification = match deploy.get_domain_verification(&site, &host).await {
+            Ok(v) => v,
             Err(err) => return deploy_error_response(err),
+        };
+        if !verification.as_ref().is_some_and(|v| v.verified) {
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "{host} is not verified for {site}; run \
+                     `boatramp domain add {host} --site {site}` first\n"
+                ),
+            )
+                .into_response();
+        }
+        // A wildcard needs DNS proof (parity with `attach_verified_domain`).
+        if host.starts_with("*.")
+            && verification.as_ref().map(|v| v.method)
+                != Some(boatramp_core::domain_verify::VerificationMethod::Dns)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                format!("wildcard {host} must be verified via DNS (an HTTP token proves only the base host)\n"),
+            )
+                .into_response();
         }
     }
     match deploy.set_site_config(&site, &config).await {
