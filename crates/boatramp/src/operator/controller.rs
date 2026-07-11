@@ -1,20 +1,32 @@
-//! The controller entrypoint (`boatramp operator run`).
+//! The controller entrypoint (`boatramp operator run`) + the `BoatRampCluster`
+//! reconciler.
 //!
-//! K1 is a **skeleton**: it connects to the API server, watches
-//! [`BoatRampCluster`], and runs a no-op reconcile loop that requeues. The actual
-//! reconcilers — workloads (K2) and the Raft **membership** state machine (K3, the
-//! mandatory core) — slot into [`reconcile`] without changing this wiring.
+//! K2: reconcile a `BoatRampCluster` into its owned workloads via **server-side
+//! apply** (idempotent, ownership-tracked). K3 adds the Raft **membership** state
+//! machine (join → learner → voter; demote + remove before delete) on top of this
+//! same loop.
 
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
+use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::{watcher, Controller};
-use kube::{Api, Client};
+use kube::{Client, Resource};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
-use super::crd::BoatRampCluster;
-use super::{Error, Result};
+use super::crd::{BoatRampCluster, BoatRampClusterStatus, ClusterMode};
+use super::{resources, Error, Result};
+
+/// The server-side-apply field manager: the operator owns the fields it sets.
+const FIELD_MANAGER: &str = "boatramp-operator";
 
 /// `operator run` flags.
 #[derive(Debug, clap::Args)]
@@ -24,9 +36,8 @@ pub struct RunArgs {
     namespace: Option<String>,
 }
 
-/// Shared reconcile context (the API client; reconcilers add their handles here).
+/// Shared reconcile context.
 struct Ctx {
-    #[allow(dead_code)] // used by the K2/K3 reconcilers.
     client: Client,
 }
 
@@ -40,8 +51,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         None => Api::all(client.clone()),
     };
 
-    // Fail fast with a clear message if the CRDs aren't installed yet, rather than
-    // looping on watch errors.
+    // Fail fast with a clear message if the CRDs aren't installed yet.
     if let Err(err) = clusters.list(&Default::default()).await {
         return Err(Error::Other(format!(
             "cannot list BoatRampCluster — are the CRDs installed? \
@@ -68,14 +78,106 @@ pub async fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile one `BoatRampCluster`. K1: a no-op that requeues — the workload (K2)
-/// and membership (K3) logic lands here.
-async fn reconcile(obj: Arc<BoatRampCluster>, _ctx: Arc<Ctx>) -> Result<Action> {
-    tracing::debug!(
-        name = obj.metadata.name.as_deref().unwrap_or("<unnamed>"),
-        "reconcile (K1 no-op)"
-    );
+/// Reconcile one `BoatRampCluster` into its owned workloads.
+async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
+    let ns = brc
+        .metadata
+        .namespace
+        .clone()
+        .ok_or_else(|| Error::Other("BoatRampCluster has no namespace".into()))?;
+    let name = brc
+        .metadata
+        .name
+        .clone()
+        .ok_or_else(|| Error::Other("BoatRampCluster has no name".into()))?;
+    let client = &ctx.client;
+    tracing::info!(%ns, %name, mode = ?brc.spec.mode, "reconciling BoatRampCluster");
+
+    // Config + the client Service are applied in both modes.
+    apply(
+        &Api::<ConfigMap>::namespaced(client.clone(), &ns),
+        &resources::config_map(&brc),
+    )
+    .await?;
+    apply(
+        &Api::<Service>::namespaced(client.clone(), &ns),
+        &resources::client_service(&brc),
+    )
+    .await?;
+
+    match brc.spec.mode {
+        ClusterMode::Cluster => {
+            apply(
+                &Api::<Service>::namespaced(client.clone(), &ns),
+                &resources::headless_service(&brc),
+            )
+            .await?;
+            apply(
+                &Api::<StatefulSet>::namespaced(client.clone(), &ns),
+                &resources::stateful_set(&brc),
+            )
+            .await?;
+            apply(
+                &Api::<PodDisruptionBudget>::namespaced(client.clone(), &ns),
+                &resources::pod_disruption_budget(&brc),
+            )
+            .await?;
+        }
+        ClusterMode::Stateless => {
+            apply(
+                &Api::<Deployment>::namespaced(client.clone(), &ns),
+                &resources::deployment(&brc),
+            )
+            .await?;
+            apply(
+                &Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), &ns),
+                &resources::hpa(&brc),
+            )
+            .await?;
+        }
+    }
+
+    // K2 records that the workloads are applied; K3 computes real membership +
+    // quorum + readiness from the live pods.
+    update_status(&Api::<BoatRampCluster>::namespaced(client.clone(), &ns), &name, &brc).await?;
+
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Server-side-apply a child object (idempotent; the operator owns its fields).
+async fn apply<K>(api: &Api<K>, obj: &K) -> Result<()>
+where
+    K: Resource + Serialize + DeserializeOwned + Clone + Debug,
+    K::DynamicType: Default,
+{
+    let name = obj
+        .meta()
+        .name
+        .clone()
+        .ok_or_else(|| Error::Other("child object has no name".into()))?;
+    api.patch(
+        &name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(obj),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Record the reconcile in the CR's `.status` subresource.
+async fn update_status(api: &Api<BoatRampCluster>, name: &str, brc: &BoatRampCluster) -> Result<()> {
+    let status = BoatRampClusterStatus {
+        phase: Some("Reconciling".to_string()),
+        observed_generation: brc.metadata.generation,
+        ..Default::default()
+    };
+    api.patch_status(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "status": status })),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Requeue after a back-off when a reconcile fails.

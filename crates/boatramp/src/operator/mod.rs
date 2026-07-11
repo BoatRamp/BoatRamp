@@ -13,6 +13,7 @@
 mod controller;
 mod crd;
 mod manifests;
+mod resources;
 
 use clap::Subcommand;
 
