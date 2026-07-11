@@ -1,6 +1,14 @@
 {
   description = "boatramp — a self-hosted, streaming-first alternative to Vercel for publishing static sites";
 
+  # Public binary cache: pull prebuilt boatramp instead of building from source.
+  # Populated by CI (.github/workflows/cache.yml) and the boatramp.dev deploy.
+  # Pulls are anonymous; only CI pushes (needs the CACHIX_AUTH_TOKEN secret).
+  nixConfig = {
+    extra-substituters = [ "https://boatramp.cachix.org" ];
+    extra-trusted-public-keys = [ "boatramp.cachix.org-1:ZEjT+bbyuOxBvWUF0xRKdf+UwnMdTlnXdWQJJbeLpS4=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

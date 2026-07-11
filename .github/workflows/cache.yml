@@ -1,0 +1,36 @@
+name: Cache
+
+# Build the boatramp binary and push it to the public boatramp.cachix.org cache,
+# so downstream consumers (contributors, and the boatramp.dev website CI) pull it
+# in seconds instead of rebuilding from source. Additive — it does not touch the
+# existing CI/nightly/release workflows.
+#
+# Pushing needs the `CACHIX_AUTH_TOKEN` repo secret (the push token for the
+# `boatramp` cache). Until it's set, this still runs green: cachix-action adds the
+# cache as a substituter and simply skips the push.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 5 * * *" # nightly — keep the cache warm against nixpkgs drift
+  workflow_dispatch:
+
+concurrency:
+  group: cache-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build + cache the boatramp binary
+        run: nix build .#default --print-build-logs
