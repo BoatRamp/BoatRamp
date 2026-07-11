@@ -50,6 +50,8 @@ mod gateway;
 mod handler_validate;
 mod logs;
 mod manage;
+#[cfg(feature = "operator")]
+mod operator;
 mod security;
 mod serve;
 mod sync;
@@ -139,6 +141,10 @@ enum Command {
     /// cluster mode on CF Containers + an edge Worker.
     #[cfg(feature = "cluster")]
     Cloudflare(cloudflare::CloudflareArgs),
+    /// Kubernetes operator: run the controller or emit CRDs/install manifests
+    /// (`operator run` / `operator crds` / `operator manifests`).
+    #[cfg(feature = "operator")]
+    Operator(operator::OperatorArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -293,6 +299,17 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `operator` talks to the Kubernetes API (or just emits manifests) — it needs
+    // neither the project nor the server config.
+    #[cfg(feature = "operator")]
+    if matches!(cli.command, Command::Operator(_)) {
+        let Command::Operator(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        operator::run(args).await?;
+        return Ok(());
+    }
+
     let path = cli.config.unwrap_or_else(|| PathBuf::from("project.cfg"));
     let config = config::ProjectConfig::load(&path)?;
 
@@ -301,6 +318,8 @@ async fn async_main() -> Result<(), CliError> {
     match cli.command {
         Command::Serve(_) => unreachable!("handled above"),
         Command::Security(_) => unreachable!("handled above"),
+        #[cfg(feature = "operator")]
+        Command::Operator(_) => unreachable!("handled above"),
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
         Command::Sync(args) => sync::run(args, &config).await?,
         Command::Build(args) => build::run(args, &config).await?,

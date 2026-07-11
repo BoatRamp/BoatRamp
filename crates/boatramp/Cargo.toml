@@ -100,6 +100,12 @@ cluster = [
   # The `MeshAdmitter` impl bridging the join route to `ClusterNode::admit`.
   "dep:async-trait",
 ]
+# In-binary **Kubernetes operator** (`boatramp operator …`): a kube-rs
+# controller-runtime + single-sourced CRD types (`BoatRampCluster`/`Site`/
+# `Function`) whose YAML the binary emits (`operator crds|manifests`). One image,
+# one version — the operator is the same binary that serves. Off by default; pulls
+# the heavy kube-rs + k8s-openapi tree only for a k8s build.
+operator = ["dep:kube", "dep:k8s-openapi", "dep:schemars", "dep:serde_yaml"]
 
 [dependencies]
 # COSE/CWT + Cedar auth is always built into the binary: the CLI
@@ -161,6 +167,11 @@ wit-component = { workspace = true, optional = true, features = [
   "dummy-module",
 ] }
 wit-parser = { workspace = true, optional = true }
+# The in-binary Kubernetes operator (`operator` feature).
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Generate a self-signed cert/key in the cluster-TLS bridge tests (avoids

@@ -80,6 +80,10 @@ pub enum CliError {
     #[cfg(feature = "cluster")]
     #[error(transparent)]
     Cloudflare(#[from] crate::cloudflare::Error),
+    /// The `operator` command (requires `--features operator`).
+    #[cfg(feature = "operator")]
+    #[error(transparent)]
+    Operator(#[from] crate::operator::Error),
 
     /// Building the multi-threaded async (Tokio) runtime.
     #[error("building async runtime: {0}")]

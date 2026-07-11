@@ -146,6 +146,24 @@ hyper = "1"
 # Tokio IO adapter (`TokioIo`) for driving a hyper client conn over a
 # `tokio::net::UnixStream` — the gateway's unix-socket upstreams.
 hyper-util = { version = "0.1", features = ["tokio"] }
+# The in-binary Kubernetes operator (`boatramp operator …`, `operator` feature).
+# kube-rs controller-runtime + CRD derive; k8s-openapi for the built-in resource
+# types the operator reconciles into; schemars for CRD schema generation.
+kube = { version = "1", default-features = false, features = [
+  "client",
+  "runtime",
+  "derive",
+  "rustls-tls",
+] }
+k8s-openapi = { version = "0.25", features = ["latest"] }
+# schemars 0.8 — the version kube-derive 1.x + k8s-openapi 0.25 generate against
+# (they emit `schemars 0.8` `JsonSchema` impls); newer schemars majors elsewhere
+# in the tree coexist as separate crates.
+schemars = "0.8"
+# YAML emission for `operator crds|manifests`. Already in the tree transitively
+# (slatedb → figment), so this adds nothing; deprecated-but-fine for one-shot
+# manifest generation (a non-blocking cargo-deny advisory).
+serde_yaml = "0.9"
 
 [profile.release]
 lto = "thin"
