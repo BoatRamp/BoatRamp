@@ -68,6 +68,12 @@ const CLAIM_BH: &str = "bh";
 pub const POP_WINDOW_SECS: u64 = 60;
 /// Clock skew tolerated for a proof minted slightly in the future, in seconds.
 pub const POP_SKEW_SECS: u64 = 30;
+/// The largest request body bound by a PoP `bh` hash. Both the client (which
+/// signs) and the server (which buffers + verifies) key the body binding off
+/// `body length ≤ this`, so they always agree on whether a proof carries a `bh`.
+/// Control-plane payloads are far smaller; larger bodies (blob/tarball uploads)
+/// stream through unbound (a documented gap — those carry their own content hash).
+pub const POP_MAX_BODY_HASH_BYTES: usize = 1024 * 1024;
 
 /// Text claim key for the holder key (RFC 8747 `cnf`, here the holder's public key
 /// `"<alg>:<hex>"`): the key that may mint the next delegation block. Present only

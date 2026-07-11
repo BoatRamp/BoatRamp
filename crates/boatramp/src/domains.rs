@@ -218,7 +218,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
 /// A/CNAME — so ownership is proven before anything is pointed at this server.
 #[cfg(feature = "acme-dns")]
 async fn add_auto(
-    http: &reqwest::Client,
+    http: &crate::client::ApiClient,
     server: &str,
     site: &str,
     host: &str,
@@ -289,7 +289,7 @@ async fn add_auto(
 /// challenge with, so `--provider` is unavailable.
 #[cfg(not(feature = "acme-dns"))]
 async fn add_auto(
-    _http: &reqwest::Client,
+    _http: &crate::client::ApiClient,
     _server: &str,
     _site: &str,
     _host: &str,
@@ -301,7 +301,7 @@ async fn add_auto(
 }
 
 /// List attached hostnames plus any started-but-not-yet-attached verifications.
-async fn ls(http: &reqwest::Client, server: &str, site: &str) -> Result<()> {
+async fn ls(http: &crate::client::ApiClient, server: &str, site: &str) -> Result<()> {
     let site_config = client::fetch_site_config(http, server, site).await?;
     let domains = &site_config.domains;
     let mut any = false;

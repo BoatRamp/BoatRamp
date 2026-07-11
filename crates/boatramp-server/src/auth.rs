@@ -21,20 +21,12 @@ use axum::response::{IntoResponse, Response};
 
 use boatramp_core::authz::{self, AuthzPolicy, Right};
 use boatramp_core::cedar::CompiledCedar;
-use boatramp_core::cose::{self, PopClaims, TokenError, TokenPublicKey};
+use boatramp_core::cose::{self, PopClaims, TokenError, TokenPublicKey, POP_MAX_BODY_HASH_BYTES};
 use boatramp_core::kv::KvStore;
 
 /// The header carrying a per-request proof-of-possession (base64url `COSE_Sign1`),
 /// signed by the token's holder (`cnf`) key. Lower-case per HTTP/2 conventions.
 const POP_HEADER: HeaderName = HeaderName::from_static("boatramp-pop");
-
-/// The largest request body the auth layer buffers to compute a PoP body-hash
-/// binding. Control-plane payloads (JSON, config, policy) are far smaller; larger
-/// bodies (blob/tarball uploads) stream through **unbuffered** and are not
-/// body-bound — a documented gap (those carry their own content hash elsewhere).
-/// Both client and server key the body binding off `Content-Length ≤ this`, so
-/// they always agree on whether a proof carries a `bh`.
-const POP_MAX_BODY_HASH_BYTES: usize = 1024 * 1024;
 
 /// Control-plane auth configuration: the token trust anchor (root public key)
 /// plus the KV that holds the RBAC policy (`authz/policy`) and revocation markers

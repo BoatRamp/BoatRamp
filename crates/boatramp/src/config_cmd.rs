@@ -121,7 +121,7 @@ pub async fn run(args: ConfigArgs, config: &ProjectConfig) -> Result<()> {
     }
 }
 
-async fn fetch(http: &reqwest::Client, server: &str) -> Result<ConfigResponse> {
+async fn fetch(http: &crate::client::ApiClient, server: &str) -> Result<ConfigResponse> {
     Ok(http
         .get(format!("{server}/api/daemon/config"))
         .send()
@@ -131,7 +131,7 @@ async fn fetch(http: &reqwest::Client, server: &str) -> Result<ConfigResponse> {
         .await?)
 }
 
-async fn put(http: &reqwest::Client, server: &str, cfg: &DaemonConfig) -> Result<String> {
+async fn put(http: &crate::client::ApiClient, server: &str, cfg: &DaemonConfig) -> Result<String> {
     let resp = http
         .put(format!("{server}/api/daemon/config"))
         .json(cfg)
@@ -144,7 +144,7 @@ async fn put(http: &reqwest::Client, server: &str, cfg: &DaemonConfig) -> Result
     Ok(v["generation"].as_str().unwrap_or("").to_string())
 }
 
-async fn get(http: &reqwest::Client, server: &str, key: Option<String>) -> Result<()> {
+async fn get(http: &crate::client::ApiClient, server: &str, key: Option<String>) -> Result<()> {
     let r = fetch(http, server).await?;
     match key {
         None => {
@@ -159,7 +159,7 @@ async fn get(http: &reqwest::Client, server: &str, key: Option<String>) -> Resul
     Ok(())
 }
 
-async fn set(http: &reqwest::Client, server: &str, key: &str, value: &str) -> Result<()> {
+async fn set(http: &crate::client::ApiClient, server: &str, key: &str, value: &str) -> Result<()> {
     let mut r = fetch(http, server).await?;
     write_key(&mut r.config, key, value)?;
     let generation = put(http, server, &r.config).await?;
@@ -167,7 +167,7 @@ async fn set(http: &reqwest::Client, server: &str, key: &str, value: &str) -> Re
     Ok(())
 }
 
-async fn rollback(http: &reqwest::Client, server: &str) -> Result<()> {
+async fn rollback(http: &crate::client::ApiClient, server: &str) -> Result<()> {
     let resp = http
         .post(format!("{server}/api/daemon/config/rollback"))
         .send()
@@ -184,7 +184,7 @@ async fn rollback(http: &reqwest::Client, server: &str) -> Result<()> {
     Ok(())
 }
 
-async fn apply(http: &reqwest::Client, server: &str, file: &std::path::Path) -> Result<()> {
+async fn apply(http: &crate::client::ApiClient, server: &str, file: &std::path::Path) -> Result<()> {
     let bytes = std::fs::read(file)?;
     let cfg: DaemonConfig = serde_json::from_slice(&bytes)?;
     let generation = put(http, server, &cfg).await?;

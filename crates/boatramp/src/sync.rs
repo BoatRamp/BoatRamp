@@ -449,7 +449,7 @@ async fn hash_file(path: &Path) -> Result<(String, u64)> {
 
 /// Upload a blob to the server, streaming from disk or sending in-memory bytes.
 async fn upload_blob(
-    client: &reqwest::Client,
+    client: &crate::client::ApiClient,
     server: &str,
     hash: &str,
     source: &BlobSource,

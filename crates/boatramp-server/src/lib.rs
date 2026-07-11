@@ -53,7 +53,7 @@ mod ratelimit;
 /// control-plane root keys behind the [`boatramp_core::cose::Signer`] seam.
 pub mod signer;
 mod srvmetrics;
-pub use auth::Auth;
+pub use auth::{require_auth, Auth};
 #[cfg(feature = "http3")]
 pub use http3::{
     advertise_http3, http3_endpoint, quinn_server_config, serve_http3, serve_http3_endpoint,

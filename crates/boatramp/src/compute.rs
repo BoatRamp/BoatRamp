@@ -389,7 +389,7 @@ fn build_spec(
 
 /// PUT a workload's desired state; returns the stored spec hash.
 async fn put_workload(
-    http: &reqwest::Client,
+    http: &crate::client::ApiClient,
     server: &str,
     name: &str,
     spec: ComputeSpec,
