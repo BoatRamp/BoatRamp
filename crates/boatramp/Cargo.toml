@@ -23,6 +23,11 @@ cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
 slatedb = ["boatramp-storage/slatedb"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
 tls = ["dep:axum-server", "dep:rustls-acme", "dep:rustls", "dep:rustls-pemfile", "dep:boatramp-rpktls"]
+# DNS-TXT domain-ownership verification (`domain add --method dns`): resolve the
+# `_boatramp-verify.<host>` TXT over public DNS. Needed to verify a host that
+# points at this same instance (e.g. a self-hosted domain behind fly/Cloudflare,
+# where an HTTP self-probe can't hairpin back). Enables the server's feature.
+domain-verify-dns = ["boatramp-server/domain-verify-dns"]
 # OIDC bearer-JWT control-plane auth: verify `serve` against an
 # OIDC issuer's JWKS. Enables the server's `oidc` feature.
 oidc = ["boatramp-server/oidc"]

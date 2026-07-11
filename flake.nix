@@ -156,9 +156,15 @@
           };
 
           # Default (base) feature set: fs blobs + SlateDB metadata. Backs the
-          # `default` package and the `container` image (fly.io / any OCI host that
-          # provides a writable volume for state).
+          # `default` package (fly.io / any OCI host that provides a writable
+          # volume for state).
           boatrampBase = mkBoatramp { };
+
+          # The `container` image adds `domain-verify-dns`: the reference/dogfood
+          # deployment self-hosts its own domains (e.g. docs.boatramp.dev on the
+          # same fly app), where an HTTP ownership probe can't hairpin back to the
+          # app — so it verifies ownership over public DNS-TXT instead.
+          boatrampContainer = mkBoatramp { features = [ "domain-verify-dns" ]; };
 
           # Shared builder for the reproducible, Nix-first OCI images. The `container`
           # (base) and `container-cloudflare` (R2 + KV) targets differ only in the
@@ -328,7 +334,7 @@
           // lib.optionalAttrs pkgs.stdenv.isLinux {
             # Base image: default backends (fs blobs + SlateDB metadata). Runs as
             # root so it can own a mounted state volume (e.g. a fly.io volume).
-            container = mkImage { pkg = boatrampBase; };
+            container = mkImage { pkg = boatrampContainer; };
             # Cloudflare image: R2 (`s3`) blobs + Cloudflare KV metadata. State is
             # remote so the container is stateless; stays hardened as `nobody`.
             container-cloudflare = mkImage {
