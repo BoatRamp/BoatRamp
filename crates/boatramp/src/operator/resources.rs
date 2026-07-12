@@ -148,6 +148,15 @@ fn container(brc: &BoatRampCluster) -> Container {
     Container {
         name: "boatramp".to_string(),
         image: Some(image(brc)),
+        // The operator controls the image via the CR's `spec.image` (an explicit
+        // version), so image changes roll through a pod-spec change, not a re-pull.
+        // Own the field explicitly (`IfNotPresent`): otherwise the apiserver's
+        // `:latest`-era `Always` default sticks, and a pinned/loaded image (or a
+        // `k3d image import`) is needlessly re-pulled.
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        // Set the entrypoint explicitly so the pod works regardless of whether the
+        // image declares one (`args` alone need an image ENTRYPOINT).
+        command: Some(vec!["boatramp".to_string()]),
         args: Some(
             ["serve", "--config", &format!("{CONFIG_MOUNT}/boatramp.cfg")]
                 .iter()
