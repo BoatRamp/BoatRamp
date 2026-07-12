@@ -165,6 +165,15 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
     )
     .await?;
 
+    // Observe the pods up front — the quorum-aware rolling upgrade (K4) needs the
+    // current membership to decide whether it's safe to advance the StatefulSet
+    // rollout, so it must be computed before the StatefulSet is (re-)applied. On
+    // the very first reconcile the StatefulSet doesn't exist yet, so this is empty
+    // and the rollout is paused — harmless, since a partition gates *updates*, not
+    // the initial pod creation.
+    let pods = observe_pods(client, &ns, &name).await?;
+    let ready = pods.iter().filter(|p| p.ready).count() as u32;
+
     match brc.spec.mode {
         ClusterMode::Cluster => {
             apply(
@@ -172,9 +181,10 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
                 &resources::headless_service(&brc),
             )
             .await?;
+            let roll_partition = super::executor::roll_partition(client, &ns, &brc, &pods).await;
             apply(
                 &Api::<StatefulSet>::namespaced(client.clone(), &ns),
-                &resources::stateful_set(&brc),
+                &resources::stateful_set(&brc, roll_partition),
             )
             .await?;
             apply(
@@ -197,12 +207,10 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
         }
     }
 
-    // Observe the pods, and — in cluster mode — drive the next quorum-safe Raft
-    // membership transition (K3 core) through the executor (K3b): it fetches the
-    // live membership from the cluster API and promotes/removes/admits one step.
-    // With no admin token configured it plans + reports but doesn't execute.
-    let pods = observe_pods(client, &ns, &name).await?;
-    let ready = pods.iter().filter(|p| p.ready).count() as u32;
+    // In cluster mode, drive the next quorum-safe Raft membership transition (K3
+    // core) through the executor (K3b): it fetches the live membership from the
+    // cluster API and promotes/removes/admits one step. With no admin token
+    // configured it plans + reports but doesn't execute.
     if brc.spec.mode == ClusterMode::Cluster {
         let root = brc.spec.root_pubkey.clone().unwrap_or_default();
         match super::executor::step(client, &ns, &brc, &pods, &root).await {

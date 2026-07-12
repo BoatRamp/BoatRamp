@@ -117,6 +117,20 @@ scale-up adds learners then promotes them; scale-down removes the highest
 ordinals first, always quorum-safe. Kill a pod and the StatefulSet recreates it;
 it rejoins (or resumes from its PVC) with no manual step.
 
+A node's **PVC is retained** on scale-down and on StatefulSet delete
+(`persistentVolumeClaimRetentionPolicy: Retain`) — a Raft voter's durable
+log/state is never auto-reclaimed. Removing the data is an explicit operator step.
+
+## Rolling upgrades
+
+Bump `spec.image` and re-apply. The operator drives a **quorum-aware** rolling
+upgrade: it pauses the StatefulSet rollout (via the `RollingUpdate` partition)
+whenever the cluster lacks a spare ready voter, so an upgrade never drops the
+cluster below quorum. Combined with the PodDisruptionBudget, a node drain behaves
+the same way. When a voter's pod does restart, Raft re-elects a new leader
+automatically (a sub-second election); explicit leader-transfer to avoid that brief
+write pause is a future optimization (openraft 0.9 has no simple transfer call).
+
 ## `spec` reference
 
 | Field | Type | Default | Description |

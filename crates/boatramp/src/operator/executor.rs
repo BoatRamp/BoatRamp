@@ -43,6 +43,31 @@ struct ClusterApi {
     token: String,
 }
 
+/// The `RollingUpdate` partition for the cluster StatefulSet (K4): `0` lets the
+/// rollout proceed one pod at a time, `replicas` **pauses** it. Pauses unless the
+/// cluster has a quorum margin (a spare ready voter), so a rolling upgrade never
+/// drops below quorum. Needs the admin token to read membership; without it (or
+/// on any error) it returns `0` and defers safety to the PDB. `pods` is the
+/// operator's current observation.
+pub(super) async fn roll_partition(
+    client: &Client,
+    ns: &str,
+    brc: &BoatRampCluster,
+    pods: &[membership::PodState],
+) -> i32 {
+    let replicas = brc.spec.replicas as i32;
+    let Ok(Some(api)) = ClusterApi::connect(client, ns, brc).await else {
+        return 0;
+    };
+    let Ok(raw) = api.members().await else { return 0 };
+    let (members, _) = membership::members_from_api(&raw);
+    if membership::has_roll_margin(&members, pods) {
+        0
+    } else {
+        replicas
+    }
+}
+
 /// Resolve a cluster's admin control-plane endpoint from its `adminTokenSecret`:
 /// the in-cluster base URL (the client Service's stable DNS) + the admin bearer
 /// token. `Ok(None)` if the CR sets no `adminTokenSecret` (⇒ the caller reports

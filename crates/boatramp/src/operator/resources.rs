@@ -15,7 +15,10 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, StatefulSet, StatefulSetSpec};
+use k8s_openapi::api::apps::v1::{
+    Deployment, DeploymentSpec, RollingUpdateStatefulSetStrategy, StatefulSet,
+    StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec, StatefulSetUpdateStrategy,
+};
 use k8s_openapi::api::autoscaling::v2::{
     HorizontalPodAutoscaler, HorizontalPodAutoscalerSpec, CrossVersionObjectReference,
     MetricSpec, ResourceMetricSource, MetricTarget,
@@ -267,7 +270,13 @@ fn selector(brc: &BoatRampCluster) -> LabelSelector {
 }
 
 /// The cluster-mode StatefulSet: stable identity + a per-node data PVC.
-pub fn stateful_set(brc: &BoatRampCluster) -> StatefulSet {
+///
+/// `roll_partition` is the `RollingUpdate` partition the operator controls
+/// (quorum-aware upgrades, K4): only pods with an ordinal `>=` the partition are
+/// updated, so the operator **pauses** the rollout by setting it to `replicas`
+/// when the cluster has no quorum margin, and to `0` to let it proceed one pod at
+/// a time (highest ordinal first).
+pub fn stateful_set(brc: &BoatRampCluster, roll_partition: i32) -> StatefulSet {
     let storage = brc.spec.storage.clone().unwrap_or_else(|| "10Gi".to_string());
     let pvc = PersistentVolumeClaim {
         metadata: ObjectMeta {
@@ -293,6 +302,24 @@ pub fn stateful_set(brc: &BoatRampCluster) -> StatefulSet {
             // The data volume comes from `volume_claim_templates`, not the pod spec.
             template: pod_template(brc, None),
             volume_claim_templates: Some(vec![pvc]),
+            // Quorum-aware rolling upgrade: the operator advances/pauses this
+            // partition based on the cluster's roll margin (K4).
+            update_strategy: Some(StatefulSetUpdateStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: Some(RollingUpdateStatefulSetStrategy {
+                    partition: Some(roll_partition),
+                    ..Default::default()
+                }),
+            }),
+            // **Retain** a node's PVC on scale-down or StatefulSet delete — a Raft
+            // voter's durable log/state must never be reclaimed automatically (it
+            // would lose the vote + data); reclaiming is an explicit operator step.
+            persistent_volume_claim_retention_policy: Some(
+                StatefulSetPersistentVolumeClaimRetentionPolicy {
+                    when_deleted: Some("Retain".to_string()),
+                    when_scaled: Some("Retain".to_string()),
+                },
+            ),
             ..Default::default()
         }),
         ..Default::default()
@@ -390,12 +417,25 @@ mod tests {
     #[test]
     fn statefulset_has_pvc_stable_dns_probes_and_owner_ref() {
         let brc = cluster("db", ClusterMode::Cluster, 3);
-        let sts = stateful_set(&brc);
+        // A paused rollout (partition == replicas) — the operator's K4 knob.
+        let sts = stateful_set(&brc, 3);
         let spec = sts.spec.unwrap();
         assert_eq!(spec.replicas, Some(3));
         assert_eq!(spec.service_name.as_deref(), Some("db-headless"));
         // A per-node PVC (the reason cluster mode is a StatefulSet).
-        assert_eq!(spec.volume_claim_templates.unwrap().len(), 1);
+        assert_eq!(spec.volume_claim_templates.as_ref().unwrap().len(), 1);
+        // K4: the operator-controlled rolling-upgrade partition.
+        assert_eq!(
+            spec.update_strategy
+                .as_ref()
+                .and_then(|u| u.rolling_update.as_ref())
+                .and_then(|r| r.partition),
+            Some(3)
+        );
+        // K4: a Raft voter's PVC is never auto-reclaimed (data + vote safety).
+        let retain = spec.persistent_volume_claim_retention_policy.as_ref().unwrap();
+        assert_eq!(retain.when_deleted.as_deref(), Some("Retain"));
+        assert_eq!(retain.when_scaled.as_deref(), Some("Retain"));
         // Probes wired to the real endpoints.
         let c = &spec.template.spec.unwrap().containers[0];
         assert_eq!(

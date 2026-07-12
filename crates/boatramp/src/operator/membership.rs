@@ -88,6 +88,17 @@ pub fn has_quorum(members: &[Member], pods: &[PodState]) -> bool {
     voters > 0 && ready_voters(members, pods) >= majority(voters)
 }
 
+/// Whether it is safe to **roll a voter's pod** (a rolling upgrade / drain) right
+/// now: the cluster must keep quorum even after one more voter goes down — i.e.
+/// there is a **margin above the majority** (`ready voters > majority`). A
+/// single-voter cluster (dev) has no margin, so a rolling upgrade would blip
+/// writes; the operator pauses the rollout until the margin returns. Learners
+/// carry no vote, so rolling a learner is always safe (this gates only voters).
+pub fn has_roll_margin(members: &[Member], pods: &[PodState]) -> bool {
+    let voters = total_voters(members);
+    voters > 1 && ready_voters(members, pods) > majority(voters)
+}
+
 /// The single next quorum-safe membership action, or `None` when the configuration
 /// already matches `desired` (converged) or no action can safely commit (wait).
 ///
@@ -286,6 +297,24 @@ mod tests {
             action_node_id(&MembershipAction::AddLearner { ordinal: 2 }, &map),
             None
         );
+    }
+
+    #[test]
+    fn roll_margin_needs_a_spare_voter() {
+        // 3 voters all ready → majority is 2, ready is 3 > 2 → safe to roll one.
+        let (pods, members) = voters(3);
+        assert!(has_roll_margin(&members, &pods));
+        // 3 voters, one pod down → ready 2 == majority 2 → NO margin (rolling
+        // another would drop below quorum).
+        let mut pods2 = pods.clone();
+        pods2[0].ready = false;
+        assert!(!has_roll_margin(&members, &pods2));
+        // A single-voter (dev) cluster never has a roll margin.
+        let (p1, m1) = voters(1);
+        assert!(!has_roll_margin(&m1, &p1));
+        // 5 voters all ready → margin (3 majority, 5 ready).
+        let (p5, m5) = voters(5);
+        assert!(has_roll_margin(&m5, &p5));
     }
 
     #[test]
