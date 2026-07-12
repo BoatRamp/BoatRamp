@@ -726,7 +726,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // Cluster mode (`[cluster]` config): the control-plane KvStore + messaging
     // come from the embedded-Raft cluster node, not the local backends.
     #[cfg(feature = "cluster")]
-    if let Some(cluster_cfg) = config.cluster.clone() {
+    if let Some(mut cluster_cfg) = config.cluster.clone() {
+        // StatefulSet-native identity: a shared ConfigMap can't hold a per-pod node
+        // id, so let the pod's ordinal drive it via env (the Kubernetes operator
+        // wires `apps.kubernetes.io/pod-index` → `BOATRAMP_CLUSTER_NODE_ID` through
+        // the downward API, and marks the lowest ordinal as the bootstrap node).
+        apply_cluster_env_overrides(&mut cluster_cfg);
         return run_cluster(args, config, cluster_cfg, addr, data_dir, storage, options).await;
     }
     #[cfg(not(feature = "cluster"))]
@@ -1188,6 +1193,23 @@ impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
 
 #[cfg(feature = "cluster")]
 #[allow(clippy::too_many_arguments)]
+/// Apply StatefulSet-native cluster overrides from the environment: the pod's
+/// ordinal sets `node_id` (`BOATRAMP_CLUSTER_NODE_ID`), and `BOATRAMP_CLUSTER_BOOTSTRAP`
+/// marks the one node that initializes membership (the Kubernetes operator sets it
+/// on the lowest ordinal). Config-file values are the fallback (non-k8s deploys).
+#[cfg(feature = "cluster")]
+fn apply_cluster_env_overrides(cfg: &mut crate::config::ClusterConfig) {
+    if let Some(id) = std::env::var("BOATRAMP_CLUSTER_NODE_ID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        cfg.node_id = id;
+    }
+    if let Ok(b) = std::env::var("BOATRAMP_CLUSTER_BOOTSTRAP") {
+        cfg.bootstrap = matches!(b.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+}
+
 async fn run_cluster(
     args: ServeArgs,
     config: &ServerConfig,
