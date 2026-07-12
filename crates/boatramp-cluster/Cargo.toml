@@ -39,6 +39,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
 futures.workspace = true
+# Derive a node's stable Raft id from its mesh public key (dynamic-join model).
+sha2.workspace = true
 
 openraft = { version = "0.9", optional = true, features = [
   "serde",

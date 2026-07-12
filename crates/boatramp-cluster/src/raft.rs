@@ -41,6 +41,49 @@ use tokio::sync::Mutex;
 /// Cluster node id.
 pub type NodeId = u64;
 
+/// Derive a node's stable Raft id from its **mesh public key** — the dynamic-join
+/// model's self-identification: a node's identity *is* its keypair, and its id is
+/// just a label for it, so no id is ever assigned by config or an operator.
+///
+/// The id is the first 8 bytes (big-endian) of `SHA-256(mesh_pubkey)`, forced
+/// non-zero (0 is reserved as "unset" in some tooling). Two distinct keys collide
+/// only with ~2⁻⁶⁴ probability; and since the *key* — not the id — is the authority
+/// on the mesh, a collision cannot let one node impersonate another (it would only
+/// confuse membership bookkeeping, and is astronomically unlikely regardless).
+pub fn derive_node_id(mesh_pubkey: &[u8]) -> NodeId {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(mesh_pubkey);
+    let id = u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"));
+    id | 1 // never 0 (reserved), at the cost of the lowest bit of spread
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::derive_node_id;
+
+    #[test]
+    fn derivation_is_deterministic_key_specific_and_nonzero() {
+        let key_a = b"mesh-public-key-a-spki-bytes";
+        let key_b = b"mesh-public-key-b-spki-bytes";
+        // Deterministic: same key → same id.
+        assert_eq!(derive_node_id(key_a), derive_node_id(key_a));
+        // Key-specific: different keys → different ids.
+        assert_ne!(derive_node_id(key_a), derive_node_id(key_b));
+        // Never zero (reserved).
+        assert_ne!(derive_node_id(key_a), 0);
+        assert_ne!(derive_node_id(b""), 0);
+    }
+
+    #[test]
+    fn ids_spread_across_many_keys() {
+        // A sanity spread check: 1000 distinct keys yield 1000 distinct ids.
+        let ids: std::collections::HashSet<u64> = (0..1000u32)
+            .map(|i| derive_node_id(format!("key-{i}").as_bytes()))
+            .collect();
+        assert_eq!(ids.len(), 1000);
+    }
+}
+
 openraft::declare_raft_types!(
     /// The boatramp Raft type configuration: control-plane KV writes as the
     /// request, `u64` node ids, `BasicNode` addressing.
