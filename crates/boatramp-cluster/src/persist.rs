@@ -510,9 +510,8 @@ impl RaftStateMachine<TypeConfig> for PersistentStateMachine {
         // A snapshot replaces local state wholesale — let each observer reconcile
         // against the new applied key set (trust set; daemon-config reload; …).
         if !self.observers.is_empty() {
-            let keys: Vec<String> = inner.data.keys().cloned().collect();
             for observer in &self.observers {
-                observer.on_reset(&keys);
+                observer.on_reset(&inner.data);
             }
         }
         Ok(())

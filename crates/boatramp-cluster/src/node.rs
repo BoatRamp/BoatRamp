@@ -61,10 +61,50 @@ impl ApplyObserver for MeshTrustObserver {
         }
     }
 
-    fn on_reset(&self, keys: &[String]) {
+    fn on_reset(&self, data: &BTreeMap<String, Vec<u8>>) {
         self.trust.replace_all(crate::mesh::trust_from_keys(
-            keys.iter().map(String::as_str),
+            data.keys().map(String::as_str),
         ));
+    }
+}
+
+/// Mirrors the replicated **peer-address directory** (`mesh/addr/*`) into this
+/// node's live [`Peers`], so a member admitted anywhere becomes dialable on every
+/// node — and a restart / snapshot-catch-up rehydrates routing — with no static
+/// peer map. Advisory: the mesh TLS still authenticates each dial by key.
+struct MeshAddrObserver {
+    peers: Peers,
+}
+
+impl ApplyObserver for MeshAddrObserver {
+    fn on_apply(&self, muts: &[boatramp_core::kv::WriteOp]) {
+        use boatramp_core::kv::WriteOp;
+        for m in muts {
+            match m {
+                WriteOp::Put(key, value) => {
+                    if let Some(node) = crate::raft::parse_addr_key(key) {
+                        if let Ok(url) = String::from_utf8(value.clone()) {
+                            self.peers.insert(node, url);
+                        }
+                    }
+                }
+                WriteOp::Delete(key) => {
+                    if let Some(node) = crate::raft::parse_addr_key(key) {
+                        self.peers.remove(node);
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_reset(&self, data: &BTreeMap<String, Vec<u8>>) {
+        for (key, value) in data {
+            if let Some(node) = crate::raft::parse_addr_key(key) {
+                if let Ok(url) = String::from_utf8(value.clone()) {
+                    self.peers.insert(node, url);
+                }
+            }
+        }
     }
 }
 
@@ -267,6 +307,9 @@ impl ClusterNode {
                 jti: jti.to_string(),
                 node,
                 pubkey_hex: pubkey_hex.to_string(),
+                // Replicated + persisted so every node (and a restart) learns where
+                // to dial the joiner; the `MeshAddrObserver` mirrors it live.
+                addr: advertise_addr.map(str::to_string),
             })
             .await?;
         let outcome = match resp {
@@ -276,9 +319,9 @@ impl ClusterNode {
             _ => AdmitOutcome::Spent,
         };
         if outcome == AdmitOutcome::Admitted {
-            // Record where to dial the joiner so the leader can replicate to it
-            // (addressing is advisory — mesh TLS re-authenticates by key). Done on
-            // every node that admits so a follower's directory is populated too.
+            // Immediately record where to dial the joiner on this node too, so the
+            // leader can replicate to it without waiting on the observer (which
+            // covers followers + restart). Advisory — mesh TLS re-auths by key.
             if let Some(addr) = advertise_addr {
                 self.peers.insert(node, addr.to_string());
             }
@@ -297,6 +340,20 @@ impl ClusterNode {
     /// address.
     pub fn peer_addrs(&self) -> BTreeMap<NodeId, String> {
         self.peers.snapshot()
+    }
+
+    /// Publish **this node's own** reachable mesh URL into the replicated
+    /// peer-address directory (and the live one), so every node — and any future
+    /// restart/snapshot — can dial it. A founder calls this at bring-up (it is
+    /// never admitted, so nothing else records its address); a joiner's address is
+    /// already recorded by the seed's `admit`. Idempotent. Forwards to the leader.
+    pub async fn advertise_addr(&self, url: &str) -> Result<(), BootstrapError> {
+        use boatramp_core::kv::KvStore;
+        self.peers.insert(self.node_id, url.to_string());
+        self.kv
+            .put(&crate::raft::addr_key(self.node_id), url.as_bytes().to_vec())
+            .await?;
+        Ok(())
     }
 
     /// The current mesh trust set as `(node_id, pubkey_hex)` pairs — every key this
@@ -379,7 +436,7 @@ impl ClusterNode {
         // batch, so revoke is all-or-nothing.
         let prefix = format!("{}{node}/", crate::mesh::TRUST_PREFIX);
         let keys = self.kv.list_prefix(&prefix).await?;
-        let mut batch: Vec<KvWriteOp> = Vec::with_capacity(keys.len() * 2);
+        let mut batch: Vec<KvWriteOp> = Vec::with_capacity(keys.len() * 2 + 1);
         for key in keys {
             // The trusted pubkey is the last path segment of the trust key.
             if let Some(pubkey_hex) = key.rsplit('/').next() {
@@ -387,6 +444,9 @@ impl ClusterNode {
             }
             batch.push(KvWriteOp::Delete(key));
         }
+        // Also drop the node's advisory address (the `MeshAddrObserver` removes it
+        // from every node's live directory as the delete replicates).
+        batch.push(KvWriteOp::Delete(crate::raft::addr_key(node)));
         if !batch.is_empty() {
             self.kv.write_batch(batch).await?;
         }
@@ -562,6 +622,11 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
         .await?
         .with_observer(Arc::new(MeshTrustObserver {
             trust: trust.clone(),
+        }))
+        // Mirror the replicated peer-address directory into the live `Peers` so a
+        // member admitted anywhere is dialable on every node (and after a restart).
+        .with_observer(Arc::new(MeshAddrObserver {
+            peers: peers.clone(),
         }));
     // Caller-supplied observers (e.g. daemon-config reload on `daemon/*`) fire on
     // every apply/snapshot alongside the mesh-trust one.
@@ -574,6 +639,16 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
     let durable_trust = crate::mesh::trust_from_keys(durable_keys.iter().map(String::as_str));
     if !durable_trust.is_empty() {
         trust.replace_all(durable_trust);
+    }
+    // Likewise rehydrate the peer-address directory from durable `mesh/addr/*`, so
+    // a dynamically-joined node keeps its routing across restarts with no peer map.
+    for key in sm.list_prefix(crate::raft::ADDR_PREFIX).await {
+        if let (Some(node), Some(url)) = (
+            crate::raft::parse_addr_key(&key),
+            sm.get(&key).await.and_then(|v| String::from_utf8(v).ok()),
+        ) {
+            peers.insert(node, url);
+        }
     }
     // The seed to persist at bootstrap (post-hydration ⇒ the config seed on a
     // fresh node; unused on a restart, where bootstrap is a no-op).
@@ -1263,6 +1338,22 @@ mod tests {
             node2.mesh.trust().contains(node2_id, id2.public_key()),
             "the joiner adopts its own admitted trust from replication"
         );
+
+        // The leader recorded the joiner's advertised address immediately.
+        assert_eq!(node1.peer_addrs().get(&node2_id).map(String::as_str), Some(url2.as_str()));
+        // …and the joiner learns the founder's address from the replicated
+        // directory (`mesh/addr/*`), not just the join response — so routing is
+        // durable, not a one-shot seed.
+        node1.advertise_addr(&url1).await.unwrap();
+        let mut learned = false;
+        for _ in 0..100 {
+            if node2.peer_addrs().get(&1).map(String::as_str) == Some(url1.as_str()) {
+                learned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(learned, "the joiner learns member addresses from replication");
 
         node1.raft.shutdown().await.unwrap();
         node2.raft.shutdown().await.unwrap();

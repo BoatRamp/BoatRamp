@@ -1286,8 +1286,8 @@ impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
         }
     }
 
-    fn on_reset(&self, keys: &[String]) {
-        if keys.iter().any(|k| k.starts_with("daemon/")) {
+    fn on_reset(&self, data: &std::collections::BTreeMap<String, Vec<u8>>) {
+        if data.keys().any(|k| k.starts_with("daemon/")) {
             self.0.notify_reload();
         }
     }
@@ -1531,6 +1531,10 @@ async fn run_cluster(
     // Initialize a brand-new cluster from this node (once) when founding.
     if do_bootstrap {
         node.bootstrap().await?;
+        // A founder is never admitted, so nothing else records its address —
+        // publish it into the replicated directory so joiners (and restarts) can
+        // dial it with no peer map.
+        node.advertise_addr(&self_advertise).await?;
         tracing::info!("cluster: bootstrapped membership");
     }
 

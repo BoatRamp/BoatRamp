@@ -152,6 +152,11 @@ pub enum WriteOp {
         node: NodeId,
         /// The admitted node's mesh public key (SPKI hex).
         pubkey_hex: String,
+        /// The joiner's advertised mesh URL, replicated so **every** node (and a
+        /// restart) learns where to dial it — advisory routing (the mesh TLS
+        /// re-authenticates by key). `None` ⇒ address unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addr: Option<String>,
     },
 }
 
@@ -181,6 +186,23 @@ pub const REVOKED_PREFIX: &str = "mesh/revoked/";
 /// The revocation-tombstone key for `pubkey_hex` (SPKI hex).
 pub fn revoked_key(pubkey_hex: &str) -> String {
     format!("{REVOKED_PREFIX}{pubkey_hex}")
+}
+
+/// The replicated-KV prefix of the **advisory peer address directory**:
+/// `mesh/addr/{node_id}` → mesh URL. Written at admission and mirrored into every
+/// node's live [`crate::http::Peers`] (and rehydrated on restart), so a
+/// dynamically-joined node keeps its routing across reboots with no static peer
+/// map. Advisory only — the mesh TLS authenticates each dial by key.
+pub const ADDR_PREFIX: &str = "mesh/addr/";
+
+/// The peer-address key for `node`.
+pub fn addr_key(node: NodeId) -> String {
+    format!("{ADDR_PREFIX}{node}")
+}
+
+/// Parse a `mesh/addr/{node}` key back to its node id (`None` if malformed).
+pub fn parse_addr_key(key: &str) -> Option<NodeId> {
+    key.strip_prefix(ADDR_PREFIX)?.parse().ok()
 }
 
 /// The applied-state byte map plus the **durable mutations** each apply makes,
@@ -278,6 +300,7 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             jti,
             node,
             pubkey_hex,
+            addr,
         } => {
             // Re-admit-proof (F6): a revoked key is refused until an explicit
             // un-revoke removes its tombstone — checked first, and the token is
@@ -293,6 +316,11 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             } else {
                 target.put(format!("{JOIN_USED_PREFIX}{jti}"), Vec::new());
                 target.put(trust_key_hex(node, &pubkey_hex), Vec::new());
+                // Replicate the joiner's advisory address so every node + a restart
+                // learns where to dial it (mirrored into the live peer directory).
+                if let Some(addr) = addr {
+                    target.put(addr_key(node), addr.into_bytes());
+                }
                 WriteResponse::Admitted(AdmitOutcome::Admitted)
             }
         }
@@ -538,10 +566,12 @@ pub trait AppliedState: Send + Sync {
 pub trait ApplyObserver: Send + Sync {
     /// The raw `WriteOp`s (original keys) applied by one `apply` call.
     fn on_apply(&self, muts: &[boatramp_core::kv::WriteOp]);
-    /// Reconcile against the full applied key set after a snapshot install
+    /// Reconcile against the **full applied state** after a snapshot install
     /// wholesale-replaces local state (a lagging/joining node catching up via
-    /// snapshot rather than the log). `keys` are all applied raw keys.
-    fn on_reset(&self, keys: &[String]);
+    /// snapshot rather than the log). `data` is every applied key→value pair, so
+    /// an observer can rebuild a view keyed on either (e.g. the trust set from
+    /// keys, or the peer-address directory from values).
+    fn on_reset(&self, data: &BTreeMap<String, Vec<u8>>);
 }
 
 impl StateMachineStore {
@@ -1083,6 +1113,7 @@ mod tests {
                 jti: "jti-1".into(),
                 node: 5,
                 pubkey_hex: "aa01".into(),
+                addr: None,
             },
         );
         assert_eq!(first, WriteResponse::Admitted(AdmitOutcome::Admitted));
@@ -1097,6 +1128,7 @@ mod tests {
                 jti: "jti-1".into(),
                 node: 5,
                 pubkey_hex: "bb02".into(),
+                addr: None,
             },
         );
         assert_eq!(replay, WriteResponse::Admitted(AdmitOutcome::Spent));
@@ -1113,6 +1145,7 @@ mod tests {
                 jti: "jti-2".into(),
                 node: 6,
                 pubkey_hex: "cc03".into(),
+                addr: None,
             },
         );
         assert_eq!(second, WriteResponse::Admitted(AdmitOutcome::Admitted));
@@ -1139,6 +1172,7 @@ mod tests {
                 jti: "jti-revoked".into(),
                 node: 7,
                 pubkey_hex: "dd04".into(),
+                addr: None,
             },
         );
         assert_eq!(barred, WriteResponse::Admitted(AdmitOutcome::Revoked));
@@ -1157,6 +1191,7 @@ mod tests {
                 jti: "jti-revoked".into(),
                 node: 7,
                 pubkey_hex: "dd04".into(),
+                addr: None,
             },
         );
         assert_eq!(now_ok, WriteResponse::Admitted(AdmitOutcome::Admitted));
