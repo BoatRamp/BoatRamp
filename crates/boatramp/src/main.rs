@@ -48,6 +48,13 @@ mod domains;
 mod error;
 mod gateway;
 mod handler_validate;
+// Joiner-side dynamic cluster join (CJ-2). The orchestration is wired into the
+// cluster runtime's join-at-startup path in CJ-3; the ticket codec + root-anchored
+// verification it exposes are unit-tested standalone. `allow(dead_code)` until the
+// startup wiring lands.
+#[cfg(feature = "cluster")]
+#[allow(dead_code)]
+mod join;
 mod logs;
 mod manage;
 #[cfg(feature = "operator")]
