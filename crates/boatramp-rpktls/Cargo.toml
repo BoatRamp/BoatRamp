@@ -19,5 +19,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 # Drives real localhost handshakes in the tests.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+] }
 tokio-rustls = "0.26"

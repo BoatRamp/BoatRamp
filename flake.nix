@@ -6,7 +6,9 @@
   # Pulls are anonymous; only CI pushes (needs the CACHIX_AUTH_TOKEN secret).
   nixConfig = {
     extra-substituters = [ "https://boatramp.cachix.org" ];
-    extra-trusted-public-keys = [ "boatramp.cachix.org-1:ZEjT+bbyuOxBvWUF0xRKdf+UwnMdTlnXdWQJJbeLpS4=" ];
+    extra-trusted-public-keys = [
+      "boatramp.cachix.org-1:ZEjT+bbyuOxBvWUF0xRKdf+UwnMdTlnXdWQJJbeLpS4="
+    ];
   };
 
   inputs = {
@@ -139,6 +141,22 @@
             }
           );
 
+          # A pre-commit hook that mirrors CI's "Ban the anyhow crate" step (the
+          # third check in the `fmt · typos · bans` job) verbatim: `anyhow` is
+          # banned in favour of typed `thiserror` enums. Runs on the whole tree
+          # (not just staged files) so it can't be sidestepped by a partial commit.
+          banAnyhow = pkgs.writeShellScript "ban-anyhow" ''
+            set -eo pipefail
+            if grep -rnI --include='*.rs' -e 'anyhow' crates/; then
+              echo "error: the 'anyhow' crate is banned — use typed thiserror error enums" >&2
+              exit 1
+            fi
+            if grep -rn --include=Cargo.toml -e '\banyhow\b' crates/ Cargo.toml; then
+              echo "error: a Cargo.toml reintroduced the 'anyhow' dependency" >&2
+              exit 1
+            fi
+          '';
+
           # Build the single `boatramp` binary with an optional extra feature set
           # on top of the defaults (`fs` + `slatedb`). The recipe lives in
           # ./nix/package.nix (shared with `overlays.default`); here we pin it to
@@ -260,15 +278,17 @@
                 # kernels; this one has CONFIG_MODULES off, so copy the uncompressed
                 # ELF into $out ourselves (fixupPhase then strips it — still
                 # Elf::load-able). `$buildRoot` is the exported out-of-tree build dir.
-                micro = (pkgs.linuxManualConfig {
-                  inherit (pkgs.linux_6_1) version src;
-                  configfile = fcConfig;
-                  allowImportFromDerivation = true;
-                }).overrideAttrs (old: {
-                  postInstall = (old.postInstall or "") + ''
-                    cp "$buildRoot/vmlinux" "$out/vmlinux"
-                  '';
-                });
+                micro =
+                  (pkgs.linuxManualConfig {
+                    inherit (pkgs.linux_6_1) version src;
+                    configfile = fcConfig;
+                    allowImportFromDerivation = true;
+                  }).overrideAttrs
+                    (old: {
+                      postInstall = (old.postInstall or "") + ''
+                        cp "$buildRoot/vmlinux" "$out/vmlinux"
+                      '';
+                    });
               in
               # `micro.dev or micro`: linuxManualConfig may not expose a `dev`
               # output, so fall back to the default output and locate the vmlinux
@@ -461,10 +481,15 @@
           };
 
           # ---- Git hooks -----------------------------------------------------
-          # `nix develop` installs these into .git/hooks. `nix flake check` runs
-          # them as a check. Clippy is intentionally NOT here — it's the crane
-          # `checks.clippy` above (the hook's bare `cargo clippy` fails offline in
-          # the flake-check sandbox). Devs still get clippy via `just lint` / CI.
+          # `nix develop` (or `direnv allow`, via ./.envrc) installs these into
+          # .git/hooks; `nix flake check` runs them as a check too. Together they
+          # mirror CI's fast `fmt · typos · bans` job — rustfmt + typos + the
+          # anyhow ban — so a drift caught by that job is caught locally *before*
+          # it is pushed (which is exactly how the earlier fmt/typos red slipped
+          # in: those commits were made without entering the dev shell, so the
+          # hook was never installed). Clippy is intentionally NOT here — it's the
+          # crane `checks.clippy` above (the hook's bare `cargo clippy` fails
+          # offline in the flake-check sandbox); devs still get it via CI.
           pre-commit.settings.hooks = {
             rustfmt = {
               enable = true;
@@ -474,6 +499,15 @@
             nixfmt-rfc-style.enable = true;
             taplo.enable = true;
             typos.enable = true;
+            # Mirror CI's "Ban the anyhow crate" step (see `banAnyhow` above).
+            ban-anyhow = {
+              enable = true;
+              name = "ban the anyhow crate";
+              entry = "${banAnyhow}";
+              language = "system";
+              files = "\\.(rs|toml)$";
+              pass_filenames = false;
+            };
           };
         };
 
