@@ -263,6 +263,7 @@ fn seed_base_url(seed: &str) -> String {
 /// (the caller verifies the members against the root). Note the seed is pinned by
 /// re-fetching its attestation with the SAME roots passed to `join_cluster` — so
 /// this fn only needs the token + proof + this node's advertised address.
+#[allow(clippy::too_many_arguments)]
 async fn join_via_seed(
     seed: &str,
     roots: &[TokenPublicKey],

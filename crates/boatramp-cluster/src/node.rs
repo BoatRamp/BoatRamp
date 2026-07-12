@@ -245,8 +245,8 @@ impl ClusterNode {
     /// The caller MUST first verify the join token — signature, TTL, and that the
     /// joiner actually holds `pubkey_hex` (possession proof) — via
     /// [`boatramp_core::cose::verify_join`]; the state machine enforces single-use
-    /// + re-admit-proof. The mesh-admit KV write forwards from a follower, but the
-    /// `add_learner` membership step needs the leader, so a join is directed
+    /// and re-admit-proof. The mesh-admit KV write forwards from a follower, but
+    /// the `add_learner` membership step needs the leader, so a join is directed
     /// there (the control-plane route forwards it).
     pub async fn admit(
         &self,
