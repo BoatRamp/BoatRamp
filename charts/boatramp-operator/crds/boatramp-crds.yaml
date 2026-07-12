@@ -35,7 +35,7 @@ spec:
           spec:
             description: A boatramp cluster managed by the operator.
             properties:
-              admin_token_secret:
+              adminTokenSecret:
                 description: Name of a `Secret` (same namespace) holding an admin control-plane token under key `token`. The operator uses it to drive Raft membership (`GET /api/cluster/members`, promote, remove) + mint join tickets. Absent ⇒ the operator plans + reports membership but does not execute it.
                 nullable: true
                 type: string
@@ -60,7 +60,7 @@ spec:
                 format: uint32
                 minimum: 0.0
                 type: integer
-              root_pubkey:
+              rootPubkey:
                 description: The cluster **root public key** (`es256:`/`ed25519:` hex) — the anchor a joining pod verifies the seed + members against. Required for the executor to build join tickets; absent ⇒ it promotes/removes but does not admit.
                 nullable: true
                 type: string

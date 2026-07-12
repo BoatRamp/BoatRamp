@@ -107,3 +107,28 @@ jobs:
       # rustc can't blow past RAM+swap.
       - name: Flake check
         run: nix flake check --print-build-logs --max-jobs 1 --cores 2
+
+  k8s-e2e:
+    name: operator e2e (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: boatramp-e2e
+      - uses: azure/setup-helm@v4
+      # Install → found a 3-node cluster → scale 3→5→3 → rolling upgrade →
+      # kill-pod recovery, quorum-verified at each step. The kind cluster is
+      # created by kind-action above; the script reuses it (KEEP=1) and builds +
+      # loads the operator image itself.
+      - name: Operator e2e
+        env:
+          PROVIDER: kind
+          CLUSTER: boatramp-e2e
+          KEEP: "1"
+        run: scripts/e2e-k8s.sh

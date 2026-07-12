@@ -44,6 +44,7 @@ pub enum ClusterMode {
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Quorum","type":"boolean","jsonPath":".status.quorum"}"#
 )]
+#[serde(rename_all = "camelCase")]
 pub struct BoatRampClusterSpec {
     /// Raft cluster (default) or stateless frontend.
     #[serde(default)]
