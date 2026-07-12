@@ -532,6 +532,7 @@ pub trait MeshControl: Send + Sync {
         possession_proof: &[u8],
         proof_iat: u64,
         now: u64,
+        advertise_addr: Option<&str>,
     ) -> Result<JoinOutcome, String>;
 
     /// Rotate **this node's** mesh identity (make-before-break) and return the new
@@ -556,8 +557,14 @@ pub trait MeshControl: Send + Sync {
 
 /// The result of a join admission ([`MeshControl::admit`]).
 pub enum JoinOutcome {
-    /// Admitted — carries the current members as root-signed assertions.
-    Admitted(Vec<String>),
+    /// Admitted — carries the current members as root-signed assertions plus the
+    /// advisory `node_id -> mesh URL` routing for them.
+    Admitted {
+        /// Root-signed member assertions the joiner verifies against the anchor.
+        members: Vec<String>,
+        /// Advisory `node_id -> mesh URL` routing (not signed).
+        addrs: std::collections::BTreeMap<u64, String>,
+    },
     /// The join token was already spent (single-use) → `409`.
     TokenSpent,
     /// The possession proof was missing/stale/invalid → `403`.
@@ -1673,6 +1680,12 @@ struct JoinRequest {
     possession_proof: String,
     /// The proof's issued-at (Unix seconds); must be fresh (anti-replay).
     proof_iat: u64,
+    /// The joiner's own mesh base URL (e.g. `https://10.0.0.4:7000`) so the leader
+    /// can dial it for Raft replication. Advisory routing only — the mesh TLS
+    /// re-authenticates every dial by key. Absent ⇒ the joiner isn't reachable by
+    /// address (the leader still admits it, but can't replicate until it learns one).
+    #[serde(default)]
+    advertise_addr: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1682,6 +1695,12 @@ struct JoinResponse {
     /// before adding it to its trust set — so a malicious/stale seed can't inject a
     /// fabricated member (PLAN-cluster-join F3).
     members: Vec<String>,
+    /// Advisory `node_id -> mesh URL` routing for the members, so the joiner can
+    /// dial each one. Not signed (addressing is advisory; the mesh TLS
+    /// re-authenticates by key), and only trusted for a `node_id` the joiner also
+    /// verified via a root-signed member assertion above.
+    #[serde(default)]
+    member_addrs: std::collections::BTreeMap<u64, String>,
 }
 
 /// Admit a joining node presenting a mesh join token. Gated by
@@ -1734,12 +1753,24 @@ async fn cluster_join(
     // The cluster verifies the possession proof against the presented key + spends
     // the token, then vouches for its members with root-signed assertions.
     match admitter
-        .admit(request.mesh_pubkey.trim(), &jti, &proof, request.proof_iat, now)
+        .admit(
+            request.mesh_pubkey.trim(),
+            &jti,
+            &proof,
+            request.proof_iat,
+            now,
+            request.advertise_addr.as_deref(),
+        )
         .await
     {
-        Ok(JoinOutcome::Admitted(members)) => {
-            (StatusCode::OK, Json(JoinResponse { members })).into_response()
-        }
+        Ok(JoinOutcome::Admitted { members, addrs }) => (
+            StatusCode::OK,
+            Json(JoinResponse {
+                members,
+                member_addrs: addrs,
+            }),
+        )
+            .into_response(),
         Ok(JoinOutcome::TokenSpent) => {
             (StatusCode::CONFLICT, "join token already spent\n").into_response()
         }
@@ -6385,13 +6416,17 @@ mod tests {
             _proof: &[u8],
             _proof_iat: u64,
             _now: u64,
+            _advertise_addr: Option<&str>,
         ) -> Result<JoinOutcome, String> {
             self.admits
                 .lock()
                 .unwrap()
                 .push((mesh_pubkey_hex.to_string(), jti.to_string()));
             Ok(match self.respond {
-                StubJoin::Admit => JoinOutcome::Admitted(vec!["signed-member".to_string()]),
+                StubJoin::Admit => JoinOutcome::Admitted {
+                    members: vec!["signed-member".to_string()],
+                    addrs: std::collections::BTreeMap::from([(7u64, "https://x:7000".to_string())]),
+                },
                 StubJoin::Spent => JoinOutcome::TokenSpent,
                 StubJoin::Invalid => JoinOutcome::ProofInvalid,
                 StubJoin::Revoked => JoinOutcome::Revoked,
@@ -6425,6 +6460,7 @@ mod tests {
             mesh_pubkey: "302a300506032b6570032100feed".into(),
             possession_proof: proof.to_string(),
             proof_iat: now_unix(),
+            advertise_addr: Some("https://joiner:7000".into()),
         };
 
         // Admitted → 200 + the signed members, and the admitter saw the jti.

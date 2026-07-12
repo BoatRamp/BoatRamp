@@ -124,15 +124,22 @@ pub struct AdoptedMember {
     pub node_id: u64,
     /// The member's mesh public key (SPKI hex) — the authority to trust.
     pub mesh_pubkey_hex: String,
+    /// The member's advisory mesh base URL, if the seed reported one — used to
+    /// dial it (the dial is still key-authenticated). `None` ⇒ address unknown.
+    pub mesh_addr: Option<String>,
 }
 
 /// Verify each returned member assertion against **any** root in the anchor set,
-/// returning the adopted members. A member that verifies under **no** root is a
-/// hard error — a malicious or stale seed cannot inject or fabricate a member
-/// (F3); it can at most *omit* one, which the caller reconciles against the
-/// leader's `GET /api/cluster/members` before treating the join as complete.
+/// returning the adopted members (attaching the advisory address the seed
+/// reported for each, keyed by the verified node id). A member that verifies
+/// under **no** root is a hard error — a malicious or stale seed cannot inject or
+/// fabricate a member (F3); it can at most *omit* one, which the caller
+/// reconciles against the leader's `GET /api/cluster/members` before treating the
+/// join as complete. The address is only trusted for a node the assertion
+/// verified (never adopted from the unsigned map alone).
 pub fn verify_members(
     assertions: &[String],
+    addrs: &std::collections::BTreeMap<u64, String>,
     roots: &[TokenPublicKey],
     now: u64,
 ) -> Result<Vec<AdoptedMember>, JoinError> {
@@ -147,6 +154,7 @@ pub fn verify_members(
                 )
             })?;
         adopted.push(AdoptedMember {
+            mesh_addr: addrs.get(&member.node_id).cloned(),
             node_id: member.node_id,
             mesh_pubkey_hex: member.pubkey_hex,
         });
@@ -188,20 +196,27 @@ struct JoinRequestBody {
     mesh_pubkey: String,
     possession_proof: String,
     proof_iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertise_addr: Option<String>,
 }
 
 /// The join response (mirrors the server's `JoinResponse`).
 #[derive(Deserialize)]
 struct JoinResponseBody {
     members: Vec<String>,
+    #[serde(default)]
+    member_addrs: std::collections::BTreeMap<u64, String>,
 }
 
-/// Join a cluster by redeeming `ticket` with the node's own mesh `identity`.
-/// Tries each seed until one admits; returns the adopted (root-verified) members
-/// so the caller can seed its mesh trust set with **no peer map**.
+/// Join a cluster by redeeming `ticket` with the node's own mesh `identity`,
+/// advertising `advertise_addr` (this node's own mesh URL) so the leader can
+/// replicate back to it. Tries each seed until one admits; returns the adopted
+/// (root-verified) members so the caller can seed its mesh trust set + peer
+/// directory with **no static peer map**.
 pub async fn join_cluster(
     ticket: &JoinTicket,
     identity: &RpkIdentity,
+    advertise_addr: Option<&str>,
     now: u64,
 ) -> Result<Vec<AdoptedMember>, JoinError> {
     let roots = ticket.roots()?;
@@ -212,10 +227,19 @@ pub async fn join_cluster(
 
     let mut last_err: Option<JoinError> = None;
     for seed in &ticket.seeds {
-        match join_via_seed(seed, &roots, &ticket.token, &mesh_pubkey_hex, &proof, proof_iat, now)
-            .await
+        match join_via_seed(
+            seed,
+            &roots,
+            &ticket.token,
+            &mesh_pubkey_hex,
+            &proof,
+            proof_iat,
+            advertise_addr,
+            now,
+        )
+        .await
         {
-            Ok(members) => return verify_members(&members, &roots, now),
+            Ok(body) => return verify_members(&body.members, &body.member_addrs, &roots, now),
             Err(err) => last_err = Some(err),
         }
     }
@@ -234,8 +258,10 @@ fn seed_base_url(seed: &str) -> String {
 }
 
 /// Redeem the join against one seed: pin it against the root anchor (`auth pin`),
-/// then `POST /api/cluster/join` over the pinned channel and return the raw
-/// member assertions (the caller verifies them against the root).
+/// then `POST /api/cluster/join` over the pinned channel and return the response
+/// (the caller verifies the members against the root). Note the seed is pinned by
+/// re-fetching its attestation with the SAME roots passed to `join_cluster` — so
+/// this fn only needs the token + proof + this node's advertised address.
 async fn join_via_seed(
     seed: &str,
     roots: &[TokenPublicKey],
@@ -243,8 +269,9 @@ async fn join_via_seed(
     mesh_pubkey_hex: &str,
     proof: &str,
     proof_iat: u64,
+    advertise_addr: Option<&str>,
     now: u64,
-) -> Result<Vec<String>, JoinError> {
+) -> Result<JoinResponseBody, JoinError> {
     let base = seed_base_url(seed);
 
     // (1) Pin the seed against the root anchor (TOFU-capture → root-verify →
@@ -254,7 +281,8 @@ async fn join_via_seed(
     // (2) A properly server-authenticated client for the join POST: the seed must
     // present exactly the key its attestation named.
     let peer: boatramp_rpktls::PeerId = 1;
-    let trust = boatramp_rpktls::TrustSet::from_map(std::iter::once((peer, attested_spki)).collect());
+    let trust =
+        boatramp_rpktls::TrustSet::from_map(std::iter::once((peer, attested_spki)).collect());
     let tls = boatramp_rpktls::client_config_server_auth(trust, peer)
         .map_err(|e| JoinError::Seed(format!("{base}: {e}")))?;
     let http = reqwest::Client::builder()
@@ -268,6 +296,7 @@ async fn join_via_seed(
             mesh_pubkey: mesh_pubkey_hex.to_string(),
             possession_proof: proof.to_string(),
             proof_iat,
+            advertise_addr: advertise_addr.map(str::to_string),
         })
         .send()
         .await?;
@@ -280,8 +309,7 @@ async fn join_via_seed(
             body: body.trim().to_string(),
         });
     }
-    let body: JoinResponseBody = resp.json().await?;
-    Ok(body.members)
+    Ok(resp.json().await?)
 }
 
 /// Fetch a seed's bootstrap attestation trust-on-first-use, verify it against the
@@ -493,13 +521,23 @@ mod tests {
             .await
             .unwrap();
 
-        // A genuine set adopts, preserving (node_id, pubkey).
-        let adopted = verify_members(&[good_a.clone(), good_b.clone()], &roots, now).unwrap();
+        // A genuine set adopts, preserving (node_id, pubkey) and attaching the
+        // advisory address only for a verified node (11 has one, 22 doesn't).
+        let addrs = std::collections::BTreeMap::from([(11u64, "https://a:7000".to_string())]);
+        let adopted = verify_members(&[good_a.clone(), good_b.clone()], &addrs, &roots, now).unwrap();
         assert_eq!(
             adopted,
             vec![
-                AdoptedMember { node_id: 11, mesh_pubkey_hex: "aa11".into() },
-                AdoptedMember { node_id: 22, mesh_pubkey_hex: "bb22".into() },
+                AdoptedMember {
+                    node_id: 11,
+                    mesh_pubkey_hex: "aa11".into(),
+                    mesh_addr: Some("https://a:7000".into()),
+                },
+                AdoptedMember {
+                    node_id: 22,
+                    mesh_pubkey_hex: "bb22".into(),
+                    mesh_addr: None,
+                },
             ]
         );
 
@@ -509,7 +547,7 @@ mod tests {
         let forged = cose::mint_member_assertion(33, "cc33", 300, now, &attacker)
             .await
             .unwrap();
-        assert!(verify_members(&[good_a, forged], &roots, now).is_err());
+        assert!(verify_members(&[good_a, forged], &addrs, &roots, now).is_err());
     }
 
     /// The possession proof a joiner builds verifies against its own mesh key over

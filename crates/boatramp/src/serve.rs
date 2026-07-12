@@ -1021,6 +1021,7 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
         possession_proof: &[u8],
         proof_iat: u64,
         now: u64,
+        advertise_addr: Option<&str>,
     ) -> std::result::Result<boatramp_server::JoinOutcome, String> {
         use boatramp_server::JoinOutcome;
 
@@ -1051,7 +1052,7 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
         use boatramp_cluster::raft::AdmitOutcome;
         match self
             .node
-            .admit(mesh_pubkey_hex, jti)
+            .admit(mesh_pubkey_hex, jti, advertise_addr)
             .await
             .map_err(|e| e.to_string())?
         {
@@ -1078,7 +1079,11 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
             .map_err(|e| e.to_string())?;
             members.push(assertion);
         }
-        Ok(JoinOutcome::Admitted(members))
+        // Advisory routing so the joiner can dial every member (each dial is still
+        // key-authenticated). Only entries for members it also verified above are
+        // usable to it.
+        let addrs = self.node.peer_addrs();
+        Ok(JoinOutcome::Admitted { members, addrs })
     }
 
     async fn rotate_key(&self) -> std::result::Result<String, String> {
