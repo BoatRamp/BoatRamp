@@ -13,9 +13,11 @@
 mod controller;
 mod crd;
 mod executor;
+mod function;
 mod manifests;
 mod membership;
 mod resources;
+mod site;
 
 use clap::Subcommand;
 

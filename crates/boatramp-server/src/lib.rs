@@ -699,6 +699,7 @@ pub fn router_with(
             "/api/sites/:site/config",
             get(get_site_config).put(put_site_config),
         )
+        .route("/api/sites/:site", axum::routing::delete(delete_site))
         .route(
             "/api/sites/:site/domains/:host/verification",
             get(domain_verify::get_domain_verification)
@@ -1395,6 +1396,17 @@ async fn list_sites(State(deploy): State<DeployStore>) -> Response {
 async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<String>) -> Response {
     match deploy.get_site_config(&site).await {
         Ok(config) => Json(config.unwrap_or_default()).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/sites/:site` — remove a site + its routing/config/aliases/pending
+/// verifications (the Kubernetes operator's `Site` finalizer). Admin-scoped
+/// (deny-safe `Right::required` default). Content-addressed deploy blobs are
+/// shared and left to `prune`. Idempotent.
+async fn delete_site(State(deploy): State<DeployStore>, Path(site): Path<String>) -> Response {
+    match deploy.delete_site(&site).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
 }

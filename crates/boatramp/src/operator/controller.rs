@@ -22,7 +22,7 @@ use kube::{Client, Resource};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::crd::{BoatRampCluster, BoatRampClusterStatus, ClusterMode};
+use super::crd::{BoatRampCluster, BoatRampClusterStatus, ClusterMode, Function, Site};
 use super::{membership, resources, Error, Result};
 
 /// The server-side-apply field manager: the operator owns the fields it sets.
@@ -65,21 +65,77 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     tracing::info!(
         namespace = args.namespace.as_deref().unwrap_or("<all>"),
-        "boatramp operator started — watching BoatRampCluster"
+        "boatramp operator started — watching BoatRampCluster + Site + Function"
     );
-    // TODO(K3): operator leader election (a coordination.k8s.io Lease) so an HA
+    // TODO: operator leader election (a coordination.k8s.io Lease) so an HA
     // multi-replica operator has a single active reconciler. Single-replica is the
     // default and correct until then.
-    Controller::new(clusters, watcher::Config::default())
-        .run(reconcile, error_policy, Arc::new(Ctx { client }))
+    let sites: Api<Site> = api_scope(&client, &args.namespace);
+    let functions: Api<Function> = api_scope(&client, &args.namespace);
+
+    // Three reconcilers, one per CRD, run concurrently: the cluster (workloads +
+    // membership), the Site (GitOps site config, K5), and the Function (K5, whose
+    // apply path awaits the FaaS backend).
+    let cluster_ctrl = Controller::new(clusters, watcher::Config::default())
+        .run(reconcile, error_policy, Arc::new(Ctx { client: client.clone() }))
         .for_each(|res| async move {
-            match res {
-                Ok(o) => tracing::debug!(?o, "reconciled"),
-                Err(err) => tracing::warn!(%err, "reconcile loop error"),
+            if let Err(err) = res {
+                tracing::warn!(%err, "cluster reconcile loop error");
             }
-        })
-        .await;
+        });
+    let site_ctrl = Controller::new(sites, watcher::Config::default())
+        .run(
+            super::site::reconcile,
+            site_error_policy,
+            Arc::new(super::site::Ctx { client: client.clone() }),
+        )
+        .for_each(|res| async move {
+            if let Err(err) = res {
+                tracing::warn!(%err, "site reconcile loop error");
+            }
+        });
+    let function_ctrl = Controller::new(functions, watcher::Config::default())
+        .run(
+            super::function::reconcile,
+            function_error_policy,
+            Arc::new(super::function::Ctx { client }),
+        )
+        .for_each(|res| async move {
+            if let Err(err) = res {
+                tracing::warn!(%err, "function reconcile loop error");
+            }
+        });
+
+    tokio::join!(cluster_ctrl, site_ctrl, function_ctrl);
     Ok(())
+}
+
+/// An `Api` scoped to the operator's namespace, or all namespaces.
+fn api_scope<K>(client: &Client, namespace: &Option<String>) -> Api<K>
+where
+    K: kube::Resource<Scope = kube::core::NamespaceResourceScope>,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    match namespace {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    }
+}
+
+/// Requeue a failed `Site` reconcile after a back-off.
+fn site_error_policy(_obj: Arc<Site>, err: &Error, _ctx: Arc<super::site::Ctx>) -> Action {
+    tracing::warn!(%err, "site reconcile failed; backing off");
+    Action::requeue(Duration::from_secs(30))
+}
+
+/// Requeue a failed `Function` reconcile after a back-off.
+fn function_error_policy(
+    _obj: Arc<Function>,
+    err: &Error,
+    _ctx: Arc<super::function::Ctx>,
+) -> Action {
+    tracing::warn!(%err, "function reconcile failed; backing off");
+    Action::requeue(Duration::from_secs(60))
 }
 
 /// Reconcile one `BoatRampCluster` into its owned workloads.

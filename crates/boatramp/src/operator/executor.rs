@@ -43,6 +43,40 @@ struct ClusterApi {
     token: String,
 }
 
+/// Resolve a cluster's admin control-plane endpoint from its `adminTokenSecret`:
+/// the in-cluster base URL (the client Service's stable DNS) + the admin bearer
+/// token. `Ok(None)` if the CR sets no `adminTokenSecret` (⇒ the caller reports
+/// but does not act). Shared by the membership executor and the Site reconciler.
+pub(super) async fn admin_endpoint(
+    client: &Client,
+    ns: &str,
+    brc: &BoatRampCluster,
+) -> Result<Option<(String, String)>> {
+    let Some(secret_name) = brc.spec.admin_token_secret.as_deref() else {
+        return Ok(None);
+    };
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+    let secret = secrets.get(secret_name).await?;
+    let token = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get(TOKEN_KEY))
+        .map(|b| String::from_utf8_lossy(&b.0).trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "admin token Secret {secret_name:?} has no non-empty `{TOKEN_KEY}` key"
+            ))
+        })?;
+    // Membership + site APIs are admin-token-gated; the mesh's transport TLS is
+    // separate, so plain in-cluster HTTP to the client Service is fine.
+    let base = format!(
+        "http://{}.{ns}.svc:{CONTROL_PLANE_PORT}",
+        resources::instance(brc)
+    );
+    Ok(Some((base, token)))
+}
+
 impl ClusterApi {
     /// Build the API client from the CR's admin-token Secret. `Ok(None)` if no
     /// `adminTokenSecret` is set (⇒ the operator plans but does not execute).
@@ -51,28 +85,9 @@ impl ClusterApi {
         ns: &str,
         brc: &BoatRampCluster,
     ) -> Result<Option<Self>> {
-        let Some(secret_name) = brc.spec.admin_token_secret.as_deref() else {
+        let Some((base, token)) = admin_endpoint(client, ns, brc).await? else {
             return Ok(None);
         };
-        let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
-        let secret = secrets.get(secret_name).await?;
-        let token = secret
-            .data
-            .as_ref()
-            .and_then(|d| d.get(TOKEN_KEY))
-            .map(|b| String::from_utf8_lossy(&b.0).trim().to_string())
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "admin token Secret {secret_name:?} has no non-empty `{TOKEN_KEY}` key"
-                ))
-            })?;
-        // In-cluster HTTP to the client Service (stable DNS). Membership APIs are
-        // admin-token-gated; the mesh's own transport TLS is separate.
-        let base = format!(
-            "http://{}.{ns}.svc:{CONTROL_PLANE_PORT}",
-            resources::instance(brc)
-        );
         Ok(Some(ClusterApi {
             http: reqwest::Client::new(),
             base,

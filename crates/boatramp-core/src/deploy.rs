@@ -1560,6 +1560,42 @@ impl DeployStore {
             .collect())
     }
 
+    /// Delete a site and its routing/config state (the Kubernetes operator's
+    /// `Site` finalizer). Removes the config pointer, the current-deployment
+    /// pointer, activation history, aliases, the domain-routing entries the site
+    /// owns (so its hosts free up), and any pending domain verifications. The
+    /// content-addressed deployment manifests + blobs are shared and left to
+    /// `prune`. Idempotent (deleting an absent site is a no-op).
+    pub async fn delete_site(&self, site: &str) -> Result<(), DeployError> {
+        use crate::kv::WriteOp;
+        // Hold the domain-claim lock so a concurrent attach can't race the routing
+        // deletes and leave a dangling `domain/*` → deleted-site entry.
+        let _claim = self.domain_claim_lock.lock().await;
+        let mut batch = vec![
+            WriteOp::Delete(Self::site_pointer_key(site)),
+            WriteOp::Delete(Self::current_key(site)),
+            WriteOp::Delete(Self::history_key(site)),
+        ];
+        if let Some(config) = self.get_site_config(site).await? {
+            for host in config.domains.exact_hosts() {
+                batch.push(WriteOp::Delete(Self::domain_key(host)));
+            }
+            for wildcard in &config.domains.wildcards {
+                if let Some(suffix) = wildcard.strip_prefix("*.") {
+                    batch.push(WriteOp::Delete(Self::wildcard_key(suffix)));
+                }
+            }
+        }
+        for key in self.kv.list_prefix(&Self::alias_prefix(site)).await? {
+            batch.push(WriteOp::Delete(key));
+        }
+        for key in self.kv.list_prefix(&format!("domainverify/{site}/")).await? {
+            batch.push(WriteOp::Delete(key));
+        }
+        self.kv.write_batch(batch).await?;
+        Ok(())
+    }
+
     /// The deployment id currently serving `site`, if any.
     pub async fn current_id(&self, site: &str) -> Result<Option<String>, DeployError> {
         match self.kv.get(&Self::current_key(site)).await? {
@@ -2483,5 +2519,38 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_site_removes_config_routing_and_aliases() {
+        let store = store();
+        let mut cfg = SiteConfig::default();
+        cfg.domains.primary = Some("blog.example".into());
+        cfg.domains.wildcards = vec!["*.preview.blog.example".into()];
+        store.set_site_config("blog", &cfg).await.unwrap();
+        // A real deployment so the alias points at something valid.
+        let id = store.put_manifest(&empty_manifest(true)).await.unwrap();
+        store.set_alias("blog", "stable", &id).await.unwrap();
+
+        // Present: config stored + its hosts route to it.
+        assert!(store.get_site_config("blog").await.unwrap().is_some());
+        assert_eq!(
+            store.resolve_site_by_host("blog.example").await.unwrap().as_deref(),
+            Some("blog")
+        );
+
+        store.delete_site("blog").await.unwrap();
+
+        // Gone: config pointer, domain routing (host freed), aliases.
+        assert!(store.get_site_config("blog").await.unwrap().is_none());
+        assert!(store
+            .resolve_site_by_host("blog.example")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.list_aliases("blog").await.unwrap().is_empty());
+
+        // Idempotent — deleting an absent site is a no-op.
+        store.delete_site("blog").await.unwrap();
     }
 }

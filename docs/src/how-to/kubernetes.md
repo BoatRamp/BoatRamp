@@ -82,6 +82,34 @@ kubectl describe brc prod              # .status.members + observedGeneration
 address-primary membership view the CLI shows for a bare-metal cluster (the pod
 address is the handle for `cluster remove`).
 
+## Declare sites with GitOps
+
+A `Site` custom resource is reconciled into a boatramp site on its cluster's
+control plane — declare hostnames in Git, `kubectl apply`, and a **finalizer**
+cleans up the routing on `kubectl delete`:
+
+```yaml
+apiVersion: boatramp.dev/v1alpha1
+kind: Site
+metadata:
+  name: marketing
+spec:
+  cluster: prod            # omit ⇒ the sole cluster in the namespace
+  domains:
+    - example.com          # → primary
+    - www.example.com      # → alias
+    - "*.preview.example.com"  # → wildcard
+```
+
+The operator resolves the target `BoatRampCluster`, uses its `adminTokenSecret`
+to `PUT` the site config, and reports `.status.phase`. (`kubectl get site` shows
+it.) Publishing content to the site is still a `boatramp sync` / CI deploy — the
+`Site` CR governs its identity + domains, not its deployments.
+
+> **`Function` (FaaS):** the `Function` CRD is installed and watched, but its
+> apply path awaits the FaaS backend (`PLAN-faas`); today it reports a `Pending`
+> status. Don't rely on it to deploy a component yet.
+
 ## Scaling
 
 Change `spec.replicas` and re-apply. The operator converges one member at a time:
