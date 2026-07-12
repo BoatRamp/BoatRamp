@@ -585,6 +585,11 @@ pub struct MeshMember {
     pub caught_up: bool,
     /// Whether this node is the current leader.
     pub leader: bool,
+    /// The node's advisory mesh URL, if this node knows it — the address-primary
+    /// handle `cluster status`/`remove` use (dynamic-join learns addresses at
+    /// admit; a static-genesis node has them from config). `None` ⇒ unknown here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
 }
 
 /// The mesh control hook, carried as an extension for the join/rotate handlers.

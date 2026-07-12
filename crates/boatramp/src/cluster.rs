@@ -28,6 +28,9 @@ pub enum Error {
     #[cfg(feature = "cluster")]
     #[error("join ticket: {0}")]
     Ticket(String),
+    /// `cluster remove <address>` found no member with that address.
+    #[error("no cluster member with address {0} (see `cluster status`)")]
+    NoSuchMember(String),
 }
 
 /// `cluster` module result; `Err` is [`Error`].
@@ -76,13 +79,28 @@ enum ClusterCommand {
         #[arg(long)]
         ttl_secs: Option<u64>,
     },
+    /// Show the cluster membership — address-primary: ADDRESS, ROLE, a short
+    /// node-id label, and STATE (ready/lagging). Target the leader for accurate
+    /// learner catch-up.
+    Status {
+        /// Show full node ids instead of the short 8-hex label.
+        #[arg(long)]
+        full: bool,
+    },
     /// Rotate the `--server` node's own mesh key, make-before-break.
     /// Node-local: rotation happens on the node whose API you target (only
     /// it holds and mints its private key), so this rotates that node's key.
     RotateKey,
-    /// Revoke a node from the mesh: its trust is deleted
+    /// Remove a node from the cluster (subsumes `revoke`): its trust is deleted
     /// cluster-wide (it can no longer authenticate) and it is dropped from the
-    /// quorum. Target the leader's API so the quorum change applies.
+    /// quorum. The target is a **mesh address** (as shown by `status`) or a raw
+    /// node id. Target the leader's API so the quorum change applies.
+    Remove {
+        /// The node to remove: its mesh address (preferred) or its raw node id.
+        target: String,
+    },
+    /// Revoke a node from the mesh by raw node id (low-level; prefer `remove`,
+    /// which accepts an address). Target the leader's API.
     Revoke {
         /// The node id to revoke.
         node: u64,
@@ -110,6 +128,64 @@ struct RotateKeyResponse {
 #[derive(serde::Serialize)]
 struct RevokeRequest {
     node_id: u64,
+}
+
+/// One row from `GET /api/cluster/members` (mirrors the server's `MeshMember`).
+#[derive(Debug, Clone, Deserialize)]
+struct MemberRow {
+    node: u64,
+    #[serde(default)]
+    voter: bool,
+    #[serde(default)]
+    caught_up: bool,
+    #[serde(default)]
+    leader: bool,
+    #[serde(default)]
+    addr: Option<String>,
+}
+
+/// A member's role for display.
+fn role(m: &MemberRow) -> &'static str {
+    if m.leader {
+        "leader"
+    } else if m.voter {
+        "voter"
+    } else {
+        "learner"
+    }
+}
+
+/// A learner's readiness for display (voters/leaders are always "ready").
+fn state(m: &MemberRow) -> &'static str {
+    if m.voter || m.caught_up {
+        "ready"
+    } else {
+        "lagging"
+    }
+}
+
+/// Render the address-primary status table (a pure fn so it is unit-tested).
+/// `full` shows the whole node id; otherwise a short 8-hex label.
+fn format_status(members: &[MemberRow], full: bool) -> String {
+    let id_label = |node: u64| {
+        if full {
+            node.to_string()
+        } else {
+            // Short label: the top 8 hex of the id (its display fingerprint).
+            format!("{:016x}", node)[..8].to_string()
+        }
+    };
+    let mut out = format!("{:<28}  {:<8}  {:<16}  {}\n", "ADDRESS", "ROLE", "NODE", "STATE");
+    for m in members {
+        out.push_str(&format!(
+            "{:<28}  {:<8}  {:<16}  {}\n",
+            m.addr.as_deref().unwrap_or("(unknown)"),
+            role(m),
+            id_label(m.node),
+            state(m),
+        ));
+    }
+    out
 }
 
 /// Entry point for `boatramp cluster`.
@@ -169,6 +245,43 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
             }
             eprintln!("single-use bearer — hand it to exactly one joining node; it cannot be recovered");
         }
+        ClusterCommand::Status { full } => {
+            let members: Vec<MemberRow> = http
+                .get(format!("{server}/api/cluster/members"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            print!("{}", format_status(&members, full));
+        }
+        ClusterCommand::Remove { target } => {
+            // Resolve an address to a node id via the membership; a bare integer
+            // is taken as a raw node id.
+            let node = match target.parse::<u64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    let members: Vec<MemberRow> = http
+                        .get(format!("{server}/api/cluster/members"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    members
+                        .iter()
+                        .find(|m| m.addr.as_deref() == Some(target.as_str()))
+                        .map(|m| m.node)
+                        .ok_or_else(|| Error::NoSuchMember(target.clone()))?
+                }
+            };
+            http.post(format!("{server}/api/cluster/revoke"))
+                .json(&RevokeRequest { node_id: node })
+                .send()
+                .await?
+                .error_for_status()?;
+            eprintln!("removed {target} (node {node}) from the cluster");
+        }
         ClusterCommand::RotateKey => {
             let response: RotateKeyResponse = http
                 .post(format!("{server}/api/cluster/rotate-key"))
@@ -192,4 +305,43 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The status table is address-primary, labels roles + learner readiness, and
+    /// shortens node ids unless `--full`.
+    #[test]
+    fn status_table_is_address_primary_and_role_labelled() {
+        let members = vec![
+            MemberRow {
+                node: 0x1122_3344_5566_7788,
+                voter: true,
+                caught_up: true,
+                leader: true,
+                addr: Some("https://a:7000".into()),
+            },
+            MemberRow {
+                node: 0xAABB_CCDD_EEFF_0011,
+                voter: false,
+                caught_up: false,
+                leader: false,
+                addr: None,
+            },
+        ];
+        let short = format_status(&members, false);
+        assert!(short.contains("ADDRESS"));
+        assert!(short.contains("https://a:7000"));
+        assert!(short.contains("leader"));
+        assert!(short.contains("11223344")); // short 8-hex label
+        assert!(short.contains("(unknown)")); // the learner has no address
+        assert!(short.contains("lagging")); // not caught up
+        assert!(short.contains("learner"));
+
+        // `--full` shows the entire id.
+        let full = format_status(&members, true);
+        assert!(full.contains(&0x1122_3344_5566_7788u64.to_string()));
+    }
 }

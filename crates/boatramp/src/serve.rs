@@ -1126,6 +1126,7 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
     }
 
     async fn members(&self) -> std::result::Result<Vec<boatramp_server::MeshMember>, String> {
+        let addrs = self.node.peer_addrs();
         Ok(self
             .node
             .members()
@@ -1135,6 +1136,7 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
                 voter: m.voter,
                 caught_up: m.caught_up,
                 leader: m.leader,
+                addr: addrs.get(&m.node).cloned(),
             })
             .collect())
     }
