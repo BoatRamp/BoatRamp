@@ -32,11 +32,19 @@ sets. Release images are cosign-signed with an attached CycloneDX SBOM.
 
 ## Create a cluster
 
-Give the operator the cluster's **root anchor** and an **admin token** so it can
-drive membership, then declare the cluster:
+Provision the cluster's keys as Secrets, then declare the cluster. The pods need
+the root **private** key to sign join tokens/attestations (`authSecret`); the
+operator needs an **admin token** to drive membership (`adminTokenSecret`):
 
 ```sh
-# The admin token the operator uses for /api/cluster/* (from `token bootstrap`):
+# The auth Secret wired into the pods: the root private key (the founder signs
+# with it) + a single-use bootstrap secret (to mint the first admin token).
+kubectl create secret generic prod-auth \
+  --from-literal=root-private-key="$BOATRAMP_AUTH_ROOT_PRIVATE_KEY" \
+  --from-literal=bootstrap-secret="$(openssl rand -hex 16)"
+
+# The admin token the operator uses for /api/cluster/* — mint it against the
+# founded cluster with the bootstrap secret (`token bootstrap`), then store it:
 kubectl create secret generic prod-admin --from-literal=token="$ADMIN_TOKEN"
 ```
 
@@ -51,8 +59,16 @@ spec:
   storage: 10Gi                 # per-node Raft PVC (cluster mode)
   posture: multi-tenant         # the operator enforces this floor
   rootPubkey: "es256:03a1…"     # the cluster root anchor (auth pubkey)
+  authSecret: prod-auth         # Secret: root-private-key (+ bootstrap-secret)
   adminTokenSecret: prod-admin  # Secret with an admin `token` key
 ```
+
+The operator renders a `[cluster]` config into the pods (so `serve` runs the
+embedded Raft node), wires the root private key + bootstrap secret from
+`authSecret`, exposes the mesh port on the headless Service, and gives each pod
+its own dialable advertise address via the downward API — so the founder can sign
+and joiners can be reached. The control plane must run `--tls rpk` for the
+attestation-pinned join; wiring that end-to-end in the operator is in progress.
 
 The reconciler:
 
@@ -142,6 +158,7 @@ write pause is a future optimization (openraft 0.9 has no simple transfer call).
 | `posture` | string | — | Security posture floor; a tenant CRD can never relax it. |
 | `adminTokenSecret` | string | — | Secret (key `token`) with an admin control-plane token — enables the membership executor. |
 | `rootPubkey` | string | — | The cluster root anchor (`alg:hex`) a joining pod verifies against. |
+| `authSecret` | string | — | Secret wiring auth into the pods: `root-private-key` (the founder signs with it) + optional `bootstrap-secret`. |
 
 ## See also
 

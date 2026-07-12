@@ -39,6 +39,10 @@ spec:
                 description: Name of a `Secret` (same namespace) holding an admin control-plane token under key `token`. The operator uses it to drive Raft membership (`GET /api/cluster/members`, promote, remove) + mint join tickets. Absent ⇒ the operator plans + reports membership but does not execute it.
                 nullable: true
                 type: string
+              authSecret:
+                description: 'Name of a `Secret` (same namespace) that wires **auth into the pods**: key `root-private-key` (the cluster root **private** key — the founder signs join tokens / attestations / member assertions with it) and an optional `bootstrap-secret` (single-use, to mint the first admin token). Absent ⇒ the pods run without control-plane auth (dev only).'
+                nullable: true
+                type: string
               image:
                 description: Container image; empty ⇒ the operator's own image (one artifact, one version).
                 nullable: true

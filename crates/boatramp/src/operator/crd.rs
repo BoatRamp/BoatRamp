@@ -73,6 +73,13 @@ pub struct BoatRampClusterSpec {
     /// to build join tickets; absent ⇒ it promotes/removes but does not admit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_pubkey: Option<String>,
+    /// Name of a `Secret` (same namespace) that wires **auth into the pods**: key
+    /// `root-private-key` (the cluster root **private** key — the founder signs
+    /// join tokens / attestations / member assertions with it) and an optional
+    /// `bootstrap-secret` (single-use, to mint the first admin token). Absent ⇒
+    /// the pods run without control-plane auth (dev only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_secret: Option<String>,
 }
 
 /// Observed state of a [`BoatRampCluster`] — surfaced in `kubectl get brc`.
