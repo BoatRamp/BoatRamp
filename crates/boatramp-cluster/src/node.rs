@@ -166,6 +166,10 @@ pub struct ClusterNode {
     /// This node's mesh TLS context — kept so [`rotate_key`](Self::rotate_key)
     /// can swap the identity it presents.
     mesh: Arc<MeshTls>,
+    /// The **live** peer directory (`NodeId -> mesh URL`). Held so `admit` can
+    /// record a joiner's advertised address (the leader must know where to dial
+    /// it for replication) and so the join response can report member addresses.
+    peers: Peers,
 }
 
 impl ClusterNode {
@@ -248,6 +252,7 @@ impl ClusterNode {
         &self,
         pubkey_hex: &str,
         jti: &str,
+        advertise_addr: Option<&str>,
     ) -> Result<crate::raft::AdmitOutcome, BootstrapError> {
         use crate::raft::AdmitOutcome;
         // The joining node is identified by its own key: its Raft id is derived from
@@ -270,12 +275,28 @@ impl ClusterNode {
             // refusal rather than silently trusting.
             _ => AdmitOutcome::Spent,
         };
-        if outcome == AdmitOutcome::Admitted && self.is_leader() && !self.is_member(node) {
-            self.raft
-                .add_learner(node, BasicNode::default(), false)
-                .await?;
+        if outcome == AdmitOutcome::Admitted {
+            // Record where to dial the joiner so the leader can replicate to it
+            // (addressing is advisory — mesh TLS re-authenticates by key). Done on
+            // every node that admits so a follower's directory is populated too.
+            if let Some(addr) = advertise_addr {
+                self.peers.insert(node, addr.to_string());
+            }
+            if self.is_leader() && !self.is_member(node) {
+                self.raft
+                    .add_learner(node, BasicNode::default(), false)
+                    .await?;
+            }
         }
         Ok(outcome)
+    }
+
+    /// The live peer directory as `NodeId -> mesh URL` — the advisory routing map
+    /// the join response reports so a joiner can dial every member (each dial is
+    /// still key-authenticated by the mesh TLS). Excludes entries with no known
+    /// address.
+    pub fn peer_addrs(&self) -> BTreeMap<NodeId, String> {
+        self.peers.snapshot()
     }
 
     /// The current mesh trust set as `(node_id, pubkey_hex)` pairs — every key this
@@ -491,27 +512,37 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
     // The node keeps `mesh` too, so `rotate_key` can swap the presented identity.
     let mesh_clients = Arc::new(MeshClients::new(mesh.clone()));
 
-    if !peers.contains_key(&node_id) {
-        return Err(BootstrapError::NotInPeerDirectory(node_id));
-    }
-    // Empty `voters` ⇒ every peer votes. Otherwise the voting set is `voters`
-    // (intersected with peers), and the rest are learners.
-    let voters: BTreeSet<NodeId> = if voters.is_empty() {
-        peers.keys().copied().collect()
+    // Genesis vs dynamic-join is inferred from the peer directory: a node that is
+    // itself listed has a static genesis map (the classic path); a node that is
+    // NOT listed is a **dynamic joiner** — its membership arrives from the seed's
+    // `add_learner` + log replication, so it starts with empty local voters/
+    // learners and never bootstraps. (Every static node lists itself, so the
+    // classic behavior is unchanged.)
+    let genesis = peers.contains_key(&node_id);
+    let (voters, learners): (BTreeSet<NodeId>, Vec<NodeId>) = if genesis {
+        // Empty `voters` ⇒ every peer votes. Otherwise the voting set is `voters`
+        // (intersected with peers), and the rest are learners.
+        let voters: BTreeSet<NodeId> = if voters.is_empty() {
+            peers.keys().copied().collect()
+        } else {
+            voters
+                .into_iter()
+                .filter(|v| peers.contains_key(v))
+                .collect()
+        };
+        if voters.is_empty() {
+            return Err(BootstrapError::NoVoters);
+        }
+        let learners: Vec<NodeId> = peers
+            .keys()
+            .copied()
+            .filter(|id| !voters.contains(id))
+            .collect();
+        (voters, learners)
     } else {
-        voters
-            .into_iter()
-            .filter(|v| peers.contains_key(v))
-            .collect()
+        // Dynamic joiner: no self-membership to seed; the seed admits + promotes.
+        (BTreeSet::new(), Vec::new())
     };
-    if voters.is_empty() {
-        return Err(BootstrapError::NoVoters);
-    }
-    let learners: Vec<NodeId> = peers
-        .keys()
-        .copied()
-        .filter(|id| !voters.contains(id))
-        .collect();
 
     let config = Arc::new(
         Config {
@@ -596,6 +627,7 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
         learners,
         genesis_trust,
         mesh,
+        peers,
     })
 }
 
@@ -1077,7 +1109,7 @@ mod tests {
 
         // The leader admits the joiner from a (pretend-verified) token handle.
         let admitted = nodes[&leader]
-            .admit(&joiner_hex, "jti-join-1")
+            .admit(&joiner_hex, "jti-join-1", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1112,7 +1144,7 @@ mod tests {
 
         // Single-use: replaying the same token admits nothing.
         let replay = nodes[&leader]
-            .admit(&joiner_hex, "jti-join-1")
+            .admit(&joiner_hex, "jti-join-1", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1124,6 +1156,116 @@ mod tests {
         for (_, node) in nodes {
             node.raft.shutdown().await.unwrap();
         }
+    }
+
+    /// **Dynamic join, end-to-end, with no peer map.** A founder comes up alone
+    /// (`cluster init`), then a *fresh* node — built in joiner mode (its own id is
+    /// NOT in its peer directory) — is admitted by the founder and replicates the
+    /// founder's writes. This is the CJ-3 conformance: two nodes form a cluster
+    /// with no static genesis, the joiner learning its membership from the leader.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_join_forms_a_cluster_with_no_peer_map() {
+        // The founder: a single genesis node (id 1, self-listed) that bootstraps.
+        let id1 = Arc::new(MeshIdentity::generate().unwrap());
+        let trust1 = TrustSet::from_map(BTreeMap::from([(1u64, id1.public_key().to_vec())]));
+        let mesh1 = Arc::new(MeshTls::new(id1.clone(), trust1.clone()));
+        let (listener1, url1) = mesh_listener();
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+
+        let node1 = build_node(ClusterParams {
+            node_id: 1,
+            peers: BTreeMap::from([(1u64, url1.clone())]),
+            voters: BTreeSet::new(),
+            durable_kv: Arc::new(MemoryKv::new()),
+            storage: storage.clone(),
+            mesh: mesh1.clone(),
+            cluster_write_capability: None,
+            extra_observers: Vec::new(),
+        })
+        .await
+        .unwrap();
+        serve_over_tls(listener1, node1.router.clone(), &mesh1);
+        node1.bootstrap().await.unwrap();
+        node1
+            .raft
+            .wait(Some(Duration::from_secs(15)))
+            .metrics(|m| m.current_leader == Some(1), "founder leads")
+            .await
+            .unwrap();
+
+        // The joiner: a fresh identity whose id is DERIVED from its key. It knows
+        // only the founder (seed) — its own id is not in its peer directory, so it
+        // comes up in joiner mode (empty membership, no bootstrap). It trusts the
+        // founder (the adopted member) so it can accept the leader's replication.
+        let id2 = Arc::new(MeshIdentity::generate().unwrap());
+        let node2_id = crate::raft::derive_node_id(id2.public_key());
+        let trust2 = TrustSet::from_map(BTreeMap::from([(1u64, id1.public_key().to_vec())]));
+        let mesh2 = Arc::new(MeshTls::new(id2.clone(), trust2));
+        let (listener2, url2) = mesh_listener();
+        let node2 = build_node(ClusterParams {
+            node_id: node2_id,
+            peers: BTreeMap::from([(1u64, url1.clone())]), // seed only — NOT self
+            voters: BTreeSet::new(),
+            durable_kv: Arc::new(MemoryKv::new()),
+            storage: storage.clone(),
+            mesh: mesh2.clone(),
+            cluster_write_capability: None,
+            extra_observers: Vec::new(),
+        })
+        .await
+        .unwrap();
+        serve_over_tls(listener2, node2.router.clone(), &mesh2);
+
+        // The founder admits the joiner (verified elsewhere): it trusts the key
+        // mesh-wide, records the joiner's address so it can replicate to it, and
+        // adds it as a learner.
+        let admitted = node1
+            .admit(&id2.public_key_hex(), "jti-dyn-join", Some(&url2))
+            .await
+            .unwrap();
+        assert_eq!(admitted, crate::raft::AdmitOutcome::Admitted);
+
+        // The joiner becomes a known member on the leader.
+        let mut is_member = false;
+        for _ in 0..100 {
+            if node1.is_member(node2_id) {
+                is_member = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(is_member, "the joiner must be added to the leader's membership");
+
+        // A write on the leader replicates to the joiner (its local read sees it)
+        // — proof the joiner caught up with no static peer map.
+        node1.kv.put("dyn/join/key", b"replicated".to_vec()).await.unwrap();
+        let mut saw = false;
+        for _ in 0..100 {
+            if node2.kv.get("dyn/join/key").await.unwrap().as_deref()
+                == Some(b"replicated".as_slice())
+            {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(saw, "the write must replicate to the dynamically-joined node");
+
+        // The joiner learned to trust its own key + the founder from the log.
+        for _ in 0..100 {
+            if node2.mesh.trust().contains(node2_id, id2.public_key()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            node2.mesh.trust().contains(node2_id, id2.public_key()),
+            "the joiner adopts its own admitted trust from replication"
+        );
+
+        node1.raft.shutdown().await.unwrap();
+        node2.raft.shutdown().await.unwrap();
     }
 
     /// `ClusterNode::rotate_key` is make-before-break: after node
