@@ -171,6 +171,16 @@ impl RpkIdentity {
         to_hex(&self.spki)
     }
 
+    /// Sign `msg` with this node's mesh private key (Ed25519), returning the raw
+    /// 64-byte signature. This is the node's **possession proof** primitive: a
+    /// joiner proves it controls the key it presents (over the join channel) by
+    /// signing a challenge — without the private key ever leaving the node. Verify
+    /// with [`verify_signature`] against the advertised SPKI public key.
+    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, RpkError> {
+        let kp = Ed25519KeyPair::from_pkcs8(&self.pkcs8).map_err(|e| RpkError::Key(e.to_string()))?;
+        Ok(kp.sign(msg).as_ref().to_vec())
+    }
+
     /// The rustls [`CertifiedKey`] that presents this identity's raw public key
     /// (RFC 7250): the "certificate" is the SPKI, signed by the Ed25519 key.
     fn certified_key(&self) -> Result<Arc<CertifiedKey>, RpkError> {
@@ -719,6 +729,25 @@ pub fn parse_public_key(hex: &str) -> Result<Vec<u8>, RpkError> {
     from_hex(hex).ok_or_else(|| RpkError::Key(format!("invalid rpk pubkey hex {hex:?}")))
 }
 
+/// Verify an Ed25519 `signature` over `msg` against a mesh public key in **SPKI
+/// DER** form (`spki`, as [`RpkIdentity::public_key`] advertises it). The peer side
+/// of [`RpkIdentity::sign`] — used to check a joiner's possession proof against the
+/// key it presents. Returns `true` iff the signature is valid.
+///
+/// An Ed25519 SPKI is the canonical 44-byte structure (a 12-byte algorithm prefix +
+/// the 32-byte raw key); a non-conforming `spki` or a bad signature yields `false`.
+pub fn verify_signature(spki: &[u8], msg: &[u8], signature: &[u8]) -> bool {
+    // Ed25519 SPKI DER is exactly 44 bytes; the raw public key is the last 32.
+    if spki.len() != 44 {
+        return false;
+    }
+    let raw = &spki[12..44];
+    use aws_lc_rs::signature::{UnparsedPublicKey, ED25519};
+    UnparsedPublicKey::new(&ED25519, raw)
+        .verify(msg, signature)
+        .is_ok()
+}
+
 /// Lower-case hex of `bytes`.
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -955,6 +984,25 @@ mod tests {
         let dbg = format!("{id:?}");
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains(&hex(id.pkcs8.as_slice())));
+    }
+
+    #[test]
+    fn possession_proof_signs_and_verifies_against_the_advertised_key() {
+        let id = RpkIdentity::generate().unwrap();
+        let msg = b"join-possession-challenge:jti=abc:pubkey=...:iat=123";
+        let sig = id.sign(msg).unwrap();
+        // The advertised SPKI key verifies the node's own signature.
+        assert!(verify_signature(id.public_key(), msg, &sig));
+        // A different key does not (an attacker can't prove possession of it).
+        let other = RpkIdentity::generate().unwrap();
+        assert!(!verify_signature(other.public_key(), msg, &sig));
+        // A tampered message / signature is rejected.
+        assert!(!verify_signature(id.public_key(), b"different", &sig));
+        let mut bad = sig.clone();
+        bad[0] ^= 0xff;
+        assert!(!verify_signature(id.public_key(), msg, &bad));
+        // A non-conforming SPKI (wrong length) is rejected, not panicked.
+        assert!(!verify_signature(&[0u8; 10], msg, &sig));
     }
 
     fn hex(b: &[u8]) -> String {
