@@ -1,0 +1,23 @@
+boatramp-operator {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+
+The operator watches the boatramp CRDs. Create a cluster with:
+
+  cat <<'EOF' | kubectl apply -f -
+  apiVersion: boatramp.dev/v1alpha1
+  kind: BoatRampCluster
+  metadata:
+    name: prod
+    namespace: {{ .Release.Namespace }}
+  spec:
+    mode: cluster
+    replicas: 3
+    storage: 10Gi
+    rootPubkey: "es256:REPLACE_ME"      # `boatramp auth pubkey`
+    adminTokenSecret: prod-admin        # Secret with an admin `token`
+  EOF
+
+Watch it come up:
+
+  kubectl get boatrampcluster -n {{ .Release.Namespace }}
+
+Docs: https://boatramp.dev/how-to/kubernetes.html

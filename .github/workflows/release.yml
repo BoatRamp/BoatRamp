@@ -181,6 +181,7 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           base="ghcr.io/${GITHUB_REPOSITORY,,}"
+          : > image-refs.txt
           for variant in container container-cloudflare; do
             repo="$base"
             [ "$variant" = "container-cloudflare" ] && repo="${base}-cloudflare"
@@ -188,4 +189,36 @@ jobs:
               --print-build-logs --out-link "image-${variant}.tar.gz"
             nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:${tag}"
             nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:latest"
+            # Record the pushed image by digest (immutable ref cosign/SBOM pin to).
+            digest="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${tag}")"
+            echo "${repo}@${digest}" >> image-refs.txt
           done
+          cat image-refs.txt
+
+      # Supply chain: keyless-sign each image + attach a CycloneDX SBOM (both via
+      # the OIDC token — no long-lived keys). Verifiable with `cosign verify` /
+      # `cosign verify-attestation` against this repo's OIDC issuer.
+      - name: Sign images + attach SBOM (cosign keyless + syft)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          while read -r ref; do
+            [ -n "$ref" ] || continue
+            nix run nixpkgs#cosign -- sign --yes "$ref"
+            nix run nixpkgs#syft -- "$ref" -o cyclonedx-json > sbom.json
+            nix run nixpkgs#cosign -- attest --yes --predicate sbom.json \
+              --type cyclonedx "$ref"
+          done < image-refs.txt
+
+      # Publish the operator Helm chart as an OCI artifact alongside the images.
+      - name: Package + push the Helm chart
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          # Pin the chart's appVersion (operator image tag) to this release.
+          nix run nixpkgs#kubernetes-helm -- package charts/boatramp-operator \
+            --version "$tag" --app-version "$tag" -d dist
+          nix run nixpkgs#kubernetes-helm -- push \
+            "dist/boatramp-operator-${tag}.tgz" "oci://ghcr.io/${owner}/charts"

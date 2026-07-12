@@ -128,6 +128,8 @@ fn cluster_role() -> ClusterRole {
                 all,
             ),
             rule(&["policy"], &["poddisruptionbudgets"], all),
+            // The stateless-mode autoscaler the operator applies.
+            rule(&["autoscaling"], &["horizontalpodautoscalers"], all),
             // Read pods (membership/readiness) + emit events.
             rule(&[""], &["pods"], &["get", "list", "watch"]),
             rule(&[""], &["events"], &["create", "patch"]),

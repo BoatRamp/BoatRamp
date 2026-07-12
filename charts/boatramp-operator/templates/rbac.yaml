@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "boatramp-operator.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+# Least-privilege cluster role — mirrors `boatramp operator manifests` (the source
+# of truth): the boatramp CRDs + their status, the workloads it owns, and the core
+# objects it applies (services / configmaps / secrets / PVCs / PDBs) + pod reads +
+# event writes. No wildcards.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "boatramp-operator.name" . }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["boatramp.dev"]
+    resources:
+      - boatrampclusters
+      - boatrampclusters/status
+      - sites
+      - sites/status
+      - functions
+      - functions/status
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "boatramp-operator.name" . }}
+  labels:
+    {{- include "boatramp-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "boatramp-operator.name" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "boatramp-operator.name" . }}
+    namespace: {{ .Release.Namespace }}

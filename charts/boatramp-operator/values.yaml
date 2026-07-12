@@ -1,0 +1,41 @@
+# The operator image. Same artifact as the boatramp server; the operator is a
+# subcommand of the one binary.
+image:
+  repository: ghcr.io/boatramp/boatramp
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Operator Deployment replica count. One active reconciler is enough (kube-rs
+# holds no leader election here); >1 is only for faster failover.
+replicaCount: 1
+
+# Watch a single namespace (leave empty to watch all — the ClusterRole allows it).
+watchNamespace: ""
+
+# Pod resource requests/limits.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+# Hardened pod/container security context (the operator needs no privileges).
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra labels/annotations applied to operator resources.
+commonLabels: {}
+commonAnnotations: {}

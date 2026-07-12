@@ -138,6 +138,30 @@ jobs:
       - name: Clippy (cluster + tls + acme-dns)
         run: cargo clippy -p boatramp --features cluster,tls,acme-dns --all-targets -- -D warnings
 
+  helm-chart:
+    name: operator Helm chart (lint + CRD drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: helm-chart
+      - uses: azure/setup-helm@v4
+
+      # The chart's `crds/` are single-sourced from the Rust CRD types. Fail if the
+      # checked-in copy has drifted from what the binary emits (regenerate with
+      # `boatramp operator crds > charts/boatramp-operator/crds/boatramp-crds.yaml`).
+      - name: CRDs match the Rust types
+        run: |
+          cargo run -p boatramp --features operator -- operator crds > /tmp/crds.yaml
+          diff -u charts/boatramp-operator/crds/boatramp-crds.yaml /tmp/crds.yaml
+
+      - name: Lint + render the chart
+        run: |
+          helm lint charts/boatramp-operator
+          helm template t charts/boatramp-operator --namespace boatramp-system >/dev/null
+
   test:
     name: test (default features)
     runs-on: ubuntu-latest

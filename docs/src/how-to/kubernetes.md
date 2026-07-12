@@ -9,17 +9,26 @@ model as the CLI — the ordinal-0 pod founds, the rest join with a ticket.
 
 ## Install the operator
 
-Everything the operator needs — the CRDs, a least-privilege RBAC bundle, and the
-operator Deployment — is emitted by the binary itself:
+The operator ships as a **Helm chart** (`charts/boatramp-operator`) — CRDs, a
+least-privilege `ClusterRole`, and the operator Deployment:
+
+```sh
+helm install boatramp-operator ./charts/boatramp-operator \
+  --namespace boatramp-system --create-namespace
+```
+
+Or, without Helm, apply the same bundle emitted by the binary itself:
 
 ```sh
 boatramp operator manifests | kubectl apply -f -
 ```
 
-`boatramp operator crds` prints just the CRDs; `boatramp operator run` is the
+`boatramp operator crds` prints just the CRDs (the chart's `crds/` are generated
+from these — a CI check guards against drift); `boatramp operator run` is the
 controller entrypoint (what the Deployment runs). The operator watches
-`BoatRampCluster` (and the tenant `Site` / `Function` CRDs) and reconciles them
-via server-side apply, so it owns exactly the fields it sets.
+`BoatRampCluster` and the tenant `Site` CRD (and `Function`, once the FaaS backend
+lands) and reconciles them via server-side apply, so it owns exactly the fields it
+sets. Release images are cosign-signed with an attached CycloneDX SBOM.
 
 ## Create a cluster
 

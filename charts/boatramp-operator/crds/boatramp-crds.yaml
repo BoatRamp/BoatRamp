@@ -1,0 +1,236 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: boatrampclusters.boatramp.dev
+spec:
+  group: boatramp.dev
+  names:
+    categories: []
+    kind: BoatRampCluster
+    plural: boatrampclusters
+    shortNames:
+    - brc
+    singular: boatrampcluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .spec.replicas
+      name: Desired
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.quorum
+      name: Quorum
+      type: boolean
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BoatRampClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: A boatramp cluster managed by the operator.
+            properties:
+              admin_token_secret:
+                description: Name of a `Secret` (same namespace) holding an admin control-plane token under key `token`. The operator uses it to drive Raft membership (`GET /api/cluster/members`, promote, remove) + mint join tickets. Absent ⇒ the operator plans + reports membership but does not execute it.
+                nullable: true
+                type: string
+              image:
+                description: Container image; empty ⇒ the operator's own image (one artifact, one version).
+                nullable: true
+                type: string
+              mode:
+                default: cluster
+                description: Raft cluster (default) or stateless frontend.
+                enum:
+                - cluster
+                - stateless
+                type: string
+              posture:
+                description: Security posture profile (`multi-tenant` / `single-tenant` / `dev` / custom); the operator enforces this floor and a tenant CRD can never relax it.
+                nullable: true
+                type: string
+              replicas:
+                default: 3
+                description: Desired node count.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              root_pubkey:
+                description: The cluster **root public key** (`es256:`/`ed25519:` hex) — the anchor a joining pod verifies the seed + members against. Required for the executor to build join tickets; absent ⇒ it promotes/removes but does not admit.
+                nullable: true
+                type: string
+              storage:
+                description: Per-node persistent-volume size (e.g. `10Gi`), cluster mode only.
+                nullable: true
+                type: string
+            type: object
+          status:
+            description: Observed state of a [`BoatRampCluster`] — surfaced in `kubectl get brc`.
+            nullable: true
+            properties:
+              members:
+                default: []
+                description: Per-node Raft membership, as the operator observes it.
+                items:
+                  description: One node's observed Raft membership.
+                  properties:
+                    node:
+                      description: The node (pod) name.
+                      type: string
+                    ready:
+                      description: Whether its `/readyz` reports ready.
+                      type: boolean
+                    role:
+                      description: 'Its Raft role: `learner`, `voter`, or `leader`.'
+                      type: string
+                  required:
+                  - node
+                  - ready
+                  - role
+                  type: object
+                type: array
+              observedGeneration:
+                description: The `.metadata.generation` this status reflects (staleness guard).
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: A short lifecycle phase (`Pending` / `Reconciling` / `Ready` / `Degraded`).
+                nullable: true
+                type: string
+              quorum:
+                description: Whether the Raft cluster currently holds quorum.
+                nullable: true
+                type: boolean
+            type: object
+        required:
+        - spec
+        title: BoatRampCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sites.boatramp.dev
+spec:
+  group: boatramp.dev
+  names:
+    categories: []
+    kind: Site
+    plural: sites
+    shortNames: []
+    singular: site
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.cluster
+      name: Cluster
+      type: string
+    - jsonPath: .status.phase
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for SiteSpec via `CustomResource`
+        properties:
+          spec:
+            description: A declarative tenant site, reconciled via the control-plane API.
+            properties:
+              cluster:
+                description: The [`BoatRampCluster`] serving this site; empty ⇒ the sole cluster in the namespace.
+                nullable: true
+                type: string
+              domains:
+                default: []
+                description: Hostnames routed to this site.
+                items:
+                  type: string
+                type: array
+            type: object
+          status:
+            description: Observed state of a [`Site`].
+            nullable: true
+            properties:
+              phase:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: Site
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: functions.boatramp.dev
+spec:
+  group: boatramp.dev
+  names:
+    categories: []
+    kind: Function
+    plural: functions
+    shortNames:
+    - fn
+    singular: function
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.cluster
+      name: Cluster
+      type: string
+    - jsonPath: .status.phase
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FunctionSpec via `CustomResource`
+        properties:
+          spec:
+            description: A declarative function (the Kubernetes surface of `PLAN-faas` FA-1..FA-3).
+            properties:
+              cluster:
+                description: The [`BoatRampCluster`] hosting this function; empty ⇒ the sole cluster.
+                nullable: true
+                type: string
+              component:
+                description: 'The wasm component: a blob content-address or an OCI reference.'
+                type: string
+              route:
+                description: An optional route this function answers (`/api/...` or a host path).
+                nullable: true
+                type: string
+            required:
+            - component
+            type: object
+          status:
+            description: Observed state of a [`Function`].
+            nullable: true
+            properties:
+              phase:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: Function
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
