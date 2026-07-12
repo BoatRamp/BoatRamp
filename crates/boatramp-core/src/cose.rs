@@ -515,27 +515,15 @@ async fn mint_inner(
     sign_claims(builder.build(), signer).await
 }
 
-/// A verified mesh join token's claim.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JoinClaim {
-    /// The node id the token authorizes joining as.
-    pub node_id: u64,
-    /// The mesh public key (SPKI hex) the token authorizes trusting.
-    pub pubkey_hex: String,
-    /// Single-use handle: the token's revocation id (`cti`, hex). The cluster
-    /// records this as spent on admission so the token can't be replayed.
-    pub jti: String,
-}
-
-/// Mint a **single-use mesh join token**: a `COSE_Sign1` CWT whose
-/// claims bind it to exactly one joining node — `br_node`/`br_pubkey` — with
-/// `br_kind = "join"` (domain separation from role tokens) and a TTL (`exp`).
-/// Bound to the pubkey, a stolen token can't admit a different key; bound to the
-/// node id, it can't be replayed as another node; and its `cti` is the single-use
-/// handle the cluster records as spent. Minted server-side; shown once.
+/// Mint a **single-use bearer mesh join token**: a `COSE_Sign1` CWT with
+/// `br_kind = "join"` (domain separation from role tokens), a short TTL (`exp`),
+/// and a single-use handle (`cti` = `jti`). It is **not** bound to a specific node
+/// or key — the operator can't know a not-yet-booted node's mesh key. At redemption
+/// the joiner presents its mesh pubkey **and a possession proof** (an Ed25519
+/// signature over a challenge naming this `jti`), which the cluster verifies before
+/// admitting; so a token alone (without the mesh private key) admits nothing, and
+/// its `jti` is spent single-use. Minted where the root key lives; shown once.
 pub async fn mint_join(
-    node_id: u64,
-    pubkey_hex: &str,
     ttl_secs: u64,
     now_unix: u64,
     signer: &dyn Signer,
@@ -544,16 +532,11 @@ pub async fn mint_join(
         .issued_at(Timestamp::WholeSeconds(now_unix as i64))
         .cwt_id(random_cti()?)
         .expiration_time(Timestamp::WholeSeconds(
-            now_unix.saturating_add(ttl_secs) as i64
+            now_unix.saturating_add(ttl_secs) as i64,
         ))
         .text_claim(
             CLAIM_KIND.to_string(),
             CborValue::Text(KIND_JOIN.to_string()),
-        )
-        .text_claim(CLAIM_NODE.to_string(), CborValue::from(node_id))
-        .text_claim(
-            CLAIM_PUBKEY.to_string(),
-            CborValue::Text(pubkey_hex.to_string()),
         )
         .build();
     sign_claims(claims, signer).await
@@ -787,58 +770,37 @@ fn role_token(claims: &ClaimsSet, exp: Option<u64>) -> Result<VerifiedToken, Tok
     })
 }
 
-/// Verify a base64url mesh **join** token: signature + alg pin +
-/// TTL, and that it is a `br_kind = "join"` token carrying a `(node_id, pubkey)`
-/// binding. Returns the single `(node_id, pubkey)` it authorizes plus its
-/// single-use handle (`jti` = `cti`). IO-free: the caller must still, at
-/// admission, (a) confirm the joiner holds `pubkey_hex` and (b) reject a `jti`
-/// already recorded as spent. A role token presented here is rejected on the kind
-/// check ([`TokenError::Claims`]).
+/// Verify a base64url **bearer** mesh join token: signature + alg pin + TTL +
+/// `br_kind = "join"`. Returns its single-use handle (`jti` = `cti`). IO-free: the
+/// caller must still, at admission, (a) verify the joiner's **possession proof**
+/// against the mesh key it presents ([`join_challenge`] + `verify_signature`) and
+/// (b) reject a `jti` already recorded as spent or revoked. A role token presented
+/// here is rejected on the kind check ([`TokenError::Claims`]).
 pub fn verify_join(
     token: &str,
     public: &TokenPublicKey,
     now_unix: u64,
-) -> Result<JoinClaim, TokenError> {
+) -> Result<String, TokenError> {
     let claims = verify_envelope(token, public)?;
     let jti = claim_cti(&claims)?;
     check_exp(&claims, now_unix)?;
-
-    let mut kind = String::new();
-    let mut node_id: Option<u64> = None;
-    let mut pubkey_hex: Option<String> = None;
-    for (name, value) in &claims.rest {
-        if let coset::cwt::ClaimName::Text(t) = name {
-            match t.as_str() {
-                CLAIM_KIND => {
-                    if let CborValue::Text(k) = value {
-                        kind = k.clone();
-                    }
-                }
-                CLAIM_NODE => {
-                    if let CborValue::Integer(i) = value {
-                        node_id = u64::try_from(*i).ok();
-                    }
-                }
-                CLAIM_PUBKEY => {
-                    if let CborValue::Text(k) = value {
-                        pubkey_hex = Some(k.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if kind != KIND_JOIN {
+    let kind = claims.rest.iter().find_map(|(name, value)| match (name, value) {
+        (coset::cwt::ClaimName::Text(t), CborValue::Text(k)) if t == CLAIM_KIND => Some(k.clone()),
+        _ => None,
+    });
+    if kind.as_deref() != Some(KIND_JOIN) {
         return Err(TokenError::Claims("not a mesh join token".into()));
     }
-    let node_id = node_id.ok_or_else(|| TokenError::Claims("join token has no node id".into()))?;
-    let pubkey_hex =
-        pubkey_hex.ok_or_else(|| TokenError::Claims("join token has no pubkey".into()))?;
-    Ok(JoinClaim {
-        node_id,
-        pubkey_hex,
-        jti,
-    })
+    Ok(jti)
+}
+
+/// The canonical bytes a joiner signs with its mesh private key to **prove
+/// possession** of the key it presents when redeeming join token `jti`. Bound to
+/// the token (`jti`), the presented key (`mesh_pubkey_hex`), and a fresh timestamp
+/// (`proof_iat`) — so the proof can't be replayed for a different token, key, or
+/// (stale) time. Built identically on both sides (a strict compare, no ambiguity).
+pub fn join_challenge(jti: &str, mesh_pubkey_hex: &str, proof_iat: u64) -> Vec<u8> {
+    format!("boatramp-mesh-join/v1\n{jti}\n{mesh_pubkey_hex}\n{proof_iat}").into_bytes()
 }
 
 /// A verified delegation credential: the **root's** roles + revocation id, the
@@ -1357,26 +1319,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_token_round_trips_and_binds_node_and_pubkey() {
+    async fn bearer_join_token_round_trips_and_yields_a_single_use_jti() {
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let public = signer.public_key();
-        let token = mint_join(7, "aa01bb02", 3600, NOW, &signer).await.unwrap();
+        let token = mint_join(3600, NOW, &signer).await.unwrap();
 
-        let claim = verify_join(&token, &public, NOW + 60).unwrap();
-        assert_eq!(claim.node_id, 7);
-        assert_eq!(claim.pubkey_hex, "aa01bb02");
-        assert!(!claim.jti.is_empty(), "the jti is the single-use handle");
+        let jti = verify_join(&token, &public, NOW + 60).unwrap();
+        assert!(!jti.is_empty(), "the jti is the single-use handle");
         // Stable across re-verification (the cluster spends it once).
-        assert_eq!(
-            verify_join(&token, &public, NOW + 60).unwrap().jti,
-            claim.jti
-        );
+        assert_eq!(verify_join(&token, &public, NOW + 60).unwrap(), jti);
+    }
+
+    #[tokio::test]
+    async fn join_challenge_binds_the_token_key_and_time() {
+        // Distinct tokens/keys/times give distinct challenges (no cross-replay).
+        let a = join_challenge("jti-1", "aa01", 100);
+        assert_eq!(a, join_challenge("jti-1", "aa01", 100));
+        assert_ne!(a, join_challenge("jti-2", "aa01", 100));
+        assert_ne!(a, join_challenge("jti-1", "bb02", 100));
+        assert_ne!(a, join_challenge("jti-1", "aa01", 101));
     }
 
     #[tokio::test]
     async fn join_token_expires_and_rejects_foreign_key() {
         let signer = LocalSigner::generate(TokenAlg::Es256);
-        let token = mint_join(3, "cccc", 100, NOW, &signer).await.unwrap();
+        let token = mint_join(100, NOW, &signer).await.unwrap();
         assert!(verify_join(&token, &signer.public_key(), NOW + 50).is_ok());
         assert!(matches!(
             verify_join(&token, &signer.public_key(), NOW + 200),
@@ -1412,7 +1379,7 @@ mod tests {
 
         // A join token (same signer) is not accepted as an attestation — the
         // `br_kind` domain separation rejects it.
-        let join = mint_join(1, tls_spki, 3600, NOW, &root).await.unwrap();
+        let join = mint_join(3600, NOW, &root).await.unwrap();
         assert!(matches!(
             verify_attestation(&join, &public, NOW + 60),
             Err(TokenError::Claims(_))
@@ -1463,7 +1430,7 @@ mod tests {
 
         // A join token verified as a role token carries kind="join" and no roles,
         // so the RBAC layer grants it nothing.
-        let join = mint_join(1, "dead", 3600, NOW, &signer).await.unwrap();
+        let join = mint_join(3600, NOW, &signer).await.unwrap();
         let v = verify(&join, &public, NOW).unwrap();
         assert_eq!(v.kind, KIND_JOIN);
         assert!(v.roles.is_empty());

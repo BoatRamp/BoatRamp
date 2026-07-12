@@ -243,12 +243,13 @@ impl ClusterNode {
     /// only single-use. The mesh-admit KV write forwards from a follower, but the
     /// `add_learner` membership step needs the leader, so a join is directed
     /// there (the control-plane route forwards it).
-    pub async fn admit(
-        &self,
-        node: NodeId,
-        pubkey_hex: &str,
-        jti: &str,
-    ) -> Result<bool, BootstrapError> {
+    pub async fn admit(&self, pubkey_hex: &str, jti: &str) -> Result<bool, BootstrapError> {
+        // The joining node is identified by its own key: its Raft id is derived from
+        // the mesh public key (dynamic-join self-identity), not assigned by config.
+        let Ok(spki) = crate::mesh::parse_public_key(pubkey_hex) else {
+            return Ok(false); // a malformed key admits nothing
+        };
+        let node = crate::raft::derive_node_id(&spki);
         let resp = self
             .kv
             .propose_with_response(WriteOp::MeshAdmit {
@@ -264,6 +265,27 @@ impl ClusterNode {
                 .await?;
         }
         Ok(admitted)
+    }
+
+    /// The current mesh trust set as `(node_id, pubkey_hex)` pairs — every key this
+    /// cluster trusts. The join handler mints a **root-signed member assertion** per
+    /// entry so a joiner adopts each only after verifying it against the root anchor
+    /// (PLAN-cluster-join F3). Reads the replicated `mesh/trust/*` durable keys.
+    pub async fn trusted_member_keys(&self) -> Vec<(NodeId, String)> {
+        use boatramp_core::kv::KvStore;
+        let keys = self
+            .kv
+            .list_prefix(crate::mesh::TRUST_PREFIX)
+            .await
+            .unwrap_or_default();
+        keys.into_iter()
+            .filter_map(|k| {
+                let (node, _spki) = crate::mesh::parse_trust_key(&k)?;
+                // The pubkey hex is the last path segment of the trust key.
+                let hex = k.rsplit('/').next()?.to_string();
+                Some((node, hex))
+            })
+            .collect()
     }
 
     /// Rotate **this node's** mesh identity, make-before-break:
@@ -985,6 +1007,9 @@ mod tests {
             .collect();
         let joiner = MeshIdentity::generate().unwrap();
         let joiner_hex = joiner.public_key_hex();
+        // The joiner's Raft id is derived from its mesh key (self-identity), not
+        // assigned — every trust/membership check keys on that derived id.
+        let joiner_id = crate::raft::derive_node_id(joiner.public_key());
 
         let mut listeners = Vec::new();
         let mut peers = BTreeMap::new();
@@ -1023,14 +1048,14 @@ mod tests {
             .unwrap();
         let leader = nodes[&1].raft.metrics().borrow().current_leader.unwrap();
 
-        // No node trusts the joiner (4) yet.
+        // No node trusts the joiner yet.
         for id in 1..=3u64 {
-            assert!(!trusts[&id].contains(4, joiner.public_key()));
+            assert!(!trusts[&id].contains(joiner_id, joiner.public_key()));
         }
 
         // The leader admits the joiner from a (pretend-verified) token handle.
         let admitted = nodes[&leader]
-            .admit(4, &joiner_hex, "jti-join-1")
+            .admit(&joiner_hex, "jti-join-1")
             .await
             .unwrap();
         assert!(admitted, "a fresh token must admit the node");
@@ -1041,7 +1066,7 @@ mod tests {
             let trust = &trusts[&id];
             let mut ok = false;
             for _ in 0..100 {
-                if trust.contains(4, joiner.public_key()) {
+                if trust.contains(joiner_id, joiner.public_key()) {
                     ok = true;
                     break;
                 }
@@ -1055,13 +1080,13 @@ mod tests {
 
         // The joiner is now a known member (learner) on the leader.
         assert!(
-            nodes[&leader].is_member(4),
+            nodes[&leader].is_member(joiner_id),
             "the admitted node must be added to membership"
         );
 
         // Single-use: replaying the same token admits nothing.
         let replay = nodes[&leader]
-            .admit(4, &joiner_hex, "jti-join-1")
+            .admit(&joiner_hex, "jti-join-1")
             .await
             .unwrap();
         assert!(!replay, "a replayed join token must be refused");

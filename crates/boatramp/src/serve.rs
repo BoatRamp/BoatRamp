@@ -987,29 +987,99 @@ fn parse_rotation_interval(spec: &str) -> Option<std::time::Duration> {
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
-/// Bridges the server's `/api/cluster/*` control routes to the cluster runtime
-/// (join admission + key rotation) over [`ClusterNode`].
+/// Clock skew tolerated on a join possession proof: `proof_iat` must be within
+/// this window of the admitting node's clock, so a captured proof cannot be
+/// replayed indefinitely (the single-use `jti` is the primary anti-replay; this
+/// bounds the pre-spend window). Symmetric to cover both directions of skew.
 #[cfg(feature = "cluster")]
-struct ClusterMeshControl(Arc<boatramp_cluster::node::ClusterNode>);
+const JOIN_PROOF_MAX_SKEW_SECS: u64 = 300;
+
+/// TTL on the root-signed member assertions handed back in a join response: long
+/// enough for the joiner to verify + adopt each key within the round-trip, short
+/// enough that a captured response can't seed a node much later. The joiner
+/// verifies each against the root anchor before trusting it (PLAN-cluster-join F3).
+#[cfg(feature = "cluster")]
+const MEMBER_ASSERTION_TTL_SECS: u64 = 300;
+
+/// Bridges the server's `/api/cluster/*` control routes to the cluster runtime
+/// (join admission + key rotation) over [`ClusterNode`]. `issuer` is the
+/// control-plane **root signer**: a join admits only if this node can mint
+/// root-signed member assertions for the joiner to adopt.
+#[cfg(feature = "cluster")]
+struct ClusterMeshControl {
+    node: Arc<boatramp_cluster::node::ClusterNode>,
+    issuer: Option<Arc<dyn boatramp_core::cose::Signer>>,
+}
 
 #[cfg(feature = "cluster")]
 #[async_trait::async_trait]
 impl boatramp_server::MeshControl for ClusterMeshControl {
     async fn admit(
         &self,
-        node: u64,
-        pubkey_hex: &str,
+        mesh_pubkey_hex: &str,
         jti: &str,
-    ) -> std::result::Result<bool, String> {
-        self.0
-            .admit(node, pubkey_hex, jti)
+        possession_proof: &[u8],
+        proof_iat: u64,
+        now: u64,
+    ) -> std::result::Result<boatramp_server::JoinOutcome, String> {
+        use boatramp_server::JoinOutcome;
+
+        // (1) Freshness: the proof must be stamped within the skew window. This
+        // bounds how long a captured (pre-spend) proof stays presentable.
+        let fresh = proof_iat <= now.saturating_add(JOIN_PROOF_MAX_SKEW_SECS)
+            && now <= proof_iat.saturating_add(JOIN_PROOF_MAX_SKEW_SECS);
+        if !fresh {
+            return Ok(JoinOutcome::ProofInvalid);
+        }
+
+        // (2) The joiner is identified by the key it claims; parse it to SPKI.
+        let Ok(spki) = boatramp_cluster::mesh::parse_public_key(mesh_pubkey_hex) else {
+            return Ok(JoinOutcome::ProofInvalid);
+        };
+
+        // (3) Possession: the proof must be a signature by that very key over the
+        // domain-separated join challenge — so a bearer token alone (without the
+        // private key) cannot join in another key's name.
+        let challenge = boatramp_core::cose::join_challenge(jti, mesh_pubkey_hex, proof_iat);
+        if !boatramp_rpktls::verify_signature(&spki, &challenge, possession_proof) {
+            return Ok(JoinOutcome::ProofInvalid);
+        }
+
+        // (4) Single-use: the state machine spends the `jti` (idempotent replay ⇒
+        // already-spent). A stale token that survived (3) still stops here.
+        let admitted = self
+            .node
+            .admit(mesh_pubkey_hex, jti)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if !admitted {
+            return Ok(JoinOutcome::TokenSpent);
+        }
+
+        // (5) Vouch for the current members with root-signed assertions so the
+        // joiner adopts each only after verifying it against the root anchor.
+        let Some(issuer) = self.issuer.as_ref() else {
+            return Err("cluster node has no root signing key to vouch for members".to_string());
+        };
+        let mut members = Vec::new();
+        for (node_id, pubkey) in self.node.trusted_member_keys().await {
+            let assertion = boatramp_core::cose::mint_member_assertion(
+                node_id,
+                &pubkey,
+                MEMBER_ASSERTION_TTL_SECS,
+                now,
+                issuer.as_ref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            members.push(assertion);
+        }
+        Ok(JoinOutcome::Admitted(members))
     }
 
     async fn rotate_key(&self) -> std::result::Result<String, String> {
         let new_pub = self
-            .0
+            .node
             .rotate_key(MESH_ROTATION_PROPAGATION)
             .await
             .map_err(|e| e.to_string())?;
@@ -1017,12 +1087,12 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
     }
 
     async fn revoke(&self, node: u64) -> std::result::Result<(), String> {
-        self.0.revoke(node).await.map_err(|e| e.to_string())
+        self.node.revoke(node).await.map_err(|e| e.to_string())
     }
 
     async fn members(&self) -> std::result::Result<Vec<boatramp_server::MeshMember>, String> {
         Ok(self
-            .0
+            .node
             .members()
             .into_iter()
             .map(|m| boatramp_server::MeshMember {
@@ -1035,7 +1105,7 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
     }
 
     async fn promote(&self, node: u64) -> std::result::Result<(), String> {
-        self.0.promote(node).await.map_err(|e| e.to_string())
+        self.node.promote(node).await.map_err(|e| e.to_string())
     }
 }
 
@@ -1313,10 +1383,6 @@ async fn run_cluster(
         tracing::info!("cluster: bootstrapped membership");
     }
 
-    // The mesh control hook: `POST /api/cluster/join` +
-    // `/rotate-key` reach the cluster runtime through it.
-    options.mesh_control = Some(Arc::new(ClusterMeshControl(node.clone())));
-
     // Scheduled mesh key rotation. Node-local, NOT leader-gated:
     // each node rotates its OWN key (only it holds/mints its private key), and
     // make-before-break is per-node + fail-safe, so nodes rotating independently
@@ -1371,6 +1437,15 @@ async fn run_cluster(
     configure_oidc(&args, &mut options).await?;
     // Fail-closed: don't expose an unauthenticated control plane on a public bind.
     enforce_auth_bind(addr, &auth, &options.posture)?;
+
+    // The mesh control hook: `POST /api/cluster/join` + `/rotate-key` reach the
+    // cluster runtime through it. Constructed after `configure_auth` so it carries
+    // the control-plane root signer (`options.issuer`) — the join flow mints
+    // root-signed member assertions with it.
+    options.mesh_control = Some(Arc::new(ClusterMeshControl {
+        node: node.clone(),
+        issuer: options.issuer.clone(),
+    }));
     let handlers = build_handler_runtime(
         kv.clone(),
         storage.clone(),

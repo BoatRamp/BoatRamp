@@ -518,11 +518,21 @@ impl BootstrapGate {
 /// `None` on a non-cluster node (the routes then return `501`).
 #[async_trait::async_trait]
 pub trait MeshControl: Send + Sync {
-    /// Admit `(node, pubkey_hex)` from an already-verified join token whose
-    /// single-use handle is `jti` — trusts the key cluster-wide and adds it to
-    /// membership. `Ok(false)` = the token was already spent. `Err` is a
-    /// human-readable failure.
-    async fn admit(&self, node: u64, pubkey_hex: &str, jti: &str) -> Result<bool, String>;
+    /// Admit a joining node presenting a bearer join token whose single-use handle
+    /// is `jti`: **verify the possession proof** (`possession_proof` over
+    /// `cose::join_challenge(jti, mesh_pubkey_hex, proof_iat)`, fresh at `now`)
+    /// against `mesh_pubkey_hex`, then — if valid and the token isn't spent — trust
+    /// the key cluster-wide, add it to membership (id derived from the key), and
+    /// return the current members as **root-signed** assertions. `Err` is a
+    /// human-readable failure (e.g. this node has no root key to vouch for members).
+    async fn admit(
+        &self,
+        mesh_pubkey_hex: &str,
+        jti: &str,
+        possession_proof: &[u8],
+        proof_iat: u64,
+        now: u64,
+    ) -> Result<JoinOutcome, String>;
 
     /// Rotate **this node's** mesh identity (make-before-break) and return the new
     /// public key (SPKI hex). Node-local: only the node itself can mint + persist
@@ -542,6 +552,16 @@ pub trait MeshControl: Send + Sync {
     /// Promote a caught-up learner `node` to a voter (leader-only; a no-op on a
     /// follower). `Err` is a human-readable failure.
     async fn promote(&self, node: u64) -> Result<(), String>;
+}
+
+/// The result of a join admission ([`MeshControl::admit`]).
+pub enum JoinOutcome {
+    /// Admitted — carries the current members as root-signed assertions.
+    Admitted(Vec<String>),
+    /// The join token was already spent (single-use) → `409`.
+    TokenSpent,
+    /// The possession proof was missing/stale/invalid → `403`.
+    ProofInvalid,
 }
 
 /// One node's Raft membership, reported by `GET /api/cluster/members`.
@@ -1639,18 +1659,26 @@ async fn bootstrap_token(
 
 #[derive(Deserialize)]
 struct JoinRequest {
-    /// The joining node's id (must match the token's grant).
-    node_id: u64,
-    /// The joining node's mesh public key, hex (must match the token's grant).
-    pubkey: String,
-    /// The single-use mesh join token (base64), from `cluster join-token`.
+    /// The single-use **bearer** mesh join token (base64url), from `cluster add`.
     token: String,
+    /// The joining node's own mesh public key (SPKI hex) — its self-derived
+    /// identity. Not pre-authorized by the token; possession is proven below.
+    mesh_pubkey: String,
+    /// A **possession proof**: an Ed25519 signature (hex) over
+    /// `cose::join_challenge(jti, mesh_pubkey, proof_iat)`, proving the joiner
+    /// controls `mesh_pubkey` — so a token + an observed key admits nothing.
+    possession_proof: String,
+    /// The proof's issued-at (Unix seconds); must be fresh (anti-replay).
+    proof_iat: u64,
 }
 
 #[derive(Serialize)]
 struct JoinResponse {
-    /// Whether this call admitted the node (`false` = the token was already spent).
-    admitted: bool,
+    /// The cluster's current members as **root-signed** mesh-member assertions
+    /// (base64url `COSE_Sign1`). The joiner verifies each against the root anchor
+    /// before adding it to its trust set — so a malicious/stale seed can't inject a
+    /// fabricated member (PLAN-cluster-join F3).
+    members: Vec<String>,
 }
 
 /// Admit a joining node presenting a mesh join token. Gated by
@@ -1680,8 +1708,9 @@ async fn cluster_join(
         )
             .into_response();
     };
-    let claim = match cose::verify_join(&request.token, &public, now_unix()) {
-        Ok(claim) => claim,
+    let now = now_unix();
+    let jti = match cose::verify_join(&request.token, &public, now) {
+        Ok(jti) => jti,
         Err(err) => {
             // A signature/framing failure is unauthenticated (401); an authentic
             // token that is expired or the wrong kind is forbidden (403).
@@ -1692,21 +1721,30 @@ async fn cluster_join(
             return (code, format!("invalid join token: {err}\n")).into_response();
         }
     };
-    // Anti-theft / anti-replay: the presented identity must be exactly the one
-    // the token authorizes.
-    if request.node_id != claim.node_id || request.pubkey.trim() != claim.pubkey_hex {
+    let Ok(proof) = hex::decode(request.possession_proof.trim()) else {
         return (
-            StatusCode::FORBIDDEN,
-            "join token does not authorize this node/key\n",
+            StatusCode::BAD_REQUEST,
+            "possession_proof must be hex\n",
         )
             .into_response();
-    }
+    };
+    // The cluster verifies the possession proof against the presented key + spends
+    // the token, then vouches for its members with root-signed assertions.
     match admitter
-        .admit(claim.node_id, &claim.pubkey_hex, &claim.jti)
+        .admit(request.mesh_pubkey.trim(), &jti, &proof, request.proof_iat, now)
         .await
     {
-        Ok(true) => (StatusCode::OK, Json(JoinResponse { admitted: true })).into_response(),
-        Ok(false) => (StatusCode::CONFLICT, "join token already spent\n").into_response(),
+        Ok(JoinOutcome::Admitted(members)) => {
+            (StatusCode::OK, Json(JoinResponse { members })).into_response()
+        }
+        Ok(JoinOutcome::TokenSpent) => {
+            (StatusCode::CONFLICT, "join token already spent\n").into_response()
+        }
+        Ok(JoinOutcome::ProofInvalid) => (
+            StatusCode::FORBIDDEN,
+            "join possession proof is missing, stale, or invalid\n",
+        )
+            .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("admit failed: {err}\n"),
@@ -1851,12 +1889,8 @@ async fn revoke_token(State(deploy): State<DeployStore>, Path(id): Path<String>)
 /// prompt operator action, so the admission window stays short.
 const DEFAULT_JOIN_TOKEN_TTL_SECS: u64 = 3600;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct CreateJoinTokenRequest {
-    /// The joining node's id.
-    node_id: u64,
-    /// The joining node's mesh public key (SPKI hex, from its startup log).
-    pubkey: String,
     /// Optional TTL in seconds; omitted ⇒ [`DEFAULT_JOIN_TOKEN_TTL_SECS`].
     #[serde(default)]
     ttl_secs: Option<u64>,
@@ -1864,20 +1898,18 @@ struct CreateJoinTokenRequest {
 
 #[derive(Serialize)]
 struct CreateJoinTokenResponse {
-    /// The minted join token, base64 — shown once, never stored.
+    /// The minted join token, base64url — shown once, never stored.
     token: String,
-    /// The node id the token admits.
-    node_id: u64,
     /// The token's expiry (Unix seconds).
     expires_at: u64,
 }
 
-/// Mint a **single-use mesh join token** bound to `(node_id, pubkey)` with a TTL:
-/// a stolen token cannot admit a different key, and its
-/// single-use handle is spent atomically at admission. Needs the root private key
-/// (the issuer); a verify-only node returns `501`. Admin-scoped (the deny-safe
-/// `Right::required` default gates `/api/cluster/*`). Returned once, never stored
-/// — single-use is enforced cluster-side, so there is no server-side metadata.
+/// Mint a **single-use bearer mesh join token** with a TTL. It is not bound to a
+/// node/key (the operator can't know a not-yet-booted node's key); the joiner
+/// proves possession of its own mesh key at redemption, and the `jti` is spent
+/// single-use cluster-side. Needs the root private key (the issuer); a verify-only
+/// node returns `501`. Admin-scoped (the deny-safe `Right::required` default gates
+/// `/api/cluster/*`). Returned once, never stored.
 async fn create_join_token(
     Extension(issuer): Extension<Issuer>,
     Json(request): Json<CreateJoinTokenRequest>,
@@ -1889,23 +1921,13 @@ async fn create_join_token(
         )
             .into_response();
     };
-    let pubkey = request.pubkey.trim();
-    if pubkey.is_empty() || pubkey.len() % 2 != 0 || !pubkey.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "pubkey must be a hex-encoded mesh public key\n",
-        )
-            .into_response();
-    }
     let ttl = request.ttl_secs.unwrap_or(DEFAULT_JOIN_TOKEN_TTL_SECS);
     let now = now_unix();
-    match cose::mint_join(request.node_id, pubkey, ttl, now, &*signer).await {
+    match cose::mint_join(ttl, now, &*signer).await {
         Ok(token) => (
             StatusCode::CREATED,
             Json(CreateJoinTokenResponse {
                 token,
-                node_id: request.node_id,
                 expires_at: now.saturating_add(ttl),
             }),
         )
@@ -6297,22 +6319,18 @@ mod tests {
     use super::*;
     use boatramp_core::cose::{LocalSigner, TokenAlg};
 
-    /// The `/api/cluster/join-token` handler mints a token the mesh core actually
-    /// accepts (bound to the requested node + pubkey), and refuses cleanly when
-    /// it can't issue: a verify-only node (no root key) → 501, a non-hex pubkey →
-    /// 400. Admin-gating is the deny-safe `Right::required`
-    /// default for `/api/cluster/*`.
+    /// The `/api/cluster/join-token` handler mints a verifiable **bearer** token,
+    /// and refuses cleanly on a verify-only node (no root key) → 501. Admin-gating
+    /// is the deny-safe `Right::required` default for `/api/cluster/*`.
     #[tokio::test]
-    async fn join_token_endpoint_mints_a_verifiable_token() {
+    async fn join_token_endpoint_mints_a_verifiable_bearer_token() {
         let keys: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
         let public = keys.public_key();
 
-        // Happy path: the returned token verifies to the requested claim.
+        // Happy path: the returned token verifies + yields a single-use jti.
         let resp = create_join_token(
             Extension(Issuer(Some(keys.clone()))),
             Json(CreateJoinTokenRequest {
-                node_id: 9,
-                pubkey: "aa01bb02".into(),
                 ttl_secs: Some(600),
             }),
         )
@@ -6323,49 +6341,51 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let token = parsed["token"].as_str().unwrap();
-        let claim = cose::verify_join(token, &public, now_unix()).unwrap();
-        assert_eq!(claim.node_id, 9);
-        assert_eq!(claim.pubkey_hex, "aa01bb02");
+        let jti = cose::verify_join(token, &public, now_unix()).unwrap();
+        assert!(!jti.is_empty());
 
         // A verify-only node (no issuing key) cannot mint → 501.
         let no_issuer = create_join_token(
             Extension(Issuer(None)),
-            Json(CreateJoinTokenRequest {
-                node_id: 1,
-                pubkey: "aa".into(),
-                ttl_secs: None,
-            }),
+            Json(CreateJoinTokenRequest { ttl_secs: None }),
         )
         .await;
         assert_eq!(no_issuer.status(), StatusCode::NOT_IMPLEMENTED);
-
-        // A non-hex pubkey is rejected before minting → 400.
-        let bad = create_join_token(
-            Extension(Issuer(Some(keys))),
-            Json(CreateJoinTokenRequest {
-                node_id: 1,
-                pubkey: "not-hex".into(),
-                ttl_secs: None,
-            }),
-        )
-        .await;
-        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Records the admit calls it receives; the join handler must reach it only
-    /// for a token whose bound `(node, pubkey)` matches the presented identity.
+    /// A configurable stub: records the `(mesh_pubkey, jti)` it's asked to admit and
+    /// returns a chosen [`JoinOutcome`] (the real possession-proof + member signing
+    /// lives in the cluster impl; here we test the handler's dispatch + status map).
     struct StubControl {
-        calls: std::sync::Mutex<Vec<(u64, String, String)>>,
+        admits: std::sync::Mutex<Vec<(String, String)>>,
+        respond: StubJoin,
+    }
+    #[derive(Clone, Copy)]
+    enum StubJoin {
+        Admit,
+        Spent,
+        Invalid,
     }
 
     #[async_trait::async_trait]
     impl MeshControl for StubControl {
-        async fn admit(&self, node: u64, pubkey_hex: &str, jti: &str) -> Result<bool, String> {
-            self.calls
+        async fn admit(
+            &self,
+            mesh_pubkey_hex: &str,
+            jti: &str,
+            _proof: &[u8],
+            _proof_iat: u64,
+            _now: u64,
+        ) -> Result<JoinOutcome, String> {
+            self.admits
                 .lock()
                 .unwrap()
-                .push((node, pubkey_hex.to_string(), jti.to_string()));
-            Ok(true)
+                .push((mesh_pubkey_hex.to_string(), jti.to_string()));
+            Ok(match self.respond {
+                StubJoin::Admit => JoinOutcome::Admitted(vec!["signed-member".to_string()]),
+                StubJoin::Spent => JoinOutcome::TokenSpent,
+                StubJoin::Invalid => JoinOutcome::ProofInvalid,
+            })
         }
         async fn rotate_key(&self) -> Result<String, String> {
             Ok("cafe".to_string())
@@ -6381,71 +6401,87 @@ mod tests {
         }
     }
 
-    /// `POST /api/cluster/join` admits only a token whose bound `(node, pubkey)`
-    /// matches the presented identity (a stolen token can't admit a different
-    /// key → 403, never reaching the admitter), and returns `501` on a
-    /// non-cluster node.
+    /// `POST /api/cluster/join`: a valid bearer token dispatches to the admitter and
+    /// maps its outcome (admitted→200+members, spent→409, proof-invalid→403); a bad
+    /// token → 401, a non-hex proof → 400, and no cluster hook → 501.
     #[tokio::test]
-    async fn cluster_join_admits_a_matching_token_and_rejects_theft() {
+    async fn cluster_join_dispatches_and_maps_outcomes() {
         let keys: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let auth = Auth::with_key(keys.public_key(), kv);
-        let token = cose::mint_join(7, "aa01", 600, now_unix(), &*keys)
-            .await
-            .unwrap();
+        let token = cose::mint_join(600, now_unix(), &*keys).await.unwrap();
+        let req = |proof: &str| JoinRequest {
+            token: token.clone(),
+            mesh_pubkey: "302a300506032b6570032100feed".into(),
+            possession_proof: proof.to_string(),
+            proof_iat: now_unix(),
+        };
 
-        // Matching node + pubkey → admitted, and the admitter sees the claim.
+        // Admitted → 200 + the signed members, and the admitter saw the jti.
         let admitter = Arc::new(StubControl {
-            calls: std::sync::Mutex::new(Vec::new()),
+            admits: std::sync::Mutex::new(Vec::new()),
+            respond: StubJoin::Admit,
         });
         let resp = cluster_join(
             Extension(auth.clone()),
             Extension(MeshControlHandle(Some(admitter.clone()))),
-            Json(JoinRequest {
-                node_id: 7,
-                pubkey: "aa01".into(),
-                token: token.clone(),
-            }),
+            Json(req("aa01")),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let (node, pubkey) = {
-            let calls = admitter.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            (calls[0].0, calls[0].1.clone())
-        };
-        assert_eq!((node, pubkey.as_str()), (7, "aa01"));
+        assert_eq!(admitter.admits.lock().unwrap().len(), 1);
 
-        // Theft: the same token, a different presented pubkey → 403, and the
-        // admitter is never called.
-        let thief = Arc::new(StubControl {
-            calls: std::sync::Mutex::new(Vec::new()),
+        // Spent token → 409; proof-invalid → 403 (the impl's verdicts, mapped).
+        let spent = Arc::new(StubControl {
+            admits: std::sync::Mutex::new(Vec::new()),
+            respond: StubJoin::Spent,
         });
-        let theft = cluster_join(
-            Extension(auth.clone()),
-            Extension(MeshControlHandle(Some(thief.clone()))),
-            Json(JoinRequest {
-                node_id: 7,
-                pubkey: "bb02".into(),
-                token: token.clone(),
-            }),
-        )
-        .await;
-        assert_eq!(theft.status(), StatusCode::FORBIDDEN);
-        assert!(
-            thief.calls.lock().unwrap().is_empty(),
-            "a mismatched key must never reach the admitter"
+        assert_eq!(
+            cluster_join(
+                Extension(auth.clone()),
+                Extension(MeshControlHandle(Some(spent))),
+                Json(req("aa01")),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let invalid = Arc::new(StubControl {
+            admits: std::sync::Mutex::new(Vec::new()),
+            respond: StubJoin::Invalid,
+        });
+        assert_eq!(
+            cluster_join(
+                Extension(auth.clone()),
+                Extension(MeshControlHandle(Some(invalid))),
+                Json(req("aa01")),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
         );
 
-        // A non-cluster node (no admitter) → 501.
+        // A non-hex possession proof → 400 (before dispatch).
+        let ok = Arc::new(StubControl {
+            admits: std::sync::Mutex::new(Vec::new()),
+            respond: StubJoin::Admit,
+        });
+        assert_eq!(
+            cluster_join(
+                Extension(auth.clone()),
+                Extension(MeshControlHandle(Some(ok))),
+                Json(req("not-hex")),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // No cluster hook → 501.
         let none = cluster_join(
             Extension(auth),
             Extension(MeshControlHandle(None)),
-            Json(JoinRequest {
-                node_id: 7,
-                pubkey: "aa01".into(),
-                token,
-            }),
+            Json(req("aa01")),
         )
         .await;
         assert_eq!(none.status(), StatusCode::NOT_IMPLEMENTED);
@@ -6543,7 +6579,8 @@ mod tests {
     #[tokio::test]
     async fn cluster_rotate_key_returns_the_new_pubkey_or_501() {
         let control = Arc::new(StubControl {
-            calls: std::sync::Mutex::new(Vec::new()),
+            admits: std::sync::Mutex::new(Vec::new()),
+            respond: StubJoin::Admit,
         });
         let resp = cluster_rotate_key(Extension(MeshControlHandle(Some(control)))).await;
         assert_eq!(resp.status(), StatusCode::OK);
