@@ -745,10 +745,24 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
 
     let storage = build_blobs(&args, &data_dir).await?;
 
-    // Cluster mode (`[cluster]` config): the control-plane KvStore + messaging
-    // come from the embedded-Raft cluster node, not the local backends.
+    // Cluster mode: triggered by a `[cluster]` config section OR the founding/
+    // joining flags (`--cluster-init` / `--cluster-join <ticket>`), so a node can
+    // join with just a ticket and no config file. The control-plane KvStore +
+    // messaging then come from the embedded-Raft cluster node.
     #[cfg(feature = "cluster")]
-    if let Some(cluster_cfg) = config.cluster.clone() {
+    if config.cluster.is_some() || args.cluster_init || args.cluster_join.is_some() {
+        let cluster_cfg = config.cluster.clone().unwrap_or_else(|| {
+            // No `[cluster]` section: synthesize defaults (a flag-only bring-up).
+            // The mesh binds the default port on the same host as `serve.addr`.
+            crate::config::ClusterConfig {
+                listen: std::net::SocketAddr::new(addr.ip(), DEFAULT_MESH_PORT),
+                root_pubkeys: Vec::new(),
+                seeds: Vec::new(),
+                join_token: None,
+                store_dir: None,
+                mesh: None,
+            }
+        });
         return run_cluster(args, config, cluster_cfg, addr, data_dir, storage, options).await;
     }
     #[cfg(not(feature = "cluster"))]
@@ -989,6 +1003,11 @@ fn spawn_http_redirect(
 /// verifier + dialer retry make a shorter/absent wait safe, not incorrect.
 #[cfg(feature = "cluster")]
 const MESH_ROTATION_PROPAGATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Default Raft peer-mesh port when a node joins/founds with only flags (no
+/// `[cluster]` section). Distinct from the public `serve.addr` port.
+#[cfg(feature = "cluster")]
+const DEFAULT_MESH_PORT: u16 = 7000;
 
 /// Parse a mesh key-rotation cadence like `"30d"`, `"12h"`, `"90m"`, `"3600s"`
 /// into a `Duration`. `None` for an empty/invalid value (⇒ no scheduled

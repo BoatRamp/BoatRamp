@@ -293,6 +293,11 @@ async fn join_via_seed(
 
     let resp = http
         .post(format!("{base}/api/cluster/join"))
+        // The join token is itself the bearer credential: the control-plane auth
+        // middleware requires *some* bearer present, but `/api/cluster/join` needs
+        // no RBAC right (the handler verifies the join token from the body), so the
+        // token is presented here to satisfy the middleware, not as a role token.
+        .bearer_auth(token)
         .json(&JoinRequestBody {
             token: token.to_string(),
             mesh_pubkey: mesh_pubkey_hex.to_string(),

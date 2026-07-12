@@ -224,7 +224,7 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
                 .map_err(|e| Error::Ticket(e.to_string()))?;
                 println!("{ticket}");
                 eprintln!("single-use join ticket — hand it to exactly one new node, e.g.:");
-                eprintln!("  boatramp serve --mode cluster --cluster-join {ticket}");
+                eprintln!("  boatramp serve --cluster-join {ticket}");
             }
             if let Some(exp) = response.expires_at {
                 eprintln!("expires at (unix): {exp}");
