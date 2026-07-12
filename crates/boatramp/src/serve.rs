@@ -88,6 +88,11 @@ pub enum Error {
          set: add each peer's `pubkey` to [cluster.peers]"
     )]
     MeshUnconfigured(std::net::SocketAddr),
+    /// The cluster startup decision failed closed (F5) or a join could not be
+    /// completed (no join token, seeds unreachable, root mismatch, …).
+    #[cfg(feature = "cluster")]
+    #[error("cluster startup: {0}")]
+    ClusterStartup(String),
     /// Configuring the secrets-at-rest envelope failed.
     #[cfg(all(feature = "cluster", feature = "acme-dns"))]
     #[error("secrets envelope: {0}")]
@@ -613,6 +618,20 @@ pub struct ServeArgs {
     /// `serve.cluster_rate_limit`.
     #[arg(long, env = "BOATRAMP_CLUSTER_RATE_LIMIT")]
     cluster_rate_limit: bool,
+
+    /// **Found a brand-new cluster** from this node (the explicit, one-time
+    /// genesis signal — F5). Required to bring up the first node with no seeds;
+    /// refused if `[cluster].seeds` are set (a node either founds or joins, not
+    /// both). A no-op once the node has durable state (restart resumes).
+    #[arg(long, env = "BOATRAMP_CLUSTER_INIT")]
+    cluster_init: bool,
+
+    /// This node's own mesh base URL that peers should dial to reach it (e.g.
+    /// `https://10.0.0.4:7000`). Advertised at join so the leader can replicate
+    /// back. Defaults to `https://<cluster.listen>`; set it when the bind address
+    /// isn't the reachable address (NAT / container / `0.0.0.0`).
+    #[arg(long, env = "BOATRAMP_CLUSTER_ADVERTISE_ADDR")]
+    cluster_advertise_addr: Option<String>,
 
     /// Keep the local config cache coherent across processes sharing one KV
     /// (Cloudflare KV / shared SlateDB): publish each control-plane write to a
@@ -1284,6 +1303,10 @@ async fn run_cluster(
         .store_dir
         .clone()
         .unwrap_or_else(|| data_dir.join("raft"));
+    // Whether this node already has durable Raft state, captured BEFORE opening
+    // (which creates the dir): the resume-vs-found/join signal (F5). A node that
+    // has ever run has this dir; a fresh node does not.
+    let had_durable_state = store_dir.exists();
     let durable_kv: Arc<dyn KvStore> = Arc::new(
         boatramp_storage::SlateKv::open_local_with_flush(store_dir, CONTROL_PLANE_FLUSH).await?,
     );
@@ -1311,14 +1334,113 @@ async fn run_cluster(
         .clone()
         .unwrap_or_else(|| data_dir.join("mesh/identity.key"));
     let identity = MeshIdentity::load_or_generate(&key_file)?;
+
+    // This node's Raft id: the legacy explicit `node_id` if set, else DERIVED from
+    // its mesh key (dynamic-join self-identity — no config id needed).
+    let node_id = if cluster_cfg.node_id != 0 {
+        cluster_cfg.node_id
+    } else {
+        boatramp_cluster::raft::derive_node_id(identity.public_key())
+    };
     tracing::info!(
-        node_id = cluster_cfg.node_id,
+        node_id,
         pubkey = %identity.public_key_hex(),
-        "cluster: mesh identity (put this pubkey in the peers' [cluster.peers])"
+        "cluster: mesh identity"
     );
 
+    // Decide founding vs joining vs resuming (F5): the single source of truth.
+    let seeds_present = !cluster_cfg.seeds.is_empty();
+    let init_requested = cluster_cfg.bootstrap || args.cluster_init;
+    let action = crate::join::decide_startup(&crate::join::StartupInputs {
+        has_durable_state: had_durable_state,
+        // A node that has ever run keeps its durable store; a wiped volume loses
+        // it, so we treat durable state as the "ever member" marker too (F5's
+        // never-re-found is enforced by requiring seeds when there's no state).
+        ever_member: had_durable_state,
+        seeds_present,
+        init_requested,
+    });
+
+    // This node's own reachable mesh URL (advertised at join so the leader can
+    // dial it), defaulting to the bind address.
+    let self_advertise = args
+        .cluster_advertise_addr
+        .clone()
+        .unwrap_or_else(|| format!("https://{}", cluster_cfg.listen));
+
+    // A dynamic joiner starts with NO static membership; the seed admits it and
+    // membership + trust arrive via replication. Bootstrap only when founding.
+    let mut do_bootstrap = false;
+    match action {
+        crate::join::StartupAction::FailClosed(reason) => {
+            return Err(Error::ClusterStartup(reason));
+        }
+        crate::join::StartupAction::Found => {
+            // Genesis: this node is the sole founding member. List itself so
+            // `build_node` takes the genesis path and `bootstrap` initializes it.
+            peers.insert(node_id, self_advertise.clone());
+            genesis_trust.insert(node_id, identity.public_key().to_vec());
+            do_bootstrap = true;
+            tracing::info!(node_id, "cluster: founding a new cluster (init)");
+        }
+        crate::join::StartupAction::Join => {
+            // Redeem the join ticket against the seeds and adopt the returned,
+            // root-verified members — seeding the trust set + peer directory with
+            // NO static peer map. This node is a joiner: it does NOT list itself,
+            // so `build_node` starts it with empty membership (the seed admits it).
+            let roots = if cluster_cfg.root_pubkeys.is_empty() {
+                config
+                    .serve
+                    .as_ref()
+                    .and_then(|s| s.auth_root_public_key.clone())
+                    .into_iter()
+                    .collect()
+            } else {
+                cluster_cfg.root_pubkeys.clone()
+            };
+            let token = cluster_cfg
+                .join_token
+                .as_deref()
+                .and_then(|s| crate::join::resolve_join_token(s).transpose())
+                .transpose()
+                .map_err(|e| Error::ClusterStartup(e.to_string()))?
+                .ok_or_else(|| {
+                    Error::ClusterStartup(
+                        "joining requires [cluster].join_token (env:/path:/inline)".into(),
+                    )
+                })?;
+            let ticket = crate::join::JoinTicket {
+                seeds: cluster_cfg.seeds.clone(),
+                root_pubkeys: roots,
+                token,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let adopted = crate::join::join_cluster(&ticket, &identity, Some(&self_advertise), now)
+                .await
+                .map_err(|e| Error::ClusterStartup(e.to_string()))?;
+            tracing::info!(node_id, members = adopted.len(), "cluster: joined via seeds");
+            for m in adopted {
+                if let Ok(spki) = mesh::parse_public_key(&m.mesh_pubkey_hex) {
+                    genesis_trust.insert(m.node_id, spki);
+                }
+                if let Some(addr) = m.mesh_addr {
+                    peers.insert(m.node_id, addr);
+                }
+            }
+        }
+        crate::join::StartupAction::Resume => {
+            // Durable state is authoritative; `build_node` hydrates trust from it.
+            // Legacy static configs still populate `peers`/`genesis_trust` above.
+            do_bootstrap = cluster_cfg.bootstrap;
+            tracing::info!(node_id, "cluster: resuming from durable state");
+        }
+    }
+
     // Fail closed: never expose an unauthenticated mesh on a non-loopback
-    // bind. An empty trust set means no peer pubkeys were configured.
+    // bind. An empty trust set means no peer pubkeys were configured/adopted.
     if !cluster_cfg.listen.ip().is_loopback() && genesis_trust.is_empty() {
         return Err(Error::MeshUnconfigured(cluster_cfg.listen));
     }
@@ -1347,7 +1469,7 @@ async fn run_cluster(
 
     let node = Arc::new(
         build_node(ClusterParams {
-            node_id: cluster_cfg.node_id,
+            node_id,
             peers,
             // Empty ⇒ every peer votes; otherwise the listed ids are the voting
             // quorum and the rest join as read-only learners (multi-region).
@@ -1386,8 +1508,8 @@ async fn run_cluster(
         }
     });
 
-    // Initialize a brand-new cluster from this node (once), if configured.
-    if cluster_cfg.bootstrap {
+    // Initialize a brand-new cluster from this node (once) when founding.
+    if do_bootstrap {
         node.bootstrap().await?;
         tracing::info!("cluster: bootstrapped membership");
     }
