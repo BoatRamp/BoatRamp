@@ -42,6 +42,7 @@
 - [Manage certificates in a cluster](./how-to/cluster-certs.md)
 - [Deploy a single node in production](./how-to/deploy-single-node.md)
 - [Deploy a self-hosted cluster](./how-to/deploy-cluster.md)
+- [Migrate the root key](./how-to/migrate-root-key.md)
 - [Deploy on Cloudflare Containers](./how-to/deploy-cloudflare.md)
 
 # Explanation
@@ -54,6 +55,7 @@
 - [The request pipeline](./explanation/request-pipeline.md)
 - [How a request reaches your site](./explanation/addressing.md)
 - [Authentication & authorization](./explanation/auth-model.md)
+- [Mesh identity & the single root anchor](./explanation/SECURITY-mesh-identity.md)
 - [The security posture model](./explanation/security-posture.md)
 - [The configuration model](./explanation/config-model.md)
 - [Compute: handlers vs containers vs microVMs](./explanation/compute-model.md)

@@ -133,22 +133,30 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 ## `cluster`
 
 Self-hosted Raft cluster. Parsed always, consumed only with the `cluster`
-feature. The peer mesh runs over RFC 7250 raw-public-key mutual TLS.
+feature. The peer mesh runs over RFC 7250 raw-public-key mutual TLS. A cluster is
+defined by its **root of trust** — there is no peer map; nodes self-identify and
+**join** by redeeming a ticket.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `node_id` | integer | — | This node's stable id, unique in the cluster. |
 | `listen` | socket address | — | Bind for the Raft peer mesh (distinct from `serve.addr`). |
-| `peers` | map | — | `id → (url, pubkey)` for every node. The `pubkey` (logged at startup) seeds the mesh trust set. |
-| `voters` | list of ids | all peers | The voting quorum; peers not listed join as learners. |
+| `root_pubkeys` | list of strings | `serve.auth_root_public_key` | The cluster **root anchor set** (`es256:`/`ed25519:` hex). Every join/trust decision verifies against it. A *set* enables make-before-break root rotation. |
+| `seeds` | list of strings | — | Control-plane addresses of existing members. Present ⇒ this node **joins**; absent + `--cluster-init` ⇒ it **founds**. |
+| `join_token` | string | — | The single-use bearer join token used when `seeds` are set. Keep the secret out of the file: `env:VAR`, `path:/file`, or an inline literal. |
 | `store_dir` | path | `<data-dir>/raft` | This node's durable Raft store. Never shared between nodes. |
-| `bootstrap` | bool | `false` | Set on exactly one node at first bring-up. |
 | `mesh` | table | — | Mesh identity + TLS: `key_file`, `key_rotation`, `join_token_ttl`, `gate_client_writes`. |
+| `node_id` | integer | derived | **Legacy/static-genesis only.** Leave unset — the id is derived from the node's mesh key. |
 
-> **Warning:** a non-loopback `listen` refuses to start until every node's
-> `pubkey` is in `peers`. Never point two nodes at one `store_dir`.
+Founding and joining are driven from the command line — `serve --cluster-init`
+founds a new cluster, `serve --cluster-join <ticket>` joins one (from
+`cluster add`). The legacy static-genesis fields `peers` / `voters` / `bootstrap`
+are still parsed for back-compat but are superseded by the dynamic-join model.
 
-See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md).
+> **Warning:** a non-loopback `listen` refuses to start with an empty trust set
+> (no `root_pubkeys`/adopted members). Never point two nodes at one `store_dir`.
+
+See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
+[Mesh identity & the single root anchor](../explanation/SECURITY-mesh-identity.md).
 
 ## `compute`
 
