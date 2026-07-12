@@ -336,6 +336,113 @@ async fn pin_seed(
     Ok(attested)
 }
 
+/// What a cluster node should do at startup, decided purely from its config +
+/// on-disk state (F5: founding is explicit + single-shot; empty seeds fail
+/// closed; a former member never re-founds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupAction {
+    /// Durable Raft state exists — resume the existing membership from it
+    /// (a plain restart; never re-founds, never re-joins).
+    Resume,
+    /// Found a brand-new single-node cluster — only on the explicit one-time
+    /// signal (`cluster init` / `--cluster-init`, or the operator's ordinal-0).
+    Found,
+    /// Join an existing cluster via the configured seeds (redeem the ticket).
+    Join,
+    /// Fail closed with a reason: no state and nothing that authorizes founding
+    /// or joining. Never a silent self-found.
+    FailClosed(String),
+}
+
+/// Inputs to the [`decide_startup`] founding decision.
+#[derive(Debug, Clone, Copy)]
+pub struct StartupInputs {
+    /// This node has non-empty durable Raft state (it is/was running).
+    pub has_durable_state: bool,
+    /// This node was ever admitted to a cluster (a durable, survives-wipe marker).
+    pub ever_member: bool,
+    /// One or more seeds are configured (something to join).
+    pub seeds_present: bool,
+    /// The explicit one-time founding signal was given for this boot.
+    pub init_requested: bool,
+}
+
+/// Decide what a node does at startup — the single source of truth for founding
+/// vs joining vs resuming (F5). Founding is **never** inferred from "seeds are
+/// absent/unreachable right now"; it happens only on the explicit init signal,
+/// and only for a node that was never a member. Everything else with no state
+/// fails closed rather than risk a second genesis (split-brain).
+pub fn decide_startup(i: &StartupInputs) -> StartupAction {
+    // A node with durable state always resumes — the highest-precedence case.
+    if i.has_durable_state {
+        return StartupAction::Resume;
+    }
+    // Ambiguous intent: founding and joining are mutually exclusive. A node
+    // either founds (init, no seeds) or joins (seeds, no init).
+    if i.init_requested && i.seeds_present {
+        return StartupAction::FailClosed(
+            "both cluster-init and seeds are configured — a node either founds \
+             (init, no seeds) or joins (seeds, no init), not both"
+                .into(),
+        );
+    }
+    // A former member whose volume was wiped must NEVER re-found; it may only
+    // rejoin via seeds.
+    if i.ever_member {
+        return if i.seeds_present {
+            StartupAction::Join
+        } else {
+            StartupAction::FailClosed(
+                "former member with no durable state and no seeds: refusing to re-found \
+                 (F5) — provide seeds to rejoin the existing cluster"
+                    .into(),
+            )
+        };
+    }
+    // A fresh node: join if seeded, else found only on the explicit signal.
+    if i.seeds_present {
+        StartupAction::Join
+    } else if i.init_requested {
+        StartupAction::Found
+    } else {
+        StartupAction::FailClosed(
+            "no durable state, no seeds, and no cluster-init: refusing to self-found \
+             (F5) — pass --cluster-init to found a new cluster or seeds to join one"
+                .into(),
+        )
+    }
+}
+
+/// Resolve a `join_token` config value, which — like the rest of the config
+/// surface — keeps the secret out of the file via a prefix (#6):
+/// `env:VAR` reads an environment variable, `path:/file` reads a file (trimmed),
+/// and anything else is an inline literal. Empty resolves to `None`.
+pub fn resolve_join_token(spec: &str) -> Result<Option<String>, JoinError> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Ok(None);
+    }
+    if let Some(var) = spec.strip_prefix("env:") {
+        return match std::env::var(var) {
+            Ok(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
+            _ => Err(JoinError::Token(format!(
+                "join_token env var {var} is unset or empty"
+            ))),
+        };
+    }
+    if let Some(path) = spec.strip_prefix("path:") {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| JoinError::Token(format!("join_token file {path}: {e}")))?;
+        let token = raw.trim().to_string();
+        return if token.is_empty() {
+            Err(JoinError::Token(format!("join_token file {path} is empty")))
+        } else {
+            Ok(Some(token))
+        };
+    }
+    Ok(Some(spec.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +532,97 @@ mod tests {
         let other = boatramp_rpktls::parse_public_key(&RpkIdentity::generate().unwrap().public_key_hex())
             .unwrap();
         assert!(!boatramp_rpktls::verify_signature(&other, &challenge, &proof));
+    }
+
+    /// The founding decision (F5): durable state resumes; a fresh node founds
+    /// only on the explicit signal and joins when seeded; a former member never
+    /// re-founds; ambiguous/empty inputs fail closed — never a silent self-found.
+    #[test]
+    fn startup_decision_enforces_explicit_single_shot_founding() {
+        let base = StartupInputs {
+            has_durable_state: false,
+            ever_member: false,
+            seeds_present: false,
+            init_requested: false,
+        };
+        let with = |f: fn(&mut StartupInputs)| {
+            let mut i = base;
+            f(&mut i);
+            decide_startup(&i)
+        };
+
+        // Durable state always resumes, regardless of every other input.
+        assert_eq!(
+            with(|i| {
+                i.has_durable_state = true;
+                i.seeds_present = true;
+                i.init_requested = true;
+            }),
+            StartupAction::Resume
+        );
+        // Fresh + explicit init + no seeds → found.
+        assert_eq!(with(|i| i.init_requested = true), StartupAction::Found);
+        // Fresh + seeds → join.
+        assert_eq!(with(|i| i.seeds_present = true), StartupAction::Join);
+        // Init AND seeds → ambiguous, fail closed.
+        assert!(matches!(
+            with(|i| {
+                i.init_requested = true;
+                i.seeds_present = true;
+            }),
+            StartupAction::FailClosed(_)
+        ));
+        // Former member, wiped volume, seeds → rejoin (never re-found).
+        assert_eq!(
+            with(|i| {
+                i.ever_member = true;
+                i.seeds_present = true;
+            }),
+            StartupAction::Join
+        );
+        // Former member, wiped volume, no seeds, even with init → fail closed
+        // (a former member never re-founds).
+        assert!(matches!(
+            with(|i| {
+                i.ever_member = true;
+                i.init_requested = true;
+            }),
+            // init+no-seeds+ever_member: not the ambiguous case, so it reaches the
+            // ever_member branch and fails closed on "no seeds".
+            StartupAction::FailClosed(_)
+        ));
+        // Fresh, nothing configured → fail closed (never a silent self-found).
+        assert!(matches!(with(|_| {}), StartupAction::FailClosed(_)));
+    }
+
+    /// `resolve_join_token` reads env:/path:/inline, and errors on an unset env
+    /// var or empty file — keeping the secret out of the config file (#6).
+    #[test]
+    fn join_token_resolves_env_path_and_inline() {
+        assert_eq!(resolve_join_token("").unwrap(), None);
+        assert_eq!(
+            resolve_join_token("inline-token").unwrap(),
+            Some("inline-token".to_string())
+        );
+
+        // env: — a uniquely-named var so the test is isolated.
+        std::env::set_var("BOATRAMP_TEST_JOIN_TOKEN", "  tok-from-env  ");
+        assert_eq!(
+            resolve_join_token("env:BOATRAMP_TEST_JOIN_TOKEN").unwrap(),
+            Some("tok-from-env".to_string())
+        );
+        assert!(resolve_join_token("env:BOATRAMP_TEST_JOIN_TOKEN_UNSET").is_err());
+
+        // path: — write a temp file and read it back trimmed.
+        let dir = std::env::temp_dir();
+        let file = dir.join("boatramp-test-join-token");
+        std::fs::write(&file, "tok-from-file\n").unwrap();
+        assert_eq!(
+            resolve_join_token(&format!("path:{}", file.display())).unwrap(),
+            Some("tok-from-file".to_string())
+        );
+        std::fs::write(&file, "   \n").unwrap();
+        assert!(resolve_join_token(&format!("path:{}", file.display())).is_err());
+        let _ = std::fs::remove_file(&file);
     }
 }

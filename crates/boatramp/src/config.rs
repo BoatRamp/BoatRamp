@@ -229,11 +229,37 @@ impl Default for ComputeConfig {
 #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterConfig {
-    /// This node's stable id (unique within the cluster).
+    /// This node's stable id. **Legacy/static-genesis only** — in the dynamic-join
+    /// model the id is *derived* from the node's mesh key (`derive_node_id`), so
+    /// leave it `0` (the default) and let the node self-identify. Removed in CJ-5.
+    #[serde(default)]
     pub node_id: u64,
     /// Address to bind this node's Raft **peer mesh** on (the `/raft/*` +
     /// `/stream/*` endpoints) — distinct from the public `serve.addr`.
     pub listen: SocketAddr,
+    /// The cluster **root anchor set** — the `es256:`/`ed25519:`-tagged public
+    /// keys that define this cluster's identity (a cluster *is* its root key).
+    /// Every join/trust decision verifies against this set. Empty ⇒ falls back to
+    /// `serve.auth_root_public_key` (the single-anchor default). A *set* enables
+    /// make-before-break root rotation (CJ-5). Consumed by the CJ-3 join-at-startup
+    /// wiring.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub root_pubkeys: Vec<String>,
+    /// **Seeds** — control-plane addresses of existing cluster members
+    /// (`host:port`), any of which can admit this node. Present ⇒ this node
+    /// **joins** (redeems its `join_token`); absent + no durable state + explicit
+    /// init ⇒ it **founds**. There is no peer map: members are learned from the
+    /// root-signed join response. Consumed by the CJ-3 join-at-startup wiring.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub seeds: Vec<String>,
+    /// The single-use bearer **join token** used when `seeds` are set. Keeps the
+    /// secret out of the file via a prefix: `env:VAR`, `path:/file`, or an inline
+    /// literal (#6). Consumed by the CJ-3 join-at-startup wiring.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub join_token: Option<String>,
     /// Static peer directory (the **genesis seed**): every node's id → its base
     /// URL + mesh public key, e.g.
     /// `"1": (url: "https://10.0.0.1:7000", pubkey: "…hex…")`. Keys are strings
