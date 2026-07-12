@@ -136,6 +136,80 @@ pub fn plan_next(desired: u32, pods: &[PodState], members: &[Member]) -> Option<
     None
 }
 
+/// A member as reported by the cluster API (`GET /api/cluster/members`): its
+/// **derived** node id, role, catch-up, and mesh address (whose host encodes the
+/// StatefulSet pod ordinal). The executor turns these into ordinal-keyed
+/// [`Member`]s the planner understands, keeping the ordinal↔node_id map so the
+/// planned action can be executed against the node-id-keyed API (#2).
+#[derive(Clone, Debug)]
+pub struct ApiMember {
+    /// The member's derived Raft node id (the API's handle for promote/remove).
+    pub node_id: u64,
+    /// `true` ⇒ a voter; `false` ⇒ a learner.
+    pub voter: bool,
+    /// Whether a learner has caught up to the leader (ready to promote).
+    pub caught_up: bool,
+    /// The member's mesh URL — its host is `<statefulset>-<ordinal>.<svc>…`.
+    pub addr: Option<String>,
+}
+
+/// Parse a StatefulSet pod ordinal from a member's mesh address. The host is the
+/// pod's stable DNS name `…//<name>-<ordinal>.<service>…`; the ordinal is the
+/// trailing integer of the first dot-separated label after the scheme.
+pub fn ordinal_from_addr(addr: &str) -> Option<u32> {
+    let after_scheme = addr.split("//").last()?;
+    let host = after_scheme.split(['.', ':', '/']).next()?; // `<name>-<ordinal>`
+    // Require an actual `<name>-<ordinal>` split (a `-`), so a bare number or an
+    // IP octet (e.g. `10.0.0.5` → `10`) isn't mistaken for an ordinal.
+    let (name, ordinal) = host.rsplit_once('-')?;
+    if name.is_empty() {
+        return None;
+    }
+    ordinal.parse::<u32>().ok()
+}
+
+/// Build the ordinal-keyed [`Member`] list the planner consumes **and** the
+/// `ordinal → node_id` map the executor needs, from the API members. Members
+/// whose address doesn't encode an ordinal (not a StatefulSet pod) are dropped —
+/// the operator only manages its own pods.
+pub fn members_from_api(
+    api: &[ApiMember],
+) -> (Vec<Member>, std::collections::BTreeMap<u32, u64>) {
+    let mut members = Vec::new();
+    let mut map = std::collections::BTreeMap::new();
+    for m in api {
+        let Some(ordinal) = m.addr.as_deref().and_then(ordinal_from_addr) else {
+            continue;
+        };
+        map.insert(ordinal, m.node_id);
+        members.push(Member {
+            ordinal,
+            role: if m.voter {
+                MemberRole::Voter
+            } else {
+                MemberRole::Learner
+            },
+            caught_up: m.caught_up,
+        });
+    }
+    (members, map)
+}
+
+/// The node id a planned action must be executed against, if the API needs one.
+/// `PromoteToVoter`/`Remove` target an existing member (resolved via the map);
+/// `AddLearner` returns `None` — a new pod **self-joins** with a ticket, so there
+/// is no node id yet.
+pub fn action_node_id(
+    action: &MembershipAction,
+    ordinal_to_node: &std::collections::BTreeMap<u32, u64>,
+) -> Option<u64> {
+    match action {
+        MembershipAction::PromoteToVoter { ordinal }
+        | MembershipAction::Remove { ordinal } => ordinal_to_node.get(ordinal).copied(),
+        MembershipAction::AddLearner { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::MemberRole::{Learner, Voter};
@@ -157,6 +231,61 @@ mod tests {
             (0..n).map(|o| pod(o, true)).collect(),
             (0..n).map(|o| member(o, Voter, true)).collect(),
         )
+    }
+
+    #[test]
+    fn ordinal_parses_from_a_statefulset_pod_address() {
+        assert_eq!(
+            ordinal_from_addr("https://boatramp-cluster-2.boatramp-cluster.ns.svc:7000"),
+            Some(2)
+        );
+        assert_eq!(ordinal_from_addr("http://my-cluster-0.svc:8080"), Some(0));
+        // A non-pod address (no trailing ordinal) is ignored.
+        assert_eq!(ordinal_from_addr("https://10.0.0.5:7000"), None);
+    }
+
+    #[test]
+    fn api_members_map_to_ordinals_and_resolve_action_node_ids() {
+        let api = vec![
+            ApiMember {
+                node_id: 0xAA,
+                voter: true,
+                caught_up: true,
+                addr: Some("https://sts-0.svc:7000".into()),
+            },
+            ApiMember {
+                node_id: 0xBB,
+                voter: false,
+                caught_up: true,
+                addr: Some("https://sts-1.svc:7000".into()),
+            },
+            // A member with no ordinal-encoding address is dropped.
+            ApiMember {
+                node_id: 0xCC,
+                voter: false,
+                caught_up: false,
+                addr: Some("https://10.0.0.9:7000".into()),
+            },
+        ];
+        let (members, map) = members_from_api(&api);
+        assert_eq!(members.len(), 2);
+        assert_eq!(map.get(&0), Some(&0xAA));
+        assert_eq!(map.get(&1), Some(&0xBB));
+        assert!(!map.values().any(|&n| n == 0xCC));
+
+        // Promote/remove resolve to the member's node id; AddLearner has none yet.
+        assert_eq!(
+            action_node_id(&MembershipAction::PromoteToVoter { ordinal: 1 }, &map),
+            Some(0xBB)
+        );
+        assert_eq!(
+            action_node_id(&MembershipAction::Remove { ordinal: 0 }, &map),
+            Some(0xAA)
+        );
+        assert_eq!(
+            action_node_id(&MembershipAction::AddLearner { ordinal: 2 }, &map),
+            None
+        );
     }
 
     #[test]

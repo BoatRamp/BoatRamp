@@ -67,8 +67,9 @@ fn child_meta(brc: &BoatRampCluster, name: String) -> ObjectMeta {
     }
 }
 
-/// The CR's name (the instance every child is keyed to).
-fn instance(brc: &BoatRampCluster) -> String {
+/// The CR's name (the instance every child is keyed to). Also the client
+/// Service's name — the DNS the operator's membership executor reaches.
+pub fn instance(brc: &BoatRampCluster) -> String {
     brc.metadata.name.clone().unwrap_or_else(|| "boatramp".to_string())
 }
 
@@ -168,17 +169,40 @@ fn container(brc: &BoatRampCluster) -> Container {
             container_port: PORT,
             ..Default::default()
         }]),
-        env: Some(vec![EnvVar {
-            name: "BOATRAMP_POD_NAME".to_string(),
-            value_from: Some(EnvVarSource {
-                field_ref: Some(ObjectFieldSelector {
-                    field_path: "metadata.name".to_string(),
+        env: Some(vec![
+            // The pod's own name (downward API): the operator's ordinal-0 pod
+            // founds the cluster; every other ordinal joins. The node *identity*
+            // is still derived from the mesh key — this only designates the founder.
+            EnvVar {
+                name: "BOATRAMP_POD_NAME".to_string(),
+                value_from: Some(EnvVarSource {
+                    field_ref: Some(ObjectFieldSelector {
+                        field_path: "metadata.name".to_string(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }]),
+            },
+            // The single-use join ticket the operator's executor rolls into a
+            // Secret for joining pods. Optional: absent for the founder / before
+            // the first AddLearner.
+            {
+                let (secret, key) = super::executor::join_env_source(brc);
+                EnvVar {
+                    name: "BOATRAMP_CLUSTER_JOIN".to_string(),
+                    value_from: Some(EnvVarSource {
+                        secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                            name: secret,
+                            key: key.to_string(),
+                            optional: Some(true),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+            },
+        ]),
         liveness_probe: Some(http_probe("/healthz")),
         readiness_probe: Some(http_probe("/readyz")),
         volume_mounts: Some(vec![
@@ -354,6 +378,8 @@ mod tests {
                 image: None,
                 storage: None,
                 posture: None,
+                admin_token_secret: None,
+                root_pubkey: None,
             },
         );
         brc.metadata.namespace = Some("tenant-a".to_string());

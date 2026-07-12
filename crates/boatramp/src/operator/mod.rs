@@ -12,6 +12,7 @@
 
 mod controller;
 mod crd;
+mod executor;
 mod manifests;
 mod membership;
 mod resources;
@@ -27,6 +28,9 @@ pub enum Error {
     /// Serializing a manifest to YAML failed.
     #[error("manifest: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    /// An HTTP call to the cluster control-plane API (membership executor) failed.
+    #[error("cluster api: {0}")]
+    Http(#[from] reqwest::Error),
     /// Any other operator failure (a legible message).
     #[error("operator: {0}")]
     Other(String),

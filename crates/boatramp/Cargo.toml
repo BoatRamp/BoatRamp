@@ -113,6 +113,8 @@ operator = [
   # kube talks to the apiserver over rustls; the workspace pulls both aws-lc-rs
   # and ring, so a provider must be installed explicitly (as `serve` does).
   "dep:rustls",
+  # The membership executor mints + encodes join tickets (crate::join, cluster).
+  "cluster",
 ]
 
 [dependencies]

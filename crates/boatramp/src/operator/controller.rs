@@ -141,23 +141,22 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
         }
     }
 
-    // Observe the pods, and — in cluster mode — plan the next quorum-safe Raft
-    // membership transition (K3 core). Executing it needs the cluster membership
-    // API (`GET /api/cluster/members` + promote/remove), which is the K3b companion;
-    // until it lands the operator plans + reports but does not yet execute.
+    // Observe the pods, and — in cluster mode — drive the next quorum-safe Raft
+    // membership transition (K3 core) through the executor (K3b): it fetches the
+    // live membership from the cluster API and promotes/removes/admits one step.
+    // With no admin token configured it plans + reports but doesn't execute.
     let pods = observe_pods(client, &ns, &name).await?;
     let ready = pods.iter().filter(|p| p.ready).count() as u32;
     if brc.spec.mode == ClusterMode::Cluster {
-        // TODO(K3b): fetch the live Raft configuration from the cluster API instead
-        // of the empty set (which keeps the planner in its safe "await bootstrap"
-        // state) and execute the returned action (mint join token / promote / remove).
-        let members: Vec<membership::Member> = Vec::new();
-        match membership::plan_next(brc.spec.replicas, &pods, &members) {
-            Some(action) => tracing::info!(
-                ?action,
-                "membership: next transition planned (executor lands in K3b)"
+        let root = brc.spec.root_pubkey.clone().unwrap_or_default();
+        match super::executor::step(client, &ns, &brc, &pods, &root).await {
+            Ok(Some(action)) => tracing::info!(?action, "membership: executed transition"),
+            Ok(None) => tracing::debug!(
+                "membership: converged, awaiting quorum, or no admin token configured"
             ),
-            None => tracing::debug!("membership: converged, or awaiting quorum/bootstrap"),
+            // A transient membership-API error must not fail the whole reconcile
+            // (workloads are already applied); back off and retry next requeue.
+            Err(err) => tracing::warn!(%err, "membership: executor step failed; will retry"),
         }
     }
 

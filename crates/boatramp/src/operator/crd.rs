@@ -61,6 +61,17 @@ pub struct BoatRampClusterSpec {
     /// the operator enforces this floor and a tenant CRD can never relax it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub posture: Option<String>,
+    /// Name of a `Secret` (same namespace) holding an admin control-plane token
+    /// under key `token`. The operator uses it to drive Raft membership
+    /// (`GET /api/cluster/members`, promote, remove) + mint join tickets. Absent ⇒
+    /// the operator plans + reports membership but does not execute it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token_secret: Option<String>,
+    /// The cluster **root public key** (`es256:`/`ed25519:` hex) — the anchor a
+    /// joining pod verifies the seed + members against. Required for the executor
+    /// to build join tickets; absent ⇒ it promotes/removes but does not admit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_pubkey: Option<String>,
 }
 
 /// Observed state of a [`BoatRampCluster`] — surfaced in `kubectl get brc`.

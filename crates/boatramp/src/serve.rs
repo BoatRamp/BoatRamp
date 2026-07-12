@@ -1357,7 +1357,13 @@ async fn run_cluster(
 
     // Decide founding vs joining vs resuming (F5): the single source of truth.
     let seeds_present = !cluster_cfg.seeds.is_empty();
-    let init_requested = args.cluster_init;
+    // The Kubernetes operator designates its **ordinal-0** StatefulSet pod as the
+    // founder (via the downward-API pod name) — every other ordinal joins. This
+    // designates the founder only; the node *identity* is still derived from the
+    // mesh key, so it is not the reverted per-pod-identity coupling.
+    let is_operator_founder = std::env::var("BOATRAMP_POD_NAME")
+        .is_ok_and(|name| name.rsplit('-').next() == Some("0"));
+    let init_requested = args.cluster_init || is_operator_founder;
     let action = crate::join::decide_startup(&crate::join::StartupInputs {
         has_durable_state: had_durable_state,
         // A node that has ever run keeps its durable store; a wiped volume loses
