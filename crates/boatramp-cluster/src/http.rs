@@ -28,8 +28,56 @@ use crate::mesh::MeshClients;
 use crate::messaging::StreamBus;
 use crate::raft::{ForwardError, Forwarder, NodeId, TypeConfig, WriteOp, WriteResponse};
 
-/// Static peer directory: `NodeId -> base URL` (e.g. `http://10.0.0.2:8080`).
-pub type Peers = Arc<BTreeMap<NodeId, String>>;
+/// A **live** peer directory: `NodeId -> mesh base URL` (e.g.
+/// `https://10.0.0.2:7000`). Mutable at runtime so dynamic-join members are added
+/// (and revoked members removed) without a static genesis map — the joiner
+/// populates it from the root-signed join response, and `admit` adds the joiner's
+/// advertised address so the leader can replicate back to it. Cheap to clone
+/// (shared) and read on every RPC dispatch. Addressing is advisory: the mesh TLS
+/// re-authenticates every dial by key regardless of the URL used to reach it.
+#[derive(Clone, Default)]
+pub struct Peers(Arc<std::sync::RwLock<BTreeMap<NodeId, String>>>);
+
+impl Peers {
+    /// A directory seeded with `initial` entries (empty for a pure dynamic-join
+    /// node that learns every peer at join time).
+    pub fn new(initial: BTreeMap<NodeId, String>) -> Self {
+        Peers(Arc::new(std::sync::RwLock::new(initial)))
+    }
+
+    /// The base URL for `node`, if known.
+    pub fn get(&self, node: NodeId) -> Option<String> {
+        self.0.read().expect("peers lock").get(&node).cloned()
+    }
+
+    /// Add or update `node`'s base URL (idempotent). Returns whether this changed
+    /// the directory (a new node or a changed address).
+    pub fn insert(&self, node: NodeId, url: String) -> bool {
+        let mut guard = self.0.write().expect("peers lock");
+        match guard.get(&node) {
+            Some(existing) if *existing == url => false,
+            _ => {
+                guard.insert(node, url);
+                true
+            }
+        }
+    }
+
+    /// Remove `node` from the directory (a revoked/removed member).
+    pub fn remove(&self, node: NodeId) {
+        self.0.write().expect("peers lock").remove(&node);
+    }
+
+    /// Whether `node` is known.
+    pub fn contains(&self, node: NodeId) -> bool {
+        self.0.read().expect("peers lock").contains_key(&node)
+    }
+
+    /// A point-in-time copy of the whole directory (for iteration/broadcast).
+    pub fn snapshot(&self) -> BTreeMap<NodeId, String> {
+        self.0.read().expect("peers lock").clone()
+    }
+}
 
 /// The peer's `ClientWriteError` (what `/raft/client-write` returns on a
 /// non-leader, carrying the leader hint).
@@ -149,7 +197,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
     async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
         HttpNetwork {
             mesh: self.mesh.clone(),
-            base_url: self.peers.get(&target).cloned().unwrap_or_default(),
+            base_url: self.peers.get(target).unwrap_or_default(),
             target,
         }
     }
@@ -341,13 +389,13 @@ impl StreamBus for HttpStreamBus {
         // Deliver to this node's own subscribers immediately.
         self.local.broadcast(topic, id, payload);
         // Relay to peers, fire-and-forget (a dropped hop is tolerated), each over
-        // that peer's pinned mutual-TLS connection.
-        for (peer, url) in self.peers.iter() {
-            if *peer == self.self_id {
+        // that peer's pinned mutual-TLS connection. Snapshot the live directory.
+        for (peer, url) in self.peers.snapshot() {
+            if peer == self.self_id {
                 continue;
             }
             // Skip an untrusted/unknown peer rather than dial it unauthenticated.
-            let Ok(client) = self.mesh.client(*peer) else {
+            let Ok(client) = self.mesh.client(peer) else {
                 continue;
             };
             let url = format!("{url}/stream/broadcast");
@@ -380,7 +428,7 @@ impl Forwarder for HttpForwarder {
                     }
                 },
             };
-            let Some(url) = self.peers.get(&leader) else {
+            let Some(url) = self.peers.get(leader) else {
                 return Err(ForwardError::LeaderNotInDirectory(leader));
             };
             // A client pinned to the leader's trusted key; if the leader isn't
@@ -392,7 +440,7 @@ impl Forwarder for HttpForwarder {
                     continue;
                 }
             };
-            match self.post(&client, url, &op).await {
+            match self.post(&client, &url, &op).await {
                 // The leader committed it.
                 Ok(Ok(resp)) => return Ok(resp),
                 // The peer was no longer leader (or election in flux) — retry.
@@ -442,6 +490,28 @@ mod tests {
             !write_capability_ok(Some(&authz), &none),
             "a trusted peer without the capability must be refused"
         );
+    }
+
+    /// The live peer directory adds, updates, removes, and snapshots members —
+    /// the dynamic-join replacement for the static genesis map.
+    #[test]
+    fn dynamic_peers_add_update_remove_and_snapshot() {
+        let peers = Peers::new(BTreeMap::from([(1u64, "https://a:7000".to_string())]));
+        assert_eq!(peers.get(1).as_deref(), Some("https://a:7000"));
+        assert!(peers.contains(1));
+        assert!(peers.get(2).is_none());
+
+        // A new node is a change; a redundant re-insert is not; a changed URL is.
+        assert!(peers.insert(2, "https://b:7000".into()));
+        assert!(!peers.insert(2, "https://b:7000".into()));
+        assert!(peers.insert(2, "https://b2:7000".into()));
+        assert_eq!(peers.get(2).as_deref(), Some("https://b2:7000"));
+
+        // Snapshot is a point-in-time copy; remove drops the entry.
+        assert_eq!(peers.snapshot().len(), 2);
+        peers.remove(1);
+        assert!(!peers.contains(1));
+        assert_eq!(peers.snapshot().len(), 1);
     }
 
     use crate::mesh::{MeshClients, MeshIdentity, MeshTls, TrustSet};
@@ -509,7 +579,7 @@ mod tests {
             peers.insert(id, url);
             listeners.push((id, listener));
         }
-        let peers: Peers = Arc::new(peers);
+        let peers: Peers = Peers::new(peers);
 
         let config = Arc::new(
             Config {
@@ -593,7 +663,7 @@ mod tests {
             peers.insert(id, url);
             listeners.push((id, listener));
         }
-        let peers: Peers = Arc::new(peers);
+        let peers: Peers = Peers::new(peers);
         let config = Arc::new(
             Config {
                 heartbeat_interval: 150,

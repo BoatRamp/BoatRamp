@@ -522,7 +522,7 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
         }
         .validate()?,
     );
-    let peers: Peers = Arc::new(peers);
+    let peers: Peers = Peers::new(peers);
 
     // Durable Raft log + state machine over the node-local store. The state
     // machine mirrors committed `mesh/trust/*` writes into the live trust set.
