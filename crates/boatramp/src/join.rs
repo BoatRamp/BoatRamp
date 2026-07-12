@@ -275,21 +275,7 @@ async fn join_via_seed(
     now: u64,
 ) -> Result<JoinResponseBody, JoinError> {
     let base = seed_base_url(seed);
-
-    // (1) Pin the seed against the root anchor (TOFU-capture → root-verify →
-    // confirm the attestation names the presented key). Reuses `auth pin`.
-    let attested_spki = pin_seed(&base, roots, now).await?;
-
-    // (2) A properly server-authenticated client for the join POST: the seed must
-    // present exactly the key its attestation named.
-    let peer: boatramp_rpktls::PeerId = 1;
-    let trust =
-        boatramp_rpktls::TrustSet::from_map(std::iter::once((peer, attested_spki)).collect());
-    let tls = boatramp_rpktls::client_config_server_auth(trust, peer)
-        .map_err(|e| JoinError::Seed(format!("{base}: {e}")))?;
-    let http = reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .build()?;
+    let http = pinned_client(&base, roots, now).await?;
 
     let resp = http
         .post(format!("{base}/api/cluster/join"))
@@ -317,6 +303,28 @@ async fn join_via_seed(
         });
     }
     Ok(resp.json().await?)
+}
+
+/// Pin a `--tls rpk` boatramp server against the root anchor set and return a
+/// reqwest client that will **only** talk to that verified key: TOFU-capture the
+/// presented key, fetch + root-verify its attestation, confirm the attestation
+/// names the captured key, then build a server-authenticated (pinned) client.
+/// Reused by the joiner and the Kubernetes operator's membership executor.
+pub(crate) async fn pinned_client(
+    base: &str,
+    roots: &[TokenPublicKey],
+    now: u64,
+) -> Result<reqwest::Client, JoinError> {
+    let attested_spki = pin_seed(base, roots, now).await?;
+    let peer: boatramp_rpktls::PeerId = 1;
+    let trust =
+        boatramp_rpktls::TrustSet::from_map(std::iter::once((peer, attested_spki)).collect());
+    let tls = boatramp_rpktls::client_config_server_auth(trust, peer)
+        .map_err(|e| JoinError::Seed(format!("{base}: {e}")))?;
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(JoinError::Http)
 }
 
 /// Fetch a seed's bootstrap attestation trust-on-first-use, verify it against the

@@ -23,9 +23,11 @@ permissions:
   attestations: write
 
 env:
-  # Full set on Linux (incl. the cfg-gated Linux compute backends); the portable
-  # core on macOS/Windows (compute *execution* is Linux-only).
-  LINUX_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,http3,acme-dns,bundler,oidc"
+  # Full set on Linux (incl. the cfg-gated Linux compute backends + the in-binary
+  # Kubernetes `operator`, so the same image both serves cluster pods and runs the
+  # controller); the portable core on macOS/Windows (compute *execution* +
+  # operator are Linux-only).
+  LINUX_FEATURES: "tls,handlers,cluster,operator,s3,cloudflare-kv,compression,http3,acme-dns,bundler,oidc"
   PORTABLE_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,bundler,oidc"
 
 jobs:

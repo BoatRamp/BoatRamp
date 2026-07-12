@@ -26,8 +26,8 @@ use k8s_openapi::api::autoscaling::v2::{
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
     HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PodSpec, PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    PodSpec, PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume,
+    VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -219,12 +219,22 @@ fn container(brc: &BoatRampCluster) -> Container {
         // Set the entrypoint explicitly so the pod works regardless of whether the
         // image declares one (`args` alone need an image ENTRYPOINT).
         command: Some(vec!["boatramp".to_string()]),
-        args: Some(
-            ["serve", "--config", &format!("{CONFIG_MOUNT}/boatramp.cfg")]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        ),
+        args: Some({
+            let mut args = vec![
+                "serve".to_string(),
+                "--config".to_string(),
+                format!("{CONFIG_MOUNT}/boatramp.cfg"),
+            ];
+            // Cluster mode serves its control plane over RPK-TLS (`--tls rpk`) so
+            // the operator (and joining pods) can pin it against the root anchor and
+            // fetch the root-signed bootstrap attestation the dynamic join needs —
+            // every pod holds the root private key (from `authSecret`) to self-attest.
+            if brc.spec.mode == ClusterMode::Cluster {
+                args.push("--tls".to_string());
+                args.push("rpk".to_string());
+            }
+            args
+        }),
         ports: Some({
             let mut ports = vec![ContainerPort {
                 name: Some("http".to_string()),
@@ -292,8 +302,22 @@ fn container(brc: &BoatRampCluster) -> Container {
             ]
         }).into_iter().flatten())
         .collect()),
-        liveness_probe: Some(http_probe("/healthz")),
-        readiness_probe: Some(http_probe("/readyz")),
+        // Cluster mode serves the control plane over RPK-TLS (RFC 7250 raw public
+        // keys), which the kubelet's HTTP prober can't speak — so probe the port
+        // with a TCP socket instead. A cluster node binds its listener only *after*
+        // it has founded/joined and is serving, so "port open" is exactly the
+        // right readiness gate (and it drives StatefulSet OrderedReady sequencing).
+        // Stateless mode is plain HTTP → the real `/healthz` + `/readyz` endpoints.
+        liveness_probe: Some(if brc.spec.mode == ClusterMode::Cluster {
+            tcp_probe()
+        } else {
+            http_probe("/healthz")
+        }),
+        readiness_probe: Some(if brc.spec.mode == ClusterMode::Cluster {
+            tcp_probe()
+        } else {
+            http_probe("/readyz")
+        }),
         volume_mounts: Some(vec![
             VolumeMount {
                 name: "config".to_string(),
@@ -315,6 +339,21 @@ fn http_probe(path: &str) -> Probe {
     Probe {
         http_get: Some(HTTPGetAction {
             path: Some(path.to_string()),
+            port: IntOrString::Int(PORT),
+            ..Default::default()
+        }),
+        period_seconds: Some(10),
+        ..Default::default()
+    }
+}
+
+/// A TCP-socket probe on the control-plane port — for cluster mode, whose RPK-TLS
+/// listener the kubelet's HTTP prober can't speak. The listener binds only once
+/// the node is founded/joined and serving, so an open port is a sound readiness
+/// signal.
+fn tcp_probe() -> Probe {
+    Probe {
+        tcp_socket: Some(TCPSocketAction {
             port: IntOrString::Int(PORT),
             ..Default::default()
         }),
@@ -523,20 +562,63 @@ mod tests {
         let retain = spec.persistent_volume_claim_retention_policy.as_ref().unwrap();
         assert_eq!(retain.when_deleted.as_deref(), Some("Retain"));
         assert_eq!(retain.when_scaled.as_deref(), Some("Retain"));
-        // Probes wired to the real endpoints.
+        // Cluster mode serves RPK-TLS, so probes are TCP-socket (see
+        // `cluster_pods_serve_rpk_tls_and_probe_by_tcp` for the full contract).
         let c = &spec.template.spec.unwrap().containers[0];
-        assert_eq!(
-            c.liveness_probe.as_ref().unwrap().http_get.as_ref().unwrap().path.as_deref(),
-            Some("/healthz")
-        );
-        assert_eq!(
-            c.readiness_probe.as_ref().unwrap().http_get.as_ref().unwrap().path.as_deref(),
-            Some("/readyz")
-        );
+        assert!(c.liveness_probe.as_ref().unwrap().tcp_socket.is_some());
+        assert!(c.readiness_probe.as_ref().unwrap().tcp_socket.is_some());
         // Owned by the CR ⇒ garbage-collected with it.
         let owners = sts.metadata.owner_references.unwrap();
         assert_eq!(owners[0].kind, "BoatRampCluster");
         assert_eq!(owners[0].controller, Some(true));
+    }
+
+    #[test]
+    fn cluster_pods_serve_rpk_tls_and_probe_by_tcp() {
+        // Cluster mode: the control plane is `--tls rpk` (so the operator + joiners
+        // can pin it), and — because the kubelet can't HTTP-probe an RPK-TLS port —
+        // liveness/readiness are TCP-socket probes on the control-plane port.
+        let brc = cluster("db", ClusterMode::Cluster, 3);
+        let c = stateful_set(&brc, 0)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers
+            .remove(0);
+        let args = c.args.unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "serve".to_string(),
+                "--config".to_string(),
+                format!("{CONFIG_MOUNT}/boatramp.cfg"),
+                "--tls".to_string(),
+                "rpk".to_string(),
+            ]
+        );
+        assert!(c.readiness_probe.as_ref().unwrap().tcp_socket.is_some());
+        assert!(c.readiness_probe.as_ref().unwrap().http_get.is_none());
+        assert!(c.liveness_probe.as_ref().unwrap().tcp_socket.is_some());
+
+        // Stateless mode stays plain HTTP: no `--tls rpk`, real `/readyz` probe.
+        let web = cluster("web", ClusterMode::Stateless, 2);
+        let wc = deployment(&web)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers
+            .remove(0);
+        assert!(!wc.args.unwrap().contains(&"rpk".to_string()));
+        let rp = wc.readiness_probe.unwrap();
+        assert!(rp.tcp_socket.is_none());
+        assert_eq!(
+            rp.http_get.unwrap().path.as_deref(),
+            Some("/readyz")
+        );
     }
 
     #[test]

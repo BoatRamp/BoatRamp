@@ -224,11 +224,8 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
         }
     }
 
-    let phase = if ready >= brc.spec.replicas {
-        "Ready"
-    } else {
-        "Reconciling"
-    };
+    let converged = ready >= brc.spec.replicas;
+    let phase = if converged { "Ready" } else { "Reconciling" };
     update_status(
         &Api::<BoatRampCluster>::namespaced(client.clone(), &ns),
         &name,
@@ -237,7 +234,13 @@ async fn reconcile(brc: Arc<BoatRampCluster>, ctx: Arc<Ctx>) -> Result<Action> {
     )
     .await?;
 
-    Ok(Action::requeue(Duration::from_secs(300)))
+    // While the cluster is still forming/converging (pods joining, learners
+    // awaiting promotion), requeue quickly so the executor rolls the next join
+    // ticket + drives the next membership step promptly — the Controller watches
+    // the CR, not the pods, so readiness transitions don't otherwise wake it. Once
+    // steady (all replicas ready), fall back to a slow drift-correcting requeue.
+    let requeue = if converged { 300 } else { 10 };
+    Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
 /// List the cluster's pods and derive [`membership::PodState`]s: the StatefulSet

@@ -4,8 +4,9 @@
 //! deletes the site on teardown, so `kubectl delete site …` cleans up the routing.
 //!
 //! The target cluster is `spec.cluster`, or the sole `BoatRampCluster` in the
-//! namespace. Reaching it reuses the membership executor's admin endpoint
-//! (`spec.adminTokenSecret`); without one the reconciler reports "no admin token".
+//! namespace. Reaching it reuses the membership executor's **pinned pod-0 channel**
+//! (`spec.adminTokenSecret` + `spec.rootPubkey` — an RPK-TLS client authenticated to
+//! the root); without them the reconciler reports "no admin token".
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,15 +84,15 @@ async fn resolve_cluster(
     }
 }
 
-/// Apply: PUT the site config (its domains) to the cluster's control plane.
+/// Apply: PUT the site config (its domains) to the cluster's control plane over
+/// the pinned pod-0 channel.
 async fn apply(client: &Client, ns: &str, site: &Site) -> Result<Action> {
     let brc = resolve_cluster(client, ns, site.spec.cluster.as_deref()).await?;
     let name = site.name_any();
-    match executor::admin_endpoint(client, ns, &brc).await? {
-        Some((base, token)) => {
+    match executor::pinned_admin_pod0(client, ns, &brc).await? {
+        Some((http, base, token)) => {
             let cfg = site_config_from_domains(&site.spec.domains);
-            reqwest::Client::new()
-                .put(format!("{base}/api/sites/{name}/config"))
+            http.put(format!("{base}/api/sites/{name}/config"))
                 .bearer_auth(&token)
                 .json(&cfg)
                 .send()
@@ -109,8 +110,8 @@ async fn apply(client: &Client, ns: &str, site: &Site) -> Result<Action> {
 async fn cleanup(client: &Client, ns: &str, site: &Site) -> Result<Action> {
     let name = site.name_any();
     if let Ok(brc) = resolve_cluster(client, ns, site.spec.cluster.as_deref()).await {
-        if let Ok(Some((base, token))) = executor::admin_endpoint(client, ns, &brc).await {
-            let _ = reqwest::Client::new()
+        if let Ok(Some((http, base, token))) = executor::pinned_admin_pod0(client, ns, &brc).await {
+            let _ = http
                 .delete(format!("{base}/api/sites/{name}"))
                 .bearer_auth(&token)
                 .send()

@@ -64,11 +64,14 @@ spec:
 ```
 
 The operator renders a `[cluster]` config into the pods (so `serve` runs the
-embedded Raft node), wires the root private key + bootstrap secret from
-`authSecret`, exposes the mesh port on the headless Service, and gives each pod
-its own dialable advertise address via the downward API — so the founder can sign
-and joiners can be reached. The control plane must run `--tls rpk` for the
-attestation-pinned join; wiring that end-to-end in the operator is in progress.
+embedded Raft node), runs each pod's control plane over **RPK-TLS** (`--tls rpk`),
+wires the root private key + bootstrap secret from `authSecret`, exposes the mesh
+port on the headless Service, and gives each pod its own dialable advertise
+address via the downward API — so the founder can sign, self-attest, and joiners
+can be reached. Because the control plane is RPK-TLS (RFC 7250 raw public keys),
+which the kubelet's HTTP prober can't speak, cluster-mode pods are probed with a
+**TCP-socket** readiness check — a node binds its listener only after it has
+founded/joined and is serving, so "port open" is the right readiness gate.
 
 The reconciler:
 
@@ -77,15 +80,21 @@ The reconciler:
 2. Designates **pod-0 as the founder** — the pod reads its own name from the
    downward API (`BOATRAMP_POD_NAME`); ordinal 0 founds, every other ordinal
    joins. (The node *identity* is still derived from each pod's mesh key.)
-3. As pods become ready, drives one **quorum-safe** membership transition per
-   reconcile against the cluster API: add the joining pod as a learner (by
-   rolling a fresh single-use join ticket into the `<name>-join` Secret the pods
-   read as `BOATRAMP_CLUSTER_JOIN`), promote a caught-up learner to a voter, or —
-   on scale-down — remove an out-of-range member *before* its pod is deleted. It
+3. Reaches every pod's control plane over an **RPK-TLS channel pinned to that
+   pod's root-attested key** — the same attestation-pin a joiner uses — so no
+   membership call trusts an unauthenticated endpoint.
+4. Keeps a fresh single-use **join ticket** in the `<name>-join` Secret (which
+   the pods read as `BOATRAMP_CLUSTER_JOIN`) while the cluster is below its
+   desired size, so a booting joiner can self-join at startup; its redemption
+   adds it as a Raft learner on the leader.
+5. Drives one **quorum-safe** membership transition per reconcile against the
+   cluster API — promote a caught-up learner to a voter (on the leader), or, on
+   scale-down, remove an out-of-range member *before* its pod is deleted. It
    never acts without quorum and never removes the last voter.
 
 Without `adminTokenSecret`/`rootPubkey` the operator still reconciles the
-workloads and **plans + reports** membership, but does not execute it.
+workloads and **plans + reports** membership, but does not execute it (both are
+needed: the token to authenticate, the root pubkey to pin the pods' RPK-TLS).
 
 ## Observe
 
@@ -117,10 +126,12 @@ spec:
     - "*.preview.example.com"  # → wildcard
 ```
 
-The operator resolves the target `BoatRampCluster`, uses its `adminTokenSecret`
-to `PUT` the site config, and reports `.status.phase`. (`kubectl get site` shows
-it.) Publishing content to the site is still a `boatramp sync` / CI deploy — the
-`Site` CR governs its identity + domains, not its deployments.
+The operator resolves the target `BoatRampCluster` and `PUT`s the site config over
+the same **pinned RPK-TLS channel** to the cluster's pod-0 that the membership
+executor uses (`adminTokenSecret` + `rootPubkey`), then reports `.status.phase`.
+(`kubectl get site` shows it.) Publishing content to the site is still a
+`boatramp sync` / CI deploy — the `Site` CR governs its identity + domains, not
+its deployments.
 
 > **`Function` (FaaS):** the `Function` CRD is installed and watched, but its
 > apply path awaits the FaaS backend (`PLAN-faas`); today it reports a `Pending`

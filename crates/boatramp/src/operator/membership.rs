@@ -160,6 +160,9 @@ pub struct ApiMember {
     pub voter: bool,
     /// Whether a learner has caught up to the leader (ready to promote).
     pub caught_up: bool,
+    /// Whether this member is the current leader (membership changes must target
+    /// the leader).
+    pub leader: bool,
     /// The member's mesh URL — its host is `<statefulset>-<ordinal>.<svc>…`.
     pub addr: Option<String>,
 }
@@ -262,12 +265,14 @@ mod tests {
                 node_id: 0xAA,
                 voter: true,
                 caught_up: true,
+                leader: true,
                 addr: Some("https://sts-0.svc:7000".into()),
             },
             ApiMember {
                 node_id: 0xBB,
                 voter: false,
                 caught_up: true,
+                leader: false,
                 addr: Some("https://sts-1.svc:7000".into()),
             },
             // A member with no ordinal-encoding address is dropped.
@@ -275,6 +280,7 @@ mod tests {
                 node_id: 0xCC,
                 voter: false,
                 caught_up: false,
+                leader: false,
                 addr: Some("https://10.0.0.9:7000".into()),
             },
         ];

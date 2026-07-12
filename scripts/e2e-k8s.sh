@@ -55,13 +55,23 @@ helm upgrade --install boatramp-operator "$ROOT/charts/boatramp-operator" \
   --set image.pullPolicy=IfNotPresent --wait --timeout 120s
 kubectl -n "$NS" rollout status deploy/boatramp-operator --timeout=120s
 
-log "Provision the root key + admin token secret"
+log "Provision the root key + admin token + auth secrets"
 root_priv="$(docker run --rm "$IMAGE" auth init 2>/dev/null | sed -n 's/^BOATRAMP_AUTH_ROOT_PRIVATE_KEY=//p')"
 root_pub="$(docker run --rm "$IMAGE" auth pubkey --private-key "$root_priv" 2>/dev/null)"
-# A bootstrap-minted admin token would need the cluster running first; for the
-# e2e we seed a token the operator uses to drive membership. (In production, mint
-# it via `token bootstrap` against the founded cluster.)
-kubectl -n "$NS" create secret generic prod-admin --from-literal=token=placeholder \
+# A real admin token, minted OFFLINE with the root key (the executor uses it to
+# authenticate to /api/cluster/*). No `cnf`, so no DPoP proof is required — plain
+# bearer. (In production you'd instead `token bootstrap` against the founded
+# cluster; offline mint is the air-gap/CI path and needs no running cluster.)
+admin_token="$(docker run --rm -e BOATRAMP_AUTH_ROOT_PRIVATE_KEY="$root_priv" "$IMAGE" \
+  token mint --role admin --ttl-secs 86400 2>/dev/null)"
+kubectl -n "$NS" create secret generic prod-admin --from-literal=token="$admin_token" \
+  --dry-run=client -o yaml | kubectl apply -f -
+# The auth Secret the pods read: the root PRIVATE key (the founder signs join
+# tokens / attestations / member assertions with it, and every pod self-attests
+# its RPK-TLS control-plane key) + a bootstrap secret. Referenced by `authSecret`.
+kubectl -n "$NS" create secret generic prod-auth \
+  --from-literal=root-private-key="$root_priv" \
+  --from-literal=bootstrap-secret="$(openssl rand -hex 16)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 log "Found a 3-node cluster"
@@ -75,6 +85,7 @@ spec:
   storage: 1Gi
   posture: dev
   rootPubkey: "$root_pub"
+  authSecret: prod-auth
   adminTokenSecret: prod-admin
 EOF
 

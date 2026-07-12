@@ -92,6 +92,11 @@ handlers = [
 cluster = [
   "handlers",
   "slatedb",
+  # The dynamic join pins a seed's **control plane** over RPK-TLS (`--tls rpk`) —
+  # it TOFU-captures the seed's presented TLS key and verifies its root-signed
+  # attestation — so cluster mode fundamentally needs the `tls` serve backend
+  # (`serve_rpk`). Without it a joiner cannot pin a seed, so a cluster can't form.
+  "tls",
   "dep:boatramp-cluster",
   "boatramp-cluster/http",
   "dep:axum",
