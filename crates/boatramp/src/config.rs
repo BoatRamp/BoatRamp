@@ -229,11 +229,6 @@ impl Default for ComputeConfig {
 #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterConfig {
-    /// This node's stable id. **Legacy/static-genesis only** — in the dynamic-join
-    /// model the id is *derived* from the node's mesh key (`derive_node_id`), so
-    /// leave it `0` (the default) and let the node self-identify. Removed in CJ-5.
-    #[serde(default)]
-    pub node_id: u64,
     /// Address to bind this node's Raft **peer mesh** on (the `/raft/*` +
     /// `/stream/*` endpoints) — distinct from the public `serve.addr`.
     pub listen: SocketAddr,
@@ -241,67 +236,30 @@ pub struct ClusterConfig {
     /// keys that define this cluster's identity (a cluster *is* its root key).
     /// Every join/trust decision verifies against this set. Empty ⇒ falls back to
     /// `serve.auth_root_public_key` (the single-anchor default). A *set* enables
-    /// make-before-break root rotation (CJ-5). Consumed by the CJ-3 join-at-startup
-    /// wiring.
+    /// make-before-break root rotation.
     #[serde(default)]
-    #[allow(dead_code)]
     pub root_pubkeys: Vec<String>,
     /// **Seeds** — control-plane addresses of existing cluster members
     /// (`host:port`), any of which can admit this node. Present ⇒ this node
     /// **joins** (redeems its `join_token`); absent + no durable state + explicit
-    /// init ⇒ it **founds**. There is no peer map: members are learned from the
-    /// root-signed join response. Consumed by the CJ-3 join-at-startup wiring.
+    /// `--cluster-init` ⇒ it **founds**. There is no peer map: members are learned
+    /// from the root-signed join response.
     #[serde(default)]
-    #[allow(dead_code)]
     pub seeds: Vec<String>,
     /// The single-use bearer **join token** used when `seeds` are set. Keeps the
     /// secret out of the file via a prefix: `env:VAR`, `path:/file`, or an inline
-    /// literal (#6). Consumed by the CJ-3 join-at-startup wiring.
+    /// literal. Usually supplied via `serve --cluster-join <ticket>` instead.
     #[serde(default)]
-    #[allow(dead_code)]
     pub join_token: Option<String>,
-    /// Static peer directory (the **genesis seed**): every node's id → its base
-    /// URL + mesh public key, e.g.
-    /// `"1": (url: "https://10.0.0.1:7000", pubkey: "…hex…")`. Keys are strings
-    /// (parsed to node ids at serve time). The `pubkey` (the node's Ed25519 mesh
-    /// identity, printed at startup) seeds the mesh **trust set** — the sole
-    /// authority on who may speak on the mesh. Consulted only at
-    /// genesis; once the cluster has durable state the live trust set is
-    /// authoritative.
-    #[serde(default)]
-    pub peers: std::collections::BTreeMap<String, PeerEntry>,
-    /// The **voting quorum**: node ids that vote (e.g. `[1, 2, 3]`). Peers not
-    /// listed join as **learners** — they replicate + serve local reads but
-    /// don't vote, so far-region nodes give local reads without a WAN quorum.
-    /// Empty (default) ⇒ every peer votes.
-    #[serde(default)]
-    pub voters: Vec<u64>,
     /// Directory for this node's **durable** Raft log/state store (node-local;
     /// distinct from the replicated control plane). Default
     /// `<data-dir>/raft`.
     #[serde(default)]
     pub store_dir: Option<PathBuf>,
-    /// Set on exactly one node at first cluster bring-up to initialize
-    /// membership. A no-op on a node already part of a cluster (restart).
-    #[serde(default)]
-    pub bootstrap: bool,
     /// Mesh identity + TLS settings. Absent ⇒ defaults (identity key
     /// auto-generated under `<data-dir>/mesh/identity.key`).
     #[serde(default)]
     pub mesh: Option<MeshConfig>,
-}
-
-/// One entry in the cluster peer directory: a node's mesh address + identity.
-#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeerEntry {
-    /// The node's mesh base URL, e.g. `https://10.0.0.1:7000` (mesh TLS ⇒ https).
-    pub url: String,
-    /// The node's mesh public key (Ed25519 `SubjectPublicKeyInfo`, hex-encoded) —
-    /// its authenticated identity. Print a node's key at startup / with the
-    /// cluster tooling. Not a secret.
-    pub pubkey: String,
 }
 
 /// `[cluster.mesh]` — mesh identity + TLS knobs.
@@ -768,41 +726,37 @@ mod tests {
     }
 
     #[test]
-    fn cluster_section_parses_node_peers_and_bootstrap() {
+    fn cluster_section_parses_the_dynamic_join_shape() {
         let cfg = server(
             r#"(
                 cluster: (
-                    node_id: 2,
                     listen: "10.0.0.2:7000",
-                    bootstrap: true,
-                    voters: [1, 2, 3],
-                    peers: {
-                        "1": (url: "https://10.0.0.1:7000", pubkey: "aa01"),
-                        "2": (url: "https://10.0.0.2:7000", pubkey: "bb02"),
-                        "3": (url: "https://10.0.0.3:7000", pubkey: "cc03"),
-                    },
+                    root_pubkeys: ["es256:03a1"],
+                    seeds: ["https://10.0.0.1:8080"],
+                    join_token: "env:BOATRAMP_JOIN_TOKEN",
                 ),
             )"#,
         );
         let cluster = cfg.cluster.unwrap();
-        assert_eq!(cluster.node_id, 2);
         assert_eq!(
             cluster.listen,
             "10.0.0.2:7000".parse::<std::net::SocketAddr>().unwrap()
         );
-        assert!(cluster.bootstrap);
-        assert_eq!(cluster.peers.len(), 3);
-        assert_eq!(
-            cluster.peers.get("1").map(|p| p.url.as_str()),
-            Some("https://10.0.0.1:7000")
-        );
-        assert_eq!(
-            cluster.peers.get("1").map(|p| p.pubkey.as_str()),
-            Some("aa01")
-        );
-        assert_eq!(cluster.voters, vec![1, 2, 3]);
+        assert_eq!(cluster.root_pubkeys, vec!["es256:03a1".to_string()]);
+        assert_eq!(cluster.seeds, vec!["https://10.0.0.1:8080".to_string()]);
+        assert_eq!(cluster.join_token.as_deref(), Some("env:BOATRAMP_JOIN_TOKEN"));
         // store_dir defaults to None (→ <data-dir>/raft at serve time).
         assert!(cluster.store_dir.is_none());
+    }
+
+    #[test]
+    fn cluster_section_founds_with_just_a_listen_addr() {
+        // A founder needs no seeds/token — just where to bind the mesh.
+        let cfg = server(r#"( cluster: ( listen: "0.0.0.0:7000" ) )"#);
+        let cluster = cfg.cluster.unwrap();
+        assert!(cluster.seeds.is_empty());
+        assert!(cluster.root_pubkeys.is_empty());
+        assert!(cluster.join_token.is_none());
     }
 
     #[test]

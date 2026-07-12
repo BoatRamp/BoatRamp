@@ -145,15 +145,16 @@ defined by its **root of trust** — there is no peer map; nodes self-identify a
 | `join_token` | string | — | The single-use bearer join token used when `seeds` are set. Keep the secret out of the file: `env:VAR`, `path:/file`, or an inline literal. |
 | `store_dir` | path | `<data-dir>/raft` | This node's durable Raft store. Never shared between nodes. |
 | `mesh` | table | — | Mesh identity + TLS: `key_file`, `key_rotation`, `join_token_ttl`, `gate_client_writes`. |
-| `node_id` | integer | derived | **Legacy/static-genesis only.** Leave unset — the id is derived from the node's mesh key. |
 
-Founding and joining are driven from the command line — `serve --cluster-init`
-founds a new cluster, `serve --cluster-join <ticket>` joins one (from
-`cluster add`). The legacy static-genesis fields `peers` / `voters` / `bootstrap`
-are still parsed for back-compat but are superseded by the dynamic-join model.
+The node id is **derived** from the node's mesh key — there is no `node_id`
+field. Founding and joining are driven from the command line: `serve
+--cluster-init` founds a new cluster, `serve --cluster-join <ticket>` joins one
+(from `cluster add`). The old static-genesis fields (`node_id`, `peers`,
+`voters`, `bootstrap`) have been **removed**.
 
 > **Warning:** a non-loopback `listen` refuses to start with an empty trust set
-> (no `root_pubkeys`/adopted members). Never point two nodes at one `store_dir`.
+> (found with `--cluster-init` or join with `--cluster-join <ticket>`). Never
+> point two nodes at one `store_dir`.
 
 See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
 [Mesh identity & the single root anchor](../explanation/SECURITY-mesh-identity.md).

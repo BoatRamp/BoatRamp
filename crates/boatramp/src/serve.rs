@@ -68,10 +68,6 @@ pub enum Error {
     /// A token root **public** key (hex) failed to parse.
     #[error("invalid auth root public key: {0}")]
     AuthPubKey(String),
-    /// A `[cluster.peers]` directory key was not a node id (u64).
-    #[cfg(feature = "cluster")]
-    #[error("[cluster.peers] key {0:?} is not a node id (u64)")]
-    BadPeerId(String),
     /// A raw-public-key TLS error — building the peer-mesh identity/config
     /// (`cluster`) or the `--tls rpk` bootstrap identity/config (`tls`). Both use
     /// the same RPK stack (`boatramp_rpktls`), so `mesh::MeshError` is an alias of
@@ -81,11 +77,11 @@ pub enum Error {
     RpkTls(#[from] boatramp_rpktls::RpkError),
     /// Refusing to serve the peer mesh on a non-loopback address with no trust set
     /// configured — that would expose an unauthenticated control plane.
-    /// Add each peer's `pubkey` to `[cluster.peers]`.
+    /// The peer mesh has no trust anchor on a non-loopback bind.
     #[cfg(feature = "cluster")]
     #[error(
         "refusing to serve the peer mesh on {0} (non-loopback) with an empty trust \
-         set: add each peer's `pubkey` to [cluster.peers]"
+         set: found with --cluster-init or join with --cluster-join <ticket>"
     )]
     MeshUnconfigured(std::net::SocketAddr),
     /// The cluster startup decision failed closed (F5) or a join could not be
@@ -1326,15 +1322,10 @@ async fn run_cluster(
 
     use boatramp_cluster::mesh::{self, MeshIdentity, MeshTls, TrustSet};
 
-    // Parse the string-keyed peer directory, splitting addressing (`url`) from
-    // identity (`pubkey` → the genesis mesh trust set).
+    // No static peer map: the peer directory + mesh trust set start empty and are
+    // populated by founding (self), joining (adopted members), or replication.
     let mut peers = std::collections::BTreeMap::new();
     let mut genesis_trust = std::collections::BTreeMap::new();
-    for (id, entry) in &cluster_cfg.peers {
-        let id: u64 = id.parse().map_err(|_| Error::BadPeerId(id.clone()))?;
-        peers.insert(id, entry.url.clone());
-        genesis_trust.insert(id, mesh::parse_public_key(&entry.pubkey)?);
-    }
 
     // Load (or generate + persist `0600`) this node's Ed25519 mesh identity.
     let mesh_cfg = cluster_cfg.mesh.clone().unwrap_or_default();
@@ -1344,13 +1335,9 @@ async fn run_cluster(
         .unwrap_or_else(|| data_dir.join("mesh/identity.key"));
     let identity = MeshIdentity::load_or_generate(&key_file)?;
 
-    // This node's Raft id: the legacy explicit `node_id` if set, else DERIVED from
-    // its mesh key (dynamic-join self-identity — no config id needed).
-    let node_id = if cluster_cfg.node_id != 0 {
-        cluster_cfg.node_id
-    } else {
-        boatramp_cluster::raft::derive_node_id(identity.public_key())
-    };
+    // This node's Raft id is DERIVED from its mesh key (dynamic-join self-identity
+    // — no config id).
+    let node_id = boatramp_cluster::raft::derive_node_id(identity.public_key());
     tracing::info!(
         node_id,
         pubkey = %identity.public_key_hex(),
@@ -1370,7 +1357,7 @@ async fn run_cluster(
 
     // Decide founding vs joining vs resuming (F5): the single source of truth.
     let seeds_present = !cluster_cfg.seeds.is_empty();
-    let init_requested = cluster_cfg.bootstrap || args.cluster_init;
+    let init_requested = args.cluster_init;
     let action = crate::join::decide_startup(&crate::join::StartupInputs {
         has_durable_state: had_durable_state,
         // A node that has ever run keeps its durable store; a wiped volume loses
@@ -1452,9 +1439,8 @@ async fn run_cluster(
             }
         }
         crate::join::StartupAction::Resume => {
-            // Durable state is authoritative; `build_node` hydrates trust from it.
-            // Legacy static configs still populate `peers`/`genesis_trust` above.
-            do_bootstrap = cluster_cfg.bootstrap;
+            // Durable state is authoritative; `build_node` hydrates trust + the
+            // peer directory from it. Never re-bootstraps.
             tracing::info!(node_id, "cluster: resuming from durable state");
         }
     }
@@ -1493,7 +1479,9 @@ async fn run_cluster(
             peers,
             // Empty ⇒ every peer votes; otherwise the listed ids are the voting
             // quorum and the rest join as read-only learners (multi-region).
-            voters: cluster_cfg.voters.iter().copied().collect(),
+            // Founding uses the self-only peer map ⇒ this node is the sole voter;
+            // a joiner's membership arrives from the seed. No static voter list.
+            voters: std::collections::BTreeSet::new(),
             durable_kv,
             storage: storage.clone(),
             mesh: mesh_tls.clone(),
@@ -1516,7 +1504,7 @@ async fn run_cluster(
         axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(mesh_tls.server()?));
     let listen = cluster_cfg.listen;
     tracing::info!(
-        node_id = cluster_cfg.node_id, %listen,
+        node_id, %listen,
         "cluster: serving peer mesh (mutual TLS)"
     );
     tokio::spawn(async move {
@@ -1550,7 +1538,7 @@ async fn run_cluster(
         let rotate_node = node.clone();
         // Stagger the first rotation by node id (seconds) so a fleet booted
         // together doesn't rotate in lockstep; then every `interval`.
-        let stagger = std::time::Duration::from_secs(cluster_cfg.node_id % 60);
+        let stagger = std::time::Duration::from_secs(node_id % 60);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval + stagger).await;
@@ -1628,7 +1616,7 @@ async fn run_cluster(
             config.compute.as_ref(),
             compute_storage,
             &data_dir,
-            cluster_cfg.node_id,
+            node_id,
             !options.posture.allow_shared_kernel_compute,
             options.daemon_runtime.clone(),
         )
