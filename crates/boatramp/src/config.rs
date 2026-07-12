@@ -744,7 +744,10 @@ mod tests {
         );
         assert_eq!(cluster.root_pubkeys, vec!["es256:03a1".to_string()]);
         assert_eq!(cluster.seeds, vec!["https://10.0.0.1:8080".to_string()]);
-        assert_eq!(cluster.join_token.as_deref(), Some("env:BOATRAMP_JOIN_TOKEN"));
+        assert_eq!(
+            cluster.join_token.as_deref(),
+            Some("env:BOATRAMP_JOIN_TOKEN")
+        );
         // store_dir defaults to None (→ <data-dir>/raft at serve time).
         assert!(cluster.store_dir.is_none());
     }

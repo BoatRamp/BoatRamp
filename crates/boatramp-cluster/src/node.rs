@@ -351,7 +351,10 @@ impl ClusterNode {
         use boatramp_core::kv::KvStore;
         self.peers.insert(self.node_id, url.to_string());
         self.kv
-            .put(&crate::raft::addr_key(self.node_id), url.as_bytes().to_vec())
+            .put(
+                &crate::raft::addr_key(self.node_id),
+                url.as_bytes().to_vec(),
+            )
             .await?;
         Ok(())
     }
@@ -440,7 +443,10 @@ impl ClusterNode {
         for key in keys {
             // The trusted pubkey is the last path segment of the trust key.
             if let Some(pubkey_hex) = key.rsplit('/').next() {
-                batch.push(KvWriteOp::Put(crate::raft::revoked_key(pubkey_hex), Vec::new()));
+                batch.push(KvWriteOp::Put(
+                    crate::raft::revoked_key(pubkey_hex),
+                    Vec::new(),
+                ));
             }
             batch.push(KvWriteOp::Delete(key));
         }
@@ -1310,11 +1316,18 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(is_member, "the joiner must be added to the leader's membership");
+        assert!(
+            is_member,
+            "the joiner must be added to the leader's membership"
+        );
 
         // A write on the leader replicates to the joiner (its local read sees it)
         // — proof the joiner caught up with no static peer map.
-        node1.kv.put("dyn/join/key", b"replicated".to_vec()).await.unwrap();
+        node1
+            .kv
+            .put("dyn/join/key", b"replicated".to_vec())
+            .await
+            .unwrap();
         let mut saw = false;
         for _ in 0..100 {
             if node2.kv.get("dyn/join/key").await.unwrap().as_deref()
@@ -1325,7 +1338,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(saw, "the write must replicate to the dynamically-joined node");
+        assert!(
+            saw,
+            "the write must replicate to the dynamically-joined node"
+        );
 
         // The joiner learned to trust its own key + the founder from the log.
         for _ in 0..100 {
@@ -1340,7 +1356,10 @@ mod tests {
         );
 
         // The leader recorded the joiner's advertised address immediately.
-        assert_eq!(node1.peer_addrs().get(&node2_id).map(String::as_str), Some(url2.as_str()));
+        assert_eq!(
+            node1.peer_addrs().get(&node2_id).map(String::as_str),
+            Some(url2.as_str())
+        );
         // …and the joiner learns the founder's address from the replicated
         // directory (`mesh/addr/*`), not just the join response — so routing is
         // durable, not a one-shot seed.
@@ -1353,7 +1372,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(learned, "the joiner learns member addresses from replication");
+        assert!(
+            learned,
+            "the joiner learns member addresses from replication"
+        );
 
         node1.raft.shutdown().await.unwrap();
         node2.raft.shutdown().await.unwrap();

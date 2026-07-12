@@ -177,7 +177,8 @@ impl RpkIdentity {
     /// signing a challenge — without the private key ever leaving the node. Verify
     /// with [`verify_signature`] against the advertised SPKI public key.
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, RpkError> {
-        let kp = Ed25519KeyPair::from_pkcs8(&self.pkcs8).map_err(|e| RpkError::Key(e.to_string()))?;
+        let kp =
+            Ed25519KeyPair::from_pkcs8(&self.pkcs8).map_err(|e| RpkError::Key(e.to_string()))?;
         Ok(kp.sign(msg).as_ref().to_vec())
     }
 
@@ -650,8 +651,7 @@ impl RpkTls {
     fn build(identity: Arc<RpkIdentity>, trust: TrustSet, key_file: Option<PathBuf>) -> Self {
         // A validated identity always yields a certified key (`from_pkcs8`
         // already parsed the same material), so this is an invariant.
-        let presented =
-            PresentedKey::from_identity(&identity).expect("rpk identity certified key");
+        let presented = PresentedKey::from_identity(&identity).expect("rpk identity certified key");
         Self {
             identity: RwLock::new(identity),
             presented,
@@ -870,7 +870,11 @@ mod tests {
     /// A one-way (server-authenticated) handshake: the server presents its key
     /// with no client-cert requirement; the client pins the server for `peer` and
     /// sends no client cert. Returns whether the handshake + round-trip succeeded.
-    async fn handshake_server_auth(server: &RpkIdentity, client_trust: TrustSet, peer: PeerId) -> bool {
+    async fn handshake_server_auth(
+        server: &RpkIdentity,
+        client_trust: TrustSet,
+        peer: PeerId,
+    ) -> bool {
         let server_pk = PresentedKey::from_identity(server).unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_config_server_auth(&server_pk).unwrap()));
         let connector = TlsConnector::from(Arc::new(
@@ -926,12 +930,18 @@ mod tests {
         });
         let name = ServerName::try_from("rpk").unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
-        connector.connect(name, tcp).await.expect("TOFU accepts any key");
+        connector
+            .connect(name, tcp)
+            .await
+            .expect("TOFU accepts any key");
         let _ = server_task.await;
 
         // The capturing verifier recorded exactly the server's presented SPKI, so
         // the caller can now verify the attestation names it.
-        assert_eq!(captured.lock().unwrap().as_deref(), Some(server_spki.as_slice()));
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some(server_spki.as_slice())
+        );
     }
 
     #[tokio::test]

@@ -532,7 +532,7 @@ pub async fn mint_join(
         .issued_at(Timestamp::WholeSeconds(now_unix as i64))
         .cwt_id(random_cti()?)
         .expiration_time(Timestamp::WholeSeconds(
-            now_unix.saturating_add(ttl_secs) as i64,
+            now_unix.saturating_add(ttl_secs) as i64
         ))
         .text_claim(
             CLAIM_KIND.to_string(),
@@ -635,7 +635,7 @@ pub async fn mint_member_assertion(
         .issued_at(Timestamp::WholeSeconds(now_unix as i64))
         .cwt_id(random_cti()?)
         .expiration_time(Timestamp::WholeSeconds(
-            now_unix.saturating_add(ttl_secs) as i64,
+            now_unix.saturating_add(ttl_secs) as i64
         ))
         .text_claim(
             CLAIM_KIND.to_string(),
@@ -690,7 +690,8 @@ pub fn verify_member_assertion(
         return Err(TokenError::Claims("not a mesh-member assertion".into()));
     }
     Ok(MemberAssertion {
-        node_id: node_id.ok_or_else(|| TokenError::Claims("member assertion has no node".into()))?,
+        node_id: node_id
+            .ok_or_else(|| TokenError::Claims("member assertion has no node".into()))?,
         pubkey_hex: pubkey_hex
             .ok_or_else(|| TokenError::Claims("member assertion has no pubkey".into()))?,
     })
@@ -784,10 +785,15 @@ pub fn verify_join(
     let claims = verify_envelope(token, public)?;
     let jti = claim_cti(&claims)?;
     check_exp(&claims, now_unix)?;
-    let kind = claims.rest.iter().find_map(|(name, value)| match (name, value) {
-        (coset::cwt::ClaimName::Text(t), CborValue::Text(k)) if t == CLAIM_KIND => Some(k.clone()),
-        _ => None,
-    });
+    let kind = claims
+        .rest
+        .iter()
+        .find_map(|(name, value)| match (name, value) {
+            (coset::cwt::ClaimName::Text(t), CborValue::Text(k)) if t == CLAIM_KIND => {
+                Some(k.clone())
+            }
+            _ => None,
+        });
     if kind.as_deref() != Some(KIND_JOIN) {
         return Err(TokenError::Claims("not a mesh join token".into()));
     }
@@ -970,7 +976,10 @@ pub async fn mint_pop(
         .issued_at(Timestamp::WholeSeconds(now_unix as i64))
         .cwt_id(random_cti()?)
         .audience(claims.aud.clone())
-        .text_claim(CLAIM_KIND.to_string(), CborValue::Text(KIND_POP.to_string()))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_POP.to_string()),
+        )
         .text_claim(CLAIM_HTM.to_string(), CborValue::Text(claims.htm.clone()))
         .text_claim(CLAIM_HTP.to_string(), CborValue::Text(claims.htp.clone()))
         .text_claim(CLAIM_ATH.to_string(), CborValue::Text(claims.ath.clone()));
@@ -1365,7 +1374,10 @@ mod tests {
 
         // Round-trip: the attested TLS key comes back.
         let att = mint_attestation(tls_spki, 3600, NOW, &root).await.unwrap();
-        assert_eq!(verify_attestation(&att, &public, NOW + 60).unwrap(), tls_spki);
+        assert_eq!(
+            verify_attestation(&att, &public, NOW + 60).unwrap(),
+            tls_spki
+        );
 
         // Past the validity window → rejected.
         assert!(matches!(
@@ -1553,8 +1565,12 @@ mod tests {
         let holder = LocalSigner::generate(TokenAlg::Es256);
 
         // A delegatable token's leaf_cnf is its own holder key.
-        let token =
-            delegatable_root(&root, &holder.public_key(), vec![GrantedRole::global("admin")]).await;
+        let token = delegatable_root(
+            &root,
+            &holder.public_key(),
+            vec![GrantedRole::global("admin")],
+        )
+        .await;
         assert_eq!(
             verify_credential(&token, &root_pub, NOW).unwrap().leaf_cnf,
             Some(holder.public_key().to_hex())
@@ -1620,12 +1636,30 @@ mod tests {
 
         // Each bound fact mismatch (incl. body present-vs-absent) → rejected.
         for bad in [
-            PopClaims { htm: "GET".into(), ..want.clone() },
-            PopClaims { htp: "/api/sites/y/config".into(), ..want.clone() },
-            PopClaims { aud: "https://evil.example.com".into(), ..want.clone() },
-            PopClaims { ath: pop_sha256_hex(b"other-token"), ..want.clone() },
-            PopClaims { bh: Some(pop_sha256_hex(b"swapped")), ..want.clone() },
-            PopClaims { bh: None, ..want.clone() },
+            PopClaims {
+                htm: "GET".into(),
+                ..want.clone()
+            },
+            PopClaims {
+                htp: "/api/sites/y/config".into(),
+                ..want.clone()
+            },
+            PopClaims {
+                aud: "https://evil.example.com".into(),
+                ..want.clone()
+            },
+            PopClaims {
+                ath: pop_sha256_hex(b"other-token"),
+                ..want.clone()
+            },
+            PopClaims {
+                bh: Some(pop_sha256_hex(b"swapped")),
+                ..want.clone()
+            },
+            PopClaims {
+                bh: None,
+                ..want.clone()
+            },
         ] {
             assert!(
                 verify_pop(&proof, &public, NOW + 5, &bad).is_err(),

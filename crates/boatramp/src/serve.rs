@@ -400,8 +400,8 @@ async fn build_compute(
     }
 
     let _ = (&storage, data_dir); // used only on Linux (container / VMM backends)
-    // The kernel-trust verifier is wired only for the embedded VMM (x86_64 Linux);
-    // silence `strict`/`daemon` everywhere else (non-Linux and linux/aarch64).
+                                  // The kernel-trust verifier is wired only for the embedded VMM (x86_64 Linux);
+                                  // silence `strict`/`daemon` everywhere else (non-Linux and linux/aarch64).
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     let _ = (strict, &daemon);
 
@@ -836,16 +836,15 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // Compute reconcile loop. Single-node is always
     // the "leader". Backends are built from the `[compute]` config + capability
     // detection; a no-op when none are registered. Detached for the server's life.
-    let (compute_backends, compute_node) =
-        build_compute(
-            config.compute.as_ref(),
-            compute_storage,
-            &data_dir,
-            0,
-            !posture.allow_shared_kernel_compute,
-            options.daemon_runtime.clone(),
-        )
-        .await;
+    let (compute_backends, compute_node) = build_compute(
+        config.compute.as_ref(),
+        compute_storage,
+        &data_dir,
+        0,
+        !posture.allow_shared_kernel_compute,
+        options.daemon_runtime.clone(),
+    )
+    .await;
     let _reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -983,8 +982,7 @@ fn spawn_http_redirect(
 ) {
     tokio::spawn(async move {
         tracing::info!(%addr, "serving HTTP→HTTPS redirect listener");
-        let service =
-            boatramp_server::http_redirect_router(deploy, posture).into_make_service();
+        let service = boatramp_server::http_redirect_router(deploy, posture).into_make_service();
         if let Err(err) = axum_server::bind(addr).serve(service).await {
             tracing::error!(%addr, %err, "HTTP redirect listener failed");
         }
@@ -1367,8 +1365,8 @@ async fn run_cluster(
     // token: decode it and fold it into the config so the rest of the flow is
     // ticket-vs-config agnostic.
     if let Some(blob) = args.cluster_join.as_deref() {
-        let ticket =
-            crate::join::JoinTicket::decode(blob).map_err(|e| Error::ClusterStartup(e.to_string()))?;
+        let ticket = crate::join::JoinTicket::decode(blob)
+            .map_err(|e| Error::ClusterStartup(e.to_string()))?;
         cluster_cfg.seeds = ticket.seeds;
         cluster_cfg.root_pubkeys = ticket.root_pubkeys;
         cluster_cfg.join_token = Some(ticket.token);
@@ -1380,8 +1378,8 @@ async fn run_cluster(
     // founder (via the downward-API pod name) — every other ordinal joins. This
     // designates the founder only; the node *identity* is still derived from the
     // mesh key, so it is not the reverted per-pod-identity coupling.
-    let is_operator_founder = std::env::var("BOATRAMP_POD_NAME")
-        .is_ok_and(|name| name.rsplit('-').next() == Some("0"));
+    let is_operator_founder =
+        std::env::var("BOATRAMP_POD_NAME").is_ok_and(|name| name.rsplit('-').next() == Some("0"));
     let init_requested = args.cluster_init || is_operator_founder;
     let action = crate::join::decide_startup(&crate::join::StartupInputs {
         has_durable_state: had_durable_state,
@@ -1453,7 +1451,11 @@ async fn run_cluster(
             let adopted = crate::join::join_cluster(&ticket, &identity, Some(&self_advertise), now)
                 .await
                 .map_err(|e| Error::ClusterStartup(e.to_string()))?;
-            tracing::info!(node_id, members = adopted.len(), "cluster: joined via seeds");
+            tracing::info!(
+                node_id,
+                members = adopted.len(),
+                "cluster: joined via seeds"
+            );
             for m in adopted {
                 if let Ok(spki) = mesh::parse_public_key(&m.mesh_pubkey_hex) {
                     genesis_trust.insert(m.node_id, spki);
@@ -2418,13 +2420,16 @@ async fn serve_rpk(
 
     // No client-auth trust set: the client authenticates with a bearer token, not
     // a client cert (that is the mutual-`cnf` binding of a later stage).
-    let rpk = boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());
+    let rpk =
+        boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());
     let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rpk.server_auth()?));
 
     tracing::info!(%addr, pubkey = %fingerprint, "serving HTTPS (RPK bootstrap TLS)");
     // The identity is public (not a secret); print it so the operator can copy it
     // to the client's `--server-pubkey`.
-    println!("control-plane RPK TLS identity — pin the client with:\n  --server-pubkey {fingerprint}");
+    println!(
+        "control-plane RPK TLS identity — pin the client with:\n  --server-pubkey {fingerprint}"
+    );
 
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());

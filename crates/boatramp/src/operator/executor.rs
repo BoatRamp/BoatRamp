@@ -87,7 +87,9 @@ pub(super) async fn roll_partition(
     let Ok(api) = ClusterApi::pin_pod(brc, ns, 0, &token, &roots).await else {
         return 0;
     };
-    let Ok(raw) = api.members().await else { return 0 };
+    let Ok(raw) = api.members().await else {
+        return 0;
+    };
     let (members, _) = membership::members_from_api(&raw);
     if membership::has_roll_margin(&members, pods) {
         0

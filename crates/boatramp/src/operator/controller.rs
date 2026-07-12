@@ -77,7 +77,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // membership), the Site (GitOps site config, K5), and the Function (K5, whose
     // apply path awaits the FaaS backend).
     let cluster_ctrl = Controller::new(clusters, watcher::Config::default())
-        .run(reconcile, error_policy, Arc::new(Ctx { client: client.clone() }))
+        .run(
+            reconcile,
+            error_policy,
+            Arc::new(Ctx {
+                client: client.clone(),
+            }),
+        )
         .for_each(|res| async move {
             if let Err(err) = res {
                 tracing::warn!(%err, "cluster reconcile loop error");
@@ -87,7 +93,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
         .run(
             super::site::reconcile,
             site_error_policy,
-            Arc::new(super::site::Ctx { client: client.clone() }),
+            Arc::new(super::site::Ctx {
+                client: client.clone(),
+            }),
         )
         .for_each(|res| async move {
             if let Err(err) = res {
@@ -262,9 +270,7 @@ async fn observe_pods(
                 .status
                 .as_ref()
                 .and_then(|s| s.conditions.as_ref())
-                .is_some_and(|cs| {
-                    cs.iter().any(|c| c.type_ == "Ready" && c.status == "True")
-                });
+                .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"));
             Some(membership::PodState { ordinal, ready })
         })
         .collect())

@@ -309,7 +309,10 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             // tombstone here, or `revoke`'s later trust-delete + tombstone).
             if target.data.contains_key(&revoked_key(&pubkey_hex)) {
                 WriteResponse::Admitted(AdmitOutcome::Revoked)
-            } else if target.data.contains_key(&format!("{JOIN_USED_PREFIX}{jti}")) {
+            } else if target
+                .data
+                .contains_key(&format!("{JOIN_USED_PREFIX}{jti}"))
+            {
                 // Single-use: spending a `jti` is check-and-set inside one apply,
                 // so a replayed token (even racing on the leader) never double-admits.
                 WriteResponse::Admitted(AdmitOutcome::Spent)

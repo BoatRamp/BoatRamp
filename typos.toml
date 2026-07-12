@@ -1,6 +1,12 @@
 # Configuration for the `typos` spell checker.
 # https://github.com/crate-ci/typos
 
+[default]
+# Opaque, copy-pasteable base64url join-ticket blobs (`brjoin1.<base64url>`) shown
+# in the cluster docs are not prose — their coincidental substrings (e.g. "Jod")
+# are not typos.
+extend-ignore-re = ["brjoin1\\.[A-Za-z0-9_-]+"]
+
 [default.extend-words]
 # `mke2fs` is the e2fsprogs tool name; not a typo of "make".
 mke = "mke"

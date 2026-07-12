@@ -157,7 +157,11 @@ pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<()> {
 /// root-signed attestation, verifies it under the root key, and confirms it names
 /// the presented key — then prints the pin. No trust is placed in the server
 /// until the root signature checks out.
-async fn run_pin(server: Option<String>, root_pubkey: String, config: &ProjectConfig) -> Result<()> {
+async fn run_pin(
+    server: Option<String>,
+    root_pubkey: String,
+    config: &ProjectConfig,
+) -> Result<()> {
     use std::sync::{Arc, Mutex};
 
     let server = client::resolve_server(server, config)?;

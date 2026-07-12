@@ -8,12 +8,8 @@
 //! reconciliation. `operator manifests | kubectl apply -f -` is a helm-less install.
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
-use k8s_openapi::api::core::v1::{
-    Container, PodSpec, PodTemplateSpec, ServiceAccount,
-};
-use k8s_openapi::api::rbac::v1::{
-    ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
-};
+use k8s_openapi::api::core::v1::{Container, PodSpec, PodTemplateSpec, ServiceAccount};
+use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::CustomResourceExt;
 
@@ -95,7 +91,9 @@ fn cluster_role() -> ClusterRole {
         verbs: verbs.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
-    let all = &["get", "list", "watch", "create", "update", "patch", "delete"];
+    let all = &[
+        "get", "list", "watch", "create", "update", "patch", "delete",
+    ];
     ClusterRole {
         metadata: ObjectMeta {
             name: Some(NAME.to_string()),
@@ -117,14 +115,15 @@ fn cluster_role() -> ClusterRole {
                 all,
             ),
             // The workloads a cluster reconciles into.
-            rule(
-                &["apps"],
-                &["statefulsets", "deployments"],
-                all,
-            ),
+            rule(&["apps"], &["statefulsets", "deployments"], all),
             rule(
                 &[""],
-                &["services", "configmaps", "secrets", "persistentvolumeclaims"],
+                &[
+                    "services",
+                    "configmaps",
+                    "secrets",
+                    "persistentvolumeclaims",
+                ],
                 all,
             ),
             rule(&["policy"], &["poddisruptionbudgets"], all),

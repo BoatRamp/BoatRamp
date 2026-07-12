@@ -169,9 +169,7 @@ fn verify_token(token: &str, roots: &[TokenPublicKey], now: u64) -> Result<Strin
     roots
         .iter()
         .find_map(|root| cose::verify_join(token, root, now).ok())
-        .ok_or_else(|| {
-            JoinError::Token("did not verify against the cluster root anchor".into())
-        })
+        .ok_or_else(|| JoinError::Token("did not verify against the cluster root anchor".into()))
 }
 
 /// The hex possession proof: the node signs the domain-separated join challenge
@@ -331,11 +329,7 @@ pub(crate) async fn pinned_client(
 /// root anchor set, confirm it names the key the seed actually presented, and
 /// return that pinned SPKI. Mirrors `auth pin` (`run_pin`) — the seed is trusted
 /// only once a root signature over its key checks out.
-async fn pin_seed(
-    base: &str,
-    roots: &[TokenPublicKey],
-    now: u64,
-) -> Result<Vec<u8>, JoinError> {
+async fn pin_seed(base: &str, roots: &[TokenPublicKey], now: u64) -> Result<Vec<u8>, JoinError> {
     let captured = Arc::new(Mutex::new(None));
     let tls = boatramp_rpktls::client_config_capturing(captured.clone())
         .map_err(|e| JoinError::Seed(format!("{base}: {e}")))?;
@@ -539,7 +533,8 @@ mod tests {
         // A genuine set adopts, preserving (node_id, pubkey) and attaching the
         // advisory address only for a verified node (11 has one, 22 doesn't).
         let addrs = std::collections::BTreeMap::from([(11u64, "https://a:7000".to_string())]);
-        let adopted = verify_members(&[good_a.clone(), good_b.clone()], &addrs, &roots, now).unwrap();
+        let adopted =
+            verify_members(&[good_a.clone(), good_b.clone()], &addrs, &roots, now).unwrap();
         assert_eq!(
             adopted,
             vec![
@@ -582,9 +577,12 @@ mod tests {
         assert!(boatramp_rpktls::verify_signature(&spki, &challenge, &proof));
 
         // A different key does not satisfy the proof.
-        let other = boatramp_rpktls::parse_public_key(&RpkIdentity::generate().unwrap().public_key_hex())
-            .unwrap();
-        assert!(!boatramp_rpktls::verify_signature(&other, &challenge, &proof));
+        let other =
+            boatramp_rpktls::parse_public_key(&RpkIdentity::generate().unwrap().public_key_hex())
+                .unwrap();
+        assert!(!boatramp_rpktls::verify_signature(
+            &other, &challenge, &proof
+        ));
     }
 
     /// The founding decision (F5): durable state resumes; a fresh node founds

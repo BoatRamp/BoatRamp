@@ -184,7 +184,11 @@ async fn rollback(http: &crate::client::ApiClient, server: &str) -> Result<()> {
     Ok(())
 }
 
-async fn apply(http: &crate::client::ApiClient, server: &str, file: &std::path::Path) -> Result<()> {
+async fn apply(
+    http: &crate::client::ApiClient,
+    server: &str,
+    file: &std::path::Path,
+) -> Result<()> {
     let bytes = std::fs::read(file)?;
     let cfg: DaemonConfig = serde_json::from_slice(&bytes)?;
     let generation = put(http, server, &cfg).await?;

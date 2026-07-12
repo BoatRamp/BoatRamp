@@ -17,7 +17,8 @@ async fn spawn_rpk_server() -> (std::net::SocketAddr, Vec<u8>) {
     let identity = RpkIdentity::generate().unwrap();
     let spki = identity.public_key().to_vec();
     let rpk = RpkTls::new(Arc::new(identity), TrustSet::default());
-    let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rpk.server_auth().unwrap()));
+    let config =
+        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rpk.server_auth().unwrap()));
 
     let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
     let handle = axum_server::Handle::new();

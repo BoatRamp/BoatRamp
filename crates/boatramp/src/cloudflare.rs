@@ -558,7 +558,12 @@ mod tests {
         // A non-founder is a joiner (env ticket), and its config body is identical.
         let cfg4 = render_node_config(&nodes, 4, 7000);
         assert!(cfg4.contains("BOATRAMP_CLUSTER_JOIN"));
-        let body = |s: &str| s.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let body = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         assert_eq!(body(&cfg1), body(&cfg4), "the config body is uniform");
     }
 

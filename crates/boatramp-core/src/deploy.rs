@@ -979,7 +979,10 @@ impl DeployStore {
             .list_prefix(crate::authz::ROOT_ANCHOR_PREFIX)
             .await?
             .iter()
-            .filter_map(|k| k.strip_prefix(crate::authz::ROOT_ANCHOR_PREFIX).map(String::from))
+            .filter_map(|k| {
+                k.strip_prefix(crate::authz::ROOT_ANCHOR_PREFIX)
+                    .map(String::from)
+            })
             .collect())
     }
 
@@ -1589,7 +1592,11 @@ impl DeployStore {
         for key in self.kv.list_prefix(&Self::alias_prefix(site)).await? {
             batch.push(WriteOp::Delete(key));
         }
-        for key in self.kv.list_prefix(&format!("domainverify/{site}/")).await? {
+        for key in self
+            .kv
+            .list_prefix(&format!("domainverify/{site}/"))
+            .await?
+        {
             batch.push(WriteOp::Delete(key));
         }
         self.kv.write_batch(batch).await?;
@@ -2013,7 +2020,10 @@ mod tests {
             .start_domain_verification("a", "shared.example", VerificationMethod::Http, 100)
             .await
             .unwrap();
-        store.mark_domain_verified("a", "shared.example").await.unwrap();
+        store
+            .mark_domain_verified("a", "shared.example")
+            .await
+            .unwrap();
         store
             .attach_verified_domain("a", "shared.example")
             .await
@@ -2034,7 +2044,10 @@ mod tests {
             .start_domain_verification("b", "shared.example", VerificationMethod::Http, 200)
             .await
             .unwrap();
-        store.mark_domain_verified("b", "shared.example").await.unwrap();
+        store
+            .mark_domain_verified("b", "shared.example")
+            .await
+            .unwrap();
         let err = store
             .attach_verified_domain("b", "shared.example")
             .await
@@ -2101,7 +2114,10 @@ mod tests {
             .start_domain_verification("a", "example.com", VerificationMethod::Http, 100)
             .await
             .unwrap();
-        store.mark_domain_verified("a", "example.com").await.unwrap();
+        store
+            .mark_domain_verified("a", "example.com")
+            .await
+            .unwrap();
         store
             .attach_verified_domain("a", "example.com")
             .await
@@ -2154,7 +2170,10 @@ mod tests {
             .find_pending_http_challenge("docs.example", &v.token, 1_000)
             .await
             .unwrap();
-        assert_eq!(found.as_ref().map(|f| f.token.clone()), Some(v.token.clone()));
+        assert_eq!(
+            found.as_ref().map(|f| f.token.clone()),
+            Some(v.token.clone())
+        );
         // A trailing dot / uppercase host still normalizes to a match.
         assert!(store
             .find_pending_http_challenge("Docs.Example.", &v.token, 1_000)
@@ -2207,7 +2226,10 @@ mod tests {
             .start_domain_verification("s", "*.example.com", VerificationMethod::Http, 100)
             .await
             .unwrap();
-        store.mark_domain_verified("s", "*.example.com").await.unwrap();
+        store
+            .mark_domain_verified("s", "*.example.com")
+            .await
+            .unwrap();
         let err = store
             .attach_verified_domain("s", "*.example.com")
             .await
@@ -2231,7 +2253,10 @@ mod tests {
             .start_domain_verification("s", "*.example.com", VerificationMethod::Dns, 200)
             .await
             .unwrap();
-        store.mark_domain_verified("s", "*.example.com").await.unwrap();
+        store
+            .mark_domain_verified("s", "*.example.com")
+            .await
+            .unwrap();
         let cfg = store
             .attach_verified_domain("s", "*.example.com")
             .await
@@ -2535,7 +2560,11 @@ mod tests {
         // Present: config stored + its hosts route to it.
         assert!(store.get_site_config("blog").await.unwrap().is_some());
         assert_eq!(
-            store.resolve_site_by_host("blog.example").await.unwrap().as_deref(),
+            store
+                .resolve_site_by_host("blog.example")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("blog")
         );
 

@@ -96,9 +96,19 @@ pub use kernel_verify::{HashOnlyVerifier, KernelVerifier};
 // in-process `EmbeddedVmm` instead of an external `firecracker` process. Needs
 // both `backend` (the trait + async runtime) and `embedded` (the KVM runtime);
 // Linux + `/dev/kvm`. The orchestration is pure-testable; the boot is the seam.
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "backend", feature = "embedded"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "backend",
+    feature = "embedded"
+))]
 pub mod embedded_backend;
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "backend", feature = "embedded"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "backend",
+    feature = "embedded"
+))]
 pub use embedded_backend::EmbeddedVmmBackend;
 
 pub use config::{FcMachine, MachineResources};

@@ -183,7 +183,10 @@ fn format_status(members: &[MemberRow], full: bool) -> String {
             format!("{:016x}", node)[..8].to_string()
         }
     };
-    let mut out = format!("{:<28}  {:<8}  {:<16}  {}\n", "ADDRESS", "ROLE", "NODE", "STATE");
+    let mut out = format!(
+        "{:<28}  {:<8}  {:<16}  {}\n",
+        "ADDRESS", "ROLE", "NODE", "STATE"
+    );
     for m in members {
         out.push_str(&format!(
             "{:<28}  {:<8}  {:<16}  {}\n",
@@ -271,7 +274,9 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
             if let Some(exp) = response.expires_at {
                 eprintln!("expires at (unix): {exp}");
             }
-            eprintln!("single-use bearer — hand it to exactly one joining node; it cannot be recovered");
+            eprintln!(
+                "single-use bearer — hand it to exactly one joining node; it cannot be recovered"
+            );
         }
         ClusterCommand::Status { full } => {
             let members: Vec<MemberRow> = http

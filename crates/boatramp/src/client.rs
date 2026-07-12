@@ -296,11 +296,7 @@ pub async fn fetch_deployments(
 }
 
 /// Fetch a site's config (server returns defaults if unset).
-pub async fn fetch_site_config(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-) -> Result<SiteConfig> {
+pub async fn fetch_site_config(client: &ApiClient, server: &str, site: &str) -> Result<SiteConfig> {
     Ok(client
         .get(format!("{server}/api/sites/{site}/config"))
         .send()
@@ -467,12 +463,7 @@ pub async fn list_aliases(
 }
 
 /// Remove a named alias.
-pub async fn remove_alias(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    name: &str,
-) -> Result<()> {
+pub async fn remove_alias(client: &ApiClient, server: &str, site: &str, name: &str) -> Result<()> {
     client
         .delete(format!("{server}/api/sites/{site}/aliases/{name}"))
         .send()
@@ -759,7 +750,11 @@ mod tests {
         // The PoP-signing client (correct holder key + origin) is authorized.
         let signed = build_client(Some(&token), Some(&holder_priv), Some(POP_ORIGIN), None);
         let resp = signed.get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK, "signed request → 200");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "signed request → 200"
+        );
 
         // The same token with **no** proof (plain bearer client) is rejected 401 —
         // no silent bearer downgrade for a holder-bound token.
@@ -773,8 +768,12 @@ mod tests {
 
         // A proof bound to the wrong origin (what a spoofed relay would carry) is
         // rejected — the server binds its *configured* origin, not the request.
-        let wrong_origin =
-            build_client(Some(&token), Some(&holder_priv), Some("https://evil.example.test"), None);
+        let wrong_origin = build_client(
+            Some(&token),
+            Some(&holder_priv),
+            Some("https://evil.example.test"),
+            None,
+        );
         let resp = wrong_origin.get(&url).send().await.unwrap();
         assert_eq!(
             resp.status(),

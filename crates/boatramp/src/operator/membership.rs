@@ -173,8 +173,8 @@ pub struct ApiMember {
 pub fn ordinal_from_addr(addr: &str) -> Option<u32> {
     let after_scheme = addr.split("//").last()?;
     let host = after_scheme.split(['.', ':', '/']).next()?; // `<name>-<ordinal>`
-    // Require an actual `<name>-<ordinal>` split (a `-`), so a bare number or an
-    // IP octet (e.g. `10.0.0.5` → `10`) isn't mistaken for an ordinal.
+                                                            // Require an actual `<name>-<ordinal>` split (a `-`), so a bare number or an
+                                                            // IP octet (e.g. `10.0.0.5` → `10`) isn't mistaken for an ordinal.
     let (name, ordinal) = host.rsplit_once('-')?;
     if name.is_empty() {
         return None;
@@ -186,9 +186,7 @@ pub fn ordinal_from_addr(addr: &str) -> Option<u32> {
 /// `ordinal → node_id` map the executor needs, from the API members. Members
 /// whose address doesn't encode an ordinal (not a StatefulSet pod) are dropped —
 /// the operator only manages its own pods.
-pub fn members_from_api(
-    api: &[ApiMember],
-) -> (Vec<Member>, std::collections::BTreeMap<u32, u64>) {
+pub fn members_from_api(api: &[ApiMember]) -> (Vec<Member>, std::collections::BTreeMap<u32, u64>) {
     let mut members = Vec::new();
     let mut map = std::collections::BTreeMap::new();
     for m in api {
@@ -218,8 +216,9 @@ pub fn action_node_id(
     ordinal_to_node: &std::collections::BTreeMap<u32, u64>,
 ) -> Option<u64> {
     match action {
-        MembershipAction::PromoteToVoter { ordinal }
-        | MembershipAction::Remove { ordinal } => ordinal_to_node.get(ordinal).copied(),
+        MembershipAction::PromoteToVoter { ordinal } | MembershipAction::Remove { ordinal } => {
+            ordinal_to_node.get(ordinal).copied()
+        }
         MembershipAction::AddLearner { .. } => None,
     }
 }
@@ -406,8 +405,16 @@ mod tests {
         // 3 voters, 2 down → no quorum → no action, even though desired < current.
         let pods = vec![pod(0, true), pod(1, false), pod(2, false)];
         let mem: Vec<_> = (0..3).map(|o| member(o, Voter, true)).collect();
-        assert_eq!(plan_next(1, &pods, &mem), None, "must not remove without quorum");
-        assert_eq!(plan_next(5, &pods, &mem), None, "must not add without quorum");
+        assert_eq!(
+            plan_next(1, &pods, &mem),
+            None,
+            "must not remove without quorum"
+        );
+        assert_eq!(
+            plan_next(5, &pods, &mem),
+            None,
+            "must not add without quorum"
+        );
     }
 
     #[test]
@@ -444,8 +451,7 @@ mod tests {
             for n in 1u32..6 {
                 for down in 0u32..n {
                     // A cluster of `n` voters with `down` of them not ready.
-                    let pods: Vec<PodState> =
-                        (0..n).map(|o| pod(o, o >= down)).collect();
+                    let pods: Vec<PodState> = (0..n).map(|o| pod(o, o >= down)).collect();
                     let mem: Vec<Member> = (0..n).map(|o| member(o, Voter, true)).collect();
                     let quorum = has_quorum(&mem, &pods);
                     if let Some(action) = plan_next(desired, &pods, &mem) {

@@ -20,13 +20,13 @@ use k8s_openapi::api::apps::v1::{
     StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec, StatefulSetUpdateStrategy,
 };
 use k8s_openapi::api::autoscaling::v2::{
-    HorizontalPodAutoscaler, HorizontalPodAutoscalerSpec, CrossVersionObjectReference,
-    MetricSpec, ResourceMetricSource, MetricTarget,
+    CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerSpec, MetricSpec,
+    MetricTarget, ResourceMetricSource,
 };
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
-    HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PodSpec, PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume,
+    HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec,
+    PodTemplateSpec, Probe, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume,
     VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
@@ -75,11 +75,17 @@ fn child_meta(brc: &BoatRampCluster, name: String) -> ObjectMeta {
 /// The CR's name (the instance every child is keyed to). Also the client
 /// Service's name — the DNS the operator's membership executor reaches.
 pub fn instance(brc: &BoatRampCluster) -> String {
-    brc.metadata.name.clone().unwrap_or_else(|| "boatramp".to_string())
+    brc.metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| "boatramp".to_string())
 }
 
 fn image(brc: &BoatRampCluster) -> String {
-    brc.spec.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string())
+    brc.spec
+        .image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_IMAGE.to_string())
 }
 
 /// The headless service's DNS name (stable per-pod identity in cluster mode).
@@ -250,58 +256,65 @@ fn container(brc: &BoatRampCluster) -> Container {
             }
             ports
         }),
-        env: Some(vec![
-            // The pod's own name (downward API): the operator's ordinal-0 pod
-            // founds the cluster; every other ordinal joins. The node *identity*
-            // is still derived from the mesh key — this only designates the founder.
-            downward_env("BOATRAMP_POD_NAME", "metadata.name"),
-            // The single-use join ticket the operator's executor rolls into a
-            // Secret for joining pods. Optional: absent for the founder / before
-            // the first AddLearner.
-            {
-                let (secret, key) = super::executor::join_env_source(brc);
-                EnvVar {
-                    name: "BOATRAMP_CLUSTER_JOIN".to_string(),
-                    value_from: Some(EnvVarSource {
-                        secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                            name: secret,
-                            key: key.to_string(),
-                            optional: Some(true),
+        env: Some(
+            vec![
+                // The pod's own name (downward API): the operator's ordinal-0 pod
+                // founds the cluster; every other ordinal joins. The node *identity*
+                // is still derived from the mesh key — this only designates the founder.
+                downward_env("BOATRAMP_POD_NAME", "metadata.name"),
+                // The single-use join ticket the operator's executor rolls into a
+                // Secret for joining pods. Optional: absent for the founder / before
+                // the first AddLearner.
+                {
+                    let (secret, key) = super::executor::join_env_source(brc);
+                    EnvVar {
+                        name: "BOATRAMP_CLUSTER_JOIN".to_string(),
+                        value_from: Some(EnvVarSource {
+                            secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                                name: secret,
+                                key: key.to_string(),
+                                optional: Some(true),
+                            }),
+                            ..Default::default()
                         }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }
-            },
-        ]
-        .into_iter()
-        // Auth from `spec.authSecret`: the root private key (the founder signs
-        // join tokens / attestations / members with it) + an optional single-use
-        // bootstrap secret (to mint the first admin token). Both optional at the
-        // Secret level so a partially-provisioned Secret doesn't wedge the pod.
-        .chain(brc.spec.auth_secret.as_deref().into_iter().flat_map(|s| {
-            [
-                secret_env("BOATRAMP_AUTH_ROOT_PRIVATE_KEY", s, "root-private-key"),
-                secret_env("BOATRAMP_BOOTSTRAP_SECRET", s, "bootstrap-secret"),
+                    }
+                },
             ]
-        }))
-        // Cluster mode: the pod advertises its **own** stable DNS as the mesh
-        // address the leader dials (the default `0.0.0.0` bind isn't dialable).
-        // Composed with k8s `$(VAR)` substitution from the pod name + namespace.
-        .chain((brc.spec.mode == ClusterMode::Cluster).then(|| {
-            vec![
-                downward_env("POD_NAMESPACE", "metadata.namespace"),
-                EnvVar {
-                    name: "BOATRAMP_CLUSTER_ADVERTISE_ADDR".to_string(),
-                    value: Some(format!(
+            .into_iter()
+            // Auth from `spec.authSecret`: the root private key (the founder signs
+            // join tokens / attestations / members with it) + an optional single-use
+            // bootstrap secret (to mint the first admin token). Both optional at the
+            // Secret level so a partially-provisioned Secret doesn't wedge the pod.
+            .chain(brc.spec.auth_secret.as_deref().into_iter().flat_map(|s| {
+                [
+                    secret_env("BOATRAMP_AUTH_ROOT_PRIVATE_KEY", s, "root-private-key"),
+                    secret_env("BOATRAMP_BOOTSTRAP_SECRET", s, "bootstrap-secret"),
+                ]
+            }))
+            // Cluster mode: the pod advertises its **own** stable DNS as the mesh
+            // address the leader dials (the default `0.0.0.0` bind isn't dialable).
+            // Composed with k8s `$(VAR)` substitution from the pod name + namespace.
+            .chain(
+                (brc.spec.mode == ClusterMode::Cluster)
+                    .then(|| {
+                        vec![
+                            downward_env("POD_NAMESPACE", "metadata.namespace"),
+                            EnvVar {
+                                name: "BOATRAMP_CLUSTER_ADVERTISE_ADDR".to_string(),
+                                value: Some(format!(
                         "https://$(BOATRAMP_POD_NAME).{}.$(POD_NAMESPACE).svc:{MESH_PORT}",
                         headless_name(brc)
                     )),
-                    ..Default::default()
-                },
-            ]
-        }).into_iter().flatten())
-        .collect()),
+                                ..Default::default()
+                            },
+                        ]
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect(),
+        ),
         // Cluster mode serves the control plane over RPK-TLS (RFC 7250 raw public
         // keys), which the kubelet's HTTP prober can't speak — so probe the port
         // with a TCP socket instead. A cluster node binds its listener only *after*
@@ -402,7 +415,11 @@ fn selector(brc: &BoatRampCluster) -> LabelSelector {
 /// when the cluster has no quorum margin, and to `0` to let it proceed one pod at
 /// a time (highest ordinal first).
 pub fn stateful_set(brc: &BoatRampCluster, roll_partition: i32) -> StatefulSet {
-    let storage = brc.spec.storage.clone().unwrap_or_else(|| "10Gi".to_string());
+    let storage = brc
+        .spec
+        .storage
+        .clone()
+        .unwrap_or_else(|| "10Gi".to_string());
     let pvc = PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some("data".to_string()),
@@ -559,7 +576,10 @@ mod tests {
             Some(3)
         );
         // K4: a Raft voter's PVC is never auto-reclaimed (data + vote safety).
-        let retain = spec.persistent_volume_claim_retention_policy.as_ref().unwrap();
+        let retain = spec
+            .persistent_volume_claim_retention_policy
+            .as_ref()
+            .unwrap();
         assert_eq!(retain.when_deleted.as_deref(), Some("Retain"));
         assert_eq!(retain.when_scaled.as_deref(), Some("Retain"));
         // Cluster mode serves RPK-TLS, so probes are TCP-socket (see
@@ -615,10 +635,7 @@ mod tests {
         assert!(!wc.args.unwrap().contains(&"rpk".to_string()));
         let rp = wc.readiness_probe.unwrap();
         assert!(rp.tcp_socket.is_none());
-        assert_eq!(
-            rp.http_get.unwrap().path.as_deref(),
-            Some("/readyz")
-        );
+        assert_eq!(rp.http_get.unwrap().path.as_deref(), Some("/readyz"));
     }
 
     #[test]
@@ -688,7 +705,16 @@ mod tests {
         // The StatefulSet pod is wired to sign (root private key) + advertise its
         // own dialable DNS as the mesh address.
         let sts = stateful_set(&brc, 0);
-        let env = sts.spec.unwrap().template.spec.unwrap().containers.remove(0).env.unwrap();
+        let env = sts
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers
+            .remove(0)
+            .env
+            .unwrap();
         let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"BOATRAMP_AUTH_ROOT_PRIVATE_KEY"));
         assert!(names.contains(&"BOATRAMP_BOOTSTRAP_SECRET"));

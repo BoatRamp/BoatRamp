@@ -183,10 +183,7 @@ impl Auth {
     /// check fails.
     pub async fn verify_bearer_roles(&self, bearer: &str) -> Option<Vec<authz::GrantedRole>> {
         let inner = self.inner.as_ref()?;
-        let verified = inner
-            .verify_credential_any(bearer, now_unix())
-            .await
-            .ok()?;
+        let verified = inner.verify_credential_any(bearer, now_unix()).await.ok()?;
         if inner.is_revoked(&verified.cti).await {
             return None;
         }
@@ -585,7 +582,10 @@ mod tests {
         // Trust the new key as a rotation anchor (make-before-break).
         let anchor = authz::root_anchor_key(&new_root.public_key().to_hex());
         kv.put(&anchor, Vec::new()).await.unwrap();
-        assert!(auth.verify_bearer(&new_token).await, "new-root token now verifies");
+        assert!(
+            auth.verify_bearer(&new_token).await,
+            "new-root token now verifies"
+        );
         // The primary's tokens verify the whole time.
         let primary_token = cose::mint(&admin_claims(now), &primary).await.unwrap();
         assert!(auth.verify_bearer(&primary_token).await);
@@ -593,7 +593,10 @@ mod tests {
         // Retire the old/new anchor → its tokens stop verifying again.
         kv.delete(&anchor).await.unwrap();
         assert!(!auth.verify_bearer(&new_token).await);
-        assert!(auth.verify_bearer(&primary_token).await, "primary still valid");
+        assert!(
+            auth.verify_bearer(&primary_token).await,
+            "primary still valid"
+        );
     }
 
     #[tokio::test]
@@ -603,7 +606,10 @@ mod tests {
         let now = now_unix();
         let token = cose::mint(&admin_claims(now), &root).await.unwrap();
         // A non-holder-bound token needs no proof when `require_pop` is off.
-        assert!(auth.authorize(&token, "GET", PATH, None, None).await.is_ok());
+        assert!(auth
+            .authorize(&token, "GET", PATH, None, None)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -657,7 +663,16 @@ mod tests {
             .is_err());
 
         // Wrong origin (a captured proof relayed to a different fleet).
-        let wrong_aud = proof(&h, &token, "GET", PATH, "https://evil.example.com", None, now).await;
+        let wrong_aud = proof(
+            &h,
+            &token,
+            "GET",
+            PATH,
+            "https://evil.example.com",
+            None,
+            now,
+        )
+        .await;
         assert!(auth
             .authorize(&token, "GET", PATH, Some(&wrong_aud), None)
             .await
@@ -674,16 +689,7 @@ mod tests {
             .is_err());
 
         // Wrong body: proof binds one body, the request carries another.
-        let bound = proof(
-            &h,
-            &token,
-            "PUT",
-            PATH,
-            ORIGIN,
-            Some(body.clone()),
-            now,
-        )
-        .await;
+        let bound = proof(&h, &token, "PUT", PATH, ORIGIN, Some(body.clone()), now).await;
         let tampered = cose::pop_sha256_hex(b"a-different-body");
         assert!(auth
             .authorize(&token, "PUT", PATH, Some(&bound), Some(tampered))
@@ -762,15 +768,9 @@ mod tests {
         let base = cose::mint_delegatable(&admin_claims(now), &h1.public_key(), &root)
             .await
             .unwrap();
-        let chain = cose::attenuate(
-            &base,
-            &h1,
-            &Default::default(),
-            Some(&h2.public_key()),
-            now,
-        )
-        .await
-        .unwrap();
+        let chain = cose::attenuate(&base, &h1, &Default::default(), Some(&h2.public_key()), now)
+            .await
+            .unwrap();
 
         let auth = auth_with(&root, false);
         // Leaf holder (h2) → authorized.

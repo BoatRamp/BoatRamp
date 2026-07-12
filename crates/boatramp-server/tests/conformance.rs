@@ -3564,7 +3564,10 @@ async fn bootstrap_identity_endpoint_serves_the_attestation() {
                 .await
                 .unwrap();
             let status = resp.status();
-            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+            let body = to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
             (status, body)
         }
     };

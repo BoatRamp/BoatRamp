@@ -755,7 +755,10 @@ pub fn router_with(
             "/api/auth/root",
             get(list_root_anchors).put(add_root_anchor),
         )
-        .route("/api/auth/root/:pubkey", axum::routing::delete(remove_root_anchor))
+        .route(
+            "/api/auth/root/:pubkey",
+            axum::routing::delete(remove_root_anchor),
+        )
         // Dynamic daemon config — validated + committed on the leader, replicated,
         // hot-swapped without a restart. Admin-scoped (deny-safe `Right::required`).
         .route(
@@ -1416,7 +1419,10 @@ async fn delete_site(State(deploy): State<DeployStore>, Path(site): Path<String>
 /// (they are different routing entities that must not collapse together).
 fn canon_domain_entry(host: &str) -> String {
     match host.strip_prefix("*.") {
-        Some(base) => format!("*.{}", base.trim().trim_end_matches('.').to_ascii_lowercase()),
+        Some(base) => format!(
+            "*.{}",
+            base.trim().trim_end_matches('.').to_ascii_lowercase()
+        ),
         None => host.trim().trim_end_matches('.').to_ascii_lowercase(),
     }
 }
@@ -1446,13 +1452,25 @@ async fn put_site_config(
         .domains
         .exact_hosts()
         .map(canon_domain_entry)
-        .chain(current.domains.wildcards.iter().map(|w| canon_domain_entry(w)))
+        .chain(
+            current
+                .domains
+                .wildcards
+                .iter()
+                .map(|w| canon_domain_entry(w)),
+        )
         .collect();
     let added: Vec<String> = config
         .domains
         .exact_hosts()
         .map(canon_domain_entry)
-        .chain(config.domains.wildcards.iter().map(|w| canon_domain_entry(w)))
+        .chain(
+            config
+                .domains
+                .wildcards
+                .iter()
+                .map(|w| canon_domain_entry(w)),
+        )
         .filter(|host| !existing.contains(host))
         .collect();
     for host in added {
@@ -1769,11 +1787,7 @@ async fn cluster_join(
         }
     };
     let Ok(proof) = hex::decode(request.possession_proof.trim()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "possession_proof must be hex\n",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "possession_proof must be hex\n").into_response();
     };
     // The cluster verifies the possession proof against the presented key + spends
     // the token, then vouches for its members with root-signed assertions.

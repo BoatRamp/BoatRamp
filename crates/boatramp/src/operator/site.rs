@@ -63,11 +63,7 @@ pub async fn reconcile(site: Arc<Site>, ctx: Arc<Ctx>) -> Result<Action> {
 
 /// Resolve the target cluster: `spec.cluster`, or — if unset — the sole
 /// `BoatRampCluster` in the namespace (error if ambiguous / none).
-async fn resolve_cluster(
-    client: &Client,
-    ns: &str,
-    name: Option<&str>,
-) -> Result<BoatRampCluster> {
+async fn resolve_cluster(client: &Client, ns: &str, name: Option<&str>) -> Result<BoatRampCluster> {
     let api: Api<BoatRampCluster> = Api::namespaced(client.clone(), ns);
     if let Some(name) = name {
         return Ok(api.get(name).await?);
@@ -100,7 +96,15 @@ async fn apply(client: &Client, ns: &str, site: &Site) -> Result<Action> {
                 .error_for_status()?;
             set_phase(client, ns, &name, "Ready").await?;
         }
-        None => set_phase(client, ns, &name, "Pending: cluster has no adminTokenSecret").await?,
+        None => {
+            set_phase(
+                client,
+                ns,
+                &name,
+                "Pending: cluster has no adminTokenSecret",
+            )
+            .await?
+        }
     }
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -144,7 +148,10 @@ mod tests {
         ]);
         assert_eq!(cfg.domains.primary.as_deref(), Some("example.com"));
         assert_eq!(cfg.domains.aliases, vec!["www.example.com".to_string()]);
-        assert_eq!(cfg.domains.wildcards, vec!["*.preview.example.com".to_string()]);
+        assert_eq!(
+            cfg.domains.wildcards,
+            vec!["*.preview.example.com".to_string()]
+        );
         // Schema version comes from the default (pinned at v1).
         assert_eq!(cfg.version, boatramp_core::SCHEMA_VERSION);
     }
