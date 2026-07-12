@@ -1,113 +1,117 @@
 # Run a three-node cluster locally
 
-In this tutorial you run a real three-node Raft cluster on one machine, publish
-to it, read from a different node, and watch it stay up when the leader stops. It
-uses loopback addresses and separate data directories, so nothing conflicts. You
-need a `boatramp` binary built with the `cluster` feature.
+In this tutorial you run a real three-node Raft cluster on one machine using the
+[dynamic-join](../how-to/deploy-cluster.md) model: one node **founds**, the others
+**join** with a one-paste ticket, and you promote them to voters so the cluster
+survives a leader loss. It uses loopback addresses and separate data directories,
+so nothing conflicts. You need a `boatramp` binary built with the `cluster` (and
+`tls`) features.
 
-For the production version of this, see
-[Deploy a self-hosted cluster](../how-to/deploy-cluster.md).
+## 1. A root key + three configs
 
-## 1. Write three configs
+A cluster is defined by its root key. Generate one:
 
-Each node gets its own `boatramp.cfg`: a distinct `node_id`, serve port, mesh
-`listen` port, and `store_dir`. All three list the same `peers` and `voters`.
-Only node 1 sets `bootstrap`.
+```sh
+eval "$(boatramp auth init | grep '^BOATRAMP_AUTH_ROOT_')"
+```
 
-`node1.cfg`:
+Each node gets a tiny `boatramp.cfg` — just its ports and store. There is **no**
+`node_id`, `peers`, `voters`, or `bootstrap`: ids are derived and membership is
+dynamic.
+
+`node1.cfg` (the founder):
 
 ```ron
 (
-    serve: ( addr: "127.0.0.1:8001", data_dir: "/tmp/br1" ),
-    cluster: (
-        node_id: 1,
-        listen: "127.0.0.1:7001",
-        bootstrap: true,
-        voters: [1, 2, 3],
-        store_dir: "/tmp/br1/raft",
-        peers: {
-            "1": (url: "https://127.0.0.1:7001", pubkey: "…node-1…"),
-            "2": (url: "https://127.0.0.1:7002", pubkey: "…node-2…"),
-            "3": (url: "https://127.0.0.1:7003", pubkey: "…node-3…"),
-        },
-    ),
+    serve: ( addr: "127.0.0.1:8001", auth_root_public_key: "es256:…" ),
+    cluster: ( listen: "127.0.0.1:7001", store_dir: "/tmp/br1/raft" ),
 )
 ```
 
-`node2.cfg` and `node3.cfg` are identical except `serve.addr`
-(`127.0.0.1:8002` / `:8003`), `data_dir` (`/tmp/br2` / `/tmp/br3`), `node_id`
-(`2` / `3`), `listen` (`:7002` / `:7003`), `store_dir` — and they omit
-`bootstrap`.
+`node2.cfg` / `node3.cfg` are identical except `serve.addr` (`:8002`/`:8003`),
+`cluster.listen` (`:7002`/`:7003`), and `store_dir` (`/tmp/br2`/`/tmp/br3`). Put
+your `BOATRAMP_AUTH_ROOT_PUBLIC_KEY` in each `auth_root_public_key`.
 
-## 2. Collect the mesh public keys
+## 2. Found node 1
 
-The peer mesh runs over raw-public-key mutual TLS, so each node must know the
-others' keys. Start each node once to generate and log its key:
+Found the cluster, over raw-public-key TLS (so joiners can pin it), with a
+single-use bootstrap secret to mint the first admin token. Keep
+`BOATRAMP_AUTH_ROOT_PRIVATE_KEY` exported:
 
 ```sh
-boatramp serve --config node1.cfg
+boatramp --config node1.cfg serve --cluster-init --tls rpk \
+  --bootstrap-secret s3cret
+```
+
+It logs its control-plane pin (`--server-pubkey …`) — export it so the CLI trusts
+node 1, then mint an admin token:
+
+```sh
+export BOATRAMP_SERVER_PUBKEY=…            # from node 1's startup log
+export BOATRAMP_TOKEN=$(BOATRAMP_BOOTSTRAP_SECRET=s3cret \
+  boatramp token bootstrap --role admin --server https://127.0.0.1:8001 | head -1)
+```
+
+## 3. Join nodes 2 and 3
+
+For each joiner, mint a **one-paste ticket** on node 1, then start the joiner with
+it (each ticket is single-use — mint one per node):
+
+```sh
+ROOT=$(boatramp auth pubkey --private-key "$BOATRAMP_AUTH_ROOT_PRIVATE_KEY")
+T2=$(boatramp cluster add --server https://127.0.0.1:8001 --root-pubkey "$ROOT" | head -1)
+boatramp --config node2.cfg serve --cluster-join "$T2" \
+  --cluster-advertise-addr https://127.0.0.1:7002
+```
+
+Repeat with a fresh ticket `T3` for `node3.cfg` (advertise `:7003`). Confirm
+membership — address-primary, the founder is the leader, the joiners are learners
+catching up:
+
+```sh
+boatramp cluster status --server https://127.0.0.1:8001
 ```
 
 ```text
-mesh identity ed25519:9f86d081… (/tmp/br1/mesh/identity.key)
-cluster listen 127.0.0.1:7001 — waiting for peers [2, 3]
+ADDRESS                  ROLE      NODE       STATE
+https://127.0.0.1:7001   leader    9f86d081   ready
+https://127.0.0.1:7002   learner   3a7bd3e2   ready
+https://127.0.0.1:7003   learner   1b4f0e98   ready
 ```
 
-Do the same for `node2.cfg` and `node3.cfg`, copy each logged `pubkey` into the
-`peers` map of all three configs, then stop the nodes.
+## 4. Promote to a voting quorum
 
-## 3. Bring up the cluster
-
-Start node 1 (the bootstrap node) first, then 2 and 3, each in its own terminal:
+Joiners start as read-only learners. Promote both so all three vote (needed to
+survive a leader loss). In Kubernetes the operator does this automatically:
 
 ```sh
-boatramp serve --config node1.cfg
-boatramp serve --config node2.cfg
-boatramp serve --config node3.cfg
+boatramp cluster promote https://127.0.0.1:7002 --server https://127.0.0.1:8001
+boatramp cluster promote https://127.0.0.1:7003 --server https://127.0.0.1:8001
 ```
 
-Confirm membership and the leader:
+`cluster status` now shows all three as `voter`/`leader`.
 
-```sh
-boatramp status --server https://127.0.0.1:8001
-```
+## 5. Publish to one node, read from another
 
-```text
-cluster: 3 nodes, leader = 1, term 3
-node 1  voter  applied 12
-node 2  voter  applied 12
-node 3  voter  applied 12
-```
-
-## 4. Publish to one node, read from another
-
-Writes forward to the leader; every node serves reads from its applied state.
-Publish to node 1 and read the same content from node 3:
+Writes forward to the leader; every node serves reads from its applied state:
 
 ```sh
 boatramp sync ./site --site my-site --server https://127.0.0.1:8001
-curl https://127.0.0.1:8003/
+curl http://127.0.0.1:8003/          # the page replicated from node 1
 ```
 
-`my-site` is the only site, so every node serves it at the root. The page served
-from node 3 is the deployment you published to node 1 — the write replicated
-through Raft.
+## 6. Watch it survive a leader loss
 
-## 5. Watch it survive a leader loss
-
-Stop node 1 (Ctrl-C its terminal). The remaining two nodes still have a quorum,
-so they elect a new leader. Ask a survivor:
+Stop node 1 (Ctrl-C). The remaining two voters hold a quorum and elect a new
+leader — ask a survivor:
 
 ```sh
-boatramp status --server https://127.0.0.1:8002
+boatramp cluster status --server https://127.0.0.1:8002
 ```
 
-```text
-cluster: 3 nodes, leader = 2, term 4
-node 2  voter  applied 12
-node 3  voter  applied 12
-node 1  down
-```
+Reads and writes continue against the new leader. Restart node 1 and it
+**resumes** from its durable store and catches up from the log.
 
-Reads and writes continue against the new leader. Restart node 1 and it rejoins
-and catches up from the log.
+For the production version, see
+[Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
+[Run on Kubernetes](../how-to/kubernetes.md).

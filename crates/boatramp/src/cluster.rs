@@ -87,6 +87,14 @@ enum ClusterCommand {
         #[arg(long)]
         full: bool,
     },
+    /// Promote a caught-up learner to a **voter** (adds it to the quorum). The
+    /// target is a **mesh address** (as shown by `status`) or a raw node id.
+    /// Target the leader's API. Use this to build a voting quorum on bare metal
+    /// (in Kubernetes the operator promotes automatically).
+    Promote {
+        /// The node to promote: its mesh address (preferred) or its raw node id.
+        target: String,
+    },
     /// Rotate the `--server` node's own mesh key, make-before-break.
     /// Node-local: rotation happens on the node whose API you target (only
     /// it holds and mints its private key), so this rotates that node's key.
@@ -188,6 +196,26 @@ fn format_status(members: &[MemberRow], full: bool) -> String {
     out
 }
 
+/// Resolve a `remove`/`promote` target to a node id: a bare integer is a raw
+/// node id; anything else is a mesh address looked up in the membership.
+async fn resolve_node(http: &client::ApiClient, server: &str, target: &str) -> Result<u64> {
+    if let Ok(id) = target.parse::<u64>() {
+        return Ok(id);
+    }
+    let members: Vec<MemberRow> = http
+        .get(format!("{server}/api/cluster/members"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    members
+        .iter()
+        .find(|m| m.addr.as_deref() == Some(target))
+        .map(|m| m.node)
+        .ok_or_else(|| Error::NoSuchMember(target.to_string()))
+}
+
 /// Entry point for `boatramp cluster`.
 pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
     let server = client::resolve_server(args.server, config)?;
@@ -256,31 +284,22 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
             print!("{}", format_status(&members, full));
         }
         ClusterCommand::Remove { target } => {
-            // Resolve an address to a node id via the membership; a bare integer
-            // is taken as a raw node id.
-            let node = match target.parse::<u64>() {
-                Ok(id) => id,
-                Err(_) => {
-                    let members: Vec<MemberRow> = http
-                        .get(format!("{server}/api/cluster/members"))
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json()
-                        .await?;
-                    members
-                        .iter()
-                        .find(|m| m.addr.as_deref() == Some(target.as_str()))
-                        .map(|m| m.node)
-                        .ok_or_else(|| Error::NoSuchMember(target.clone()))?
-                }
-            };
+            let node = resolve_node(&http, &server, &target).await?;
             http.post(format!("{server}/api/cluster/revoke"))
                 .json(&RevokeRequest { node_id: node })
                 .send()
                 .await?
                 .error_for_status()?;
             eprintln!("removed {target} (node {node}) from the cluster");
+        }
+        ClusterCommand::Promote { target } => {
+            let node = resolve_node(&http, &server, &target).await?;
+            http.post(format!("{server}/api/cluster/promote"))
+                .json(&RevokeRequest { node_id: node })
+                .send()
+                .await?
+                .error_for_status()?;
+            eprintln!("promoted {target} (node {node}) to a voter");
         }
         ClusterCommand::RotateKey => {
             let response: RotateKeyResponse = http

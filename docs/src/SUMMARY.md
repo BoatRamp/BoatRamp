@@ -42,6 +42,7 @@
 - [Manage certificates in a cluster](./how-to/cluster-certs.md)
 - [Deploy a single node in production](./how-to/deploy-single-node.md)
 - [Deploy a self-hosted cluster](./how-to/deploy-cluster.md)
+- [Run on Kubernetes (the in-binary operator)](./how-to/kubernetes.md)
 - [Migrate the root key](./how-to/migrate-root-key.md)
 - [Deploy on Cloudflare Containers](./how-to/deploy-cloudflare.md)
 

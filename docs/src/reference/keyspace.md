@@ -34,7 +34,21 @@ scrub` re-hashes each to detect drift.
 | `authz/policy` | the RBAC policy (roles → rights); absent ⇒ the built-in default |
 | `authz/tokens/<id>` | issued-token metadata (label, roles); the token is never stored |
 | `authz/revoked/<id>` | a revocation marker (presence ⇒ revoked) |
+| `auth/root/<alg:hex>` | an extra trusted **root anchor** (`auth rotate-root`, make-before-break) |
 | `cert/<domain>` | a stored cert (chain + key + expiry) — cluster-managed |
+
+### Mesh membership (cluster mode, replicated)
+
+The dynamic-join trust + routing state, replicated through the control plane so
+every node (and a restart) converges. See
+[Deploy a self-hosted cluster](../how-to/deploy-cluster.md).
+
+| Key prefix | Value |
+| --- | --- |
+| `mesh/trust/<node>/<pubkey>` | an accepted mesh public key (the sole authority on who may speak on the mesh) |
+| `mesh/addr/<node>` | a member's advisory mesh URL (routing; the TLS re-authenticates by key) |
+| `mesh/revoked/<pubkey>` | a durable **revocation tombstone** — a fresh token can't re-admit this key until un-revoked (F6) |
+| `mesh/join/used/<jti>` | a spent single-use join-token handle (makes admission single-use) |
 
 ### Messaging (handler `wasi:messaging`)
 

@@ -62,12 +62,27 @@ the [CLI reference](./cli.md) maps each command onto them.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/cluster/join-token` | Mint a single-use mesh join token. |
-| `POST` | `/api/cluster/join` | Admit a joining node presenting a join token. |
+| `POST` | `/api/cluster/join-token` | Mint a single-use bearer mesh join token (admin). |
+| `POST` | `/api/cluster/join` | Admit a joining node (gated by the join token in the body + a possession proof, not admin RBAC). |
+| `GET` | `/api/cluster/members` | List the Raft membership (node, voter, caught-up, leader, address). |
+| `POST` | `/api/cluster/promote` | Promote a caught-up learner to a voter (leader-only). |
 | `POST` | `/api/cluster/rotate-key` | Rotate this node's mesh key (make-before-break). |
-| `POST` | `/api/cluster/revoke` | Revoke a node from the mesh. |
+| `POST` | `/api/cluster/revoke` | Revoke a node from the mesh (durable tombstone + drop from quorum). |
 
-See [Manage cluster mesh certificates](../how-to/cluster-certs.md).
+See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
+[Run on Kubernetes](../how-to/kubernetes.md).
+
+## Root anchors
+
+Make-before-break root-key rotation (`auth rotate-root`). Admin-scoped.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/auth/root` | List the extra trusted root anchors. |
+| `PUT` | `/api/auth/root` | Trust a new root anchor (`{ "pubkey": "alg:hex" }`). |
+| `DELETE` | `/api/auth/root/:pubkey` | Retire a root anchor. |
+
+See [Migrate the root key](../how-to/migrate-root-key.md).
 
 ## Certificates & cache
 

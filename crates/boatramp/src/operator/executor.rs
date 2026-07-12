@@ -117,7 +117,7 @@ impl ClusterApi {
         self.http
             .post(format!("{}/api/cluster/promote", self.base))
             .bearer_auth(&self.token)
-            .json(&json!({ "node": node }))
+            .json(&json!({ "node_id": node }))
             .send()
             .await?
             .error_for_status()?;

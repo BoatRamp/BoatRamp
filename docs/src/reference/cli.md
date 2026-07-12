@@ -44,7 +44,8 @@ flags unique to each command:
 | [`alias`](#boatramp-alias) | Manage named pointers to deployments. |
 | [`access`](#boatramp-access) | Configure visitor access control. |
 | [`token`](#boatramp-token) | Manage control-plane API tokens. |
-| [`cluster`](#boatramp-cluster) | Operate a cluster's mesh membership. |
+| [`cluster`](#boatramp-cluster) | Operate a cluster's dynamic-join membership. |
+| [`operator`](#boatramp-operator) | Run the in-binary Kubernetes operator / print its manifests. |
 | [`security`](#boatramp-security) | Inspect the operator security posture. |
 | [`auth`](#boatramp-auth) | Generate/inspect the root key; edit the RBAC policy. |
 | [`gateway`](#boatramp-gateway) | Publish a private service through the reverse-proxy gateway. |
@@ -128,6 +129,9 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 | `--protect-previews` | `BOATRAMP_PROTECT_PREVIEWS` | `false` | Require a token to view `/_deploy` previews. |
 | `--cluster-rate-limit` | `BOATRAMP_CLUSTER_RATE_LIMIT` | `false` | Rate-limit cluster-wide via the KV, not per node. |
 | `--shared-cache-coherence` | `BOATRAMP_SHARED_CACHE_COHERENCE` | `false` | Keep the config cache coherent across processes sharing one KV. |
+| `--cluster-init` | `BOATRAMP_CLUSTER_INIT` | `false` | **Found** a new cluster from this node (explicit, one-time). See [Deploy a cluster](../how-to/deploy-cluster.md). |
+| `--cluster-join <ticket>` | `BOATRAMP_CLUSTER_JOIN` | — | **Join** an existing cluster with a one-paste ticket from `cluster add`. |
+| `--cluster-advertise-addr <url>` | `BOATRAMP_CLUSTER_ADVERTISE_ADDR` | `https://<cluster.listen>` | This node's reachable mesh URL peers dial (set behind NAT / `0.0.0.0`). |
 
 ```sh
 boatramp serve --config boatramp.cfg \
@@ -267,14 +271,29 @@ Manage control-plane API tokens. See
 
 ## `boatramp cluster`
 
-Operate a self-hosted cluster's mesh membership. See
-[Manage cluster mesh certificates](../how-to/cluster-certs.md).
+Operate a self-hosted cluster's dynamic-join membership. See
+[Deploy a self-hosted cluster](../how-to/deploy-cluster.md).
 
 | Sub-action | Description |
 | --- | --- |
-| `join-token` | Mint a single-use mesh join token, bound to the joining node's id and mesh public key. |
+| `add --root-pubkey <k> [--seed <addr>] [--ttl-secs <n>] [--print-token-only]` | Print a one-paste **join ticket** (single-use token + seed + root anchor) for a new node. |
+| `status [--full]` | Show membership address-primary (ADDRESS/ROLE/NODE/STATE); `--full` shows whole node ids. |
+| `promote <address\|node>` | Promote a caught-up learner to a voter (build a quorum on bare metal). Target the leader. |
+| `remove <address\|node>` | Remove a node (subsumes `revoke`): revoke trust cluster-wide + drop from the quorum. Target the leader. |
+| `join-token [--ttl-secs <n>]` | Mint a raw single-use bearer join token (low-level; prefer `add`). |
 | `rotate-key` | Rotate the `--server` node's own mesh key, make-before-break (node-local). |
-| `revoke` | Revoke a node from the mesh cluster-wide and drop it from the quorum (target the leader). |
+| `revoke <node>` | Revoke a node by raw node id (low-level; prefer `remove`). |
+
+## `boatramp operator`
+
+Run the in-binary Kubernetes operator, or print its install manifests. See
+[Run on Kubernetes](../how-to/kubernetes.md). Requires the `operator` build feature.
+
+| Sub-action | Description |
+| --- | --- |
+| `run [--namespace <ns>]` | Run the controller: watch the boatramp CRDs and reconcile them. |
+| `crds` | Print the CRD YAML (`BoatRampCluster` / `Site` / `Function`). |
+| `manifests` | Print the full install bundle: CRDs + least-privilege RBAC + the operator Deployment. |
 
 ## `boatramp security`
 
@@ -293,7 +312,9 @@ Generate/inspect the control-plane root key and edit the RBAC policy. See
 | Sub-action | Description |
 | --- | --- |
 | `init` | Generate a fresh ES256 root keypair. |
-| `pubkey <alg:hex>` | Derive the public key from a root private key. |
+| `pubkey --private-key <alg:hex>` | Derive the public key from a root private key. |
+| `pin --root-pubkey <k>` | Resolve a `--tls rpk` server's TLS pin from the root anchor (prints `BOATRAMP_SERVER_PUBKEY`). |
+| `rotate-root [--add <pubkey>] [--retire <pubkey>]` | Make-before-break root rotation: trust a new anchor, or retire an old one; no flag lists the extra anchors. See [Migrate the root key](../how-to/migrate-root-key.md). |
 | `policy get` | Print the active RBAC policy as JSON (the built-in default if none is stored). |
 | `policy set <file.json>` | Replace the policy from a JSON file (validated server-side). |
 

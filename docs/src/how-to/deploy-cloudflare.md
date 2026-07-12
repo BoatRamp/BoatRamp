@@ -53,6 +53,12 @@ Review the artifacts, then `wrangler deploy` (or re-run with --apply).
 `--primary` hosts the voting quorum; the other regions host read-only learners
 that serve local reads and forward writes to the leader. Keep `--quorum` odd.
 
+The generated config is **uniform** across nodes ([dynamic join](./deploy-cluster.md)):
+node 1 founds via `BOATRAMP_CLUSTER_INIT=1` and the rest join with a
+`BOATRAMP_CLUSTER_JOIN` ticket — no per-node id or peer map. Set those env vars in
+each instance's container config (Cloudflare Containers instances are otherwise
+fungible, so the founder is designated by env, not by a baked-in config).
+
 ## 3. Deploy
 
 Review the artifacts, then push them with wrangler:
