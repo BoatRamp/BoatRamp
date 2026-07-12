@@ -1045,15 +1045,19 @@ impl boatramp_server::MeshControl for ClusterMeshControl {
             return Ok(JoinOutcome::ProofInvalid);
         }
 
-        // (4) Single-use: the state machine spends the `jti` (idempotent replay ⇒
-        // already-spent). A stale token that survived (3) still stops here.
-        let admitted = self
+        // (4) Single-use + re-admit-proof: the state machine spends the `jti`
+        // (idempotent replay ⇒ already-spent) and refuses a revoked key (F6). A
+        // stale/spent token or a revoked key that survived (3) stops here.
+        use boatramp_cluster::raft::AdmitOutcome;
+        match self
             .node
             .admit(mesh_pubkey_hex, jti)
             .await
-            .map_err(|e| e.to_string())?;
-        if !admitted {
-            return Ok(JoinOutcome::TokenSpent);
+            .map_err(|e| e.to_string())?
+        {
+            AdmitOutcome::Admitted => {}
+            AdmitOutcome::Spent => return Ok(JoinOutcome::TokenSpent),
+            AdmitOutcome::Revoked => return Ok(JoinOutcome::Revoked),
         }
 
         // (5) Vouch for the current members with root-signed assertions so the

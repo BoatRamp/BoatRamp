@@ -562,6 +562,9 @@ pub enum JoinOutcome {
     TokenSpent,
     /// The possession proof was missing/stale/invalid → `403`.
     ProofInvalid,
+    /// The presented key is revoked (a durable tombstone bars it, F6) — an
+    /// explicit un-revoke is required before it can rejoin → `403`.
+    Revoked,
 }
 
 /// One node's Raft membership, reported by `GET /api/cluster/members`.
@@ -1743,6 +1746,11 @@ async fn cluster_join(
         Ok(JoinOutcome::ProofInvalid) => (
             StatusCode::FORBIDDEN,
             "join possession proof is missing, stale, or invalid\n",
+        )
+            .into_response(),
+        Ok(JoinOutcome::Revoked) => (
+            StatusCode::FORBIDDEN,
+            "this mesh key is revoked; an explicit un-revoke is required before it can rejoin\n",
         )
             .into_response(),
         Err(err) => (
@@ -6365,6 +6373,7 @@ mod tests {
         Admit,
         Spent,
         Invalid,
+        Revoked,
     }
 
     #[async_trait::async_trait]
@@ -6385,6 +6394,7 @@ mod tests {
                 StubJoin::Admit => JoinOutcome::Admitted(vec!["signed-member".to_string()]),
                 StubJoin::Spent => JoinOutcome::TokenSpent,
                 StubJoin::Invalid => JoinOutcome::ProofInvalid,
+                StubJoin::Revoked => JoinOutcome::Revoked,
             })
         }
         async fn rotate_key(&self) -> Result<String, String> {
@@ -6454,6 +6464,21 @@ mod tests {
             cluster_join(
                 Extension(auth.clone()),
                 Extension(MeshControlHandle(Some(invalid))),
+                Json(req("aa01")),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        // A revoked key → 403 (a tombstone bars re-admission until un-revoked).
+        let revoked = Arc::new(StubControl {
+            admits: std::sync::Mutex::new(Vec::new()),
+            respond: StubJoin::Revoked,
+        });
+        assert_eq!(
+            cluster_join(
+                Extension(auth.clone()),
+                Extension(MeshControlHandle(Some(revoked))),
                 Json(req("aa01")),
             )
             .await

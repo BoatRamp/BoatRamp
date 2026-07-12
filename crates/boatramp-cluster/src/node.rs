@@ -233,21 +233,27 @@ impl ClusterNode {
 
     /// Admit a joining node from a **verified** join token.
     /// Proposes a single-use [`WriteOp::MeshAdmit`], which atomically trusts
-    /// `(node, pubkey_hex)` cluster-wide and spends the token's `jti`; then, on
-    /// the leader, adds the node as a learner so it starts replicating. Returns
-    /// whether the node was admitted (`false` = the token was already spent).
+    /// `(node, pubkey_hex)` cluster-wide and spends the token's `jti` — unless the
+    /// key is revoked (a tombstone bars it, F6) or the token was already spent.
+    /// On admission, on the leader, adds the node as a learner so it starts
+    /// replicating. Returns the [`AdmitOutcome`].
     ///
     /// The caller MUST first verify the join token — signature, TTL, and that the
-    /// joiner actually holds `pubkey_hex` — via
-    /// [`boatramp_core::cose::verify_join`]; the state machine enforces
-    /// only single-use. The mesh-admit KV write forwards from a follower, but the
+    /// joiner actually holds `pubkey_hex` (possession proof) — via
+    /// [`boatramp_core::cose::verify_join`]; the state machine enforces single-use
+    /// + re-admit-proof. The mesh-admit KV write forwards from a follower, but the
     /// `add_learner` membership step needs the leader, so a join is directed
     /// there (the control-plane route forwards it).
-    pub async fn admit(&self, pubkey_hex: &str, jti: &str) -> Result<bool, BootstrapError> {
+    pub async fn admit(
+        &self,
+        pubkey_hex: &str,
+        jti: &str,
+    ) -> Result<crate::raft::AdmitOutcome, BootstrapError> {
+        use crate::raft::AdmitOutcome;
         // The joining node is identified by its own key: its Raft id is derived from
         // the mesh public key (dynamic-join self-identity), not assigned by config.
         let Ok(spki) = crate::mesh::parse_public_key(pubkey_hex) else {
-            return Ok(false); // a malformed key admits nothing
+            return Ok(AdmitOutcome::Revoked); // a malformed key admits nothing
         };
         let node = crate::raft::derive_node_id(&spki);
         let resp = self
@@ -258,13 +264,18 @@ impl ClusterNode {
                 pubkey_hex: pubkey_hex.to_string(),
             })
             .await?;
-        let admitted = matches!(resp, WriteResponse::Admitted(true));
-        if admitted && self.is_leader() && !self.is_member(node) {
+        let outcome = match resp {
+            WriteResponse::Admitted(o) => o,
+            // A MeshAdmit only ever yields Admitted(_); treat anything else as a
+            // refusal rather than silently trusting.
+            _ => AdmitOutcome::Spent,
+        };
+        if outcome == AdmitOutcome::Admitted && self.is_leader() && !self.is_member(node) {
             self.raft
                 .add_learner(node, BasicNode::default(), false)
                 .await?;
         }
-        Ok(admitted)
+        Ok(outcome)
     }
 
     /// The current mesh trust set as `(node_id, pubkey_hex)` pairs — every key this
@@ -340,10 +351,21 @@ impl ClusterNode {
     pub async fn revoke(&self, node: NodeId) -> Result<(), BootstrapError> {
         use boatramp_core::kv::{KvStore, WriteOp as KvWriteOp};
 
-        // Delete all of `node`'s accepted keys: `mesh/trust/{node}/*`.
+        // Delete all of `node`'s accepted keys (`mesh/trust/{node}/*`) AND drop a
+        // durable revocation tombstone per key (`mesh/revoked/{pubkey}`, keyed on
+        // the full pubkey — F4/F6) so a fresh token can never silently re-admit a
+        // just-revoked key without an explicit un-revoke. Both ride one atomic
+        // batch, so revoke is all-or-nothing.
         let prefix = format!("{}{node}/", crate::mesh::TRUST_PREFIX);
         let keys = self.kv.list_prefix(&prefix).await?;
-        let batch: Vec<KvWriteOp> = keys.into_iter().map(KvWriteOp::Delete).collect();
+        let mut batch: Vec<KvWriteOp> = Vec::with_capacity(keys.len() * 2);
+        for key in keys {
+            // The trusted pubkey is the last path segment of the trust key.
+            if let Some(pubkey_hex) = key.rsplit('/').next() {
+                batch.push(KvWriteOp::Put(crate::raft::revoked_key(pubkey_hex), Vec::new()));
+            }
+            batch.push(KvWriteOp::Delete(key));
+        }
         if !batch.is_empty() {
             self.kv.write_batch(batch).await?;
         }
@@ -1058,7 +1080,11 @@ mod tests {
             .admit(&joiner_hex, "jti-join-1")
             .await
             .unwrap();
-        assert!(admitted, "a fresh token must admit the node");
+        assert_eq!(
+            admitted,
+            crate::raft::AdmitOutcome::Admitted,
+            "a fresh token must admit the node"
+        );
 
         // The trust replicates to every node's own live set (their observers
         // mirror the committed MeshAdmit).
@@ -1089,7 +1115,11 @@ mod tests {
             .admit(&joiner_hex, "jti-join-1")
             .await
             .unwrap();
-        assert!(!replay, "a replayed join token must be refused");
+        assert_eq!(
+            replay,
+            crate::raft::AdmitOutcome::Spent,
+            "a replayed join token must be refused"
+        );
 
         for (_, node) in nodes {
             node.raft.shutdown().await.unwrap();

@@ -170,6 +170,19 @@ pub fn trust_key_hex(node: NodeId, pubkey_hex: &str) -> String {
 /// makes [`WriteOp::MeshAdmit`] single-use across the cluster.
 const JOIN_USED_PREFIX: &str = "mesh/join/used/";
 
+/// The replicated-KV prefix of **revocation tombstones**, keyed on the revoked
+/// node's **full mesh pubkey** (F4: authority keys on the key, never the id).
+/// A tombstone makes `revoke` durable + re-admit-proof (F6): once set, no fresh
+/// join token can silently re-admit that key — an explicit un-revoke (tombstone
+/// delete) is required. A `revoke` racing an `admit` therefore always ends
+/// *revoked*, in either apply order.
+pub const REVOKED_PREFIX: &str = "mesh/revoked/";
+
+/// The revocation-tombstone key for `pubkey_hex` (SPKI hex).
+pub fn revoked_key(pubkey_hex: &str) -> String {
+    format!("{REVOKED_PREFIX}{pubkey_hex}")
+}
+
 /// The applied-state byte map plus the **durable mutations** each apply makes,
 /// recorded with *raw* keys. The in-memory state machine discards `muts`; the
 /// persistent one ([`crate::persist`]) write-throughs them to its `KvStore`, so
@@ -266,15 +279,21 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             node,
             pubkey_hex,
         } => {
-            // Single-use: spending a `jti` is check-and-set inside one apply, so
-            // a replayed token (even racing on the leader) can never double-admit.
-            let used = format!("{JOIN_USED_PREFIX}{jti}");
-            if target.data.contains_key(&used) {
-                WriteResponse::Admitted(false)
+            // Re-admit-proof (F6): a revoked key is refused until an explicit
+            // un-revoke removes its tombstone — checked first, and the token is
+            // NOT spent, so it stays redeemable once the key is un-revoked. A
+            // `revoke` racing this `admit` ends *revoked* in either order (the
+            // tombstone here, or `revoke`'s later trust-delete + tombstone).
+            if target.data.contains_key(&revoked_key(&pubkey_hex)) {
+                WriteResponse::Admitted(AdmitOutcome::Revoked)
+            } else if target.data.contains_key(&format!("{JOIN_USED_PREFIX}{jti}")) {
+                // Single-use: spending a `jti` is check-and-set inside one apply,
+                // so a replayed token (even racing on the leader) never double-admits.
+                WriteResponse::Admitted(AdmitOutcome::Spent)
             } else {
-                target.put(used, Vec::new());
+                target.put(format!("{JOIN_USED_PREFIX}{jti}"), Vec::new());
                 target.put(trust_key_hex(node, &pubkey_hex), Vec::new());
-                WriteResponse::Admitted(true)
+                WriteResponse::Admitted(AdmitOutcome::Admitted)
             }
         }
     }
@@ -347,9 +366,22 @@ pub enum WriteResponse {
     Kv,
     /// A claim's leased records (id + attempt count).
     Claimed(Vec<ClaimedRecord>),
-    /// A [`WriteOp::MeshAdmit`] outcome: `true` if this call admitted the node,
-    /// `false` if the join token was already spent (replay refused).
-    Admitted(bool),
+    /// A [`WriteOp::MeshAdmit`] outcome (see [`AdmitOutcome`]).
+    Admitted(AdmitOutcome),
+}
+
+/// The outcome of applying a [`WriteOp::MeshAdmit`]: the joiner was admitted, the
+/// token was already spent (replay), or the key is revoked (a tombstone bars it
+/// until an explicit un-revoke — F6). Deterministic at the apply layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdmitOutcome {
+    /// The joiner was trusted mesh-wide and the token spent.
+    Admitted,
+    /// The join token was already spent (single-use replay refused) → `409`.
+    Spent,
+    /// The key is revoked; a fresh token cannot re-admit it → an explicit
+    /// un-revoke is required (F6).
+    Revoked,
 }
 
 // ---- log store (in-memory) -------------------------------------------------
@@ -1053,7 +1085,7 @@ mod tests {
                 pubkey_hex: "aa01".into(),
             },
         );
-        assert_eq!(first, WriteResponse::Admitted(true));
+        assert_eq!(first, WriteResponse::Admitted(AdmitOutcome::Admitted));
         assert!(data.contains_key(&trust_key_hex(5, "aa01")), "node trusted");
         assert!(data.contains_key("mesh/join/used/jti-1"), "handle spent");
 
@@ -1067,7 +1099,7 @@ mod tests {
                 pubkey_hex: "bb02".into(),
             },
         );
-        assert_eq!(replay, WriteResponse::Admitted(false));
+        assert_eq!(replay, WriteResponse::Admitted(AdmitOutcome::Spent));
         assert!(
             !data.contains_key(&trust_key_hex(5, "bb02")),
             "a replayed jti must not admit a different key"
@@ -1083,8 +1115,52 @@ mod tests {
                 pubkey_hex: "cc03".into(),
             },
         );
-        assert_eq!(second, WriteResponse::Admitted(true));
+        assert_eq!(second, WriteResponse::Admitted(AdmitOutcome::Admitted));
         assert!(data.contains_key(&trust_key_hex(6, "cc03")));
+    }
+
+    /// A revocation tombstone bars re-admission (F6): once `mesh/revoked/{key}`
+    /// is set, a **fresh** join token for that key is refused (`Revoked`) and the
+    /// token is **not** spent — so it becomes redeemable again only after an
+    /// explicit un-revoke (tombstone delete). This is the durable, re-admit-proof
+    /// property that makes a `revoke` racing an `admit` always end revoked.
+    #[test]
+    fn revocation_tombstone_bars_readmission_until_unrevoked() {
+        let mut data = BTreeMap::new();
+        // The key was revoked (tombstone present), trust already gone.
+        data.insert(revoked_key("dd04"), Vec::new());
+
+        // A fresh token for the revoked key is refused, trust NOT restored,
+        // and — critically — the token handle is NOT consumed.
+        let mut t = ApplyTarget::new(&mut data);
+        let barred = apply_op(
+            &mut t,
+            WriteOp::MeshAdmit {
+                jti: "jti-revoked".into(),
+                node: 7,
+                pubkey_hex: "dd04".into(),
+            },
+        );
+        assert_eq!(barred, WriteResponse::Admitted(AdmitOutcome::Revoked));
+        assert!(!data.contains_key(&trust_key_hex(7, "dd04")), "no re-trust");
+        assert!(
+            !data.contains_key("mesh/join/used/jti-revoked"),
+            "a barred admit must not spend the token"
+        );
+
+        // Un-revoke (delete the tombstone) → the same token now admits.
+        data.remove(&revoked_key("dd04"));
+        let mut t2 = ApplyTarget::new(&mut data);
+        let now_ok = apply_op(
+            &mut t2,
+            WriteOp::MeshAdmit {
+                jti: "jti-revoked".into(),
+                node: 7,
+                pubkey_hex: "dd04".into(),
+            },
+        );
+        assert_eq!(now_ok, WriteResponse::Admitted(AdmitOutcome::Admitted));
+        assert!(data.contains_key(&trust_key_hex(7, "dd04")), "re-admitted");
     }
 
     /// Spin up an in-process 3-node cluster, elect a leader, replicate a write,
