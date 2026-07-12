@@ -50,6 +50,12 @@ pub const KIND_BOOTSTRAP_TLS: &str = "bootstrap-tls";
 /// token's holder (`cnf`) key to bind one request to that holder — so a leaked
 /// bearer token alone can't be replayed.
 pub const KIND_POP: &str = "pop";
+/// Token kind: a **cluster mesh-member assertion** — the root key vouching that a
+/// given mesh public key (`br_pubkey`) belongs to node `br_node` of this cluster.
+/// A joiner adopts each returned member into its trust set only after verifying
+/// this against the root anchor, so a malicious seed cannot inject a fabricated
+/// member (dynamic-join trust bootstrap; see PLAN-cluster-join F3).
+pub const KIND_MESH_MEMBER: &str = "mesh-member";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -618,6 +624,93 @@ pub fn verify_attestation(
         return Err(TokenError::Claims("not a bootstrap-tls attestation".into()));
     }
     pubkey_hex.ok_or_else(|| TokenError::Claims("attestation has no pubkey".into()))
+}
+
+/// A verified cluster mesh-member assertion: the root key's binding of a mesh
+/// public key to a node id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberAssertion {
+    /// The node id (label) the assertion vouches for.
+    pub node_id: u64,
+    /// The node's mesh public key (SPKI hex) — the identity a joiner adds to trust.
+    pub pubkey_hex: String,
+}
+
+/// Mint a **cluster mesh-member assertion**: a `COSE_Sign1` CWT signed by the root
+/// key binding `(node_id, mesh_pubkey)` with `br_kind = "mesh-member"` and a TTL.
+/// The join response returns one per current member so a joiner can verify each
+/// against the root anchor before trusting it — a malicious/stale seed cannot then
+/// inject or fabricate a member (PLAN-cluster-join F3).
+pub async fn mint_member_assertion(
+    node_id: u64,
+    mesh_pubkey_hex: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64,
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_MESH_MEMBER.to_string()),
+        )
+        .text_claim(CLAIM_NODE.to_string(), CborValue::from(node_id))
+        .text_claim(
+            CLAIM_PUBKEY.to_string(),
+            CborValue::Text(mesh_pubkey_hex.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify a mesh-member assertion against the root `public` at `now_unix`:
+/// signature + alg pin + TTL + `br_kind = "mesh-member"`, returning the vouched
+/// `(node_id, mesh_pubkey)`. A token of any other kind is rejected (domain
+/// separation) — so a role/join/attestation token can't pose as a member.
+pub fn verify_member_assertion(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<MemberAssertion, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    check_exp(&claims, now_unix)?;
+    let mut kind = String::new();
+    let mut node_id: Option<u64> = None;
+    let mut pubkey_hex: Option<String> = None;
+    for (name, value) in &claims.rest {
+        if let coset::cwt::ClaimName::Text(t) = name {
+            match t.as_str() {
+                CLAIM_KIND => {
+                    if let CborValue::Text(k) = value {
+                        kind = k.clone();
+                    }
+                }
+                CLAIM_NODE => {
+                    if let CborValue::Integer(i) = value {
+                        node_id = u64::try_from(*i).ok();
+                    }
+                }
+                CLAIM_PUBKEY => {
+                    if let CborValue::Text(k) = value {
+                        pubkey_hex = Some(k.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if kind != KIND_MESH_MEMBER {
+        return Err(TokenError::Claims("not a mesh-member assertion".into()));
+    }
+    Ok(MemberAssertion {
+        node_id: node_id.ok_or_else(|| TokenError::Claims("member assertion has no node".into()))?,
+        pubkey_hex: pubkey_hex
+            .ok_or_else(|| TokenError::Claims("member assertion has no pubkey".into()))?,
+    })
 }
 
 /// A random 16-byte revocation/single-use id (`cti`).
@@ -1322,6 +1415,36 @@ mod tests {
         let join = mint_join(1, tls_spki, 3600, NOW, &root).await.unwrap();
         assert!(matches!(
             verify_attestation(&join, &public, NOW + 60),
+            Err(TokenError::Claims(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn member_assertion_round_trips_and_rejects_tamper_expiry_and_kind() {
+        let root = LocalSigner::generate(TokenAlg::Es256);
+        let public = root.public_key();
+        let mesh_spki = "302a300506032b6570032100feedface00000000feedface00000000";
+
+        // Round-trip: the vouched (node, key) comes back.
+        let m = mint_member_assertion(42, mesh_spki, 3600, NOW, &root)
+            .await
+            .unwrap();
+        let got = verify_member_assertion(&m, &public, NOW + 60).unwrap();
+        assert_eq!(got.node_id, 42);
+        assert_eq!(got.pubkey_hex, mesh_spki);
+
+        // Expired → rejected.
+        assert!(matches!(
+            verify_member_assertion(&m, &public, NOW + 4000),
+            Err(TokenError::Expired)
+        ));
+        // Not the root key → rejected (only the root anchor vouches for members).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_member_assertion(&m, &stranger.public_key(), NOW).is_err());
+        // A bootstrap-TLS attestation is not a member assertion (domain separation).
+        let att = mint_attestation(mesh_spki, 3600, NOW, &root).await.unwrap();
+        assert!(matches!(
+            verify_member_assertion(&att, &public, NOW + 60),
             Err(TokenError::Claims(_))
         ));
     }
