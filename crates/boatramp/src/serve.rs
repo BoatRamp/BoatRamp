@@ -633,6 +633,13 @@ pub struct ServeArgs {
     #[arg(long, env = "BOATRAMP_CLUSTER_ADVERTISE_ADDR")]
     cluster_advertise_addr: Option<String>,
 
+    /// **Join an existing cluster** using a one-paste ticket from `cluster add`
+    /// (bundles the seeds + root anchor + single-use token). Overrides
+    /// `[cluster].seeds`/`root_pubkeys`/`join_token`. Mutually exclusive with
+    /// `--cluster-init`.
+    #[arg(long, env = "BOATRAMP_CLUSTER_JOIN")]
+    cluster_join: Option<String>,
+
     /// Keep the local config cache coherent across processes sharing one KV
     /// (Cloudflare KV / shared SlateDB): publish each control-plane write to a
     /// changelog and poll it to invalidate just the keys peers changed.
@@ -1289,7 +1296,7 @@ impl boatramp_cluster::raft::ApplyObserver for DaemonConfigObserver {
 async fn run_cluster(
     args: ServeArgs,
     config: &ServerConfig,
-    cluster_cfg: crate::config::ClusterConfig,
+    mut cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
     storage: Arc<dyn Storage>,
@@ -1347,6 +1354,17 @@ async fn run_cluster(
         pubkey = %identity.public_key_hex(),
         "cluster: mesh identity"
     );
+
+    // A one-paste `--cluster-join <ticket>` overrides the `[cluster]` seeds/root/
+    // token: decode it and fold it into the config so the rest of the flow is
+    // ticket-vs-config agnostic.
+    if let Some(blob) = args.cluster_join.as_deref() {
+        let ticket =
+            crate::join::JoinTicket::decode(blob).map_err(|e| Error::ClusterStartup(e.to_string()))?;
+        cluster_cfg.seeds = ticket.seeds;
+        cluster_cfg.root_pubkeys = ticket.root_pubkeys;
+        cluster_cfg.join_token = Some(ticket.token);
+    }
 
     // Decide founding vs joining vs resuming (F5): the single source of truth.
     let seeds_present = !cluster_cfg.seeds.is_empty();

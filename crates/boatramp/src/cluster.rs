@@ -24,6 +24,10 @@ pub enum Error {
     /// An HTTP request to the control plane failed.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// Encoding the join ticket failed.
+    #[cfg(feature = "cluster")]
+    #[error("join ticket: {0}")]
+    Ticket(String),
 }
 
 /// `cluster` module result; `Err` is [`Error`].
@@ -42,9 +46,31 @@ pub struct ClusterArgs {
 
 #[derive(Debug, Subcommand)]
 enum ClusterCommand {
+    /// Print a one-paste **join ticket** for a new node: a single-use join token
+    /// bundled with the seed address + the cluster root anchor, so the joiner
+    /// self-identifies and joins with no peer map. Run against any existing node.
+    #[cfg(feature = "cluster")]
+    Add {
+        /// The cluster **root public key** (`es256:`/`ed25519:` hex) — the anchor
+        /// the joiner verifies the seed + members against. From `auth pubkey`.
+        #[arg(long)]
+        root_pubkey: String,
+        /// The seed control-plane address the joiner should reach (defaults to
+        /// `--server`). This is where the joiner POSTs its `/api/cluster/join`.
+        #[arg(long)]
+        seed: Option<String>,
+        /// Token time-to-live in seconds (default: the server's short window).
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// Print only the raw single-use token (scripting escape hatch), not the
+        /// full ticket.
+        #[arg(long)]
+        print_token_only: bool,
+    },
     /// Mint a single-use **bearer** mesh join token (printed once). Any node can
     /// redeem it, but only by proving possession of its own mesh key at join
-    /// time, and only once — hand it to exactly one joining node.
+    /// time, and only once — hand it to exactly one joining node. (Prefer
+    /// `cluster add`, which bundles the token into a one-paste join ticket.)
     JoinToken {
         /// Token time-to-live in seconds (default: the server's short window).
         #[arg(long)]
@@ -92,6 +118,42 @@ pub async fn run(args: ClusterArgs, config: &ProjectConfig) -> Result<()> {
     let http = client::http_client(client::token(config).as_deref());
 
     match args.command {
+        #[cfg(feature = "cluster")]
+        ClusterCommand::Add {
+            root_pubkey,
+            seed,
+            ttl_secs,
+            print_token_only,
+        } => {
+            let response: JoinTokenResponse = http
+                .post(format!("{server}/api/cluster/join-token"))
+                .json(&JoinTokenRequest { ttl_secs })
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if print_token_only {
+                println!("{}", response.token);
+            } else {
+                // The seed the joiner reaches defaults to the node we just minted
+                // against (its control plane serves `/api/cluster/join`).
+                let seed_addr = seed.unwrap_or_else(|| server.clone());
+                let ticket = crate::join::JoinTicket {
+                    seeds: vec![seed_addr.clone()],
+                    root_pubkeys: vec![root_pubkey.trim().to_string()],
+                    token: response.token,
+                }
+                .encode()
+                .map_err(|e| Error::Ticket(e.to_string()))?;
+                println!("{ticket}");
+                eprintln!("single-use join ticket — hand it to exactly one new node, e.g.:");
+                eprintln!("  boatramp serve --mode cluster --cluster-join {ticket}");
+            }
+            if let Some(exp) = response.expires_at {
+                eprintln!("expires at (unix): {exp}");
+            }
+        }
         ClusterCommand::JoinToken { ttl_secs } => {
             let response: JoinTokenResponse = http
                 .post(format!("{server}/api/cluster/join-token"))

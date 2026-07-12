@@ -26,11 +26,8 @@ use serde::{Deserialize, Serialize};
 use boatramp_core::cose::{self, TokenPublicKey};
 use boatramp_rpktls::RpkIdentity;
 
-/// Versioned, human-recognisable prefix on the opaque ticket blob. The
-/// encode/decode round-trip is consumed by the `cluster add` CLI (CJ-4); the
-/// startup path builds a ticket straight from config, so they're allow(dead_code)
-/// until then.
-#[allow(dead_code)]
+/// Versioned, human-recognisable prefix on the opaque ticket blob. Encoded by the
+/// `cluster add` CLI, decoded by `serve --cluster-join`.
 const TICKET_MAGIC: &str = "brjoin1";
 
 /// A failure joining a cluster.
@@ -83,7 +80,6 @@ pub struct JoinTicket {
 
 impl JoinTicket {
     /// Encode to the opaque `--cluster-join` blob.
-    #[allow(dead_code)]
     pub fn encode(&self) -> Result<String, JoinError> {
         let json = serde_json::to_vec(self).map_err(|e| JoinError::Ticket(e.to_string()))?;
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
@@ -91,7 +87,6 @@ impl JoinTicket {
     }
 
     /// Decode the opaque blob back to a ticket (validating it is non-empty).
-    #[allow(dead_code)]
     pub fn decode(blob: &str) -> Result<Self, JoinError> {
         let b64 = blob
             .trim()
