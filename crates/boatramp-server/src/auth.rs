@@ -28,6 +28,8 @@ use boatramp_core::kv::KvStore;
 /// signed by the token's holder (`cnf`) key. Lower-case per HTTP/2 conventions.
 const POP_HEADER: HeaderName = HeaderName::from_static("boatramp-pop");
 
+use authz::ROOT_ANCHOR_PREFIX;
+
 /// Control-plane auth configuration: the token trust anchor (root public key)
 /// plus the KV that holds the RBAC policy (`authz/policy`) and revocation markers
 /// (`authz/revoked/<id>`). `None` ⇒ auth disabled (development).
@@ -144,7 +146,7 @@ impl Auth {
         let Some(inner) = &self.inner else {
             return false;
         };
-        let Ok(verified) = cose::verify_credential(bearer, &inner.public, now_unix()) else {
+        let Ok(verified) = inner.verify_credential_any(bearer, now_unix()).await else {
             return false;
         };
         !inner.is_revoked(&verified.cti).await
@@ -157,7 +159,10 @@ impl Auth {
     /// check fails.
     pub async fn verify_bearer_roles(&self, bearer: &str) -> Option<Vec<authz::GrantedRole>> {
         let inner = self.inner.as_ref()?;
-        let verified = cose::verify_credential(bearer, &inner.public, now_unix()).ok()?;
+        let verified = inner
+            .verify_credential_any(bearer, now_unix())
+            .await
+            .ok()?;
         if inner.is_revoked(&verified.cti).await {
             return None;
         }
@@ -186,8 +191,10 @@ impl Auth {
             return Ok(());
         };
         let now = now_unix();
-        let verified =
-            cose::verify_credential(bearer, &inner.public, now).map_err(Reject::from_token_err)?;
+        let verified = inner
+            .verify_credential_any(bearer, now)
+            .await
+            .map_err(Reject::from_token_err)?;
         if inner.is_revoked(&verified.cti).await {
             return Err(Reject::forbidden("token revoked\n"));
         }
@@ -229,6 +236,43 @@ impl AuthInner {
     /// Whether the token's revocation id (`cti`) is marked revoked in the KV.
     async fn is_revoked(&self, cti: &str) -> bool {
         matches!(self.kv.get(&authz::revoked_key(cti)).await, Ok(Some(_)))
+    }
+
+    /// Verify a credential against the primary anchor, then — only on failure —
+    /// the replicated **rotation anchor set** (`auth/root/*`). This makes a
+    /// `auth rotate-root` make-before-break: both the old and new root keys are
+    /// trusted during the overlap, so no node ever rejects a valid token. The
+    /// replicated set is consulted only when the primary key doesn't verify (the
+    /// rare overlap case), so the common path stays a single in-memory check.
+    async fn verify_credential_any(
+        &self,
+        bearer: &str,
+        now: u64,
+    ) -> Result<cose::VerifiedChain, TokenError> {
+        match cose::verify_credential(bearer, &self.public, now) {
+            Ok(v) => Ok(v),
+            Err(primary_err) => {
+                for anchor in self.rotation_anchors().await {
+                    if let Ok(v) = cose::verify_credential(bearer, &anchor, now) {
+                        return Ok(v);
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
+    /// The replicated rotation anchors — extra root public keys added by
+    /// `auth rotate-root` (`auth/root/{es256:hex}`), trusted alongside the primary.
+    async fn rotation_anchors(&self) -> Vec<TokenPublicKey> {
+        self.kv
+            .list_prefix(ROOT_ANCHOR_PREFIX)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|k| k.strip_prefix(ROOT_ANCHOR_PREFIX))
+            .filter_map(|hex| TokenPublicKey::from_hex(hex).ok())
+            .collect()
     }
 
     /// Require + verify a per-request PoP proof for a holder-bound credential.
@@ -495,6 +539,37 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Make-before-break root rotation: a token signed by a **new** root verifies
+    /// only once that key is trusted as a rotation anchor (`auth/root/*`), while
+    /// the **primary** root's tokens keep verifying throughout — so there is no
+    /// window where a valid token is rejected. Retiring the anchor reverses it.
+    #[tokio::test]
+    async fn rotation_anchor_is_make_before_break() {
+        use boatramp_core::kv::KvStore;
+        let primary = holder();
+        let new_root = holder();
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let auth = Auth::with_key(primary.public_key(), kv.clone());
+        let now = now_unix();
+
+        let new_token = cose::mint(&admin_claims(now), &new_root).await.unwrap();
+        // Before rotation: only the primary is trusted, so the new key's token fails.
+        assert!(!auth.verify_bearer(&new_token).await);
+
+        // Trust the new key as a rotation anchor (make-before-break).
+        let anchor = authz::root_anchor_key(&new_root.public_key().to_hex());
+        kv.put(&anchor, Vec::new()).await.unwrap();
+        assert!(auth.verify_bearer(&new_token).await, "new-root token now verifies");
+        // The primary's tokens verify the whole time.
+        let primary_token = cose::mint(&admin_claims(now), &primary).await.unwrap();
+        assert!(auth.verify_bearer(&primary_token).await);
+
+        // Retire the old/new anchor → its tokens stop verifying again.
+        kv.delete(&anchor).await.unwrap();
+        assert!(!auth.verify_bearer(&new_token).await);
+        assert!(auth.verify_bearer(&primary_token).await, "primary still valid");
     }
 
     #[tokio::test]

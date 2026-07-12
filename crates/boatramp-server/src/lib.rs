@@ -748,6 +748,13 @@ pub fn router_with(
             "/api/authz/policy",
             get(get_authz_policy).put(put_authz_policy),
         )
+        // The replicated **root-anchor set** — make-before-break root rotation
+        // (`auth rotate-root`). Admin-scoped (deny-safe `Right::required` default).
+        .route(
+            "/api/auth/root",
+            get(list_root_anchors).put(add_root_anchor),
+        )
+        .route("/api/auth/root/:pubkey", axum::routing::delete(remove_root_anchor))
         // Dynamic daemon config — validated + committed on the leader, replicated,
         // hot-swapped without a restart. Admin-scoped (deny-safe `Right::required`).
         .route(
@@ -2038,6 +2045,51 @@ async fn put_authz_policy(
         return (StatusCode::BAD_REQUEST, format!("invalid policy: {err}\n")).into_response();
     }
     match deploy.set_authz_policy(&policy).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// The extra trusted root anchors (make-before-break rotation).
+async fn list_root_anchors(State(deploy): State<DeployStore>) -> Response {
+    match deploy.list_root_anchors().await {
+        Ok(anchors) => (StatusCode::OK, Json(anchors)).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct RootAnchorRequest {
+    /// The `alg:hex`-encoded root public key to trust alongside the primary.
+    pubkey: String,
+}
+
+/// Trust an additional root anchor — rejects anything that isn't a valid
+/// `TokenPublicKey` so a malformed anchor can never be added.
+async fn add_root_anchor(
+    State(deploy): State<DeployStore>,
+    Json(req): Json<RootAnchorRequest>,
+) -> Response {
+    let pubkey = req.pubkey.trim();
+    if cose::TokenPublicKey::from_hex(pubkey).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "pubkey must be an alg:hex TokenPublicKey (e.g. es256:…)\n",
+        )
+            .into_response();
+    }
+    match deploy.add_root_anchor(pubkey).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Retire a root anchor (the old key, after a rotation propagates).
+async fn remove_root_anchor(
+    State(deploy): State<DeployStore>,
+    Path(pubkey): Path<String>,
+) -> Response {
+    match deploy.remove_root_anchor(pubkey.trim()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }

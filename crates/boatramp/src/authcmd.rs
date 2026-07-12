@@ -86,6 +86,20 @@ enum AuthCommand {
     /// Manage the RBAC policy (`authz/policy`).
     #[command(subcommand)]
     Policy(PolicyCommand),
+    /// **Rotate the cluster root key**, make-before-break. With no flag, list the
+    /// extra trusted anchors. `--add` trusts a new anchor cluster-wide (so both
+    /// old + new verify — no window where a valid token is rejected); re-point
+    /// `[serve.signer]` to the new key so new tokens/attestations use it, then
+    /// `--retire` the old anchor once every node has the new one. See
+    /// `how-to/migrate-root-key.md`.
+    RotateRoot {
+        /// Trust a new root anchor (`<alg>:<hex>` public key, from `auth pubkey`).
+        #[arg(long, value_name = "PUBKEY")]
+        add: Option<String>,
+        /// Retire a previously-added anchor (the old key, after propagation).
+        #[arg(long, value_name = "PUBKEY")]
+        retire: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,6 +145,9 @@ pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<()> {
         }
         AuthCommand::Pin { root_pubkey } => run_pin(args.server, root_pubkey, config).await?,
         AuthCommand::Policy(command) => run_policy(command, args.server, config).await?,
+        AuthCommand::RotateRoot { add, retire } => {
+            run_rotate_root(add, retire, args.server, config).await?
+        }
     }
     Ok(())
 }
@@ -190,6 +207,60 @@ async fn run_pin(server: Option<String>, root_pubkey: String, config: &ProjectCo
 
     eprintln!("verified {server} against the root key. Export this to pin it:");
     println!("BOATRAMP_SERVER_PUBKEY={attested_hex}");
+    Ok(())
+}
+
+/// Drive a make-before-break root rotation via the replicated anchor set.
+async fn run_rotate_root(
+    add: Option<String>,
+    retire: Option<String>,
+    server: Option<String>,
+    config: &ProjectConfig,
+) -> Result<()> {
+    let server = client::resolve_server(server, config)?;
+    let http = client::http_client(client::token(config).as_deref());
+
+    if let Some(pubkey) = add.as_deref() {
+        let pubkey = pubkey.trim();
+        // Validate locally for a clear error before the round-trip.
+        boatramp_core::cose::TokenPublicKey::from_hex(pubkey)
+            .map_err(|e| Error::Attestation(format!("invalid --add pubkey: {e}")))?;
+        http.put(format!("{server}/api/auth/root"))
+            .json(&serde_json::json!({ "pubkey": pubkey }))
+            .send()
+            .await?
+            .error_for_status()?;
+        eprintln!("trusted new root anchor {pubkey} (make-before-break).");
+        eprintln!(
+            "Now re-point [serve.signer] / BOATRAMP_AUTH_ROOT_PRIVATE_KEY to the new key so new \
+             tokens + attestations use it, wait for every node to converge, then retire the old \
+             anchor:\n  boatramp auth rotate-root --retire <old-pubkey>"
+        );
+    }
+    if let Some(pubkey) = retire.as_deref() {
+        let pubkey = pubkey.trim();
+        http.delete(format!("{server}/api/auth/root/{pubkey}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        eprintln!("retired root anchor {pubkey}.");
+    }
+    if add.is_none() && retire.is_none() {
+        let anchors: Vec<String> = http
+            .get(format!("{server}/api/auth/root"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if anchors.is_empty() {
+            println!("(no extra root anchors — running on the primary root key only)");
+        } else {
+            for a in anchors {
+                println!("{a}");
+            }
+        }
+    }
     Ok(())
 }
 

@@ -528,6 +528,16 @@ pub fn revoked_key(revocation_id: &str) -> String {
     format!("{REVOKED_PREFIX}{revocation_id}")
 }
 
+/// KV key prefix for extra trusted **root anchors** added by `auth rotate-root`
+/// (`auth/root/{alg:hex}`). Each is a `TokenPublicKey` trusted alongside the
+/// configured primary root during a make-before-break root rotation.
+pub const ROOT_ANCHOR_PREFIX: &str = "auth/root/";
+
+/// The root-anchor key trusting `pubkey` (an `alg:hex`-encoded `TokenPublicKey`).
+pub fn root_anchor_key(pubkey: &str) -> String {
+    format!("{ROOT_ANCHOR_PREFIX}{pubkey}")
+}
+
 /// The metadata key for an issued token (keyed by its authority revocation id).
 pub fn token_meta_key(id: &str) -> String {
     format!("{TOKEN_META_PREFIX}{id}")

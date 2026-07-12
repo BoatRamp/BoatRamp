@@ -953,6 +953,36 @@ impl DeployStore {
         Ok(())
     }
 
+    /// Trust an additional **root anchor** (`auth rotate-root`): a `TokenPublicKey`
+    /// (`alg:hex`) accepted alongside the configured primary root, for a
+    /// make-before-break rotation. Replicated to every node through the control
+    /// plane, so no per-node edit is needed.
+    pub async fn add_root_anchor(&self, pubkey: &str) -> Result<(), DeployError> {
+        self.kv
+            .put(&crate::authz::root_anchor_key(pubkey), Vec::new())
+            .await?;
+        Ok(())
+    }
+
+    /// Retire a previously-added root anchor (the old key, after propagation).
+    pub async fn remove_root_anchor(&self, pubkey: &str) -> Result<(), DeployError> {
+        self.kv
+            .delete(&crate::authz::root_anchor_key(pubkey))
+            .await?;
+        Ok(())
+    }
+
+    /// The currently-trusted extra root anchors (the `alg:hex` public keys).
+    pub async fn list_root_anchors(&self) -> Result<Vec<String>, DeployError> {
+        Ok(self
+            .kv
+            .list_prefix(crate::authz::ROOT_ANCHOR_PREFIX)
+            .await?
+            .iter()
+            .filter_map(|k| k.strip_prefix(crate::authz::ROOT_ANCHOR_PREFIX).map(String::from))
+            .collect())
+    }
+
     // ---- Dynamic daemon config --------------------------------------------
 
     /// The `daemon/current` pointer key → the active generation hash.

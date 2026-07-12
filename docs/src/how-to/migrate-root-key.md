@@ -27,20 +27,25 @@ This is the reverse, too (external → local, e.g. offboarding a KMS): re-point
 ## New-key rotation (import-less HSMs)
 
 When the backend **cannot** import (keys must be generated in-HSM), the anchor
-must rotate. This uses the root-pubkey **set** (`cluster.root_pubkeys`) for a
-make-before-break, cluster-wide rotation with **no window where a node rejects a
-valid token**:
+must rotate. boatramp keeps a **replicated root-anchor set** so both the old and
+new anchors are trusted during the overlap — **no window where a node rejects a
+valid token** — and no per-node edit:
 
-1. Mint the new anchor in the target backend.
-2. Add its public key to the replicated root-pubkey set — every node now trusts
-   **both** the old and new anchors.
-3. Re-sign live attestations/tokens under the new key.
-4. After propagation, retire the old anchor.
+```sh
+# 1. Mint the new anchor in the target backend, then trust it cluster-wide:
+boatramp auth rotate-root --add "$(boatramp auth pubkey --private-key "$NEW_KEY")"
 
-> **Status:** the root-pubkey *set* that makes both anchors trusted is in place
-> today. The one-command driver, `boatramp auth rotate-root --to <signer>`, that
-> automates steps 1–4 is planned; until it lands, the set can be edited and
-> re-signed manually. The same-key custody move above needs no such automation.
+# 2. Re-point [serve.signer] / BOATRAMP_AUTH_ROOT_PRIVATE_KEY to the new key so
+#    new tokens + node attestations are signed by it, and restart each node.
+
+# 3. Once every node has converged (old + new both trusted), retire the old key:
+boatramp auth rotate-root --retire "$OLD_PUBKEY"
+```
+
+`auth rotate-root` with no flag lists the currently-trusted extra anchors. Every
+node verifies a token against its primary root **and** the replicated anchor set,
+so old-key tokens keep working until you retire the old anchor in step 3. The
+reverse rotation (new → old) is the same two commands.
 
 ## See also
 
