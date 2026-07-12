@@ -63,10 +63,14 @@ Two independent defenses reduce the blast radius without touching custody:
 - **A root-pubkey *set*.** `cluster.root_pubkeys` is a set, enabling
   make-before-break **root rotation** (add the new anchor, re-sign, retire the
   old) with no rejection window — see [Migrate the root key](../how-to/migrate-root-key.md).
-- **A distinct mesh-admission signer** (evaluated as a follow-up): a separate key
-  for admitting nodes, distinct from the admin-token root, so compromise of one
-  does not grant the other. This narrows the radius *without* forcing anyone onto
-  an HSM.
+- **A distinct mesh-admission signer.** You can mint join tokens (and member
+  assertions) with a **separate key** from the admin-token root and trust it via
+  `auth rotate-root --add <admission-pubkey>`. The join path verifies against the
+  admin root *and* the anchor set, so admission is authorized by the distinct key
+  while the admin-token root stays independent — compromise of one does not grant
+  the other. This narrows the radius *without* a separate signer config or forcing
+  anyone onto an HSM. (Put the admission pubkey in the join ticket's anchors so
+  joiners verify members against it.)
 
 ## Seeds are integrity-relevant (F2)
 

@@ -1742,8 +1742,9 @@ async fn cluster_join(
         )
             .into_response();
     };
+    let _ = public; // presence gates 501; verification tries the anchor set below.
     let now = now_unix();
-    let jti = match cose::verify_join(&request.token, &public, now) {
+    let jti = match auth.verify_join_token(&request.token, now).await {
         Ok(jti) => jti,
         Err(err) => {
             // A signature/framing failure is unauthenticated (401); an authentic

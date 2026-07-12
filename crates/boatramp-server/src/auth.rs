@@ -152,6 +152,30 @@ impl Auth {
         !inner.is_revoked(&verified.cti).await
     }
 
+    /// Verify a mesh **join token** against the primary root, then — on failure —
+    /// the replicated rotation anchor set, returning its single-use `jti`. Because
+    /// the anchor set is operator-managed (`auth rotate-root`), a cluster can mint
+    /// join tokens with a **distinct mesh-admission key** trusted alongside (not
+    /// instead of) the admin-token root — narrowing the admission blast radius
+    /// (F8) without a separate signer config or imposing KMS. `Err` when auth is
+    /// disabled or the token verifies under no trusted anchor.
+    pub async fn verify_join_token(&self, token: &str, now: u64) -> Result<String, TokenError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Err(TokenError::Invalid("auth disabled".into()));
+        };
+        match cose::verify_join(token, &inner.public, now) {
+            Ok(jti) => Ok(jti),
+            Err(primary_err) => {
+                for anchor in inner.rotation_anchors().await {
+                    if let Ok(jti) = cose::verify_join(token, &anchor, now) {
+                        return Ok(jti);
+                    }
+                }
+                Err(primary_err)
+            }
+        }
+    }
+
     /// Like [`verify_bearer`](Self::verify_bearer), but returns the token's
     /// granted roles on success. `whoami` uses this so it reports an identity
     /// only for a token that is authentic, **unexpired, and unrevoked** — not for
