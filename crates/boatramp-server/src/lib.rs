@@ -3294,19 +3294,56 @@ fn parse_cookie_header(raw: &str) -> std::collections::BTreeMap<String, String> 
         })
 }
 
-/// Parse a URL query string into key→value pairs (first value wins). Values are
-/// taken verbatim (no percent-decoding) — sufficient for conditional matching.
+/// Parse a URL query string into key→value pairs (first value wins), with
+/// `application/x-www-form-urlencoded` decoding (`+` → space, `%XX` → byte) so a
+/// condition compares against the real value.
 fn parse_query_string(raw: &str) -> std::collections::BTreeMap<String, String> {
     raw.split('&')
         .filter(|p| !p.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (k.to_string(), v.to_string()),
-            None => (pair.to_string(), String::new()),
+            Some((k, v)) => (percent_decode(k), percent_decode(v)),
+            None => (percent_decode(pair), String::new()),
         })
         .fold(std::collections::BTreeMap::new(), |mut m, (k, v)| {
             m.entry(k).or_insert(v);
             m
         })
+}
+
+/// Decode a `application/x-www-form-urlencoded` component: `+` → space, `%XX` →
+/// the byte, everything else verbatim. Invalid `%` escapes are left as-is;
+/// non-UTF-8 results are lossily replaced.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Merge conditional-routing `Vary` header names into a response, so a per-visitor
@@ -3417,26 +3454,29 @@ async fn serve_resolved(
                         if stream.websocket && is_upgrade_request(request.headers()) {
                             use axum::extract::FromRequestParts;
                             let (mut parts, _body) = request.into_parts();
-                            return match axum::extract::ws::WebSocketUpgrade::from_request_parts(
-                                &mut parts,
-                                &(),
-                            )
-                            .await
-                            {
-                                Ok(ws) => {
-                                    serve_ws_stream(
-                                        inner,
-                                        site,
-                                        site_handlers,
-                                        stream,
-                                        ws,
-                                        client_ip,
-                                        preview,
-                                    )
-                                    .await
-                                }
-                                Err(rejection) => rejection.into_response(),
-                            };
+                            return apply_vary(
+                                match axum::extract::ws::WebSocketUpgrade::from_request_parts(
+                                    &mut parts,
+                                    &(),
+                                )
+                                .await
+                                {
+                                    Ok(ws) => {
+                                        serve_ws_stream(
+                                            inner,
+                                            site,
+                                            site_handlers,
+                                            stream,
+                                            ws,
+                                            client_ip,
+                                            preview,
+                                        )
+                                        .await
+                                    }
+                                    Err(rejection) => rejection.into_response(),
+                                },
+                                &vary,
+                            );
                         }
                         // Pull the only field needed from the request as an owned
                         // value: `&Request` is not `Send` (the body isn't `Sync`),
@@ -3446,20 +3486,23 @@ async fn serve_resolved(
                             .get("last-event-id")
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_string);
-                        return serve_stream(
-                            inner,
-                            site,
-                            site_handlers,
-                            stream,
-                            after,
-                            client_ip,
-                            preview,
-                        )
-                        .await;
+                        return apply_vary(
+                            serve_stream(
+                                inner,
+                                site,
+                                site_handlers,
+                                stream,
+                                after,
+                                client_ip,
+                                preview,
+                            )
+                            .await,
+                            &vary,
+                        );
                     }
                     // A stream route on a site with handlers disabled / no runtime
                     // is not served (deny by default).
-                    return not_found();
+                    return apply_vary(not_found(), &vary);
                 }
             }
         }
@@ -3474,47 +3517,52 @@ async fn serve_resolved(
             .filter(|g| g.is_enabled())
         {
             if let Some(route) = gw.match_route(request_path) {
-                return match gw.upstreams.get(&route.upstream) {
-                    Some(upstream) => {
-                        // A compute-backed upstream resolves its pool live from
-                        // the workload's healthy replica endpoints. Record
-                        // the request as activity so the reconcile loop
-                        // keeps the workload warm / wakes it, and only sleeps it
-                        // once genuinely idle.
-                        let compute_backends = match &upstream.compute {
-                            Some(workload) => {
-                                gateway::record_activity(workload);
-                                let mut pool = compute_endpoints(deploy, workload).await;
-                                // Wake-from-zero: no live replica but one
-                                // is parked → nudge the reconcile loop to restore it
-                                // and hold this request until it's serving. The cold
-                                // start is invisible to the client; only a genuine
-                                // restore failure (timeout) falls through to 502.
-                                if pool.is_empty() && has_parked_replica(deploy, workload).await {
-                                    gateway::wake_reconcile();
-                                    pool = await_warm(deploy, workload, COMPUTE_WAKE_TIMEOUT).await;
+                return apply_vary(
+                    match gw.upstreams.get(&route.upstream) {
+                        Some(upstream) => {
+                            // A compute-backed upstream resolves its pool live from
+                            // the workload's healthy replica endpoints. Record
+                            // the request as activity so the reconcile loop
+                            // keeps the workload warm / wakes it, and only sleeps it
+                            // once genuinely idle.
+                            let compute_backends = match &upstream.compute {
+                                Some(workload) => {
+                                    gateway::record_activity(workload);
+                                    let mut pool = compute_endpoints(deploy, workload).await;
+                                    // Wake-from-zero: no live replica but one
+                                    // is parked → nudge the reconcile loop to restore it
+                                    // and hold this request until it's serving. The cold
+                                    // start is invisible to the client; only a genuine
+                                    // restore failure (timeout) falls through to 502.
+                                    if pool.is_empty() && has_parked_replica(deploy, workload).await
+                                    {
+                                        gateway::wake_reconcile();
+                                        pool = await_warm(deploy, workload, COMPUTE_WAKE_TIMEOUT)
+                                            .await;
+                                    }
+                                    Some(pool)
                                 }
-                                Some(pool)
-                            }
-                            None => None,
-                        };
-                        dispatch_gateway(
-                            request,
-                            site.unwrap_or(""),
-                            &route.upstream,
-                            upstream,
-                            request_path,
-                            client_ip,
-                            compute_backends,
+                                None => None,
+                            };
+                            dispatch_gateway(
+                                request,
+                                site.unwrap_or(""),
+                                &route.upstream,
+                                upstream,
+                                request_path,
+                                client_ip,
+                                compute_backends,
+                            )
+                            .await
+                        }
+                        None => (
+                            StatusCode::BAD_GATEWAY,
+                            "gateway route references an unknown upstream\n",
                         )
-                        .await
-                    }
-                    None => (
-                        StatusCode::BAD_GATEWAY,
-                        "gateway route references an unknown upstream\n",
-                    )
-                        .into_response(),
-                };
+                            .into_response(),
+                    },
+                    &vary,
+                );
             }
         }
     }
@@ -6561,6 +6609,38 @@ mod tests {
     use super::*;
     use boatramp_core::cose::{LocalSigner, TokenAlg};
 
+    #[test]
+    fn query_string_parses_and_url_decodes() {
+        let q = parse_query_string("lang=fr&city=S%C3%A3o+Paulo&flag&dup=1&dup=2");
+        assert_eq!(q.get("lang").map(String::as_str), Some("fr"));
+        assert_eq!(q.get("city").map(String::as_str), Some("São Paulo")); // %C3%A3 + '+'
+        assert_eq!(q.get("flag").map(String::as_str), Some("")); // bare key
+        assert_eq!(q.get("dup").map(String::as_str), Some("1")); // first value wins
+    }
+
+    #[test]
+    fn cookie_header_parses_pairs() {
+        let c = parse_cookie_header("beta=1; sid = abc ; empty=");
+        assert_eq!(c.get("beta").map(String::as_str), Some("1"));
+        assert_eq!(c.get("sid").map(String::as_str), Some("abc"));
+        assert_eq!(c.get("empty").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn apply_vary_merges_without_duplicates() {
+        let base = (StatusCode::OK, "x").into_response();
+        let r = apply_vary(base, &["accept-language".into()]);
+        assert_eq!(r.headers().get(header::VARY).unwrap(), "accept-language");
+        // Merges into an existing Vary, de-duplicating case-insensitively.
+        let r = apply_vary(r, &["cookie".into(), "accept-language".into()]);
+        let v = r.headers().get(header::VARY).unwrap().to_str().unwrap();
+        assert!(v.contains("accept-language") && v.contains("cookie"));
+        assert_eq!(v.matches("accept-language").count(), 1);
+        // Empty vary is a no-op.
+        let plain = apply_vary((StatusCode::OK, "y").into_response(), &[]);
+        assert!(plain.headers().get(header::VARY).is_none());
+    }
+
     /// The `/api/cluster/join-token` handler mints a verifiable **bearer** token,
     /// and refuses cleanly on a verify-only node (no root key) → 501. Admin-gating
     /// is the deny-safe `Right::required` default for `/api/cluster/*`.
@@ -6886,7 +6966,6 @@ mod tests {
     #[test]
     fn resolve_env_merges_static_and_host_secrets() {
         use boatramp_core::config::HandlersSiteConfig;
-        use std::collections::BTreeMap;
 
         // A uniquely-named host var holds the real secret value.
         std::env::set_var("BOATRAMP_TEST_RESOLVE_SECRET", "topsecret");
@@ -7223,7 +7302,6 @@ mod tests {
         use boatramp_core::deploy::{DeployStore, FileEntry, Manifest};
         use boatramp_handlers::{HandlerEngine, Limits};
         use futures::StreamExt;
-        use std::collections::BTreeMap;
 
         let storage = Arc::new(MemStorage::default());
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
@@ -7338,7 +7416,6 @@ mod tests {
         use boatramp_core::deploy::{DeployStore, FileEntry, Manifest};
         use boatramp_handlers::{HandlerEngine, Limits};
         use futures::StreamExt;
-        use std::collections::BTreeMap;
         use std::sync::atomic::Ordering;
 
         let storage = Arc::new(MemStorage::default());
@@ -7459,7 +7536,6 @@ mod tests {
         use boatramp_core::deploy::{DeployStore, FileEntry, Manifest};
         use boatramp_handlers::{HandlerEngine, Limits};
         use futures::StreamExt;
-        use std::collections::BTreeMap;
 
         let storage = Arc::new(MemStorage::default());
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());

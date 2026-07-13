@@ -130,6 +130,27 @@ string/list methods `.startsWith(…)`, `.endsWith(…)`, `.contains(…)`.
 when: "method == 'GET' && header('X-Country') == 'IT' && path.startsWith('/shop')"
 ```
 
+### Computed destinations (`${…}`)
+
+A `to` destination may embed `${<expr>}` — a string-valued expression from the same
+language — so **one** rule can route to a computed target. `${…}` interpolation runs
+*before* the usual `:name` / `:splat` capture expansion. The classic use is sending
+a visitor to their negotiated locale in a single rule:
+
+```ron
+redirects: [
+  ( from: "/",
+    to: "/${prefers_language(['fr','en','de'])}/",
+    status: 302,
+    // Only redirect when a supported locale is actually accepted (else "//").
+    when: "prefers_language(['fr','en','de']) != ''" ),
+],
+```
+
+Embedded expressions are type-checked at `validate`/`sync` (each must be a string),
+and — like conditions — a `${…}` that reads a header/cookie/`Accept-Language`
+contributes to the response `Vary`.
+
 > **Caching.** A condition that reads `Accept-Language`, a cookie, or a header makes
 > the response depend on that dimension, so boatramp automatically adds the matching
 > **`Vary`** header (e.g. `Vary: accept-language`) to the response — a downstream

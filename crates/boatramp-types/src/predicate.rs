@@ -215,6 +215,151 @@ pub fn compile_cached(src: &str) -> Result<Arc<Predicate>, ConfigError> {
     Ok(compiled)
 }
 
+/// A redirect/rewrite **destination template**: literal text with embedded
+/// `${<expr>}` request expressions (each string-typed), evaluated against the
+/// request. Lets one rule route to a computed target — e.g.
+/// `to: "/${prefers_language(['fr','en'])}/"` sends the visitor to their locale.
+/// `${…}` interpolation runs *before* the `:name`/`:splat` capture expansion the
+/// router already applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Template {
+    parts: Vec<TemplatePart>,
+    vary: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplatePart {
+    Lit(String),
+    Expr(Expr),
+}
+
+impl Template {
+    /// Whether a destination string needs template compilation (contains `${`).
+    /// The router skips [`compile`](Self::compile) + evaluation when this is false.
+    pub fn is_template(dest: &str) -> bool {
+        dest.contains("${")
+    }
+
+    /// Compile a destination template: split on `${…}`, then parse + type-check
+    /// each embedded expression (which must be string-typed). Errors surface at
+    /// `validate`/`sync`, never at request time.
+    pub fn compile(src: &str) -> Result<Template, ConfigError> {
+        let mut parts = Vec::new();
+        let mut vary = Vec::new();
+        let bytes = src.as_bytes();
+        let mut i = 0;
+        let mut lit_start = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                if i > lit_start {
+                    parts.push(TemplatePart::Lit(src[lit_start..i].to_string()));
+                }
+                let (expr_src, next) = scan_interpolation(src, i + 2)?;
+                let tokens = lex(&expr_src)?;
+                let mut parser = Parser::new(tokens);
+                let expr = parser.parse_expr()?;
+                parser.expect_end()?;
+                let ty = check(&expr)?;
+                if ty != Type::Str {
+                    return Err(ConfigError::parse(format!(
+                        "template `${{…}}` must be a string expression, got {}: {expr_src:?}",
+                        ty.name()
+                    )));
+                }
+                collect_vary(&expr, &mut vary);
+                parts.push(TemplatePart::Expr(expr));
+                i = next;
+                lit_start = next;
+            } else {
+                i += 1;
+            }
+        }
+        if lit_start < src.len() {
+            parts.push(TemplatePart::Lit(src[lit_start..].to_string()));
+        }
+        vary.sort();
+        vary.dedup();
+        Ok(Template { parts, vary })
+    }
+
+    /// Expand the template against a request: interpolate each `${…}` with its
+    /// evaluated string value (a defensive non-string, unreachable after
+    /// type-check, interpolates empty).
+    pub fn expand(&self, env: &EvalEnv<'_>) -> String {
+        let mut out = String::new();
+        for part in &self.parts {
+            match part {
+                TemplatePart::Lit(s) => out.push_str(s),
+                TemplatePart::Expr(e) => {
+                    if let Some(Value::Str(s)) = eval_expr(e, env) {
+                        out.push_str(&s);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The response `Vary` header names the interpolated expressions read.
+    pub fn vary_headers(&self) -> &[String] {
+        &self.vary
+    }
+}
+
+/// Scan from just after a `${` (at `start`) to the matching `}`, skipping `}`
+/// inside string literals, and return the inner expression source + the index
+/// just past the `}`.
+fn scan_interpolation(src: &str, start: usize) -> Result<(String, usize), ConfigError> {
+    let bytes = src.as_bytes();
+    let mut i = start;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match in_str {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    in_str = None;
+                }
+                i += 1;
+            }
+            None => match c {
+                b'\'' | b'"' => {
+                    in_str = Some(c);
+                    i += 1;
+                }
+                b'}' => return Ok((src[start..i].to_string(), i + 1)),
+                _ => i += 1,
+            },
+        }
+    }
+    Err(ConfigError::parse(
+        "unterminated `${…}` in a routing destination template",
+    ))
+}
+
+/// Compile a destination template through a process-wide cache (mirrors
+/// [`compile_cached`] for predicates).
+pub fn compile_template_cached(src: &str) -> Result<Arc<Template>, ConfigError> {
+    const CAP: usize = 1024;
+    static CACHE: OnceLock<RwLock<BTreeMap<String, Arc<Template>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(BTreeMap::new()));
+    if let Some(hit) = cache.read().ok().and_then(|c| c.get(src).cloned()) {
+        return Ok(hit);
+    }
+    let compiled = Arc::new(Template::compile(src)?);
+    if let Ok(mut c) = cache.write() {
+        if c.len() >= CAP {
+            c.clear();
+        }
+        c.insert(src.to_string(), compiled.clone());
+    }
+    Ok(compiled)
+}
+
 // ----------------------------------------------------------------------------
 // Lexer
 // ----------------------------------------------------------------------------
@@ -1004,5 +1149,37 @@ mod tests {
         let b = compile_cached("method == 'GET'").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert!(compile_cached("nonsense(").is_err());
+    }
+
+    #[test]
+    fn template_interpolates_and_reports_vary() {
+        assert!(Template::is_template("/${x}/"));
+        assert!(!Template::is_template("/static/"));
+
+        // A dynamic destination: send to the negotiated locale (ctx prefers fr).
+        let t = Template::compile("/${prefers_language(['fr','en'])}/home").unwrap();
+        assert_eq!(t.vary_headers(), &["accept-language"]);
+        let c = ctx();
+        let exists = |_p: &str| false;
+        let env = EvalEnv {
+            ctx: &c,
+            path: "/",
+            file_exists: &exists,
+        };
+        assert_eq!(t.expand(&env), "/fr/home");
+
+        // Multiple interpolations + literals, including a header read.
+        let t = Template::compile("/${header('x-country')}/${prefers_language(['fr'])}").unwrap();
+        assert_eq!(t.vary_headers(), &["accept-language", "x-country"]);
+        assert_eq!(t.expand(&env), "/IT/fr");
+
+        // A literal-only template expands to itself with no vary.
+        let t = Template::compile("/en/home").unwrap();
+        assert!(t.vary_headers().is_empty());
+        assert_eq!(t.expand(&env), "/en/home");
+
+        // Compile rejects a non-string interpolation and an unterminated `${`.
+        assert!(Template::compile("/${file_exists('/x')}/").is_err());
+        assert!(Template::compile("/${prefers_language(['fr'])").is_err());
     }
 }

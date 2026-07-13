@@ -128,11 +128,17 @@ impl DeployConfig {
             if let Some(when) = &redirect.when {
                 crate::predicate::Predicate::compile(when)?;
             }
+            if crate::predicate::Template::is_template(&redirect.to) {
+                crate::predicate::Template::compile(&redirect.to)?;
+            }
         }
         for rewrite in &self.rewrites {
             Pattern::compile(&rewrite.from)?;
             if let Some(when) = &rewrite.when {
                 crate::predicate::Predicate::compile(when)?;
+            }
+            if crate::predicate::Template::is_template(&rewrite.to) {
+                crate::predicate::Template::compile(&rewrite.to)?;
             }
         }
         for header in &self.headers {

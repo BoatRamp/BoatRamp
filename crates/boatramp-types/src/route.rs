@@ -119,9 +119,10 @@ pub fn resolve_ctx(
         if !eval_when(&redirect.when, ctx, &path, &file_exists, &mut vary) {
             continue; // path matched but the condition is false — keep looking
         }
+        let to = interpolate_to(&redirect.to, ctx, &path, &file_exists, &mut vary);
         return finish(
             Outcome::Redirect {
-                location: m.expand(&redirect.to),
+                location: m.expand(&to),
                 status: redirect.status,
             },
             vary,
@@ -142,7 +143,8 @@ pub fn resolve_ctx(
         if !eval_when(&rewrite.when, ctx, &path, &file_exists, &mut vary) {
             continue;
         }
-        let target = m.expand(&rewrite.to);
+        let to = interpolate_to(&rewrite.to, ctx, &path, &file_exists, &mut vary);
+        let target = m.expand(&to);
         if is_absolute_url(&target) {
             return finish(Outcome::Proxy { url: target }, vary);
         }
@@ -182,6 +184,34 @@ fn eval_when(
             })
         }
         Err(_) => false,
+    }
+}
+
+/// Interpolate a destination's `${…}` request expressions against `ctx`, before
+/// the router applies `:name`/`:splat` capture expansion. A destination with no
+/// `${…}` is returned unchanged (the common, allocation-free case). Accumulates
+/// the interpolated expressions' `Vary` dimensions. A template that fails to
+/// compile (impossible after `validate`) is used verbatim.
+fn interpolate_to(
+    to: &str,
+    ctx: &RequestContext,
+    path: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+    vary: &mut Vec<String>,
+) -> String {
+    if !crate::predicate::Template::is_template(to) {
+        return to.to_string();
+    }
+    match crate::predicate::compile_template_cached(to) {
+        Ok(t) => {
+            vary.extend(t.vary_headers().iter().cloned());
+            t.expand(&EvalEnv {
+                ctx,
+                path,
+                file_exists,
+            })
+        }
+        Err(_) => to.to_string(),
     }
 }
 
@@ -588,6 +618,42 @@ mod tests {
         let r = resolve_ctx(&cfg, &present, "/fr/only.html", &ctx);
         assert!(matches!(r.outcome, Outcome::File { path, .. } if path == "fr/only.html"));
         assert!(r.vary.is_empty());
+    }
+
+    #[test]
+    fn conditional_redirect_to_negotiated_locale_in_one_rule() {
+        let mut cfg = DeployConfig::default();
+        // A single rule: root → the visitor's preferred locale, via `${…}`
+        // interpolation, gated so it only fires for a supported locale.
+        cfg.redirects.push(crate::config::Redirect {
+            from: "/".into(),
+            to: "/${prefers_language(['fr','en','de'])}/".into(),
+            status: 302,
+            when: Some("prefers_language(['fr','en','de']) != ''".into()),
+        });
+        let files = files(&["index.html"]);
+
+        let de = RequestContext {
+            accept_languages: vec!["de".into()],
+            ..Default::default()
+        };
+        let r = resolve_ctx(&cfg, &files, "/", &de);
+        assert_eq!(
+            r.outcome,
+            Outcome::Redirect {
+                location: "/de/".into(),
+                status: 302
+            }
+        );
+        assert_eq!(r.vary, vec!["accept-language".to_string()]);
+
+        // A visitor who accepts no supported locale → no redirect (when is false).
+        let xx = RequestContext {
+            accept_languages: vec!["xx".into()],
+            ..Default::default()
+        };
+        let r = resolve_ctx(&cfg, &files, "/", &xx);
+        assert!(matches!(r.outcome, Outcome::File { path, .. } if path == "index.html"));
     }
 
     #[test]
