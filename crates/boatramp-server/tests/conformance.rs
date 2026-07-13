@@ -200,6 +200,7 @@ async fn seed() -> DeployStore {
             from: "/old".to_string(),
             to: "/new".to_string(),
             status: 301,
+            when: None,
         }],
         headers: vec![HeaderRule {
             matches: "**.js".to_string(),
@@ -1622,6 +1623,7 @@ async fn activation_during_traffic_drops_no_requests() {
                 from: "/old".to_string(),
                 to: "/new".to_string(),
                 status: 301,
+                when: None,
             }],
             ..Default::default()
         },

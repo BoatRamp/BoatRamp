@@ -58,6 +58,7 @@ Each rule redirects a matching path. First match wins.
 | `from` | pattern | — | Source path pattern. |
 | `to` | string | — | Destination, with `:name` / `:splat` substitution. |
 | `status` | u16 | `308` | HTTP status. `308` is permanent and method-preserving. |
+| `when` | string | — | Optional [condition](#conditional-rules-when) — the rule fires only if it and `from` both match. |
 
 ```ron
 redirects: [ (from: "/old/:slug", to: "/new/:slug", status: 301) ],
@@ -74,6 +75,7 @@ First match wins.
 | `from` | pattern | — | Source path pattern. |
 | `to` | string | — | Internal path or absolute proxy URL, with `:name` / `:splat` substitution. |
 | `status` | u16 | `200` | Status served for an internal rewrite (e.g. `200` for SPA fallback). |
+| `when` | string | — | Optional [condition](#conditional-rules-when) — the rule fires only if it and `from` both match. |
 
 An SPA fallback is a rewrite of everything to the app shell:
 
@@ -82,6 +84,58 @@ rewrites: [ (from: "/*", to: "/index.html", status: 200) ],
 ```
 
 Proxy rewrites are constrained by [`proxy_allow`](#proxy_allow).
+
+## Conditional rules (`when`)
+
+A redirect or rewrite may carry a **`when`** condition — a small server-side
+expression over the request. The rule fires only when its `from` pattern matches
+**and** its `when` is true; otherwise the router keeps looking. This is how you do
+language- or file-aware routing without a WASM handler, and it runs in the routing
+hot path (compiled once at `sync`, then a fast in-memory evaluation per request).
+
+```ron
+routing: (
+  redirects: [
+    // Send the root to the visitor's preferred locale.
+    ( from: "/", to: "/fr/", status: 302, when: "prefers_language(['fr','en']) == 'fr'" ),
+    ( from: "/", to: "/en/", status: 302, when: "prefers_language(['en','fr']) == 'en'" ),
+    // Fall back to the English page when a localized file is missing in this deploy.
+    ( from: "/fr/*", to: "/en/:splat", status: 302, when: "!file_exists(path)" ),
+  ],
+)
+```
+
+The expression language is a **subset of [CEL](https://cel.dev/)** — boolean
+expressions only, no loops, no timestamps, no regex — so it is bounded and cheap.
+It is compiled and type-checked at `boatramp validate` / `sync` (a bad expression
+fails the deploy).
+
+**Variables** (strings): `method`, `host`, `path` (the normalized request path).
+
+**Functions:**
+
+| Call | Result | Notes |
+| --- | --- | --- |
+| `header("name")` | string | Request header value (`""` if absent). Name must be a literal. |
+| `cookie("name")` | string | Cookie value (`""` if absent). |
+| `query("name")` | string | Query-string value (`""` if absent). |
+| `file_exists("/path")` | bool | Does that path serve a file in *this* deployment (honors clean-URLs + index)? |
+| `accepts_language("fr")` | bool | Does `Accept-Language` accept the tag (primary-subtag match)? |
+| `prefers_language(["fr","en"])` | string | The first listed tag the request accepts, else `""`. |
+
+**Operators:** `==` `!=` `in` `&&` `||` `!`, string concatenation with `+`, and the
+string/list methods `.startsWith(…)`, `.endsWith(…)`, `.contains(…)`.
+
+```ron
+when: "method == 'GET' && header('X-Country') == 'IT' && path.startsWith('/shop')"
+```
+
+> **Caching.** A condition that reads `Accept-Language`, a cookie, or a header makes
+> the response depend on that dimension, so boatramp automatically adds the matching
+> **`Vary`** header (e.g. `Vary: accept-language`) to the response — a downstream
+> cache then keys on it and never serves one visitor's locale redirect to another.
+> Conditions that read only the URL + deploy content (`path`, `file_exists`) add no
+> `Vary`.
 
 ## `headers`
 

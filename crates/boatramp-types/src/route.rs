@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use crate::config::{DeployConfig, TrailingSlash};
 use crate::file::FileEntry;
 use crate::matcher::Pattern;
+use crate::predicate::{EvalEnv, RequestContext};
 
 /// What to do with a request, before HTTP concerns (conditional/range/headers).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,12 +46,38 @@ pub enum Outcome {
     },
 }
 
-/// Resolve a request path to an [`Outcome`].
+/// An [`Outcome`] plus the response `Vary` header names any conditional rule the
+/// resolver evaluated depends on (so a per-language / per-cookie redirect is not
+/// cached across visitors). `vary` is empty for a purely path-based resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveResult {
+    /// What to do with the request.
+    pub outcome: Outcome,
+    /// Deduplicated `Vary` header names (lower-cased) — see the type doc.
+    pub vary: Vec<String>,
+}
+
+/// Resolve a request path to an [`Outcome`], ignoring conditional (`when`) rules
+/// that need request context — a convenience for path-only callers/tests. Prefer
+/// [`resolve_ctx`] on the request path so `when` predicates evaluate.
 pub fn resolve(
     config: &DeployConfig,
     files: &BTreeMap<String, FileEntry>,
     request_path: &str,
 ) -> Outcome {
+    resolve_ctx(config, files, request_path, &RequestContext::default()).outcome
+}
+
+/// Resolve a request to an [`Outcome`], evaluating each redirect/rewrite's
+/// optional `when` predicate against `ctx`. A rule applies only when its path
+/// pattern matches **and** its condition (if any) is true; the returned `vary`
+/// carries the request dimensions those conditions read.
+pub fn resolve_ctx(
+    config: &DeployConfig,
+    files: &BTreeMap<String, FileEntry>,
+    request_path: &str,
+    ctx: &RequestContext,
+) -> ResolveResult {
     let path = if request_path.starts_with('/') {
         request_path.to_string()
     } else {
@@ -61,41 +88,66 @@ pub fn resolve(
     // climb above the deploy root (path hardening / audit).
     let path = normalize_dot_segments(&path);
 
+    let mut vary: Vec<String> = Vec::new();
+    // `file_exists(p)` mirrors real serving (clean-URLs + directory index), so a
+    // predicate asks "would this path serve a file in *this* deploy?".
+    let file_exists = |p: &str| resolve_file(config, files, p).is_some();
+
+    let finish = |outcome: Outcome, mut vary: Vec<String>| {
+        vary.sort();
+        vary.dedup();
+        ResolveResult { outcome, vary }
+    };
+
     if let Some(location) = normalize_trailing_slash(config, &path) {
-        return Outcome::Redirect {
-            location,
-            status: 308,
-        };
+        return finish(
+            Outcome::Redirect {
+                location,
+                status: 308,
+            },
+            vary,
+        );
     }
 
     for redirect in &config.redirects {
-        if let Some(m) = Pattern::compile_with(&redirect.from, config.case_insensitive)
+        let Some(m) = Pattern::compile_with(&redirect.from, config.case_insensitive)
             .ok()
             .and_then(|p| p.match_path(&path))
-        {
-            return Outcome::Redirect {
+        else {
+            continue;
+        };
+        if !eval_when(&redirect.when, ctx, &path, &file_exists, &mut vary) {
+            continue; // path matched but the condition is false — keep looking
+        }
+        return finish(
+            Outcome::Redirect {
                 location: m.expand(&redirect.to),
                 status: redirect.status,
-            };
-        }
+            },
+            vary,
+        );
     }
 
     if let Some((path, entry)) = resolve_file(config, files, &path) {
-        return Outcome::File { path, entry };
+        return finish(Outcome::File { path, entry }, vary);
     }
 
     for rewrite in &config.rewrites {
-        if let Some(m) = Pattern::compile_with(&rewrite.from, config.case_insensitive)
+        let Some(m) = Pattern::compile_with(&rewrite.from, config.case_insensitive)
             .ok()
             .and_then(|p| p.match_path(&path))
-        {
-            let target = m.expand(&rewrite.to);
-            if is_absolute_url(&target) {
-                return Outcome::Proxy { url: target };
-            }
-            if let Some((path, entry)) = resolve_file(config, files, &target) {
-                return Outcome::File { path, entry };
-            }
+        else {
+            continue;
+        };
+        if !eval_when(&rewrite.when, ctx, &path, &file_exists, &mut vary) {
+            continue;
+        }
+        let target = m.expand(&rewrite.to);
+        if is_absolute_url(&target) {
+            return finish(Outcome::Proxy { url: target }, vary);
+        }
+        if let Some((path, entry)) = resolve_file(config, files, &target) {
+            return finish(Outcome::File { path, entry }, vary);
         }
     }
 
@@ -103,7 +155,34 @@ pub fn resolve(
         let key = doc.trim_start_matches('/').to_string();
         files.get(&key).map(|entry| (key, entry.clone()))
     });
-    Outcome::NotFound { error }
+    finish(Outcome::NotFound { error }, vary)
+}
+
+/// Evaluate a rule's optional `when` predicate against the request. Returns
+/// whether the rule fires (a rule with no `when` always does), accumulating the
+/// predicate's `Vary` dimensions into `vary` when the path already matched — the
+/// outcome depended on them regardless of the result. A predicate that fails to
+/// compile (impossible after `validate` accepted the deploy) fails closed: the
+/// rule is skipped.
+fn eval_when(
+    when: &Option<String>,
+    ctx: &RequestContext,
+    path: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+    vary: &mut Vec<String>,
+) -> bool {
+    let Some(src) = when else { return true };
+    match crate::predicate::compile_cached(src) {
+        Ok(pred) => {
+            vary.extend(pred.vary_headers().iter().cloned());
+            pred.eval(&EvalEnv {
+                ctx,
+                path,
+                file_exists,
+            })
+        }
+        Err(_) => false,
+    }
 }
 
 /// Find the WebAssembly handler whose route and methods match this request, if
@@ -433,6 +512,7 @@ mod tests {
             from: "/old/:slug".into(),
             to: "/new/:slug".into(),
             status: 301,
+            when: None,
         });
         assert_eq!(
             resolve(&cfg, &BTreeMap::new(), "/old/hi"),
@@ -444,6 +524,73 @@ mod tests {
     }
 
     #[test]
+    fn conditional_redirect_honors_when_and_reports_vary() {
+        let mut cfg = DeployConfig::default();
+        // Send the root to the French tree only when the visitor prefers French.
+        cfg.redirects.push(crate::config::Redirect {
+            from: "/".into(),
+            to: "/fr/".into(),
+            status: 302,
+            when: Some("prefers_language(['fr','en']) == 'fr'".into()),
+        });
+        let files = files(&["index.html"]);
+
+        // French visitor → redirected; the outcome varies on Accept-Language.
+        let fr = RequestContext {
+            accept_languages: vec!["fr".into()],
+            ..Default::default()
+        };
+        let r = resolve_ctx(&cfg, &files, "/", &fr);
+        assert_eq!(
+            r.outcome,
+            Outcome::Redirect {
+                location: "/fr/".into(),
+                status: 302
+            }
+        );
+        assert_eq!(r.vary, vec!["accept-language".to_string()]);
+
+        // English visitor → NOT redirected (falls through to index.html), but the
+        // response still varies on Accept-Language (a French visitor differs).
+        let en = RequestContext {
+            accept_languages: vec!["en".into()],
+            ..Default::default()
+        };
+        let r = resolve_ctx(&cfg, &files, "/", &en);
+        assert!(matches!(r.outcome, Outcome::File { path, .. } if path == "index.html"));
+        assert_eq!(r.vary, vec!["accept-language".to_string()]);
+    }
+
+    #[test]
+    fn conditional_redirect_on_missing_file() {
+        let mut cfg = DeployConfig::default();
+        // No French translation of this path → send to the English one.
+        cfg.redirects.push(crate::config::Redirect {
+            from: "/fr/only.html".into(),
+            to: "/en/only.html".into(),
+            status: 302,
+            when: Some("!file_exists(path)".into()),
+        });
+        let ctx = RequestContext::default();
+
+        // Missing localized file → the redirect fires.
+        let missing = files(&["en/only.html"]);
+        assert_eq!(
+            resolve_ctx(&cfg, &missing, "/fr/only.html", &ctx).outcome,
+            Outcome::Redirect {
+                location: "/en/only.html".into(),
+                status: 302
+            }
+        );
+        // Present localized file → served, no redirect. A file check varies on
+        // nothing (it reads only the URL + deploy content).
+        let present = files(&["fr/only.html", "en/only.html"]);
+        let r = resolve_ctx(&cfg, &present, "/fr/only.html", &ctx);
+        assert!(matches!(r.outcome, Outcome::File { path, .. } if path == "fr/only.html"));
+        assert!(r.vary.is_empty());
+    }
+
+    #[test]
     fn spa_fallback_via_rewrite() {
         let files = files(&["index.html", "assets/app.js"]);
         let mut cfg = DeployConfig::default();
@@ -451,6 +598,7 @@ mod tests {
             from: "/**".into(),
             to: "/index.html".into(),
             status: 200,
+            when: None,
         });
         // Real file still wins.
         assert!(
@@ -484,6 +632,7 @@ mod tests {
             from: "/Old/:slug".into(),
             to: "/new/:slug".into(),
             status: 301,
+            when: None,
         });
         assert_eq!(
             resolve(&on, &files, "/old/hi"),
@@ -501,6 +650,7 @@ mod tests {
             from: "/api/**".into(),
             to: "https://backend/:splat".into(),
             status: 200,
+            when: None,
         });
         assert_eq!(
             resolve(&cfg, &BTreeMap::new(), "/api/users/1"),

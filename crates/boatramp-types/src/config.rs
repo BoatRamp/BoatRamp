@@ -125,9 +125,15 @@ impl DeployConfig {
     pub fn compile_check(&self) -> Result<(), ConfigError> {
         for redirect in &self.redirects {
             Pattern::compile(&redirect.from)?;
+            if let Some(when) = &redirect.when {
+                crate::predicate::Predicate::compile(when)?;
+            }
         }
         for rewrite in &self.rewrites {
             Pattern::compile(&rewrite.from)?;
+            if let Some(when) = &rewrite.when {
+                crate::predicate::Predicate::compile(when)?;
+            }
         }
         for header in &self.headers {
             Pattern::compile(&header.matches)?;
@@ -340,6 +346,12 @@ pub struct Redirect {
     /// HTTP status (default 308 — permanent, method-preserving).
     #[serde(default = "default_redirect_status")]
     pub status: u16,
+    /// Optional server-side condition (a [`crate::predicate`] expression over the
+    /// request — `Accept-Language`, cookies, headers, `file_exists(...)`, …). When
+    /// set, the rule fires only if it evaluates true. Compiled + type-checked at
+    /// `validate`/`sync`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 fn default_redirect_status() -> u16 {
@@ -357,6 +369,9 @@ pub struct Rewrite {
     /// Status to serve for an internal rewrite (default 200).
     #[serde(default = "default_rewrite_status")]
     pub status: u16,
+    /// Optional server-side condition — see [`Redirect::when`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 fn default_rewrite_status() -> u16 {

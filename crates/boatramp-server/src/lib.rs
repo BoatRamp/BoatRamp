@@ -3235,6 +3235,109 @@ async fn serve_preview(
 /// Run the deploy-config routing pipeline against a resolved `manifest`, then
 /// stream the chosen entry (or proxy). `client_ip` is the resolved visitor
 /// address (for proxy `X-Forwarded-For`).
+/// Build the [`RequestContext`](boatramp_core::predicate::RequestContext) a
+/// conditional-routing `when` predicate reads from the live request. Only called
+/// when the deployment actually has conditional rules, so the non-conditional hot
+/// path never pays for it.
+fn build_request_context(request: &Request) -> boatramp_core::predicate::RequestContext {
+    use boatramp_core::predicate::RequestContext;
+    let headers = request.headers();
+    let mut hmap: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (name, value) in headers {
+        if let Ok(v) = value.to_str() {
+            hmap.entry(name.as_str().to_ascii_lowercase())
+                .and_modify(|e| {
+                    e.push_str(", ");
+                    e.push_str(v);
+                })
+                .or_insert_with(|| v.to_string());
+        }
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .unwrap_or_default();
+    let cookies = headers
+        .get(header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .map(parse_cookie_header)
+        .unwrap_or_default();
+    let query = request
+        .uri()
+        .query()
+        .map(parse_query_string)
+        .unwrap_or_default();
+    let accept_languages = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|h| h.to_str().ok())
+        .map(RequestContext::parse_accept_language)
+        .unwrap_or_default();
+    RequestContext {
+        method: request.method().as_str().to_ascii_uppercase(),
+        host,
+        headers: hmap,
+        cookies,
+        query,
+        accept_languages,
+    }
+}
+
+/// Parse a `Cookie` header into name→value pairs (first value wins).
+fn parse_cookie_header(raw: &str) -> std::collections::BTreeMap<String, String> {
+    raw.split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .fold(std::collections::BTreeMap::new(), |mut m, (k, v)| {
+            m.entry(k).or_insert(v);
+            m
+        })
+}
+
+/// Parse a URL query string into key→value pairs (first value wins). Values are
+/// taken verbatim (no percent-decoding) — sufficient for conditional matching.
+fn parse_query_string(raw: &str) -> std::collections::BTreeMap<String, String> {
+    raw.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .fold(std::collections::BTreeMap::new(), |mut m, (k, v)| {
+            m.entry(k).or_insert(v);
+            m
+        })
+}
+
+/// Merge conditional-routing `Vary` header names into a response, so a per-visitor
+/// (language/cookie/header) redirect or page is never shared across visitors by a
+/// downstream cache. A no-op when `vary` is empty (the non-conditional case).
+fn apply_vary(mut response: Response, vary: &[String]) -> Response {
+    if vary.is_empty() {
+        return response;
+    }
+    let mut names: Vec<String> = response
+        .headers()
+        .get(header::VARY)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for v in vary {
+        if !names.iter().any(|n| n == v) {
+            names.push(v.clone());
+        }
+    }
+    if let Ok(hv) = HeaderValue::from_str(&names.join(", ")) {
+        response.headers_mut().insert(header::VARY, hv);
+    }
+    response
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "handlers"), allow(unused_variables))]
 async fn serve_resolved(
@@ -3250,7 +3353,19 @@ async fn serve_resolved(
     // preview-scoped identity; `None` for live serving.
     preview: Option<&str>,
 ) -> Response {
-    let outcome = route::resolve(&manifest.config, &manifest.files, request_path);
+    // Evaluate conditional (`when`) routing against the request. The request
+    // context is built only when the deploy has conditional rules, and `vary`
+    // carries the request dimensions those conditions read (applied to the
+    // response below so a per-language/-cookie outcome isn't wrongly cached).
+    let ctx = if manifest.config.redirects.iter().any(|r| r.when.is_some())
+        || manifest.config.rewrites.iter().any(|r| r.when.is_some())
+    {
+        build_request_context(&request)
+    } else {
+        boatramp_core::predicate::RequestContext::default()
+    };
+    let route::ResolveResult { outcome, vary } =
+        route::resolve_ctx(&manifest.config, &manifest.files, request_path, &ctx);
     // Routing precedence: redirects win over handlers, which
     // win over rewrites/static. A redirect short-circuits below; otherwise a
     // matching handler is dispatched in preference to the file/rewrite outcome.
@@ -3262,19 +3377,22 @@ async fn serve_resolved(
                 request.method().as_str(),
                 request_path,
             ) {
-                return dispatch_handler(
-                    handlers,
-                    deploy,
-                    manifest,
-                    site,
-                    request_path,
-                    site_config,
-                    handler,
-                    request,
-                    client_ip,
-                    preview,
-                )
-                .await;
+                return apply_vary(
+                    dispatch_handler(
+                        handlers,
+                        deploy,
+                        manifest,
+                        site,
+                        request_path,
+                        site_config,
+                        handler,
+                        request,
+                        client_ip,
+                        preview,
+                    )
+                    .await,
+                    &vary,
+                );
             }
             // No handler matched: a GET to a configured SSE stream route fans out
             // its messaging topics. Streams are GET-only.
@@ -3400,7 +3518,7 @@ async fn serve_resolved(
             }
         }
     }
-    match outcome {
+    let response = match outcome {
         Outcome::Redirect { location, status } => redirect(status, &location),
         Outcome::Proxy { url } => proxy(request, &url, &manifest.config, client_ip).await,
         Outcome::File {
@@ -3409,7 +3527,7 @@ async fn serve_resolved(
         } => {
             // Static content answers only GET/HEAD; other methods are 405.
             if !matches!(*request.method(), Method::GET | Method::HEAD) {
-                return method_not_allowed();
+                return apply_vary(method_not_allowed(), &vary);
             }
             serve_entry(
                 deploy,
@@ -3437,7 +3555,8 @@ async fn serve_resolved(
             }
             None => not_found(),
         },
-    }
+    };
+    apply_vary(response, &vary)
 }
 
 /// `405` for a non-`GET`/`HEAD` request to static content.
@@ -6772,13 +6891,13 @@ mod tests {
         // A uniquely-named host var holds the real secret value.
         std::env::set_var("BOATRAMP_TEST_RESOLVE_SECRET", "topsecret");
 
-        let deploy_env = BTreeMap::from([
+        let deploy_env = std::collections::BTreeMap::from([
             ("GREETING".to_string(), "hi".to_string()),
             ("OVERRIDE_ME".to_string(), "static".to_string()),
         ]);
         let site_handlers = HandlersSiteConfig {
             enabled: true,
-            secrets: BTreeMap::from([
+            secrets: std::collections::BTreeMap::from([
                 // guest var <- host env var holding the value
                 (
                     "SECRET_TOKEN".to_string(),
@@ -7118,14 +7237,14 @@ mod tests {
             futures::stream::once(async move { Ok(bytes::Bytes::from_static(EVENT_CONSUMER)) })
                 .boxed();
         deploy.put_blob(&hash, stream).await.unwrap();
-        let mut files = BTreeMap::new();
+        let mut files = std::collections::BTreeMap::new();
         files.insert(
             "consumer.wasm".to_string(),
             FileEntry {
                 hash: hash.clone(),
                 size: EVENT_CONSUMER.len() as u64,
                 content_type: None,
-                variants: BTreeMap::new(),
+                variants: std::collections::BTreeMap::new(),
             },
         );
         let manifest = Manifest {
@@ -7230,14 +7349,14 @@ mod tests {
         let stream: ByteStream =
             futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
         deploy.put_blob(&hash, stream).await.unwrap();
-        let mut files = BTreeMap::new();
+        let mut files = std::collections::BTreeMap::new();
         files.insert(
             "counter.wasm".to_string(),
             FileEntry {
                 hash: hash.clone(),
                 size: KV_COUNTER.len() as u64,
                 content_type: None,
-                variants: BTreeMap::new(),
+                variants: std::collections::BTreeMap::new(),
             },
         );
         let manifest = Manifest {
@@ -7249,7 +7368,7 @@ mod tests {
                     component: "counter.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
                     limits: None,
-                    env: BTreeMap::new(),
+                    env: std::collections::BTreeMap::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -7350,14 +7469,14 @@ mod tests {
         let stream: ByteStream =
             futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
         deploy.put_blob(&hash, stream).await.unwrap();
-        let mut files = BTreeMap::new();
+        let mut files = std::collections::BTreeMap::new();
         files.insert(
             "counter.wasm".to_string(),
             FileEntry {
                 hash: hash.clone(),
                 size: KV_COUNTER.len() as u64,
                 content_type: None,
-                variants: BTreeMap::new(),
+                variants: std::collections::BTreeMap::new(),
             },
         );
         let manifest = Manifest {
@@ -7369,7 +7488,7 @@ mod tests {
                     component: "counter.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
                     limits: None,
-                    env: BTreeMap::new(),
+                    env: std::collections::BTreeMap::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),

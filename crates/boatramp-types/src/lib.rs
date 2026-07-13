@@ -23,6 +23,7 @@ pub mod file;
 pub mod gateway;
 pub mod manifest;
 pub mod matcher;
+pub mod predicate;
 pub mod route;
 pub mod security;
 pub mod waf;

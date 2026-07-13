@@ -57,18 +57,21 @@ pub fn parse_redirects(text: &str) -> CompatRules {
                 from,
                 to: to.to_string(),
                 status: code,
+                when: None,
             }),
             // Any other explicit status is a redirect.
             Some(code) => out.redirects.push(Redirect {
                 from,
                 to: to.to_string(),
                 status: code,
+                when: None,
             }),
             // No status → a permanent redirect (Netlify defaults to 301).
             None => out.redirects.push(Redirect {
                 from,
                 to: to.to_string(),
                 status: 301,
+                when: None,
             }),
         }
     }
@@ -133,17 +136,20 @@ mod tests {
                 Redirect {
                     from: "/old/:slug".into(),
                     to: "/new/:slug".into(),
-                    status: 301
+                    status: 301,
+                    when: None,
                 },
                 Redirect {
                     from: "/legacy".into(),
                     to: "/home".into(),
-                    status: 301
+                    status: 301,
+                    when: None,
                 },
                 Redirect {
                     from: "/gone".into(),
                     to: "/".into(),
-                    status: 410
+                    status: 410,
+                    when: None,
                 },
             ]
         );
@@ -153,12 +159,14 @@ mod tests {
                 Rewrite {
                     from: "/api/**".into(),
                     to: "https://api.example.com/:splat".into(),
-                    status: 200
+                    status: 200,
+                    when: None,
                 },
                 Rewrite {
                     from: "/blog/**".into(),
                     to: "/index.html".into(),
-                    status: 200
+                    status: 200,
+                    when: None,
                 },
             ]
         );
