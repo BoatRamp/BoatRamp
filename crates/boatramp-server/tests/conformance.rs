@@ -2460,6 +2460,205 @@ async fn function_blob_trigger_refused_on_unwatchable_backend() {
     );
 }
 
+/// A mock cloud [`WatchProvider`](boatramp_core::blob_provision::WatchProvider) for
+/// the FA-5b2 wiring tests — records provisions/retractions instead of calling a
+/// cloud SDK, standing in for the real S3→SQS provider.
+#[cfg(feature = "handlers")]
+#[derive(Default)]
+struct MockWatchProvider {
+    provisioned: std::sync::Mutex<Vec<String>>,
+    retracted: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_core::blob_provision::WatchProvider for MockWatchProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    fn recipe(&self, prefix: &str) -> String {
+        format!("create a queue + bucket notification for prefix {prefix:?}")
+    }
+    async fn provision(
+        &self,
+        prefix: &str,
+    ) -> Result<
+        Vec<boatramp_core::blob_notify::ManagedResource>,
+        boatramp_core::blob_provision::ProvisionError,
+    > {
+        self.provisioned.lock().unwrap().push(prefix.to_string());
+        Ok(vec![boatramp_core::blob_notify::ManagedResource::new(
+            "mock-queue",
+            format!("q-{prefix}"),
+        )])
+    }
+    async fn verify(
+        &self,
+        _prefix: &str,
+    ) -> Result<bool, boatramp_core::blob_provision::ProvisionError> {
+        Ok(true)
+    }
+    async fn retract(
+        &self,
+        resources: &[boatramp_core::blob_notify::ManagedResource],
+    ) -> Result<(), boatramp_core::blob_provision::ProvisionError> {
+        for r in resources {
+            self.retracted.lock().unwrap().push(r.id.clone());
+        }
+        Ok(())
+    }
+}
+
+/// FA-5b2 wiring: on a cloud backend, adding a `blob` trigger **provisions** the
+/// native pipeline through the configured `WatchProvider` (recording the managed-
+/// notification ledger), and removing it **retracts** the pipeline + drops the
+/// ledger entry — the auto-DNS discipline, for object-store events.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
+    use boatramp_core::Storage;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    // A watch-capable backend (fs) so the activation gate passes; the mock
+    // provider stands in for the cloud pipeline.
+    let root = std::env::temp_dir().join(format!("boatramp-blobprov-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&root));
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage.clone(), None, None);
+    let provider = Arc::new(MockWatchProvider::default());
+    runtime.set_watch_provider(provider.clone());
+    runtime.set_provision_tier(boatramp_core::blob_notify::ProvisionTier::Provision);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // Add the blob trigger → the pipeline is provisioned for the full storage
+    // prefix, and the managed-notification ledger records it.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        provider.provisioned.lock().unwrap().as_slice(),
+        &["hblob/fn/counter/uploads/".to_string()]
+    );
+    let record = deploy
+        .get_managed_notification("counter", "hblob/fn/counter/uploads/")
+        .await
+        .unwrap()
+        .expect("ledger records the provisioned pipeline");
+    assert_eq!(record.provider, "mock");
+
+    // Remove the trigger → the pipeline is retracted and the ledger entry dropped.
+    let del = Request::builder()
+        .method("DELETE")
+        .uri("/api/functions/counter/triggers/onupload")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(del).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(provider.retracted.lock().unwrap().len(), 1);
+    assert!(deploy
+        .get_managed_notification("counter", "hblob/fn/counter/uploads/")
+        .await
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// FA-5b2 tiers: `dry-run` returns the recipe and provisions nothing; `refuse`
+/// fails closed. Both keep the "conceptually clear / no surprises" guarantee.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_blob_trigger_dry_run_returns_recipe_and_refuse_fails_closed() {
+    use boatramp_core::blob_notify::ProvisionTier;
+    use boatramp_core::Storage;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    async fn app_with_tier(
+        root: &std::path::Path,
+        tier: ProvisionTier,
+    ) -> (axum::Router, DeployStore, Arc<MockWatchProvider>) {
+        let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(root));
+        let kv = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+        let provider = Arc::new(MockWatchProvider::default());
+        runtime.set_watch_provider(provider.clone());
+        runtime.set_provision_tier(tier);
+        (
+            router(deploy.clone(), Auth::disabled(), runtime),
+            deploy,
+            provider,
+        )
+    }
+
+    // dry-run → 400 carrying the recipe; nothing provisioned or ledgered.
+    let root1 = std::env::temp_dir().join(format!("boatramp-blobdry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root1);
+    let (app, deploy, provider) = app_with_tier(&root1, ProvisionTier::DryRun).await;
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/functions/counter/triggers/onupload")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "type": "blob", "prefix": "uploads/" }))
+                .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("queue"),
+        "dry-run should return the recipe"
+    );
+    assert!(provider.provisioned.lock().unwrap().is_empty());
+    assert!(deploy
+        .list_managed_notifications("counter")
+        .await
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&root1);
+
+    // refuse → 400, fail-closed.
+    let root2 = std::env::temp_dir().join(format!("boatramp-blobref-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root2);
+    let (app, _deploy, provider) = app_with_tier(&root2, ProvisionTier::Refuse).await;
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(provider.provisioned.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
 /// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
 /// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
 /// every 500 ms; a dead-letter needs five ticks).

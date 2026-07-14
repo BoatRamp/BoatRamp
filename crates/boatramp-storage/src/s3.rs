@@ -23,6 +23,10 @@ const PART_SIZE: usize = 8 * 1024 * 1024;
 pub struct S3Storage {
     client: aws_sdk_s3::Client,
     bucket: String,
+    /// Optional SQS client for the blob-change **consumer** (FA-5b2). When set,
+    /// [`supports_watch`](Storage::supports_watch) is `true` and
+    /// [`watch`](Storage::watch) polls the queue provisioned for the prefix.
+    sqs: Option<aws_sdk_sqs::Client>,
 }
 
 /// Connection options for [`S3Storage::connect`].
@@ -44,7 +48,17 @@ impl S3Storage {
         Self {
             client,
             bucket: bucket.into(),
+            sqs: None,
         }
+    }
+
+    /// Attach an SQS client so this backend can **consume** blob-change
+    /// notifications (FA-5b2): [`supports_watch`](Storage::supports_watch) becomes
+    /// `true`, and [`watch`](Storage::watch) long-polls the queue provisioned for
+    /// the watched prefix (see [`crate::s3_notify`]).
+    pub fn with_sqs_notify(mut self, sqs: aws_sdk_sqs::Client) -> Self {
+        self.sqs = Some(sqs);
+        self
     }
 
     /// Build a backend from the ambient AWS environment (env vars, shared
@@ -71,6 +85,36 @@ impl S3Storage {
             builder = builder.force_path_style(true);
         }
         Self::new(aws_sdk_s3::Client::from_conf(builder.build()), opts.bucket)
+    }
+
+    /// Build a **notify-enabled** backend and its blob-change
+    /// [`S3WatchProvider`](crate::s3_notify::S3WatchProvider) from one shared AWS
+    /// config (FA-5b2). The returned storage consumes the provisioned SQS queue
+    /// (so [`supports_watch`](Storage::supports_watch) is `true`); the provider
+    /// creates/retracts the pipeline. `account_id` scopes the queue's
+    /// `SendMessage` policy to this account.
+    pub async fn connect_with_notify(
+        opts: S3Options,
+        account_id: impl Into<String>,
+    ) -> (Self, crate::s3_notify::S3WatchProvider) {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(region) = opts.region.clone() {
+            loader = loader.region(aws_sdk_s3::config::Region::new(region));
+        }
+        if let Some(endpoint) = opts.endpoint.clone() {
+            loader = loader.endpoint_url(endpoint);
+        }
+        let shared = loader.load().await;
+        let mut builder = aws_sdk_s3::config::Builder::from(&shared);
+        if opts.force_path_style {
+            builder = builder.force_path_style(true);
+        }
+        let s3 = aws_sdk_s3::Client::from_conf(builder.build());
+        let sqs = aws_sdk_sqs::Client::new(&shared);
+        let storage = Self::new(s3.clone(), opts.bucket.clone()).with_sqs_notify(sqs.clone());
+        let provider =
+            crate::s3_notify::S3WatchProvider::new(s3, sqs, opts.bucket, account_id.into());
+        (storage, provider)
     }
 
     /// The bucket this backend targets.
@@ -347,6 +391,38 @@ impl Storage for S3Storage {
         }
 
         Ok(out)
+    }
+
+    /// S3 can watch once the SQS notification consumer is wired (the pipeline
+    /// itself is provisioned per-prefix by
+    /// [`S3WatchProvider`](crate::s3_notify::S3WatchProvider) at trigger add).
+    fn supports_watch(&self) -> bool {
+        self.sqs.is_some()
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<boatramp_core::ChangeStream>, StorageError> {
+        let Some(sqs) = self.sqs.clone() else {
+            return Ok(None);
+        };
+        // The queue name is derived deterministically from the prefix, so no
+        // lookup table is needed — provider and consumer agree.
+        let name = crate::s3_notify::queue_name(prefix);
+        let url = match sqs.get_queue_url().queue_name(&name).send().await {
+            Ok(resp) => match resp.queue_url() {
+                Some(url) => url.to_string(),
+                None => return Ok(None),
+            },
+            // No queue yet ⇒ not provisioned; the reconcile retries next tick.
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(crate::s3_notify::s3_watch_stream(
+            sqs,
+            url,
+            prefix.to_string(),
+        )))
     }
 }
 

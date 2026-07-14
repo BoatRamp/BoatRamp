@@ -130,6 +130,15 @@ struct HandlerRuntimeInner {
     /// `max_concurrent` quota), created on first use.
     function_semaphores:
         std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Optional cloud **blob-change notification provisioner** (FA-5b2): when set,
+    /// adding a `Blob` trigger provisions the native pipeline (S3→SQS, …) per the
+    /// [`provision_tier`](Self::provision_tier), and removing it retracts. Absent
+    /// on a self-watching backend (fs), which needs no provisioning.
+    watch_provider: std::sync::OnceLock<Arc<dyn boatramp_core::blob_provision::WatchProvider>>,
+    /// The operator tier governing the [`watch_provider`](Self::watch_provider):
+    /// dry-run (recipe) / provision / verify-only / refuse. Unset reads as the
+    /// fail-closed default (`Refuse`).
+    provision_tier: std::sync::OnceLock<boatramp_core::blob_notify::ProvisionTier>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -172,7 +181,32 @@ impl HandlerRuntime {
                 max_component_bytes: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
+                watch_provider: std::sync::OnceLock::new(),
+                provision_tier: std::sync::OnceLock::new(),
             })),
+        }
+    }
+
+    /// Wire the cloud blob-change notification provisioner (FA-5b2). Set once at
+    /// startup when the storage backend is a cloud object store; a no-op runtime,
+    /// or a self-watching backend (fs), leaves it unset.
+    #[cfg(feature = "handlers")]
+    pub fn set_watch_provider(
+        &self,
+        provider: Arc<dyn boatramp_core::blob_provision::WatchProvider>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.watch_provider.set(provider);
+        }
+    }
+
+    /// Set the operator provisioning tier for the
+    /// [`watch_provider`](Self::set_watch_provider). Set once at startup; unset is
+    /// the fail-closed `Refuse`.
+    #[cfg(feature = "handlers")]
+    pub fn set_provision_tier(&self, tier: boatramp_core::blob_notify::ProvisionTier) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.provision_tier.set(tier);
         }
     }
 
@@ -2395,17 +2429,50 @@ async fn put_trigger_handler(
     }
     // Fail closed: a blob-change trigger is only meaningful on a backend that can
     // natively watch — refuse (never silently no-op) so the semantics stay uniform.
-    if matches!(kind, boatramp_core::function::TriggerKind::Blob { .. }) {
-        let watchable = handlers
-            .inner
-            .as_ref()
-            .is_some_and(|inner| inner.storage.supports_watch());
-        if !watchable {
+    if let boatramp_core::function::TriggerKind::Blob { prefix } = &kind {
+        let Some(inner) = handlers.inner.as_ref() else {
             return (
                 StatusCode::BAD_REQUEST,
                 "this storage backend does not support blob-change triggers\n",
             )
                 .into_response();
+        };
+        if !inner.storage.supports_watch() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this storage backend does not support blob-change triggers\n",
+            )
+                .into_response();
+        }
+        // On a cloud object store a native pipeline (S3→SQS, …) must be
+        // provisioned per the operator tier before the watch can fire. A
+        // self-watching backend (fs) has no provider and needs nothing.
+        if let Some(provider) = inner.watch_provider.get() {
+            let storage_prefix = blob_storage_prefix(&name, prefix);
+            let tier = inner.provision_tier.get().copied().unwrap_or_default();
+            match boatramp_core::blob_provision::ensure_watch(
+                provider.as_ref(),
+                tier,
+                &name,
+                &storage_prefix,
+                &deploy,
+                now_unix(),
+            )
+            .await
+            {
+                Ok(boatramp_core::blob_provision::ProvisionOutcome::Ready) => {}
+                // Dry-run: print the exact pipeline to apply; don't activate.
+                Ok(boatramp_core::blob_provision::ProvisionOutcome::Recipe(recipe)) => {
+                    return (StatusCode::BAD_REQUEST, format!("{recipe}\n")).into_response();
+                }
+                // Fail-closed refuse (no creds / nothing configured).
+                Ok(boatramp_core::blob_provision::ProvisionOutcome::Refused(msg)) => {
+                    return (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response();
+                }
+                Err(err) => {
+                    return (StatusCode::BAD_GATEWAY, format!("{err}\n")).into_response();
+                }
+            }
         }
     }
     let trigger = boatramp_core::function::FunctionTrigger {
@@ -2436,16 +2503,55 @@ async fn list_triggers_handler(
 }
 
 /// `DELETE /api/functions/:name/triggers/:id` — remove a stored trigger.
-/// `system·admin`. Idempotent.
+/// `system·admin`. Idempotent. Removing a `Blob` trigger also **retracts** any
+/// cloud notification pipeline provisioned for it (so no leaked queues), mirroring
+/// auto-DNS retraction.
 #[cfg(feature = "handlers")]
 async fn delete_trigger_handler(
     State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Path((name, id)): Path<(String, String)>,
 ) -> Response {
+    // Look the trigger up first: a `Blob` trigger may own a provisioned pipeline
+    // to retract before the trigger record is gone.
+    if let (Some(inner), Ok(Some(trigger))) = (
+        handlers.inner.as_ref(),
+        deploy.get_trigger(&name, &id).await,
+    ) {
+        if let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
+            (&trigger.kind, inner.watch_provider.get())
+        {
+            let storage_prefix = blob_storage_prefix(&name, prefix);
+            if let Ok(Some(record)) = deploy
+                .get_managed_notification(&name, &storage_prefix)
+                .await
+            {
+                if let Err(err) = boatramp_core::blob_provision::retract_watch(
+                    provider.as_ref(),
+                    &record,
+                    &deploy,
+                )
+                .await
+                {
+                    tracing::warn!(function = %name, %err, "retracting blob notification failed");
+                }
+            }
+        }
+    }
     match deploy.delete_trigger(&name, &id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
+}
+
+/// The full storage key prefix a function's `Blob { prefix }` trigger watches:
+/// the function's blobstore namespace (`hblob/fn/<name>/`) joined with the
+/// trigger-relative prefix. The provisioner (bucket-notification filter), the
+/// notification ledger, and the [`spawn_blob_watcher`] consumer all key off this,
+/// so they must agree.
+#[cfg(feature = "handlers")]
+fn blob_storage_prefix(function: &str, trigger_prefix: &str) -> String {
+    format!("hblob/fn/{function}/{trigger_prefix}")
 }
 
 /// Dispatch a function's stored triggers on a scheduler tick: fire due **cron**
@@ -7238,8 +7344,8 @@ async fn spawn_blob_watcher(
     prefix: &str,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // The function's blobstore lives under `hblob/fn/<name>/`; the trigger prefix
-    // is relative to that namespace.
-    let storage_prefix = format!("hblob/fn/{}/{prefix}", function.name);
+    // is relative to that namespace (same key the provisioner + ledger use).
+    let storage_prefix = blob_storage_prefix(&function.name, prefix);
     let mut stream = match inner.storage.watch(&storage_prefix).await {
         Ok(Some(stream)) => stream,
         Ok(None) => return None,

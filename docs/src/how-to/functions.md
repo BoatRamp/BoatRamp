@@ -193,12 +193,44 @@ $ boatramp function trigger rm greeter tick
   topic and invokes the function once per message, acking on success.
 - A **blob** trigger fires when an object changes under the watched prefix — and it
   fires for **any** writer, not just boatramp, because it uses the storage
-  backend's native change notification (inotify/FSEvents locally). The changed key
-  + kind arrive as the invocation's JSON body. It needs a **watch-capable** storage
-  backend: on one that can't watch, adding the trigger is refused (a `400`, never a
-  silent no-op) — cloud object stores gain watch support with notification
-  auto-provisioning (a later step). In a cluster the scheduler fires each trigger
-  on the leader, exactly once.
+  backend's native change notification (inotify/FSEvents locally, S3→SQS in the
+  cloud). The changed key + kind arrive as the invocation's JSON body. It needs a
+  **watch-capable** storage backend: on one that can't watch, adding the trigger is
+  refused (a `400`, never a silent no-op). In a cluster the scheduler fires each
+  trigger on the leader, exactly once.
+
+### Cloud blob triggers (auto-provisioning)
+
+The `function trigger add --blob` command is **identical** on every backend — the
+environment difference hides behind the storage backend. On the filesystem the
+watch is zero-config (inotify/FSEvents). On a cloud object store the native event
+pipeline must be created first, so boatramp provisions it for you — "auto-DNS, but
+for object-store events." For S3 that pipeline is an **SQS queue** + a queue access
+policy + a bucket `QueueConfiguration` (added by **read-merge-write**, so existing
+notifications are preserved and an overlapping foreign entry is refused, never
+clobbered). What boatramp creates is recorded in a managed-notification ledger and
+**retracted** when you remove the trigger, so no cloud resources leak.
+
+You pick the behavior with a **tier** in the server's `boatramp.cfg` (the elevated
+cloud credentials live server-side, not in the CLI):
+
+```ron
+serve: (
+    // dry-run | provision | verify-only | refuse (default)
+    blob_notify_tier: "provision",
+    blob_notify_account_id: "123456789012",   // scopes the SQS queue policy
+)
+```
+
+- **`dry-run`** — adding the trigger prints the exact pipeline to apply and does
+  **not** activate (nothing is mutated, no credentials needed).
+- **`provision`** — boatramp creates + reconciles + retracts the pipeline (needs
+  credentials allowed to manage SQS + the bucket notification config).
+- **`verify-only`** — you pre-wired the pipeline; boatramp checks it exists, then
+  consumes it.
+- **`refuse`** (default) — no pipeline, no provisioning ⇒ the trigger is refused
+  (fail-closed). This is why a cloud blob trigger with no tier configured is a
+  `400`: the behavior stays conceptually clear, never a silent no-op.
 
 ## Signed webhooks
 

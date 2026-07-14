@@ -540,6 +540,16 @@ pub struct ServeConfig {
     /// Keep the config cache coherent across processes sharing one KV via the
     /// changelog.
     pub shared_cache_coherence: bool,
+    /// Cloud blob-change notification provisioning tier (FA-5b2): how boatramp
+    /// obtains the native event pipeline (S3→SQS) that backs a `blob` trigger —
+    /// `dry-run` (print the recipe), `provision` (create + retract), `verify-only`
+    /// (operator pre-wired), or `refuse` (fail closed). Absent ⇒ no provisioning:
+    /// `blob` triggers then work only on a self-watching backend (fs). Only wired
+    /// for the S3 backend (`--features s3`).
+    pub blob_notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    /// The AWS account id used to scope the provisioned SQS queue's `SendMessage`
+    /// policy (`aws:SourceAccount`). Required when `blob_notify_tier` provisions.
+    pub blob_notify_account_id: Option<String>,
 }
 
 /// `publish` section — where and what to deploy (the `sync` target).
