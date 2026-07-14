@@ -26,13 +26,13 @@ pub enum FunctionError {
     #[error("specify exactly one of --cron, --queue, or --blob")]
     BadTrigger,
     /// `function init --lang` named an unknown template.
-    #[error("unknown template language {0:?} (supported: rust)")]
+    #[error("unknown template language {0:?} (supported: rust, js)")]
     UnknownLang(String),
     /// `function init` target directory already exists.
     #[error("{0} already exists")]
     AlreadyExists(std::path::PathBuf),
-    /// `function build` (the `cargo build` invocation) failed.
-    #[error("cargo build failed (is the wasm32-wasip2 target installed?)")]
+    /// `function build` (the `cargo build` / `jco componentize` invocation) failed.
+    #[error("build failed (Rust needs the wasm32-wasip2 target; JS needs node/npx)")]
     BuildFailed,
     /// `function build` produced no component `.wasm`.
     #[error("no component produced under target/wasm32-wasip2/release")]
@@ -175,7 +175,7 @@ enum FunctionCommand {
     Init {
         /// Function/project name (also the Rust crate name).
         name: String,
-        /// Language template (only `rust` for now).
+        /// Language template: `rust` (default) or `js`.
         #[arg(long, default_value = "rust")]
         lang: String,
         /// Parent directory to create the project under (default: cwd).
@@ -649,15 +649,19 @@ async fn read_invoke_body(
     }
 }
 
-/// The embedded Rust function template (`function init --lang rust`).
+/// The embedded function templates (`function init --lang <lang>`).
 static RUST_TEMPLATE: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/rust");
+static JS_TEMPLATE: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/js");
 
 /// Scaffold a new function project from a language template.
 fn init_project(name: &str, lang: &str, dir: Option<std::path::PathBuf>) -> Result<()> {
-    if lang != "rust" {
-        return Err(FunctionError::UnknownLang(lang.to_string()));
-    }
+    let template = match lang {
+        "rust" => &RUST_TEMPLATE,
+        "js" | "javascript" => &JS_TEMPLATE,
+        other => return Err(FunctionError::UnknownLang(other.to_string())),
+    };
     let crate_name = sanitize_crate_name(name);
     let target = dir
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -665,14 +669,15 @@ fn init_project(name: &str, lang: &str, dir: Option<std::path::PathBuf>) -> Resu
     if target.exists() {
         return Err(FunctionError::AlreadyExists(target));
     }
-    write_template(&RUST_TEMPLATE, &target, &crate_name)?;
+    write_template(template, &target, &crate_name)?;
     println!("scaffolded {crate_name} in {}", target.display());
     println!("  next: cd {crate_name} && boatramp function build");
     Ok(())
 }
 
-/// Write every embedded template file to `dest_root`, renaming `Cargo.toml.tmpl`
-/// → `Cargo.toml` with the crate name substituted.
+/// Write every embedded template file to `dest_root`. Any `*.tmpl` file is written
+/// without the `.tmpl` suffix with `BOATRAMP_FUNCTION_NAME` substituted (so
+/// `Cargo.toml.tmpl` / `package.json.tmpl` become the real manifests).
 fn write_template(
     dir: &include_dir::Dir,
     dest_root: &std::path::Path,
@@ -682,12 +687,15 @@ fn write_template(
     collect_files(dir, &mut files);
     for file in files {
         let rel = file.path();
-        let (rel, contents) = if rel.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml.tmpl")
-        {
+        let is_tmpl = rel
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "tmpl");
+        let (rel, contents) = if is_tmpl {
             let text = std::str::from_utf8(file.contents())
                 .unwrap_or_default()
                 .replace("BOATRAMP_FUNCTION_NAME", crate_name);
-            (rel.with_file_name("Cargo.toml"), text.into_bytes())
+            (rel.with_extension(""), text.into_bytes())
         } else {
             (rel.to_path_buf(), file.contents().to_vec())
         };
@@ -731,12 +739,35 @@ fn sanitize_crate_name(name: &str) -> String {
     }
 }
 
+/// The jco version `function build` pins for JS components (validated round-trip).
+const JCO_VERSION: &str = "1.25.2";
+
 /// Build a function project to a component and print the produced `.wasm` path.
+/// The language is detected from the project files: `Cargo.toml` ⇒ Rust
+/// (`cargo build --target wasm32-wasip2`), `package.json` ⇒ JS
+/// (`jco componentize`).
 async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
     let dir = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+    let component = if dir.join("Cargo.toml").exists() {
+        build_rust(&dir).await?
+    } else if dir.join("package.json").exists() {
+        build_js(&dir).await?
+    } else {
+        return Err(FunctionError::NoComponent);
+    };
+    println!("built {}", component.display());
+    println!(
+        "  deploy: boatramp function deploy <name> --component {}",
+        component.display()
+    );
+    Ok(())
+}
+
+/// Compile a Rust function project → the produced component path.
+async fn build_rust(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let status = tokio::process::Command::new("cargo")
         .args(["build", "--release", "--target", "wasm32-wasip2"])
-        .current_dir(&dir)
+        .current_dir(dir)
         .status()
         .await?;
     if !status.success() {
@@ -744,7 +775,7 @@ async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
     }
     // The cdylib output is a single `<crate>.wasm` under the release dir.
     let release = dir.join("target/wasm32-wasip2/release");
-    let component = std::fs::read_dir(&release)
+    std::fs::read_dir(&release)
         .ok()
         .and_then(|entries| {
             entries
@@ -752,13 +783,41 @@ async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
                 .map(|e| e.path())
                 .find(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm"))
         })
-        .ok_or(FunctionError::NoComponent)?;
-    println!("built {}", component.display());
-    println!(
-        "  deploy: boatramp function deploy <name> --component {}",
-        component.display()
-    );
-    Ok(())
+        .ok_or(FunctionError::NoComponent)
+}
+
+/// Componentize a JS function project with `jco` → the produced component path.
+/// `jco` is fetched via `npx` (version-pinned), so only Node is required.
+async fn build_js(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("function");
+    let out = format!("{name}.wasm");
+    let status = tokio::process::Command::new("npx")
+        .args([
+            "--yes",
+            &format!("@bytecodealliance/jco@{JCO_VERSION}"),
+            "componentize",
+            "handler.js",
+            "--wit",
+            "wit",
+            "-n",
+            "wasi:http/proxy",
+            "-o",
+            &out,
+        ])
+        .current_dir(dir)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(FunctionError::BuildFailed);
+    }
+    let component = dir.join(&out);
+    if !component.exists() {
+        return Err(FunctionError::NoComponent);
+    }
+    Ok(component)
 }
 
 /// The local single-function harness (FA-7): run a scaffolded component through
@@ -991,6 +1050,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn init_scaffolds_a_js_tree() {
+        let root = std::env::temp_dir().join(format!("boatramp-initjs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        init_project("My JS Fn", "js", Some(root.clone())).unwrap();
+        let proj = root.join("my-js-fn");
+
+        // The manifest is written (not the `.tmpl`), name substituted.
+        let pkg = std::fs::read_to_string(proj.join("package.json")).unwrap();
+        assert!(pkg.contains("\"name\": \"my-js-fn\""));
+        assert!(!pkg.contains("BOATRAMP_FUNCTION_NAME"));
+        assert!(!proj.join("package.json.tmpl").exists());
+        // Handler source + the WIT closure came along.
+        assert!(proj.join("handler.js").exists());
+        assert!(proj.join("wit/handler.wit").exists());
+        // `javascript` is an accepted alias for `js`.
+        assert!(init_project("Other", "javascript", Some(root.clone())).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The local harness runs a component through the engine: a matching assertion
     /// passes, a wrong one fails. Uses a prebuilt fixture (no `cargo build`), so
     /// it is fast; needs `--features handlers` (the engine).
@@ -1040,6 +1120,25 @@ mod tests {
         let wasm = proj.join("target/wasm32-wasip2/release/roundtrip_demo.wasm");
         assert!(wasm.exists(), "expected a built component at {wasm:?}");
         // A component starts with the wasm preamble + the component-model layer.
+        let bytes = std::fs::read(&wasm).unwrap();
+        assert_eq!(&bytes[..4], b"\0asm");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scaffolded JS template compiles to a component via `jco componentize`.
+    /// `#[ignore]`d because it fetches `jco` through `npx` (network) and runs
+    /// StarlingMonkey (slow). Run with `--ignored` / `just function-roundtrip`.
+    #[tokio::test]
+    #[ignore = "runs jco via npx (network + slow); run with --ignored / in the flake check"]
+    async fn init_then_build_js_produces_a_component() {
+        let root =
+            std::env::temp_dir().join(format!("boatramp-jsroundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        init_project("js roundtrip", "js", Some(root.clone())).unwrap();
+        let proj = root.join("js-roundtrip");
+        build_project(Some(proj.clone())).await.unwrap();
+        let wasm = proj.join("js-roundtrip.wasm");
+        assert!(wasm.exists(), "expected a built component at {wasm:?}");
         let bytes = std::fs::read(&wasm).unwrap();
         assert_eq!(&bytes[..4], b"\0asm");
         let _ = std::fs::remove_dir_all(&root);

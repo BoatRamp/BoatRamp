@@ -24,12 +24,21 @@ built target/wasm32-wasip2/release/greeter.wasm
   deploy: boatramp function deploy <name> --component target/wasm32-wasip2/release/greeter.wasm
 ```
 
-`function init` writes a minimal Rust component (a `handle` function you edit) plus
-its `wit/` world; `function build` runs `cargo build --release --target
-wasm32-wasip2` and prints the produced component. Building needs the
-`wasm32-wasip2` target (`rustup target add wasm32-wasip2`, or use the project's
-`nix develop` shell). More language templates (JS, Python) follow; today `--lang
-rust` is the one built in.
+`function init` writes a minimal component (a `handle` function you edit) plus its
+`wit/` world; `function build` compiles it and prints the produced component,
+detecting the language from the project files:
+
+- **`--lang rust`** (default) — a `wasi:http` component built with `cargo build
+  --release --target wasm32-wasip2`. Needs the `wasm32-wasip2` target (`rustup
+  target add wasm32-wasip2`, or the project's `nix develop` shell).
+- **`--lang js`** — a JavaScript component built with
+  [`jco componentize`](https://github.com/bytecodealliance/jco) (fetched
+  version-pinned via `npx`, so only Node is required; `nix develop` provides it).
+  Note a JS component bundles a JS engine, so it is ~12 MB — larger than a Rust
+  component, but it runs on the same engine and deploys identically.
+
+Python (via `componentize-py`) is planned. The produced `.wasm` is a portable WASI
+component either way — deploy it with `function deploy`.
 
 ### Run it locally
 

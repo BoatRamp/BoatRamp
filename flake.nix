@@ -400,6 +400,9 @@
               pkgs.nixfmt
               # WebAssembly component tooling for the `handlers` engine.
               pkgs.wasm-tools
+              # Node.js for the JS function template's `jco componentize` build
+              # (`boatramp function build` fetches a version-pinned `jco` via npx).
+              pkgs.nodejs
               # Local S3-compatible server for exercising the s3 backend.
               pkgs.minio
               pkgs.minio-client

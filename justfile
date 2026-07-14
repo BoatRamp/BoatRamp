@@ -88,6 +88,12 @@ function-roundtrip:
     cargo test -p boatramp --features handlers function::tests::harness_runs_a_component_and_asserts
     cargo test -p boatramp function::tests::init_then_build -- --ignored --nocapture
 
+# FA-7 JS round-trip: scaffold the JS template + componentize it with `jco` (via
+# `npx`, needs `nodejs` from `nix develop` + network). Separate from the Rust
+# recipe since it fetches jco + runs StarlingMonkey (slow).
+function-roundtrip-js:
+    cargo test -p boatramp function::tests::init_then_build_js -- --ignored --nocapture
+
 # Remove build artifacts.
 clean:
     cargo clean
