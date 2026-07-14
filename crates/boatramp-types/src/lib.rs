@@ -20,6 +20,7 @@ pub mod dns_managed;
 pub mod domain_verify;
 pub mod error;
 pub mod file;
+pub mod function;
 pub mod gateway;
 pub mod manifest;
 pub mod matcher;
