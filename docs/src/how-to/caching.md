@@ -78,6 +78,15 @@ HTTP/2 304
 etag: "9f86d081884c7d65..."
 ```
 
+## Conditional routing varies automatically
+
+If a [conditional redirect/rewrite](./routing.md#route-on-the-request-conditional-rules)
+decides the response from a request header (`Accept-Language`, a cookie, `X-…`),
+boatramp adds the matching **`Vary`** header for you — e.g. a locale redirect
+gets `vary: accept-language`. A shared cache then keys on that dimension and never
+serves one visitor's redirect to another. You don't set this by hand; conditions
+that read only the URL + deploy content (`path`, `file_exists`) add no `Vary`.
+
 ## Reference
 
 - Full `routing` schema, including `cache.default` and header-rule fields:

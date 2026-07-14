@@ -19,7 +19,9 @@ the backend as soon as the pipeline resolves it.
 4. **Path normalization.** Clean URLs, the trailing-slash policy, and dot-segment
    collapsing (traversal-safe).
 5. **Route.** Redirects, then handlers, then rewrites / SPA fallback /
-   reverse-proxy.
+   reverse-proxy. A redirect or rewrite may carry a `when` condition evaluated
+   against the request (language, cookies, headers, file existence), which
+   contributes to the response `Vary`.
 6. **Resolve.** Map the path to a manifest entry — a directory index, or a custom
    error document when nothing matches.
 7. **HTTP correctness.** Conditional `304`, `Range` / `206`, `ETag`, response

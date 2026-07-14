@@ -42,6 +42,46 @@ rewrites: [ (from: "/**", to: "/index.html") ],
 A rewrite serves a different file under the requested URL; a redirect sends the
 client a new URL with a 3xx status.
 
+## Route on the request (conditional rules)
+
+A redirect or rewrite can carry a **`when`** condition — a small server-side
+expression over the request — so the rule fires only when its `from` pattern and
+its `when` both match. This does language- or file-aware routing without a
+handler; it runs in the routing hot path (compiled at `sync`, evaluated in memory
+per request).
+
+Send visitors to their preferred language, in a single rule, with a `${…}`
+computed destination:
+
+```ron
+redirects: [
+    (
+        from: "/",
+        to: "/${prefers_language(['fr', 'en', 'de'])}/",
+        status: 302,
+        // Only redirect when a supported locale is actually accepted.
+        when: "prefers_language(['fr', 'en', 'de']) != ''",
+    ),
+],
+```
+
+Fall back to the English page when a localized file isn't in this deployment:
+
+```ron
+redirects: [
+    (from: "/fr/*", to: "/en/:splat", status: 302, when: "!file_exists(path)"),
+],
+```
+
+Conditions can read the method, host, path, `header("name")`, `cookie("name")`,
+`query("name")`, `accepts_language("fr")`, `prefers_language([...])`, and
+`file_exists("/path")`, combined with `== != in && || !` and `.startsWith/…`. The
+full grammar is in the [routing reference](../reference/routing.md#conditional-rules-when).
+
+Because a condition that reads `Accept-Language`, a cookie, or a header makes the
+response vary per visitor, boatramp automatically adds the matching **`Vary`**
+header so caches key on it correctly — no extra config needed.
+
 ## Validate before you publish
 
 `boatramp validate` parses `project.cfg` and checks the routing rules — glob

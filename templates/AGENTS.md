@@ -92,8 +92,9 @@ flake.nix            # (optional) devshell that puts `boatramp` + toolchain on P
 Keep the build **simple and boring**: its only job is to emit a directory. A
 project can be pure static HTML, static + a WASM “island” for interactivity
 (progressive enhancement — the static site must still work if the island fails to
-load), or static + server-side WASM handlers. Pick the least dynamic option that
-meets the need.
+load), static + `when` conditional routing (server-side redirects on language /
+cookie / file existence, no code — see below), or static + server-side WASM
+handlers. Pick the least dynamic option that meets the need.
 
 ---
 
@@ -170,11 +171,33 @@ If the project has a `justfile`, prefer wiring these into `just dev` / `just bui
 
 ---
 
+## Server-side conditions without a handler (`when`)
+
+Before reaching for a handler, check whether a **conditional redirect/rewrite**
+does the job. A `routing.redirects`/`rewrites` rule can carry a `when` condition —
+a tiny server-side expression over the request (`Accept-Language`, cookies,
+headers, `file_exists(...)`) — and a `${…}` computed destination. This covers the
+common "route on the request" cases (locale negotiation, file-existence fallback,
+country/cookie splits) in config, with no WASM to build:
+
+```ron
+redirects: [
+    // One rule → the visitor's preferred locale.
+    ( from: "/", to: "/${prefers_language(['fr','en','de'])}/", status: 302,
+      when: "prefers_language(['fr','en','de']) != ''" ),
+],
+```
+
+boatramp adds the right `Vary` header automatically. Full grammar:
+`docs/reference/routing.md` (“Conditional rules”). Prefer this over a handler when
+you only need to *decide a route*, not generate a response.
+
 ## Going dynamic: handlers (only if you actually need server-side logic)
 
-Static-first is the default. If the project needs server-side dynamic routes,
-boatramp runs **WebAssembly handlers** — components built for `wasm32-wasip2` that
-export `wasi:http/incoming-handler`, sandboxed in-process (they reach only the host
+Static-first is the default. If the project needs to *generate* a response
+server-side (not just pick a route — that's `when`, above), boatramp runs
+**WebAssembly handlers** — components built for `wasm32-wasip2` that export
+`wasi:http/incoming-handler`, sandboxed in-process (they reach only the host
 capabilities you grant). Wire them under `routing.handlers`:
 
 ```ron
@@ -230,8 +253,9 @@ devshell (or `nix run .#boatramp -- sync …` in CI).
 2. **`boatramp validate`** after any `project.cfg` change, before committing.
 3. **Prove it locally**: `serve` + `sync` + `curl` the actual routes/headers you
    changed. Don’t claim routing/handler behavior you haven’t observed.
-4. **Least dynamic wins**: static → client-side island → WASM handler → heavier
-   compute, in that order of preference. Justify any step up.
+4. **Least dynamic wins**: static → client-side island → `when` conditional
+   routing → WASM handler → heavier compute, in that order of preference. Justify
+   any step up.
 5. **Secrets stay out of the repo** (`BOATRAMP_TOKEN` and friends are env-only).
 6. **The build emits a directory; boatramp ships it.** Don’t build a parallel
    deploy path.
