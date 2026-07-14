@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConsumerConfig, DeployConfig, HandlerConfig, HandlerLimits, Overlap};
+use crate::file::FileEntry;
 
 /// A function's owner — a **site** or a **project/tenant**. Drives the KV/blob/sql
 /// binding prefix and the inherited RBAC (a site-scoped function gains no privilege
@@ -340,6 +341,38 @@ pub fn desugar(cfg: &DeployConfig) -> (Vec<FunctionSpec>, Vec<Trigger>) {
     (functions, triggers)
 }
 
+/// Materialize desugared specs into stored [`Function`]s for a site, resolving each
+/// component **path** to its blob hash via the deploy's file map (the blob hash is
+/// the content-addressed version id). `created` is the deploy's activation time.
+/// Specs whose component isn't in the file map are dropped (a validated deploy
+/// always has them). This is the derived, read-only view of a site's functions
+/// (FA-1); independently-stored top-level functions come with FA-2.
+pub fn materialize(
+    specs: &[FunctionSpec],
+    site: &str,
+    files: &BTreeMap<String, FileEntry>,
+    created: u64,
+) -> Vec<Function> {
+    specs
+        .iter()
+        .filter_map(|s| {
+            let hash = files.get(s.component.trim_start_matches('/'))?.hash.clone();
+            Some(Function {
+                name: s.name.clone(),
+                owner: Owner::Site(site.to_string()),
+                versions: vec![FunctionVersion {
+                    id: hash.clone(),
+                    component: hash.clone(),
+                    created,
+                    lifecycle: s.lifecycle,
+                }],
+                active: hash,
+                config: s.config.clone(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +483,33 @@ mod tests {
             TriggerKind::Stream { topics, .. } => assert_eq!(topics, &["ticks".to_string()]),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn materialize_resolves_paths_to_blob_hashes() {
+        let cfg = DeployConfig {
+            handlers: vec![handler("/api/hello", "hello.wasm", &["GET"], &[])],
+            ..Default::default()
+        };
+        let (specs, _) = desugar(&cfg);
+        let files = BTreeMap::from([(
+            "hello.wasm".to_string(),
+            FileEntry {
+                hash: "sha256:abc".into(),
+                size: 10,
+                content_type: None,
+                variants: BTreeMap::new(),
+            },
+        )]);
+        let funcs = materialize(&specs, "blog", &files, 1_800_000_000);
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "api-hello");
+        assert_eq!(funcs[0].owner, Owner::Site("blog".into()));
+        assert_eq!(funcs[0].active, "sha256:abc");
+        assert_eq!(funcs[0].versions[0].component, "sha256:abc");
+        assert_eq!(funcs[0].versions[0].created, 1_800_000_000);
+        // A spec whose component blob is absent is dropped (no phantom function).
+        assert!(materialize(&specs, "blog", &BTreeMap::new(), 0).is_empty());
     }
 
     #[test]

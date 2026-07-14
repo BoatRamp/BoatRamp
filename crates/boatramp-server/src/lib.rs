@@ -684,6 +684,7 @@ pub fn router_with(
     // Control-plane API — gated by the auth middleware.
     let api = Router::new()
         .route("/api/sites", get(list_sites))
+        .route("/api/functions", get(list_functions))
         .route(
             "/api/sites/:site/deployments",
             post(create_deployment).get(list_deployments),
@@ -1393,6 +1394,88 @@ async fn list_sites(State(deploy): State<DeployStore>) -> Response {
     match deploy.all_sites().await {
         Ok(sites) => Json(sites).into_response(),
         Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `?site=` filter for the functions view.
+#[derive(serde::Deserialize)]
+struct FunctionQuery {
+    site: Option<String>,
+}
+
+/// One entry in the `GET /api/functions` view.
+#[derive(serde::Serialize)]
+struct FunctionSummary {
+    /// Site-scoped name (`<site>/<name>`).
+    name: String,
+    /// Execution substrate.
+    runtime: String,
+    /// Active version id (the component blob hash).
+    version: String,
+    /// Rendered triggers that reach this function.
+    triggers: Vec<String>,
+}
+
+/// `GET /api/functions[?site=…]` — the derived, **read-only** site-scoped function
+/// view (FA-1): desugar each site's active manifest into functions + triggers and
+/// resolve component paths to their blob-hash version ids. A pure projection of the
+/// manifests — the serve path is untouched, so a site's handlers are unchanged.
+/// `system·read`.
+async fn list_functions(
+    State(deploy): State<DeployStore>,
+    axum::extract::Query(query): axum::extract::Query<FunctionQuery>,
+) -> Response {
+    use boatramp_core::function;
+    let sites = match &query.site {
+        Some(s) => vec![s.clone()],
+        None => match deploy.all_sites().await {
+            Ok(s) => s,
+            Err(err) => return deploy_error_response(err),
+        },
+    };
+    let mut out: Vec<FunctionSummary> = Vec::new();
+    for site in sites {
+        let manifest = match deploy.current_manifest(&site).await {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(err) => return deploy_error_response(err),
+        };
+        let (specs, triggers) = function::desugar(&manifest.config);
+        for f in function::materialize(&specs, &site, &manifest.files, 0) {
+            let trigs = triggers
+                .iter()
+                .filter(|t| t.target.as_ref().map(|r| r.name.as_str()) == Some(f.name.as_str()))
+                .map(render_trigger)
+                .collect();
+            out.push(FunctionSummary {
+                name: format!("{site}/{}", f.name),
+                runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
+                version: f.active,
+                triggers: trigs,
+            });
+        }
+    }
+    Json(out).into_response()
+}
+
+/// Render a trigger to a short one-line label for the functions view.
+fn render_trigger(t: &boatramp_core::function::Trigger) -> String {
+    use boatramp_core::function::TriggerKind;
+    match &t.kind {
+        TriggerKind::Route { path, methods, .. } => {
+            let m = if methods.is_empty() {
+                "*".to_string()
+            } else {
+                methods.join(",")
+            };
+            format!("route {m} {path}")
+        }
+        TriggerKind::Invoke { name } => format!("invoke {name}"),
+        TriggerKind::Queue { topic } => format!("queue {topic}"),
+        TriggerKind::Cron { schedule, .. } => format!("cron {schedule}"),
+        TriggerKind::Blob { prefix } => format!("blob {prefix}"),
+        TriggerKind::Webhook { path, .. } => format!("webhook {path}"),
+        TriggerKind::Stream { topics, .. } => format!("stream {}", topics.join(",")),
     }
 }
 

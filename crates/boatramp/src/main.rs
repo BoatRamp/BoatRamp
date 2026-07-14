@@ -46,6 +46,7 @@ mod dlq;
 mod dns;
 mod domains;
 mod error;
+mod function;
 mod gateway;
 mod handler_validate;
 // Joiner-side dynamic cluster join (CJ-2/CJ-3): the ticket codec, root-anchored
@@ -93,6 +94,8 @@ enum Command {
     Validate(build::ValidateArgs),
     /// List a site's deployment history.
     Deployments(manage::DeploymentsArgs),
+    /// Inspect the functions a site runs (its handlers/consumers/crons as functions).
+    Function(function::FunctionArgs),
     /// Roll back to the previous (or a specific) deployment.
     Rollback(manage::RollbackArgs),
     /// Show a site's current deployment (id, age, size).
@@ -335,6 +338,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Bundle(args) => bundle::run(args, &config).await?,
         Command::Validate(args) => build::validate(args)?,
         Command::Deployments(args) => manage::list(args, &config).await?,
+        Command::Function(args) => function::run(args, &config).await?,
         Command::Rollback(args) => manage::rollback(args, &config).await?,
         Command::Status(args) => manage::status(args, &config).await?,
         Command::Domain(args) => domains::run(args, &config).await?,
