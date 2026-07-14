@@ -1,0 +1,21 @@
+# A boatramp function — a `wasi:http` WebAssembly component.
+#
+# Build it:   cargo build --release --target wasm32-wasip2
+#   (or:      boatramp function build)
+# Deploy it:  boatramp function deploy NAME --component \
+#               target/wasm32-wasip2/release/NAME.wasm
+[package]
+name = "BOATRAMP_FUNCTION_NAME"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+strip = true

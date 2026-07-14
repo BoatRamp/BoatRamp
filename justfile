@@ -78,6 +78,14 @@ sqld data_dir="./.sqld" port="8080" admin_port="9090":
 acme-dns-e2e:
     cargo test -p boatramp-acme --features acme --test pebble_dns01 -- --ignored --nocapture
 
+# FA-7 `function init` → `function build` round-trip: scaffold the Rust template
+# and compile it to a `wasi:http` component (needs the `wasm32-wasip2` target +
+# `wasm-tools`, both in `nix develop`). This is the "each template builds to a
+# component" gate; run it in CI / the dev shell (it fetches the template's crates,
+# so it is not a hermetic flake check).
+function-roundtrip:
+    cargo test -p boatramp function::tests::init_then_build -- --ignored --nocapture
+
 # Remove build artifacts.
 clean:
     cargo clean

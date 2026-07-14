@@ -67,6 +67,8 @@ async-trait = "0.1"
 # Native filesystem change notification (inotify / FSEvents / kqueue) for the
 # FsStorage blob-change watch (FA-5). Syscall-crate-correct vs. shelling out.
 notify = "6"
+# Embed the `function init` scaffolding templates into the CLI binary (FA-7).
+include_dir = "0.7"
 # Async Docker Engine API client for the remote-docker compute backend.
 bollard = "0.17"
 thiserror = "2"

@@ -25,6 +25,18 @@ pub enum FunctionError {
     /// `function trigger add` needs exactly one of `--cron` / `--queue` / `--blob`.
     #[error("specify exactly one of --cron, --queue, or --blob")]
     BadTrigger,
+    /// `function init --lang` named an unknown template.
+    #[error("unknown template language {0:?} (supported: rust)")]
+    UnknownLang(String),
+    /// `function init` target directory already exists.
+    #[error("{0} already exists")]
+    AlreadyExists(std::path::PathBuf),
+    /// `function build` (the `cargo build` invocation) failed.
+    #[error("cargo build failed (is the wasm32-wasip2 target installed?)")]
+    BuildFailed,
+    /// `function build` produced no component `.wasm`.
+    #[error("no component produced under target/wasm32-wasip2/release")]
+    NoComponent,
 }
 
 type Result<T> = std::result::Result<T, FunctionError>;
@@ -151,6 +163,24 @@ enum FunctionCommand {
     },
     /// Manage a function's scheduled / event triggers (cron, queue).
     Trigger(TriggerArgs),
+    /// Scaffold a new function project from a language template.
+    Init {
+        /// Function/project name (also the Rust crate name).
+        name: String,
+        /// Language template (only `rust` for now).
+        #[arg(long, default_value = "rust")]
+        lang: String,
+        /// Parent directory to create the project under (default: cwd).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Build a function project to a `wasi:http` component (`cargo build
+    /// --release --target wasm32-wasip2`). Prints the produced `.wasm` path.
+    Build {
+        /// The project directory (default: cwd).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 /// `function trigger` — cron + queue triggers the server dispatches.
@@ -463,6 +493,8 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             );
         }
         FunctionCommand::Trigger(args) => run_trigger(args, config).await?,
+        FunctionCommand::Init { name, lang, dir } => init_project(&name, &lang, dir)?,
+        FunctionCommand::Build { dir } => build_project(dir).await?,
     }
     Ok(())
 }
@@ -550,6 +582,118 @@ async fn read_invoke_body(
     }
 }
 
+/// The embedded Rust function template (`function init --lang rust`).
+static RUST_TEMPLATE: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/rust");
+
+/// Scaffold a new function project from a language template.
+fn init_project(name: &str, lang: &str, dir: Option<std::path::PathBuf>) -> Result<()> {
+    if lang != "rust" {
+        return Err(FunctionError::UnknownLang(lang.to_string()));
+    }
+    let crate_name = sanitize_crate_name(name);
+    let target = dir
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(&crate_name);
+    if target.exists() {
+        return Err(FunctionError::AlreadyExists(target));
+    }
+    write_template(&RUST_TEMPLATE, &target, &crate_name)?;
+    println!("scaffolded {crate_name} in {}", target.display());
+    println!("  next: cd {crate_name} && boatramp function build");
+    Ok(())
+}
+
+/// Write every embedded template file to `dest_root`, renaming `Cargo.toml.tmpl`
+/// → `Cargo.toml` with the crate name substituted.
+fn write_template(
+    dir: &include_dir::Dir,
+    dest_root: &std::path::Path,
+    crate_name: &str,
+) -> Result<()> {
+    let mut files: Vec<&include_dir::File> = Vec::new();
+    collect_files(dir, &mut files);
+    for file in files {
+        let rel = file.path();
+        let (rel, contents) = if rel.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml.tmpl")
+        {
+            let text = std::str::from_utf8(file.contents())
+                .unwrap_or_default()
+                .replace("BOATRAMP_FUNCTION_NAME", crate_name);
+            (rel.with_file_name("Cargo.toml"), text.into_bytes())
+        } else {
+            (rel.to_path_buf(), file.contents().to_vec())
+        };
+        let dest = dest_root.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, contents)?;
+    }
+    Ok(())
+}
+
+/// Recursively gather every file in the embedded directory (paths are relative to
+/// the template root).
+fn collect_files<'a>(dir: &'a include_dir::Dir, out: &mut Vec<&'a include_dir::File<'a>>) {
+    out.extend(dir.files());
+    for sub in dir.dirs() {
+        collect_files(sub, out);
+    }
+}
+
+/// A valid Rust crate name from a function name: lowercase, non-alphanumerics → `-`,
+/// collapsed, trimmed. Empty input becomes `function`.
+fn sanitize_crate_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "function".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build a function project to a component and print the produced `.wasm` path.
+async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
+    let dir = dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+    let status = tokio::process::Command::new("cargo")
+        .args(["build", "--release", "--target", "wasm32-wasip2"])
+        .current_dir(&dir)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(FunctionError::BuildFailed);
+    }
+    // The cdylib output is a single `<crate>.wasm` under the release dir.
+    let release = dir.join("target/wasm32-wasip2/release");
+    let component = std::fs::read_dir(&release)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().and_then(|e| e.to_str()) == Some("wasm"))
+        })
+        .ok_or(FunctionError::NoComponent)?;
+    println!("built {}", component.display());
+    println!(
+        "  deploy: boatramp function deploy <name> --component {}",
+        component.display()
+    );
+    Ok(())
+}
+
 /// Resolve the target server and build an authenticated client — the shared
 /// preamble of every mutating `function` subcommand.
 fn conn(server: Option<String>, config: &ProjectConfig) -> Result<(String, client::ApiClient)> {
@@ -583,4 +727,66 @@ async fn fetch(
 fn short(id: &str) -> &str {
     let id = id.strip_prefix("sha256:").unwrap_or(id);
     &id[..id.len().min(12)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_crate_names() {
+        assert_eq!(sanitize_crate_name("My Cool Fn"), "my-cool-fn");
+        assert_eq!(sanitize_crate_name("resize_images"), "resize-images");
+        assert_eq!(sanitize_crate_name("  --Foo.Bar--  "), "foo-bar");
+        assert_eq!(sanitize_crate_name("!!!"), "function");
+    }
+
+    #[test]
+    fn init_scaffolds_a_buildable_tree() {
+        let root = std::env::temp_dir().join(format!("boatramp-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        init_project("My Cool Fn", "rust", Some(root.clone())).unwrap();
+        let proj = root.join("my-cool-fn");
+
+        // The manifest is written (not the `.tmpl`), with the name substituted.
+        let cargo = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("name = \"my-cool-fn\""));
+        assert!(!cargo.contains("BOATRAMP_FUNCTION_NAME"));
+        assert!(!proj.join("Cargo.toml.tmpl").exists());
+        // Source + the WIT closure came along, so `cargo build` would have them.
+        assert!(proj.join("src/lib.rs").exists());
+        assert!(proj.join("wit/handler.wit").exists());
+
+        // Refuses an unknown language and an existing directory.
+        assert!(matches!(
+            init_project("x", "python", Some(root.clone())),
+            Err(FunctionError::UnknownLang(_))
+        ));
+        assert!(matches!(
+            init_project("My Cool Fn", "rust", Some(root.clone())),
+            Err(FunctionError::AlreadyExists(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scaffolded Rust template compiles to a real `wasi:http` component.
+    /// `#[ignore]`d because it invokes `cargo build --target wasm32-wasip2` (slow +
+    /// needs the wasm toolchain); run with `--ignored`, and wired into the flake
+    /// check. Validates FA-7's init → build round-trip end to end.
+    #[tokio::test]
+    #[ignore = "compiles a wasm component; run with --ignored / in the flake check"]
+    async fn init_then_build_produces_a_component() {
+        let root = std::env::temp_dir().join(format!("boatramp-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        init_project("roundtrip demo", "rust", Some(root.clone())).unwrap();
+        let proj = root.join("roundtrip-demo");
+        build_project(Some(proj.clone())).await.unwrap();
+        let wasm = proj.join("target/wasm32-wasip2/release/roundtrip_demo.wasm");
+        assert!(wasm.exists(), "expected a built component at {wasm:?}");
+        // A component starts with the wasm preamble + the component-model layer.
+        let bytes = std::fs::read(&wasm).unwrap();
+        assert_eq!(&bytes[..4], b"\0asm");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

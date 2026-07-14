@@ -10,6 +10,27 @@ a route instead, see [Deploy a handler](./deploy-handler.md).
 All of the commands below take `--server <url>` (or read it from `project.cfg`) and
 require a token with `system·admin` for writes / invoke, `system·read` for reads.
 
+## Scaffold a new function
+
+Start from a template instead of hand-wiring a `wasi:http` component:
+
+```console
+$ boatramp function init greeter
+scaffolded greeter in ./greeter
+  next: cd greeter && boatramp function build
+
+$ cd greeter && boatramp function build
+built target/wasm32-wasip2/release/greeter.wasm
+  deploy: boatramp function deploy <name> --component target/wasm32-wasip2/release/greeter.wasm
+```
+
+`function init` writes a minimal Rust component (a `handle` function you edit) plus
+its `wit/` world; `function build` runs `cargo build --release --target
+wasm32-wasip2` and prints the produced component. Building needs the
+`wasm32-wasip2` target (`rustup target add wasm32-wasip2`, or use the project's
+`nix develop` shell). More language templates (JS, Python) follow; today `--lang
+rust` is the one built in.
+
 ## Deploy a version
 
 Deploy a component `.wasm` as a named function. The CLI uploads it as a
