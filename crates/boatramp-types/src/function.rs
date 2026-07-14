@@ -76,6 +76,52 @@ pub struct FunctionConfig {
     /// Usage quota (FA-4). Absent / all-`None` ⇒ unlimited.
     #[serde(default, skip_serializing_if = "FunctionQuota::is_unset")]
     pub quota: FunctionQuota,
+    /// Signed inbound-webhook ingress (FA-5). Absent ⇒ no webhook endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookConfig>,
+}
+
+/// The signature scheme a webhook is verified under (FA-5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookAlgorithm {
+    /// `HMAC-SHA256(body, secret)`, hex — the GitHub/Stripe-style scheme.
+    #[default]
+    HmacSha256,
+}
+
+/// Signed inbound-webhook config for a function (FA-5). The verifying secret is a
+/// **reference to a host env var** (never stored plaintext — mirrors site
+/// secrets); the endpoint verifies the request signature over the raw body,
+/// constant-time, **before** the guest runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// The host env var holding the shared secret.
+    pub secret_env: String,
+    /// Signature scheme (default HMAC-SHA256).
+    #[serde(default)]
+    pub algorithm: WebhookAlgorithm,
+    /// The header carrying the hex signature (default `x-boatramp-signature`; a
+    /// leading `sha256=` is accepted and stripped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_header: Option<String>,
+    /// Max request body accepted before verifying/dispatching (default 1 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<u64>,
+}
+
+impl WebhookConfig {
+    /// The signature header name (defaulted).
+    pub fn header(&self) -> &str {
+        self.signature_header
+            .as_deref()
+            .unwrap_or("x-boatramp-signature")
+    }
+    /// The body cap (defaulted to 1 MiB).
+    pub fn body_cap(&self) -> u64 {
+        self.max_body_bytes.unwrap_or(1024 * 1024)
+    }
 }
 
 impl FunctionConfig {
@@ -86,6 +132,7 @@ impl FunctionConfig {
             env: h.env.clone(),
             runtime: Runtime::default(),
             quota: FunctionQuota::default(),
+            webhook: None,
         }
     }
     fn from_consumer(c: &ConsumerConfig) -> Self {
@@ -145,8 +192,9 @@ pub enum TriggerKind {
     },
     /// An object-storage change under a prefix (FA-5).
     Blob { prefix: String },
-    /// A signed inbound webhook (FA-5).
-    Webhook { path: String, secret: String },
+    /// A signed inbound webhook (FA-5). `secret_env` names the host env var
+    /// holding the verifying secret (never the secret itself).
+    Webhook { path: String, secret_env: String },
     /// Host-native SSE / WebSocket topic fan-out — the "stream" shape (no component,
     /// so a stream trigger's `target` is `None`).
     Stream {
@@ -1011,6 +1059,40 @@ mod tests {
         assert!(u.admit(&unset, 1));
         assert_eq!(u.window_count, 0);
         assert!(unset.is_unset());
+    }
+
+    #[test]
+    fn webhook_config_defaults_and_round_trips() {
+        // Defaults: header + body cap.
+        let w = WebhookConfig {
+            secret_env: "HOOK_SECRET".into(),
+            algorithm: WebhookAlgorithm::HmacSha256,
+            signature_header: None,
+            max_body_bytes: None,
+        };
+        assert_eq!(w.header(), "x-boatramp-signature");
+        assert_eq!(w.body_cap(), 1024 * 1024);
+
+        // A config carrying a webhook round-trips and the secret is an env *ref*.
+        let cfg = FunctionConfig {
+            webhook: Some(w),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"secret_env\":\"HOOK_SECRET\""));
+        assert!(json.contains("\"hmac_sha256\""));
+        let back: FunctionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+
+        // Custom header + cap are honoured.
+        let custom = WebhookConfig {
+            secret_env: "S".into(),
+            algorithm: WebhookAlgorithm::HmacSha256,
+            signature_header: Some("x-hub-signature-256".into()),
+            max_body_bytes: Some(4096),
+        };
+        assert_eq!(custom.header(), "x-hub-signature-256");
+        assert_eq!(custom.body_cap(), 4096);
     }
 
     #[test]

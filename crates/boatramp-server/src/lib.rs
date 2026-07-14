@@ -868,7 +868,14 @@ pub fn router_with(
         .route(
             "/.well-known/boatramp-bootstrap-identity",
             get(serve_bootstrap_identity),
-        )
+        );
+    // Signed inbound-webhook ingress (FA-5): a **public** (signature-gated, not
+    // token-gated) route that verifies the request signature before invoking the
+    // function. Needs the engine, so it is registered only with the handlers
+    // feature.
+    #[cfg(feature = "handlers")]
+    let app = app.route("/_webhooks/:name", post(webhook_ingress));
+    let app = app
         .fallback(serve_by_host)
         .with_state(deploy)
         .layer(Extension(BootstrapAttestation(bootstrap_attestation)))
@@ -2343,6 +2350,141 @@ async fn get_function_usage(
         Ok(None) => Json(boatramp_core::function::Metering::new(name)).into_response(),
         Err(err) => deploy_error_response(err),
     }
+}
+
+// ---- signed webhook ingress (FA-5) -------------------------------------------
+
+/// `POST /_webhooks/:name` (FA-5) — signed inbound-webhook ingress. **Public** but
+/// signature-gated: the request signature is verified over the raw body,
+/// constant-time, **before** the guest runs (the SSRF/abuse guard). Requires the
+/// function to declare a `webhook` config whose `secret_env` names a set host env
+/// var. A valid signature invokes the function (sync, active version) and returns
+/// its response; a missing/invalid signature is `401`, an oversize body `413`.
+#[cfg(feature = "handlers")]
+async fn webhook_ingress(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return handler_unavailable();
+    };
+    let function = match deploy.get_function(&name).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    };
+    let Some(webhook) = function.config.webhook.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("function {name:?} has no webhook\n"),
+        )
+            .into_response();
+    };
+    // The verifying secret is a host env-var *reference*, never stored plaintext.
+    let Ok(secret) = std::env::var(&webhook.secret_env) else {
+        tracing::warn!(
+            function = %name,
+            env = %webhook.secret_env,
+            "webhook secret env var is not set; refusing",
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "webhook not configured\n").into_response();
+    };
+    // Capture the signature + content type *before* consuming the body.
+    let provided = request
+        .headers()
+        .get(webhook.header())
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = match axum::body::to_bytes(request.into_body(), webhook.body_cap() as usize).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "webhook body exceeds the cap\n",
+            )
+                .into_response()
+        }
+    };
+    let Some(provided) = provided else {
+        return (StatusCode::UNAUTHORIZED, "missing webhook signature\n").into_response();
+    };
+    if !verify_webhook_signature(webhook.algorithm, secret.as_bytes(), &body, &provided) {
+        return (StatusCode::UNAUTHORIZED, "invalid webhook signature\n").into_response();
+    }
+    // Rate-limit quota (fail-closed) applies to a verified webhook like any invoke.
+    if let Err(response) = admit_by_quota(inner, &deploy, &function).await {
+        return response;
+    }
+    let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+        return handler_unavailable();
+    };
+    let bytes_in = body.len() as u64;
+    let request = build_webhook_request(content_type, body.to_vec());
+    let (response, duration_ms) =
+        execute_function(inner, &deploy, &function, &component, request).await;
+    let sample = boatramp_core::function::MeteringSample {
+        success: response.status().as_u16() < 500,
+        duration_ms,
+        bytes_in,
+        bytes_out: 0,
+    };
+    record_metering(inner, &deploy, &function.name, &sample).await;
+    response
+}
+
+/// Verify a webhook signature over `body`, constant-time. HMAC-SHA256 accepts the
+/// raw hex or a `sha256=`-prefixed hex (GitHub style).
+#[cfg(feature = "handlers")]
+fn verify_webhook_signature(
+    algorithm: boatramp_core::function::WebhookAlgorithm,
+    secret: &[u8],
+    body: &[u8],
+    provided: &str,
+) -> bool {
+    use boatramp_core::function::WebhookAlgorithm;
+    use hmac::{Hmac, Mac};
+    use subtle::ConstantTimeEq;
+    match algorithm {
+        WebhookAlgorithm::HmacSha256 => {
+            let provided = provided.strip_prefix("sha256=").unwrap_or(provided);
+            let Ok(provided_bytes) = hex::decode(provided) else {
+                return false;
+            };
+            // HMAC accepts a key of any length, so this construction never fails.
+            let Ok(mut mac) = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret) else {
+                return false;
+            };
+            mac.update(body);
+            let expected = mac.finalize().into_bytes();
+            provided_bytes.ct_eq(&expected).into()
+        }
+    }
+}
+
+/// Build the engine request for a verified webhook: a `POST` carrying the raw body
+/// (+ content type). `execute_function` rewrites the URI to the invoke authority.
+#[cfg(feature = "handlers")]
+fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request {
+    let mut builder = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/");
+    if let Some(ct) = &content_type {
+        if let Ok(value) = HeaderValue::from_str(ct) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
 }
 
 async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<String>) -> Response {

@@ -62,6 +62,10 @@ enum FunctionCommand {
         /// Execution substrate: `wasm` (default), `microvm`, or `container`.
         #[arg(long)]
         runtime: Option<String>,
+        /// Enable a signed webhook: the host env var holding the HMAC-SHA256
+        /// verifying secret (never the secret itself).
+        #[arg(long)]
+        webhook_secret_env: Option<String>,
         /// Server base URL.
         #[arg(long)]
         server: Option<String>,
@@ -241,6 +245,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             name,
             component,
             runtime,
+            webhook_secret_env,
             server,
         } => {
             let (server, http) = conn(server, config)?;
@@ -250,6 +255,12 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             let mut cfg = serde_json::Map::new();
             if let Some(r) = &runtime {
                 cfg.insert("runtime".to_string(), serde_json::json!(r));
+            }
+            if let Some(secret_env) = &webhook_secret_env {
+                cfg.insert(
+                    "webhook".to_string(),
+                    serde_json::json!({ "secret_env": secret_env }),
+                );
             }
             // Top-level functions carry their own version line (decision 3).
             let body = serde_json::json!({

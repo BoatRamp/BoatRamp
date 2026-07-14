@@ -72,6 +72,10 @@ reqwest.workspace = true
 base64.workspace = true
 hex.workspace = true
 getrandom.workspace = true
+# HMAC-SHA256 webhook-signature verification (FA-5) + constant-time compare.
+sha2.workspace = true
+hmac.workspace = true
+subtle.workspace = true
 # AES-256-GCM for the local-KEK secrets-at-rest envelope. Same provider the
 # mesh + rustls already use.
 aws-lc-rs = "1.17"

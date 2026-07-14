@@ -1897,6 +1897,148 @@ async fn function_invoke_meters_usage_per_function() {
     assert_eq!(ghost["invocations"], 0);
 }
 
+// ---- signed webhook ingress (FA-5) -----------------------------------------
+
+/// Deploy a function that declares a `webhook` verified by `secret_env` (FA-5).
+#[cfg(feature = "handlers")]
+async fn deploy_webhook_function(
+    deploy: &DeployStore,
+    name: &str,
+    component: &[u8],
+    secret_env: &str,
+) -> String {
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner, WebhookConfig};
+    let hash = sha256_hex(component);
+    let bytes = component.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let config = FunctionConfig {
+        webhook: Some(WebhookConfig {
+            secret_env: secret_env.to_string(),
+            algorithm: Default::default(),
+            signature_header: None,
+            max_body_bytes: None,
+        }),
+        ..Default::default()
+    };
+    let f = Function::new(
+        name,
+        Owner::Project("default".into()),
+        &hash,
+        config,
+        Lifecycle::Independent,
+        0,
+    );
+    deploy.put_function(&f).await.unwrap();
+    hash
+}
+
+/// `HMAC-SHA256(body, secret)` as lowercase hex (mirrors the server's verifier).
+#[cfg(feature = "handlers")]
+fn hmac_sha256_hex(secret: &[u8], body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// A `POST /_webhooks/<name>` request with an optional signature header.
+#[cfg(feature = "handlers")]
+fn webhook_request(name: &str, body: &[u8], sig: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/_webhooks/{name}"));
+    if let Some(s) = sig {
+        builder = builder.header("x-boatramp-signature", s);
+    }
+    let mut req = builder.body(Body::from(body.to_vec())).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40200))));
+    req
+}
+
+/// The webhook endpoint verifies the HMAC signature before dispatch: a valid
+/// signature (bare or `sha256=`-prefixed) invokes the function; a bad or missing
+/// one is `401`; a function without a webhook config is `404`.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_webhook_verifies_signature_before_dispatch() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let secret_env = "BOATRAMP_TEST_WEBHOOK_SECRET";
+    std::env::set_var(secret_env, "s3cr3t-key");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_webhook_function(&deploy, "hook", HTTP_200, secret_env).await;
+    // A plain function (no webhook config) for the 404 case.
+    deploy_test_function(&deploy, "plain", HTTP_200, Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let body = br#"{"event":"push"}"#;
+    let sig = hmac_sha256_hex(b"s3cr3t-key", body);
+
+    // Valid signature → the function runs (200).
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, Some(&sig)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The GitHub-style `sha256=` prefix is accepted.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request(
+            "hook",
+            body,
+            Some(&format!("sha256={sig}")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A wrong signature is rejected before the guest runs.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, Some("00deadbeef")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A signature over a *different* body is rejected (tamper).
+    let good_for_other = hmac_sha256_hex(b"s3cr3t-key", b"other");
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, Some(&good_for_other)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Missing signature header → 401.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A function without a webhook config → 404 (even with a plausible signature).
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("plain", body, Some(&sig)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 /// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
 /// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
 /// every 500 ms; a dead-letter needs five ticks).
