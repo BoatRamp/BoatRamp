@@ -108,9 +108,23 @@ impl UpstreamState {
     /// skipped (unless *all* are ejected — then every backend is a candidate so
     /// the upstream never hard-fails on a stale ejection), the survivors are
     /// ordered by the LB policy, and the list is capped to `max_retries + 1`.
-    pub fn candidates(&self, backends: &[String], up: &Upstream, now: Instant) -> Vec<String> {
+    /// `client_region` (extracted from the request by the caller) drives
+    /// [`LbPolicy::Nearest`]; the other policies ignore it.
+    pub fn candidates(
+        &self,
+        backends: &[String],
+        up: &Upstream,
+        now: Instant,
+        client_region: Option<&str>,
+    ) -> Vec<String> {
         if backends.is_empty() {
             return Vec::new();
+        }
+        // Nearest ranks the *whole* pool (health-first, then by region distance),
+        // keeping unhealthy backends as last-resort fallback — like the all-ejected
+        // path below — so it bypasses the pre-filter + cursor.
+        if up.lb == LbPolicy::Nearest {
+            return self.nearest_candidates(backends, up, now, client_region);
         }
         let healthy: Vec<&String> = backends
             .iter()
@@ -124,10 +138,40 @@ impl UpstreamState {
         let start = match up.lb {
             LbPolicy::RoundRobin => self.cursor.fetch_add(1, Ordering::Relaxed) % pool.len(),
             LbPolicy::Random => (self.next_rand() as usize) % pool.len(),
+            LbPolicy::Nearest => unreachable!("Nearest is handled above"),
         };
         let attempts = (up.max_retries as usize + 1).min(pool.len());
         (0..attempts)
             .map(|i| pool[(start + i) % pool.len()].clone())
+            .collect()
+    }
+
+    /// Order the whole pool for [`LbPolicy::Nearest`] (FA-8): build a
+    /// [`RegionCandidate`](boatramp_core::geo::RegionCandidate) per backend (its
+    /// region tag from `up.regions`, its health from passive/active state) and
+    /// rank via [`rank_by_nearest`](boatramp_core::geo::rank_by_nearest) —
+    /// healthy-first, then ascending distance from `client_region`, unhealthy kept
+    /// last as fallback. Capped to `max_retries + 1`.
+    fn nearest_candidates(
+        &self,
+        backends: &[String],
+        up: &Upstream,
+        now: Instant,
+        client_region: Option<&str>,
+    ) -> Vec<String> {
+        use boatramp_core::geo::{rank_by_nearest, RegionCandidate};
+        let cands: Vec<RegionCandidate> = backends
+            .iter()
+            .map(|b| RegionCandidate {
+                region: up.regions.get(b).cloned(),
+                healthy: !self.is_unavailable(b, now),
+            })
+            .collect();
+        let attempts = (up.max_retries as usize + 1).min(backends.len());
+        rank_by_nearest(&cands, client_region, &up.region_map)
+            .into_iter()
+            .take(attempts)
+            .map(|i| backends[i].clone())
             .collect()
     }
 
@@ -437,7 +481,7 @@ mod tests {
         let state = UpstreamState::default();
         let now = Instant::now();
         let picks: Vec<String> = (0..6)
-            .map(|_| state.candidates(&backends(&up), &up, now)[0].clone())
+            .map(|_| state.candidates(&backends(&up), &up, now, None)[0].clone())
             .collect();
         // Rotation cycles a, b, c, a, b, c (order may start anywhere but cycles).
         assert_eq!(
@@ -467,12 +511,14 @@ mod tests {
         // While ejected, candidates never include "a".
         let mid = t0 + Duration::from_millis(500);
         for _ in 0..5 {
-            assert!(!state.candidates(&bs, &up, mid).contains(&"a".to_string()));
+            assert!(!state
+                .candidates(&bs, &up, mid, None)
+                .contains(&"a".to_string()));
         }
         // After the cooldown it is a candidate again.
         let later = t0 + Duration::from_millis(1500);
         let seen: std::collections::HashSet<String> = (0..6)
-            .flat_map(|_| state.candidates(&bs, &up, later))
+            .flat_map(|_| state.candidates(&bs, &up, later, None))
             .collect();
         assert!(seen.contains("a"));
         // A success clears the fail count + ejection immediately.
@@ -493,7 +539,7 @@ mod tests {
         state.record("a", false, up.passive_health, now);
         state.record("b", false, up.passive_health, now);
         // Both ejected → never hard-fail; the full pool stays available.
-        let cands = state.candidates(&backends(&up), &up, now);
+        let cands = state.candidates(&backends(&up), &up, now, None);
         assert_eq!(cands.len(), 1); // max_retries 0 → one attempt, but from the full pool
     }
 
@@ -502,12 +548,57 @@ mod tests {
         let mut up = pool(&["a", "b", "c", "d"]);
         up.max_retries = 2;
         let state = UpstreamState::default();
-        let cands = state.candidates(&backends(&up), &up, Instant::now());
+        let cands = state.candidates(&backends(&up), &up, Instant::now(), None);
         assert_eq!(cands.len(), 3); // max_retries(2) + 1
                                     // Distinct backends, contiguous in the rotation.
         assert_eq!(
             cands.iter().collect::<std::collections::HashSet<_>>().len(),
             3
+        );
+    }
+
+    #[test]
+    fn nearest_orders_by_region_distance_and_respects_health() {
+        let mut up = pool(&["a", "b", "c"]);
+        up.lb = LbPolicy::Nearest;
+        up.max_retries = 2; // allow the whole pool as candidates
+        up.regions = [
+            ("a".to_string(), "us-east".to_string()),
+            ("b".to_string(), "us-west".to_string()),
+            ("c".to_string(), "eu-west".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        up.region_map = boatramp_core::geo::RegionMap::from_edges([
+            ("us-east".to_string(), "us-west".to_string(), 1),
+            ("us-east".to_string(), "eu-west".to_string(), 3),
+        ]);
+        let state = UpstreamState::default();
+        let now = Instant::now();
+
+        // Client in us-east → nearest first: a (0) → b (1) → c (3).
+        assert_eq!(
+            state.candidates(&backends(&up), &up, now, Some("us-east")),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        // Eject the nearest (a): it drops to a last-resort fallback, the healthy
+        // b/c lead (nearest-of-the-healthy first).
+        up.passive_health = Some(PassiveHealth {
+            max_fails: 1,
+            fail_timeout_ms: 10_000,
+        });
+        state.record("a", false, up.passive_health, now);
+        assert_eq!(
+            state.candidates(&backends(&up), &up, now, Some("us-east")),
+            vec!["b".to_string(), "c".to_string(), "a".to_string()]
+        );
+
+        // No client region (header absent) → Nearest degrades to health-first +
+        // original order, never a hard failure.
+        assert_eq!(
+            state.candidates(&backends(&up), &up, now, None),
+            vec!["b".to_string(), "c".to_string(), "a".to_string()]
         );
     }
 
@@ -627,7 +718,7 @@ mod tests {
 
         let bs: Vec<String> = up.static_backends().iter().map(|s| s.to_string()).collect();
         let seen: std::collections::HashSet<String> = (0..8)
-            .flat_map(|_| state.candidates(&bs, &up, t0 + Duration::from_millis(20)))
+            .flat_map(|_| state.candidates(&bs, &up, t0 + Duration::from_millis(20), None))
             .collect();
         assert!(seen.contains(&healthy), "healthy backend stays in rotation");
         assert!(

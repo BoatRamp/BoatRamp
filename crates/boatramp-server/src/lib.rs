@@ -6021,7 +6021,16 @@ async fn dispatch_gateway(
         )
             .into_response();
     }
-    let candidates = state.candidates(&backends, upstream, now);
+    // FA-8: extract the client's region from the configured edge header (set by a
+    // CDN/edge, e.g. `fly-region` / `cf-ipcountry`), driving `LbPolicy::Nearest`.
+    // Unset header ⇒ no client region ⇒ Nearest degrades to health-first order.
+    let client_region = upstream
+        .client_region_header
+        .as_deref()
+        .and_then(|name| request.headers().get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let candidates = state.candidates(&backends, upstream, now, client_region.as_deref());
 
     // Retry across backends only when the request body is replayable (none) —
     // GET/HEAD with no declared/streamed body. Otherwise use a single backend.

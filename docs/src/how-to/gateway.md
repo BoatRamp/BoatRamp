@@ -36,6 +36,26 @@ boatramp gateway upstream add api \
 
 `--retries` tries another backend on a connect failure (body-less requests only).
 
+### Route to the nearest region
+
+With `--lb nearest`, the gateway sends each request to the **nearest healthy**
+backend by region: tag each backend with `--region URL=REGION`, and name the
+request header your CDN/edge sets with the client's region via
+`--client-region-header` (e.g. `fly-region`, `cf-ipcountry`):
+
+```sh
+boatramp gateway upstream add api \
+  --backend http://us.internal:8080 --region http://us.internal:8080=us-east \
+  --backend http://eu.internal:8080 --region http://eu.internal:8080=eu-west \
+  --lb nearest --client-region-header fly-region --retries 1 --site my-site
+```
+
+Selection is **health-first, then by distance**: an unhealthy nearest backend is
+skipped for a healthy farther one (kept only as a last-resort fallback), and if the
+client region is unknown the pool falls back to health-first order — never a hard
+failure. By default nearness is binary (same region wins); to rank *how* far apart
+regions are, set a distance table (`region_map`) in the site config directly.
+
 To resolve the pool from DNS instead of listing backends, discover an A/AAAA
 record set:
 

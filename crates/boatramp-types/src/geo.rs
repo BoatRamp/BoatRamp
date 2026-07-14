@@ -70,6 +70,12 @@ impl RegionMap {
             .unwrap_or(FAR)
     }
 
+    /// Whether the table is empty (no operator-supplied edges) — then nearness is
+    /// binary (same region `0`, any other [`FAR`]).
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
     fn edge_key(a: &str, b: &str) -> String {
         format!("{a}\u{1}{b}")
     }
