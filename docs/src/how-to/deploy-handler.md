@@ -1,12 +1,15 @@
 # Deploy a handler
 
-Serve a route from an already-built WebAssembly component. You declare the
-handler in `project.cfg`, validate the manifest, then sync — the sync step
-validates the component blob and activates it against the site policy.
+Serve a route from an already-built WebAssembly component. A handler is a
+[function](../explanation/functions.md) reached by an HTTP route — you declare it
+in `project.cfg`, validate the manifest, then sync, and the sync step validates the
+component blob and activates it against the site policy.
 
 To build a component from scratch, see
 [Write your first handler](../tutorials/first-handler.md). To use the host
-bindings from guest code, see [Use handler bindings](./handler-bindings.md).
+bindings from guest code, see [Use handler bindings](./handler-bindings.md). To
+run the same kind of component *invoked by name* instead of behind a route, see
+[Deploy & invoke a function](./functions.md).
 
 ## Before you start
 

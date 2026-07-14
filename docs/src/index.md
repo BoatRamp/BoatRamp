@@ -2,9 +2,10 @@
 
 boatramp is a self-hosted, streaming-first alternative to Vercel and Netlify,
 shipped as one Rust binary that is both the server and the CLI. You run it
-yourself to publish static sites, WebAssembly handlers, and edge compute, with
-atomic deployments and instant rollback. The same commands and config run on a
-single node, a self-hosted cluster, or Cloudflare Containers.
+yourself to publish static sites and **functions** — portable WASI components you
+run behind a route, invoke by name, or chain into workflows — with atomic
+deployments and instant rollback. The same commands and config run on a single
+node, a self-hosted cluster, or Cloudflare Containers.
 
 ## Where to start
 
@@ -12,8 +13,9 @@ single node, a self-hosted cluster, or Cloudflare Containers.
   [Publish your first site](./tutorials/first-site.md).
 - **Running it in production?** Start with
   [Deploy a single node](./how-to/deploy-single-node.md).
-- **Writing handlers?** Build and deploy one in
-  [Write your first handler](./tutorials/first-handler.md).
+- **Writing functions?** Build and deploy one behind a route in
+  [Write your first handler](./tutorials/first-handler.md), then
+  [invoke one by name](./how-to/functions.md).
 - **Automating or integrating?** Read the
   [authentication & authorization model](./explanation/auth-model.md).
 
@@ -24,7 +26,8 @@ single node, a self-hosted cluster, or Cloudflare Containers.
 | [Static hosting](./tutorials/first-site.md) | Content-addressed blobs, atomic deploys, instant rollback. |
 | [Domains & TLS](./how-to/custom-domain.md) | Virtualhosts, ownership verification, automatic certificates. |
 | [Auto-DNS](./how-to/auto-dns.md) | Ten managed-DNS providers for ACME and custom domains. |
-| [Handlers](./tutorials/first-handler.md) | Sandboxed Wasm components with kv / sql / blobstore / messaging bindings. |
+| [Functions](./how-to/functions.md) | Portable WASI components — behind a route (handlers), invoked by name (sync/async), or metered & quota'd. |
+| [Workflows](./how-to/workflows.md) | Chain functions into a durable DAG with retries, fan-in/out, and compensation. |
 | [Compute](./how-to/compute.md) | Containers and microVMs behind a route, with scale-to-zero. |
 | [Gateway](./how-to/gateway.md) | Load-balancing reverse proxy with health checks and retries. |
 | [Clustering](./how-to/deploy-cluster.md) | Raft-replicated control plane, multi-region reads. |
