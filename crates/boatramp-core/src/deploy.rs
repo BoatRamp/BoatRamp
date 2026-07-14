@@ -713,6 +713,110 @@ impl DeployStore {
         Ok(out)
     }
 
+    // ---- workflows (FA-6) --------------------------------------------------
+
+    /// Persist a workflow definition.
+    pub async fn put_workflow(
+        &self,
+        workflow: &crate::workflow::Workflow,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(workflow).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::workflow::keys::definition(&workflow.name), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a workflow definition, if any.
+    pub async fn get_workflow(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::workflow::Workflow>, DeployError> {
+        match self
+            .kv
+            .get(&crate::workflow::keys::definition(name))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List all workflow definitions (skips the `workflows/<name>/runs/…` sub-keys
+    /// by requiring the suffix to hold no further `/`).
+    pub async fn list_workflows(&self) -> Result<Vec<crate::workflow::Workflow>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("workflows/").await? {
+            if key["workflows/".len()..].contains('/') {
+                continue;
+            }
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(w) = serde_json::from_slice(&bytes) {
+                    out.push(w);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete a workflow definition. Returns whether it existed. Runs are left in
+    /// place (terminal history); `prune` removes them.
+    pub async fn delete_workflow(&self, name: &str) -> Result<bool, DeployError> {
+        let key = crate::workflow::keys::definition(name);
+        let existed = self.kv.get(&key).await?.is_some();
+        self.kv.delete(&key).await?;
+        Ok(existed)
+    }
+
+    /// Persist (create or update) a workflow run.
+    pub async fn put_workflow_run(
+        &self,
+        run: &crate::workflow::WorkflowRun,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(run).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::workflow::keys::run(&run.workflow, &run.id), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Load one workflow run, if any.
+    pub async fn get_workflow_run(
+        &self,
+        workflow: &str,
+        id: &str,
+    ) -> Result<Option<crate::workflow::WorkflowRun>, DeployError> {
+        match self
+            .kv
+            .get(&crate::workflow::keys::run(workflow, id))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List a workflow's runs (the executor drain scan / poll listing).
+    pub async fn list_workflow_runs(
+        &self,
+        workflow: &str,
+    ) -> Result<Vec<crate::workflow::WorkflowRun>, DeployError> {
+        let prefix = crate::workflow::keys::runs_prefix(workflow);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(run) = serde_json::from_slice(&bytes) {
+                    out.push(run);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The ownership-verification challenge for `(site, host)`, if one exists.
     pub async fn get_domain_verification(
         &self,
@@ -2042,6 +2146,55 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_definition_and_run_storage() {
+        use crate::kv::MemoryKv;
+        use crate::workflow::{Step, Workflow, WorkflowRun};
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store.get_workflow("etl").await.unwrap().is_none());
+        assert!(store.list_workflows().await.unwrap().is_empty());
+
+        let wf = Workflow {
+            name: "etl".into(),
+            steps: vec![
+                Step {
+                    id: "a".into(),
+                    function: "extract".into(),
+                    depends_on: vec![],
+                    retry: Default::default(),
+                    compensate: None,
+                },
+                Step {
+                    id: "b".into(),
+                    function: "load".into(),
+                    depends_on: vec!["a".into()],
+                    retry: Default::default(),
+                    compensate: None,
+                },
+            ],
+        };
+        store.put_workflow(&wf).await.unwrap();
+        assert_eq!(store.get_workflow("etl").await.unwrap().unwrap(), wf);
+        assert_eq!(store.list_workflows().await.unwrap().len(), 1);
+
+        // A run is stored under the workflow's runs prefix — not mistaken for a def.
+        let run = WorkflowRun::start(&wf, "r1", None, 5);
+        store.put_workflow_run(&run).await.unwrap();
+        assert_eq!(
+            store.get_workflow_run("etl", "r1").await.unwrap().unwrap(),
+            run
+        );
+        assert_eq!(store.list_workflow_runs("etl").await.unwrap().len(), 1);
+        // The run sub-key must not appear in the definition list.
+        assert_eq!(store.list_workflows().await.unwrap().len(), 1);
+
+        // Delete reports prior existence + is idempotent.
+        assert!(store.delete_workflow("etl").await.unwrap());
+        assert!(store.get_workflow("etl").await.unwrap().is_none());
+        assert!(!store.delete_workflow("etl").await.unwrap());
     }
 
     #[tokio::test]

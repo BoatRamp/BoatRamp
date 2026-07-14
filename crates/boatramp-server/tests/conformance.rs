@@ -2039,6 +2039,189 @@ async fn function_webhook_verifies_signature_before_dispatch() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// ---- workflow orchestration (FA-6) -----------------------------------------
+
+/// `PUT /api/workflows/<name>` with a step DAG (asserts 200 or returns the status).
+#[cfg(feature = "handlers")]
+async fn define_workflow(app: &axum::Router, name: &str, steps: serde_json::Value) -> StatusCode {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/workflows/{name}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "steps": steps })).unwrap(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Start a run (`POST .../runs`) and return its id.
+#[cfg(feature = "handlers")]
+async fn start_run(app: &axum::Router, name: &str) -> String {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/workflows/{name}/runs"))
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40300))));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    run["id"].as_str().unwrap().to_string()
+}
+
+/// Poll a run until terminal (`succeeded`/`failed`).
+#[cfg(feature = "handlers")]
+async fn poll_run(app: &axum::Router, name: &str, id: &str) -> serde_json::Value {
+    for _ in 0..120 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/workflows/{name}/runs/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if matches!(run["status"].as_str(), Some("succeeded") | Some("failed")) {
+            return run;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("workflow run {id} never terminated");
+}
+
+/// A 3-step chain (a → b → c) runs every step in order and the run succeeds.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn workflow_chain_runs_to_completion() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "a", "function": "counter" },
+        { "id": "b", "function": "counter", "depends_on": ["a"] },
+        { "id": "c", "function": "counter", "depends_on": ["b"] },
+    ]);
+    assert_eq!(define_workflow(&app, "chain", steps).await, StatusCode::OK);
+    let id = start_run(&app, "chain").await;
+
+    let run = poll_run(&app, "chain", &id).await;
+    assert_eq!(run["status"], "succeeded");
+    for step in ["a", "b", "c"] {
+        assert_eq!(run["steps"][step]["status"], "succeeded");
+    }
+}
+
+/// A fan-out + fan-in DAG (root → {x,y,z} → join) runs the barrier join only once
+/// all three parallel branches have completed, and the run succeeds.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn workflow_fan_out_and_join_completes() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "noop", HTTP_200, Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "root", "function": "noop" },
+        { "id": "x", "function": "noop", "depends_on": ["root"] },
+        { "id": "y", "function": "noop", "depends_on": ["root"] },
+        { "id": "z", "function": "noop", "depends_on": ["root"] },
+        { "id": "join", "function": "noop", "depends_on": ["x", "y", "z"] },
+    ]);
+    assert_eq!(define_workflow(&app, "fan", steps).await, StatusCode::OK);
+    let id = start_run(&app, "fan").await;
+
+    let run = poll_run(&app, "fan", &id).await;
+    assert_eq!(run["status"], "succeeded");
+    for step in ["root", "x", "y", "z", "join"] {
+        assert_eq!(run["steps"][step]["status"], "succeeded");
+    }
+}
+
+/// A failing step fails the run and triggers reverse-order compensation of the
+/// steps that already succeeded.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_failing_step_triggers_compensation() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "ok", HTTP_200, Vec::new()).await;
+    deploy_test_function(&deploy, "comp", HTTP_200, Vec::new()).await;
+    // A non-Wasm blob → the step function compile-fails → a step failure.
+    deploy_test_function(&deploy, "bad", b"not a wasm component", Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // a (ok, compensate=comp) → b (bad). b fails → run fails, a compensated.
+    let steps = serde_json::json!([
+        { "id": "a", "function": "ok", "compensate": "comp" },
+        { "id": "b", "function": "bad", "depends_on": ["a"] },
+    ]);
+    assert_eq!(define_workflow(&app, "saga", steps).await, StatusCode::OK);
+    let id = start_run(&app, "saga").await;
+
+    let run = poll_run(&app, "saga", &id).await;
+    assert_eq!(run["status"], "failed");
+    assert_eq!(run["steps"]["b"]["status"], "failed");
+    assert_eq!(run["steps"]["a"]["status"], "compensated");
+}
+
+/// The define endpoint validates the DAG: a cycle is a `400`.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn workflow_define_rejects_a_cycle() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "a", "function": "f", "depends_on": ["b"] },
+        { "id": "b", "function": "f", "depends_on": ["a"] },
+    ]);
+    assert_eq!(
+        define_workflow(&app, "cyclic", steps).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 /// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
 /// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
 /// every 500 ms; a dead-letter needs five ticks).

@@ -36,6 +36,9 @@ pub enum CliError {
     /// The `function` command.
     #[error(transparent)]
     Function(#[from] crate::function::FunctionError),
+    /// The `workflow` command.
+    #[error(transparent)]
+    Workflow(#[from] crate::workflow::WorkflowError),
     /// The `domain` command.
     #[error(transparent)]
     Domains(#[from] crate::domains::Error),

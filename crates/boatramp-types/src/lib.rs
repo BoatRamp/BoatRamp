@@ -28,6 +28,7 @@ pub mod predicate;
 pub mod route;
 pub mod security;
 pub mod waf;
+pub mod workflow;
 
 pub use error::ConfigError;
 

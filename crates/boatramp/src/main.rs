@@ -49,6 +49,7 @@ mod error;
 mod function;
 mod gateway;
 mod handler_validate;
+mod workflow;
 // Joiner-side dynamic cluster join (CJ-2/CJ-3): the ticket codec, root-anchored
 // verification, founding decision, and `join_cluster` orchestration wired into
 // the cluster runtime's join-at-startup path (`run_cluster`).
@@ -96,6 +97,8 @@ enum Command {
     Deployments(manage::DeploymentsArgs),
     /// Inspect the functions a site runs (its handlers/consumers/crons as functions).
     Function(function::FunctionArgs),
+    /// Define + run declarative function workflows (FA-6 orchestration).
+    Workflow(workflow::WorkflowArgs),
     /// Roll back to the previous (or a specific) deployment.
     Rollback(manage::RollbackArgs),
     /// Show a site's current deployment (id, age, size).
@@ -339,6 +342,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Validate(args) => build::validate(args)?,
         Command::Deployments(args) => manage::list(args, &config).await?,
         Command::Function(args) => function::run(args, &config).await?,
+        Command::Workflow(args) => workflow::run(args, &config).await?,
         Command::Rollback(args) => manage::rollback(args, &config).await?,
         Command::Status(args) => manage::status(args, &config).await?,
         Command::Domain(args) => domains::run(args, &config).await?,

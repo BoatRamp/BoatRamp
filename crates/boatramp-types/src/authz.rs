@@ -192,6 +192,13 @@ impl Right {
                 let action = if get { Action::Read } else { Action::Admin };
                 Right::new(Resource::System, None, action)
             }
+            // Workflows (FA-6): read the definitions/runs with `system·read`;
+            // defining a workflow, starting a run, or deleting requires
+            // `system·admin`. Same shape as `/api/functions`.
+            p if p == "/api/workflows" || p.starts_with("/api/workflows/") => {
+                let action = if get { Action::Read } else { Action::Admin };
+                Right::new(Resource::System, None, action)
+            }
             "/api/blobs" => Right::new(Resource::Blobs, None, Action::Deploy),
             "/api/certs" => Right::new(Resource::Certs, None, Action::Read),
             "/api/cache/invalidate" => Right::new(Resource::Cache, None, Action::Write),
