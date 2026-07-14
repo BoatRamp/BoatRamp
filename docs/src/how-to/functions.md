@@ -31,6 +31,30 @@ wasm32-wasip2` and prints the produced component. Building needs the
 `nix develop` shell). More language templates (JS, Python) follow; today `--lang
 rust` is the one built in.
 
+### Run it locally
+
+Before deploying, exercise the component **locally** — no server, no upload. The
+harness runs the component in-process through the same engine that serves it in
+production:
+
+```console
+# One request + assertions (exits non-zero if an assertion fails):
+$ boatramp function test --component target/wasm32-wasip2/release/greeter.wasm \
+    --path /hello --expect-status 200 --expect-body "hello"
+HTTP 200
+hello from your boatramp function (/hello)
+ok
+
+# Or serve it on a local port and curl it:
+$ boatramp function dev --component target/wasm32-wasip2/release/greeter.wasm --port 8787
+serving …/greeter.wasm on http://127.0.0.1:8787  (Ctrl-C to stop)
+```
+
+The harness grants no host capabilities (kv/sql/blobstore/messaging), so it suits
+components that only use the HTTP request/response — capability-backed local
+testing comes later. `function test`/`dev` are in the build compiled with the
+`handlers` feature (the engine).
+
 ## Deploy a version
 
 Deploy a component `.wasm` as a named function. The CLI uploads it as a

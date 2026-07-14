@@ -37,6 +37,14 @@ pub enum FunctionError {
     /// `function build` produced no component `.wasm`.
     #[error("no component produced under target/wasm32-wasip2/release")]
     NoComponent,
+    /// The local harness (`function test`/`dev`) failed to run the component.
+    #[cfg(feature = "handlers")]
+    #[error("running the component: {0}")]
+    Harness(String),
+    /// A `function test` assertion (status / body) failed.
+    #[cfg(feature = "handlers")]
+    #[error("function test assertion failed")]
+    HarnessFailed,
 }
 
 type Result<T> = std::result::Result<T, FunctionError>;
@@ -180,6 +188,42 @@ enum FunctionCommand {
         /// The project directory (default: cwd).
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
+    },
+    /// Run a component locally against one request and assert on the response
+    /// (the local single-function harness).
+    #[cfg(feature = "handlers")]
+    Test {
+        /// Path to the component `.wasm`.
+        #[arg(long)]
+        component: std::path::PathBuf,
+        /// Request path (default `/`).
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Request method (default `GET`).
+        #[arg(long, default_value = "GET")]
+        method: String,
+        /// Inline request body.
+        #[arg(long)]
+        data: Option<String>,
+        /// Request content type.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Assert the response status equals this.
+        #[arg(long)]
+        expect_status: Option<u16>,
+        /// Assert the response body contains this substring.
+        #[arg(long)]
+        expect_body: Option<String>,
+    },
+    /// Serve a component locally on an HTTP port (the local dev harness).
+    #[cfg(feature = "handlers")]
+    Dev {
+        /// Path to the component `.wasm`.
+        #[arg(long)]
+        component: std::path::PathBuf,
+        /// Port to listen on (127.0.0.1).
+        #[arg(long, default_value = "8787")]
+        port: u16,
     },
 }
 
@@ -495,6 +539,29 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
         FunctionCommand::Trigger(args) => run_trigger(args, config).await?,
         FunctionCommand::Init { name, lang, dir } => init_project(&name, &lang, dir)?,
         FunctionCommand::Build { dir } => build_project(dir).await?,
+        #[cfg(feature = "handlers")]
+        FunctionCommand::Test {
+            component,
+            path,
+            method,
+            data,
+            content_type,
+            expect_status,
+            expect_body,
+        } => {
+            harness::test_component(
+                component,
+                &path,
+                &method,
+                data,
+                content_type,
+                expect_status,
+                expect_body,
+            )
+            .await?
+        }
+        #[cfg(feature = "handlers")]
+        FunctionCommand::Dev { component, port } => harness::dev_serve(component, port).await?,
     }
     Ok(())
 }
@@ -694,6 +761,160 @@ async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// The local single-function harness (FA-7): run a scaffolded component through
+/// the engine in-process — `function test` (one request + asserts) and
+/// `function dev` (a local HTTP server). Only the no-capability request path is
+/// wired (the template's shape); capability-backed local testing is future.
+#[cfg(feature = "handlers")]
+mod harness {
+    use super::{FunctionError, Result};
+    use boatramp_handlers::{Bindings, HandlerEngine, Limits};
+    use http_body_util::{BodyExt, Full};
+
+    /// The engine's compile-cache key for a locally-run component (one per run).
+    const LOCAL_HASH: &str = "function-local";
+
+    /// Run `component` against one request; print the response and assert.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn test_component(
+        component: std::path::PathBuf,
+        path: &str,
+        method: &str,
+        data: Option<String>,
+        content_type: Option<String>,
+        expect_status: Option<u16>,
+        expect_body: Option<String>,
+    ) -> Result<()> {
+        let wasm = tokio::fs::read(&component).await?;
+        let engine = HandlerEngine::new(Limits::default(), 4).map_err(harness_err)?;
+        let (status, body) = run_once(
+            &engine,
+            &wasm,
+            method,
+            path,
+            content_type.as_deref(),
+            data.unwrap_or_default().into_bytes(),
+        )
+        .await?;
+        let text = String::from_utf8_lossy(&body);
+        println!("HTTP {status}");
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+
+        let mut ok = true;
+        if let Some(exp) = expect_status {
+            if status != exp {
+                eprintln!("FAIL: expected status {exp}, got {status}");
+                ok = false;
+            }
+        }
+        if let Some(sub) = &expect_body {
+            if !text.contains(sub.as_str()) {
+                eprintln!("FAIL: body does not contain {sub:?}");
+                ok = false;
+            }
+        }
+        if ok {
+            println!("ok");
+            Ok(())
+        } else {
+            Err(FunctionError::HarnessFailed)
+        }
+    }
+
+    /// Serve `component` locally on `127.0.0.1:<port>` until interrupted. Each
+    /// request runs the component; the response is buffered (fine for local dev).
+    pub(super) async fn dev_serve(component: std::path::PathBuf, port: u16) -> Result<()> {
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::sync::Arc;
+
+        let wasm = Arc::new(tokio::fs::read(&component).await?);
+        let engine = Arc::new(HandlerEngine::new(Limits::default(), 16).map_err(harness_err)?);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        println!(
+            "serving {} on http://127.0.0.1:{port}  (Ctrl-C to stop)",
+            component.display()
+        );
+
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let io = TokioIo::new(stream);
+            let engine = engine.clone();
+            let wasm = wasm.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                    let engine = engine.clone();
+                    let wasm = wasm.clone();
+                    async move {
+                        let response = match engine
+                            .serve(LOCAL_HASH, &wasm, req, Bindings::new("fn/local"))
+                            .await
+                        {
+                            Ok(resp) => {
+                                let (parts, body) = resp.into_parts();
+                                let bytes = body
+                                    .collect()
+                                    .await
+                                    .map(|c| c.to_bytes())
+                                    .unwrap_or_default();
+                                http::Response::from_parts(parts, Full::new(bytes))
+                            }
+                            Err(err) => http::Response::builder()
+                                .status(500)
+                                .body(Full::new(bytes::Bytes::from(format!(
+                                    "function error: {err:?}\n"
+                                ))))
+                                .unwrap(),
+                        };
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    }
+
+    /// Run one request through the engine → (status, body bytes).
+    async fn run_once(
+        engine: &HandlerEngine,
+        wasm: &[u8],
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<(u16, Vec<u8>)> {
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri(format!("http://localhost{path}"));
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let request = builder
+            .body(Full::new(bytes::Bytes::from(body)))
+            .map_err(harness_err)?;
+        let response = engine
+            .serve(LOCAL_HASH, wasm, request, Bindings::new("fn/local"))
+            .await
+            .map_err(|e| FunctionError::Harness(format!("{e:?}")))?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| FunctionError::Harness(format!("{e:?}")))?
+            .to_bytes();
+        Ok((status, bytes.to_vec()))
+    }
+
+    fn harness_err<E: std::fmt::Display>(err: E) -> FunctionError {
+        FunctionError::Harness(err.to_string())
+    }
+}
+
 /// Resolve the target server and build an authenticated client — the shared
 /// preamble of every mutating `function` subcommand.
 fn conn(server: Option<String>, config: &ProjectConfig) -> Result<(String, client::ApiClient)> {
@@ -768,6 +989,40 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The local harness runs a component through the engine: a matching assertion
+    /// passes, a wrong one fails. Uses a prebuilt fixture (no `cargo build`), so
+    /// it is fast; needs `--features handlers` (the engine).
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn harness_runs_a_component_and_asserts() {
+        const HTTP_200: &[u8] =
+            include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+        let tmp =
+            std::env::temp_dir().join(format!("boatramp-harness-{}.wasm", std::process::id()));
+        std::fs::write(&tmp, HTTP_200).unwrap();
+
+        // A matching status + body assertion passes.
+        harness::test_component(
+            tmp.clone(),
+            "/",
+            "GET",
+            None,
+            None,
+            Some(200),
+            Some("hello from boatramp".into()),
+        )
+        .await
+        .unwrap();
+
+        // A wrong status assertion fails.
+        assert!(matches!(
+            harness::test_component(tmp.clone(), "/", "GET", None, None, Some(404), None).await,
+            Err(FunctionError::HarnessFailed)
+        ));
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The scaffolded Rust template compiles to a real `wasi:http` component.
