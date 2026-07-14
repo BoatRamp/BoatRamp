@@ -19,6 +19,9 @@ pub enum FunctionError {
     /// A control-plane HTTP request failed.
     #[error("control-plane request: {0}")]
     Http(#[from] reqwest::Error),
+    /// Reading the invoke request body (a file or stdin) failed.
+    #[error("reading request body: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, FunctionError>;
@@ -94,6 +97,43 @@ enum FunctionCommand {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Invoke a function. Reads the request body from `--data`, `--data-file`, or
+    /// stdin; prints the function's response body.
+    Invoke {
+        /// Function name.
+        name: String,
+        /// Inline request body (mutually exclusive with `--data-file`).
+        #[arg(long, conflicts_with = "data_file")]
+        data: Option<String>,
+        /// Read the request body from this file (`-` = stdin).
+        #[arg(long)]
+        data_file: Option<std::path::PathBuf>,
+        /// Content type of the request body.
+        #[arg(long)]
+        content_type: Option<String>,
+        /// Deliver asynchronously: enqueue + print the invocation id to poll.
+        #[arg(long)]
+        r#async: bool,
+        /// Idempotency key — a repeat with the same key replays the first outcome.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Invoke a specific version/alias instead of the active version.
+        #[arg(long)]
+        version: Option<String>,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Show a durable (async) invocation's status/result by id.
+    Invocation {
+        /// Function name.
+        name: String,
+        /// The invocation id from `function invoke --async`.
+        id: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
 }
 
 /// A function as the server's `/api/functions` view reports it.
@@ -119,6 +159,23 @@ struct StoredFunction {
 struct StoredConfig {
     #[serde(default)]
     runtime: String,
+}
+
+/// A durable invocation record as `/invoke` (async) and `/invocations/:id`
+/// report it — the fields the CLI surfaces.
+#[derive(Debug, Deserialize)]
+struct InvocationRecord {
+    id: String,
+    status: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    result: Option<InvocationResultView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InvocationResultView {
+    status: u16,
 }
 
 /// Run the `function` subcommand.
@@ -223,8 +280,94 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 .error_for_status()?;
             println!("removed {name}");
         }
+        FunctionCommand::Invoke {
+            name,
+            data,
+            data_file,
+            content_type,
+            r#async,
+            idempotency_key,
+            version,
+            server,
+        } => {
+            let (server, http) = conn(server, config)?;
+            let body = read_invoke_body(data, data_file).await?;
+            let mut qs: Vec<String> = Vec::new();
+            if r#async {
+                qs.push("mode=async".to_string());
+            }
+            if let Some(v) = &version {
+                qs.push(format!("version={v}"));
+            }
+            let url = if qs.is_empty() {
+                format!("{server}/api/functions/{name}/invoke")
+            } else {
+                format!("{server}/api/functions/{name}/invoke?{}", qs.join("&"))
+            };
+            let mut req = http.post(url).body(body);
+            if let Some(ct) = &content_type {
+                req = req.header("content-type", ct.as_str());
+            }
+            if let Some(key) = &idempotency_key {
+                req = req.header("idempotency-key", key.as_str());
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let bytes = resp.bytes().await?;
+            if r#async {
+                // 202 + a JSON invocation record: surface the id to poll.
+                match serde_json::from_slice::<InvocationRecord>(&bytes) {
+                    Ok(inv) => println!("queued {} [{}]", inv.id, inv.status),
+                    Err(_) => eprint!("{}", String::from_utf8_lossy(&bytes)),
+                }
+            } else {
+                // Print the function's response body verbatim; note a non-success
+                // status on stderr (a control-plane 404/401, or the guest's own).
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&bytes);
+                if !status.is_success() {
+                    eprintln!("invoke returned HTTP {}", status.as_u16());
+                }
+            }
+        }
+        FunctionCommand::Invocation { name, id, server } => {
+            let (server, http) = conn(server, config)?;
+            let inv: InvocationRecord = http
+                .get(format!("{server}/api/functions/{name}/invocations/{id}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}  [{}]  attempts={}", inv.id, inv.status, inv.attempts);
+            if let Some(result) = &inv.result {
+                println!("  result: HTTP {}", result.status);
+            }
+        }
     }
     Ok(())
+}
+
+/// Read the invoke request body: `--data` inline, `--data-file <path>` (`-` =
+/// stdin), or empty when neither is given.
+async fn read_invoke_body(
+    data: Option<String>,
+    data_file: Option<std::path::PathBuf>,
+) -> Result<Vec<u8>> {
+    if let Some(inline) = data {
+        return Ok(inline.into_bytes());
+    }
+    let Some(path) = data_file else {
+        return Ok(Vec::new());
+    };
+    if path.as_os_str() == "-" {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        tokio::io::stdin().read_to_end(&mut buf).await?;
+        Ok(buf)
+    } else {
+        Ok(tokio::fs::read(&path).await?)
+    }
 }
 
 /// Resolve the target server and build an authenticated client — the shared

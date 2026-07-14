@@ -244,6 +244,21 @@ impl Function {
             ))
         }
     }
+
+    /// Resolve a **reference** — an alias label or a version id — to the component
+    /// blob hash that backs it, if known. An alias label is resolved first, then a
+    /// version id (so a label named like an id still wins as a label).
+    pub fn resolve(&self, reference: &str) -> Option<&str> {
+        let id = self
+            .aliases
+            .get(reference)
+            .map(String::as_str)
+            .unwrap_or(reference);
+        self.versions
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.component.as_str())
+    }
 }
 
 /// One immutable version of a function.
@@ -277,6 +292,95 @@ pub struct FunctionSpec {
     pub lifecycle: Lifecycle,
 }
 
+/// How an invocation is delivered (FA-3). `Sync` runs inline and returns the
+/// function's response; `Async` durably enqueues the call, returns `202` with an
+/// id, and a drain worker runs it later (retried, then dead-lettered).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvokeMode {
+    /// Run inline; the caller blocks on the function's response.
+    #[default]
+    Sync,
+    /// Durably enqueue; the caller gets an id to poll.
+    Async,
+}
+
+/// The lifecycle of a durable (async) invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationStatus {
+    /// Enqueued, not yet claimed by a drain worker.
+    #[default]
+    Queued,
+    /// Claimed and executing.
+    Running,
+    /// Completed (the function returned a response — any HTTP status).
+    Succeeded,
+    /// Exhausted its attempts and was dead-lettered.
+    Failed,
+}
+
+/// The captured response of a completed invocation (sync idempotency replay +
+/// async poll both read this). The body is base64 so the record is plain JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvocationResult {
+    /// The HTTP status the function returned.
+    pub status: u16,
+    /// The response content type, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// The response body, base64 (standard, no padding stripped).
+    pub body_b64: String,
+}
+
+/// A durable invocation record — the unit of the async queue and the receipt an
+/// idempotency key replays. Keyed under [`keys::invocation`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Invocation {
+    /// Opaque invocation id (also the queue key suffix).
+    pub id: String,
+    /// The function invoked.
+    pub function: String,
+    /// The function version that ran (or will run) — pinned at enqueue so a
+    /// later deploy can't silently change an in-flight async call.
+    pub version: String,
+    /// Delivery mode.
+    pub mode: InvokeMode,
+    /// Current status.
+    pub status: InvocationStatus,
+    /// The idempotency key that created it, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Delivery attempts so far (async).
+    #[serde(default)]
+    pub attempts: u32,
+    /// The request body the function receives, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_b64: Option<String>,
+    /// The request content type forwarded to the function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_content_type: Option<String>,
+    /// The captured result once complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<InvocationResult>,
+    /// Unix create time.
+    pub created: u64,
+    /// Unix last-update time.
+    pub updated: u64,
+}
+
+impl Invocation {
+    /// Whether the invocation reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            InvocationStatus::Succeeded | InvocationStatus::Failed
+        )
+    }
+}
+
 /// KV keyspace for a function (mirrors the deploy/alias immutability model).
 pub mod keys {
     /// Function metadata.
@@ -294,6 +398,18 @@ pub mod keys {
     /// A trigger bound to the function.
     pub fn trigger(name: &str, id: &str) -> String {
         format!("functions/{name}/triggers/{id}")
+    }
+    /// A durable invocation record.
+    pub fn invocation(name: &str, id: &str) -> String {
+        format!("functions/{name}/invocations/{id}")
+    }
+    /// The prefix under which all of a function's invocations live (queue scan).
+    pub fn invocations_prefix(name: &str) -> String {
+        format!("functions/{name}/invocations/")
+    }
+    /// An idempotency key → invocation id pointer.
+    pub fn idempotency(name: &str, key: &str) -> String {
+        format!("functions/{name}/idem/{key}")
     }
 }
 
@@ -675,6 +791,48 @@ mod tests {
         f.rollback("hashB").unwrap();
         assert_eq!(f.active, "hashB");
         assert!(f.rollback("ghost").is_err());
+
+        // `resolve` maps a version id OR an alias label to the component hash;
+        // an unknown reference resolves to nothing.
+        assert_eq!(f.resolve("hashA"), Some("hashA"));
+        assert_eq!(f.resolve("prod"), Some("hashB")); // alias → version → component
+        assert_eq!(f.resolve("ghost"), None);
+    }
+
+    #[test]
+    fn invocation_model_round_trips_and_reports_terminal() {
+        let inv = Invocation {
+            id: "inv-1".into(),
+            function: "greeter".into(),
+            version: "hashA".into(),
+            mode: InvokeMode::Async,
+            status: InvocationStatus::Queued,
+            idempotency_key: Some("k".into()),
+            attempts: 0,
+            request_b64: Some("aGk=".into()),
+            request_content_type: Some("text/plain".into()),
+            result: None,
+            created: 1,
+            updated: 1,
+        };
+        assert!(!inv.is_terminal());
+        let json = serde_json::to_string(&inv).unwrap();
+        let back: Invocation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, inv);
+        // Enum wire forms are snake_case + stable.
+        assert!(json.contains("\"mode\":\"async\""));
+        assert!(json.contains("\"status\":\"queued\""));
+
+        let done = Invocation {
+            status: InvocationStatus::Succeeded,
+            result: Some(InvocationResult {
+                status: 200,
+                content_type: None,
+                body_b64: "b2s=".into(),
+            }),
+            ..inv
+        };
+        assert!(done.is_terminal());
     }
 
     #[test]
@@ -688,6 +846,18 @@ mod tests {
         assert_eq!(
             keys::trigger("resize", "t1"),
             "functions/resize/triggers/t1"
+        );
+        assert_eq!(
+            keys::invocation("resize", "inv-1"),
+            "functions/resize/invocations/inv-1"
+        );
+        assert_eq!(
+            keys::invocations_prefix("resize"),
+            "functions/resize/invocations/"
+        );
+        assert_eq!(
+            keys::idempotency("resize", "k-1"),
+            "functions/resize/idem/k-1"
         );
     }
 }

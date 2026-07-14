@@ -1563,6 +1563,228 @@ async fn handler_route_dispatches_through_engine() {
     assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
 }
 
+// ---- function invoke API (FA-3) --------------------------------------------
+
+/// Deploy a top-level function straight into the store: upload `component` as a
+/// content-addressed blob and store a `Function` whose single active version is
+/// it. Returns the component hash (= the version id).
+#[cfg(feature = "handlers")]
+async fn deploy_test_function(
+    deploy: &DeployStore,
+    name: &str,
+    component: &[u8],
+    imports: Vec<String>,
+) -> String {
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner};
+    let hash = sha256_hex(component);
+    let bytes = component.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let config = FunctionConfig {
+        imports,
+        ..Default::default()
+    };
+    let f = Function::new(
+        name,
+        Owner::Project("default".into()),
+        &hash,
+        config,
+        Lifecycle::Independent,
+        0,
+    );
+    deploy.put_function(&f).await.unwrap();
+    hash
+}
+
+/// Build a `POST /api/functions/<name>/invoke` request with an optional
+/// `?mode=` and `Idempotency-Key`.
+#[cfg(feature = "handlers")]
+fn invoke_request(name: &str, mode: Option<&str>, idem: Option<&str>) -> Request<Body> {
+    let uri = match mode {
+        Some(m) => format!("/api/functions/{name}/invoke?mode={m}"),
+        None => format!("/api/functions/{name}/invoke"),
+    };
+    let mut builder = Request::builder().method("POST").uri(uri);
+    if let Some(key) = idem {
+        builder = builder.header("idempotency-key", key);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40100))));
+    req
+}
+
+/// Sync invoke runs the component inline and returns its response; a repeated
+/// `Idempotency-Key` replays the first outcome instead of running again (proven
+/// by the counter fixture advancing only once).
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_sync_and_idempotency() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Two plain sync invokes run twice — the counter advances 1 → 2.
+    for expected in ["hits=1\n", "hits=2\n"] {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("counter", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], expected.as_bytes());
+    }
+
+    // Same idempotency key twice → the second replays the first (still hits=3).
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("counter", None, Some("k-1")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        seen.push(String::from_utf8_lossy(&body).into_owned());
+    }
+    assert_eq!(seen, vec!["hits=3\n".to_string(), "hits=3\n".to_string()]);
+
+    // A fresh key runs again — hits=4, so exactly one run happened per key.
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("counter", None, Some("k-2")))
+        .await
+        .unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"hits=4\n");
+
+    // Invoking an unknown function is a 404.
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("ghost", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Async invoke returns `202` + an invocation id, the scheduler drains it, and a
+/// poll reports `succeeded` with the captured result.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_async_drains_and_polls() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    // Drain worker: the scheduler tick processes queued invocations.
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Enqueue → 202 + a queued record.
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("counter", Some("async"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let queued: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(queued["status"], "queued");
+    let id = queued["id"].as_str().unwrap().to_string();
+
+    // Poll until the drain settles it (first scheduler tick fires immediately).
+    let final_status = poll_invocation(&app, "counter", &id).await;
+    assert_eq!(final_status["status"], "succeeded");
+    assert_eq!(final_status["result"]["status"], 200);
+    // The captured body is base64 of "hits=1\n".
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(final_status["result"]["body_b64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&decoded[..], b"hits=1\n");
+}
+
+/// A durable invocation whose component can't run (a non-Wasm blob → a compile
+/// failure = a delivery failure) is retried up to the cap, then dead-lettered
+/// (`failed`, `attempts == MAX`).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn function_invoke_async_dead_letters_on_repeated_failure() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    // A blob that is present but is not a valid Wasm component: every run
+    // compile-fails → a 500 → a retryable delivery failure.
+    deploy_test_function(&deploy, "broken", b"not a wasm component", Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("broken", Some("async"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let queued: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id = queued["id"].as_str().unwrap().to_string();
+
+    let final_status = poll_invocation(&app, "broken", &id).await;
+    assert_eq!(final_status["status"], "failed");
+    assert_eq!(final_status["attempts"], 5); // MAX_INVOKE_ATTEMPTS
+}
+
+/// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
+/// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
+/// every 500 ms; a dead-letter needs five ticks).
+#[cfg(feature = "handlers")]
+async fn poll_invocation(app: &axum::Router, name: &str, id: &str) -> serde_json::Value {
+    for _ in 0..120 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/functions/{name}/invocations/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if matches!(
+            record["status"].as_str(),
+            Some("succeeded") | Some("failed")
+        ) {
+            return record;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("invocation {id} never reached a terminal state");
+}
+
 /// Flipping the active deployment while traffic is in flight drops zero
 /// requests (graceful drain). Handlers are instantiated per
 /// request off a clone of the compiled component, so an activation just routes

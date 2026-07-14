@@ -554,11 +554,18 @@ impl DeployStore {
     }
 
     /// List all stored (top-level) functions.
+    ///
+    /// Only the `functions/<name>` *meta* keys are function records; the
+    /// `functions/<name>/{versions,alias,triggers,invocations,idem}/…` sub-keys
+    /// are skipped by requiring the suffix to hold no further `/`.
     pub async fn list_stored_functions(
         &self,
     ) -> Result<Vec<crate::function::Function>, DeployError> {
         let mut out = Vec::new();
         for key in self.kv.list_prefix("functions/").await? {
+            if key["functions/".len()..].contains('/') {
+                continue;
+            }
             if let Some(bytes) = self.kv.get(&key).await? {
                 if let Ok(f) = serde_json::from_slice(&bytes) {
                     out.push(f);
@@ -575,6 +582,91 @@ impl DeployStore {
         let existed = self.kv.get(&key).await?.is_some();
         self.kv.delete(&key).await?;
         Ok(existed)
+    }
+
+    // ---- function invocations (FA-3) ---------------------------------------
+
+    /// Persist (create or update) an invocation record.
+    pub async fn put_invocation(
+        &self,
+        inv: &crate::function::Invocation,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(inv).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::function::keys::invocation(&inv.function, &inv.id),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Load one invocation record, if any.
+    pub async fn get_invocation(
+        &self,
+        function: &str,
+        id: &str,
+    ) -> Result<Option<crate::function::Invocation>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::invocation(function, id))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List a function's invocation records (queue scan / poll listing).
+    pub async fn list_invocations(
+        &self,
+        function: &str,
+    ) -> Result<Vec<crate::function::Invocation>, DeployError> {
+        let prefix = crate::function::keys::invocations_prefix(function);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(inv) = serde_json::from_slice(&bytes) {
+                    out.push(inv);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bind an idempotency key to an invocation id (the dedup pointer). The value
+    /// is the raw invocation id.
+    pub async fn put_idempotency(
+        &self,
+        function: &str,
+        key: &str,
+        invocation_id: &str,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .put(
+                &crate::function::keys::idempotency(function, key),
+                invocation_id.as_bytes().to_vec(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve an idempotency key to its invocation id, if one was recorded.
+    pub async fn get_idempotency(
+        &self,
+        function: &str,
+        key: &str,
+    ) -> Result<Option<String>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::idempotency(function, key))
+            .await?
+        {
+            Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            None => Ok(None),
+        }
     }
 
     /// The ownership-verification challenge for `(site, host)`, if one exists.
@@ -1822,6 +1914,90 @@ mod tests {
         assert!(store.delete_function("resize").await.unwrap());
         assert!(store.get_function("resize").await.unwrap().is_none());
         assert!(!store.delete_function("resize").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn function_invocation_and_idempotency_storage() {
+        use crate::function::{
+            Function, FunctionConfig, Invocation, InvocationResult, InvocationStatus, InvokeMode,
+            Lifecycle, Owner,
+        };
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        // A function whose invocation sub-keys must NOT leak into the function list.
+        let f = Function::new(
+            "greeter",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(&f).await.unwrap();
+
+        let mut inv = Invocation {
+            id: "inv-1".into(),
+            function: "greeter".into(),
+            version: "hashA".into(),
+            mode: InvokeMode::Async,
+            status: InvocationStatus::Queued,
+            idempotency_key: Some("key-1".into()),
+            attempts: 0,
+            request_b64: None,
+            request_content_type: None,
+            result: None,
+            created: 10,
+            updated: 10,
+        };
+        store.put_invocation(&inv).await.unwrap();
+        store
+            .put_idempotency("greeter", "key-1", "inv-1")
+            .await
+            .unwrap();
+
+        // Read back, resolve the idempotency pointer, and list.
+        assert_eq!(
+            store
+                .get_invocation("greeter", "inv-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Queued
+        );
+        assert_eq!(
+            store.get_idempotency("greeter", "key-1").await.unwrap(),
+            Some("inv-1".to_string())
+        );
+        assert_eq!(store.list_invocations("greeter").await.unwrap().len(), 1);
+        // The invocation + idempotency sub-keys must not be mistaken for functions.
+        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+
+        // Transition to a terminal, captured result.
+        inv.status = InvocationStatus::Succeeded;
+        inv.attempts = 1;
+        inv.result = Some(InvocationResult {
+            status: 200,
+            content_type: Some("text/plain".into()),
+            body_b64: "aGVsbG8=".into(),
+        });
+        inv.updated = 20;
+        store.put_invocation(&inv).await.unwrap();
+        let got = store
+            .get_invocation("greeter", "inv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.is_terminal());
+        assert_eq!(got.result.unwrap().status, 200);
+
+        // An unrecorded key resolves to nothing.
+        assert!(store
+            .get_idempotency("greeter", "absent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

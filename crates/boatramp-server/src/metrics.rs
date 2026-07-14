@@ -22,6 +22,8 @@ pub enum Trigger {
     Cron,
     /// The scheduler delivered a message to a consumer.
     Consumer,
+    /// A direct `POST /api/functions/<name>/invoke` (sync or drained async).
+    Invoke,
 }
 
 impl Trigger {
@@ -30,6 +32,7 @@ impl Trigger {
             Trigger::Http => "http",
             Trigger::Cron => "cron",
             Trigger::Consumer => "consumer",
+            Trigger::Invoke => "invoke",
         }
     }
 }

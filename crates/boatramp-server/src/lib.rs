@@ -805,7 +805,14 @@ pub fn router_with(
             "/api/sites/:site/_boatramp/logs/stream",
             get(operator_logs_stream),
         )
-        .route("/api/sites/:site/_boatramp/dlq", post(operator_dlq));
+        .route("/api/sites/:site/_boatramp/dlq", post(operator_dlq))
+        // The function **invoke** surface (FA-3) needs the engine, so it is
+        // registered only with the handlers feature.
+        .route("/api/functions/:name/invoke", post(invoke_function))
+        .route(
+            "/api/functions/:name/invocations/:id",
+            get(get_invocation_record),
+        );
     let api = api
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
@@ -1637,6 +1644,516 @@ async fn remove_function(State(deploy): State<DeployStore>, Path(name): Path<Str
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
+}
+
+// ---- function invoke API (FA-3) ----------------------------------------------
+
+/// The authority the engine sees for an invoked function. `wasi:http` needs a
+/// scheme + authority; the public control-plane path is the host's concern, so
+/// every function is invoked at `http://function.invoke/`.
+#[cfg(feature = "handlers")]
+const INVOKE_AUTHORITY: &str = "function.invoke";
+
+/// Attempts a durable (async) invocation gets before it is dead-lettered
+/// (left terminal-`failed` in its keyspace for inspection).
+#[cfg(feature = "handlers")]
+const MAX_INVOKE_ATTEMPTS: u32 = 5;
+
+/// Max request body buffered when **enqueuing** an async invocation. The sync
+/// path streams into the guest and never buffers; async must persist the body,
+/// so it is bounded here (mirrors the engine's default body cap).
+#[cfg(feature = "handlers")]
+const MAX_ASYNC_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Query of `POST /api/functions/:name/invoke`.
+#[cfg(feature = "handlers")]
+#[derive(serde::Deserialize)]
+struct InvokeQuery {
+    /// Delivery mode: `sync` (default) or `async`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Which version/alias to invoke (defaults to the active version).
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// A random 16-byte invocation id, hex, from the OS CSPRNG (the same source the
+/// token layer draws its `cti` from). A CSPRNG failure implies a broken platform
+/// and is logged; it is not expected on our targets.
+#[cfg(feature = "handlers")]
+fn new_invocation_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        tracing::error!("getrandom failed generating an invocation id");
+    }
+    hex::encode(bytes)
+}
+
+/// `POST /api/functions/:name/invoke` (FA-3) — invoke a function.
+///
+/// `?mode=sync` (default) runs inline and returns the function's response.
+/// `?mode=async` durably enqueues the call and returns `202 Accepted` with an
+/// invocation id to poll at `/invocations/:id`; a drain worker runs it (retried,
+/// then dead-lettered). An `Idempotency-Key` header dedups: a repeat with the
+/// same key replays the first call's outcome instead of running again.
+/// `system·admin` (a finer per-function invoke right lands in FA-4).
+#[cfg(feature = "handlers")]
+async fn invoke_function(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<InvokeQuery>,
+    request: Request,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return handler_unavailable();
+    };
+    let function = match deploy.get_function(&name).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    };
+    let reference = query.version.as_deref().unwrap_or(&function.active);
+    let Some(component) = function.resolve(reference).map(str::to_owned) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no version {reference:?} in function {name:?}\n"),
+        )
+            .into_response();
+    };
+    let is_async = query.mode.as_deref() == Some("async");
+    let idem_key = request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Idempotency replay: a recorded key returns the first call's outcome (its
+    // captured result, or `202` + id while the async call is still in flight).
+    if let Some(key) = &idem_key {
+        match deploy.get_idempotency(&name, key).await {
+            Ok(Some(id)) => {
+                if let Ok(Some(inv)) = deploy.get_invocation(&name, &id).await {
+                    return replay_invocation(&inv);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => return deploy_error_response(err),
+        }
+    }
+
+    if is_async {
+        enqueue_invocation(&deploy, &function, &component, request, idem_key).await
+    } else {
+        execute_sync(inner, &deploy, &function, &component, request, idem_key).await
+    }
+}
+
+/// Run a function inline and return its response. With an idempotency key the
+/// response is captured + persisted (as a `succeeded` [`Invocation`]) so a repeat
+/// replays it; without one it streams straight back.
+#[cfg(feature = "handlers")]
+async fn execute_sync(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+    idem_key: Option<String>,
+) -> Response {
+    let response = execute_function(inner, deploy, function, component, request).await;
+    let Some(key) = idem_key else {
+        return response;
+    };
+    // Capture so the outcome can be replayed under the idempotency key.
+    let (status, content_type, body) = capture_response(response).await;
+    let now = now_unix();
+    let id = new_invocation_id();
+    let inv = boatramp_core::function::Invocation {
+        id: id.clone(),
+        function: function.name.clone(),
+        version: component.to_string(),
+        mode: boatramp_core::function::InvokeMode::Sync,
+        status: boatramp_core::function::InvocationStatus::Succeeded,
+        idempotency_key: Some(key.clone()),
+        attempts: 1,
+        request_b64: None,
+        request_content_type: None,
+        result: Some(boatramp_core::function::InvocationResult {
+            status: status.as_u16(),
+            content_type: content_type.clone(),
+            body_b64: b64_encode(&body),
+        }),
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        return deploy_error_response(err);
+    }
+    if let Err(err) = deploy.put_idempotency(&function.name, &key, &id).await {
+        return deploy_error_response(err);
+    }
+    rebuild_response(status, content_type.as_deref(), body)
+}
+
+/// Durably enqueue an async invocation: buffer the request body, persist a
+/// `queued` [`Invocation`], bind the idempotency key, and return `202` + id.
+#[cfg(feature = "handlers")]
+async fn enqueue_invocation(
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+    idem_key: Option<String>,
+) -> Response {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = match axum::body::to_bytes(request.into_body(), MAX_ASYNC_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "async invoke body exceeds the buffer cap\n",
+            )
+                .into_response()
+        }
+    };
+    let now = now_unix();
+    let id = new_invocation_id();
+    let inv = boatramp_core::function::Invocation {
+        id: id.clone(),
+        function: function.name.clone(),
+        version: component.to_string(),
+        mode: boatramp_core::function::InvokeMode::Async,
+        status: boatramp_core::function::InvocationStatus::Queued,
+        idempotency_key: idem_key.clone(),
+        attempts: 0,
+        request_b64: (!body.is_empty()).then(|| b64_encode(&body)),
+        request_content_type: content_type,
+        result: None,
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        return deploy_error_response(err);
+    }
+    if let Some(key) = &idem_key {
+        if let Err(err) = deploy.put_idempotency(&function.name, key, &id).await {
+            return deploy_error_response(err);
+        }
+    }
+    (StatusCode::ACCEPTED, Json(inv)).into_response()
+}
+
+/// `GET /api/functions/:name/invocations/:id` (FA-3) — poll a durable
+/// invocation's status/result. `system·read`.
+#[cfg(feature = "handlers")]
+async fn get_invocation_record(
+    State(deploy): State<DeployStore>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
+    match deploy.get_invocation(&name, &id).await {
+        Ok(Some(inv)) => Json(inv).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("no invocation {id:?} for function {name:?}\n"),
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Reconstruct a `Response` for an idempotency replay / async poll shortcut: a
+/// completed invocation replays its captured result; one still in flight returns
+/// `202` + the record.
+#[cfg(feature = "handlers")]
+fn replay_invocation(inv: &boatramp_core::function::Invocation) -> Response {
+    match &inv.result {
+        Some(result) => {
+            let body = b64_decode(&result.body_b64);
+            rebuild_response(
+                StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK),
+                result.content_type.as_deref(),
+                body,
+            )
+        }
+        None => (StatusCode::ACCEPTED, Json(inv.clone())).into_response(),
+    }
+}
+
+/// The core engine run: load the component blob, build the function's bindings
+/// under its own `fn/<name>` scope, and serve the request. Errors map to the same
+/// statuses as a handler dispatch.
+#[cfg(feature = "handlers")]
+async fn execute_function(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+) -> Response {
+    let wasm = match read_blob_fully(deploy, component).await {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
+    let scope = format!("fn/{}", function.name);
+    let bindings = build_function_bindings(inner, &scope, &function.config).await;
+    let limits = function_limits(function.config.limits.as_ref());
+    let request = prepare_invoke_request(request);
+    let start = std::time::Instant::now();
+    let result = inner
+        .engine
+        .serve_with_limits(component, &wasm, request, bindings, limits)
+        .await;
+    inner.metrics.observe(
+        &function.name,
+        metrics::Trigger::Invoke,
+        "invoke",
+        component,
+        metrics::Outcome::from_result(&result),
+        start.elapsed(),
+    );
+    match result {
+        Ok(response) => {
+            let (parts, body) = response.into_parts();
+            axum::http::Response::from_parts(parts, axum::body::Body::new(body))
+        }
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "function invocation failed");
+            handler_error_response(&err)
+        }
+    }
+}
+
+/// Build a top-level function's bindings. Unlike a site handler (whose grants are
+/// the site allowlist ∩ its imports), a top-level function is admin-deployed, so
+/// its declared `imports` **are** its grants — served under its own `fn/<name>`
+/// scope so kv/blob/messaging/sql land in an isolated namespace.
+#[cfg(feature = "handlers")]
+async fn build_function_bindings(
+    inner: &HandlerRuntimeInner,
+    scope: &str,
+    config: &boatramp_core::function::FunctionConfig,
+) -> boatramp_handlers::Bindings {
+    let granted = |name: &str| config.imports.iter().any(|i| i == name);
+    let mut bindings = boatramp_handlers::Bindings::new(scope);
+    if granted("wasi:keyvalue") {
+        bindings = bindings.with_keyvalue(scope, inner.kv.clone());
+    }
+    if granted("wasi:blobstore") {
+        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
+        bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
+    }
+    if granted("sql") {
+        if let Some(provider) = &inner.sql {
+            match provider.database(scope, "").await {
+                Ok(backend) => bindings = bindings.with_sql("", backend),
+                Err(err) => tracing::warn!(scope, %err, "opening function SQL database failed"),
+            }
+        }
+    }
+    if granted("wasi:messaging") {
+        if let Some(messaging) = &inner.messaging {
+            bindings = bindings.with_messaging(format!("{scope}/"), messaging.clone());
+        }
+    }
+    inner.logs.configure(scope, None);
+    bindings = bindings.with_logging(scope.to_string(), inner.logs.clone());
+    let env: Vec<(String, String)> = config
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    bindings.with_env(env)
+}
+
+/// Per-invocation limits for a function: its own `limits` (memory/timeout/fuel),
+/// left at the engine default where unset. The engine clamps to its ceiling.
+#[cfg(feature = "handlers")]
+fn function_limits(
+    limits: Option<&boatramp_core::config::HandlerLimits>,
+) -> boatramp_handlers::Limits {
+    let mut l = boatramp_handlers::Limits::default();
+    if let Some(hl) = limits {
+        if let Some(mb) = hl.memory_mb {
+            l.memory_bytes = (mb as usize).saturating_mul(1024 * 1024);
+        }
+        if let Some(ms) = hl.timeout_ms {
+            l.timeout_ms = ms as u64;
+        }
+        if let Some(fuel) = hl.fuel {
+            l.fuel = Some(fuel);
+        }
+    }
+    l
+}
+
+/// Point a request at the synthetic invoke authority so `wasi:http` sees a
+/// well-formed absolute URI (`http://function.invoke/`), preserving method +
+/// headers + body. The public `/api/functions/<name>/invoke` path is dropped —
+/// the function sees a clean request, not the control-plane envelope.
+#[cfg(feature = "handlers")]
+fn prepare_invoke_request(mut request: Request) -> Request {
+    if let Ok(uri) = format!("http://{INVOKE_AUTHORITY}/").parse() {
+        *request.uri_mut() = uri;
+    }
+    request
+        .headers_mut()
+        .insert(header::HOST, HeaderValue::from_static(INVOKE_AUTHORITY));
+    request
+}
+
+/// Buffer a response into `(status, content-type, body)` — for idempotency
+/// capture and async result persistence.
+#[cfg(feature = "handlers")]
+async fn capture_response(response: Response) -> (StatusCode, Option<String>, Vec<u8>) {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    (status, content_type, body)
+}
+
+/// Rebuild a `Response` from captured parts.
+#[cfg(feature = "handlers")]
+fn rebuild_response(status: StatusCode, content_type: Option<&str>, body: Vec<u8>) -> Response {
+    let mut builder = axum::http::Response::builder().status(status);
+    if let Some(ct) = content_type {
+        if let Ok(value) = HeaderValue::from_str(ct) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| handler_unavailable())
+}
+
+/// Standard base64 of bytes (invocation records are plain JSON).
+#[cfg(feature = "handlers")]
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode standard base64 back to bytes (empty on malformed input — a persisted
+/// record we wrote is always valid).
+#[cfg(feature = "handlers")]
+fn b64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .unwrap_or_default()
+}
+
+/// Drain a function's queued async invocations: run each once, capturing its
+/// result. A failed run is retried next tick until [`MAX_INVOKE_ATTEMPTS`], then
+/// dead-lettered (left `failed` for inspection). Driven from the scheduler tick.
+#[cfg(feature = "handlers")]
+async fn drain_function_invocations(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+) {
+    let queued = match deploy.list_invocations(&function.name).await {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "listing invocations failed");
+            return;
+        }
+    };
+    for inv in queued {
+        if !matches!(
+            inv.status,
+            boatramp_core::function::InvocationStatus::Queued
+        ) {
+            continue;
+        }
+        run_queued_invocation(inner, deploy, function, inv).await;
+    }
+}
+
+/// Execute one queued invocation against its pinned version, persisting the
+/// terminal outcome (or re-queuing for retry / dead-lettering on failure).
+#[cfg(feature = "handlers")]
+async fn run_queued_invocation(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    mut inv: boatramp_core::function::Invocation,
+) {
+    use boatramp_core::function::InvocationStatus;
+    // The version was pinned at enqueue; a later deploy can't silently change it.
+    let Some(component) = function.resolve(&inv.version).map(str::to_owned) else {
+        // The pinned version is gone (rolled off / pruned) — unrunnable, so fail.
+        inv.status = InvocationStatus::Failed;
+        inv.updated = now_unix();
+        let _ = deploy.put_invocation(&inv).await;
+        return;
+    };
+    inv.status = InvocationStatus::Running;
+    inv.attempts = inv.attempts.saturating_add(1);
+    inv.updated = now_unix();
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        tracing::warn!(function = %function.name, %err, "marking invocation running failed");
+        return;
+    }
+    let request = build_stored_request(&inv);
+    let response = execute_function(inner, deploy, function, &component, request).await;
+    let (status, content_type, body) = capture_response(response).await;
+    // A function that returns a 5xx from the engine wrapper (timeout/trap/etc.)
+    // is a delivery failure worth retrying; any response the guest itself
+    // produced (including its own 4xx/5xx) is a successful delivery.
+    let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
+        && status != StatusCode::GATEWAY_TIMEOUT
+        && status != StatusCode::SERVICE_UNAVAILABLE;
+    if delivered {
+        inv.status = InvocationStatus::Succeeded;
+        inv.result = Some(boatramp_core::function::InvocationResult {
+            status: status.as_u16(),
+            content_type,
+            body_b64: b64_encode(&body),
+        });
+    } else if inv.attempts >= MAX_INVOKE_ATTEMPTS {
+        inv.status = InvocationStatus::Failed;
+    } else {
+        inv.status = InvocationStatus::Queued;
+    }
+    inv.updated = now_unix();
+    let _ = deploy.put_invocation(&inv).await;
+}
+
+/// Rebuild the engine request for a stored async invocation from its buffered
+/// body + content type (method is always `POST` for an enqueued call).
+#[cfg(feature = "handlers")]
+fn build_stored_request(inv: &boatramp_core::function::Invocation) -> Request {
+    let body = inv
+        .request_b64
+        .as_deref()
+        .map(b64_decode)
+        .unwrap_or_default();
+    let mut builder = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(format!("http://{INVOKE_AUTHORITY}/"))
+        .header(header::HOST, INVOKE_AUTHORITY);
+    if let Some(ct) = &inv.request_content_type {
+        if let Ok(value) = HeaderValue::from_str(ct) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
 }
 
 async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<String>) -> Response {
@@ -5940,6 +6457,16 @@ async fn run_scheduler_tick(
                     running.store(false, Ordering::Release);
                 }));
             }
+        }
+    }
+    // --- async function invocations (FA-3) ---
+    // Drain each top-level function's queued invocations. Leader-gated like crons
+    // (`None` = single node) so a durable async call runs exactly once
+    // cluster-wide; the drain runs inline so the outcome is settled this tick.
+    let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
+    if invoke_enabled {
+        for function in deploy.list_stored_functions().await? {
+            drain_function_invocations(inner, deploy, &function).await;
         }
     }
     Ok((acked, cron_handles))
