@@ -22,6 +22,9 @@ pub enum FunctionError {
     /// Reading the invoke request body (a file or stdin) failed.
     #[error("reading request body: {0}")]
     Io(#[from] std::io::Error),
+    /// `function trigger add` needs exactly one of `--cron` / `--queue`.
+    #[error("specify exactly one of --cron or --queue")]
+    BadTrigger,
 }
 
 type Result<T> = std::result::Result<T, FunctionError>;
@@ -146,6 +149,60 @@ enum FunctionCommand {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Manage a function's scheduled / event triggers (cron, queue).
+    Trigger(TriggerArgs),
+}
+
+/// `function trigger` — cron + queue triggers the server dispatches.
+#[derive(Debug, clap::Args)]
+struct TriggerArgs {
+    #[command(subcommand)]
+    command: TriggerCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum TriggerCommand {
+    /// Add/replace a trigger. Exactly one of `--cron` / `--queue`.
+    Add {
+        /// Function name.
+        name: String,
+        /// Trigger id (unique within the function).
+        id: String,
+        /// A cron schedule (`min hour dom month dow`) — a scheduled invoke.
+        #[arg(long, conflicts_with = "queue")]
+        cron: Option<String>,
+        /// A queue topic — invoke the function per message on `fn/<name>/<topic>`.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// List a function's triggers.
+    Ls {
+        /// Function name.
+        name: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Remove a trigger by id.
+    Rm {
+        /// Function name.
+        name: String,
+        /// Trigger id.
+        id: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+}
+
+/// A stored trigger as `/triggers` reports it (id + kind).
+#[derive(Debug, Deserialize)]
+struct TriggerView {
+    id: String,
+    kind: serde_json::Value,
 }
 
 /// A function as the server's `/api/functions` view reports it.
@@ -400,6 +457,62 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 "  bytes:       {} in / {} out",
                 usage.bytes_in_total, usage.bytes_out_total
             );
+        }
+        FunctionCommand::Trigger(args) => run_trigger(args, config).await?,
+    }
+    Ok(())
+}
+
+/// Run the `function trigger` subcommand.
+async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
+    match args.command {
+        TriggerCommand::Add {
+            name,
+            id,
+            cron,
+            queue,
+            server,
+        } => {
+            let (server, http) = conn(server, config)?;
+            let kind = match (cron, queue) {
+                (Some(schedule), None) => {
+                    serde_json::json!({ "type": "cron", "schedule": schedule })
+                }
+                (None, Some(topic)) => serde_json::json!({ "type": "queue", "topic": topic }),
+                _ => return Err(FunctionError::BadTrigger),
+            };
+            http.put(format!("{server}/api/functions/{name}/triggers/{id}"))
+                .json(&kind)
+                .send()
+                .await?
+                .error_for_status()?;
+            println!("added trigger {name}/{id}");
+        }
+        TriggerCommand::Ls { name, server } => {
+            let (server, http) = conn(server, config)?;
+            let list: Vec<TriggerView> = http
+                .get(format!("{server}/api/functions/{name}/triggers"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if list.is_empty() {
+                println!("no triggers");
+                return Ok(());
+            }
+            for t in list {
+                let kind = t.kind.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("{}  [{}]", t.id, kind);
+            }
+        }
+        TriggerCommand::Rm { name, id, server } => {
+            let (server, http) = conn(server, config)?;
+            http.delete(format!("{server}/api/functions/{name}/triggers/{id}"))
+                .send()
+                .await?
+                .error_for_status()?;
+            println!("removed trigger {name}/{id}");
         }
     }
     Ok(())

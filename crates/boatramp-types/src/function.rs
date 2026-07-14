@@ -206,6 +206,24 @@ pub enum TriggerKind {
     },
 }
 
+/// A **stored trigger** bound to a top-level function — the durable form the
+/// server dispatches (FA-3 *scheduled* + FA-5 *event sources*). Its owning
+/// function is the key context, so there is no separate `target`. Keyed under
+/// [`keys::trigger`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionTrigger {
+    /// Unique id within the function (the key suffix).
+    pub id: String,
+    /// What fires it.
+    pub kind: TriggerKind,
+    /// Cron dedup: the minute-stamp (`hour*60 + minute` within the day, or a
+    /// monotonic per-fire stamp) this trigger last fired at — durable so a fire
+    /// isn't repeated across a restart or (in a cluster) a leader change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_minute: Option<i64>,
+}
+
 /// A stored, content-addressed function resource (the FA-1/FA-2 keyspace form).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

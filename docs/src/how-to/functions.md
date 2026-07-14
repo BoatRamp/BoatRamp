@@ -107,6 +107,30 @@ limit ⇒ `429`):
 - `max_invocations` over a `window_secs` window — a fixed-window rate limit.
 - `max_concurrent` — the most in-flight invocations at once (per node).
 
+## Scheduled & event triggers
+
+A top-level function can also be reached by a **trigger** the server dispatches on
+its own — no caller. Add one with `function trigger add`:
+
+```console
+# Run the function on a schedule (a durable async invocation each fire).
+$ boatramp function trigger add greeter tick --cron "0 * * * *"
+
+# Invoke the function per message on its queue `fn/greeter/jobs`.
+$ boatramp function trigger add greeter jobs --queue jobs
+
+$ boatramp function trigger ls greeter
+tick  [cron]
+jobs  [queue]
+
+$ boatramp function trigger rm greeter tick
+```
+
+A cron fire enqueues a durable invocation (retried, then dead-lettered, like any
+[async invoke](#invoke-it)); a queue trigger claims messages from the function's
+own `fn/<name>/<topic>` topic and invokes the function once per message, acking on
+success. In a cluster the scheduler fires each trigger on the leader, exactly once.
+
 ## Signed webhooks
 
 To let an external system trigger a function over a *public, signature-verified*

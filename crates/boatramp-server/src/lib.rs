@@ -825,6 +825,13 @@ pub fn router_with(
             get(get_invocation_record),
         )
         .route("/api/functions/:name/usage", get(get_function_usage))
+        // Function triggers (scheduled + event sources): cron + queue triggers the
+        // scheduler dispatches. Needs the engine, so behind the handlers feature.
+        .route("/api/functions/:name/triggers", get(list_triggers_handler))
+        .route(
+            "/api/functions/:name/triggers/:id",
+            put(put_trigger_handler).delete(delete_trigger_handler),
+        )
         // Workflow orchestration (FA-6): definitions + runs. The executor drain
         // needs the engine, so the surface is registered with the handlers feature.
         .route("/api/workflows", get(list_workflows_handler))
@@ -2363,6 +2370,198 @@ async fn get_function_usage(
         // No invocations yet ⇒ a zeroed aggregate, so the CLI always has a shape.
         Ok(None) => Json(boatramp_core::function::Metering::new(name)).into_response(),
         Err(err) => deploy_error_response(err),
+    }
+}
+
+// ---- function triggers: scheduled + event sources ----------------------------
+
+/// `PUT /api/functions/:name/triggers/:id` — add/replace a stored trigger on a
+/// function (the body is a [`TriggerKind`], e.g. `{"type":"cron","schedule":…}`).
+/// The scheduler dispatches `cron` (→ a scheduled async invocation) and `queue`
+/// (→ claim + invoke) triggers. `system·admin`.
+#[cfg(feature = "handlers")]
+async fn put_trigger_handler(
+    State(deploy): State<DeployStore>,
+    Path((name, id)): Path<(String, String)>,
+    Json(kind): Json<boatramp_core::function::TriggerKind>,
+) -> Response {
+    match deploy.get_function(&name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    }
+    let trigger = boatramp_core::function::FunctionTrigger {
+        id: id.clone(),
+        kind,
+        last_fired_minute: None,
+    };
+    if let Err(err) = deploy.put_trigger(&name, &trigger).await {
+        return deploy_error_response(err);
+    }
+    Json(trigger).into_response()
+}
+
+/// `GET /api/functions/:name/triggers` — list a function's stored triggers.
+/// `system·read`.
+#[cfg(feature = "handlers")]
+async fn list_triggers_handler(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+) -> Response {
+    match deploy.list_triggers(&name).await {
+        Ok(mut list) => {
+            list.sort_by(|a, b| a.id.cmp(&b.id));
+            Json(list).into_response()
+        }
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/functions/:name/triggers/:id` — remove a stored trigger.
+/// `system·admin`. Idempotent.
+#[cfg(feature = "handlers")]
+async fn delete_trigger_handler(
+    State(deploy): State<DeployStore>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
+    match deploy.delete_trigger(&name, &id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Dispatch a function's stored triggers on a scheduler tick: fire due **cron**
+/// triggers (enqueue a durable async invocation, minute-deduped) and drain
+/// **queue** triggers (claim a batch + invoke per message). Route/webhook/invoke
+/// triggers are request-driven and not dispatched here.
+#[cfg(feature = "handlers")]
+async fn dispatch_function_triggers(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    now: &CronNow,
+) {
+    use boatramp_core::function::TriggerKind;
+    let triggers = match deploy.list_triggers(&function.name).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "listing triggers failed");
+            return;
+        }
+    };
+    for mut trigger in triggers {
+        match &trigger.kind {
+            TriggerKind::Cron { schedule, .. } => {
+                let Ok(parsed) = boatramp_core::cron::CronSchedule::parse(schedule) else {
+                    continue;
+                };
+                if !parsed.fires_at(now.minute, now.hour, now.dom, now.month, now.dow) {
+                    continue;
+                }
+                if trigger.last_fired_minute == Some(now.minute_stamp) {
+                    continue; // already fired this minute
+                }
+                enqueue_scheduled_invocation(deploy, function).await;
+                trigger.last_fired_minute = Some(now.minute_stamp);
+                let _ = deploy.put_trigger(&function.name, &trigger).await;
+            }
+            TriggerKind::Queue { topic } => {
+                dispatch_function_queue(inner, deploy, function, topic).await;
+            }
+            // Route / Invoke / Webhook are request-driven; Blob / Stream are not
+            // dispatched from the scheduler in this pass.
+            _ => {}
+        }
+    }
+}
+
+/// Enqueue a durable async invocation of a function's active version with no body
+/// — the scheduled (cron) fire. The existing invoke drain runs it.
+#[cfg(feature = "handlers")]
+async fn enqueue_scheduled_invocation(
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+) {
+    let now = now_unix();
+    let inv = boatramp_core::function::Invocation {
+        id: new_invocation_id(),
+        function: function.name.clone(),
+        version: function.active.clone(),
+        mode: boatramp_core::function::InvokeMode::Async,
+        status: boatramp_core::function::InvocationStatus::Queued,
+        idempotency_key: None,
+        attempts: 0,
+        request_b64: None,
+        request_content_type: None,
+        result: None,
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        tracing::warn!(function = %function.name, %err, "enqueuing scheduled invocation failed");
+    }
+}
+
+/// Claim a batch from a function's queue-trigger topic and invoke the function per
+/// message (ack on a delivered response, nack — for redelivery / eventual
+/// dead-letter — otherwise). The topic is namespaced under the function's own
+/// `fn/<name>/` scope, so it is a per-function work queue (fan-out to many
+/// functions is future work).
+#[cfg(feature = "handlers")]
+async fn dispatch_function_queue(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    topic: &str,
+) {
+    let Some(messaging) = inner.messaging.clone() else {
+        return;
+    };
+    let namespaced = format!("fn/{}/{topic}", function.name);
+    let batch = match messaging
+        .claim(
+            &namespaced,
+            CONSUMER_LEASE,
+            CONSUMER_BATCH,
+            CONSUMER_MAX_ATTEMPTS,
+        )
+        .await
+    {
+        Ok(batch) => batch,
+        Err(err) => {
+            tracing::warn!(function = %function.name, topic, %err, "claiming queue messages failed");
+            return;
+        }
+    };
+    if batch.is_empty() {
+        return;
+    }
+    let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+        return;
+    };
+    for msg in batch {
+        let bytes_in = msg.payload.len() as u64;
+        let request = build_webhook_request(None, msg.payload.clone());
+        let (response, duration_ms) =
+            execute_function(inner, deploy, function, &component, request).await;
+        let (status, _content_type, body) = capture_response(response).await;
+        let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
+            && status != StatusCode::GATEWAY_TIMEOUT
+            && status != StatusCode::SERVICE_UNAVAILABLE;
+        let sample = boatramp_core::function::MeteringSample {
+            success: delivered,
+            duration_ms,
+            bytes_in,
+            bytes_out: body.len() as u64,
+        };
+        record_metering(inner, deploy, &function.name, &sample).await;
+        if delivered {
+            let _ = messaging.ack(&msg).await;
+        } else {
+            let _ = messaging.nack(&msg).await;
+        }
     }
 }
 
@@ -7101,6 +7300,9 @@ async fn run_scheduler_tick(
     let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
     if invoke_enabled {
         for function in deploy.list_stored_functions().await? {
+            // Fire due triggers first (a cron enqueues an invocation this tick),
+            // then drain the queue so a just-enqueued call runs without waiting.
+            dispatch_function_triggers(inner, deploy, &function, &now).await;
             drain_function_invocations(inner, deploy, &function).await;
         }
         // --- workflow runs (FA-6), same leader gate ---

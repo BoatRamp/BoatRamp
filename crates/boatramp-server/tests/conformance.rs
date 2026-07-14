@@ -2222,6 +2222,145 @@ async fn workflow_define_rejects_a_cycle() {
     );
 }
 
+// ---- function triggers: scheduled + queue dispatch -------------------------
+
+/// `PUT /api/functions/<name>/triggers/<id>` with a `TriggerKind` body.
+#[cfg(feature = "handlers")]
+async fn put_trigger(
+    app: &axum::Router,
+    name: &str,
+    id: &str,
+    kind: serde_json::Value,
+) -> StatusCode {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/functions/{name}/triggers/{id}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&kind).unwrap()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Poll a KV key until it exists, then return its value.
+#[cfg(feature = "handlers")]
+async fn poll_kv(kv: &Arc<MemoryKv>, key: &str) -> Vec<u8> {
+    use boatramp_core::kv::KvStore;
+    for _ in 0..120 {
+        if let Some(v) = kv.get(key).await.unwrap() {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("kv key {key} never appeared");
+}
+
+/// A `cron` trigger on a top-level function fires on the schedule and enqueues a
+/// durable async invocation the drain then runs — the "scheduled invoke" path.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_cron_trigger_runs_a_scheduled_invocation() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // A cron that fires every minute; also exercise trigger list.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "tick",
+            serde_json::json!({ "type": "cron", "schedule": "* * * * *" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/api/functions/counter/triggers")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(list_req).await.unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let triggers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(triggers.as_array().unwrap().len(), 1);
+
+    // The scheduler fires the cron → the scheduled invocation runs → counter++.
+    let hits = poll_kv(&kv, "hkv/fn/counter/hits").await;
+    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
+    assert!(n >= 1, "counter did not advance: {n}");
+
+    // A durable, succeeded invocation was recorded for the fire.
+    let invs = deploy.list_invocations("counter").await.unwrap();
+    assert!(invs.iter().any(|i| matches!(
+        i.status,
+        boatramp_core::function::InvocationStatus::Succeeded
+    )));
+
+    // Delete removes it (idempotent).
+    let del = Request::builder()
+        .method("DELETE")
+        .uri("/api/functions/counter/triggers/tick")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(del).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// A `queue` trigger claims messages from the function's namespaced topic and
+/// invokes it per message — the event-bus consumer path.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_queue_trigger_dispatches_a_message() {
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "worker", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    // A job waiting on the function's namespaced topic before the scheduler runs.
+    messaging.publish("fn/worker/jobs", b"job-1").await.unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    assert_eq!(
+        put_trigger(
+            &app,
+            "worker",
+            "jobs",
+            serde_json::json!({ "type": "queue", "topic": "jobs" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // The scheduler claims the message and invokes the function → counter++.
+    let hits = poll_kv(&kv, "hkv/fn/worker/hits").await;
+    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
+    assert!(n >= 1, "worker did not run: {n}");
+}
+
 /// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
 /// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
 /// every 500 ms; a dead-letter needs five ticks).

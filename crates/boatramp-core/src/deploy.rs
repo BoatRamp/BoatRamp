@@ -584,6 +584,67 @@ impl DeployStore {
         Ok(existed)
     }
 
+    // ---- function triggers (FA-3 scheduled / FA-5 event sources) ------------
+
+    /// Persist (create or replace) a stored trigger on a function.
+    pub async fn put_trigger(
+        &self,
+        function: &str,
+        trigger: &crate::function::FunctionTrigger,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(trigger).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::function::keys::trigger(function, &trigger.id),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Load one stored trigger, if any.
+    pub async fn get_trigger(
+        &self,
+        function: &str,
+        id: &str,
+    ) -> Result<Option<crate::function::FunctionTrigger>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::trigger(function, id))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List a function's stored triggers.
+    pub async fn list_triggers(
+        &self,
+        function: &str,
+    ) -> Result<Vec<crate::function::FunctionTrigger>, DeployError> {
+        let prefix = format!("functions/{function}/triggers/");
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(t) = serde_json::from_slice(&bytes) {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete a stored trigger. Returns whether it existed.
+    pub async fn delete_trigger(&self, function: &str, id: &str) -> Result<bool, DeployError> {
+        let key = crate::function::keys::trigger(function, id);
+        let existed = self.kv.get(&key).await?.is_some();
+        self.kv.delete(&key).await?;
+        Ok(existed)
+    }
+
     // ---- function invocations (FA-3) ---------------------------------------
 
     /// Persist (create or update) an invocation record.
@@ -2195,6 +2256,71 @@ mod tests {
         assert!(store.delete_workflow("etl").await.unwrap());
         assert!(store.get_workflow("etl").await.unwrap().is_none());
         assert!(!store.delete_workflow("etl").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn function_trigger_storage_round_trips() {
+        use crate::function::{
+            Function, FunctionConfig, FunctionTrigger, Lifecycle, Owner, TriggerKind,
+        };
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let f = Function::new(
+            "worker",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(&f).await.unwrap();
+        assert!(store.list_triggers("worker").await.unwrap().is_empty());
+
+        let cron = FunctionTrigger {
+            id: "tick".into(),
+            kind: TriggerKind::Cron {
+                schedule: "* * * * *".into(),
+                overlap: Default::default(),
+            },
+            last_fired_minute: None,
+        };
+        store.put_trigger("worker", &cron).await.unwrap();
+        let queue = FunctionTrigger {
+            id: "jobs".into(),
+            kind: TriggerKind::Queue {
+                topic: "jobs".into(),
+            },
+            last_fired_minute: None,
+        };
+        store.put_trigger("worker", &queue).await.unwrap();
+
+        assert_eq!(store.list_triggers("worker").await.unwrap().len(), 2);
+        assert_eq!(
+            store.get_trigger("worker", "tick").await.unwrap().unwrap(),
+            cron
+        );
+        // Trigger sub-keys don't leak into the function list.
+        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+
+        // Dedup state persists through an update.
+        let mut fired = cron.clone();
+        fired.last_fired_minute = Some(42);
+        store.put_trigger("worker", &fired).await.unwrap();
+        assert_eq!(
+            store
+                .get_trigger("worker", "tick")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_fired_minute,
+            Some(42)
+        );
+
+        // Delete reports prior existence + is idempotent.
+        assert!(store.delete_trigger("worker", "tick").await.unwrap());
+        assert!(!store.delete_trigger("worker", "tick").await.unwrap());
+        assert_eq!(store.list_triggers("worker").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
