@@ -22,8 +22,8 @@ pub enum FunctionError {
     /// Reading the invoke request body (a file or stdin) failed.
     #[error("reading request body: {0}")]
     Io(#[from] std::io::Error),
-    /// `function trigger add` needs exactly one of `--cron` / `--queue`.
-    #[error("specify exactly one of --cron or --queue")]
+    /// `function trigger add` needs exactly one of `--cron` / `--queue` / `--blob`.
+    #[error("specify exactly one of --cron, --queue, or --blob")]
     BadTrigger,
 }
 
@@ -162,18 +162,22 @@ struct TriggerArgs {
 
 #[derive(Debug, clap::Subcommand)]
 enum TriggerCommand {
-    /// Add/replace a trigger. Exactly one of `--cron` / `--queue`.
+    /// Add/replace a trigger. Exactly one of `--cron` / `--queue` / `--blob`.
     Add {
         /// Function name.
         name: String,
         /// Trigger id (unique within the function).
         id: String,
         /// A cron schedule (`min hour dom month dow`) — a scheduled invoke.
-        #[arg(long, conflicts_with = "queue")]
+        #[arg(long, conflicts_with_all = ["queue", "blob"])]
         cron: Option<String>,
         /// A queue topic — invoke the function per message on `fn/<name>/<topic>`.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "blob")]
         queue: Option<String>,
+        /// A blobstore prefix — invoke the function when an object under
+        /// `fn/<name>/<prefix>` changes (needs a watch-capable storage backend).
+        #[arg(long)]
+        blob: Option<String>,
         /// Server base URL.
         #[arg(long)]
         server: Option<String>,
@@ -471,14 +475,20 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
             id,
             cron,
             queue,
+            blob,
             server,
         } => {
             let (server, http) = conn(server, config)?;
-            let kind = match (cron, queue) {
-                (Some(schedule), None) => {
+            let kind = match (cron, queue, blob) {
+                (Some(schedule), None, None) => {
                     serde_json::json!({ "type": "cron", "schedule": schedule })
                 }
-                (None, Some(topic)) => serde_json::json!({ "type": "queue", "topic": topic }),
+                (None, Some(topic), None) => {
+                    serde_json::json!({ "type": "queue", "topic": topic })
+                }
+                (None, None, Some(prefix)) => {
+                    serde_json::json!({ "type": "blob", "prefix": prefix })
+                }
                 _ => return Err(FunctionError::BadTrigger),
             };
             http.put(format!("{server}/api/functions/{name}/triggers/{id}"))

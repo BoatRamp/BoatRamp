@@ -2382,6 +2382,7 @@ async fn get_function_usage(
 #[cfg(feature = "handlers")]
 async fn put_trigger_handler(
     State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Path((name, id)): Path<(String, String)>,
     Json(kind): Json<boatramp_core::function::TriggerKind>,
 ) -> Response {
@@ -2391,6 +2392,21 @@ async fn put_trigger_handler(
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
         }
         Err(err) => return deploy_error_response(err),
+    }
+    // Fail closed: a blob-change trigger is only meaningful on a backend that can
+    // natively watch — refuse (never silently no-op) so the semantics stay uniform.
+    if matches!(kind, boatramp_core::function::TriggerKind::Blob { .. }) {
+        let watchable = handlers
+            .inner
+            .as_ref()
+            .is_some_and(|inner| inner.storage.supports_watch());
+        if !watchable {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this storage backend does not support blob-change triggers\n",
+            )
+                .into_response();
+        }
     }
     let trigger = boatramp_core::function::FunctionTrigger {
         id: id.clone(),
@@ -7129,6 +7145,10 @@ impl HandlerRuntime {
                 std::collections::HashMap::new();
             let mut cron_state: std::collections::HashMap<String, CronEntry> =
                 std::collections::HashMap::new();
+            // Live blob-change watchers, keyed by `<function>|<trigger id>`; each
+            // owns a native watch stream + its drain task (FA-5).
+            let mut blob_watchers: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+                std::collections::HashMap::new();
             let mut interval = tokio::time::interval(SCHEDULER_TICK);
             loop {
                 interval.tick().await;
@@ -7145,8 +7165,134 @@ impl HandlerRuntime {
                 {
                     tracing::warn!(%err, "scheduler tick failed");
                 }
+                // Reconcile blob-change watchers (FA-5): spawn one per live
+                // `Blob` trigger, drop those whose trigger is gone.
+                reconcile_blob_watchers(&inner, &deploy, &mut blob_watchers).await;
             }
         }))
+    }
+}
+
+/// Reconcile the live blob-change watchers against the stored `Blob` triggers:
+/// spawn a watcher for each new trigger, abort + drop watchers whose trigger was
+/// removed. Leader-gated (shared-FS clusters would otherwise fire per-node).
+#[cfg(feature = "handlers")]
+async fn reconcile_blob_watchers(
+    inner: &Arc<HandlerRuntimeInner>,
+    deploy: &DeployStore,
+    watchers: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    use boatramp_core::function::TriggerKind;
+    // Only the leader (or a single node) dispatches, matching cron/invoke.
+    if inner.cron_leader_gate.get().is_some_and(|gate| !gate()) {
+        for (_, handle) in watchers.drain() {
+            handle.abort();
+        }
+        return;
+    }
+    let functions = match deploy.list_stored_functions().await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut desired = std::collections::HashSet::new();
+    for function in functions {
+        let triggers = deploy
+            .list_triggers(&function.name)
+            .await
+            .unwrap_or_default();
+        for trigger in triggers {
+            let TriggerKind::Blob { prefix } = &trigger.kind else {
+                continue;
+            };
+            let watch_id = format!("{}|{}", function.name, trigger.id);
+            desired.insert(watch_id.clone());
+            if let std::collections::hash_map::Entry::Vacant(slot) = watchers.entry(watch_id) {
+                if let Some(handle) =
+                    spawn_blob_watcher(inner.clone(), deploy.clone(), function.clone(), prefix)
+                        .await
+                {
+                    slot.insert(handle);
+                }
+            }
+        }
+    }
+    // Drop watchers whose trigger no longer exists.
+    watchers.retain(|id, handle| {
+        if desired.contains(id) {
+            true
+        } else {
+            handle.abort();
+            false
+        }
+    });
+}
+
+/// Spawn a task that watches the function's blob prefix and enqueues an async
+/// invocation on each change. Returns `None` if the backend can't watch (the
+/// activation gate should already have refused, so this is defensive).
+#[cfg(feature = "handlers")]
+async fn spawn_blob_watcher(
+    inner: Arc<HandlerRuntimeInner>,
+    deploy: DeployStore,
+    function: boatramp_core::function::Function,
+    prefix: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // The function's blobstore lives under `hblob/fn/<name>/`; the trigger prefix
+    // is relative to that namespace.
+    let storage_prefix = format!("hblob/fn/{}/{prefix}", function.name);
+    let mut stream = match inner.storage.watch(&storage_prefix).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "starting blob watch failed");
+            return None;
+        }
+    };
+    let namespace = format!("hblob/fn/{}/", function.name);
+    Some(tokio::spawn(async move {
+        use futures::StreamExt;
+        while let Some(change) = stream.next().await {
+            enqueue_blob_invocation(&deploy, &function, &change, &namespace).await;
+        }
+    }))
+}
+
+/// Enqueue a durable async invocation for a blob change, with the changed key +
+/// kind as the JSON request body (the function-relative key, `hblob/fn/<name>/`
+/// stripped).
+#[cfg(feature = "handlers")]
+async fn enqueue_blob_invocation(
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    change: &boatramp_core::BlobChange,
+    namespace: &str,
+) {
+    use boatramp_core::BlobChangeKind;
+    let key = change.key.strip_prefix(namespace).unwrap_or(&change.key);
+    let kind = match change.kind {
+        BlobChangeKind::Created => "created",
+        BlobChangeKind::Modified => "modified",
+        BlobChangeKind::Removed => "removed",
+    };
+    let body = serde_json::json!({ "key": key, "kind": kind });
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let now = now_unix();
+    let inv = boatramp_core::function::Invocation {
+        id: new_invocation_id(),
+        function: function.name.clone(),
+        version: function.active.clone(),
+        mode: boatramp_core::function::InvokeMode::Async,
+        status: boatramp_core::function::InvocationStatus::Queued,
+        idempotency_key: None,
+        attempts: 0,
+        request_b64: (!payload.is_empty()).then(|| b64_encode(&payload)),
+        request_content_type: Some("application/json".to_string()),
+        result: None,
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        tracing::warn!(function = %function.name, %err, "enqueuing blob invocation failed");
     }
 }
 

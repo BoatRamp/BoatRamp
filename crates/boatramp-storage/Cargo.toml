@@ -30,6 +30,7 @@ futures.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
+notify.workspace = true
 
 bytes = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
@@ -42,4 +43,5 @@ libsql = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+bytes.workspace = true

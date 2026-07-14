@@ -119,17 +119,29 @@ $ boatramp function trigger add greeter tick --cron "0 * * * *"
 # Invoke the function per message on its queue `fn/greeter/jobs`.
 $ boatramp function trigger add greeter jobs --queue jobs
 
+# Invoke the function when an object changes under `fn/greeter/uploads/`.
+$ boatramp function trigger add greeter onupload --blob uploads/
+
 $ boatramp function trigger ls greeter
-tick  [cron]
 jobs  [queue]
+onupload  [blob]
+tick  [cron]
 
 $ boatramp function trigger rm greeter tick
 ```
 
-A cron fire enqueues a durable invocation (retried, then dead-lettered, like any
-[async invoke](#invoke-it)); a queue trigger claims messages from the function's
-own `fn/<name>/<topic>` topic and invokes the function once per message, acking on
-success. In a cluster the scheduler fires each trigger on the leader, exactly once.
+- A **cron** fire enqueues a durable invocation (retried, then dead-lettered, like
+  any [async invoke](#invoke-it)).
+- A **queue** trigger claims messages from the function's own `fn/<name>/<topic>`
+  topic and invokes the function once per message, acking on success.
+- A **blob** trigger fires when an object changes under the watched prefix — and it
+  fires for **any** writer, not just boatramp, because it uses the storage
+  backend's native change notification (inotify/FSEvents locally). The changed key
+  + kind arrive as the invocation's JSON body. It needs a **watch-capable** storage
+  backend: on one that can't watch, adding the trigger is refused (a `400`, never a
+  silent no-op) — cloud object stores gain watch support with notification
+  auto-provisioning (a later step). In a cluster the scheduler fires each trigger
+  on the leader, exactly once.
 
 ## Signed webhooks
 

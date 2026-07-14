@@ -192,6 +192,91 @@ impl Storage for FsStorage {
         }
         Ok(out)
     }
+
+    /// The filesystem backend watches natively via inotify / FSEvents / kqueue.
+    fn supports_watch(&self) -> bool {
+        true
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<boatramp_core::ChangeStream>, StorageError> {
+        use boatramp_core::{BlobChange, BlobChangeKind};
+        use notify::{EventKind, RecursiveMode, Watcher};
+
+        // Watch the directory containing `prefix` (everything up to the last `/`),
+        // recursively, and filter events back to the full `prefix`. Create the dir
+        // first so a not-yet-written namespace can still be watched.
+        let dir_part = match prefix.rfind('/') {
+            Some(i) => &prefix[..=i],
+            None => "",
+        };
+        let watch_dir = self.resolve(dir_part.trim_end_matches('/'))?;
+        tokio::fs::create_dir_all(&watch_dir).await?;
+        // Canonicalize both sides: the OS notification layer (FSEvents especially)
+        // reports canonical paths, so a symlinked temp/root (`/tmp` → `/private/tmp`)
+        // would otherwise fail `strip_prefix` and every event would be dropped.
+        let root = tokio::fs::canonicalize(&self.root)
+            .await
+            .unwrap_or_else(|_| self.root.clone());
+        let watch_dir = tokio::fs::canonicalize(&watch_dir)
+            .await
+            .unwrap_or(watch_dir);
+        let filter = prefix.to_string();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BlobChange>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            let kind = match event.kind {
+                EventKind::Create(_) => BlobChangeKind::Created,
+                EventKind::Modify(_) => BlobChangeKind::Modified,
+                EventKind::Remove(_) => BlobChangeKind::Removed,
+                _ => return,
+            };
+            for path in event.paths {
+                let Ok(rel) = path.strip_prefix(&root) else {
+                    continue;
+                };
+                let key = rel.to_string_lossy().replace('\\', "/");
+                if key.starts_with(&filter) {
+                    let _ = tx.send(BlobChange { key, kind });
+                }
+            }
+        })
+        .map_err(watch_err)?;
+        watcher
+            .watch(&watch_dir, RecursiveMode::Recursive)
+            .map_err(watch_err)?;
+
+        // The stream owns the `Watcher` — dropping the stream stops the watch.
+        Ok(Some(Box::pin(FsWatchStream {
+            _watcher: watcher,
+            rx,
+        })))
+    }
+}
+
+/// A change stream that keeps its `notify` watcher alive for as long as the
+/// stream lives (dropping the stream tears the watch down).
+struct FsWatchStream {
+    _watcher: notify::RecommendedWatcher,
+    rx: tokio::sync::mpsc::UnboundedReceiver<boatramp_core::BlobChange>,
+}
+
+impl futures::Stream for FsWatchStream {
+    type Item = boatramp_core::BlobChange;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Map a `notify` error into a `StorageError`.
+fn watch_err(err: notify::Error) -> StorageError {
+    StorageError::Io(std::io::Error::other(err))
 }
 
 /// Best-effort MIME guess from a key's file extension.
@@ -218,6 +303,7 @@ fn mime_from_key(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[test]
     fn rejects_path_traversal() {
@@ -225,5 +311,44 @@ mod tests {
         assert!(store.resolve("../etc/passwd").is_err());
         assert!(store.resolve("/etc/passwd").is_err());
         assert!(store.resolve("ok/index.html").is_ok());
+    }
+
+    #[tokio::test]
+    async fn watch_reports_a_write_under_the_prefix() {
+        // A pid-unique temp root so parallel tests don't collide.
+        let root = std::env::temp_dir().join(format!("boatramp-fswatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = FsStorage::new(&root);
+        assert!(store.supports_watch());
+
+        // Watch a function-blobstore-style prefix.
+        let prefix = "hblob/fn/worker/uploads/";
+        let mut stream = store.watch(prefix).await.unwrap().expect("watch supported");
+
+        // Write an object under the watched prefix, plus one outside it.
+        let body = |bytes: &'static [u8]| -> ByteStream {
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(bytes)) }).boxed()
+        };
+        store
+            .put(
+                "hblob/fn/worker/uploads/report.json",
+                body(b"{}"),
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .put("hblob/fn/worker/other/x", body(b"x"), PutMeta::default())
+            .await
+            .unwrap();
+
+        // The change under the prefix arrives; the one outside does not.
+        let change = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("a change event within the timeout")
+            .expect("the stream yields a change");
+        assert_eq!(change.key, "hblob/fn/worker/uploads/report.json");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

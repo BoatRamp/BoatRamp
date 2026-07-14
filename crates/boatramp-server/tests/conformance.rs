@@ -2361,6 +2361,105 @@ async fn function_queue_trigger_dispatches_a_message() {
     assert!(n >= 1, "worker did not run: {n}");
 }
 
+/// A `blob` trigger fires the function when an object appears under the watched
+/// prefix — notify-only, so it fires for *any* writer (here a direct storage
+/// write). Requires a backend that natively watches (`FsStorage`).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn function_blob_trigger_fires_on_a_write() {
+    use boatramp_core::{PutMeta, Storage};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    // A real filesystem store so `watch` is supported (MemStorage isn't watchable).
+    let root = std::env::temp_dir().join(format!("boatramp-blobtrig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&root));
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage.clone(), None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Let the scheduler reconcile + spawn the watcher (a few ticks), then write.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let body: ByteStream =
+        futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed();
+    storage
+        .put(
+            "hblob/fn/counter/uploads/report.json",
+            body,
+            PutMeta::default(),
+        )
+        .await
+        .unwrap();
+
+    // The change enqueues an invocation the drain runs → counter++.
+    let hits = poll_kv(&kv, "hkv/fn/counter/hits").await;
+    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
+    assert!(n >= 1, "blob trigger did not fire: {n}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `blob` trigger is refused at activation on a backend that can't watch
+/// (`MemStorage`) — fail-closed, never a silent no-op.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_blob_trigger_refused_on_unwatchable_backend() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // MemStorage doesn't support watch → a blob trigger is a 400. A cron trigger
+    // on the same function still works.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "tick",
+            serde_json::json!({ "type": "cron", "schedule": "* * * * *" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
 /// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
 /// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
 /// every 500 ms; a dead-letter needs five ticks).

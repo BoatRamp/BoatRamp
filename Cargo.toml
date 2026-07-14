@@ -64,6 +64,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 bytes = "1"
 async-trait = "0.1"
+# Native filesystem change notification (inotify / FSEvents / kqueue) for the
+# FsStorage blob-change watch (FA-5). Syscall-crate-correct vs. shelling out.
+notify = "6"
 # Async Docker Engine API client for the remote-docker compute backend.
 bollard = "0.17"
 thiserror = "2"
