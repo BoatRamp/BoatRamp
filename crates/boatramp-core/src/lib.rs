@@ -13,6 +13,7 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+pub mod blob_provision;
 pub mod cache_coherence;
 #[cfg(feature = "authz")]
 pub mod cedar;
@@ -41,8 +42,8 @@ pub mod sql;
 // `boatramp_core::config`/`::route`/`::matcher`/`::domain_verify`/… paths are
 // unchanged. (`compute` is its own module above — it re-exports the types layer.)
 pub use boatramp_types::{
-    access, authz, config, cron, daemon_config, dns_managed, domain_verify, function, gateway,
-    matcher, predicate, route, security, waf, workflow,
+    access, authz, blob_notify, config, cron, daemon_config, dns_managed, domain_verify, function,
+    gateway, matcher, predicate, route, security, waf, workflow,
 };
 pub use boatramp_types::{schema_version, SCHEMA_VERSION};
 

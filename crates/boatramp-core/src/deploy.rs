@@ -774,6 +774,74 @@ impl DeployStore {
         Ok(out)
     }
 
+    // ---- blob-change notification ledger (FA-5b2) --------------------------
+
+    /// Record the cloud notification pipeline provisioned for a function's
+    /// blob-change trigger, so it can be retracted later.
+    pub async fn put_managed_notification(
+        &self,
+        record: &crate::blob_notify::ManagedNotification,
+    ) -> Result<(), DeployError> {
+        let bytes = record
+            .to_json()
+            .map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::blob_notify::blobnotify_key(&record.function, &record.prefix),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The notification ledger entry for `(function, prefix)`, if any.
+    pub async fn get_managed_notification(
+        &self,
+        function: &str,
+        prefix: &str,
+    ) -> Result<Option<crate::blob_notify::ManagedNotification>, DeployError> {
+        match self
+            .kv
+            .get(&crate::blob_notify::blobnotify_key(function, prefix))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                crate::blob_notify::ManagedNotification::from_json(&bytes)
+                    .map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// All notification ledger entries for a function.
+    pub async fn list_managed_notifications(
+        &self,
+        function: &str,
+    ) -> Result<Vec<crate::blob_notify::ManagedNotification>, DeployError> {
+        let prefix = crate::blob_notify::blobnotify_function_prefix(function);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(record) = crate::blob_notify::ManagedNotification::from_json(&bytes) {
+                    out.push(record);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop a notification ledger entry (after its resources are retracted).
+    pub async fn remove_managed_notification(
+        &self,
+        function: &str,
+        prefix: &str,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .delete(&crate::blob_notify::blobnotify_key(function, prefix))
+            .await?;
+        Ok(())
+    }
+
     // ---- workflows (FA-6) --------------------------------------------------
 
     /// Persist a workflow definition.
@@ -2204,6 +2272,83 @@ mod tests {
         // An unrecorded key resolves to nothing.
         assert!(store
             .get_idempotency("greeter", "absent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn notification_ledger_provisions_and_retracts_through_the_store() {
+        use crate::blob_notify::{ManagedResource, ProvisionTier};
+        use crate::blob_provision::{ensure_watch, retract_watch, ProvisionError, WatchProvider};
+        use crate::kv::MemoryKv;
+
+        // A minimal provider standing in for a cloud SDK.
+        struct StoreMock;
+        #[async_trait::async_trait]
+        impl WatchProvider for StoreMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn recipe(&self, _prefix: &str) -> String {
+                String::new()
+            }
+            async fn provision(
+                &self,
+                _prefix: &str,
+            ) -> Result<Vec<ManagedResource>, ProvisionError> {
+                Ok(vec![ManagedResource::new("queue", "q-1")])
+            }
+            async fn verify(&self, _prefix: &str) -> Result<bool, ProvisionError> {
+                Ok(true)
+            }
+            async fn retract(&self, _res: &[ManagedResource]) -> Result<(), ProvisionError> {
+                Ok(())
+            }
+        }
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store
+            .get_managed_notification("ingest", "uploads/")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Provision through the real store (its `LedgerSink` impl) → recorded.
+        let provider = StoreMock;
+        let out = ensure_watch(
+            &provider,
+            ProvisionTier::Provision,
+            "ingest",
+            "uploads/",
+            &store,
+            7,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            out,
+            crate::blob_provision::ProvisionOutcome::Ready
+        ));
+        let record = store
+            .get_managed_notification("ingest", "uploads/")
+            .await
+            .unwrap()
+            .expect("the pipeline is recorded in the store ledger");
+        assert_eq!(record.provider, "mock");
+        assert_eq!(
+            store
+                .list_managed_notifications("ingest")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Retract removes the ledger entry.
+        retract_watch(&provider, &record, &store).await.unwrap();
+        assert!(store
+            .get_managed_notification("ingest", "uploads/")
             .await
             .unwrap()
             .is_none());

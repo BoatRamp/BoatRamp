@@ -10,6 +10,7 @@
 
 pub mod access;
 pub mod authz;
+pub mod blob_notify;
 pub mod cert;
 pub mod compute;
 pub mod config;
