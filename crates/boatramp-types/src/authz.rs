@@ -184,11 +184,13 @@ impl Right {
         // Exact, non-site endpoints.
         let right = match path {
             "/api/sites" => Right::new(Resource::System, None, Action::Read),
-            // Functions read (FA-1): the derived site-scoped function view, listed
-            // across sites — `system·read` like `/api/sites`. (A per-owner `function`
-            // resource with invoke/deploy rights lands in FA-4.)
+            // Functions (FA-1/FA-2): read the function view with `system·read` (like
+            // `/api/sites`); mutating a top-level function (deploy a version, alias,
+            // rollback, delete) requires `system·admin`. (A per-owner `function`
+            // resource with finer invoke/deploy rights lands in FA-4.)
             p if p == "/api/functions" || p.starts_with("/api/functions/") => {
-                Right::new(Resource::System, None, Action::Read)
+                let action = if get { Action::Read } else { Action::Admin };
+                Right::new(Resource::System, None, action)
             }
             "/api/blobs" => Right::new(Resource::Blobs, None, Action::Deploy),
             "/api/certs" => Right::new(Resource::Certs, None, Action::Read),

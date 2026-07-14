@@ -1,8 +1,9 @@
 //! The `function` subcommand — the FaaS **function** surface (PLAN-faas).
 //!
-//! FA-1 ships the read view: list/show the derived site-scoped functions a site's
-//! handlers/consumers/crons desugar to. `function invoke` / `deploy` land in
-//! FA-3 / FA-7.
+//! FA-1 shipped the read view: list/show the derived site-scoped functions a site's
+//! handlers/consumers/crons desugar to. FA-2 adds the write view for **top-level**
+//! functions — `deploy` a component version, `rollback`, `alias`, and `rm` — each
+//! carrying its own independent version line. `function invoke` lands in FA-3.
 
 use serde::Deserialize;
 
@@ -48,6 +49,51 @@ enum FunctionCommand {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Deploy a version of a top-level function from a component `.wasm`.
+    Deploy {
+        /// Function name.
+        name: String,
+        /// Path to the component `.wasm` (uploaded as a content-addressed blob).
+        #[arg(long)]
+        component: std::path::PathBuf,
+        /// Execution substrate: `wasm` (default), `microvm`, or `container`.
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Roll a function's active version back to `--to <version>`.
+    Rollback {
+        /// Function name.
+        name: String,
+        /// The version id to activate.
+        #[arg(long)]
+        to: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Point an alias label at a version.
+    Alias {
+        /// Function name.
+        name: String,
+        /// The alias label (e.g. `prod`, `staging`).
+        label: String,
+        /// The version id the alias points at.
+        version: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Remove a top-level function.
+    Rm {
+        /// Function name.
+        name: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
 }
 
 /// A function as the server's `/api/functions` view reports it.
@@ -57,6 +103,22 @@ struct FunctionSummary {
     runtime: String,
     version: String,
     triggers: Vec<String>,
+}
+
+/// The stored `Function` a mutating call (`deploy`/`rollback`) echoes back — the
+/// full record, of which we only surface the name, active version, and runtime.
+#[derive(Debug, Deserialize)]
+struct StoredFunction {
+    name: String,
+    active: String,
+    #[serde(default)]
+    config: StoredConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StoredConfig {
+    #[serde(default)]
+    runtime: String,
 }
 
 /// Run the `function` subcommand.
@@ -92,8 +154,85 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 None => println!("no function {name:?}"),
             }
         }
+        FunctionCommand::Deploy {
+            name,
+            component,
+            runtime,
+            server,
+        } => {
+            let (server, http) = conn(server, config)?;
+            // Upload the component first; the server rejects a deploy whose blob is
+            // absent, so this is content-addressed staging, not a second round-trip.
+            let hash = client::put_file_blob(&http, &server, &component).await?;
+            let mut cfg = serde_json::Map::new();
+            if let Some(r) = &runtime {
+                cfg.insert("runtime".to_string(), serde_json::json!(r));
+            }
+            // Top-level functions carry their own version line (decision 3).
+            let body = serde_json::json!({
+                "component": hash,
+                "config": serde_json::Value::Object(cfg),
+                "lifecycle": "independent",
+            });
+            let f: StoredFunction = http
+                .put(format!("{server}/api/functions/{name}"))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!(
+                "deployed {}  [{}]  {}",
+                f.name,
+                f.config.runtime,
+                short(&f.active)
+            );
+        }
+        FunctionCommand::Rollback { name, to, server } => {
+            let (server, http) = conn(server, config)?;
+            let f: StoredFunction = http
+                .post(format!("{server}/api/functions/{name}/rollback"))
+                .json(&serde_json::json!({ "to": to }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("rolled {} back to {}", f.name, short(&f.active));
+        }
+        FunctionCommand::Alias {
+            name,
+            label,
+            version,
+            server,
+        } => {
+            let (server, http) = conn(server, config)?;
+            http.put(format!("{server}/api/functions/{name}/aliases/{label}"))
+                .json(&serde_json::json!({ "version": version }))
+                .send()
+                .await?
+                .error_for_status()?;
+            println!("aliased {name}:{label} -> {}", short(&version));
+        }
+        FunctionCommand::Rm { name, server } => {
+            let (server, http) = conn(server, config)?;
+            http.delete(format!("{server}/api/functions/{name}"))
+                .send()
+                .await?
+                .error_for_status()?;
+            println!("removed {name}");
+        }
     }
     Ok(())
+}
+
+/// Resolve the target server and build an authenticated client — the shared
+/// preamble of every mutating `function` subcommand.
+fn conn(server: Option<String>, config: &ProjectConfig) -> Result<(String, client::ApiClient)> {
+    let server = client::resolve_server(server, config)?;
+    let http = client::http_client(client::token(config).as_deref());
+    Ok((server, http))
 }
 
 /// Fetch the functions view (all sites, or one with `?site=`).

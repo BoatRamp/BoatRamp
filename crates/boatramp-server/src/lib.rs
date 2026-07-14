@@ -686,6 +686,12 @@ pub fn router_with(
         .route("/api/sites", get(list_sites))
         .route("/api/functions", get(list_functions))
         .route(
+            "/api/functions/:name",
+            put(deploy_function).delete(remove_function),
+        )
+        .route("/api/functions/:name/rollback", post(rollback_function))
+        .route("/api/functions/:name/aliases/:label", put(alias_function))
+        .route(
             "/api/sites/:site/deployments",
             post(create_deployment).get(list_deployments),
         )
@@ -1406,14 +1412,25 @@ struct FunctionQuery {
 /// One entry in the `GET /api/functions` view.
 #[derive(serde::Serialize)]
 struct FunctionSummary {
-    /// Site-scoped name (`<site>/<name>`).
+    /// Function name (`<site>/<name>` for site-scoped; bare for top-level).
     name: String,
+    /// Owner (`site:<site>` or `project:<project>`).
+    owner: String,
     /// Execution substrate.
     runtime: String,
     /// Active version id (the component blob hash).
     version: String,
     /// Rendered triggers that reach this function.
     triggers: Vec<String>,
+}
+
+/// Render a function owner for the view.
+fn owner_str(owner: &boatramp_core::function::Owner) -> String {
+    use boatramp_core::function::Owner;
+    match owner {
+        Owner::Site(s) => format!("site:{s}"),
+        Owner::Project(p) => format!("project:{p}"),
+    }
 }
 
 /// `GET /api/functions[?site=…]` — the derived, **read-only** site-scoped function
@@ -1449,10 +1466,30 @@ async fn list_functions(
                 .collect();
             out.push(FunctionSummary {
                 name: format!("{site}/{}", f.name),
+                owner: format!("site:{site}"),
                 runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
                 version: f.active,
                 triggers: trigs,
             });
+        }
+    }
+    // Top-level (independently-stored) functions — FA-2. A `?site=` filter is
+    // site-scoped only, so it excludes these.
+    if query.site.is_none() {
+        match deploy.list_stored_functions().await {
+            Ok(stored) => {
+                for f in stored {
+                    out.push(FunctionSummary {
+                        name: f.name.clone(),
+                        owner: owner_str(&f.owner),
+                        runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
+                        version: f.active,
+                        // A top-level function has a stable invoke URL (FA-3).
+                        triggers: vec![format!("invoke {}", f.name)],
+                    });
+                }
+            }
+            Err(err) => return deploy_error_response(err),
         }
     }
     Json(out).into_response()
@@ -1476,6 +1513,129 @@ fn render_trigger(t: &boatramp_core::function::Trigger) -> String {
         TriggerKind::Blob { prefix } => format!("blob {prefix}"),
         TriggerKind::Webhook { path, .. } => format!("webhook {path}"),
         TriggerKind::Stream { topics, .. } => format!("stream {}", topics.join(",")),
+    }
+}
+
+/// Body of `PUT /api/functions/:name` — deploy a version of a top-level function.
+#[derive(serde::Deserialize)]
+struct FunctionUpsert {
+    /// The component blob hash (uploaded first via `PUT /api/blobs/<hash>`).
+    component: String,
+    /// Binding/capability config.
+    #[serde(default)]
+    config: boatramp_core::function::FunctionConfig,
+    /// Version lifecycle (defaults to `deploy-pinned`; top-level functions choose
+    /// `independent`).
+    #[serde(default)]
+    lifecycle: boatramp_core::function::Lifecycle,
+}
+
+/// `PUT /api/functions/:name` (FA-2) — deploy a version of a top-level function.
+/// The component blob must already be uploaded. Creates the function if new;
+/// otherwise appends + activates the version (idempotent per component hash).
+/// `system·admin`.
+async fn deploy_function(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+    Json(body): Json<FunctionUpsert>,
+) -> Response {
+    use boatramp_core::function::{Function, Owner};
+    match deploy.has_blob(&body.component).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("component blob {} not uploaded\n", body.component),
+            )
+                .into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    }
+    let now = now_unix();
+    let f = match deploy.get_function(&name).await {
+        Ok(Some(mut existing)) => {
+            existing.config = body.config;
+            existing.upsert_version(&body.component, body.lifecycle, now);
+            existing
+        }
+        // A brand-new top-level function is owned by the (single, for now) default
+        // project; per-tenant ownership arrives with FA-4.
+        Ok(None) => Function::new(
+            name.clone(),
+            Owner::Project("default".to_string()),
+            &body.component,
+            body.config,
+            body.lifecycle,
+            now,
+        ),
+        Err(err) => return deploy_error_response(err),
+    };
+    if let Err(err) = deploy.put_function(&f).await {
+        return deploy_error_response(err);
+    }
+    Json(f).into_response()
+}
+
+/// Body of `POST /api/functions/:name/rollback`.
+#[derive(serde::Deserialize)]
+struct RollbackBody {
+    to: String,
+}
+
+/// `POST /api/functions/:name/rollback` (FA-2) — point active at a prior version.
+async fn rollback_function(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    match deploy.get_function(&name).await {
+        Ok(Some(mut f)) => match f.rollback(&body.to) {
+            Ok(()) => {
+                if let Err(err) = deploy.put_function(&f).await {
+                    return deploy_error_response(err);
+                }
+                Json(f).into_response()
+            }
+            Err(msg) => (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Body of `PUT /api/functions/:name/aliases/:label`.
+#[derive(serde::Deserialize)]
+struct AliasBody {
+    version: String,
+}
+
+/// `PUT /api/functions/:name/aliases/:label` (FA-2) — point a label at a version.
+async fn alias_function(
+    State(deploy): State<DeployStore>,
+    Path((name, label)): Path<(String, String)>,
+    Json(body): Json<AliasBody>,
+) -> Response {
+    match deploy.get_function(&name).await {
+        Ok(Some(mut f)) => match f.set_alias(&label, &body.version) {
+            Ok(()) => {
+                if let Err(err) = deploy.put_function(&f).await {
+                    return deploy_error_response(err);
+                }
+                Json(f).into_response()
+            }
+            Err(msg) => (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/functions/:name` (FA-2) — remove a top-level function (idempotent).
+/// Content-addressed component blobs are shared and left to `prune`.
+async fn remove_function(State(deploy): State<DeployStore>, Path(name): Path<String>) -> Response {
+    match deploy.delete_function(&name).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
     }
 }
 
@@ -6756,6 +6916,176 @@ mod tests {
         )
         .await;
         assert_eq!(no_issuer.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// FA-2: the top-level function **write** path driven through the HTTP handlers —
+    /// deploy two versions, roll back, alias, remove — plus the two 400/absent-blob
+    /// guards. The store-layer semantics are the `boatramp-core` oracle; this pins the
+    /// handler wrapper (status codes, blob gate, JSON echo).
+    #[tokio::test]
+    async fn function_write_path_deploy_rollback_alias_remove() {
+        use boatramp_core::function::Lifecycle;
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+
+        // A storage whose `head` (hence `has_blob`) is toggleable — enough to drive
+        // both the blob-present deploy path and the absent-blob 400.
+        struct FakeStorage {
+            present: bool,
+        }
+        #[async_trait::async_trait]
+        impl Storage for FakeStorage {
+            async fn get(&self, _: &str) -> Result<GetObject, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn get_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<GetObject, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn put(
+                &self,
+                _: &str,
+                _: ByteStream,
+                _: PutMeta,
+            ) -> Result<ObjectMeta, StorageError> {
+                Err(StorageError::unsupported("fake"))
+            }
+            async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+                if self.present {
+                    Ok(ObjectMeta {
+                        key: key.to_string(),
+                        ..Default::default()
+                    })
+                } else {
+                    Err(StorageError::NotFound(key.to_string()))
+                }
+            }
+            async fn delete(&self, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, value)
+        }
+
+        let deploy = DeployStore::new(
+            Arc::new(FakeStorage { present: true }),
+            Arc::new(MemoryKv::new()),
+        );
+        let v1 = "a".repeat(64);
+        let v2 = "b".repeat(64);
+
+        // Deploy v1 → created, active = v1.
+        let (st, body) = body_json(
+            deploy_function(
+                State(deploy.clone()),
+                Path("greeter".to_string()),
+                Json(FunctionUpsert {
+                    component: v1.clone(),
+                    config: Default::default(),
+                    lifecycle: Lifecycle::Independent,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["active"], v1);
+
+        // Deploy v2 → active advances, two versions retained.
+        let (_, body) = body_json(
+            deploy_function(
+                State(deploy.clone()),
+                Path("greeter".to_string()),
+                Json(FunctionUpsert {
+                    component: v2.clone(),
+                    config: Default::default(),
+                    lifecycle: Lifecycle::Independent,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["active"], v2);
+        assert_eq!(body["versions"].as_array().unwrap().len(), 2);
+
+        // Roll back to v1.
+        let (st, body) = body_json(
+            rollback_function(
+                State(deploy.clone()),
+                Path("greeter".to_string()),
+                Json(RollbackBody { to: v1.clone() }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["active"], v1);
+
+        // Rolling back to an unknown version is a 400 (plain-text body).
+        let resp = rollback_function(
+            State(deploy.clone()),
+            Path("greeter".to_string()),
+            Json(RollbackBody { to: "c".repeat(64) }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Alias prod → v2.
+        let (st, body) = body_json(
+            alias_function(
+                State(deploy.clone()),
+                Path(("greeter".to_string(), "prod".to_string())),
+                Json(AliasBody {
+                    version: v2.clone(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["aliases"]["prod"], v2);
+
+        // Remove → 204, and it's gone.
+        let (st, _) =
+            body_json(remove_function(State(deploy.clone()), Path("greeter".to_string())).await)
+                .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        assert!(deploy.get_function("greeter").await.unwrap().is_none());
+
+        // Deploying a component whose blob was never uploaded is a 400.
+        let empty = DeployStore::new(
+            Arc::new(FakeStorage { present: false }),
+            Arc::new(MemoryKv::new()),
+        );
+        let resp = deploy_function(
+            State(empty),
+            Path("orphan".to_string()),
+            Json(FunctionUpsert {
+                component: v1.clone(),
+                config: Default::default(),
+                lifecycle: Lifecycle::default(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A configurable stub: records the `(mesh_pubkey, jti)` it's asked to admit and

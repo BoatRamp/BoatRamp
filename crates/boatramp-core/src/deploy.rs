@@ -525,6 +525,58 @@ impl DeployStore {
         Ok(sites.into_iter().collect())
     }
 
+    // ---- Top-level functions (PLAN-faas FA-2) --------------------------------
+    // Independently-versioned functions stored as one JSON record per name under
+    // `functions/<name>`, referencing content-addressed component blobs. Reuses the
+    // blob store + KV; the deploy/alias immutability model applies (a version id is
+    // its component's content hash).
+
+    /// Store a top-level function's record (its versions, active, aliases).
+    pub async fn put_function(&self, f: &crate::function::Function) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(f).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::function::keys::meta(&f.name), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a stored function record, if any.
+    pub async fn get_function(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::function::Function>, DeployError> {
+        match self.kv.get(&crate::function::keys::meta(name)).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List all stored (top-level) functions.
+    pub async fn list_stored_functions(
+        &self,
+    ) -> Result<Vec<crate::function::Function>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("functions/").await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(f) = serde_json::from_slice(&bytes) {
+                    out.push(f);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete a stored function. Returns whether it existed. The component blobs
+    /// are content-addressed + shared, so they are left to `prune`.
+    pub async fn delete_function(&self, name: &str) -> Result<bool, DeployError> {
+        let key = crate::function::keys::meta(name);
+        let existed = self.kv.get(&key).await?.is_some();
+        self.kv.delete(&key).await?;
+        Ok(existed)
+    }
+
     /// The ownership-verification challenge for `(site, host)`, if one exists.
     pub async fn get_domain_verification(
         &self,
@@ -1733,6 +1785,43 @@ mod tests {
         async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
             Ok(Vec::new())
         }
+    }
+
+    #[tokio::test]
+    async fn function_storage_versioning_alias_rollback() {
+        use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store.list_stored_functions().await.unwrap().is_empty());
+
+        let mut f = Function::new(
+            "resize",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(&f).await.unwrap();
+        assert_eq!(
+            store.get_function("resize").await.unwrap().unwrap().active,
+            "hashA"
+        );
+        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+
+        // A new version + an alias, persisted and read back.
+        f.upsert_version("hashB", Lifecycle::Independent, 2);
+        f.set_alias("prod", "hashA").unwrap();
+        store.put_function(&f).await.unwrap();
+        let got = store.get_function("resize").await.unwrap().unwrap();
+        assert_eq!(got.active, "hashB");
+        assert_eq!(got.aliases.get("prod").map(String::as_str), Some("hashA"));
+
+        // Delete is idempotent + reports prior existence.
+        assert!(store.delete_function("resize").await.unwrap());
+        assert!(store.get_function("resize").await.unwrap().is_none());
+        assert!(!store.delete_function("resize").await.unwrap());
     }
 
     #[tokio::test]

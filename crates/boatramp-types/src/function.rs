@@ -166,8 +166,84 @@ pub struct Function {
     pub versions: Vec<FunctionVersion>,
     /// The active version's id.
     pub active: String,
+    /// Named aliases → version id (staging/previews; mirrors deploy aliases).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
     /// Binding/capability config.
     pub config: FunctionConfig,
+}
+
+impl Function {
+    /// A new top-level function with a single active version (the component blob).
+    /// The version id **is** the component's content hash (content-addressed).
+    pub fn new(
+        name: impl Into<String>,
+        owner: Owner,
+        component_hash: impl Into<String>,
+        config: FunctionConfig,
+        lifecycle: Lifecycle,
+        created: u64,
+    ) -> Self {
+        let hash = component_hash.into();
+        Function {
+            name: name.into(),
+            owner,
+            versions: vec![FunctionVersion {
+                id: hash.clone(),
+                component: hash.clone(),
+                created,
+                lifecycle,
+            }],
+            active: hash,
+            aliases: BTreeMap::new(),
+            config,
+        }
+    }
+
+    /// Add a version for `component_hash` (id = the hash) and make it active. If a
+    /// version with that hash already exists it is just re-activated (idempotent).
+    /// Returns the (active) version id.
+    pub fn upsert_version(
+        &mut self,
+        component_hash: impl Into<String>,
+        lifecycle: Lifecycle,
+        created: u64,
+    ) -> String {
+        let hash = component_hash.into();
+        if !self.versions.iter().any(|v| v.id == hash) {
+            self.versions.push(FunctionVersion {
+                id: hash.clone(),
+                component: hash.clone(),
+                created,
+                lifecycle,
+            });
+        }
+        self.active = hash.clone();
+        hash
+    }
+
+    /// Point `active` at an existing version id. `Err` if the version is unknown.
+    pub fn rollback(&mut self, to: &str) -> Result<(), String> {
+        if self.versions.iter().any(|v| v.id == to) {
+            self.active = to.to_string();
+            Ok(())
+        } else {
+            Err(format!("no version {to:?} in function {:?}", self.name))
+        }
+    }
+
+    /// Set `label` → an existing version id. `Err` if the version is unknown.
+    pub fn set_alias(&mut self, label: &str, version: &str) -> Result<(), String> {
+        if self.versions.iter().any(|v| v.id == version) {
+            self.aliases.insert(label.to_string(), version.to_string());
+            Ok(())
+        } else {
+            Err(format!(
+                "no version {version:?} in function {:?}",
+                self.name
+            ))
+        }
+    }
 }
 
 /// One immutable version of a function.
@@ -367,6 +443,7 @@ pub fn materialize(
                     lifecycle: s.lifecycle,
                 }],
                 active: hash,
+                aliases: BTreeMap::new(),
                 config: s.config.clone(),
             })
         })
@@ -530,6 +607,7 @@ mod tests {
                 lifecycle: Lifecycle::Independent,
             }],
             active: "v1abc".into(),
+            aliases: BTreeMap::from([("prod".into(), "v1abc".into())]),
             config: FunctionConfig {
                 imports: vec!["blobstore".into()],
                 runtime: Runtime::Microvm,
@@ -564,6 +642,39 @@ mod tests {
             let j = serde_json::to_string(&t).unwrap();
             assert_eq!(serde_json::from_str::<Trigger>(&j).unwrap(), t);
         }
+    }
+
+    #[test]
+    fn versioning_alias_and_rollback() {
+        let mut f = Function::new(
+            "resize",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        assert_eq!(f.active, "hashA");
+        assert_eq!(f.versions.len(), 1);
+
+        // A new component → a new active version.
+        f.upsert_version("hashB", Lifecycle::Independent, 2);
+        assert_eq!(f.active, "hashB");
+        assert_eq!(f.versions.len(), 2);
+        // Re-deploying the same hash is idempotent (re-activates, no dup version).
+        f.upsert_version("hashA", Lifecycle::Independent, 3);
+        assert_eq!(f.active, "hashA");
+        assert_eq!(f.versions.len(), 2);
+
+        // Alias to a known version; unknown is rejected.
+        f.set_alias("prod", "hashB").unwrap();
+        assert_eq!(f.aliases.get("prod").map(String::as_str), Some("hashB"));
+        assert!(f.set_alias("prod", "ghost").is_err());
+
+        // Rollback to a known version; unknown is rejected.
+        f.rollback("hashB").unwrap();
+        assert_eq!(f.active, "hashB");
+        assert!(f.rollback("ghost").is_err());
     }
 
     #[test]
