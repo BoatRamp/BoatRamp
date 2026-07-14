@@ -24,6 +24,9 @@ pub mod s3;
 #[cfg(feature = "s3")]
 pub mod s3_notify;
 
+#[cfg(feature = "gcs")]
+pub mod gcs;
+
 #[cfg(feature = "slatedb")]
 pub mod kv_slatedb;
 
@@ -44,6 +47,9 @@ pub use s3::{S3Options, S3Storage};
 
 #[cfg(feature = "s3")]
 pub use s3_notify::S3WatchProvider;
+
+#[cfg(feature = "gcs")]
+pub use gcs::{GcsOptions, GcsStorage};
 
 #[cfg(feature = "slatedb")]
 pub use kv_slatedb::SlateKv;

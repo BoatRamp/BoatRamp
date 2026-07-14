@@ -52,6 +52,10 @@ pub enum Error {
     #[cfg(not(feature = "s3"))]
     #[error("this build has no S3 support; rebuild with `--features s3`")]
     NoS3Support,
+    /// `--blobs gcs` selected but the binary lacks GCS support.
+    #[cfg(not(feature = "gcs"))]
+    #[error("this build has no GCS support; rebuild with `--features gcs`")]
+    NoGcsSupport,
     /// `--kv slatedb` selected but the binary lacks SlateDB support.
     #[cfg(not(feature = "slatedb"))]
     #[error("this build has no slatedb support; rebuild with `--features slatedb`")]
@@ -144,6 +148,14 @@ pub enum Error {
     #[cfg(feature = "s3")]
     #[error("--s3-bucket is required for --blobs s3")]
     S3BucketRequired,
+    /// `--blobs gcs` was selected without a bucket.
+    #[cfg(feature = "gcs")]
+    #[error("--gcs-bucket is required for --blobs gcs")]
+    GcsBucketRequired,
+    /// Connecting the GCS backend failed (usually credential resolution).
+    #[cfg(feature = "gcs")]
+    #[error("GCS backend: {0}")]
+    GcsConnect(String),
     /// A handler `sql` binding named an env var that is not set.
     #[cfg(feature = "handlers")]
     #[error("handlers SQL binding: env var {0} is not set")]
@@ -439,6 +451,8 @@ enum BlobBackend {
     Fs,
     /// S3-compatible object store (requires `--features s3`).
     S3,
+    /// Google Cloud Storage (requires `--features gcs`).
+    Gcs,
 }
 
 /// Metadata (manifest + pointer) backend.
@@ -509,6 +523,20 @@ pub struct ServeArgs {
     /// Use S3 path-style addressing (required by MinIO).
     #[arg(long, env = "BOATRAMP_S3_PATH_STYLE")]
     s3_path_style: bool,
+
+    /// GCS bucket (required for `--blobs gcs`).
+    #[arg(long, env = "BOATRAMP_GCS_BUCKET")]
+    gcs_bucket: Option<String>,
+
+    /// GCS storage endpoint URL, e.g. a `fake-gcs-server` emulator (optional;
+    /// defaults to the public GCS JSON API).
+    #[arg(long, env = "BOATRAMP_GCS_ENDPOINT")]
+    gcs_endpoint: Option<String>,
+
+    /// Skip GCS credential resolution (anonymous — the emulator). Real GCS uses
+    /// Application Default Credentials.
+    #[arg(long, env = "BOATRAMP_GCS_ANONYMOUS")]
+    gcs_anonymous: bool,
 
     /// Number of deploy manifests/pointers to keep in the in-memory LRU.
     #[arg(long, default_value_t = 256)]
@@ -2638,7 +2666,42 @@ async fn build_blobs(
             provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
         }),
         BlobBackend::S3 => build_s3(args, notify_tier, notify_account).await,
+        BlobBackend::Gcs => build_gcs(args, notify_tier, notify_account).await,
     }
+}
+
+// Storage S1: GCS storage plane only — blob-change notifications (Pub/Sub) land
+// with the GcsWatchProvider in a later stage, at which point this returns a
+// `Some(provider)` (mirroring `build_s3`). Until then a GCS blob trigger is
+// refused (`supports_watch()` is false), never a silent no-op.
+#[cfg(feature = "gcs")]
+async fn build_gcs(
+    args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    let bucket = args.gcs_bucket.clone().ok_or(Error::GcsBucketRequired)?;
+    let storage = boatramp_storage::GcsStorage::connect(boatramp_storage::GcsOptions {
+        bucket,
+        endpoint: args.gcs_endpoint.clone(),
+        anonymous: args.gcs_anonymous,
+    })
+    .await
+    .map_err(|err| Error::GcsConnect(err.to_string()))?;
+    Ok(BuiltBlobs {
+        storage: Arc::new(storage),
+        watch_provider: None,
+        provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+    })
+}
+
+#[cfg(not(feature = "gcs"))]
+async fn build_gcs(
+    _args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    Err(Error::NoGcsSupport)
 }
 
 #[cfg(feature = "s3")]

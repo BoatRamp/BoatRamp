@@ -56,6 +56,21 @@ minio data_dir="./.minio":
     mkdir -p {{ data_dir }}
     minio server {{ data_dir }} --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
 
+# Run the GCS backend round-trip against a `fake-gcs-server` emulator (Docker).
+# Boots the emulator with a pre-created `boatramp` bucket, then runs the env-gated
+# `gcs_emulator` seam. The `gcs` feature toolchain is needed.
+gcs-emulator bucket="boatramp":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker run -d --name boatramp-fakegcs -p 4443:4443 \
+      fsouza/fake-gcs-server -scheme http -public-host localhost:4443 >/dev/null
+    trap 'docker rm -f boatramp-fakegcs >/dev/null' EXIT
+    sleep 2
+    curl -fsS -X POST "http://localhost:4443/storage/v1/b?project=test" \
+      -H 'Content-Type: application/json' --data '{"name":"{{ bucket }}"}' >/dev/null
+    BOATRAMP_TEST_GCS_ENDPOINT=http://localhost:4443 BOATRAMP_TEST_GCS_BUCKET={{ bucket }} \
+      cargo test -p boatramp-storage --features gcs --test gcs_emulator -- --nocapture
+
 # Start a local sqld (libsql server) for the `sql` backend test. Serves
 # the hrana/HTTP protocol; runs in the foreground (Ctrl-C to stop). Namespaces
 # are enabled (the per-site isolation model — one namespace per site) with the

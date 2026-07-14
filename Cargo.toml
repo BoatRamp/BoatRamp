@@ -121,6 +121,13 @@ aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 # SQS client for the S3→SQS blob-change notification pipeline (FA-5b2).
 aws-sdk-sqs = { version = "1", features = ["behavior-version-latest"] }
 
+# GCS backend (compiled only with `--features gcs`). Native SDK, matching the S3
+# backend's native-SDK choice. rustls (not openssl) to match the rest of the tree.
+google-cloud-storage = { version = "0.24", default-features = false, features = [
+  "rustls-tls",
+  "auth",
+] }
+
 # Durable embedded KV: transactional LSM over object storage (local fs, S3/R2,
 # GCS, ...). Compiled only with the `slatedb` feature.
 slatedb = "0.13"
