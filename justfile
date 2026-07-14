@@ -94,6 +94,11 @@ function-roundtrip:
 function-roundtrip-js:
     cargo test -p boatramp function::tests::init_then_build_js -- --ignored --nocapture
 
+# FA-7 Python round-trip: scaffold the Python template + componentize it with
+# `componentize-py` (via `uvx`, needs `uv` from `nix develop` + network).
+function-roundtrip-py:
+    cargo test -p boatramp function::tests::init_then_build_python -- --ignored --nocapture
+
 # Remove build artifacts.
 clean:
     cargo clean

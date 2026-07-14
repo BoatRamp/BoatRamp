@@ -403,6 +403,9 @@
               # Node.js for the JS function template's `jco componentize` build
               # (`boatramp function build` fetches a version-pinned `jco` via npx).
               pkgs.nodejs
+              # uv for the Python function template's `componentize-py` build
+              # (`boatramp function build` runs it version-pinned via `uvx`).
+              pkgs.uv
               # Local S3-compatible server for exercising the s3 backend.
               pkgs.minio
               pkgs.minio-client

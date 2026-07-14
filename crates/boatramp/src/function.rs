@@ -26,13 +26,13 @@ pub enum FunctionError {
     #[error("specify exactly one of --cron, --queue, or --blob")]
     BadTrigger,
     /// `function init --lang` named an unknown template.
-    #[error("unknown template language {0:?} (supported: rust, js)")]
+    #[error("unknown template language {0:?} (supported: rust, js, python)")]
     UnknownLang(String),
     /// `function init` target directory already exists.
     #[error("{0} already exists")]
     AlreadyExists(std::path::PathBuf),
-    /// `function build` (the `cargo build` / `jco componentize` invocation) failed.
-    #[error("build failed (Rust needs the wasm32-wasip2 target; JS needs node/npx)")]
+    /// `function build` (the language's componentize invocation) failed.
+    #[error("build failed (Rust: wasm32-wasip2 target; JS: node/npx; Python: uv/componentize-py)")]
     BuildFailed,
     /// `function build` produced no component `.wasm`.
     #[error("no component produced under target/wasm32-wasip2/release")]
@@ -175,7 +175,7 @@ enum FunctionCommand {
     Init {
         /// Function/project name (also the Rust crate name).
         name: String,
-        /// Language template: `rust` (default) or `js`.
+        /// Language template: `rust` (default), `js`, or `python`.
         #[arg(long, default_value = "rust")]
         lang: String,
         /// Parent directory to create the project under (default: cwd).
@@ -654,12 +654,18 @@ static RUST_TEMPLATE: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/rust");
 static JS_TEMPLATE: include_dir::Dir<'_> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/js");
+static PYTHON_TEMPLATE: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/templates/python");
+
+/// The pinned `componentize-py` version `function build` runs via `uvx` for Python.
+const COMPONENTIZE_PY_VERSION: &str = "0.25.0";
 
 /// Scaffold a new function project from a language template.
 fn init_project(name: &str, lang: &str, dir: Option<std::path::PathBuf>) -> Result<()> {
     let template = match lang {
         "rust" => &RUST_TEMPLATE,
         "js" | "javascript" => &JS_TEMPLATE,
+        "python" | "py" => &PYTHON_TEMPLATE,
         other => return Err(FunctionError::UnknownLang(other.to_string())),
     };
     let crate_name = sanitize_crate_name(name);
@@ -752,6 +758,8 @@ async fn build_project(dir: Option<std::path::PathBuf>) -> Result<()> {
         build_rust(&dir).await?
     } else if dir.join("package.json").exists() {
         build_js(&dir).await?
+    } else if dir.join("pyproject.toml").exists() {
+        build_python(&dir).await?
     } else {
         return Err(FunctionError::NoComponent);
     };
@@ -818,6 +826,65 @@ async fn build_js(dir: &std::path::Path) -> Result<std::path::PathBuf> {
         return Err(FunctionError::NoComponent);
     }
     Ok(component)
+}
+
+/// Componentize a Python function project with `componentize-py` → the produced
+/// component path. Run version-pinned via `uvx` (so only `uv` is required; `nix
+/// develop` provides it), falling back to `componentize-py` on `PATH`.
+async fn build_python(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("function");
+    let out = format!("{name}.wasm");
+    // `-d wit -w wasi:http/proxy componentize app -o <out>` — `app` is app.py.
+    let build_args = [
+        "-d",
+        "wit",
+        "-w",
+        "wasi:http/proxy",
+        "componentize",
+        "app",
+        "-o",
+        &out,
+    ];
+    // Prefer a `componentize-py` already on PATH; otherwise fetch it via `uvx`.
+    let status = if which("componentize-py") {
+        tokio::process::Command::new("componentize-py")
+            .args(build_args)
+            .current_dir(dir)
+            .status()
+            .await?
+    } else {
+        tokio::process::Command::new("uvx")
+            .arg("--from")
+            .arg(format!("componentize-py=={COMPONENTIZE_PY_VERSION}"))
+            .arg("componentize-py")
+            .args(build_args)
+            .current_dir(dir)
+            .status()
+            .await?
+    };
+    if !status.success() {
+        return Err(FunctionError::BuildFailed);
+    }
+    let component = dir.join(&out);
+    if !component.exists() {
+        return Err(FunctionError::NoComponent);
+    }
+    Ok(component)
+}
+
+/// Whether an executable is on `PATH` (best-effort, for build-tool discovery).
+fn which(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let p = dir.join(cmd);
+                p.is_file()
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// The local single-function harness (FA-7): run a scaffolded component through
@@ -1039,7 +1106,7 @@ mod tests {
 
         // Refuses an unknown language and an existing directory.
         assert!(matches!(
-            init_project("x", "python", Some(root.clone())),
+            init_project("x", "cobol", Some(root.clone())),
             Err(FunctionError::UnknownLang(_))
         ));
         assert!(matches!(
@@ -1067,6 +1134,30 @@ mod tests {
         assert!(proj.join("wit/handler.wit").exists());
         // `javascript` is an accepted alias for `js`.
         assert!(init_project("Other", "javascript", Some(root.clone())).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_scaffolds_a_python_tree() {
+        let root = std::env::temp_dir().join(format!("boatramp-initpy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        init_project("My Py Fn", "python", Some(root.clone())).unwrap();
+        let proj = root.join("my-py-fn");
+
+        let pyproject = std::fs::read_to_string(proj.join("pyproject.toml")).unwrap();
+        assert!(pyproject.contains("name = \"my-py-fn\""));
+        assert!(!pyproject.contains("BOATRAMP_FUNCTION_NAME"));
+        assert!(!proj.join("pyproject.toml.tmpl").exists());
+        assert!(proj.join("app.py").exists());
+        assert!(proj.join("wit/handler.wit").exists());
+        // `py` is an accepted alias.
+        assert!(init_project("Other", "py", Some(root.clone())).is_ok());
+        // An unknown language is still rejected.
+        assert!(matches!(
+            init_project("x", "ruby", Some(root.clone())),
+            Err(FunctionError::UnknownLang(_))
+        ));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1138,6 +1229,26 @@ mod tests {
         let proj = root.join("js-roundtrip");
         build_project(Some(proj.clone())).await.unwrap();
         let wasm = proj.join("js-roundtrip.wasm");
+        assert!(wasm.exists(), "expected a built component at {wasm:?}");
+        let bytes = std::fs::read(&wasm).unwrap();
+        assert_eq!(&bytes[..4], b"\0asm");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scaffolded Python template compiles to a component via `componentize-py`
+    /// (run through `uvx`). `#[ignore]`d — fetches `componentize-py` (network) and
+    /// runs CPython (slow). Run with `--ignored` / `just function-roundtrip-py`
+    /// (needs `uv` from `nix develop`).
+    #[tokio::test]
+    #[ignore = "runs componentize-py via uvx (network + slow); run with --ignored"]
+    async fn init_then_build_python_produces_a_component() {
+        let root =
+            std::env::temp_dir().join(format!("boatramp-pyroundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        init_project("py roundtrip", "python", Some(root.clone())).unwrap();
+        let proj = root.join("py-roundtrip");
+        build_project(Some(proj.clone())).await.unwrap();
+        let wasm = proj.join("py-roundtrip.wasm");
         assert!(wasm.exists(), "expected a built component at {wasm:?}");
         let bytes = std::fs::read(&wasm).unwrap();
         assert_eq!(&bytes[..4], b"\0asm");

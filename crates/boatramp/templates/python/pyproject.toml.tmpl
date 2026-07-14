@@ -1,0 +1,14 @@
+# A boatramp function (wasi:http component) in Python.
+#
+# Build it:   boatramp function build   (runs `componentize-py`)
+# Deploy it:  boatramp function deploy NAME --component NAME.wasm
+[project]
+name = "BOATRAMP_FUNCTION_NAME"
+version = "0.1.0"
+description = "A boatramp function in Python."
+requires-python = ">=3.10"
+
+# The build tool. `boatramp function build` runs it version-pinned via `uvx`
+# (so only `uv` is needed); or install it directly: `pip install componentize-py`.
+[tool.boatramp]
+build = "componentize-py==0.25.0"

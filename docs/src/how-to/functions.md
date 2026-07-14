@@ -34,11 +34,14 @@ detecting the language from the project files:
 - **`--lang js`** — a JavaScript component built with
   [`jco componentize`](https://github.com/bytecodealliance/jco) (fetched
   version-pinned via `npx`, so only Node is required; `nix develop` provides it).
-  Note a JS component bundles a JS engine, so it is ~12 MB — larger than a Rust
-  component, but it runs on the same engine and deploys identically.
+- **`--lang python`** — a Python component built with
+  [`componentize-py`](https://github.com/bytecodealliance/componentize-py) (run
+  version-pinned via `uvx`, so only `uv` is required; `nix develop` provides it).
 
-Python (via `componentize-py`) is planned. The produced `.wasm` is a portable WASI
-component either way — deploy it with `function deploy`.
+The produced `.wasm` is a portable WASI component in every case — deploy it with
+`function deploy`, and it runs on the same engine. Note the JS and Python
+components bundle their language runtime (~12–18 MB) and so are larger than a Rust
+component; pick the language that fits your code.
 
 ### Run it locally
 
