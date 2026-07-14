@@ -266,6 +266,12 @@ fn escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Public wrapper over [`escape`] for callers rendering their own series (e.g. the
+/// FA-4 function-usage gauges).
+pub fn escape_label(value: &str) -> String {
+    escape(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

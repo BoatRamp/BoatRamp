@@ -669,6 +669,50 @@ impl DeployStore {
         }
     }
 
+    // ---- function metering (FA-4) ------------------------------------------
+
+    /// The usage aggregate for a function, if any has been recorded.
+    pub async fn get_metering(
+        &self,
+        function: &str,
+    ) -> Result<Option<crate::function::Metering>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::metering(function))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a function's usage aggregate.
+    pub async fn put_metering(
+        &self,
+        metering: &crate::function::Metering,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(metering).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::function::keys::metering(&metering.function), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// List every function's usage aggregate (the `functions usage` fan-out).
+    pub async fn list_metering(&self) -> Result<Vec<crate::function::Metering>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("metering/").await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(m) = serde_json::from_slice(&bytes) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The ownership-verification challenge for `(site, host)`, if one exists.
     pub async fn get_domain_verification(
         &self,
@@ -1998,6 +2042,45 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn function_metering_storage_is_tenant_isolated() {
+        use crate::function::{Metering, MeteringSample};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store.get_metering("a").await.unwrap().is_none());
+
+        let mut ma = Metering::new("a");
+        ma.record(
+            &MeteringSample {
+                success: true,
+                duration_ms: 4,
+                bytes_in: 1,
+                bytes_out: 2,
+            },
+            10,
+        );
+        store.put_metering(&ma).await.unwrap();
+
+        let mut mb = Metering::new("b");
+        mb.record(
+            &MeteringSample {
+                success: false,
+                duration_ms: 9,
+                bytes_in: 0,
+                bytes_out: 0,
+            },
+            11,
+        );
+        store.put_metering(&mb).await.unwrap();
+
+        // Each function's aggregate is stored + read independently.
+        assert_eq!(store.get_metering("a").await.unwrap().unwrap().successes, 1);
+        assert_eq!(store.get_metering("b").await.unwrap().unwrap().failures, 1);
+        let all = store.list_metering().await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]

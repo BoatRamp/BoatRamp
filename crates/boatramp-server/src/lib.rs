@@ -121,6 +121,15 @@ struct HandlerRuntimeInner {
     /// size *before* the blob is read. Set via
     /// [`HandlerRuntime::set_max_component_bytes`]; unset reads as `0`.
     max_component_bytes: std::sync::OnceLock<u64>,
+    /// Per-function locks serializing the metering + rate-limit read-modify-write
+    /// (FA-4), so concurrent invocations of one function can't lose an update.
+    /// Created on first use, keyed by function name.
+    function_meter_locks:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-function concurrency semaphores (for functions that set a
+    /// `max_concurrent` quota), created on first use.
+    function_semaphores:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -161,6 +170,8 @@ impl HandlerRuntime {
                 cron_leader_gate: std::sync::OnceLock::new(),
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
+                function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+                function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
             })),
         }
     }
@@ -812,7 +823,8 @@ pub fn router_with(
         .route(
             "/api/functions/:name/invocations/:id",
             get(get_invocation_record),
-        );
+        )
+        .route("/api/functions/:name/usage", get(get_function_usage));
     let api = api
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
@@ -1732,6 +1744,7 @@ async fn invoke_function(
 
     // Idempotency replay: a recorded key returns the first call's outcome (its
     // captured result, or `202` + id while the async call is still in flight).
+    // Checked *before* the quota so a replay never spends the rate budget.
     if let Some(key) = &idem_key {
         match deploy.get_idempotency(&name, key).await {
             Ok(Some(id)) => {
@@ -1742,6 +1755,12 @@ async fn invoke_function(
             Ok(None) => {}
             Err(err) => return deploy_error_response(err),
         }
+    }
+
+    // Rate-limit quota (FA-4), fail-closed → 429, charged once at entry for both
+    // sync and async (a drain retry does not re-charge).
+    if let Err(response) = admit_by_quota(inner, &deploy, &function).await {
+        return response;
     }
 
     if is_async {
@@ -1763,12 +1782,30 @@ async fn execute_sync(
     request: Request,
     idem_key: Option<String>,
 ) -> Response {
-    let response = execute_function(inner, deploy, function, component, request).await;
+    let (response, duration_ms) =
+        execute_function(inner, deploy, function, component, request).await;
     let Some(key) = idem_key else {
+        // No capture on the plain streaming path: meter counts + duration + a
+        // head-status success signal (byte totals are metered on the buffered
+        // async / idempotent paths).
+        let sample = boatramp_core::function::MeteringSample {
+            success: response.status().as_u16() < 500,
+            duration_ms,
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        record_metering(inner, deploy, &function.name, &sample).await;
         return response;
     };
     // Capture so the outcome can be replayed under the idempotency key.
     let (status, content_type, body) = capture_response(response).await;
+    let sample = boatramp_core::function::MeteringSample {
+        success: status.as_u16() < 500,
+        duration_ms,
+        bytes_in: 0,
+        bytes_out: body.len() as u64,
+    };
+    record_metering(inner, deploy, &function.name, &sample).await;
     let now = now_unix();
     let id = new_invocation_id();
     let inv = boatramp_core::function::Invocation {
@@ -1886,9 +1923,12 @@ fn replay_invocation(inv: &boatramp_core::function::Invocation) -> Response {
     }
 }
 
-/// The core engine run: load the component blob, build the function's bindings
-/// under its own `fn/<name>` scope, and serve the request. Errors map to the same
-/// statuses as a handler dispatch.
+/// The core engine run: enforce the per-function concurrency quota, load the
+/// component blob, build the function's bindings under its own `fn/<name>` scope,
+/// and serve the request. Returns the response and its time-to-head in ms (for
+/// metering). Errors map to the same statuses as a handler dispatch; a
+/// `max_concurrent`-full function yields `503` (a retryable delivery failure for
+/// the async drain).
 #[cfg(feature = "handlers")]
 async fn execute_function(
     inner: &HandlerRuntimeInner,
@@ -1896,10 +1936,24 @@ async fn execute_function(
     function: &boatramp_core::function::Function,
     component: &str,
     request: Request,
-) -> Response {
+) -> (Response, u64) {
+    // Concurrency quota (held through the head, mirroring the site permit).
+    let _permit = match acquire_function_permit(inner, &function.name, &function.config.quota) {
+        Ok(permit) => permit,
+        Err(()) => {
+            return (
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "function concurrency limit reached\n",
+                )
+                    .into_response(),
+                0,
+            )
+        }
+    };
     let wasm = match read_blob_fully(deploy, component).await {
         Ok(bytes) => bytes,
-        Err(response) => return response,
+        Err(response) => return (response, 0),
     };
     let scope = format!("fn/{}", function.name);
     let bindings = build_function_bindings(inner, &scope, &function.config).await;
@@ -1910,15 +1964,16 @@ async fn execute_function(
         .engine
         .serve_with_limits(component, &wasm, request, bindings, limits)
         .await;
+    let elapsed = start.elapsed();
     inner.metrics.observe(
         &function.name,
         metrics::Trigger::Invoke,
         "invoke",
         component,
         metrics::Outcome::from_result(&result),
-        start.elapsed(),
+        elapsed,
     );
-    match result {
+    let response = match result {
         Ok(response) => {
             let (parts, body) = response.into_parts();
             axum::http::Response::from_parts(parts, axum::body::Body::new(body))
@@ -1927,7 +1982,8 @@ async fn execute_function(
             tracing::warn!(function = %function.name, %err, "function invocation failed");
             handler_error_response(&err)
         }
-    }
+    };
+    (response, elapsed.as_millis() as u64)
 }
 
 /// Build a top-level function's bindings. Unlike a site handler (whose grants are
@@ -2108,8 +2164,14 @@ async fn run_queued_invocation(
         tracing::warn!(function = %function.name, %err, "marking invocation running failed");
         return;
     }
+    let bytes_in = inv
+        .request_b64
+        .as_deref()
+        .map(|b| b64_decode(b).len() as u64)
+        .unwrap_or(0);
     let request = build_stored_request(&inv);
-    let response = execute_function(inner, deploy, function, &component, request).await;
+    let (response, duration_ms) =
+        execute_function(inner, deploy, function, &component, request).await;
     let (status, content_type, body) = capture_response(response).await;
     // A function that returns a 5xx from the engine wrapper (timeout/trap/etc.)
     // is a delivery failure worth retrying; any response the guest itself
@@ -2131,6 +2193,20 @@ async fn run_queued_invocation(
     }
     inv.updated = now_unix();
     let _ = deploy.put_invocation(&inv).await;
+    // Meter a settled attempt (a requeue-for-retry is not yet a completed
+    // invocation, so only the terminal transition is metered).
+    if matches!(
+        inv.status,
+        InvocationStatus::Succeeded | InvocationStatus::Failed
+    ) {
+        let sample = boatramp_core::function::MeteringSample {
+            success: matches!(inv.status, InvocationStatus::Succeeded),
+            duration_ms,
+            bytes_in,
+            bytes_out: body.len() as u64,
+        };
+        record_metering(inner, deploy, &function.name, &sample).await;
+    }
 }
 
 /// Rebuild the engine request for a stored async invocation from its buffered
@@ -2154,6 +2230,119 @@ fn build_stored_request(inv: &boatramp_core::function::Invocation) -> Request {
     builder
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
+}
+
+// ---- function metering + quotas (FA-4) ---------------------------------------
+
+/// The per-function lock serializing its metering + rate-limit read-modify-write,
+/// created on first use so concurrent invocations of one function can't lose an
+/// update (the KV is get/put, not atomic-increment).
+#[cfg(feature = "handlers")]
+fn function_meter_lock(inner: &HandlerRuntimeInner, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    inner
+        .function_meter_locks
+        .lock()
+        .unwrap()
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Acquire a permit from the function's concurrency semaphore (created on first
+/// use) when it sets a `max_concurrent` quota; `Ok(None)` if uncapped, `Err(())`
+/// when at the limit (the caller turns that into a `503`).
+#[cfg(feature = "handlers")]
+fn acquire_function_permit(
+    inner: &HandlerRuntimeInner,
+    name: &str,
+    quota: &boatramp_core::function::FunctionQuota,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    let Some(max) = quota.max_concurrent else {
+        return Ok(None);
+    };
+    let semaphore = {
+        let mut map = inner.function_semaphores.lock().unwrap();
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max as usize)))
+            .clone()
+    };
+    semaphore.try_acquire_owned().map(Some).map_err(|_| ())
+}
+
+/// Charge one invocation against the function's rate-limit quota (fixed window).
+/// `Ok(())` admits; `Err(429)` means the window is full (fail-closed). A function
+/// with no `max_invocations` cap always admits without touching the store.
+#[cfg(feature = "handlers")]
+async fn admit_by_quota(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+) -> Result<(), Response> {
+    let quota = &function.config.quota;
+    if quota.max_invocations.is_none() {
+        return Ok(());
+    }
+    let lock = function_meter_lock(inner, &function.name);
+    let _guard = lock.lock().await;
+    let now = now_unix();
+    let mut metering = match deploy.get_metering(&function.name).await {
+        Ok(Some(m)) => m,
+        Ok(None) => boatramp_core::function::Metering::new(&function.name),
+        Err(err) => return Err(deploy_error_response(err)),
+    };
+    if !metering.admit(quota, now) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "function invocation quota exceeded\n",
+        )
+            .into_response());
+    }
+    if let Err(err) = deploy.put_metering(&metering).await {
+        return Err(deploy_error_response(err));
+    }
+    Ok(())
+}
+
+/// Fold one invocation's measured cost into the function's usage aggregate
+/// (best-effort: a metering write failure is logged, never surfaced to the
+/// caller). Serialized per function so concurrent updates don't race.
+#[cfg(feature = "handlers")]
+async fn record_metering(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &str,
+    sample: &boatramp_core::function::MeteringSample,
+) {
+    let lock = function_meter_lock(inner, function);
+    let _guard = lock.lock().await;
+    let now = now_unix();
+    let mut metering = match deploy.get_metering(function).await {
+        Ok(Some(m)) => m,
+        Ok(None) => boatramp_core::function::Metering::new(function),
+        Err(err) => {
+            tracing::warn!(function, %err, "reading metering failed");
+            return;
+        }
+    };
+    metering.record(sample, now);
+    if let Err(err) = deploy.put_metering(&metering).await {
+        tracing::warn!(function, %err, "writing metering failed");
+    }
+}
+
+/// `GET /api/functions/:name/usage` (FA-4) — the function's usage aggregate.
+/// `system·read`.
+#[cfg(feature = "handlers")]
+async fn get_function_usage(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+) -> Response {
+    match deploy.get_metering(&name).await {
+        Ok(Some(m)) => Json(m).into_response(),
+        // No invocations yet ⇒ a zeroed aggregate, so the CLI always has a shape.
+        Ok(None) => Json(boatramp_core::function::Metering::new(name)).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
 }
 
 async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<String>) -> Response {
@@ -7291,6 +7480,46 @@ async fn prometheus_metrics(
                 }
             }
             body.push_str(&metrics::render_consumer_gauges(&rows));
+        }
+        // Function usage series (FA-4), from the persisted metering aggregates.
+        // Best-effort: a store error omits the block rather than failing the scrape.
+        if let Ok(mut usage) = deploy.list_metering().await {
+            if !usage.is_empty() {
+                usage.sort_by(|a, b| a.function.cmp(&b.function));
+                body.push_str(
+                    "# HELP boatramp_function_invocations_total Function invocations metered.\n\
+                     # TYPE boatramp_function_invocations_total counter\n",
+                );
+                for m in &usage {
+                    let f = metrics::escape_label(&m.function);
+                    body.push_str(&format!(
+                        "boatramp_function_invocations_total{{function=\"{f}\"}} {}\n",
+                        m.invocations
+                    ));
+                }
+                body.push_str(
+                    "# HELP boatramp_function_failures_total Function invocations that failed to deliver.\n\
+                     # TYPE boatramp_function_failures_total counter\n",
+                );
+                for m in &usage {
+                    let f = metrics::escape_label(&m.function);
+                    body.push_str(&format!(
+                        "boatramp_function_failures_total{{function=\"{f}\"}} {}\n",
+                        m.failures
+                    ));
+                }
+                body.push_str(
+                    "# HELP boatramp_function_duration_ms_total Summed function wall-clock duration, ms.\n\
+                     # TYPE boatramp_function_duration_ms_total counter\n",
+                );
+                for m in &usage {
+                    let f = metrics::escape_label(&m.function);
+                    body.push_str(&format!(
+                        "boatramp_function_duration_ms_total{{function=\"{f}\"}} {}\n",
+                        m.duration_ms_total
+                    ));
+                }
+            }
         }
     }
     (

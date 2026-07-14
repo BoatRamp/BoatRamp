@@ -1759,6 +1759,144 @@ async fn function_invoke_async_dead_letters_on_repeated_failure() {
     assert_eq!(final_status["attempts"], 5); // MAX_INVOKE_ATTEMPTS
 }
 
+/// Deploy a top-level function with a usage `quota` set (FA-4).
+#[cfg(feature = "handlers")]
+async fn deploy_quota_function(
+    deploy: &DeployStore,
+    name: &str,
+    component: &[u8],
+    quota: boatramp_core::function::FunctionQuota,
+) -> String {
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner};
+    let hash = sha256_hex(component);
+    let bytes = component.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let config = FunctionConfig {
+        quota,
+        ..Default::default()
+    };
+    let f = Function::new(
+        name,
+        Owner::Project("default".into()),
+        &hash,
+        config,
+        Lifecycle::Independent,
+        0,
+    );
+    deploy.put_function(&f).await.unwrap();
+    hash
+}
+
+/// Fetch a function's usage aggregate via `GET /usage`.
+#[cfg(feature = "handlers")]
+async fn fetch_usage(app: &axum::Router, name: &str) -> serde_json::Value {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/functions/{name}/usage"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The rate-limit quota admits up to `max_invocations` per window, then fails
+/// closed with `429`; metering counts only the admitted+run invocations.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_quota_returns_429_and_meters_admitted() {
+    use boatramp_core::function::FunctionQuota;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_quota_function(
+        &deploy,
+        "limited",
+        HTTP_200,
+        FunctionQuota {
+            max_invocations: Some(2),
+            window_secs: Some(3600),
+            max_concurrent: None,
+        },
+    )
+    .await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // First two admitted, third rate-limited (fail-closed).
+    for expect in [
+        StatusCode::OK,
+        StatusCode::OK,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("limited", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expect);
+    }
+
+    // Usage reflects only the two that ran.
+    let usage = fetch_usage(&app, "limited").await;
+    assert_eq!(usage["invocations"], 2);
+    assert_eq!(usage["successes"], 2);
+}
+
+/// Metering accumulates per invocation and is tenant-isolated (one function's
+/// usage never bleeds into another's).
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_meters_usage_per_function() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "alpha", HTTP_200, Vec::new()).await;
+    deploy_test_function(&deploy, "beta", HTTP_200, Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Invoke alpha three times, beta once.
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("alpha", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("beta", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let alpha = fetch_usage(&app, "alpha").await;
+    assert_eq!(alpha["invocations"], 3);
+    assert_eq!(alpha["successes"], 3);
+    let beta = fetch_usage(&app, "beta").await;
+    assert_eq!(beta["invocations"], 1);
+    // A never-invoked function reports a zeroed aggregate, not a 404.
+    let ghost = fetch_usage(&app, "ghost").await;
+    assert_eq!(ghost["invocations"], 0);
+}
+
 /// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
 /// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
 /// every 500 ms; a dead-letter needs five ticks).

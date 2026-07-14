@@ -134,6 +134,14 @@ enum FunctionCommand {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Show a function's usage aggregate (invocations, duration, bytes).
+    Usage {
+        /// Function name.
+        name: String,
+        /// Server base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
 }
 
 /// A function as the server's `/api/functions` view reports it.
@@ -176,6 +184,24 @@ struct InvocationRecord {
 #[derive(Debug, Deserialize)]
 struct InvocationResultView {
     status: u16,
+}
+
+/// A function's usage aggregate as `/usage` reports it (FA-4).
+#[derive(Debug, Default, Deserialize)]
+struct UsageView {
+    function: String,
+    #[serde(default)]
+    invocations: u64,
+    #[serde(default)]
+    successes: u64,
+    #[serde(default)]
+    failures: u64,
+    #[serde(default)]
+    duration_ms_total: u64,
+    #[serde(default)]
+    bytes_in_total: u64,
+    #[serde(default)]
+    bytes_out_total: u64,
 }
 
 /// Run the `function` subcommand.
@@ -343,6 +369,26 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             if let Some(result) = &inv.result {
                 println!("  result: HTTP {}", result.status);
             }
+        }
+        FunctionCommand::Usage { name, server } => {
+            let (server, http) = conn(server, config)?;
+            let usage: UsageView = http
+                .get(format!("{server}/api/functions/{name}/usage"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("{}", usage.function);
+            println!(
+                "  invocations: {} ({} ok, {} failed)",
+                usage.invocations, usage.successes, usage.failures
+            );
+            println!("  duration:    {} ms total", usage.duration_ms_total);
+            println!(
+                "  bytes:       {} in / {} out",
+                usage.bytes_in_total, usage.bytes_out_total
+            );
         }
     }
     Ok(())

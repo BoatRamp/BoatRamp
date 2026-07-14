@@ -73,6 +73,9 @@ pub struct FunctionConfig {
     pub env: BTreeMap<String, String>,
     /// Execution substrate (default `wasm`).
     pub runtime: Runtime,
+    /// Usage quota (FA-4). Absent / all-`None` ⇒ unlimited.
+    #[serde(default, skip_serializing_if = "FunctionQuota::is_unset")]
+    pub quota: FunctionQuota,
 }
 
 impl FunctionConfig {
@@ -82,6 +85,7 @@ impl FunctionConfig {
             limits: h.limits.clone(),
             env: h.env.clone(),
             runtime: Runtime::default(),
+            quota: FunctionQuota::default(),
         }
     }
     fn from_consumer(c: &ConsumerConfig) -> Self {
@@ -381,6 +385,125 @@ impl Invocation {
     }
 }
 
+/// Per-function usage quota (FA-4) — `require`-style knobs enforced host-side,
+/// **fail-closed** (over the limit ⇒ `429`). Accounting, not billing: this bounds
+/// abuse, it does not charge. All limits are per node today (a cluster-wide token
+/// bucket is future work); `None` on a field means that dimension is unlimited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FunctionQuota {
+    /// Max invocations admitted within [`window_secs`](Self::window_secs) (a
+    /// fixed window: the counter resets when the window rolls over).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_invocations: Option<u64>,
+    /// The rate-limit window length in seconds (defaults to 60 when a
+    /// `max_invocations` cap is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_secs: Option<u64>,
+    /// Max concurrent in-flight invocations for this function (per node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+}
+
+impl FunctionQuota {
+    /// Whether any dimension is set (an all-`None` quota is a no-op the caller can
+    /// skip entirely).
+    pub fn is_unset(&self) -> bool {
+        self.max_invocations.is_none() && self.max_concurrent.is_none()
+    }
+    /// The effective rate-limit window (defaults to 60s).
+    pub fn window(&self) -> u64 {
+        self.window_secs.unwrap_or(60)
+    }
+}
+
+/// One invocation's measured cost, folded into a [`Metering`] aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteringSample {
+    /// Whether the invocation succeeded (the guest produced a response).
+    pub success: bool,
+    /// Wall-clock duration in milliseconds (the server-side CPU-time proxy; true
+    /// fuel accounting needs the engine to surface post-completion cost).
+    pub duration_ms: u64,
+    /// Request bytes delivered to the function.
+    pub bytes_in: u64,
+    /// Response bytes the function produced.
+    pub bytes_out: u64,
+}
+
+/// Host-side usage aggregate for one function (FA-4), tenant-isolated under
+/// [`keys::metering`]. It also carries the fixed-window rate-limit counter so
+/// metering + quota share a single read-modify-write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Metering {
+    /// The function these counters belong to.
+    pub function: String,
+    /// Total invocations metered (sync + drained async).
+    pub invocations: u64,
+    /// Invocations whose guest produced a response.
+    pub successes: u64,
+    /// Invocations that failed to deliver (engine error / dead-lettered).
+    pub failures: u64,
+    /// Summed wall-clock duration, milliseconds.
+    pub duration_ms_total: u64,
+    /// Summed request bytes.
+    pub bytes_in_total: u64,
+    /// Summed response bytes.
+    pub bytes_out_total: u64,
+    /// The current rate-limit window's start (unix seconds).
+    pub window_start: u64,
+    /// Invocations admitted in the current window.
+    pub window_count: u64,
+    /// Last update (unix seconds).
+    pub updated: u64,
+}
+
+impl Metering {
+    /// A fresh aggregate for `function`.
+    pub fn new(function: impl Into<String>) -> Self {
+        Metering {
+            function: function.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Fold one invocation's cost into the usage counters.
+    pub fn record(&mut self, sample: &MeteringSample, now: u64) {
+        self.invocations += 1;
+        if sample.success {
+            self.successes += 1;
+        } else {
+            self.failures += 1;
+        }
+        self.duration_ms_total = self.duration_ms_total.saturating_add(sample.duration_ms);
+        self.bytes_in_total = self.bytes_in_total.saturating_add(sample.bytes_in);
+        self.bytes_out_total = self.bytes_out_total.saturating_add(sample.bytes_out);
+        self.updated = now;
+    }
+
+    /// Admit one invocation against the fixed-window rate limit, rolling the
+    /// window over when it has elapsed. Returns `true` if admitted (and records
+    /// the admission), `false` if the window is already at `max` (⇒ the caller
+    /// fails closed with `429`). An unset cap always admits.
+    pub fn admit(&mut self, quota: &FunctionQuota, now: u64) -> bool {
+        let Some(max) = quota.max_invocations else {
+            return true;
+        };
+        let window = quota.window();
+        if now.saturating_sub(self.window_start) >= window {
+            self.window_start = now;
+            self.window_count = 0;
+        }
+        if self.window_count >= max {
+            return false;
+        }
+        self.window_count += 1;
+        self.updated = now;
+        true
+    }
+}
+
 /// KV keyspace for a function (mirrors the deploy/alias immutability model).
 pub mod keys {
     /// Function metadata.
@@ -410,6 +533,10 @@ pub mod keys {
     /// An idempotency key → invocation id pointer.
     pub fn idempotency(name: &str, key: &str) -> String {
         format!("functions/{name}/idem/{key}")
+    }
+    /// The function's usage-metering aggregate (FA-4).
+    pub fn metering(name: &str) -> String {
+        format!("metering/{name}")
     }
 }
 
@@ -836,6 +963,57 @@ mod tests {
     }
 
     #[test]
+    fn metering_records_and_rate_limits() {
+        let mut m = Metering::new("greeter");
+        m.record(
+            &MeteringSample {
+                success: true,
+                duration_ms: 5,
+                bytes_in: 3,
+                bytes_out: 7,
+            },
+            100,
+        );
+        m.record(
+            &MeteringSample {
+                success: false,
+                duration_ms: 2,
+                bytes_in: 0,
+                bytes_out: 0,
+            },
+            101,
+        );
+        assert_eq!(m.invocations, 2);
+        assert_eq!(m.successes, 1);
+        assert_eq!(m.failures, 1);
+        assert_eq!(m.duration_ms_total, 7);
+        assert_eq!(m.bytes_out_total, 7);
+        assert_eq!(m.updated, 101);
+
+        // Fixed-window rate limit: 2 per 10s window.
+        let quota = FunctionQuota {
+            max_invocations: Some(2),
+            window_secs: Some(10),
+            max_concurrent: None,
+        };
+        let mut r = Metering::new("greeter");
+        assert!(r.admit(&quota, 1000)); // 1st in window
+        assert!(r.admit(&quota, 1001)); // 2nd
+        assert!(!r.admit(&quota, 1002)); // 3rd → rejected
+        assert_eq!(r.window_count, 2);
+        // The window rolls over after `window_secs`, resetting the counter.
+        assert!(r.admit(&quota, 1011));
+        assert_eq!(r.window_count, 1);
+
+        // An unset cap always admits and never touches the counter.
+        let unset = FunctionQuota::default();
+        let mut u = Metering::new("greeter");
+        assert!(u.admit(&unset, 1));
+        assert_eq!(u.window_count, 0);
+        assert!(unset.is_unset());
+    }
+
+    #[test]
     fn keyspace_is_stable() {
         assert_eq!(keys::meta("resize"), "functions/resize");
         assert_eq!(
@@ -859,5 +1037,6 @@ mod tests {
             keys::idempotency("resize", "k-1"),
             "functions/resize/idem/k-1"
         );
+        assert_eq!(keys::metering("resize"), "metering/resize");
     }
 }
