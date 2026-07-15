@@ -43,6 +43,15 @@ ignore = [
   # which never Debug-prints those pointers, so the path is unreachable. No safe
   # upgrade (0.9.18 is the current line). Revisit when crossbeam-epoch patches.
   "RUSTSEC-2026-0204",
+
+  # rsa (0.9.10) "Marvin" RSA-decryption timing side-channel. Present ONLY with
+  # the opt-in `sql-mysql` feature (not the default graph): sqlx-mysql pulls `rsa`
+  # solely for MySQL's sha256/caching_sha2 auth, where the *client* RSA-**encrypts**
+  # the password during a non-TLS handshake. Marvin targets the private-key
+  # *decryptor* (the MySQL server), an operation boatramp never performs — and a
+  # TLS connection skips the RSA exchange entirely. No fixed `rsa` release exists.
+  # Revisit when RustCrypto/RSA ships a constant-time release or sqlx drops it.
+  "RUSTSEC-2023-0071",
 ]
 
 [bans]

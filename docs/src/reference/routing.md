@@ -214,7 +214,7 @@ rejected at validate.
 | `wasi:keyvalue` | Per-site KV store. |
 | `wasi:blobstore` | Per-site blob store. |
 | `wasi:messaging` | Publish / subscribe on topics. |
-| `sql` | Per-site SQL database. |
+| `sql` | Per-site SQL database (managed libsql), or an operator-configured external Postgres/MySQL opened by name. |
 | `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities. |
 
 The site's [`allow_imports`](./siteconfig.md#handlers) is the allowlist; a

@@ -188,6 +188,31 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// An external `[handlers.bindings.sql.databases.<name>]` named an
+    /// unrecognised engine `kind`.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[error("handlers SQL binding: external database {name:?} has unknown kind {kind:?} (expected postgres | mysql)")]
+    SqlExternalKind { name: String, kind: String },
+    /// An external database entry omitted the required `url_env`.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[error("handlers SQL binding: external database {0:?} is missing `url_env`")]
+    SqlExternalUrlEnvMissing(String),
+    /// Building an external database backend (pool/URL parse) failed.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[error("handlers SQL binding: external database {name:?}: {source}")]
+    SqlExternalConnect {
+        name: String,
+        #[source]
+        source: boatramp_core::sql::SqlError,
+    },
+    /// External databases were configured but this build has no external SQL
+    /// engine compiled in.
+    #[cfg(all(
+        feature = "handlers",
+        not(any(feature = "sql-postgres", feature = "sql-mysql"))
+    ))]
+    #[error("handlers SQL binding: external database {0:?} needs an external SQL engine — rebuild with --features sql-postgres and/or sql-mysql")]
+    SqlExternalUnavailable(String),
 
     // ---- propagated library errors (`#[from]`) ------------------------------
     /// Resolving the `[security]` posture (e.g. an unknown profile name) failed.
@@ -2280,9 +2305,57 @@ fn build_sql_backends(
         }
         None => None,
     };
-    Ok(Arc::new(
-        backend.with_preview_policy(preview_mode, preview_init),
-    ))
+    let default: Arc<dyn boatramp_core::sql::SqlBackends> =
+        Arc::new(backend.with_preview_policy(preview_mode, preview_init));
+
+    // Overlay any external (bring-your-own) databases on the managed default.
+    // With none configured the default is returned unchanged (and a build
+    // without an external SQL engine never has to link the sqlx path).
+    let databases = cfg.map(|c| &c.databases);
+    if databases.is_none_or(|d| d.is_empty()) {
+        return Ok(default);
+    }
+    let databases = databases.expect("checked non-empty above");
+
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    {
+        use boatramp_storage::sql_sqlx::{
+            connect, CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions,
+        };
+        let mut composite = CompositeSqlBackends::new(default);
+        for (name, db) in databases {
+            let kind = ExternalSqlKind::parse(&db.kind).ok_or_else(|| Error::SqlExternalKind {
+                name: name.clone(),
+                kind: db.kind.clone(),
+            })?;
+            if db.url_env.trim().is_empty() {
+                return Err(Error::SqlExternalUrlEnvMissing(name.clone()));
+            }
+            // The connection URL(s) are secrets, resolved from the environment.
+            let url =
+                std::env::var(&db.url_env).map_err(|_| Error::SqlEnvUnset(db.url_env.clone()))?;
+            let read_url = match &db.read_url_env {
+                Some(var) => Some(std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?),
+                None => None,
+            };
+            let opts = ExternalSqlOptions::new(url)
+                .with_read_url(read_url)
+                .with_max_connections(db.pool_max)
+                .read_only(db.read_only)
+                .with_connect_timeout(db.connect_timeout_secs.map(std::time::Duration::from_secs));
+            let external = connect(kind, &opts).map_err(|source| Error::SqlExternalConnect {
+                name: name.clone(),
+                source,
+            })?;
+            composite = composite.with_external(name.clone(), external, db.allow_preview);
+        }
+        Ok(Arc::new(composite))
+    }
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    {
+        let name = databases.keys().next().cloned().unwrap_or_default();
+        Err(Error::SqlExternalUnavailable(name))
+    }
 }
 
 #[cfg(not(feature = "handlers"))]

@@ -11,6 +11,7 @@
 //!
 //! Both are RON; a missing file yields the default config.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -354,6 +355,42 @@ pub struct SqlBindingConfig {
     /// Path to an idempotent SQL script run when an `empty` preview database is
     /// first opened (e.g. schema/seed). Ignored in `branch`/`shared` modes.
     pub preview_init: Option<PathBuf>,
+    /// `handlers.bindings.sql.databases` — external **bring-your-own** databases,
+    /// each opened by name via `sql.open("<name>")`. An operator-configured
+    /// Postgres/MySQL whose *isolation is the operator's* (it's their database),
+    /// so these bypass the per-site libsql boundary and are reachable by any
+    /// handler/function granted the `sql` binding. Needs the `sql-postgres` /
+    /// `sql-mysql` build feature for the engine. A name here shadows the same
+    /// name on the managed libsql default.
+    pub databases: BTreeMap<String, ExternalDatabaseConfig>,
+}
+
+/// One external (bring-your-own) SQL database for the handler `sql` binding. The
+/// connection URL is a secret and is named indirectly (`url_env`), never written
+/// in the config file.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ExternalDatabaseConfig {
+    /// Engine: `postgres` (aliases `postgresql`/`pg`) or `mysql` (alias
+    /// `mariadb`).
+    pub kind: String,
+    /// Name of the env var holding the connection URL (e.g.
+    /// `postgres://user:pw@host/db`). Required.
+    pub url_env: String,
+    /// Optional env var holding a **read-replica** connection URL. When set,
+    /// `open-read-only` transactions route there; writes stay on `url_env`.
+    pub read_url_env: Option<String>,
+    /// Maximum pooled connections (default 8).
+    pub pool_max: Option<u32>,
+    /// Open every transaction `READ ONLY` (the engine rejects writes) — for a
+    /// database functions should only read.
+    pub read_only: bool,
+    /// Permit **preview** deployments to reach this database. Default `false`: a
+    /// preview is refused, so it can never touch the operator's live external DB.
+    pub allow_preview: bool,
+    /// Connection/acquire timeout in seconds (default 10).
+    pub connect_timeout_secs: Option<u64>,
 }
 
 /// The signing algorithm for a signer that can choose one (`Local`, `Vault`,
@@ -830,6 +867,49 @@ mod tests {
             sql.preview_init.as_deref(),
             Some(Path::new("/etc/boatramp/seed.sql"))
         );
+    }
+
+    #[test]
+    fn sql_binding_external_databases() {
+        let cfg = server(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "analytics": (
+                            kind: "postgres",
+                            url_env: "ANALYTICS_PG_URL",
+                            pool_max: 16,
+                            read_only: true,
+                        ),
+                        "events": (
+                            kind: "mysql",
+                            url_env: "EVENTS_MYSQL_URL",
+                            read_url_env: "EVENTS_MYSQL_REPLICA_URL",
+                            allow_preview: true,
+                        ),
+                    },
+                ) ) ),
+            )"#,
+        );
+        let sql = cfg.handlers.unwrap().bindings.sql.unwrap();
+        assert_eq!(sql.databases.len(), 2);
+
+        let analytics = &sql.databases["analytics"];
+        assert_eq!(analytics.kind, "postgres");
+        assert_eq!(analytics.url_env, "ANALYTICS_PG_URL");
+        assert_eq!(analytics.pool_max, Some(16));
+        assert!(analytics.read_only);
+        assert!(!analytics.allow_preview);
+        assert!(analytics.read_url_env.is_none());
+
+        let events = &sql.databases["events"];
+        assert_eq!(events.kind, "mysql");
+        assert_eq!(
+            events.read_url_env.as_deref(),
+            Some("EVENTS_MYSQL_REPLICA_URL")
+        );
+        assert!(events.allow_preview);
+        assert!(!events.read_only);
     }
 
     /// Path to a file at the repo root (two levels up from this crate).

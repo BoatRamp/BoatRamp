@@ -167,6 +167,23 @@ libsql = { version = "0.9", default-features = false, features = [
   "tls",
 ] }
 
+# External bring-your-own SQL databases for the handler `sql` binding: an
+# operator-configured Postgres/MySQL a function/handler opens by name (isolation
+# is the operator's — it's their DB — so these bypass the per-site libsql
+# boundary; libsql stays the managed default). Compiled only with the
+# `sql-postgres` / `sql-mysql` features. rustls (ring), no openssl — matching the
+# project norm. The type features (chrono/uuid/bigdecimal/json) let the generic
+# row decoder stringify timestamps/uuids/numerics/json into the small
+# engine-agnostic value vocabulary. `postgres`/`mysql` are added per feature.
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls-ring",
+  "chrono",
+  "uuid",
+  "bigdecimal",
+  "json",
+] }
+
 # Embedded bundler (compiled only with `--features bundler`).
 rolldown = "1.1"
 lightningcss = "1.0.0-alpha.71"

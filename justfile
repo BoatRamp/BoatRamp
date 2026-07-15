@@ -102,6 +102,28 @@ sqld data_dir="./.sqld" port="8080" admin_port="9090":
     sqld -d "{{ data_dir }}" --http-listen-addr 127.0.0.1:{{ port }} \
       --admin-listen-addr 127.0.0.1:{{ admin_port }} --enable-namespaces
 
+# Start a throwaway PostgreSQL in Docker for the external (bring-your-own) SQL
+# backend test. Runs in the foreground (Ctrl-C to stop; the container is removed
+# on exit). Prints the URL to run the live round-trip with.
+pg port="5432":
+    @echo "postgres on localhost:{{ port }} — run the external-SQL test with:"
+    @echo "  BOATRAMP_TEST_PG_URL=postgres://boatramp:boatramp@localhost:{{ port }}/boatramp \\"
+    @echo "    cargo test -p boatramp-storage --features sql-postgres --test sql_sqlx_live -- --nocapture"
+    docker run --rm --name boatramp-pg -p {{ port }}:5432 \
+      -e POSTGRES_USER=boatramp -e POSTGRES_PASSWORD=boatramp -e POSTGRES_DB=boatramp \
+      postgres:16-alpine
+
+# Start a throwaway MySQL in Docker for the external (bring-your-own) SQL backend
+# test. Runs in the foreground (Ctrl-C to stop; the container is removed on exit).
+mysql port="3306":
+    @echo "mysql on localhost:{{ port }} — run the external-SQL test with:"
+    @echo "  BOATRAMP_TEST_MYSQL_URL=mysql://boatramp:boatramp@localhost:{{ port }}/boatramp \\"
+    @echo "    cargo test -p boatramp-storage --features sql-mysql --test sql_sqlx_live -- --nocapture"
+    docker run --rm --name boatramp-mysql -p {{ port }}:3306 \
+      -e MYSQL_USER=boatramp -e MYSQL_PASSWORD=boatramp -e MYSQL_DATABASE=boatramp \
+      -e MYSQL_ROOT_PASSWORD=boatramp \
+      mysql:8
+
 # Run the ACME DNS-01 wildcard-cert end-to-end test against a local Pebble CA.
 # The test spawns `pebble` + `pebble-challtestsrv` (provided by `nix develop`),
 # mints a throwaway CA, and drives a real `*.deploy.test` wildcard issuance.

@@ -45,6 +45,9 @@ pub mod kv_cloudflare;
 #[cfg(feature = "sql")]
 pub mod sql_libsql;
 
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod sql_sqlx;
+
 #[cfg(feature = "cache")]
 pub mod cache;
 
@@ -77,6 +80,9 @@ pub use kv_cloudflare::CloudflareKv;
 
 #[cfg(feature = "sql")]
 pub use sql_libsql::{LibsqlSql, LibsqlSqlBackends};
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub use sql_sqlx::{ExternalSqlKind, ExternalSqlOptions};
 
 #[cfg(feature = "cache")]
 pub use cache::CachedStorage;

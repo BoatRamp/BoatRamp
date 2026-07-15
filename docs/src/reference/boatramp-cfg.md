@@ -130,7 +130,28 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 
 `bindings.sql` fields: `dir`, `url`, `admin_url`, `replica_url`, `token_env`,
 `admin_token_env`, `preview_mode` (`empty` \| `branch` \| `shared`),
-`preview_init`. See [Use handler bindings](../how-to/handler-bindings.md).
+`preview_init`, `databases`. See
+[Use handler bindings](../how-to/handler-bindings.md).
+
+### External SQL databases
+
+`bindings.sql.databases` is a map of `name → external database`, each an
+operator-run Postgres/MySQL a guest opens by that name (`sql.open("<name>")`)
+instead of a per-site libsql one. Needs the `sql-postgres` / `sql-mysql` build
+feature. Isolation is the operator's — an external database is shared across
+every guest granted the `sql` binding — so it bypasses the per-site libsql
+boundary; libsql stays the managed default. A name here shadows the same name on
+the libsql default.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `kind` | string | — | Engine: `postgres` (aliases `postgresql`/`pg`) or `mysql` (alias `mariadb`). Required. |
+| `url_env` | string | — | Env var holding the connection URL, e.g. `postgres://user:pw@host/db`. A secret — never the URL in-file. Required. |
+| `read_url_env` | string | — | Env var holding a read-replica URL. When set, `open-read-only` routes there; writes stay on `url_env`. |
+| `pool_max` | int | `8` | Maximum pooled connections. |
+| `read_only` | bool | `false` | Open every transaction `READ ONLY` (the engine rejects writes). |
+| `allow_preview` | bool | `false` | Permit preview deployments to reach it. Default refuses them, so a preview can't touch live external data. |
+| `connect_timeout_secs` | int | `10` | Connection/acquire timeout, in seconds. |
 
 ## `cluster`
 
