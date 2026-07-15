@@ -447,7 +447,7 @@ async fn build_compute(
     tracing::info!(backends = ?advertised, free_vcpus, free_mem_mib, "compute node inventory");
     let node = Node {
         id: node_id,
-        region: None,
+        region: cfg.region.clone(),
         labels: std::collections::BTreeMap::new(),
         free_vcpus,
         free_mem_mib,

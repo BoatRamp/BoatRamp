@@ -5241,7 +5241,7 @@ async fn serve_resolved(
                             // the request as activity so the reconcile loop
                             // keeps the workload warm / wakes it, and only sleeps it
                             // once genuinely idle.
-                            let compute_backends = match &upstream.compute {
+                            let (compute_backends, compute_regions) = match &upstream.compute {
                                 Some(workload) => {
                                     gateway::record_activity(workload);
                                     let mut pool = compute_endpoints(deploy, workload).await;
@@ -5256,9 +5256,18 @@ async fn serve_resolved(
                                         pool = await_warm(deploy, workload, COMPUTE_WAKE_TIMEOUT)
                                             .await;
                                     }
-                                    Some(pool)
+                                    // FA-8: for a nearest-region pool, tag each replica
+                                    // endpoint with its node's region (from placement).
+                                    let regions = if upstream.lb
+                                        == boatramp_core::gateway::LbPolicy::Nearest
+                                    {
+                                        Some(compute_endpoint_regions(deploy, workload).await)
+                                    } else {
+                                        None
+                                    };
+                                    (Some(pool), regions)
                                 }
-                                None => None,
+                                None => (None, None),
                             };
                             dispatch_gateway(
                                 request,
@@ -5268,6 +5277,7 @@ async fn serve_resolved(
                                 request_path,
                                 client_ip,
                                 compute_backends,
+                                compute_regions,
                             )
                             .await
                         }
@@ -5991,6 +6001,7 @@ fn gateway_addr_allowed(ip: IpAddr, posture: &boatramp_core::security::SecurityP
 /// candidate on a backend failure — but only for body-less idempotent requests,
 /// since a sent body can't be replayed. Each attempt's
 /// outcome feeds passive health so future requests route around a dead backend.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_gateway(
     request: Request,
     site: &str,
@@ -6002,6 +6013,11 @@ async fn dispatch_gateway(
     // the workload's live healthy replica endpoints here; otherwise `None` and
     // the static/DNS pool is used.
     compute_backends: Option<Vec<String>>,
+    // FA-8: per-replica region tags (endpoint URL → region) for a compute-backed
+    // `LbPolicy::Nearest` pool, derived from node placement; merged over the
+    // upstream's static `regions` so nearest-replica routing works without a manual
+    // `--region` map. `None`/empty for non-nearest or non-compute pools.
+    compute_regions: Option<std::collections::BTreeMap<String, String>>,
 ) -> Response {
     // Read the security posture once from the original request — the retry path
     // below rebuilds the request (dropping extensions), so we thread the resolved
@@ -6012,6 +6028,14 @@ async fn dispatch_gateway(
     // background prober has a current config snapshot.
     state.arm_active_probe(upstream);
     let now = std::time::Instant::now();
+    // Merge compute-derived replica regions into the upstream so the nearest LB
+    // sees them (a per-request clone only when there are regions to add).
+    let merged_upstream = compute_regions.filter(|r| !r.is_empty()).map(|regions| {
+        let mut u = upstream.clone();
+        u.regions.extend(regions);
+        u
+    });
+    let upstream = merged_upstream.as_ref().unwrap_or(upstream);
     let backends =
         compute_backends.unwrap_or_else(|| state.backends(upstream, &gateway::SystemResolver, now));
     if backends.is_empty() {
@@ -6084,6 +6108,24 @@ async fn compute_endpoints(deploy: &DeployStore, workload: &str) -> Vec<String> 
         .into_iter()
         .filter(|state| state.healthy)
         .map(|state| state.endpoint.url())
+        .collect()
+}
+
+/// The region of each healthy replica endpoint of a compute workload (FA-8), as
+/// `endpoint-url → region`, denormalized from the replica's node placement. Feeds
+/// the nearest-replica LB; replicas whose node had no region are omitted
+/// (region-neutral).
+async fn compute_endpoint_regions(
+    deploy: &DeployStore,
+    workload: &str,
+) -> std::collections::BTreeMap<String, String> {
+    deploy
+        .list_replica_states(workload)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|state| state.healthy)
+        .filter_map(|state| state.region.map(|region| (state.endpoint.url(), region)))
         .collect()
 }
 

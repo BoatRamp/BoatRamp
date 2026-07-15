@@ -192,6 +192,11 @@ pub struct ComputeConfig {
     /// default may select under `multi-tenant`. Host-access-gated. Empty ⇒ no
     /// kernel is allow-listed.
     pub kernel_allowed_hashes: Vec<String>,
+    /// This node's **region** tag (FA-8). Advertised on the compute `Node` so a
+    /// gateway routing to a `compute:`-backed workload with `--lb nearest` sends
+    /// each request to the nearest replica by its node's region — no manual
+    /// `--region` map. `None` ⇒ region-agnostic.
+    pub region: Option<String>,
 }
 
 /// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
@@ -219,6 +224,7 @@ impl Default for ComputeConfig {
             kernel_allowed_hashes: vec![
                 "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
             ],
+            region: None,
         }
     }
 }

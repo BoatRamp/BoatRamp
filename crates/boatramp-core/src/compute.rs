@@ -432,6 +432,12 @@ pub struct ObservedInstance {
     pub backend: String,
     /// The endpoint the gateway routes to (the last-known endpoint while `Zero`).
     pub endpoint: Endpoint,
+    /// The region of the node this replica runs on, denormalized from
+    /// [`Node::region`] at launch so the gateway's nearest-replica LB (FA-8) can
+    /// tag the replica's endpoint without a node lookup. `#[serde(default)]` keeps
+    /// older records (no field) deserializing — schema stays v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// Whether the last health check passed (always `false` while `Zero`).
     pub healthy: bool,
     /// Lifecycle phase. `#[serde(default)]` keeps older records (no field)
@@ -711,7 +717,8 @@ pub async fn reconcile_once(
                             .push(format!("{wl}/{replica}: no backend {backend:?}"));
                         continue;
                     };
-                    match launch_one(b.as_ref(), &wl, replica, node, &spec).await {
+                    let node_region = region_of_node(nodes, node);
+                    match launch_one(b.as_ref(), &wl, replica, node, node_region, &spec).await {
                         Ok(state) => match deploy.set_replica_state(&state).await {
                             Ok(()) => report.launched += 1,
                             Err(e) => report.errors.push(format!("{wl}/{replica}: persist: {e}")),
@@ -798,6 +805,7 @@ pub async fn reconcile_once(
                                 node,
                                 backend: backend.clone(),
                                 endpoint: instance.endpoint,
+                                region: region_of_node(nodes, node),
                                 healthy: true,
                                 phase: ReplicaPhase::Running,
                                 snapshot: None,
@@ -822,12 +830,21 @@ pub async fn reconcile_once(
     Ok(report)
 }
 
+/// The region of node `id` in `nodes`, for tagging a replica's endpoint (FA-8).
+fn region_of_node(nodes: &[Node], id: u64) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| n.id == id)
+        .and_then(|n| n.region.clone())
+}
+
 /// Materialize + launch one replica, returning its observed state.
 async fn launch_one(
     backend: &dyn ComputeBackend,
     workload: &str,
     replica: u32,
     node: u64,
+    node_region: Option<String>,
     spec: &ComputeSpec,
 ) -> Result<ObservedInstance, BackendError> {
     let artifact = backend.materialize(spec).await?;
@@ -844,6 +861,7 @@ async fn launch_one(
         node,
         backend: backend.id().to_string(),
         endpoint: instance.endpoint,
+        region: node_region,
         healthy: true,
         phase: ReplicaPhase::Running,
         snapshot: None,
@@ -1122,6 +1140,7 @@ mod tests {
                 host: "10.0.0.2".into(),
                 port: 80,
             },
+            region: None,
             healthy,
             phase: ReplicaPhase::Running,
             snapshot: None,
@@ -1705,7 +1724,13 @@ mod tests {
             .unwrap();
         assert_eq!((r.launched, r.stopped), (2, 0), "{:?}", r.errors);
         assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert_eq!(deploy.list_replica_states("w").await.unwrap().len(), 2);
+        let states = deploy.list_replica_states("w").await.unwrap();
+        assert_eq!(states.len(), 2);
+        // FA-8: each launched replica inherits its node's region tag.
+        assert!(
+            states.iter().all(|s| s.region.as_deref() == Some("eu")),
+            "replicas carry their node's region"
+        );
 
         // Pass 2: already converged (FakeBackend reports Healthy) → no-op.
         let r2 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive)
