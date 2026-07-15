@@ -37,6 +37,8 @@ Top-level sections, all optional:
 | `default_site` | string | — | Site served for a `Host` matching no domain, instead of `404`. |
 | `protect_previews` | bool | `false` | Require a control-plane token to view `/_deploy` previews. |
 | `pop_origin` | string | — | The fleet's canonical public origin (e.g. `https://cp.example.com`) a per-request proof-of-possession must bind (`aud`). Required for holder-bound (`cnf`/PoP) tokens; compared against the proof, never a `Host`/`X-Forwarded-*` header. Env `BOATRAMP_POP_ORIGIN`. See [PoP-bind a token](../how-to/pop-tokens.md). |
+| `blob_notify_tier` | `dry-run` \| `provision` \| `verify-only` \| `refuse` | — | Cloud blob-change notification provisioning tier for `blob` triggers on a cloud object store (S3→SQS / GCS→Pub/Sub / Azure→Event Grid). Absent ⇒ no provisioning (blob triggers work only on a self-watching backend like `fs`). See [Cloud blob triggers](../how-to/functions.md#cloud-blob-triggers-auto-provisioning). |
+| `blob_notify_account_id` | string | — | Scopes the provisioned notification pipeline: the **AWS account id** (S3 queue policy) or **GCP project id** (GCS topic + notificationConfig). Unused by Azure (the queue shares the account's shared-key auth). |
 
 > **Warning:** with no `auth_root_*` key configured, control-plane auth is
 > disabled. Under the default `multi-tenant` posture, `serve` refuses to start
@@ -171,6 +173,7 @@ microVM where `/dev/kvm` exists).
 | `subnet` | string | `10.0.0.0/24` | Guest IP subnet. |
 | `vcpus` | integer | detect | vCPUs this node advertises as schedulable (`0` = detect). |
 | `mem_mib` | integer | `1024` | Memory (MiB) advertised as schedulable (`0` = 1 GiB). |
+| `region` | string | — | This node's region tag (FA-8). Advertised on the node so a gateway routing to a `compute:`-backed workload with `--lb nearest` sends each request to the nearest replica by its node's region — no manual `--region` map. See [Route to the nearest region](../how-to/gateway.md#route-to-the-nearest-region). |
 | `kernel_signing_pubkeys` | list | boatramp's built-in key | **Static** trust anchors (`"<alg>:<hex>"`) for the strict-posture kernel bar; a signed default kernel must verify against one. |
 | `kernel_allowed_hashes` | list | the released `boatramp-vmlinux` hash | **Static** allow-list of kernel content hashes a dynamic default may select under `multi-tenant`. Ships pre-seeded with the first-party signed release so it verifies out of the box; replace it to allow only your own kernels. |
 

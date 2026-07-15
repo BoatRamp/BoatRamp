@@ -16,7 +16,9 @@ the `cargo build` command line. Some features imply others: `http3` implies
 | --- | --- | --- |
 | `fs` | yes | Filesystem blob backend (`--blobs fs`). |
 | `slatedb` | yes | The default `--kv slatedb`: a durable transactional LSM over an `object_store` backend. |
-| `s3` | no | S3 blob backend (`--blobs s3`). |
+| `s3` | no | S3 blob backend (`--blobs s3`) + its S3→SQS blob-change notification provider. |
+| `gcs` | no | Google Cloud Storage blob backend (`--blobs gcs`) + its GCS→Pub/Sub notification provider. |
+| `azure` | no | Azure Blob Storage backend (`--blobs azure`) + its Event Grid→Storage Queue notification provider. |
 | `cloudflare-kv` | no | Cloudflare KV metadata backend. |
 | `tls` | no | HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs). |
 | `acme-dns` | no | Wildcard TLS via ACME DNS-01 plus the `dns` subcommand (`--tls acme-dns`) and the pluggable DNS-provider clients. Implies `tls`. |

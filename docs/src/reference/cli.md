@@ -78,12 +78,19 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 | --- | --- | --- | --- |
 | `--addr <host:port>` | `BOATRAMP_ADDR` | `127.0.0.1:8080` | Bind address. |
 | `--data-dir <path>` | `BOATRAMP_DATA_DIR` | `./data` | Blob + KV root for the filesystem backends. |
-| `--blobs <fs\|s3>` | — | `fs` | Blob backend (`s3` needs `--features s3`). |
+| `--blobs <fs\|s3\|gcs\|azure>` | — | `fs` | Blob backend (`s3`/`gcs`/`azure` need `--features s3`/`gcs`/`azure`). |
 | `--kv <slatedb\|memory\|cloudflare>` | — | `slatedb` | KV backend (`cloudflare` needs `--features cloudflare-kv`). |
 | `--s3-bucket <name>` | `BOATRAMP_S3_BUCKET` | — | S3 bucket (`--blobs s3`). |
 | `--s3-endpoint <url>` | `BOATRAMP_S3_ENDPOINT` | — | S3 endpoint (MinIO / R2). |
 | `--s3-region <region>` | `BOATRAMP_S3_REGION` | — | S3 region. |
 | `--s3-path-style` | `BOATRAMP_S3_PATH_STYLE` | `false` | Use path-style S3 addressing. |
+| `--gcs-bucket <name>` | `BOATRAMP_GCS_BUCKET` | — | GCS bucket (`--blobs gcs`). Credentials via Application Default Credentials. |
+| `--gcs-endpoint <url>` | `BOATRAMP_GCS_ENDPOINT` | — | GCS endpoint (a `fake-gcs-server` emulator). |
+| `--gcs-anonymous` | `BOATRAMP_GCS_ANONYMOUS` | `false` | Skip GCS credential resolution (the emulator). |
+| `--azure-account <name>` | `BOATRAMP_AZURE_ACCOUNT` | — | Azure storage account (`--blobs azure`). |
+| `--azure-container <name>` | `BOATRAMP_AZURE_CONTAINER` | — | Azure container (`--blobs azure`). |
+| `--azure-access-key <key>` | `BOATRAMP_AZURE_ACCESS_KEY` | — | Azure shared-key auth (prefer the env var). |
+| `--azure-emulator` | `BOATRAMP_AZURE_EMULATOR` | `false` | Use the Azurite emulator (well-known dev credentials). |
 | `--cache-entries <n>` | — | `256` | Front metadata cache size. |
 
 ### Authentication

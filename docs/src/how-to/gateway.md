@@ -56,6 +56,14 @@ client region is unknown the pool falls back to health-first order — never a h
 failure. By default nearness is binary (same region wins); to rank *how* far apart
 regions are, set a distance table (`region_map`) in the site config directly.
 
+**Compute-backed pools tag themselves.** When the upstream resolves its pool from a
+compute workload (`compute: <name>`, replicas managed by the reconcile loop) rather
+than static `--backend`s, you don't write a `--region` map: each replica is
+**auto-tagged** with the region of the node it runs on — that node's
+[`[compute].region`](../reference/boatramp-cfg.md#compute). Just set `--lb nearest`
++ `--client-region-header` on the upstream and give each node a `[compute].region`,
+and every request goes to the nearest healthy replica.
+
 To resolve the pool from DNS instead of listing backends, discover an A/AAAA
 record set:
 
