@@ -31,6 +31,8 @@
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
+- [Deploy & invoke a function](./how-to/functions.md)
+- [Orchestrate functions with workflows](./how-to/workflows.md)
 - [Run a container or microVM](./how-to/compute.md)
 - [Scale compute to zero](./how-to/scale-to-zero.md)
 - [Load-balance & proxy upstreams](./how-to/gateway.md)
@@ -50,6 +52,7 @@
 
 - [What is boatramp](./explanation/what-is-boatramp.md)
 - [Core concepts & the deployment model](./explanation/concepts.md)
+- [Functions: the compute primitive](./explanation/functions.md)
 - [Architecture overview](./explanation/architecture.md)
 - [Storage, KV, and KvStore's three roles](./explanation/storage.md)
 - [Cache coherence](./explanation/cache-coherence.md)
@@ -59,7 +62,7 @@
 - [Mesh identity & the single root anchor](./explanation/SECURITY-mesh-identity.md)
 - [The security posture model](./explanation/security-posture.md)
 - [The configuration model](./explanation/config-model.md)
-- [Compute: handlers vs containers vs microVMs](./explanation/compute-model.md)
+- [Compute: functions and their runtimes](./explanation/compute-model.md)
 - [Deployment topologies & the one-UX seam](./explanation/topologies.md)
 - [Maturity, validation & support](./explanation/maturity.md)
 

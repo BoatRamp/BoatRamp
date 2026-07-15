@@ -525,6 +525,427 @@ impl DeployStore {
         Ok(sites.into_iter().collect())
     }
 
+    // ---- Top-level functions (PLAN-faas FA-2) --------------------------------
+    // Independently-versioned functions stored as one JSON record per name under
+    // `functions/<name>`, referencing content-addressed component blobs. Reuses the
+    // blob store + KV; the deploy/alias immutability model applies (a version id is
+    // its component's content hash).
+
+    /// Store a top-level function's record (its versions, active, aliases).
+    pub async fn put_function(&self, f: &crate::function::Function) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(f).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::function::keys::meta(&f.name), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a stored function record, if any.
+    pub async fn get_function(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::function::Function>, DeployError> {
+        match self.kv.get(&crate::function::keys::meta(name)).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List all stored (top-level) functions.
+    ///
+    /// Only the `functions/<name>` *meta* keys are function records; the
+    /// `functions/<name>/{versions,alias,triggers,invocations,idem}/…` sub-keys
+    /// are skipped by requiring the suffix to hold no further `/`.
+    pub async fn list_stored_functions(
+        &self,
+    ) -> Result<Vec<crate::function::Function>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("functions/").await? {
+            if key["functions/".len()..].contains('/') {
+                continue;
+            }
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(f) = serde_json::from_slice(&bytes) {
+                    out.push(f);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete a stored function. Returns whether it existed. The component blobs
+    /// are content-addressed + shared, so they are left to `prune`.
+    pub async fn delete_function(&self, name: &str) -> Result<bool, DeployError> {
+        let key = crate::function::keys::meta(name);
+        let existed = self.kv.get(&key).await?.is_some();
+        self.kv.delete(&key).await?;
+        Ok(existed)
+    }
+
+    // ---- function triggers (FA-3 scheduled / FA-5 event sources) ------------
+
+    /// Persist (create or replace) a stored trigger on a function.
+    pub async fn put_trigger(
+        &self,
+        function: &str,
+        trigger: &crate::function::FunctionTrigger,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(trigger).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::function::keys::trigger(function, &trigger.id),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Load one stored trigger, if any.
+    pub async fn get_trigger(
+        &self,
+        function: &str,
+        id: &str,
+    ) -> Result<Option<crate::function::FunctionTrigger>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::trigger(function, id))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List a function's stored triggers.
+    pub async fn list_triggers(
+        &self,
+        function: &str,
+    ) -> Result<Vec<crate::function::FunctionTrigger>, DeployError> {
+        let prefix = format!("functions/{function}/triggers/");
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(t) = serde_json::from_slice(&bytes) {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete a stored trigger. Returns whether it existed.
+    pub async fn delete_trigger(&self, function: &str, id: &str) -> Result<bool, DeployError> {
+        let key = crate::function::keys::trigger(function, id);
+        let existed = self.kv.get(&key).await?.is_some();
+        self.kv.delete(&key).await?;
+        Ok(existed)
+    }
+
+    // ---- function invocations (FA-3) ---------------------------------------
+
+    /// Persist (create or update) an invocation record.
+    pub async fn put_invocation(
+        &self,
+        inv: &crate::function::Invocation,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(inv).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::function::keys::invocation(&inv.function, &inv.id),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Load one invocation record, if any.
+    pub async fn get_invocation(
+        &self,
+        function: &str,
+        id: &str,
+    ) -> Result<Option<crate::function::Invocation>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::invocation(function, id))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List a function's invocation records (queue scan / poll listing).
+    pub async fn list_invocations(
+        &self,
+        function: &str,
+    ) -> Result<Vec<crate::function::Invocation>, DeployError> {
+        let prefix = crate::function::keys::invocations_prefix(function);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(inv) = serde_json::from_slice(&bytes) {
+                    out.push(inv);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bind an idempotency key to an invocation id (the dedup pointer). The value
+    /// is the raw invocation id.
+    pub async fn put_idempotency(
+        &self,
+        function: &str,
+        key: &str,
+        invocation_id: &str,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .put(
+                &crate::function::keys::idempotency(function, key),
+                invocation_id.as_bytes().to_vec(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve an idempotency key to its invocation id, if one was recorded.
+    pub async fn get_idempotency(
+        &self,
+        function: &str,
+        key: &str,
+    ) -> Result<Option<String>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::idempotency(function, key))
+            .await?
+        {
+            Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    // ---- function metering (FA-4) ------------------------------------------
+
+    /// The usage aggregate for a function, if any has been recorded.
+    pub async fn get_metering(
+        &self,
+        function: &str,
+    ) -> Result<Option<crate::function::Metering>, DeployError> {
+        match self
+            .kv
+            .get(&crate::function::keys::metering(function))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist a function's usage aggregate.
+    pub async fn put_metering(
+        &self,
+        metering: &crate::function::Metering,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(metering).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::function::keys::metering(&metering.function), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// List every function's usage aggregate (the `functions usage` fan-out).
+    pub async fn list_metering(&self) -> Result<Vec<crate::function::Metering>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("metering/").await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(m) = serde_json::from_slice(&bytes) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // ---- blob-change notification ledger (FA-5b2) --------------------------
+
+    /// Record the cloud notification pipeline provisioned for a function's
+    /// blob-change trigger, so it can be retracted later.
+    pub async fn put_managed_notification(
+        &self,
+        record: &crate::blob_notify::ManagedNotification,
+    ) -> Result<(), DeployError> {
+        let bytes = record
+            .to_json()
+            .map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(
+                &crate::blob_notify::blobnotify_key(&record.function, &record.prefix),
+                bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The notification ledger entry for `(function, prefix)`, if any.
+    pub async fn get_managed_notification(
+        &self,
+        function: &str,
+        prefix: &str,
+    ) -> Result<Option<crate::blob_notify::ManagedNotification>, DeployError> {
+        match self
+            .kv
+            .get(&crate::blob_notify::blobnotify_key(function, prefix))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                crate::blob_notify::ManagedNotification::from_json(&bytes)
+                    .map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// All notification ledger entries for a function.
+    pub async fn list_managed_notifications(
+        &self,
+        function: &str,
+    ) -> Result<Vec<crate::blob_notify::ManagedNotification>, DeployError> {
+        let prefix = crate::blob_notify::blobnotify_function_prefix(function);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(record) = crate::blob_notify::ManagedNotification::from_json(&bytes) {
+                    out.push(record);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop a notification ledger entry (after its resources are retracted).
+    pub async fn remove_managed_notification(
+        &self,
+        function: &str,
+        prefix: &str,
+    ) -> Result<(), DeployError> {
+        self.kv
+            .delete(&crate::blob_notify::blobnotify_key(function, prefix))
+            .await?;
+        Ok(())
+    }
+
+    // ---- workflows (FA-6) --------------------------------------------------
+
+    /// Persist a workflow definition.
+    pub async fn put_workflow(
+        &self,
+        workflow: &crate::workflow::Workflow,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(workflow).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::workflow::keys::definition(&workflow.name), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a workflow definition, if any.
+    pub async fn get_workflow(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::workflow::Workflow>, DeployError> {
+        match self
+            .kv
+            .get(&crate::workflow::keys::definition(name))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List all workflow definitions (skips the `workflows/<name>/runs/…` sub-keys
+    /// by requiring the suffix to hold no further `/`).
+    pub async fn list_workflows(&self) -> Result<Vec<crate::workflow::Workflow>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("workflows/").await? {
+            if key["workflows/".len()..].contains('/') {
+                continue;
+            }
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(w) = serde_json::from_slice(&bytes) {
+                    out.push(w);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete a workflow definition. Returns whether it existed. Runs are left in
+    /// place (terminal history); `prune` removes them.
+    pub async fn delete_workflow(&self, name: &str) -> Result<bool, DeployError> {
+        let key = crate::workflow::keys::definition(name);
+        let existed = self.kv.get(&key).await?.is_some();
+        self.kv.delete(&key).await?;
+        Ok(existed)
+    }
+
+    /// Persist (create or update) a workflow run.
+    pub async fn put_workflow_run(
+        &self,
+        run: &crate::workflow::WorkflowRun,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(run).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&crate::workflow::keys::run(&run.workflow, &run.id), bytes)
+            .await?;
+        Ok(())
+    }
+
+    /// Load one workflow run, if any.
+    pub async fn get_workflow_run(
+        &self,
+        workflow: &str,
+        id: &str,
+    ) -> Result<Option<crate::workflow::WorkflowRun>, DeployError> {
+        match self
+            .kv
+            .get(&crate::workflow::keys::run(workflow, id))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List a workflow's runs (the executor drain scan / poll listing).
+    pub async fn list_workflow_runs(
+        &self,
+        workflow: &str,
+    ) -> Result<Vec<crate::workflow::WorkflowRun>, DeployError> {
+        let prefix = crate::workflow::keys::runs_prefix(workflow);
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(&prefix).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if let Ok(run) = serde_json::from_slice(&bytes) {
+                    out.push(run);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The ownership-verification challenge for `(site, host)`, if one exists.
     pub async fn get_domain_verification(
         &self,
@@ -1733,6 +2154,357 @@ mod tests {
         async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
             Ok(Vec::new())
         }
+    }
+
+    #[tokio::test]
+    async fn function_storage_versioning_alias_rollback() {
+        use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store.list_stored_functions().await.unwrap().is_empty());
+
+        let mut f = Function::new(
+            "resize",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(&f).await.unwrap();
+        assert_eq!(
+            store.get_function("resize").await.unwrap().unwrap().active,
+            "hashA"
+        );
+        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+
+        // A new version + an alias, persisted and read back.
+        f.upsert_version("hashB", Lifecycle::Independent, 2);
+        f.set_alias("prod", "hashA").unwrap();
+        store.put_function(&f).await.unwrap();
+        let got = store.get_function("resize").await.unwrap().unwrap();
+        assert_eq!(got.active, "hashB");
+        assert_eq!(got.aliases.get("prod").map(String::as_str), Some("hashA"));
+
+        // Delete is idempotent + reports prior existence.
+        assert!(store.delete_function("resize").await.unwrap());
+        assert!(store.get_function("resize").await.unwrap().is_none());
+        assert!(!store.delete_function("resize").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn function_invocation_and_idempotency_storage() {
+        use crate::function::{
+            Function, FunctionConfig, Invocation, InvocationResult, InvocationStatus, InvokeMode,
+            Lifecycle, Owner,
+        };
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        // A function whose invocation sub-keys must NOT leak into the function list.
+        let f = Function::new(
+            "greeter",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(&f).await.unwrap();
+
+        let mut inv = Invocation {
+            id: "inv-1".into(),
+            function: "greeter".into(),
+            version: "hashA".into(),
+            mode: InvokeMode::Async,
+            status: InvocationStatus::Queued,
+            idempotency_key: Some("key-1".into()),
+            attempts: 0,
+            request_b64: None,
+            request_content_type: None,
+            result: None,
+            created: 10,
+            updated: 10,
+        };
+        store.put_invocation(&inv).await.unwrap();
+        store
+            .put_idempotency("greeter", "key-1", "inv-1")
+            .await
+            .unwrap();
+
+        // Read back, resolve the idempotency pointer, and list.
+        assert_eq!(
+            store
+                .get_invocation("greeter", "inv-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Queued
+        );
+        assert_eq!(
+            store.get_idempotency("greeter", "key-1").await.unwrap(),
+            Some("inv-1".to_string())
+        );
+        assert_eq!(store.list_invocations("greeter").await.unwrap().len(), 1);
+        // The invocation + idempotency sub-keys must not be mistaken for functions.
+        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+
+        // Transition to a terminal, captured result.
+        inv.status = InvocationStatus::Succeeded;
+        inv.attempts = 1;
+        inv.result = Some(InvocationResult {
+            status: 200,
+            content_type: Some("text/plain".into()),
+            body_b64: "aGVsbG8=".into(),
+        });
+        inv.updated = 20;
+        store.put_invocation(&inv).await.unwrap();
+        let got = store
+            .get_invocation("greeter", "inv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.is_terminal());
+        assert_eq!(got.result.unwrap().status, 200);
+
+        // An unrecorded key resolves to nothing.
+        assert!(store
+            .get_idempotency("greeter", "absent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn notification_ledger_provisions_and_retracts_through_the_store() {
+        use crate::blob_notify::{ManagedResource, ProvisionTier};
+        use crate::blob_provision::{ensure_watch, retract_watch, ProvisionError, WatchProvider};
+        use crate::kv::MemoryKv;
+
+        // A minimal provider standing in for a cloud SDK.
+        struct StoreMock;
+        #[async_trait::async_trait]
+        impl WatchProvider for StoreMock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn recipe(&self, _prefix: &str) -> String {
+                String::new()
+            }
+            async fn provision(
+                &self,
+                _prefix: &str,
+            ) -> Result<Vec<ManagedResource>, ProvisionError> {
+                Ok(vec![ManagedResource::new("queue", "q-1")])
+            }
+            async fn verify(&self, _prefix: &str) -> Result<bool, ProvisionError> {
+                Ok(true)
+            }
+            async fn retract(&self, _res: &[ManagedResource]) -> Result<(), ProvisionError> {
+                Ok(())
+            }
+        }
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store
+            .get_managed_notification("ingest", "uploads/")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Provision through the real store (its `LedgerSink` impl) → recorded.
+        let provider = StoreMock;
+        let out = ensure_watch(
+            &provider,
+            ProvisionTier::Provision,
+            "ingest",
+            "uploads/",
+            &store,
+            7,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            out,
+            crate::blob_provision::ProvisionOutcome::Ready
+        ));
+        let record = store
+            .get_managed_notification("ingest", "uploads/")
+            .await
+            .unwrap()
+            .expect("the pipeline is recorded in the store ledger");
+        assert_eq!(record.provider, "mock");
+        assert_eq!(
+            store
+                .list_managed_notifications("ingest")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Retract removes the ledger entry.
+        retract_watch(&provider, &record, &store).await.unwrap();
+        assert!(store
+            .get_managed_notification("ingest", "uploads/")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_definition_and_run_storage() {
+        use crate::kv::MemoryKv;
+        use crate::workflow::{Step, Workflow, WorkflowRun};
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store.get_workflow("etl").await.unwrap().is_none());
+        assert!(store.list_workflows().await.unwrap().is_empty());
+
+        let wf = Workflow {
+            name: "etl".into(),
+            steps: vec![
+                Step {
+                    id: "a".into(),
+                    function: "extract".into(),
+                    depends_on: vec![],
+                    retry: Default::default(),
+                    compensate: None,
+                },
+                Step {
+                    id: "b".into(),
+                    function: "load".into(),
+                    depends_on: vec!["a".into()],
+                    retry: Default::default(),
+                    compensate: None,
+                },
+            ],
+        };
+        store.put_workflow(&wf).await.unwrap();
+        assert_eq!(store.get_workflow("etl").await.unwrap().unwrap(), wf);
+        assert_eq!(store.list_workflows().await.unwrap().len(), 1);
+
+        // A run is stored under the workflow's runs prefix — not mistaken for a def.
+        let run = WorkflowRun::start(&wf, "r1", None, 5);
+        store.put_workflow_run(&run).await.unwrap();
+        assert_eq!(
+            store.get_workflow_run("etl", "r1").await.unwrap().unwrap(),
+            run
+        );
+        assert_eq!(store.list_workflow_runs("etl").await.unwrap().len(), 1);
+        // The run sub-key must not appear in the definition list.
+        assert_eq!(store.list_workflows().await.unwrap().len(), 1);
+
+        // Delete reports prior existence + is idempotent.
+        assert!(store.delete_workflow("etl").await.unwrap());
+        assert!(store.get_workflow("etl").await.unwrap().is_none());
+        assert!(!store.delete_workflow("etl").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn function_trigger_storage_round_trips() {
+        use crate::function::{
+            Function, FunctionConfig, FunctionTrigger, Lifecycle, Owner, TriggerKind,
+        };
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let f = Function::new(
+            "worker",
+            Owner::Project("acme".into()),
+            "hashA",
+            FunctionConfig::default(),
+            Lifecycle::Independent,
+            1,
+        );
+        store.put_function(&f).await.unwrap();
+        assert!(store.list_triggers("worker").await.unwrap().is_empty());
+
+        let cron = FunctionTrigger {
+            id: "tick".into(),
+            kind: TriggerKind::Cron {
+                schedule: "* * * * *".into(),
+                overlap: Default::default(),
+            },
+            last_fired_minute: None,
+        };
+        store.put_trigger("worker", &cron).await.unwrap();
+        let queue = FunctionTrigger {
+            id: "jobs".into(),
+            kind: TriggerKind::Queue {
+                topic: "jobs".into(),
+            },
+            last_fired_minute: None,
+        };
+        store.put_trigger("worker", &queue).await.unwrap();
+
+        assert_eq!(store.list_triggers("worker").await.unwrap().len(), 2);
+        assert_eq!(
+            store.get_trigger("worker", "tick").await.unwrap().unwrap(),
+            cron
+        );
+        // Trigger sub-keys don't leak into the function list.
+        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+
+        // Dedup state persists through an update.
+        let mut fired = cron.clone();
+        fired.last_fired_minute = Some(42);
+        store.put_trigger("worker", &fired).await.unwrap();
+        assert_eq!(
+            store
+                .get_trigger("worker", "tick")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_fired_minute,
+            Some(42)
+        );
+
+        // Delete reports prior existence + is idempotent.
+        assert!(store.delete_trigger("worker", "tick").await.unwrap());
+        assert!(!store.delete_trigger("worker", "tick").await.unwrap());
+        assert_eq!(store.list_triggers("worker").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn function_metering_storage_is_tenant_isolated() {
+        use crate::function::{Metering, MeteringSample};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        assert!(store.get_metering("a").await.unwrap().is_none());
+
+        let mut ma = Metering::new("a");
+        ma.record(
+            &MeteringSample {
+                success: true,
+                duration_ms: 4,
+                bytes_in: 1,
+                bytes_out: 2,
+            },
+            10,
+        );
+        store.put_metering(&ma).await.unwrap();
+
+        let mut mb = Metering::new("b");
+        mb.record(
+            &MeteringSample {
+                success: false,
+                duration_ms: 9,
+                bytes_in: 0,
+                bytes_out: 0,
+            },
+            11,
+        );
+        store.put_metering(&mb).await.unwrap();
+
+        // Each function's aggregate is stored + read independently.
+        assert_eq!(store.get_metering("a").await.unwrap().unwrap().successes, 1);
+        assert_eq!(store.get_metering("b").await.unwrap().unwrap().failures, 1);
+        let all = store.list_metering().await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]

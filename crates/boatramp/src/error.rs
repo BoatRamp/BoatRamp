@@ -33,6 +33,12 @@ pub enum CliError {
     /// `prune`, `scrub`, `cert-status`).
     #[error(transparent)]
     Manage(#[from] crate::manage::Error),
+    /// The `function` command.
+    #[error(transparent)]
+    Function(#[from] crate::function::FunctionError),
+    /// The `workflow` command.
+    #[error(transparent)]
+    Workflow(#[from] crate::workflow::WorkflowError),
     /// The `domain` command.
     #[error(transparent)]
     Domains(#[from] crate::domains::Error),

@@ -13,6 +13,9 @@ use clap::{Subcommand, ValueEnum};
 enum LbArg {
     RoundRobin,
     Random,
+    /// Route to the nearest healthy backend by region (FA-8); pair with
+    /// `--client-region-header` + `--region URL=REGION`.
+    Nearest,
 }
 
 impl From<LbArg> for LbPolicy {
@@ -20,8 +23,20 @@ impl From<LbArg> for LbPolicy {
         match a {
             LbArg::RoundRobin => LbPolicy::RoundRobin,
             LbArg::Random => LbPolicy::Random,
+            LbArg::Nearest => LbPolicy::Nearest,
         }
     }
+}
+
+/// Parse a `--region URL=REGION` tag into a `(url, region)` pair.
+fn parse_region_tag(tag: &str) -> Result<(String, String)> {
+    let (url, region) = tag
+        .split_once('=')
+        .ok_or_else(|| Error::BadRegion(tag.to_string()))?;
+    if url.is_empty() || region.is_empty() {
+        return Err(Error::BadRegion(tag.to_string()));
+    }
+    Ok((url.to_string(), region.to_string()))
 }
 
 use crate::client;
@@ -48,6 +63,9 @@ pub enum Error {
     /// `route rm` named a route that doesn't exist.
     #[error("no route matching {0}")]
     NoRoute(String),
+    /// A `--region` tag was not `URL=REGION`.
+    #[error("bad --region {0:?}; expected URL=REGION")]
+    BadRegion(String),
 }
 
 /// `gateway` module result; `Err` is [`Error`].
@@ -159,6 +177,14 @@ enum UpstreamCommand {
         /// Accept a self-signed / invalid upstream TLS certificate.
         #[arg(long)]
         tls_insecure: bool,
+        /// For `--lb nearest`: the request header carrying the client's region
+        /// (set by the CDN/edge, e.g. `fly-region`, `cf-ipcountry`).
+        #[arg(long)]
+        client_region_header: Option<String>,
+        /// For `--lb nearest`: tag a backend with a region as `URL=REGION`
+        /// (repeatable). Untagged backends are region-neutral.
+        #[arg(long = "region", value_name = "URL=REGION")]
+        regions: Vec<String>,
     },
     /// Remove an upstream (and any routes that reference it).
     Rm {
@@ -222,6 +248,8 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
             connect_timeout_ms,
             request_timeout_ms,
             tls_insecure,
+            client_region_header,
+            regions,
         }) => {
             let discover = discover_host.map(|host| Discovery {
                 host,
@@ -254,6 +282,11 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
                     expected_status: probe_expected_status.unwrap_or(d.expected_status),
                 }
             });
+            // Parse the `--region URL=REGION` tags into the per-backend map (FA-8).
+            let region_tags = regions
+                .iter()
+                .map(|t| parse_region_tag(t))
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
             gateway.upstreams.insert(
                 name.clone(),
                 Upstream {
@@ -269,6 +302,8 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
                     connect_timeout_ms,
                     request_timeout_ms,
                     tls_insecure,
+                    regions: region_tags,
+                    client_region_header,
                     ..Default::default()
                 },
             );

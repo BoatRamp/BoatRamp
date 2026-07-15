@@ -10,6 +10,7 @@
 
 pub mod access;
 pub mod authz;
+pub mod blob_notify;
 pub mod cert;
 pub mod compute;
 pub mod config;
@@ -20,13 +21,16 @@ pub mod dns_managed;
 pub mod domain_verify;
 pub mod error;
 pub mod file;
+pub mod function;
 pub mod gateway;
+pub mod geo;
 pub mod manifest;
 pub mod matcher;
 pub mod predicate;
 pub mod route;
 pub mod security;
 pub mod waf;
+pub mod workflow;
 
 pub use error::ConfigError;
 

@@ -1,16 +1,19 @@
-# Compute: handlers vs containers vs microVMs
+# Compute: functions and their runtimes
 
-boatramp runs application code three ways. They differ in isolation, startup
-cost, and what code they can run. Pick the lightest one that fits.
+The unit of compute is a [function](./functions.md) — a portable WASI component.
+Its **runtime** is a separate choice: *where* that function's code executes. The
+three runtimes differ in isolation, startup cost, and what code they can run; pick
+the lightest one that fits. This is one knob on the function, not three different
+kinds of compute.
 
-## The three options
+## The three runtimes
 
-**Wasm handler** — a WebAssembly component bound to a route. It runs in an
-in-process wasmtime sandbox with capability-based host bindings (kv, sql,
-blobstore, messaging). Instantiation is sub-millisecond, memory is small, and the
-sandbox is strong because the guest can only touch what you grant. The constraint
-is the model: the code must compile to a `wasi:http` component. Reach for a
-handler first — see [Deploy a handler](../how-to/deploy-handler.md).
+**Wasm** (the default) — the component runs in an in-process wasmtime sandbox with
+capability-based host bindings (kv, sql, blobstore, messaging). Instantiation is
+sub-millisecond, memory is small, and the sandbox is strong because the guest can
+only touch what you grant. The constraint is the model: the code must compile to a
+`wasi:http` component. This is the runtime a [handler](../how-to/deploy-handler.md)
+(a route-triggered function) uses, and the one to reach for first.
 
 **Container** — an OCI image run as a long-lived workload with a shared host
 kernel, isolated with a jailed worker, namespaces, cgroups, and a seccomp filter.
@@ -25,13 +28,15 @@ backend; a microVM backend is available on Linux hosts with `/dev/kvm`.
 
 ## Choosing
 
-| | Wasm handler | Container | microVM |
+| | Wasm | Container | microVM |
 | --- | --- | --- | --- |
 | Isolation | in-process capability sandbox | shared kernel + namespaces | own kernel (hardware) |
 | Startup | sub-millisecond | fast | boot (or restore) |
 | Runs | `wasi:http` components | any Linux program | any Linux program |
 | Trust | any | code you trust | untrusted / tenant code |
 
+A function selects its runtime with a `runtime` knob (`wasm` by default); the
+trigger, versioning, and addressing are the same whichever runtime executes it.
 The isolation choice is also a posture decision. Under the strict `multi-tenant`
 [security posture](./security-posture.md), shared-kernel (container) compute is
 disabled, so a workload marked `--isolation untrusted` — or any workload under

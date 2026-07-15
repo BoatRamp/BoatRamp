@@ -1,10 +1,13 @@
 # What is boatramp?
 
-boatramp is software you run to publish static sites, WebAssembly handlers, and
-private services on your own infrastructure. It ships as a single Rust binary
-that is both the server and the CLI: the same executable serves HTTP, exposes a
-control-plane API, and drives deployments from the command line. You install it,
-point it at a folder, and it hosts what you publish.
+boatramp is software you run to publish static sites, **functions**, and private
+services on your own infrastructure. A function is a portable WASI component you
+run behind a route (a *handler*), invoke by name, put on a schedule, or chain into
+a [workflow](../how-to/workflows.md) — the same component, reached different ways
+(see [Functions: the compute primitive](./functions.md)). It ships as a single
+Rust binary that is both the server and the CLI: the same executable serves HTTP,
+exposes a control-plane API, and drives deployments from the command line. You
+install it, point it at a folder, and it hosts what you publish.
 
 Two principles shape everything else.
 
@@ -27,7 +30,7 @@ data. It is also not a CDN you point at an origin, and not a web server you hand
 a config file. Where Vercel and Netlify run the infrastructure for you, boatramp
 gives you the same publishing model to run yourself. Where Caddy and nginx serve
 files and proxy requests, boatramp adds deployments, virtualhost routing, TLS
-issuance, sandboxed handlers, and authorization as one system.
+issuance, sandboxed functions, and authorization as one system.
 
 ## Who it is for
 
@@ -40,4 +43,5 @@ they run a single node, a Raft cluster, or Cloudflare Containers.
 - Evaluating boatramp? Publish something in [your first site](../tutorials/first-site.md).
 - Running it in production? Start with [deploying a single node](../how-to/deploy-single-node.md).
 - Writing dynamic routes? See the [handlers tutorial](../tutorials/first-handler.md).
-- Want the model behind it? Read the [core concepts](./concepts.md).
+- Want the compute model? Read [Functions: the compute primitive](./functions.md).
+- Want the deployment model? Read the [core concepts](./concepts.md).

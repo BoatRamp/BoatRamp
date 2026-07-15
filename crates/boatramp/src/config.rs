@@ -192,6 +192,11 @@ pub struct ComputeConfig {
     /// default may select under `multi-tenant`. Host-access-gated. Empty ⇒ no
     /// kernel is allow-listed.
     pub kernel_allowed_hashes: Vec<String>,
+    /// This node's **region** tag (FA-8). Advertised on the compute `Node` so a
+    /// gateway routing to a `compute:`-backed workload with `--lb nearest` sends
+    /// each request to the nearest replica by its node's region — no manual
+    /// `--region` map. `None` ⇒ region-agnostic.
+    pub region: Option<String>,
 }
 
 /// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
@@ -219,6 +224,7 @@ impl Default for ComputeConfig {
             kernel_allowed_hashes: vec![
                 "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
             ],
+            region: None,
         }
     }
 }
@@ -540,6 +546,16 @@ pub struct ServeConfig {
     /// Keep the config cache coherent across processes sharing one KV via the
     /// changelog.
     pub shared_cache_coherence: bool,
+    /// Cloud blob-change notification provisioning tier (FA-5b2): how boatramp
+    /// obtains the native event pipeline (S3→SQS) that backs a `blob` trigger —
+    /// `dry-run` (print the recipe), `provision` (create + retract), `verify-only`
+    /// (operator pre-wired), or `refuse` (fail closed). Absent ⇒ no provisioning:
+    /// `blob` triggers then work only on a self-watching backend (fs). Only wired
+    /// for the S3 backend (`--features s3`).
+    pub blob_notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    /// The AWS account id used to scope the provisioned SQS queue's `SendMessage`
+    /// policy (`aws:SourceAccount`). Required when `blob_notify_tier` provisions.
+    pub blob_notify_account_id: Option<String>,
 }
 
 /// `publish` section — where and what to deploy (the `sync` target).

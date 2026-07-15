@@ -27,4 +27,9 @@ Hashi = "Hashi"
 [files]
 # Lockfiles and vendored third-party WIT (upstream WASI definitions, copied
 # verbatim — their spelling is not ours to "fix").
-extend-exclude = ["Cargo.lock", "flake.lock", "examples/handlers/*/wit/**"]
+extend-exclude = [
+  "Cargo.lock",
+  "flake.lock",
+  "examples/handlers/*/wit/**",
+  "crates/boatramp/templates/*/wit/**",
+]

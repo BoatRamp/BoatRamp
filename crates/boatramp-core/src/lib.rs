@@ -13,6 +13,7 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+pub mod blob_provision;
 pub mod cache_coherence;
 #[cfg(feature = "authz")]
 pub mod cedar;
@@ -41,8 +42,8 @@ pub mod sql;
 // `boatramp_core::config`/`::route`/`::matcher`/`::domain_verify`/… paths are
 // unchanged. (`compute` is its own module above — it re-exports the types layer.)
 pub use boatramp_types::{
-    access, authz, config, cron, daemon_config, dns_managed, domain_verify, gateway, matcher,
-    predicate, route, security, waf,
+    access, authz, blob_notify, config, cron, daemon_config, dns_managed, domain_verify, function,
+    gateway, geo, matcher, predicate, route, security, waf, workflow,
 };
 pub use boatramp_types::{schema_version, SCHEMA_VERSION};
 
@@ -83,6 +84,31 @@ pub struct GetObject {
     pub body: ByteStream,
 }
 
+/// How an object under a watched prefix changed (FA-5 blob-change triggers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobChangeKind {
+    /// An object was created.
+    Created,
+    /// An existing object's bytes changed.
+    Modified,
+    /// An object was removed.
+    Removed,
+}
+
+/// A single change event under a watched prefix — a backend-native notification
+/// ([`Storage::watch`]), never boatramp's own write path (so the semantics are the
+/// same whoever wrote it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobChange {
+    /// The full storage key that changed.
+    pub key: String,
+    /// What happened to it.
+    pub kind: BlobChangeKind,
+}
+
+/// A stream of change events under a watched prefix, live until dropped.
+pub type ChangeStream = BoxStream<'static, BlobChange>;
+
 /// A pluggable, streaming object-storage backend.
 ///
 /// Implementations MUST stream data without buffering whole objects in memory.
@@ -116,4 +142,21 @@ pub trait Storage: Send + Sync {
 
     /// List object metadata under `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError>;
+
+    /// Whether this backend can natively watch for changes (FA-5 blob-change
+    /// triggers). A cheap, side-effect-free capability probe: a `Blob` trigger is
+    /// **refused at activation** on a backend that returns `false`, so the
+    /// semantics never silently degrade. Defaults to `false`.
+    fn supports_watch(&self) -> bool {
+        false
+    }
+
+    /// Watch for changes under `prefix`, returning a live stream of
+    /// [`BlobChange`]s until dropped (backend-native notification — inotify /
+    /// FSEvents locally, SQS / Pub/Sub / Event Grid for cloud stores). `Ok(None)`
+    /// means this backend does not support watching (the default), matching
+    /// [`supports_watch`](Self::supports_watch).
+    async fn watch(&self, _prefix: &str) -> Result<Option<ChangeStream>, StorageError> {
+        Ok(None)
+    }
 }

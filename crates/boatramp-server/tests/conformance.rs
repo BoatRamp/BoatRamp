@@ -1563,6 +1563,1142 @@ async fn handler_route_dispatches_through_engine() {
     assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
 }
 
+// ---- function invoke API (FA-3) --------------------------------------------
+
+/// Deploy a top-level function straight into the store: upload `component` as a
+/// content-addressed blob and store a `Function` whose single active version is
+/// it. Returns the component hash (= the version id).
+#[cfg(feature = "handlers")]
+async fn deploy_test_function(
+    deploy: &DeployStore,
+    name: &str,
+    component: &[u8],
+    imports: Vec<String>,
+) -> String {
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner};
+    let hash = sha256_hex(component);
+    let bytes = component.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let config = FunctionConfig {
+        imports,
+        ..Default::default()
+    };
+    let f = Function::new(
+        name,
+        Owner::Project("default".into()),
+        &hash,
+        config,
+        Lifecycle::Independent,
+        0,
+    );
+    deploy.put_function(&f).await.unwrap();
+    hash
+}
+
+/// Build a `POST /api/functions/<name>/invoke` request with an optional
+/// `?mode=` and `Idempotency-Key`.
+#[cfg(feature = "handlers")]
+fn invoke_request(name: &str, mode: Option<&str>, idem: Option<&str>) -> Request<Body> {
+    let uri = match mode {
+        Some(m) => format!("/api/functions/{name}/invoke?mode={m}"),
+        None => format!("/api/functions/{name}/invoke"),
+    };
+    let mut builder = Request::builder().method("POST").uri(uri);
+    if let Some(key) = idem {
+        builder = builder.header("idempotency-key", key);
+    }
+    let mut req = builder.body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40100))));
+    req
+}
+
+/// Sync invoke runs the component inline and returns its response; a repeated
+/// `Idempotency-Key` replays the first outcome instead of running again (proven
+/// by the counter fixture advancing only once).
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_sync_and_idempotency() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Two plain sync invokes run twice — the counter advances 1 → 2.
+    for expected in ["hits=1\n", "hits=2\n"] {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("counter", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], expected.as_bytes());
+    }
+
+    // Same idempotency key twice → the second replays the first (still hits=3).
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("counter", None, Some("k-1")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        seen.push(String::from_utf8_lossy(&body).into_owned());
+    }
+    assert_eq!(seen, vec!["hits=3\n".to_string(), "hits=3\n".to_string()]);
+
+    // A fresh key runs again — hits=4, so exactly one run happened per key.
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("counter", None, Some("k-2")))
+        .await
+        .unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"hits=4\n");
+
+    // Invoking an unknown function is a 404.
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("ghost", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Async invoke returns `202` + an invocation id, the scheduler drains it, and a
+/// poll reports `succeeded` with the captured result.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_async_drains_and_polls() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    // Drain worker: the scheduler tick processes queued invocations.
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Enqueue → 202 + a queued record.
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("counter", Some("async"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let queued: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(queued["status"], "queued");
+    let id = queued["id"].as_str().unwrap().to_string();
+
+    // Poll until the drain settles it (first scheduler tick fires immediately).
+    let final_status = poll_invocation(&app, "counter", &id).await;
+    assert_eq!(final_status["status"], "succeeded");
+    assert_eq!(final_status["result"]["status"], 200);
+    // The captured body is base64 of "hits=1\n".
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(final_status["result"]["body_b64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&decoded[..], b"hits=1\n");
+}
+
+/// A durable invocation whose component can't run (a non-Wasm blob → a compile
+/// failure = a delivery failure) is retried up to the cap, then dead-lettered
+/// (`failed`, `attempts == MAX`).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn function_invoke_async_dead_letters_on_repeated_failure() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    // A blob that is present but is not a valid Wasm component: every run
+    // compile-fails → a 500 → a retryable delivery failure.
+    deploy_test_function(&deploy, "broken", b"not a wasm component", Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("broken", Some("async"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let queued: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let id = queued["id"].as_str().unwrap().to_string();
+
+    let final_status = poll_invocation(&app, "broken", &id).await;
+    assert_eq!(final_status["status"], "failed");
+    assert_eq!(final_status["attempts"], 5); // MAX_INVOKE_ATTEMPTS
+}
+
+/// Deploy a top-level function with a usage `quota` set (FA-4).
+#[cfg(feature = "handlers")]
+async fn deploy_quota_function(
+    deploy: &DeployStore,
+    name: &str,
+    component: &[u8],
+    quota: boatramp_core::function::FunctionQuota,
+) -> String {
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner};
+    let hash = sha256_hex(component);
+    let bytes = component.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let config = FunctionConfig {
+        quota,
+        ..Default::default()
+    };
+    let f = Function::new(
+        name,
+        Owner::Project("default".into()),
+        &hash,
+        config,
+        Lifecycle::Independent,
+        0,
+    );
+    deploy.put_function(&f).await.unwrap();
+    hash
+}
+
+/// Fetch a function's usage aggregate via `GET /usage`.
+#[cfg(feature = "handlers")]
+async fn fetch_usage(app: &axum::Router, name: &str) -> serde_json::Value {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/functions/{name}/usage"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The rate-limit quota admits up to `max_invocations` per window, then fails
+/// closed with `429`; metering counts only the admitted+run invocations.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_quota_returns_429_and_meters_admitted() {
+    use boatramp_core::function::FunctionQuota;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_quota_function(
+        &deploy,
+        "limited",
+        HTTP_200,
+        FunctionQuota {
+            max_invocations: Some(2),
+            window_secs: Some(3600),
+            max_concurrent: None,
+        },
+    )
+    .await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // First two admitted, third rate-limited (fail-closed).
+    for expect in [
+        StatusCode::OK,
+        StatusCode::OK,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("limited", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expect);
+    }
+
+    // Usage reflects only the two that ran.
+    let usage = fetch_usage(&app, "limited").await;
+    assert_eq!(usage["invocations"], 2);
+    assert_eq!(usage["successes"], 2);
+}
+
+/// Metering accumulates per invocation and is tenant-isolated (one function's
+/// usage never bleeds into another's).
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_invoke_meters_usage_per_function() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "alpha", HTTP_200, Vec::new()).await;
+    deploy_test_function(&deploy, "beta", HTTP_200, Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // Invoke alpha three times, beta once.
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(invoke_request("alpha", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .clone()
+        .oneshot(invoke_request("beta", None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let alpha = fetch_usage(&app, "alpha").await;
+    assert_eq!(alpha["invocations"], 3);
+    assert_eq!(alpha["successes"], 3);
+    let beta = fetch_usage(&app, "beta").await;
+    assert_eq!(beta["invocations"], 1);
+    // A never-invoked function reports a zeroed aggregate, not a 404.
+    let ghost = fetch_usage(&app, "ghost").await;
+    assert_eq!(ghost["invocations"], 0);
+}
+
+// ---- signed webhook ingress (FA-5) -----------------------------------------
+
+/// Deploy a function that declares a `webhook` verified by `secret_env` (FA-5).
+#[cfg(feature = "handlers")]
+async fn deploy_webhook_function(
+    deploy: &DeployStore,
+    name: &str,
+    component: &[u8],
+    secret_env: &str,
+) -> String {
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner, WebhookConfig};
+    let hash = sha256_hex(component);
+    let bytes = component.to_vec();
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+    let config = FunctionConfig {
+        webhook: Some(WebhookConfig {
+            secret_env: secret_env.to_string(),
+            algorithm: Default::default(),
+            signature_header: None,
+            max_body_bytes: None,
+        }),
+        ..Default::default()
+    };
+    let f = Function::new(
+        name,
+        Owner::Project("default".into()),
+        &hash,
+        config,
+        Lifecycle::Independent,
+        0,
+    );
+    deploy.put_function(&f).await.unwrap();
+    hash
+}
+
+/// `HMAC-SHA256(body, secret)` as lowercase hex (mirrors the server's verifier).
+#[cfg(feature = "handlers")]
+fn hmac_sha256_hex(secret: &[u8], body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// A `POST /_webhooks/<name>` request with an optional signature header.
+#[cfg(feature = "handlers")]
+fn webhook_request(name: &str, body: &[u8], sig: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/_webhooks/{name}"));
+    if let Some(s) = sig {
+        builder = builder.header("x-boatramp-signature", s);
+    }
+    let mut req = builder.body(Body::from(body.to_vec())).unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40200))));
+    req
+}
+
+/// The webhook endpoint verifies the HMAC signature before dispatch: a valid
+/// signature (bare or `sha256=`-prefixed) invokes the function; a bad or missing
+/// one is `401`; a function without a webhook config is `404`.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_webhook_verifies_signature_before_dispatch() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let secret_env = "BOATRAMP_TEST_WEBHOOK_SECRET";
+    std::env::set_var(secret_env, "s3cr3t-key");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_webhook_function(&deploy, "hook", HTTP_200, secret_env).await;
+    // A plain function (no webhook config) for the 404 case.
+    deploy_test_function(&deploy, "plain", HTTP_200, Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let body = br#"{"event":"push"}"#;
+    let sig = hmac_sha256_hex(b"s3cr3t-key", body);
+
+    // Valid signature → the function runs (200).
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, Some(&sig)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The GitHub-style `sha256=` prefix is accepted.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request(
+            "hook",
+            body,
+            Some(&format!("sha256={sig}")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A wrong signature is rejected before the guest runs.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, Some("00deadbeef")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A signature over a *different* body is rejected (tamper).
+    let good_for_other = hmac_sha256_hex(b"s3cr3t-key", b"other");
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, Some(&good_for_other)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Missing signature header → 401.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("hook", body, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A function without a webhook config → 404 (even with a plausible signature).
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("plain", body, Some(&sig)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---- workflow orchestration (FA-6) -----------------------------------------
+
+/// `PUT /api/workflows/<name>` with a step DAG (asserts 200 or returns the status).
+#[cfg(feature = "handlers")]
+async fn define_workflow(app: &axum::Router, name: &str, steps: serde_json::Value) -> StatusCode {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/workflows/{name}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "steps": steps })).unwrap(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Start a run (`POST .../runs`) and return its id.
+#[cfg(feature = "handlers")]
+async fn start_run(app: &axum::Router, name: &str) -> String {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/workflows/{name}/runs"))
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40300))));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    run["id"].as_str().unwrap().to_string()
+}
+
+/// Poll a run until terminal (`succeeded`/`failed`).
+#[cfg(feature = "handlers")]
+async fn poll_run(app: &axum::Router, name: &str, id: &str) -> serde_json::Value {
+    for _ in 0..120 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/workflows/{name}/runs/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if matches!(run["status"].as_str(), Some("succeeded") | Some("failed")) {
+            return run;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("workflow run {id} never terminated");
+}
+
+/// A 3-step chain (a → b → c) runs every step in order and the run succeeds.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn workflow_chain_runs_to_completion() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "a", "function": "counter" },
+        { "id": "b", "function": "counter", "depends_on": ["a"] },
+        { "id": "c", "function": "counter", "depends_on": ["b"] },
+    ]);
+    assert_eq!(define_workflow(&app, "chain", steps).await, StatusCode::OK);
+    let id = start_run(&app, "chain").await;
+
+    let run = poll_run(&app, "chain", &id).await;
+    assert_eq!(run["status"], "succeeded");
+    for step in ["a", "b", "c"] {
+        assert_eq!(run["steps"][step]["status"], "succeeded");
+    }
+}
+
+/// A fan-out + fan-in DAG (root → {x,y,z} → join) runs the barrier join only once
+/// all three parallel branches have completed, and the run succeeds.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn workflow_fan_out_and_join_completes() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "noop", HTTP_200, Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "root", "function": "noop" },
+        { "id": "x", "function": "noop", "depends_on": ["root"] },
+        { "id": "y", "function": "noop", "depends_on": ["root"] },
+        { "id": "z", "function": "noop", "depends_on": ["root"] },
+        { "id": "join", "function": "noop", "depends_on": ["x", "y", "z"] },
+    ]);
+    assert_eq!(define_workflow(&app, "fan", steps).await, StatusCode::OK);
+    let id = start_run(&app, "fan").await;
+
+    let run = poll_run(&app, "fan", &id).await;
+    assert_eq!(run["status"], "succeeded");
+    for step in ["root", "x", "y", "z", "join"] {
+        assert_eq!(run["steps"][step]["status"], "succeeded");
+    }
+}
+
+/// A failing step fails the run and triggers reverse-order compensation of the
+/// steps that already succeeded.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_failing_step_triggers_compensation() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "ok", HTTP_200, Vec::new()).await;
+    deploy_test_function(&deploy, "comp", HTTP_200, Vec::new()).await;
+    // A non-Wasm blob → the step function compile-fails → a step failure.
+    deploy_test_function(&deploy, "bad", b"not a wasm component", Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // a (ok, compensate=comp) → b (bad). b fails → run fails, a compensated.
+    let steps = serde_json::json!([
+        { "id": "a", "function": "ok", "compensate": "comp" },
+        { "id": "b", "function": "bad", "depends_on": ["a"] },
+    ]);
+    assert_eq!(define_workflow(&app, "saga", steps).await, StatusCode::OK);
+    let id = start_run(&app, "saga").await;
+
+    let run = poll_run(&app, "saga", &id).await;
+    assert_eq!(run["status"], "failed");
+    assert_eq!(run["steps"]["b"]["status"], "failed");
+    assert_eq!(run["steps"]["a"]["status"], "compensated");
+}
+
+/// The define endpoint validates the DAG: a cycle is a `400`.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn workflow_define_rejects_a_cycle() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "a", "function": "f", "depends_on": ["b"] },
+        { "id": "b", "function": "f", "depends_on": ["a"] },
+    ]);
+    assert_eq!(
+        define_workflow(&app, "cyclic", steps).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+// ---- function triggers: scheduled + queue dispatch -------------------------
+
+/// `PUT /api/functions/<name>/triggers/<id>` with a `TriggerKind` body.
+#[cfg(feature = "handlers")]
+async fn put_trigger(
+    app: &axum::Router,
+    name: &str,
+    id: &str,
+    kind: serde_json::Value,
+) -> StatusCode {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/functions/{name}/triggers/{id}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&kind).unwrap()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Poll a KV key until it exists, then return its value.
+#[cfg(feature = "handlers")]
+async fn poll_kv(kv: &Arc<MemoryKv>, key: &str) -> Vec<u8> {
+    use boatramp_core::kv::KvStore;
+    for _ in 0..120 {
+        if let Some(v) = kv.get(key).await.unwrap() {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("kv key {key} never appeared");
+}
+
+/// A `cron` trigger on a top-level function fires on the schedule and enqueues a
+/// durable async invocation the drain then runs — the "scheduled invoke" path.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_cron_trigger_runs_a_scheduled_invocation() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // A cron that fires every minute; also exercise trigger list.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "tick",
+            serde_json::json!({ "type": "cron", "schedule": "* * * * *" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/api/functions/counter/triggers")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(list_req).await.unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let triggers: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(triggers.as_array().unwrap().len(), 1);
+
+    // The scheduler fires the cron → the scheduled invocation runs → counter++.
+    let hits = poll_kv(&kv, "hkv/fn/counter/hits").await;
+    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
+    assert!(n >= 1, "counter did not advance: {n}");
+
+    // A durable, succeeded invocation was recorded for the fire.
+    let invs = deploy.list_invocations("counter").await.unwrap();
+    assert!(invs.iter().any(|i| matches!(
+        i.status,
+        boatramp_core::function::InvocationStatus::Succeeded
+    )));
+
+    // Delete removes it (idempotent).
+    let del = Request::builder()
+        .method("DELETE")
+        .uri("/api/functions/counter/triggers/tick")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(del).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// A `queue` trigger claims messages from the function's namespaced topic and
+/// invokes it per message — the event-bus consumer path.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_queue_trigger_dispatches_a_message() {
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "worker", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    // A job waiting on the function's namespaced topic before the scheduler runs.
+    messaging.publish("fn/worker/jobs", b"job-1").await.unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    assert_eq!(
+        put_trigger(
+            &app,
+            "worker",
+            "jobs",
+            serde_json::json!({ "type": "queue", "topic": "jobs" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // The scheduler claims the message and invokes the function → counter++.
+    let hits = poll_kv(&kv, "hkv/fn/worker/hits").await;
+    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
+    assert!(n >= 1, "worker did not run: {n}");
+}
+
+/// A `blob` trigger fires the function when an object appears under the watched
+/// prefix — notify-only, so it fires for *any* writer (here a direct storage
+/// write). Requires a backend that natively watches (`FsStorage`).
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn function_blob_trigger_fires_on_a_write() {
+    use boatramp_core::{PutMeta, Storage};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    // A real filesystem store so `watch` is supported (MemStorage isn't watchable).
+    let root = std::env::temp_dir().join(format!("boatramp-blobtrig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&root));
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage.clone(), None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Write under the watched prefix until the trigger fires. Retrying the write
+    // makes the test robust to the scheduler's watcher-spawn timing — an FS watcher
+    // only sees events after it starts, so a single fixed-sleep write can race the
+    // spawn under parallel load (each retry is a fresh event once the watch is up).
+    use boatramp_core::kv::KvStore;
+    let mut fired = false;
+    for _ in 0..50 {
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed();
+        storage
+            .put(
+                "hblob/fn/counter/uploads/report.json",
+                body,
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Some(hits) = kv.get("hkv/fn/counter/hits").await.unwrap() {
+            if String::from_utf8_lossy(&hits)
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0)
+                >= 1
+            {
+                fired = true;
+                break;
+            }
+        }
+    }
+    assert!(fired, "blob trigger did not fire after repeated writes");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `blob` trigger is refused at activation on a backend that can't watch
+/// (`MemStorage`) — fail-closed, never a silent no-op.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_blob_trigger_refused_on_unwatchable_backend() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    // MemStorage doesn't support watch → a blob trigger is a 400. A cron trigger
+    // on the same function still works.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "tick",
+            serde_json::json!({ "type": "cron", "schedule": "* * * * *" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+/// A mock cloud [`WatchProvider`](boatramp_core::blob_provision::WatchProvider) for
+/// the FA-5b2 wiring tests — records provisions/retractions instead of calling a
+/// cloud SDK, standing in for the real S3→SQS provider.
+#[cfg(feature = "handlers")]
+#[derive(Default)]
+struct MockWatchProvider {
+    provisioned: std::sync::Mutex<Vec<String>>,
+    retracted: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_core::blob_provision::WatchProvider for MockWatchProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    fn recipe(&self, prefix: &str) -> String {
+        format!("create a queue + bucket notification for prefix {prefix:?}")
+    }
+    async fn provision(
+        &self,
+        prefix: &str,
+    ) -> Result<
+        Vec<boatramp_core::blob_notify::ManagedResource>,
+        boatramp_core::blob_provision::ProvisionError,
+    > {
+        self.provisioned.lock().unwrap().push(prefix.to_string());
+        Ok(vec![boatramp_core::blob_notify::ManagedResource::new(
+            "mock-queue",
+            format!("q-{prefix}"),
+        )])
+    }
+    async fn verify(
+        &self,
+        _prefix: &str,
+    ) -> Result<bool, boatramp_core::blob_provision::ProvisionError> {
+        Ok(true)
+    }
+    async fn retract(
+        &self,
+        resources: &[boatramp_core::blob_notify::ManagedResource],
+    ) -> Result<(), boatramp_core::blob_provision::ProvisionError> {
+        for r in resources {
+            self.retracted.lock().unwrap().push(r.id.clone());
+        }
+        Ok(())
+    }
+}
+
+/// FA-5b2 wiring: on a cloud backend, adding a `blob` trigger **provisions** the
+/// native pipeline through the configured `WatchProvider` (recording the managed-
+/// notification ledger), and removing it **retracts** the pipeline + drops the
+/// ledger entry — the auto-DNS discipline, for object-store events.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
+    use boatramp_core::Storage;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    // A watch-capable backend (fs) so the activation gate passes; the mock
+    // provider stands in for the cloud pipeline.
+    let root = std::env::temp_dir().join(format!("boatramp-blobprov-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&root));
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage.clone(), None, None);
+    let provider = Arc::new(MockWatchProvider::default());
+    runtime.set_watch_provider(provider.clone());
+    runtime.set_provision_tier(boatramp_core::blob_notify::ProvisionTier::Provision);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // Add the blob trigger → the pipeline is provisioned for the full storage
+    // prefix, and the managed-notification ledger records it.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        provider.provisioned.lock().unwrap().as_slice(),
+        &["hblob/fn/counter/uploads/".to_string()]
+    );
+    let record = deploy
+        .get_managed_notification("counter", "hblob/fn/counter/uploads/")
+        .await
+        .unwrap()
+        .expect("ledger records the provisioned pipeline");
+    assert_eq!(record.provider, "mock");
+
+    // Remove the trigger → the pipeline is retracted and the ledger entry dropped.
+    let del = Request::builder()
+        .method("DELETE")
+        .uri("/api/functions/counter/triggers/onupload")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(del).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(provider.retracted.lock().unwrap().len(), 1);
+    assert!(deploy
+        .get_managed_notification("counter", "hblob/fn/counter/uploads/")
+        .await
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// FA-5b2 tiers: `dry-run` returns the recipe and provisions nothing; `refuse`
+/// fails closed. Both keep the "conceptually clear / no surprises" guarantee.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn function_blob_trigger_dry_run_returns_recipe_and_refuse_fails_closed() {
+    use boatramp_core::blob_notify::ProvisionTier;
+    use boatramp_core::Storage;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    async fn app_with_tier(
+        root: &std::path::Path,
+        tier: ProvisionTier,
+    ) -> (axum::Router, DeployStore, Arc<MockWatchProvider>) {
+        let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(root));
+        let kv = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        deploy_test_function(&deploy, "counter", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+        let provider = Arc::new(MockWatchProvider::default());
+        runtime.set_watch_provider(provider.clone());
+        runtime.set_provision_tier(tier);
+        (
+            router(deploy.clone(), Auth::disabled(), runtime),
+            deploy,
+            provider,
+        )
+    }
+
+    // dry-run → 400 carrying the recipe; nothing provisioned or ledgered.
+    let root1 = std::env::temp_dir().join(format!("boatramp-blobdry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root1);
+    let (app, deploy, provider) = app_with_tier(&root1, ProvisionTier::DryRun).await;
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/functions/counter/triggers/onupload")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "type": "blob", "prefix": "uploads/" }))
+                .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("queue"),
+        "dry-run should return the recipe"
+    );
+    assert!(provider.provisioned.lock().unwrap().is_empty());
+    assert!(deploy
+        .list_managed_notifications("counter")
+        .await
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&root1);
+
+    // refuse → 400, fail-closed.
+    let root2 = std::env::temp_dir().join(format!("boatramp-blobref-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root2);
+    let (app, _deploy, provider) = app_with_tier(&root2, ProvisionTier::Refuse).await;
+    assert_eq!(
+        put_trigger(
+            &app,
+            "counter",
+            "onupload",
+            serde_json::json!({ "type": "blob", "prefix": "uploads/" }),
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(provider.provisioned.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
+/// Poll `GET /api/functions/<name>/invocations/<id>` until it reaches a terminal
+/// state (`succeeded`/`failed`), up to a generous ceiling (the scheduler ticks
+/// every 500 ms; a dead-letter needs five ticks).
+#[cfg(feature = "handlers")]
+async fn poll_invocation(app: &axum::Router, name: &str, id: &str) -> serde_json::Value {
+    for _ in 0..120 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/functions/{name}/invocations/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if matches!(
+            record["status"].as_str(),
+            Some("succeeded") | Some("failed")
+        ) {
+            return record;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("invocation {id} never reached a terminal state");
+}
+
 /// Flipping the active deployment while traffic is in flight drops zero
 /// requests (graceful drain). Handlers are instantiated per
 /// request off a clone of the compiled component, so an activation just routes

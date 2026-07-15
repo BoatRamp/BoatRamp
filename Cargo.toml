@@ -64,6 +64,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 bytes = "1"
 async-trait = "0.1"
+# Native filesystem change notification (inotify / FSEvents / kqueue) for the
+# FsStorage blob-change watch (FA-5). Syscall-crate-correct vs. shelling out.
+notify = "6"
+# Embed the `function init` scaffolding templates into the CLI binary (FA-7).
+include_dir = "0.7"
 # Async Docker Engine API client for the remote-docker compute backend.
 bollard = "0.17"
 thiserror = "2"
@@ -78,6 +83,8 @@ clap_mangen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
 hex = "0.4"
 lru = "0.16"
 walkdir = "2"
@@ -111,6 +118,40 @@ reqwest = { version = "0.12", default-features = false, features = [
 # S3 backend (compiled only with `--features s3`).
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+# SQS client for the S3→SQS blob-change notification pipeline (FA-5b2).
+aws-sdk-sqs = { version = "1", features = ["behavior-version-latest"] }
+
+# GCS backend (compiled only with `--features gcs`). Native SDK, matching the S3
+# backend's native-SDK choice. rustls (not openssl) to match the rest of the tree.
+google-cloud-storage = { version = "0.24", default-features = false, features = [
+  "rustls-tls",
+  "auth",
+] }
+# Pub/Sub for the GCS→Pub/Sub blob-change notification pipeline (FA-5b2).
+google-cloud-pubsub = { version = "0.30", default-features = false, features = [
+  "rustls-tls",
+  "auth",
+] }
+
+# Azure Blob backend (compiled only with `--features azure`). The mature
+# `azure-sdk-for-rust` 0.21 line (the official 1.0 SDK needs rustc 1.88 > our MSRV
+# 1.82). rustls + pure-Rust HMAC, matching the no-openssl posture.
+azure_core = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+] }
+azure_storage = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+  "hmac_rust",
+] }
+azure_storage_blobs = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+  "hmac_rust",
+] }
+# Storage Queue for the Azure Event Grid → Storage Queue notification pipeline.
+azure_storage_queues = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+  "hmac_rust",
+] }
 
 # Durable embedded KV: transactional LSM over object storage (local fs, S3/R2,
 # GCS, ...). Compiled only with the `slatedb` feature.

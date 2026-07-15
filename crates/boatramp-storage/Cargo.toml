@@ -11,7 +11,32 @@ description = "Pluggable streaming blob backends and KV stores for boatramp"
 [features]
 default = ["fs"]
 fs = []
-s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:bytes"]
+s3 = [
+  "dep:aws-config",
+  "dep:aws-sdk-s3",
+  "dep:aws-sdk-sqs",
+  "dep:serde_json",
+  "dep:bytes",
+]
+# GCS backend (native google-cloud-storage SDK). `tokio/sync` for the upload
+# channel bridge (Send-only ByteStream → the SDK's Send+Sync upload stream).
+gcs = [
+  "dep:google-cloud-storage",
+  "dep:google-cloud-pubsub",
+  "dep:serde_json",
+  "dep:bytes",
+  "tokio/sync",
+]
+# Azure Blob backend (native azure-sdk-for-rust 0.21).
+azure = [
+  "dep:azure_core",
+  "dep:azure_storage",
+  "dep:azure_storage_blobs",
+  "dep:azure_storage_queues",
+  "dep:serde_json",
+  "dep:base64",
+  "dep:bytes",
+]
 cloudflare-kv = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # Durable embedded KV: transactional LSM over an object_store backend.
 slatedb = ["dep:slatedb", "dep:bytes"]
@@ -30,10 +55,19 @@ futures.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
+notify.workspace = true
 
 bytes = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-sqs = { workspace = true, optional = true }
+google-cloud-storage = { workspace = true, optional = true }
+google-cloud-pubsub = { workspace = true, optional = true }
+azure_core = { workspace = true, optional = true }
+azure_storage = { workspace = true, optional = true }
+azure_storage_blobs = { workspace = true, optional = true }
+azure_storage_queues = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -42,4 +76,5 @@ libsql = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+bytes.workspace = true

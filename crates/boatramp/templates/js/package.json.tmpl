@@ -1,0 +1,13 @@
+{
+  "name": "BOATRAMP_FUNCTION_NAME",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A boatramp function (wasi:http component) in JavaScript.",
+  "scripts": {
+    "build": "jco componentize handler.js --wit wit -n wasi:http/proxy -o BOATRAMP_FUNCTION_NAME.wasm"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.25.0"
+  }
+}

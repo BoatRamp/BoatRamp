@@ -17,6 +17,8 @@ path = "src/main.rs"
 default = ["fs", "slatedb"]
 fs = ["boatramp-storage/fs"]
 s3 = ["boatramp-storage/s3"]
+gcs = ["boatramp-storage/gcs"]
+azure = ["boatramp-storage/azure"]
 cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
 # Durable embedded KV (the default `--kv slatedb`): transactional LSM over an
 # object_store backend.
@@ -82,6 +84,12 @@ handlers = [
   # single-node/cluster split is config (`[handlers.bindings.sql]`), not a
   # backend choice.
   "boatramp-storage/sql",
+  # The local single-function harness (`function dev`/`test`) drives the engine.
+  "dep:http",
+  "dep:http-body-util",
+  "dep:bytes",
+  "dep:hyper",
+  "dep:hyper-util",
 ]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
@@ -147,6 +155,13 @@ boatramp-container.workspace = true
 # The remote-docker compute backend (cross-platform Engine API client).
 boatramp-docker.workspace = true
 boatramp-handlers = { workspace = true, optional = true }
+# The local single-function harness (`function dev`/`test`, FA-7) drives the
+# engine directly, so it builds requests + collects responses over `http`.
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio"] }
 boatramp-acme = { workspace = true, optional = true }
 boatramp-cluster = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
@@ -164,6 +179,8 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ron.workspace = true
+# Embedded `function init` scaffolding templates.
+include_dir.workspace = true
 reqwest.workspace = true
 walkdir.workspace = true
 sha2.workspace = true

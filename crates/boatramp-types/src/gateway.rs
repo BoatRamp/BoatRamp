@@ -65,6 +65,21 @@ pub struct Upstream {
     /// Load-balancing policy across the pool (G5). Default round-robin.
     #[serde(skip_serializing_if = "LbPolicy::is_default")]
     pub lb: LbPolicy,
+    /// Per-backend region tags (backend URL → region) for [`LbPolicy::Nearest`]
+    /// (FA-8). An untagged backend is region-neutral. Keys match the pool entries
+    /// (static `targets`, or a DNS/compute-resolved endpoint URL).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub regions: BTreeMap<String, crate::geo::Region>,
+    /// Operator region-distance table for [`LbPolicy::Nearest`] (FA-8). Default =
+    /// binary nearness (same region `0`, any other far).
+    #[serde(skip_serializing_if = "crate::geo::RegionMap::is_empty")]
+    pub region_map: crate::geo::RegionMap,
+    /// Request header carrying the client's region (e.g. `fly-region`,
+    /// `cf-ipcountry`, `x-boatramp-client-region`) for [`LbPolicy::Nearest`]
+    /// (FA-8). `None` ⇒ no client region, so Nearest degrades to health-first +
+    /// original order (never a hard failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_region_header: Option<String>,
     /// Extra backends to try when an attempt fails to *connect* (G5). `0` = no
     /// retry (the request fails on the first backend's connect error). Capped at
     /// the pool size at run time. Only connect failures retry — a backend that
@@ -130,6 +145,12 @@ pub enum LbPolicy {
     RoundRobin,
     /// Pick a pseudo-random backend per request.
     Random,
+    /// Route to the **nearest healthy** backend by region (FA-8): order the pool
+    /// health-first, then by ascending distance from the client's region
+    /// (`client_region_header`) to each backend's region (`regions` +
+    /// `region_map`). Falls back to health-first order when no client region is
+    /// known. Needs region tags to be meaningful; untagged backends are neutral.
+    Nearest,
 }
 
 impl LbPolicy {
@@ -365,6 +386,39 @@ mod tests {
             .unwrap()
             .upstreams["api"];
         assert_eq!(single.static_backends(), vec!["https://10.0.0.5:8443/base"]);
+    }
+
+    #[test]
+    fn nearest_upstream_round_trips_with_region_config() {
+        let up = Upstream {
+            targets: vec!["http://a".into(), "http://b".into()],
+            lb: LbPolicy::Nearest,
+            regions: BTreeMap::from([
+                ("http://a".to_string(), "us-east".to_string()),
+                ("http://b".to_string(), "eu-west".to_string()),
+            ]),
+            region_map: crate::geo::RegionMap::from_edges([(
+                "us-east".to_string(),
+                "eu-west".to_string(),
+                4,
+            )]),
+            client_region_header: Some("fly-region".into()),
+            max_retries: 2,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&up).unwrap();
+        assert_eq!(serde_json::from_str::<Upstream>(&json).unwrap(), up);
+        // Nearest is kebab-cased on the wire.
+        assert!(json.contains("\"lb\":\"nearest\""));
+        // A default (round-robin, region-agnostic) upstream omits all geo fields.
+        let plain = serde_json::to_string(&Upstream {
+            target: "http://x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!plain.contains("region_map"));
+        assert!(!plain.contains("client_region_header"));
+        assert!(!plain.contains("\"regions\""));
     }
 
     #[test]

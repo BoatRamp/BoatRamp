@@ -40,6 +40,16 @@ specific deployment independently of the live pointer. You publish to an alias t
 review a build, then activate it for the site when it is ready. Promotion is a
 pointer move, not a rebuild.
 
+## Compute is a function
+
+Dynamic code is a **function** — a portable WASI component plus the capabilities it
+is granted. A function is reached through a **trigger**: an HTTP route (a
+*handler*), a queue topic (a *consumer*), a schedule (a *cron*), or a call by name.
+The component and its sandbox are the same in every case; only the door differs.
+A site's `handlers`, `consumers`, and `crons` *are* functions with triggers, and a
+top-level function adds its own version line so it can be invoked, aliased, and
+rolled back on its own. See [Functions: the compute primitive](./functions.md).
+
 ## Three configuration tiers
 
 Configuration is split by audience across three surfaces, so each concern lives

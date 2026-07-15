@@ -22,6 +22,8 @@ pub enum Trigger {
     Cron,
     /// The scheduler delivered a message to a consumer.
     Consumer,
+    /// A direct `POST /api/functions/<name>/invoke` (sync or drained async).
+    Invoke,
 }
 
 impl Trigger {
@@ -30,6 +32,7 @@ impl Trigger {
             Trigger::Http => "http",
             Trigger::Cron => "cron",
             Trigger::Consumer => "consumer",
+            Trigger::Invoke => "invoke",
         }
     }
 }
@@ -261,6 +264,12 @@ fn escape(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+/// Public wrapper over [`escape`] for callers rendering their own series (e.g. the
+/// FA-4 function-usage gauges).
+pub fn escape_label(value: &str) -> String {
+    escape(value)
 }
 
 #[cfg(test)]

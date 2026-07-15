@@ -56,6 +56,36 @@ minio data_dir="./.minio":
     mkdir -p {{ data_dir }}
     minio server {{ data_dir }} --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
 
+# Run the GCS backend round-trip against a `fake-gcs-server` emulator (Docker).
+# Boots the emulator with a pre-created `boatramp` bucket, then runs the env-gated
+# `gcs_emulator` seam. The `gcs` feature toolchain is needed.
+gcs-emulator bucket="boatramp":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker run -d --name boatramp-fakegcs -p 4443:4443 \
+      fsouza/fake-gcs-server -scheme http -public-host localhost:4443 >/dev/null
+    trap 'docker rm -f boatramp-fakegcs >/dev/null' EXIT
+    sleep 2
+    curl -fsS -X POST "http://localhost:4443/storage/v1/b?project=test" \
+      -H 'Content-Type: application/json' --data '{"name":"{{ bucket }}"}' >/dev/null
+    BOATRAMP_TEST_GCS_ENDPOINT=http://localhost:4443 BOATRAMP_TEST_GCS_BUCKET={{ bucket }} \
+      cargo test -p boatramp-storage --features gcs --test gcs_emulator -- --nocapture
+
+# Run the Azure Blob backend round-trip against an Azurite emulator (Docker).
+# Boots Azurite, creates the container via the Azure CLI against the well-known
+# devstoreaccount1, then runs the env-gated `azure_emulator` seam.
+azure-emulator container="boatramp":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker run -d --name boatramp-azurite -p 10000:10000 \
+      mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0 >/dev/null
+    trap 'docker rm -f boatramp-azurite >/dev/null' EXIT
+    sleep 2
+    CONN='DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
+    az storage container create --name {{ container }} --connection-string "$CONN" >/dev/null
+    BOATRAMP_TEST_AZURE_CONTAINER={{ container }} \
+      cargo test -p boatramp-storage --features azure --test azure_emulator -- --nocapture
+
 # Start a local sqld (libsql server) for the `sql` backend test. Serves
 # the hrana/HTTP protocol; runs in the foreground (Ctrl-C to stop). Namespaces
 # are enabled (the per-site isolation model — one namespace per site) with the
@@ -77,6 +107,27 @@ sqld data_dir="./.sqld" port="8080" admin_port="9090":
 # mints a throwaway CA, and drives a real `*.deploy.test` wildcard issuance.
 acme-dns-e2e:
     cargo test -p boatramp-acme --features acme --test pebble_dns01 -- --ignored --nocapture
+
+# FA-7 `function init` → `function build` → local-harness round-trip: scaffold the
+# Rust template, compile it to a `wasi:http` component, and run it through the
+# in-process harness (needs the `wasm32-wasip2` target + `wasm-tools`, both in
+# `nix develop`). The "each template builds to a component and round-trips through
+# the local harness" gate; run it in CI / the dev shell (it fetches the template's
+# crates, so it is not a hermetic flake check).
+function-roundtrip:
+    cargo test -p boatramp --features handlers function::tests::harness_runs_a_component_and_asserts
+    cargo test -p boatramp function::tests::init_then_build -- --ignored --nocapture
+
+# FA-7 JS round-trip: scaffold the JS template + componentize it with `jco` (via
+# `npx`, needs `nodejs` from `nix develop` + network). Separate from the Rust
+# recipe since it fetches jco + runs StarlingMonkey (slow).
+function-roundtrip-js:
+    cargo test -p boatramp function::tests::init_then_build_js -- --ignored --nocapture
+
+# FA-7 Python round-trip: scaffold the Python template + componentize it with
+# `componentize-py` (via `uvx`, needs `uv` from `nix develop` + network).
+function-roundtrip-py:
+    cargo test -p boatramp function::tests::init_then_build_python -- --ignored --nocapture
 
 # Remove build artifacts.
 clean:

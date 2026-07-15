@@ -185,6 +185,11 @@ impl ApiRequestBuilder {
         self.inner = self.inner.query(query);
         self
     }
+    /// Set a request header (a malformed name/value is dropped by `reqwest`).
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        self.inner = self.inner.header(key, value);
+        self
+    }
     /// Build, (optionally) PoP-sign, and send the request. Returns the same
     /// [`reqwest::Response`]/[`reqwest::Error`] as a plain `reqwest` send.
     pub async fn send(self) -> reqwest::Result<reqwest::Response> {

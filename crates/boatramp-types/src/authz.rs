@@ -184,6 +184,21 @@ impl Right {
         // Exact, non-site endpoints.
         let right = match path {
             "/api/sites" => Right::new(Resource::System, None, Action::Read),
+            // Functions (FA-1/FA-2): read the function view with `system·read` (like
+            // `/api/sites`); mutating a top-level function (deploy a version, alias,
+            // rollback, delete) requires `system·admin`. (A per-owner `function`
+            // resource with finer invoke/deploy rights lands in FA-4.)
+            p if p == "/api/functions" || p.starts_with("/api/functions/") => {
+                let action = if get { Action::Read } else { Action::Admin };
+                Right::new(Resource::System, None, action)
+            }
+            // Workflows (FA-6): read the definitions/runs with `system·read`;
+            // defining a workflow, starting a run, or deleting requires
+            // `system·admin`. Same shape as `/api/functions`.
+            p if p == "/api/workflows" || p.starts_with("/api/workflows/") => {
+                let action = if get { Action::Read } else { Action::Admin };
+                Right::new(Resource::System, None, action)
+            }
             "/api/blobs" => Right::new(Resource::Blobs, None, Action::Deploy),
             "/api/certs" => Right::new(Resource::Certs, None, Action::Read),
             "/api/cache/invalidate" => Right::new(Resource::Cache, None, Action::Write),

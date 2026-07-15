@@ -121,6 +121,24 @@ struct HandlerRuntimeInner {
     /// size *before* the blob is read. Set via
     /// [`HandlerRuntime::set_max_component_bytes`]; unset reads as `0`.
     max_component_bytes: std::sync::OnceLock<u64>,
+    /// Per-function locks serializing the metering + rate-limit read-modify-write
+    /// (FA-4), so concurrent invocations of one function can't lose an update.
+    /// Created on first use, keyed by function name.
+    function_meter_locks:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-function concurrency semaphores (for functions that set a
+    /// `max_concurrent` quota), created on first use.
+    function_semaphores:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Optional cloud **blob-change notification provisioner** (FA-5b2): when set,
+    /// adding a `Blob` trigger provisions the native pipeline (S3→SQS, …) per the
+    /// [`provision_tier`](Self::provision_tier), and removing it retracts. Absent
+    /// on a self-watching backend (fs), which needs no provisioning.
+    watch_provider: std::sync::OnceLock<Arc<dyn boatramp_core::blob_provision::WatchProvider>>,
+    /// The operator tier governing the [`watch_provider`](Self::watch_provider):
+    /// dry-run (recipe) / provision / verify-only / refuse. Unset reads as the
+    /// fail-closed default (`Refuse`).
+    provision_tier: std::sync::OnceLock<boatramp_core::blob_notify::ProvisionTier>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -161,7 +179,34 @@ impl HandlerRuntime {
                 cron_leader_gate: std::sync::OnceLock::new(),
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
+                function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+                function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
+                watch_provider: std::sync::OnceLock::new(),
+                provision_tier: std::sync::OnceLock::new(),
             })),
+        }
+    }
+
+    /// Wire the cloud blob-change notification provisioner (FA-5b2). Set once at
+    /// startup when the storage backend is a cloud object store; a no-op runtime,
+    /// or a self-watching backend (fs), leaves it unset.
+    #[cfg(feature = "handlers")]
+    pub fn set_watch_provider(
+        &self,
+        provider: Arc<dyn boatramp_core::blob_provision::WatchProvider>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.watch_provider.set(provider);
+        }
+    }
+
+    /// Set the operator provisioning tier for the
+    /// [`watch_provider`](Self::set_watch_provider). Set once at startup; unset is
+    /// the fail-closed `Refuse`.
+    #[cfg(feature = "handlers")]
+    pub fn set_provision_tier(&self, tier: boatramp_core::blob_notify::ProvisionTier) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.provision_tier.set(tier);
         }
     }
 
@@ -684,6 +729,13 @@ pub fn router_with(
     // Control-plane API — gated by the auth middleware.
     let api = Router::new()
         .route("/api/sites", get(list_sites))
+        .route("/api/functions", get(list_functions))
+        .route(
+            "/api/functions/:name",
+            put(deploy_function).delete(remove_function),
+        )
+        .route("/api/functions/:name/rollback", post(rollback_function))
+        .route("/api/functions/:name/aliases/:label", put(alias_function))
         .route(
             "/api/sites/:site/deployments",
             post(create_deployment).get(list_deployments),
@@ -798,7 +850,36 @@ pub fn router_with(
             "/api/sites/:site/_boatramp/logs/stream",
             get(operator_logs_stream),
         )
-        .route("/api/sites/:site/_boatramp/dlq", post(operator_dlq));
+        .route("/api/sites/:site/_boatramp/dlq", post(operator_dlq))
+        // The function **invoke** surface (FA-3) needs the engine, so it is
+        // registered only with the handlers feature.
+        .route("/api/functions/:name/invoke", post(invoke_function))
+        .route(
+            "/api/functions/:name/invocations/:id",
+            get(get_invocation_record),
+        )
+        .route("/api/functions/:name/usage", get(get_function_usage))
+        // Function triggers (scheduled + event sources): cron + queue triggers the
+        // scheduler dispatches. Needs the engine, so behind the handlers feature.
+        .route("/api/functions/:name/triggers", get(list_triggers_handler))
+        .route(
+            "/api/functions/:name/triggers/:id",
+            put(put_trigger_handler).delete(delete_trigger_handler),
+        )
+        // Workflow orchestration (FA-6): definitions + runs. The executor drain
+        // needs the engine, so the surface is registered with the handlers feature.
+        .route("/api/workflows", get(list_workflows_handler))
+        .route(
+            "/api/workflows/:name",
+            put(define_workflow)
+                .get(get_workflow_handler)
+                .delete(delete_workflow_handler),
+        )
+        .route("/api/workflows/:name/runs", post(start_workflow_run))
+        .route(
+            "/api/workflows/:name/runs/:id",
+            get(get_workflow_run_handler),
+        );
     let api = api
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
@@ -842,7 +923,14 @@ pub fn router_with(
         .route(
             "/.well-known/boatramp-bootstrap-identity",
             get(serve_bootstrap_identity),
-        )
+        );
+    // Signed inbound-webhook ingress (FA-5): a **public** (signature-gated, not
+    // token-gated) route that verifies the request signature before invoking the
+    // function. Needs the engine, so it is registered only with the handlers
+    // feature.
+    #[cfg(feature = "handlers")]
+    let app = app.route("/_webhooks/:name", post(webhook_ingress));
+    let app = app
         .fallback(serve_by_host)
         .with_state(deploy)
         .layer(Extension(BootstrapAttestation(bootstrap_attestation)))
@@ -1394,6 +1482,1634 @@ async fn list_sites(State(deploy): State<DeployStore>) -> Response {
         Ok(sites) => Json(sites).into_response(),
         Err(err) => deploy_error_response(err),
     }
+}
+
+/// `?site=` filter for the functions view.
+#[derive(serde::Deserialize)]
+struct FunctionQuery {
+    site: Option<String>,
+}
+
+/// One entry in the `GET /api/functions` view.
+#[derive(serde::Serialize)]
+struct FunctionSummary {
+    /// Function name (`<site>/<name>` for site-scoped; bare for top-level).
+    name: String,
+    /// Owner (`site:<site>` or `project:<project>`).
+    owner: String,
+    /// Execution substrate.
+    runtime: String,
+    /// Active version id (the component blob hash).
+    version: String,
+    /// Rendered triggers that reach this function.
+    triggers: Vec<String>,
+}
+
+/// Render a function owner for the view.
+fn owner_str(owner: &boatramp_core::function::Owner) -> String {
+    use boatramp_core::function::Owner;
+    match owner {
+        Owner::Site(s) => format!("site:{s}"),
+        Owner::Project(p) => format!("project:{p}"),
+    }
+}
+
+/// `GET /api/functions[?site=…]` — the derived, **read-only** site-scoped function
+/// view (FA-1): desugar each site's active manifest into functions + triggers and
+/// resolve component paths to their blob-hash version ids. A pure projection of the
+/// manifests — the serve path is untouched, so a site's handlers are unchanged.
+/// `system·read`.
+async fn list_functions(
+    State(deploy): State<DeployStore>,
+    axum::extract::Query(query): axum::extract::Query<FunctionQuery>,
+) -> Response {
+    use boatramp_core::function;
+    let sites = match &query.site {
+        Some(s) => vec![s.clone()],
+        None => match deploy.all_sites().await {
+            Ok(s) => s,
+            Err(err) => return deploy_error_response(err),
+        },
+    };
+    let mut out: Vec<FunctionSummary> = Vec::new();
+    for site in sites {
+        let manifest = match deploy.current_manifest(&site).await {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(err) => return deploy_error_response(err),
+        };
+        let (specs, triggers) = function::desugar(&manifest.config);
+        for f in function::materialize(&specs, &site, &manifest.files, 0) {
+            let trigs = triggers
+                .iter()
+                .filter(|t| t.target.as_ref().map(|r| r.name.as_str()) == Some(f.name.as_str()))
+                .map(render_trigger)
+                .collect();
+            out.push(FunctionSummary {
+                name: format!("{site}/{}", f.name),
+                owner: format!("site:{site}"),
+                runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
+                version: f.active,
+                triggers: trigs,
+            });
+        }
+    }
+    // Top-level (independently-stored) functions — FA-2. A `?site=` filter is
+    // site-scoped only, so it excludes these.
+    if query.site.is_none() {
+        match deploy.list_stored_functions().await {
+            Ok(stored) => {
+                for f in stored {
+                    out.push(FunctionSummary {
+                        name: f.name.clone(),
+                        owner: owner_str(&f.owner),
+                        runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
+                        version: f.active,
+                        // A top-level function has a stable invoke URL (FA-3).
+                        triggers: vec![format!("invoke {}", f.name)],
+                    });
+                }
+            }
+            Err(err) => return deploy_error_response(err),
+        }
+    }
+    Json(out).into_response()
+}
+
+/// Render a trigger to a short one-line label for the functions view.
+fn render_trigger(t: &boatramp_core::function::Trigger) -> String {
+    use boatramp_core::function::TriggerKind;
+    match &t.kind {
+        TriggerKind::Route { path, methods, .. } => {
+            let m = if methods.is_empty() {
+                "*".to_string()
+            } else {
+                methods.join(",")
+            };
+            format!("route {m} {path}")
+        }
+        TriggerKind::Invoke { name } => format!("invoke {name}"),
+        TriggerKind::Queue { topic } => format!("queue {topic}"),
+        TriggerKind::Cron { schedule, .. } => format!("cron {schedule}"),
+        TriggerKind::Blob { prefix } => format!("blob {prefix}"),
+        TriggerKind::Webhook { path, .. } => format!("webhook {path}"),
+        TriggerKind::Stream { topics, .. } => format!("stream {}", topics.join(",")),
+    }
+}
+
+/// Body of `PUT /api/functions/:name` — deploy a version of a top-level function.
+#[derive(serde::Deserialize)]
+struct FunctionUpsert {
+    /// The component blob hash (uploaded first via `PUT /api/blobs/<hash>`).
+    component: String,
+    /// Binding/capability config.
+    #[serde(default)]
+    config: boatramp_core::function::FunctionConfig,
+    /// Version lifecycle (defaults to `deploy-pinned`; top-level functions choose
+    /// `independent`).
+    #[serde(default)]
+    lifecycle: boatramp_core::function::Lifecycle,
+}
+
+/// `PUT /api/functions/:name` (FA-2) — deploy a version of a top-level function.
+/// The component blob must already be uploaded. Creates the function if new;
+/// otherwise appends + activates the version (idempotent per component hash).
+/// `system·admin`.
+async fn deploy_function(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+    Json(body): Json<FunctionUpsert>,
+) -> Response {
+    use boatramp_core::function::{Function, Owner};
+    match deploy.has_blob(&body.component).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("component blob {} not uploaded\n", body.component),
+            )
+                .into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    }
+    let now = now_unix();
+    let f = match deploy.get_function(&name).await {
+        Ok(Some(mut existing)) => {
+            existing.config = body.config;
+            existing.upsert_version(&body.component, body.lifecycle, now);
+            existing
+        }
+        // A brand-new top-level function is owned by the (single, for now) default
+        // project; per-tenant ownership arrives with FA-4.
+        Ok(None) => Function::new(
+            name.clone(),
+            Owner::Project("default".to_string()),
+            &body.component,
+            body.config,
+            body.lifecycle,
+            now,
+        ),
+        Err(err) => return deploy_error_response(err),
+    };
+    if let Err(err) = deploy.put_function(&f).await {
+        return deploy_error_response(err);
+    }
+    Json(f).into_response()
+}
+
+/// Body of `POST /api/functions/:name/rollback`.
+#[derive(serde::Deserialize)]
+struct RollbackBody {
+    to: String,
+}
+
+/// `POST /api/functions/:name/rollback` (FA-2) — point active at a prior version.
+async fn rollback_function(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+    Json(body): Json<RollbackBody>,
+) -> Response {
+    match deploy.get_function(&name).await {
+        Ok(Some(mut f)) => match f.rollback(&body.to) {
+            Ok(()) => {
+                if let Err(err) = deploy.put_function(&f).await {
+                    return deploy_error_response(err);
+                }
+                Json(f).into_response()
+            }
+            Err(msg) => (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Body of `PUT /api/functions/:name/aliases/:label`.
+#[derive(serde::Deserialize)]
+struct AliasBody {
+    version: String,
+}
+
+/// `PUT /api/functions/:name/aliases/:label` (FA-2) — point a label at a version.
+async fn alias_function(
+    State(deploy): State<DeployStore>,
+    Path((name, label)): Path<(String, String)>,
+    Json(body): Json<AliasBody>,
+) -> Response {
+    match deploy.get_function(&name).await {
+        Ok(Some(mut f)) => match f.set_alias(&label, &body.version) {
+            Ok(()) => {
+                if let Err(err) = deploy.put_function(&f).await {
+                    return deploy_error_response(err);
+                }
+                Json(f).into_response()
+            }
+            Err(msg) => (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/functions/:name` (FA-2) — remove a top-level function (idempotent).
+/// Content-addressed component blobs are shared and left to `prune`.
+async fn remove_function(State(deploy): State<DeployStore>, Path(name): Path<String>) -> Response {
+    match deploy.delete_function(&name).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+// ---- function invoke API (FA-3) ----------------------------------------------
+
+/// The authority the engine sees for an invoked function. `wasi:http` needs a
+/// scheme + authority; the public control-plane path is the host's concern, so
+/// every function is invoked at `http://function.invoke/`.
+#[cfg(feature = "handlers")]
+const INVOKE_AUTHORITY: &str = "function.invoke";
+
+/// Attempts a durable (async) invocation gets before it is dead-lettered
+/// (left terminal-`failed` in its keyspace for inspection).
+#[cfg(feature = "handlers")]
+const MAX_INVOKE_ATTEMPTS: u32 = 5;
+
+/// Max request body buffered when **enqueuing** an async invocation. The sync
+/// path streams into the guest and never buffers; async must persist the body,
+/// so it is bounded here (mirrors the engine's default body cap).
+#[cfg(feature = "handlers")]
+const MAX_ASYNC_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Query of `POST /api/functions/:name/invoke`.
+#[cfg(feature = "handlers")]
+#[derive(serde::Deserialize)]
+struct InvokeQuery {
+    /// Delivery mode: `sync` (default) or `async`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Which version/alias to invoke (defaults to the active version).
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// A random 16-byte invocation id, hex, from the OS CSPRNG (the same source the
+/// token layer draws its `cti` from). A CSPRNG failure implies a broken platform
+/// and is logged; it is not expected on our targets.
+#[cfg(feature = "handlers")]
+fn new_invocation_id() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        tracing::error!("getrandom failed generating an invocation id");
+    }
+    hex::encode(bytes)
+}
+
+/// `POST /api/functions/:name/invoke` (FA-3) — invoke a function.
+///
+/// `?mode=sync` (default) runs inline and returns the function's response.
+/// `?mode=async` durably enqueues the call and returns `202 Accepted` with an
+/// invocation id to poll at `/invocations/:id`; a drain worker runs it (retried,
+/// then dead-lettered). An `Idempotency-Key` header dedups: a repeat with the
+/// same key replays the first call's outcome instead of running again.
+/// `system·admin` (a finer per-function invoke right lands in FA-4).
+#[cfg(feature = "handlers")]
+async fn invoke_function(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<InvokeQuery>,
+    request: Request,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return handler_unavailable();
+    };
+    let function = match deploy.get_function(&name).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    };
+    let reference = query.version.as_deref().unwrap_or(&function.active);
+    let Some(component) = function.resolve(reference).map(str::to_owned) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no version {reference:?} in function {name:?}\n"),
+        )
+            .into_response();
+    };
+    let is_async = query.mode.as_deref() == Some("async");
+    let idem_key = request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Idempotency replay: a recorded key returns the first call's outcome (its
+    // captured result, or `202` + id while the async call is still in flight).
+    // Checked *before* the quota so a replay never spends the rate budget.
+    if let Some(key) = &idem_key {
+        match deploy.get_idempotency(&name, key).await {
+            Ok(Some(id)) => {
+                if let Ok(Some(inv)) = deploy.get_invocation(&name, &id).await {
+                    return replay_invocation(&inv);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => return deploy_error_response(err),
+        }
+    }
+
+    // Rate-limit quota (FA-4), fail-closed → 429, charged once at entry for both
+    // sync and async (a drain retry does not re-charge).
+    if let Err(response) = admit_by_quota(inner, &deploy, &function).await {
+        return response;
+    }
+
+    if is_async {
+        enqueue_invocation(&deploy, &function, &component, request, idem_key).await
+    } else {
+        execute_sync(inner, &deploy, &function, &component, request, idem_key).await
+    }
+}
+
+/// Run a function inline and return its response. With an idempotency key the
+/// response is captured + persisted (as a `succeeded` [`Invocation`]) so a repeat
+/// replays it; without one it streams straight back.
+#[cfg(feature = "handlers")]
+async fn execute_sync(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+    idem_key: Option<String>,
+) -> Response {
+    let (response, duration_ms) =
+        execute_function(inner, deploy, function, component, request).await;
+    let Some(key) = idem_key else {
+        // No capture on the plain streaming path: meter counts + duration + a
+        // head-status success signal (byte totals are metered on the buffered
+        // async / idempotent paths).
+        let sample = boatramp_core::function::MeteringSample {
+            success: response.status().as_u16() < 500,
+            duration_ms,
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        record_metering(inner, deploy, &function.name, &sample).await;
+        return response;
+    };
+    // Capture so the outcome can be replayed under the idempotency key.
+    let (status, content_type, body) = capture_response(response).await;
+    let sample = boatramp_core::function::MeteringSample {
+        success: status.as_u16() < 500,
+        duration_ms,
+        bytes_in: 0,
+        bytes_out: body.len() as u64,
+    };
+    record_metering(inner, deploy, &function.name, &sample).await;
+    let now = now_unix();
+    let id = new_invocation_id();
+    let inv = boatramp_core::function::Invocation {
+        id: id.clone(),
+        function: function.name.clone(),
+        version: component.to_string(),
+        mode: boatramp_core::function::InvokeMode::Sync,
+        status: boatramp_core::function::InvocationStatus::Succeeded,
+        idempotency_key: Some(key.clone()),
+        attempts: 1,
+        request_b64: None,
+        request_content_type: None,
+        result: Some(boatramp_core::function::InvocationResult {
+            status: status.as_u16(),
+            content_type: content_type.clone(),
+            body_b64: b64_encode(&body),
+        }),
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        return deploy_error_response(err);
+    }
+    if let Err(err) = deploy.put_idempotency(&function.name, &key, &id).await {
+        return deploy_error_response(err);
+    }
+    rebuild_response(status, content_type.as_deref(), body)
+}
+
+/// Durably enqueue an async invocation: buffer the request body, persist a
+/// `queued` [`Invocation`], bind the idempotency key, and return `202` + id.
+#[cfg(feature = "handlers")]
+async fn enqueue_invocation(
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+    idem_key: Option<String>,
+) -> Response {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = match axum::body::to_bytes(request.into_body(), MAX_ASYNC_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "async invoke body exceeds the buffer cap\n",
+            )
+                .into_response()
+        }
+    };
+    let now = now_unix();
+    let id = new_invocation_id();
+    let inv = boatramp_core::function::Invocation {
+        id: id.clone(),
+        function: function.name.clone(),
+        version: component.to_string(),
+        mode: boatramp_core::function::InvokeMode::Async,
+        status: boatramp_core::function::InvocationStatus::Queued,
+        idempotency_key: idem_key.clone(),
+        attempts: 0,
+        request_b64: (!body.is_empty()).then(|| b64_encode(&body)),
+        request_content_type: content_type,
+        result: None,
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        return deploy_error_response(err);
+    }
+    if let Some(key) = &idem_key {
+        if let Err(err) = deploy.put_idempotency(&function.name, key, &id).await {
+            return deploy_error_response(err);
+        }
+    }
+    (StatusCode::ACCEPTED, Json(inv)).into_response()
+}
+
+/// `GET /api/functions/:name/invocations/:id` (FA-3) — poll a durable
+/// invocation's status/result. `system·read`.
+#[cfg(feature = "handlers")]
+async fn get_invocation_record(
+    State(deploy): State<DeployStore>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
+    match deploy.get_invocation(&name, &id).await {
+        Ok(Some(inv)) => Json(inv).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("no invocation {id:?} for function {name:?}\n"),
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Reconstruct a `Response` for an idempotency replay / async poll shortcut: a
+/// completed invocation replays its captured result; one still in flight returns
+/// `202` + the record.
+#[cfg(feature = "handlers")]
+fn replay_invocation(inv: &boatramp_core::function::Invocation) -> Response {
+    match &inv.result {
+        Some(result) => {
+            let body = b64_decode(&result.body_b64);
+            rebuild_response(
+                StatusCode::from_u16(result.status).unwrap_or(StatusCode::OK),
+                result.content_type.as_deref(),
+                body,
+            )
+        }
+        None => (StatusCode::ACCEPTED, Json(inv.clone())).into_response(),
+    }
+}
+
+/// The core engine run: enforce the per-function concurrency quota, load the
+/// component blob, build the function's bindings under its own `fn/<name>` scope,
+/// and serve the request. Returns the response and its time-to-head in ms (for
+/// metering). Errors map to the same statuses as a handler dispatch; a
+/// `max_concurrent`-full function yields `503` (a retryable delivery failure for
+/// the async drain).
+#[cfg(feature = "handlers")]
+async fn execute_function(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    request: Request,
+) -> (Response, u64) {
+    // Concurrency quota (held through the head, mirroring the site permit).
+    let _permit = match acquire_function_permit(inner, &function.name, &function.config.quota) {
+        Ok(permit) => permit,
+        Err(()) => {
+            return (
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "function concurrency limit reached\n",
+                )
+                    .into_response(),
+                0,
+            )
+        }
+    };
+    let wasm = match read_blob_fully(deploy, component).await {
+        Ok(bytes) => bytes,
+        Err(response) => return (response, 0),
+    };
+    let scope = format!("fn/{}", function.name);
+    let bindings = build_function_bindings(inner, &scope, &function.config).await;
+    let limits = function_limits(function.config.limits.as_ref());
+    let request = prepare_invoke_request(request);
+    let start = std::time::Instant::now();
+    let result = inner
+        .engine
+        .serve_with_limits(component, &wasm, request, bindings, limits)
+        .await;
+    let elapsed = start.elapsed();
+    inner.metrics.observe(
+        &function.name,
+        metrics::Trigger::Invoke,
+        "invoke",
+        component,
+        metrics::Outcome::from_result(&result),
+        elapsed,
+    );
+    let response = match result {
+        Ok(response) => {
+            let (parts, body) = response.into_parts();
+            axum::http::Response::from_parts(parts, axum::body::Body::new(body))
+        }
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "function invocation failed");
+            handler_error_response(&err)
+        }
+    };
+    (response, elapsed.as_millis() as u64)
+}
+
+/// Build a top-level function's bindings. Unlike a site handler (whose grants are
+/// the site allowlist ∩ its imports), a top-level function is admin-deployed, so
+/// its declared `imports` **are** its grants — served under its own `fn/<name>`
+/// scope so kv/blob/messaging/sql land in an isolated namespace.
+#[cfg(feature = "handlers")]
+async fn build_function_bindings(
+    inner: &HandlerRuntimeInner,
+    scope: &str,
+    config: &boatramp_core::function::FunctionConfig,
+) -> boatramp_handlers::Bindings {
+    let granted = |name: &str| config.imports.iter().any(|i| i == name);
+    let mut bindings = boatramp_handlers::Bindings::new(scope);
+    if granted("wasi:keyvalue") {
+        bindings = bindings.with_keyvalue(scope, inner.kv.clone());
+    }
+    if granted("wasi:blobstore") {
+        let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
+        bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
+    }
+    if granted("sql") {
+        if let Some(provider) = &inner.sql {
+            match provider.database(scope, "").await {
+                Ok(backend) => bindings = bindings.with_sql("", backend),
+                Err(err) => tracing::warn!(scope, %err, "opening function SQL database failed"),
+            }
+        }
+    }
+    if granted("wasi:messaging") {
+        if let Some(messaging) = &inner.messaging {
+            bindings = bindings.with_messaging(format!("{scope}/"), messaging.clone());
+        }
+    }
+    inner.logs.configure(scope, None);
+    bindings = bindings.with_logging(scope.to_string(), inner.logs.clone());
+    let env: Vec<(String, String)> = config
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    bindings.with_env(env)
+}
+
+/// Per-invocation limits for a function: its own `limits` (memory/timeout/fuel),
+/// left at the engine default where unset. The engine clamps to its ceiling.
+#[cfg(feature = "handlers")]
+fn function_limits(
+    limits: Option<&boatramp_core::config::HandlerLimits>,
+) -> boatramp_handlers::Limits {
+    let mut l = boatramp_handlers::Limits::default();
+    if let Some(hl) = limits {
+        if let Some(mb) = hl.memory_mb {
+            l.memory_bytes = (mb as usize).saturating_mul(1024 * 1024);
+        }
+        if let Some(ms) = hl.timeout_ms {
+            l.timeout_ms = ms as u64;
+        }
+        if let Some(fuel) = hl.fuel {
+            l.fuel = Some(fuel);
+        }
+    }
+    l
+}
+
+/// Point a request at the synthetic invoke authority so `wasi:http` sees a
+/// well-formed absolute URI (`http://function.invoke/`), preserving method +
+/// headers + body. The public `/api/functions/<name>/invoke` path is dropped —
+/// the function sees a clean request, not the control-plane envelope.
+#[cfg(feature = "handlers")]
+fn prepare_invoke_request(mut request: Request) -> Request {
+    if let Ok(uri) = format!("http://{INVOKE_AUTHORITY}/").parse() {
+        *request.uri_mut() = uri;
+    }
+    request
+        .headers_mut()
+        .insert(header::HOST, HeaderValue::from_static(INVOKE_AUTHORITY));
+    request
+}
+
+/// Buffer a response into `(status, content-type, body)` — for idempotency
+/// capture and async result persistence.
+#[cfg(feature = "handlers")]
+async fn capture_response(response: Response) -> (StatusCode, Option<String>, Vec<u8>) {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    (status, content_type, body)
+}
+
+/// Rebuild a `Response` from captured parts.
+#[cfg(feature = "handlers")]
+fn rebuild_response(status: StatusCode, content_type: Option<&str>, body: Vec<u8>) -> Response {
+    let mut builder = axum::http::Response::builder().status(status);
+    if let Some(ct) = content_type {
+        if let Ok(value) = HeaderValue::from_str(ct) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| handler_unavailable())
+}
+
+/// Standard base64 of bytes (invocation records are plain JSON).
+#[cfg(feature = "handlers")]
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode standard base64 back to bytes (empty on malformed input — a persisted
+/// record we wrote is always valid).
+#[cfg(feature = "handlers")]
+fn b64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .unwrap_or_default()
+}
+
+/// Drain a function's queued async invocations: run each once, capturing its
+/// result. A failed run is retried next tick until [`MAX_INVOKE_ATTEMPTS`], then
+/// dead-lettered (left `failed` for inspection). Driven from the scheduler tick.
+#[cfg(feature = "handlers")]
+async fn drain_function_invocations(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+) {
+    let queued = match deploy.list_invocations(&function.name).await {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "listing invocations failed");
+            return;
+        }
+    };
+    for inv in queued {
+        if !matches!(
+            inv.status,
+            boatramp_core::function::InvocationStatus::Queued
+        ) {
+            continue;
+        }
+        run_queued_invocation(inner, deploy, function, inv).await;
+    }
+}
+
+/// Execute one queued invocation against its pinned version, persisting the
+/// terminal outcome (or re-queuing for retry / dead-lettering on failure).
+#[cfg(feature = "handlers")]
+async fn run_queued_invocation(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    mut inv: boatramp_core::function::Invocation,
+) {
+    use boatramp_core::function::InvocationStatus;
+    // The version was pinned at enqueue; a later deploy can't silently change it.
+    let Some(component) = function.resolve(&inv.version).map(str::to_owned) else {
+        // The pinned version is gone (rolled off / pruned) — unrunnable, so fail.
+        inv.status = InvocationStatus::Failed;
+        inv.updated = now_unix();
+        let _ = deploy.put_invocation(&inv).await;
+        return;
+    };
+    inv.status = InvocationStatus::Running;
+    inv.attempts = inv.attempts.saturating_add(1);
+    inv.updated = now_unix();
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        tracing::warn!(function = %function.name, %err, "marking invocation running failed");
+        return;
+    }
+    let bytes_in = inv
+        .request_b64
+        .as_deref()
+        .map(|b| b64_decode(b).len() as u64)
+        .unwrap_or(0);
+    let request = build_stored_request(&inv);
+    let (response, duration_ms) =
+        execute_function(inner, deploy, function, &component, request).await;
+    let (status, content_type, body) = capture_response(response).await;
+    // A function that returns a 5xx from the engine wrapper (timeout/trap/etc.)
+    // is a delivery failure worth retrying; any response the guest itself
+    // produced (including its own 4xx/5xx) is a successful delivery.
+    let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
+        && status != StatusCode::GATEWAY_TIMEOUT
+        && status != StatusCode::SERVICE_UNAVAILABLE;
+    if delivered {
+        inv.status = InvocationStatus::Succeeded;
+        inv.result = Some(boatramp_core::function::InvocationResult {
+            status: status.as_u16(),
+            content_type,
+            body_b64: b64_encode(&body),
+        });
+    } else if inv.attempts >= MAX_INVOKE_ATTEMPTS {
+        inv.status = InvocationStatus::Failed;
+    } else {
+        inv.status = InvocationStatus::Queued;
+    }
+    inv.updated = now_unix();
+    let _ = deploy.put_invocation(&inv).await;
+    // Meter a settled attempt (a requeue-for-retry is not yet a completed
+    // invocation, so only the terminal transition is metered).
+    if matches!(
+        inv.status,
+        InvocationStatus::Succeeded | InvocationStatus::Failed
+    ) {
+        let sample = boatramp_core::function::MeteringSample {
+            success: matches!(inv.status, InvocationStatus::Succeeded),
+            duration_ms,
+            bytes_in,
+            bytes_out: body.len() as u64,
+        };
+        record_metering(inner, deploy, &function.name, &sample).await;
+    }
+}
+
+/// Rebuild the engine request for a stored async invocation from its buffered
+/// body + content type (method is always `POST` for an enqueued call).
+#[cfg(feature = "handlers")]
+fn build_stored_request(inv: &boatramp_core::function::Invocation) -> Request {
+    let body = inv
+        .request_b64
+        .as_deref()
+        .map(b64_decode)
+        .unwrap_or_default();
+    let mut builder = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(format!("http://{INVOKE_AUTHORITY}/"))
+        .header(header::HOST, INVOKE_AUTHORITY);
+    if let Some(ct) = &inv.request_content_type {
+        if let Ok(value) = HeaderValue::from_str(ct) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
+}
+
+// ---- function metering + quotas (FA-4) ---------------------------------------
+
+/// The per-function lock serializing its metering + rate-limit read-modify-write,
+/// created on first use so concurrent invocations of one function can't lose an
+/// update (the KV is get/put, not atomic-increment).
+#[cfg(feature = "handlers")]
+fn function_meter_lock(inner: &HandlerRuntimeInner, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    inner
+        .function_meter_locks
+        .lock()
+        .unwrap()
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Acquire a permit from the function's concurrency semaphore (created on first
+/// use) when it sets a `max_concurrent` quota; `Ok(None)` if uncapped, `Err(())`
+/// when at the limit (the caller turns that into a `503`).
+#[cfg(feature = "handlers")]
+fn acquire_function_permit(
+    inner: &HandlerRuntimeInner,
+    name: &str,
+    quota: &boatramp_core::function::FunctionQuota,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    let Some(max) = quota.max_concurrent else {
+        return Ok(None);
+    };
+    let semaphore = {
+        let mut map = inner.function_semaphores.lock().unwrap();
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(max as usize)))
+            .clone()
+    };
+    semaphore.try_acquire_owned().map(Some).map_err(|_| ())
+}
+
+/// Charge one invocation against the function's rate-limit quota (fixed window).
+/// `Ok(())` admits; `Err(429)` means the window is full (fail-closed). A function
+/// with no `max_invocations` cap always admits without touching the store.
+#[cfg(feature = "handlers")]
+async fn admit_by_quota(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+) -> Result<(), Response> {
+    let quota = &function.config.quota;
+    if quota.max_invocations.is_none() {
+        return Ok(());
+    }
+    let lock = function_meter_lock(inner, &function.name);
+    let _guard = lock.lock().await;
+    let now = now_unix();
+    let mut metering = match deploy.get_metering(&function.name).await {
+        Ok(Some(m)) => m,
+        Ok(None) => boatramp_core::function::Metering::new(&function.name),
+        Err(err) => return Err(deploy_error_response(err)),
+    };
+    if !metering.admit(quota, now) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "function invocation quota exceeded\n",
+        )
+            .into_response());
+    }
+    if let Err(err) = deploy.put_metering(&metering).await {
+        return Err(deploy_error_response(err));
+    }
+    Ok(())
+}
+
+/// Fold one invocation's measured cost into the function's usage aggregate
+/// (best-effort: a metering write failure is logged, never surfaced to the
+/// caller). Serialized per function so concurrent updates don't race.
+#[cfg(feature = "handlers")]
+async fn record_metering(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &str,
+    sample: &boatramp_core::function::MeteringSample,
+) {
+    let lock = function_meter_lock(inner, function);
+    let _guard = lock.lock().await;
+    let now = now_unix();
+    let mut metering = match deploy.get_metering(function).await {
+        Ok(Some(m)) => m,
+        Ok(None) => boatramp_core::function::Metering::new(function),
+        Err(err) => {
+            tracing::warn!(function, %err, "reading metering failed");
+            return;
+        }
+    };
+    metering.record(sample, now);
+    if let Err(err) = deploy.put_metering(&metering).await {
+        tracing::warn!(function, %err, "writing metering failed");
+    }
+}
+
+/// `GET /api/functions/:name/usage` (FA-4) — the function's usage aggregate.
+/// `system·read`.
+#[cfg(feature = "handlers")]
+async fn get_function_usage(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+) -> Response {
+    match deploy.get_metering(&name).await {
+        Ok(Some(m)) => Json(m).into_response(),
+        // No invocations yet ⇒ a zeroed aggregate, so the CLI always has a shape.
+        Ok(None) => Json(boatramp_core::function::Metering::new(name)).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+// ---- function triggers: scheduled + event sources ----------------------------
+
+/// `PUT /api/functions/:name/triggers/:id` — add/replace a stored trigger on a
+/// function (the body is a [`TriggerKind`], e.g. `{"type":"cron","schedule":…}`).
+/// The scheduler dispatches `cron` (→ a scheduled async invocation) and `queue`
+/// (→ claim + invoke) triggers. `system·admin`.
+#[cfg(feature = "handlers")]
+async fn put_trigger_handler(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path((name, id)): Path<(String, String)>,
+    Json(kind): Json<boatramp_core::function::TriggerKind>,
+) -> Response {
+    match deploy.get_function(&name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    }
+    // Fail closed: a blob-change trigger is only meaningful on a backend that can
+    // natively watch — refuse (never silently no-op) so the semantics stay uniform.
+    if let boatramp_core::function::TriggerKind::Blob { prefix } = &kind {
+        let Some(inner) = handlers.inner.as_ref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this storage backend does not support blob-change triggers\n",
+            )
+                .into_response();
+        };
+        if !inner.storage.supports_watch() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this storage backend does not support blob-change triggers\n",
+            )
+                .into_response();
+        }
+        // On a cloud object store a native pipeline (S3→SQS, …) must be
+        // provisioned per the operator tier before the watch can fire. A
+        // self-watching backend (fs) has no provider and needs nothing.
+        if let Some(provider) = inner.watch_provider.get() {
+            let storage_prefix = blob_storage_prefix(&name, prefix);
+            let tier = inner.provision_tier.get().copied().unwrap_or_default();
+            match boatramp_core::blob_provision::ensure_watch(
+                provider.as_ref(),
+                tier,
+                &name,
+                &storage_prefix,
+                &deploy,
+                now_unix(),
+            )
+            .await
+            {
+                Ok(boatramp_core::blob_provision::ProvisionOutcome::Ready) => {}
+                // Dry-run: print the exact pipeline to apply; don't activate.
+                Ok(boatramp_core::blob_provision::ProvisionOutcome::Recipe(recipe)) => {
+                    return (StatusCode::BAD_REQUEST, format!("{recipe}\n")).into_response();
+                }
+                // Fail-closed refuse (no creds / nothing configured).
+                Ok(boatramp_core::blob_provision::ProvisionOutcome::Refused(msg)) => {
+                    return (StatusCode::BAD_REQUEST, format!("{msg}\n")).into_response();
+                }
+                Err(err) => {
+                    return (StatusCode::BAD_GATEWAY, format!("{err}\n")).into_response();
+                }
+            }
+        }
+    }
+    let trigger = boatramp_core::function::FunctionTrigger {
+        id: id.clone(),
+        kind,
+        last_fired_minute: None,
+    };
+    if let Err(err) = deploy.put_trigger(&name, &trigger).await {
+        return deploy_error_response(err);
+    }
+    Json(trigger).into_response()
+}
+
+/// `GET /api/functions/:name/triggers` — list a function's stored triggers.
+/// `system·read`.
+#[cfg(feature = "handlers")]
+async fn list_triggers_handler(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+) -> Response {
+    match deploy.list_triggers(&name).await {
+        Ok(mut list) => {
+            list.sort_by(|a, b| a.id.cmp(&b.id));
+            Json(list).into_response()
+        }
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/functions/:name/triggers/:id` — remove a stored trigger.
+/// `system·admin`. Idempotent. Removing a `Blob` trigger also **retracts** any
+/// cloud notification pipeline provisioned for it (so no leaked queues), mirroring
+/// auto-DNS retraction.
+#[cfg(feature = "handlers")]
+async fn delete_trigger_handler(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
+    // Look the trigger up first: a `Blob` trigger may own a provisioned pipeline
+    // to retract before the trigger record is gone.
+    if let (Some(inner), Ok(Some(trigger))) = (
+        handlers.inner.as_ref(),
+        deploy.get_trigger(&name, &id).await,
+    ) {
+        if let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
+            (&trigger.kind, inner.watch_provider.get())
+        {
+            let storage_prefix = blob_storage_prefix(&name, prefix);
+            if let Ok(Some(record)) = deploy
+                .get_managed_notification(&name, &storage_prefix)
+                .await
+            {
+                if let Err(err) = boatramp_core::blob_provision::retract_watch(
+                    provider.as_ref(),
+                    &record,
+                    &deploy,
+                )
+                .await
+                {
+                    tracing::warn!(function = %name, %err, "retracting blob notification failed");
+                }
+            }
+        }
+    }
+    match deploy.delete_trigger(&name, &id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// The full storage key prefix a function's `Blob { prefix }` trigger watches:
+/// the function's blobstore namespace (`hblob/fn/<name>/`) joined with the
+/// trigger-relative prefix. The provisioner (bucket-notification filter), the
+/// notification ledger, and the [`spawn_blob_watcher`] consumer all key off this,
+/// so they must agree.
+#[cfg(feature = "handlers")]
+fn blob_storage_prefix(function: &str, trigger_prefix: &str) -> String {
+    format!("hblob/fn/{function}/{trigger_prefix}")
+}
+
+/// Dispatch a function's stored triggers on a scheduler tick: fire due **cron**
+/// triggers (enqueue a durable async invocation, minute-deduped) and drain
+/// **queue** triggers (claim a batch + invoke per message). Route/webhook/invoke
+/// triggers are request-driven and not dispatched here.
+#[cfg(feature = "handlers")]
+async fn dispatch_function_triggers(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    now: &CronNow,
+) {
+    use boatramp_core::function::TriggerKind;
+    let triggers = match deploy.list_triggers(&function.name).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "listing triggers failed");
+            return;
+        }
+    };
+    for mut trigger in triggers {
+        match &trigger.kind {
+            TriggerKind::Cron { schedule, .. } => {
+                let Ok(parsed) = boatramp_core::cron::CronSchedule::parse(schedule) else {
+                    continue;
+                };
+                if !parsed.fires_at(now.minute, now.hour, now.dom, now.month, now.dow) {
+                    continue;
+                }
+                if trigger.last_fired_minute == Some(now.minute_stamp) {
+                    continue; // already fired this minute
+                }
+                enqueue_scheduled_invocation(deploy, function).await;
+                trigger.last_fired_minute = Some(now.minute_stamp);
+                let _ = deploy.put_trigger(&function.name, &trigger).await;
+            }
+            TriggerKind::Queue { topic } => {
+                dispatch_function_queue(inner, deploy, function, topic).await;
+            }
+            // Route / Invoke / Webhook are request-driven; Blob / Stream are not
+            // dispatched from the scheduler in this pass.
+            _ => {}
+        }
+    }
+}
+
+/// Enqueue a durable async invocation of a function's active version with no body
+/// — the scheduled (cron) fire. The existing invoke drain runs it.
+#[cfg(feature = "handlers")]
+async fn enqueue_scheduled_invocation(
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+) {
+    let now = now_unix();
+    let inv = boatramp_core::function::Invocation {
+        id: new_invocation_id(),
+        function: function.name.clone(),
+        version: function.active.clone(),
+        mode: boatramp_core::function::InvokeMode::Async,
+        status: boatramp_core::function::InvocationStatus::Queued,
+        idempotency_key: None,
+        attempts: 0,
+        request_b64: None,
+        request_content_type: None,
+        result: None,
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        tracing::warn!(function = %function.name, %err, "enqueuing scheduled invocation failed");
+    }
+}
+
+/// Claim a batch from a function's queue-trigger topic and invoke the function per
+/// message (ack on a delivered response, nack — for redelivery / eventual
+/// dead-letter — otherwise). The topic is namespaced under the function's own
+/// `fn/<name>/` scope, so it is a per-function work queue (fan-out to many
+/// functions is future work).
+#[cfg(feature = "handlers")]
+async fn dispatch_function_queue(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    topic: &str,
+) {
+    let Some(messaging) = inner.messaging.clone() else {
+        return;
+    };
+    let namespaced = format!("fn/{}/{topic}", function.name);
+    let batch = match messaging
+        .claim(
+            &namespaced,
+            CONSUMER_LEASE,
+            CONSUMER_BATCH,
+            CONSUMER_MAX_ATTEMPTS,
+        )
+        .await
+    {
+        Ok(batch) => batch,
+        Err(err) => {
+            tracing::warn!(function = %function.name, topic, %err, "claiming queue messages failed");
+            return;
+        }
+    };
+    if batch.is_empty() {
+        return;
+    }
+    let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+        return;
+    };
+    for msg in batch {
+        let bytes_in = msg.payload.len() as u64;
+        let request = build_webhook_request(None, msg.payload.clone());
+        let (response, duration_ms) =
+            execute_function(inner, deploy, function, &component, request).await;
+        let (status, _content_type, body) = capture_response(response).await;
+        let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
+            && status != StatusCode::GATEWAY_TIMEOUT
+            && status != StatusCode::SERVICE_UNAVAILABLE;
+        let sample = boatramp_core::function::MeteringSample {
+            success: delivered,
+            duration_ms,
+            bytes_in,
+            bytes_out: body.len() as u64,
+        };
+        record_metering(inner, deploy, &function.name, &sample).await;
+        if delivered {
+            let _ = messaging.ack(&msg).await;
+        } else {
+            let _ = messaging.nack(&msg).await;
+        }
+    }
+}
+
+// ---- signed webhook ingress (FA-5) -------------------------------------------
+
+/// `POST /_webhooks/:name` (FA-5) — signed inbound-webhook ingress. **Public** but
+/// signature-gated: the request signature is verified over the raw body,
+/// constant-time, **before** the guest runs (the SSRF/abuse guard). Requires the
+/// function to declare a `webhook` config whose `secret_env` names a set host env
+/// var. A valid signature invokes the function (sync, active version) and returns
+/// its response; a missing/invalid signature is `401`, an oversize body `413`.
+#[cfg(feature = "handlers")]
+async fn webhook_ingress(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return handler_unavailable();
+    };
+    let function = match deploy.get_function(&name).await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    };
+    let Some(webhook) = function.config.webhook.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("function {name:?} has no webhook\n"),
+        )
+            .into_response();
+    };
+    // The verifying secret is a host env-var *reference*, never stored plaintext.
+    let Ok(secret) = std::env::var(&webhook.secret_env) else {
+        tracing::warn!(
+            function = %name,
+            env = %webhook.secret_env,
+            "webhook secret env var is not set; refusing",
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "webhook not configured\n").into_response();
+    };
+    // Capture the signature + content type *before* consuming the body.
+    let provided = request
+        .headers()
+        .get(webhook.header())
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = match axum::body::to_bytes(request.into_body(), webhook.body_cap() as usize).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "webhook body exceeds the cap\n",
+            )
+                .into_response()
+        }
+    };
+    let Some(provided) = provided else {
+        return (StatusCode::UNAUTHORIZED, "missing webhook signature\n").into_response();
+    };
+    if !verify_webhook_signature(webhook.algorithm, secret.as_bytes(), &body, &provided) {
+        return (StatusCode::UNAUTHORIZED, "invalid webhook signature\n").into_response();
+    }
+    // Rate-limit quota (fail-closed) applies to a verified webhook like any invoke.
+    if let Err(response) = admit_by_quota(inner, &deploy, &function).await {
+        return response;
+    }
+    let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+        return handler_unavailable();
+    };
+    let bytes_in = body.len() as u64;
+    let request = build_webhook_request(content_type, body.to_vec());
+    let (response, duration_ms) =
+        execute_function(inner, &deploy, &function, &component, request).await;
+    let sample = boatramp_core::function::MeteringSample {
+        success: response.status().as_u16() < 500,
+        duration_ms,
+        bytes_in,
+        bytes_out: 0,
+    };
+    record_metering(inner, &deploy, &function.name, &sample).await;
+    response
+}
+
+/// Verify a webhook signature over `body`, constant-time. HMAC-SHA256 accepts the
+/// raw hex or a `sha256=`-prefixed hex (GitHub style).
+#[cfg(feature = "handlers")]
+fn verify_webhook_signature(
+    algorithm: boatramp_core::function::WebhookAlgorithm,
+    secret: &[u8],
+    body: &[u8],
+    provided: &str,
+) -> bool {
+    use boatramp_core::function::WebhookAlgorithm;
+    use hmac::{Hmac, Mac};
+    use subtle::ConstantTimeEq;
+    match algorithm {
+        WebhookAlgorithm::HmacSha256 => {
+            let provided = provided.strip_prefix("sha256=").unwrap_or(provided);
+            let Ok(provided_bytes) = hex::decode(provided) else {
+                return false;
+            };
+            // HMAC accepts a key of any length, so this construction never fails.
+            let Ok(mut mac) = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret) else {
+                return false;
+            };
+            mac.update(body);
+            let expected = mac.finalize().into_bytes();
+            provided_bytes.ct_eq(&expected).into()
+        }
+    }
+}
+
+/// Build the engine request for a verified webhook: a `POST` carrying the raw body
+/// (+ content type). `execute_function` rewrites the URI to the invoke authority.
+#[cfg(feature = "handlers")]
+fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request {
+    let mut builder = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/");
+    if let Some(ct) = &content_type {
+        if let Ok(value) = HeaderValue::from_str(ct) {
+            builder = builder.header(header::CONTENT_TYPE, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
+}
+
+// ---- workflow orchestration (FA-6) -------------------------------------------
+
+/// Max request body buffered as a workflow run's initial input.
+#[cfg(feature = "handlers")]
+const MAX_WORKFLOW_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Body of `PUT /api/workflows/:name` — the step DAG (the name comes from the path).
+#[cfg(feature = "handlers")]
+#[derive(serde::Deserialize)]
+struct WorkflowBody {
+    steps: Vec<boatramp_core::workflow::Step>,
+}
+
+/// `PUT /api/workflows/:name` (FA-6) — define/replace a workflow. The DAG is
+/// validated (unique ids, deps resolve, acyclic) before it is stored. `system·admin`.
+#[cfg(feature = "handlers")]
+async fn define_workflow(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+    Json(body): Json<WorkflowBody>,
+) -> Response {
+    let workflow = boatramp_core::workflow::Workflow {
+        name: name.clone(),
+        steps: body.steps,
+    };
+    if let Err(reason) = workflow.validate() {
+        return (StatusCode::BAD_REQUEST, format!("{reason}\n")).into_response();
+    }
+    if let Err(err) = deploy.put_workflow(&workflow).await {
+        return deploy_error_response(err);
+    }
+    Json(workflow).into_response()
+}
+
+/// `GET /api/workflows` (FA-6) — list workflow definitions. `system·read`.
+#[cfg(feature = "handlers")]
+async fn list_workflows_handler(State(deploy): State<DeployStore>) -> Response {
+    match deploy.list_workflows().await {
+        Ok(mut list) => {
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            Json(list).into_response()
+        }
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `GET /api/workflows/:name` (FA-6) — a workflow definition. `system·read`.
+#[cfg(feature = "handlers")]
+async fn get_workflow_handler(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+) -> Response {
+    match deploy.get_workflow(&name).await {
+        Ok(Some(w)) => Json(w).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/workflows/:name` (FA-6) — remove a workflow definition (runs are
+/// left as history). `system·admin`. Idempotent.
+#[cfg(feature = "handlers")]
+async fn delete_workflow_handler(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+) -> Response {
+    match deploy.delete_workflow(&name).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `POST /api/workflows/:name/runs` (FA-6) — start a run. The request body is the
+/// run's initial input (delivered to the root steps). Returns `202` + the queued
+/// run; the executor drain advances it. `system·admin`.
+#[cfg(feature = "handlers")]
+async fn start_workflow_run(
+    State(deploy): State<DeployStore>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    let workflow = match deploy.get_workflow(&name).await {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
+    };
+    let body = match axum::body::to_bytes(request.into_body(), MAX_WORKFLOW_INPUT_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "workflow input exceeds the cap\n",
+            )
+                .into_response()
+        }
+    };
+    let now = now_unix();
+    let id = new_invocation_id();
+    let input_b64 = (!body.is_empty()).then(|| b64_encode(&body));
+    let run = boatramp_core::workflow::WorkflowRun::start(&workflow, id, input_b64, now);
+    if let Err(err) = deploy.put_workflow_run(&run).await {
+        return deploy_error_response(err);
+    }
+    (StatusCode::ACCEPTED, Json(run)).into_response()
+}
+
+/// `GET /api/workflows/:name/runs/:id` (FA-6) — poll a run's status/step state.
+/// `system·read`.
+#[cfg(feature = "handlers")]
+async fn get_workflow_run_handler(
+    State(deploy): State<DeployStore>,
+    Path((name, id)): Path<(String, String)>,
+) -> Response {
+    match deploy.get_workflow_run(&name, &id).await {
+        Ok(Some(run)) => Json(run).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("no run {id:?} for workflow {name:?}\n"),
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// Drain a workflow's non-terminal runs, advancing each by one tick. Driven from
+/// the scheduler tick, leader-gated like the invocation drain.
+#[cfg(feature = "handlers")]
+async fn drain_workflow_runs(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    workflow: &boatramp_core::workflow::Workflow,
+) {
+    let runs = match deploy.list_workflow_runs(&workflow.name).await {
+        Ok(runs) => runs,
+        Err(err) => {
+            tracing::warn!(workflow = %workflow.name, %err, "listing workflow runs failed");
+            return;
+        }
+    };
+    for run in runs {
+        if run.is_terminal() {
+            continue;
+        }
+        advance_workflow_run(inner, deploy, workflow, run).await;
+    }
+}
+
+/// Advance one run by a tick: run every ready step once, then settle the run
+/// (succeeded when all steps did; failed + compensated when a step exhausted its
+/// retries). A step whose function is missing or returns a `5xx` (engine wrapper)
+/// is a failure, retried up to its `max_attempts`.
+#[cfg(feature = "handlers")]
+async fn advance_workflow_run(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    workflow: &boatramp_core::workflow::Workflow,
+    mut run: boatramp_core::workflow::WorkflowRun,
+) {
+    use boatramp_core::workflow::StepStatus;
+    let now = now_unix();
+    for step_id in run.ready_steps(workflow) {
+        let Some(step) = workflow.step(&step_id).cloned() else {
+            continue;
+        };
+        let input = build_step_input(&run, &step);
+        let outcome = run_workflow_step(inner, deploy, &step, input).await;
+        let Some(sr) = run.steps.get_mut(&step_id) else {
+            continue;
+        };
+        sr.attempts = sr.attempts.saturating_add(1);
+        sr.updated = now;
+        match outcome {
+            Some(output) => {
+                sr.status = StepStatus::Succeeded;
+                sr.output_b64 = Some(b64_encode(&output));
+                run.completed_order.push(step_id.clone());
+            }
+            None if sr.attempts >= step.retry.max_attempts => sr.status = StepStatus::Failed,
+            None => sr.status = StepStatus::Pending, // retry next tick
+        }
+    }
+    // Settle the run.
+    let any_failed = run.steps.values().any(|r| r.status == StepStatus::Failed);
+    if any_failed {
+        compensate_run(inner, deploy, workflow, &mut run).await;
+        run.status = boatramp_core::workflow::WorkflowStatus::Failed;
+    } else if run.all_succeeded() {
+        run.status = boatramp_core::workflow::WorkflowStatus::Succeeded;
+    }
+    run.updated = now_unix();
+    let _ = deploy.put_workflow_run(&run).await;
+}
+
+/// Run a single step's function (active version) with `input` as its request body.
+/// Returns the response body on a delivered guest response, or `None` on a
+/// missing function / engine-level failure (a retryable step failure).
+#[cfg(feature = "handlers")]
+async fn run_workflow_step(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    step: &boatramp_core::workflow::Step,
+    input: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let function = match deploy.get_function(&step.function).await {
+        Ok(Some(f)) => f,
+        _ => return None,
+    };
+    let component = function.resolve(&function.active).map(str::to_owned)?;
+    let request = build_step_request(input);
+    let (response, _duration) =
+        execute_function(inner, deploy, &function, &component, request).await;
+    let (status, _content_type, body) = capture_response(response).await;
+    // A guest response (any status the guest itself set, incl. 4xx) is delivered;
+    // an engine wrapper 5xx (timeout/trap/overload/missing blob) is a failure.
+    let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
+        && status != StatusCode::GATEWAY_TIMEOUT
+        && status != StatusCode::SERVICE_UNAVAILABLE;
+    delivered.then_some(body)
+}
+
+/// On a run failure, invoke each completed step's `compensate` function in reverse
+/// completion order (best-effort) and mark those steps `compensated`.
+#[cfg(feature = "handlers")]
+async fn compensate_run(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    workflow: &boatramp_core::workflow::Workflow,
+    run: &mut boatramp_core::workflow::WorkflowRun,
+) {
+    let completed = run.completed_order.clone();
+    for step_id in completed.iter().rev() {
+        let Some(step) = workflow.step(step_id) else {
+            continue;
+        };
+        if let Some(compensate_fn) = &step.compensate {
+            if let Ok(Some(function)) = deploy.get_function(compensate_fn).await {
+                if let Some(component) = function.resolve(&function.active).map(str::to_owned) {
+                    let request = build_step_request(Vec::new());
+                    // Best-effort rollback; its outcome does not change the verdict.
+                    let _ = execute_function(inner, deploy, &function, &component, request).await;
+                }
+            }
+        }
+        if let Some(sr) = run.steps.get_mut(step_id) {
+            sr.status = boatramp_core::workflow::StepStatus::Compensated;
+            sr.updated = now_unix();
+        }
+    }
+}
+
+/// The input a step's function receives: for a root step, the run's initial input;
+/// otherwise a JSON object mapping each dependency's step id → its output (as a
+/// string). Data-transform is deliberately minimal (the scope guard).
+#[cfg(feature = "handlers")]
+fn build_step_input(
+    run: &boatramp_core::workflow::WorkflowRun,
+    step: &boatramp_core::workflow::Step,
+) -> Vec<u8> {
+    if step.depends_on.is_empty() {
+        return run.input_b64.as_deref().map(b64_decode).unwrap_or_default();
+    }
+    let mut map = serde_json::Map::new();
+    for dep in &step.depends_on {
+        let out = run
+            .steps
+            .get(dep)
+            .and_then(|r| r.output_b64.as_deref())
+            .map(b64_decode)
+            .unwrap_or_default();
+        map.insert(
+            dep.clone(),
+            serde_json::Value::String(String::from_utf8_lossy(&out).into_owned()),
+        );
+    }
+    serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_default()
+}
+
+/// Build the engine request for a step: a `POST` carrying the input body as JSON.
+#[cfg(feature = "handlers")]
+fn build_step_request(input: Vec<u8>) -> Request {
+    axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(input))
+        .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
 }
 
 async fn get_site_config(State(deploy): State<DeployStore>, Path(site): Path<String>) -> Response {
@@ -3525,7 +5241,7 @@ async fn serve_resolved(
                             // the request as activity so the reconcile loop
                             // keeps the workload warm / wakes it, and only sleeps it
                             // once genuinely idle.
-                            let compute_backends = match &upstream.compute {
+                            let (compute_backends, compute_regions) = match &upstream.compute {
                                 Some(workload) => {
                                     gateway::record_activity(workload);
                                     let mut pool = compute_endpoints(deploy, workload).await;
@@ -3540,9 +5256,18 @@ async fn serve_resolved(
                                         pool = await_warm(deploy, workload, COMPUTE_WAKE_TIMEOUT)
                                             .await;
                                     }
-                                    Some(pool)
+                                    // FA-8: for a nearest-region pool, tag each replica
+                                    // endpoint with its node's region (from placement).
+                                    let regions = if upstream.lb
+                                        == boatramp_core::gateway::LbPolicy::Nearest
+                                    {
+                                        Some(compute_endpoint_regions(deploy, workload).await)
+                                    } else {
+                                        None
+                                    };
+                                    (Some(pool), regions)
                                 }
-                                None => None,
+                                None => (None, None),
                             };
                             dispatch_gateway(
                                 request,
@@ -3552,6 +5277,7 @@ async fn serve_resolved(
                                 request_path,
                                 client_ip,
                                 compute_backends,
+                                compute_regions,
                             )
                             .await
                         }
@@ -4275,6 +6001,7 @@ fn gateway_addr_allowed(ip: IpAddr, posture: &boatramp_core::security::SecurityP
 /// candidate on a backend failure — but only for body-less idempotent requests,
 /// since a sent body can't be replayed. Each attempt's
 /// outcome feeds passive health so future requests route around a dead backend.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_gateway(
     request: Request,
     site: &str,
@@ -4286,6 +6013,11 @@ async fn dispatch_gateway(
     // the workload's live healthy replica endpoints here; otherwise `None` and
     // the static/DNS pool is used.
     compute_backends: Option<Vec<String>>,
+    // FA-8: per-replica region tags (endpoint URL → region) for a compute-backed
+    // `LbPolicy::Nearest` pool, derived from node placement; merged over the
+    // upstream's static `regions` so nearest-replica routing works without a manual
+    // `--region` map. `None`/empty for non-nearest or non-compute pools.
+    compute_regions: Option<std::collections::BTreeMap<String, String>>,
 ) -> Response {
     // Read the security posture once from the original request — the retry path
     // below rebuilds the request (dropping extensions), so we thread the resolved
@@ -4296,6 +6028,14 @@ async fn dispatch_gateway(
     // background prober has a current config snapshot.
     state.arm_active_probe(upstream);
     let now = std::time::Instant::now();
+    // Merge compute-derived replica regions into the upstream so the nearest LB
+    // sees them (a per-request clone only when there are regions to add).
+    let merged_upstream = compute_regions.filter(|r| !r.is_empty()).map(|regions| {
+        let mut u = upstream.clone();
+        u.regions.extend(regions);
+        u
+    });
+    let upstream = merged_upstream.as_ref().unwrap_or(upstream);
     let backends =
         compute_backends.unwrap_or_else(|| state.backends(upstream, &gateway::SystemResolver, now));
     if backends.is_empty() {
@@ -4305,7 +6045,16 @@ async fn dispatch_gateway(
         )
             .into_response();
     }
-    let candidates = state.candidates(&backends, upstream, now);
+    // FA-8: extract the client's region from the configured edge header (set by a
+    // CDN/edge, e.g. `fly-region` / `cf-ipcountry`), driving `LbPolicy::Nearest`.
+    // Unset header ⇒ no client region ⇒ Nearest degrades to health-first order.
+    let client_region = upstream
+        .client_region_header
+        .as_deref()
+        .and_then(|name| request.headers().get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let candidates = state.candidates(&backends, upstream, now, client_region.as_deref());
 
     // Retry across backends only when the request body is replayable (none) —
     // GET/HEAD with no declared/streamed body. Otherwise use a single backend.
@@ -4359,6 +6108,24 @@ async fn compute_endpoints(deploy: &DeployStore, workload: &str) -> Vec<String> 
         .into_iter()
         .filter(|state| state.healthy)
         .map(|state| state.endpoint.url())
+        .collect()
+}
+
+/// The region of each healthy replica endpoint of a compute workload (FA-8), as
+/// `endpoint-url → region`, denormalized from the replica's node placement. Feeds
+/// the nearest-replica LB; replicas whose node had no region are omitted
+/// (region-neutral).
+async fn compute_endpoint_regions(
+    deploy: &DeployStore,
+    workload: &str,
+) -> std::collections::BTreeMap<String, String> {
+    deploy
+        .list_replica_states(workload)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|state| state.healthy)
+        .filter_map(|state| state.region.map(|region| (state.endpoint.url(), region)))
         .collect()
 }
 
@@ -5535,6 +7302,10 @@ impl HandlerRuntime {
                 std::collections::HashMap::new();
             let mut cron_state: std::collections::HashMap<String, CronEntry> =
                 std::collections::HashMap::new();
+            // Live blob-change watchers, keyed by `<function>|<trigger id>`; each
+            // owns a native watch stream + its drain task (FA-5).
+            let mut blob_watchers: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+                std::collections::HashMap::new();
             let mut interval = tokio::time::interval(SCHEDULER_TICK);
             loop {
                 interval.tick().await;
@@ -5551,8 +7322,134 @@ impl HandlerRuntime {
                 {
                     tracing::warn!(%err, "scheduler tick failed");
                 }
+                // Reconcile blob-change watchers (FA-5): spawn one per live
+                // `Blob` trigger, drop those whose trigger is gone.
+                reconcile_blob_watchers(&inner, &deploy, &mut blob_watchers).await;
             }
         }))
+    }
+}
+
+/// Reconcile the live blob-change watchers against the stored `Blob` triggers:
+/// spawn a watcher for each new trigger, abort + drop watchers whose trigger was
+/// removed. Leader-gated (shared-FS clusters would otherwise fire per-node).
+#[cfg(feature = "handlers")]
+async fn reconcile_blob_watchers(
+    inner: &Arc<HandlerRuntimeInner>,
+    deploy: &DeployStore,
+    watchers: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    use boatramp_core::function::TriggerKind;
+    // Only the leader (or a single node) dispatches, matching cron/invoke.
+    if inner.cron_leader_gate.get().is_some_and(|gate| !gate()) {
+        for (_, handle) in watchers.drain() {
+            handle.abort();
+        }
+        return;
+    }
+    let functions = match deploy.list_stored_functions().await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut desired = std::collections::HashSet::new();
+    for function in functions {
+        let triggers = deploy
+            .list_triggers(&function.name)
+            .await
+            .unwrap_or_default();
+        for trigger in triggers {
+            let TriggerKind::Blob { prefix } = &trigger.kind else {
+                continue;
+            };
+            let watch_id = format!("{}|{}", function.name, trigger.id);
+            desired.insert(watch_id.clone());
+            if let std::collections::hash_map::Entry::Vacant(slot) = watchers.entry(watch_id) {
+                if let Some(handle) =
+                    spawn_blob_watcher(inner.clone(), deploy.clone(), function.clone(), prefix)
+                        .await
+                {
+                    slot.insert(handle);
+                }
+            }
+        }
+    }
+    // Drop watchers whose trigger no longer exists.
+    watchers.retain(|id, handle| {
+        if desired.contains(id) {
+            true
+        } else {
+            handle.abort();
+            false
+        }
+    });
+}
+
+/// Spawn a task that watches the function's blob prefix and enqueues an async
+/// invocation on each change. Returns `None` if the backend can't watch (the
+/// activation gate should already have refused, so this is defensive).
+#[cfg(feature = "handlers")]
+async fn spawn_blob_watcher(
+    inner: Arc<HandlerRuntimeInner>,
+    deploy: DeployStore,
+    function: boatramp_core::function::Function,
+    prefix: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // The function's blobstore lives under `hblob/fn/<name>/`; the trigger prefix
+    // is relative to that namespace (same key the provisioner + ledger use).
+    let storage_prefix = blob_storage_prefix(&function.name, prefix);
+    let mut stream = match inner.storage.watch(&storage_prefix).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "starting blob watch failed");
+            return None;
+        }
+    };
+    let namespace = format!("hblob/fn/{}/", function.name);
+    Some(tokio::spawn(async move {
+        use futures::StreamExt;
+        while let Some(change) = stream.next().await {
+            enqueue_blob_invocation(&deploy, &function, &change, &namespace).await;
+        }
+    }))
+}
+
+/// Enqueue a durable async invocation for a blob change, with the changed key +
+/// kind as the JSON request body (the function-relative key, `hblob/fn/<name>/`
+/// stripped).
+#[cfg(feature = "handlers")]
+async fn enqueue_blob_invocation(
+    deploy: &DeployStore,
+    function: &boatramp_core::function::Function,
+    change: &boatramp_core::BlobChange,
+    namespace: &str,
+) {
+    use boatramp_core::BlobChangeKind;
+    let key = change.key.strip_prefix(namespace).unwrap_or(&change.key);
+    let kind = match change.kind {
+        BlobChangeKind::Created => "created",
+        BlobChangeKind::Modified => "modified",
+        BlobChangeKind::Removed => "removed",
+    };
+    let body = serde_json::json!({ "key": key, "kind": kind });
+    let payload = serde_json::to_vec(&body).unwrap_or_default();
+    let now = now_unix();
+    let inv = boatramp_core::function::Invocation {
+        id: new_invocation_id(),
+        function: function.name.clone(),
+        version: function.active.clone(),
+        mode: boatramp_core::function::InvokeMode::Async,
+        status: boatramp_core::function::InvocationStatus::Queued,
+        idempotency_key: None,
+        attempts: 0,
+        request_b64: (!payload.is_empty()).then(|| b64_encode(&payload)),
+        request_content_type: Some("application/json".to_string()),
+        result: None,
+        created: now,
+        updated: now,
+    };
+    if let Err(err) = deploy.put_invocation(&inv).await {
+        tracing::warn!(function = %function.name, %err, "enqueuing blob invocation failed");
     }
 }
 
@@ -5697,6 +7594,23 @@ async fn run_scheduler_tick(
                     running.store(false, Ordering::Release);
                 }));
             }
+        }
+    }
+    // --- async function invocations (FA-3) ---
+    // Drain each top-level function's queued invocations. Leader-gated like crons
+    // (`None` = single node) so a durable async call runs exactly once
+    // cluster-wide; the drain runs inline so the outcome is settled this tick.
+    let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
+    if invoke_enabled {
+        for function in deploy.list_stored_functions().await? {
+            // Fire due triggers first (a cron enqueues an invocation this tick),
+            // then drain the queue so a just-enqueued call runs without waiting.
+            dispatch_function_triggers(inner, deploy, &function, &now).await;
+            drain_function_invocations(inner, deploy, &function).await;
+        }
+        // --- workflow runs (FA-6), same leader gate ---
+        for workflow in deploy.list_workflows().await? {
+            drain_workflow_runs(inner, deploy, &workflow).await;
         }
     }
     Ok((acked, cron_handles))
@@ -6522,6 +8436,46 @@ async fn prometheus_metrics(
             }
             body.push_str(&metrics::render_consumer_gauges(&rows));
         }
+        // Function usage series (FA-4), from the persisted metering aggregates.
+        // Best-effort: a store error omits the block rather than failing the scrape.
+        if let Ok(mut usage) = deploy.list_metering().await {
+            if !usage.is_empty() {
+                usage.sort_by(|a, b| a.function.cmp(&b.function));
+                body.push_str(
+                    "# HELP boatramp_function_invocations_total Function invocations metered.\n\
+                     # TYPE boatramp_function_invocations_total counter\n",
+                );
+                for m in &usage {
+                    let f = metrics::escape_label(&m.function);
+                    body.push_str(&format!(
+                        "boatramp_function_invocations_total{{function=\"{f}\"}} {}\n",
+                        m.invocations
+                    ));
+                }
+                body.push_str(
+                    "# HELP boatramp_function_failures_total Function invocations that failed to deliver.\n\
+                     # TYPE boatramp_function_failures_total counter\n",
+                );
+                for m in &usage {
+                    let f = metrics::escape_label(&m.function);
+                    body.push_str(&format!(
+                        "boatramp_function_failures_total{{function=\"{f}\"}} {}\n",
+                        m.failures
+                    ));
+                }
+                body.push_str(
+                    "# HELP boatramp_function_duration_ms_total Summed function wall-clock duration, ms.\n\
+                     # TYPE boatramp_function_duration_ms_total counter\n",
+                );
+                for m in &usage {
+                    let f = metrics::escape_label(&m.function);
+                    body.push_str(&format!(
+                        "boatramp_function_duration_ms_total{{function=\"{f}\"}} {}\n",
+                        m.duration_ms_total
+                    ));
+                }
+            }
+        }
     }
     (
         [(
@@ -6673,6 +8627,176 @@ mod tests {
         )
         .await;
         assert_eq!(no_issuer.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// FA-2: the top-level function **write** path driven through the HTTP handlers —
+    /// deploy two versions, roll back, alias, remove — plus the two 400/absent-blob
+    /// guards. The store-layer semantics are the `boatramp-core` oracle; this pins the
+    /// handler wrapper (status codes, blob gate, JSON echo).
+    #[tokio::test]
+    async fn function_write_path_deploy_rollback_alias_remove() {
+        use boatramp_core::function::Lifecycle;
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+
+        // A storage whose `head` (hence `has_blob`) is toggleable — enough to drive
+        // both the blob-present deploy path and the absent-blob 400.
+        struct FakeStorage {
+            present: bool,
+        }
+        #[async_trait::async_trait]
+        impl Storage for FakeStorage {
+            async fn get(&self, _: &str) -> Result<GetObject, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn get_range(
+                &self,
+                _: &str,
+                _: u64,
+                _: Option<u64>,
+            ) -> Result<GetObject, StorageError> {
+                Err(StorageError::NotFound(String::new()))
+            }
+            async fn put(
+                &self,
+                _: &str,
+                _: ByteStream,
+                _: PutMeta,
+            ) -> Result<ObjectMeta, StorageError> {
+                Err(StorageError::unsupported("fake"))
+            }
+            async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+                if self.present {
+                    Ok(ObjectMeta {
+                        key: key.to_string(),
+                        ..Default::default()
+                    })
+                } else {
+                    Err(StorageError::NotFound(key.to_string()))
+                }
+            }
+            async fn delete(&self, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, value)
+        }
+
+        let deploy = DeployStore::new(
+            Arc::new(FakeStorage { present: true }),
+            Arc::new(MemoryKv::new()),
+        );
+        let v1 = "a".repeat(64);
+        let v2 = "b".repeat(64);
+
+        // Deploy v1 → created, active = v1.
+        let (st, body) = body_json(
+            deploy_function(
+                State(deploy.clone()),
+                Path("greeter".to_string()),
+                Json(FunctionUpsert {
+                    component: v1.clone(),
+                    config: Default::default(),
+                    lifecycle: Lifecycle::Independent,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["active"], v1);
+
+        // Deploy v2 → active advances, two versions retained.
+        let (_, body) = body_json(
+            deploy_function(
+                State(deploy.clone()),
+                Path("greeter".to_string()),
+                Json(FunctionUpsert {
+                    component: v2.clone(),
+                    config: Default::default(),
+                    lifecycle: Lifecycle::Independent,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["active"], v2);
+        assert_eq!(body["versions"].as_array().unwrap().len(), 2);
+
+        // Roll back to v1.
+        let (st, body) = body_json(
+            rollback_function(
+                State(deploy.clone()),
+                Path("greeter".to_string()),
+                Json(RollbackBody { to: v1.clone() }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["active"], v1);
+
+        // Rolling back to an unknown version is a 400 (plain-text body).
+        let resp = rollback_function(
+            State(deploy.clone()),
+            Path("greeter".to_string()),
+            Json(RollbackBody { to: "c".repeat(64) }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Alias prod → v2.
+        let (st, body) = body_json(
+            alias_function(
+                State(deploy.clone()),
+                Path(("greeter".to_string(), "prod".to_string())),
+                Json(AliasBody {
+                    version: v2.clone(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["aliases"]["prod"], v2);
+
+        // Remove → 204, and it's gone.
+        let (st, _) =
+            body_json(remove_function(State(deploy.clone()), Path("greeter".to_string())).await)
+                .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        assert!(deploy.get_function("greeter").await.unwrap().is_none());
+
+        // Deploying a component whose blob was never uploaded is a 400.
+        let empty = DeployStore::new(
+            Arc::new(FakeStorage { present: false }),
+            Arc::new(MemoryKv::new()),
+        );
+        let resp = deploy_function(
+            State(empty),
+            Path("orphan".to_string()),
+            Json(FunctionUpsert {
+                component: v1.clone(),
+                config: Default::default(),
+                lifecycle: Lifecycle::default(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A configurable stub: records the `(mesh_pubkey, jti)` it's asked to admit and
@@ -7167,6 +9291,7 @@ mod tests {
                 host: "10.0.0.2".into(),
                 port: 80,
             },
+            region: None,
             healthy,
             phase,
             snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {

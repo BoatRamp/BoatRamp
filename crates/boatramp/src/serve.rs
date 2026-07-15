@@ -52,6 +52,14 @@ pub enum Error {
     #[cfg(not(feature = "s3"))]
     #[error("this build has no S3 support; rebuild with `--features s3`")]
     NoS3Support,
+    /// `--blobs gcs` selected but the binary lacks GCS support.
+    #[cfg(not(feature = "gcs"))]
+    #[error("this build has no GCS support; rebuild with `--features gcs`")]
+    NoGcsSupport,
+    /// `--blobs azure` selected but the binary lacks Azure support.
+    #[cfg(not(feature = "azure"))]
+    #[error("this build has no Azure support; rebuild with `--features azure`")]
+    NoAzureSupport,
     /// `--kv slatedb` selected but the binary lacks SlateDB support.
     #[cfg(not(feature = "slatedb"))]
     #[error("this build has no slatedb support; rebuild with `--features slatedb`")]
@@ -144,6 +152,22 @@ pub enum Error {
     #[cfg(feature = "s3")]
     #[error("--s3-bucket is required for --blobs s3")]
     S3BucketRequired,
+    /// `--blobs gcs` was selected without a bucket.
+    #[cfg(feature = "gcs")]
+    #[error("--gcs-bucket is required for --blobs gcs")]
+    GcsBucketRequired,
+    /// Connecting the GCS backend failed (usually credential resolution).
+    #[cfg(feature = "gcs")]
+    #[error("GCS backend: {0}")]
+    GcsConnect(String),
+    /// `--blobs azure` was selected without an account/container.
+    #[cfg(feature = "azure")]
+    #[error("--azure-account and --azure-container are required for --blobs azure")]
+    AzureConfigRequired,
+    /// Connecting the Azure backend failed.
+    #[cfg(feature = "azure")]
+    #[error("Azure backend: {0}")]
+    AzureConnect(String),
     /// A handler `sql` binding named an env var that is not set.
     #[cfg(feature = "handlers")]
     #[error("handlers SQL binding: env var {0} is not set")]
@@ -423,7 +447,7 @@ async fn build_compute(
     tracing::info!(backends = ?advertised, free_vcpus, free_mem_mib, "compute node inventory");
     let node = Node {
         id: node_id,
-        region: None,
+        region: cfg.region.clone(),
         labels: std::collections::BTreeMap::new(),
         free_vcpus,
         free_mem_mib,
@@ -439,6 +463,10 @@ enum BlobBackend {
     Fs,
     /// S3-compatible object store (requires `--features s3`).
     S3,
+    /// Google Cloud Storage (requires `--features gcs`).
+    Gcs,
+    /// Azure Blob Storage (requires `--features azure`).
+    Azure,
 }
 
 /// Metadata (manifest + pointer) backend.
@@ -509,6 +537,37 @@ pub struct ServeArgs {
     /// Use S3 path-style addressing (required by MinIO).
     #[arg(long, env = "BOATRAMP_S3_PATH_STYLE")]
     s3_path_style: bool,
+
+    /// GCS bucket (required for `--blobs gcs`).
+    #[arg(long, env = "BOATRAMP_GCS_BUCKET")]
+    gcs_bucket: Option<String>,
+
+    /// GCS storage endpoint URL, e.g. a `fake-gcs-server` emulator (optional;
+    /// defaults to the public GCS JSON API).
+    #[arg(long, env = "BOATRAMP_GCS_ENDPOINT")]
+    gcs_endpoint: Option<String>,
+
+    /// Skip GCS credential resolution (anonymous — the emulator). Real GCS uses
+    /// Application Default Credentials.
+    #[arg(long, env = "BOATRAMP_GCS_ANONYMOUS")]
+    gcs_anonymous: bool,
+
+    /// Azure storage account name (required for `--blobs azure`).
+    #[arg(long, env = "BOATRAMP_AZURE_ACCOUNT")]
+    azure_account: Option<String>,
+
+    /// Azure container name (required for `--blobs azure`).
+    #[arg(long, env = "BOATRAMP_AZURE_CONTAINER")]
+    azure_container: Option<String>,
+
+    /// Azure storage account access key (shared-key auth; required unless
+    /// `--azure-emulator`). Prefer the env var over the flag.
+    #[arg(long, env = "BOATRAMP_AZURE_ACCESS_KEY")]
+    azure_access_key: Option<String>,
+
+    /// Use the Azurite emulator (well-known dev credentials + local endpoint).
+    #[arg(long, env = "BOATRAMP_AZURE_EMULATOR")]
+    azure_emulator: bool,
 
     /// Number of deploy manifests/pointers to keep in the in-memory LRU.
     #[arg(long, default_value_t = 256)]
@@ -743,7 +802,13 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         .or(serve_cfg.data_dir)
         .unwrap_or_else(|| PathBuf::from("./data"));
 
-    let storage = build_blobs(&args, &data_dir).await?;
+    // Cloud blob-change notification provisioning config (FA-5b2): the tier + the
+    // account id that scopes a provisioned queue policy. Read before `storage` so
+    // the notify-enabled S3 backend + its provider share one AWS config.
+    let notify_tier = serve_cfg.blob_notify_tier;
+    let notify_account = serve_cfg.blob_notify_account_id.clone();
+    let built_blobs = build_blobs(&args, &data_dir, notify_tier, notify_account).await?;
+    let storage = built_blobs.storage.clone();
 
     // Cluster mode: triggered by a `[cluster]` config section OR the founding/
     // joining flags (`--cluster-init` / `--cluster-join <ticket>`), so a node can
@@ -763,7 +828,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 mesh: None,
             }
         });
-        return run_cluster(args, config, cluster_cfg, addr, data_dir, storage, options).await;
+        return run_cluster(
+            args,
+            config,
+            cluster_cfg,
+            addr,
+            data_dir,
+            built_blobs,
+            options,
+        )
+        .await;
     }
     #[cfg(not(feature = "cluster"))]
     if config.cluster.is_some() {
@@ -830,6 +904,13 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         posture.max_handler_blob_bytes,
         posture.max_component_bytes,
     )?;
+    // FA-5b2: on a cloud backend, wire the blob-change notification provisioner +
+    // its tier so adding a `blob` trigger provisions (and removing it retracts).
+    #[cfg(feature = "handlers")]
+    if let Some(provider) = built_blobs.watch_provider.clone() {
+        handlers.set_watch_provider(provider);
+        handlers.set_provision_tier(built_blobs.provision_tier);
+    }
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv);
 
@@ -1314,10 +1395,14 @@ async fn run_cluster(
     mut cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
-    storage: Arc<dyn Storage>,
+    built_blobs: BuiltBlobs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     use boatramp_cluster::node::{build_node, ClusterParams};
+
+    // The blob backend; `built_blobs` also carries the optional FA-5b2 blob-change
+    // watch provider + tier the handler runtime is wired with below.
+    let storage = built_blobs.storage.clone();
 
     // Node-local durable Raft log/state store (distinct from the *replicated*
     // control plane the cluster serves).
@@ -1631,6 +1716,13 @@ async fn run_cluster(
     handlers.set_cron_leader_gate(Arc::new(move || {
         boatramp_cluster::raft::is_leader(&raft, node_id)
     }));
+    // FA-5b2: wire the blob-change notification provisioner (leader-gated dispatch
+    // already ensures a single node reconciles the watchers).
+    #[cfg(feature = "handlers")]
+    if let Some(provider) = built_blobs.watch_provider.clone() {
+        handlers.set_watch_provider(provider);
+        handlers.set_provision_tier(built_blobs.provision_tier);
+    }
 
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv);
@@ -2592,28 +2684,180 @@ async fn serve_rpk(
     Err(Error::NoTlsSupport)
 }
 
-async fn build_blobs(args: &ServeArgs, data_dir: &Path) -> Result<Arc<dyn Storage>> {
+/// The blob backend plus, on a cloud object store with notification provisioning
+/// configured, its blob-change [`WatchProvider`](boatramp_core::blob_provision::WatchProvider)
+/// and operator tier (FA-5b2). The provider/tier are consumed only by the handler
+/// runtime, so they are dead code in a `--no-default-features` (no `handlers`)
+/// build.
+struct BuiltBlobs {
+    storage: Arc<dyn Storage>,
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    watch_provider: Option<Arc<dyn boatramp_core::blob_provision::WatchProvider>>,
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    provision_tier: boatramp_core::blob_notify::ProvisionTier,
+}
+
+async fn build_blobs(
+    args: &ServeArgs,
+    data_dir: &Path,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
     match args.blobs {
-        BlobBackend::Fs => Ok(Arc::new(FsStorage::new(data_dir.join("blobs")))),
-        BlobBackend::S3 => build_s3(args).await,
+        BlobBackend::Fs => Ok(BuiltBlobs {
+            storage: Arc::new(FsStorage::new(data_dir.join("blobs"))),
+            watch_provider: None,
+            provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+        }),
+        BlobBackend::S3 => build_s3(args, notify_tier, notify_account).await,
+        BlobBackend::Gcs => build_gcs(args, notify_tier, notify_account).await,
+        BlobBackend::Azure => build_azure(args, notify_tier, notify_account).await,
     }
 }
 
+// Azure storage + optional blob-change notification (Event Grid → Storage Queue,
+// FA-5b2). When a notify tier is configured the backend is consumer-wired and
+// paired with the AzureWatchProvider (the Event Grid subscription is an operator
+// step — see the provider recipe).
+#[cfg(feature = "azure")]
+async fn build_azure(
+    args: &ServeArgs,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    let (Some(account), Some(container)) =
+        (args.azure_account.clone(), args.azure_container.clone())
+    else {
+        return Err(Error::AzureConfigRequired);
+    };
+    let opts = boatramp_storage::AzureOptions {
+        account,
+        container,
+        access_key: args.azure_access_key.clone(),
+        emulator: args.azure_emulator,
+    };
+    match notify_tier {
+        Some(tier) => {
+            let (storage, provider) = boatramp_storage::AzureStorage::connect_with_notify(opts)
+                .map_err(|err| Error::AzureConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: Some(Arc::new(provider)),
+                provision_tier: tier,
+            })
+        }
+        None => {
+            let storage = boatramp_storage::AzureStorage::connect(opts)
+                .map_err(|err| Error::AzureConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: None,
+                provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "azure"))]
+async fn build_azure(
+    _args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    Err(Error::NoAzureSupport)
+}
+
+// GCS storage + optional blob-change notification (GCS→Pub/Sub, FA-5b2). When a
+// notify tier is configured the backend is consumer-wired and paired with the
+// GcsWatchProvider; `blob_notify_account_id` is read as the GCP project id.
+#[cfg(feature = "gcs")]
+async fn build_gcs(
+    args: &ServeArgs,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    let bucket = args.gcs_bucket.clone().ok_or(Error::GcsBucketRequired)?;
+    let opts = boatramp_storage::GcsOptions {
+        bucket,
+        endpoint: args.gcs_endpoint.clone(),
+        anonymous: args.gcs_anonymous,
+    };
+    match notify_tier {
+        Some(tier) => {
+            let project = notify_account.unwrap_or_default();
+            let (storage, provider) =
+                boatramp_storage::GcsStorage::connect_with_notify(opts, project)
+                    .await
+                    .map_err(|err| Error::GcsConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: Some(Arc::new(provider)),
+                provision_tier: tier,
+            })
+        }
+        None => {
+            let storage = boatramp_storage::GcsStorage::connect(opts)
+                .await
+                .map_err(|err| Error::GcsConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: None,
+                provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "gcs"))]
+async fn build_gcs(
+    _args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    Err(Error::NoGcsSupport)
+}
+
 #[cfg(feature = "s3")]
-async fn build_s3(args: &ServeArgs) -> Result<Arc<dyn Storage>> {
+async fn build_s3(
+    args: &ServeArgs,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
     let bucket = args.s3_bucket.clone().ok_or(Error::S3BucketRequired)?;
-    let storage = boatramp_storage::S3Storage::connect(boatramp_storage::S3Options {
+    let opts = boatramp_storage::S3Options {
         bucket,
         endpoint: args.s3_endpoint.clone(),
         region: args.s3_region.clone(),
         force_path_style: args.s3_path_style,
-    })
-    .await;
-    Ok(Arc::new(storage))
+    };
+    match notify_tier {
+        // Blob-change notification provisioning is enabled: build the
+        // consumer-wired storage + the S3→SQS provider from one AWS config.
+        Some(tier) => {
+            let account = notify_account.unwrap_or_default();
+            let (storage, provider) =
+                boatramp_storage::S3Storage::connect_with_notify(opts, account).await;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: Some(Arc::new(provider)),
+                provision_tier: tier,
+            })
+        }
+        // No provisioning configured: a plain S3 backend (blob triggers refuse).
+        None => Ok(BuiltBlobs {
+            storage: Arc::new(boatramp_storage::S3Storage::connect(opts).await),
+            watch_provider: None,
+            provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+        }),
+    }
 }
 
 #[cfg(not(feature = "s3"))]
-async fn build_s3(_args: &ServeArgs) -> Result<Arc<dyn Storage>> {
+async fn build_s3(
+    _args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
     Err(Error::NoS3Support)
 }
 
