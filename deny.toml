@@ -26,6 +26,23 @@ ignore = [
   "RUSTSEC-2026-0098", # name constraints for URI names
   "RUSTSEC-2026-0099", # name constraints with wildcard names
   "RUSTSEC-2026-0104", # panic in CRL parsing
+
+  # quick-xml (0.38.4) memory-exhaustion / quadratic-parse DoS. Transitive via
+  # slatedb -> object_store, which pins `quick-xml ^0.38`; no released object_store
+  # yet uses the fixed quick-xml >=0.41 (0.14.0 is on 0.40.1, still flagged, and it
+  # additionally pulls a *yanked* spin + crossbeam-epoch — a net-worse tree), so
+  # there is no clean bump. Reachable only when SlateKv is backed by a cloud object
+  # store (S3/R2/GCS) that returns malicious LIST XML — not the default local-FS
+  # KV. Revisit when object_store ships quick-xml >=0.41.
+  "RUSTSEC-2026-0194", # quick-xml: quadratic duplicate-attribute-name check
+  "RUSTSEC-2026-0195", # quick-xml: unbounded NsReader namespace allocation
+
+  # crossbeam-epoch (0.9.18): invalid pointer deref in the `fmt::Pointer`/`Debug`
+  # impls for `Atomic`/`Shared` — only triggered by *formatting* a null-created
+  # epoch pointer. Transitive via slatedb -> crossbeam-skiplist (its memtable),
+  # which never Debug-prints those pointers, so the path is unreachable. No safe
+  # upgrade (0.9.18 is the current line). Revisit when crossbeam-epoch patches.
+  "RUSTSEC-2026-0204",
 ]
 
 [bans]
