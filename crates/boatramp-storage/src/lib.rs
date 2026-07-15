@@ -27,6 +27,9 @@ pub mod s3_notify;
 #[cfg(feature = "gcs")]
 pub mod gcs;
 
+#[cfg(feature = "gcs")]
+pub mod gcs_notify;
+
 #[cfg(feature = "azure")]
 pub mod azure;
 
@@ -53,6 +56,9 @@ pub use s3_notify::S3WatchProvider;
 
 #[cfg(feature = "gcs")]
 pub use gcs::{GcsOptions, GcsStorage};
+
+#[cfg(feature = "gcs")]
+pub use gcs_notify::GcsWatchProvider;
 
 #[cfg(feature = "azure")]
 pub use azure::{AzureOptions, AzureStorage};

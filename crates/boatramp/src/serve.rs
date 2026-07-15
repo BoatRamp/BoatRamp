@@ -2739,29 +2739,45 @@ async fn build_azure(
     Err(Error::NoAzureSupport)
 }
 
-// Storage S1: GCS storage plane only — blob-change notifications (Pub/Sub) land
-// with the GcsWatchProvider in a later stage, at which point this returns a
-// `Some(provider)` (mirroring `build_s3`). Until then a GCS blob trigger is
-// refused (`supports_watch()` is false), never a silent no-op.
+// GCS storage + optional blob-change notification (GCS→Pub/Sub, FA-5b2). When a
+// notify tier is configured the backend is consumer-wired and paired with the
+// GcsWatchProvider; `blob_notify_account_id` is read as the GCP project id.
 #[cfg(feature = "gcs")]
 async fn build_gcs(
     args: &ServeArgs,
-    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
-    _notify_account: Option<String>,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_account: Option<String>,
 ) -> Result<BuiltBlobs> {
     let bucket = args.gcs_bucket.clone().ok_or(Error::GcsBucketRequired)?;
-    let storage = boatramp_storage::GcsStorage::connect(boatramp_storage::GcsOptions {
+    let opts = boatramp_storage::GcsOptions {
         bucket,
         endpoint: args.gcs_endpoint.clone(),
         anonymous: args.gcs_anonymous,
-    })
-    .await
-    .map_err(|err| Error::GcsConnect(err.to_string()))?;
-    Ok(BuiltBlobs {
-        storage: Arc::new(storage),
-        watch_provider: None,
-        provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
-    })
+    };
+    match notify_tier {
+        Some(tier) => {
+            let project = notify_account.unwrap_or_default();
+            let (storage, provider) =
+                boatramp_storage::GcsStorage::connect_with_notify(opts, project)
+                    .await
+                    .map_err(|err| Error::GcsConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: Some(Arc::new(provider)),
+                provision_tier: tier,
+            })
+        }
+        None => {
+            let storage = boatramp_storage::GcsStorage::connect(opts)
+                .await
+                .map_err(|err| Error::GcsConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: None,
+                provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+            })
+        }
+    }
 }
 
 #[cfg(not(feature = "gcs"))]

@@ -127,6 +127,11 @@ google-cloud-storage = { version = "0.24", default-features = false, features = 
   "rustls-tls",
   "auth",
 ] }
+# Pub/Sub for the GCS→Pub/Sub blob-change notification pipeline (FA-5b2).
+google-cloud-pubsub = { version = "0.30", default-features = false, features = [
+  "rustls-tls",
+  "auth",
+] }
 
 # Azure Blob backend (compiled only with `--features azure`). The mature
 # `azure-sdk-for-rust` 0.21 line (the official 1.0 SDK needs rustc 1.88 > our MSRV

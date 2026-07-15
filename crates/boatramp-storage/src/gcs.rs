@@ -28,6 +28,10 @@ use google_cloud_storage::http::Error as GcsError;
 pub struct GcsStorage {
     client: Client,
     bucket: String,
+    /// Optional Pub/Sub client for the blob-change **consumer** (S3/FA-5b2). When
+    /// set, [`supports_watch`](Storage::supports_watch) is `true` and
+    /// [`watch`](Storage::watch) pulls the subscription provisioned for the prefix.
+    pubsub: Option<google_cloud_pubsub::client::Client>,
 }
 
 /// Connection options for [`GcsStorage::connect`].
@@ -49,7 +53,49 @@ impl GcsStorage {
         Self {
             client,
             bucket: bucket.into(),
+            pubsub: None,
         }
+    }
+
+    /// Attach a Pub/Sub client so this backend can **consume** blob-change
+    /// notifications (S3/FA-5b2): [`supports_watch`](Storage::supports_watch)
+    /// becomes `true`, and [`watch`](Storage::watch) pulls the subscription
+    /// provisioned for the watched prefix (see [`crate::gcs_notify`]).
+    pub fn with_pubsub_notify(mut self, pubsub: google_cloud_pubsub::client::Client) -> Self {
+        self.pubsub = Some(pubsub);
+        self
+    }
+
+    /// Build a notify-enabled GCS backend + its blob-change
+    /// [`GcsWatchProvider`](crate::gcs_notify::GcsWatchProvider) (FA-5b2 GCS),
+    /// sharing credentials. The storage consumes the provisioned Pub/Sub
+    /// subscription; the provider creates/retracts the topic + subscription +
+    /// bucket notification. `project` is the GCP project id.
+    pub async fn connect_with_notify(
+        opts: GcsOptions,
+        project: impl Into<String>,
+    ) -> Result<(Self, crate::gcs_notify::GcsWatchProvider), StorageError> {
+        use google_cloud_pubsub::client::{Client as PubsubClient, ClientConfig as PubsubConfig};
+        let project = project.into();
+        let storage = Self::connect(opts.clone()).await?;
+        let gcs_client = storage.client.clone();
+
+        let mut pubsub_config = PubsubConfig::default()
+            .with_auth()
+            .await
+            .map_err(|err| StorageError::backend(format!("Pub/Sub auth: {err}")))?;
+        pubsub_config.project_id = Some(project.clone());
+        let pubsub = PubsubClient::new(pubsub_config)
+            .await
+            .map_err(|err| StorageError::backend(err.to_string()))?;
+
+        let provider = crate::gcs_notify::GcsWatchProvider::new(
+            gcs_client,
+            pubsub.clone(),
+            opts.bucket,
+            project,
+        );
+        Ok((storage.with_pubsub_notify(pubsub), provider))
     }
 
     /// Build a backend from [`GcsOptions`]. Credentials come from Application
@@ -199,6 +245,34 @@ impl Storage for GcsStorage {
             }
         }
         Ok(out)
+    }
+
+    /// GCS can watch once the Pub/Sub notification consumer is wired (the pipeline
+    /// itself is provisioned per-prefix by
+    /// [`GcsWatchProvider`](crate::gcs_notify::GcsWatchProvider) at trigger add).
+    fn supports_watch(&self) -> bool {
+        self.pubsub.is_some()
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<boatramp_core::ChangeStream>, StorageError> {
+        let Some(pubsub) = self.pubsub.clone() else {
+            return Ok(None);
+        };
+        // The subscription name is derived deterministically from the prefix, so no
+        // lookup table is needed — provider and consumer agree.
+        let name = crate::gcs_notify::subscription_name(prefix);
+        let subscription = pubsub.subscription(&name);
+        // No subscription yet ⇒ not provisioned; the reconcile retries next tick.
+        if !subscription.exists(None).await.unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(Some(crate::gcs_notify::gcs_watch_stream(
+            subscription,
+            prefix.to_string(),
+        )))
     }
 }
 

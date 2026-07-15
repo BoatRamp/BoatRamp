@@ -20,7 +20,13 @@ s3 = [
 ]
 # GCS backend (native google-cloud-storage SDK). `tokio/sync` for the upload
 # channel bridge (Send-only ByteStream → the SDK's Send+Sync upload stream).
-gcs = ["dep:google-cloud-storage", "dep:serde_json", "dep:bytes", "tokio/sync"]
+gcs = [
+  "dep:google-cloud-storage",
+  "dep:google-cloud-pubsub",
+  "dep:serde_json",
+  "dep:bytes",
+  "tokio/sync",
+]
 # Azure Blob backend (native azure-sdk-for-rust 0.21).
 azure = [
   "dep:azure_core",
@@ -54,6 +60,7 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-sdk-sqs = { workspace = true, optional = true }
 google-cloud-storage = { workspace = true, optional = true }
+google-cloud-pubsub = { workspace = true, optional = true }
 azure_core = { workspace = true, optional = true }
 azure_storage = { workspace = true, optional = true }
 azure_storage_blobs = { workspace = true, optional = true }
