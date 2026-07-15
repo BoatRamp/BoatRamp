@@ -219,6 +219,31 @@ handlers: [
 
 ---
 
+## Beyond route-triggered handlers: functions & triggers (advanced)
+
+A `routing.handlers` entry is one **route-triggered** view of boatramp’s compute
+primitive, the **function** — the same kind of `wasi:http` component you can also
+deploy and run *on its own*, with its own version line, invoked directly or fired by
+a trigger. Reach for a top-level function (instead of a handler) when the unit of
+compute isn’t tied to one site’s route:
+
+- a job you call directly — `boatramp function invoke` (streamed **sync**, or durable
+  **async** that survives a restart and retries), with an `Idempotency-Key` for safe
+  retries;
+- a **scheduled** task (`function trigger add … --cron`), a **queue** consumer
+  (`--queue`), or a **blob-change** trigger (`--blob <prefix>` — fires on any writer;
+  auto-provisions the cloud pipeline on S3/GCS/Azure backends);
+- a signature-verified **webhook** endpoint (`POST /_webhooks/<name>`, HMAC-checked);
+- multi-step orchestration — a declarative **workflow**, a DAG of function calls
+  (`boatramp workflow …`).
+
+These are the real `boatramp function …` / `boatramp workflow …` command groups —
+verify with `--help` like everything else. Most site projects never need them; they
+are the “heavier compute” rung, above handlers. Start:
+`docs/how-to/functions.md` and `docs/how-to/workflows.md`.
+
+---
+
 ## Deploy / CI
 
 CI’s job: build the output directory, then `sync` it to the live server with a
@@ -254,8 +279,8 @@ devshell (or `nix run .#boatramp -- sync …` in CI).
 3. **Prove it locally**: `serve` + `sync` + `curl` the actual routes/headers you
    changed. Don’t claim routing/handler behavior you haven’t observed.
 4. **Least dynamic wins**: static → client-side island → `when` conditional
-   routing → WASM handler → heavier compute, in that order of preference. Justify
-   any step up.
+   routing → WASM handler → top-level function / heavier compute, in that order of
+   preference. Justify any step up.
 5. **Secrets stay out of the repo** (`BOATRAMP_TOKEN` and friends are env-only).
 6. **The build emits a directory; boatramp ships it.** Don’t build a parallel
    deploy path.
@@ -274,6 +299,8 @@ Everything here is a summary; the source of truth is the boatramp repo’s docs
 - **Publishing / rollback / aliases** — `how-to/publish.md`
 - **Custom domains + TLS** — `how-to/custom-domain.md`, `how-to/acme-cert.md`
 - **Handlers & bindings** — `how-to/deploy-handler.md`, `how-to/handler-bindings.md`
+- **Functions, triggers & workflows** — `how-to/functions.md`, `how-to/workflows.md`;
+  the primitive itself — `explanation/functions.md`
 - **Concepts & the deployment model** — `explanation/concepts.md`,
   `explanation/addressing.md`
 - **Tokens & auth** — `how-to/ci-token.md`, `how-to/auth-bootstrap.md`
