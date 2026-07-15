@@ -319,7 +319,7 @@ mod postgres_backend {
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
     use sqlx::pool::PoolConnection;
     use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-    use sqlx::{Column, Postgres, Row, TypeInfo, ValueRef};
+    use sqlx::{Column, Executor, Postgres, Row, TypeInfo, ValueRef};
 
     /// An external PostgreSQL [`SqlBackend`] over a lazily-connecting pool.
     pub struct PgSqlBackend {
@@ -361,10 +361,10 @@ mod postgres_backend {
         } else {
             "BEGIN"
         };
-        sqlx::query(stmt)
-            .execute(&mut *conn)
-            .await
-            .map_err(map_err)?;
+        // Transaction-control statements go through the text protocol: MySQL's
+        // prepared-statement protocol rejects START TRANSACTION / COMMIT /
+        // ROLLBACK ("not supported in the prepared statement protocol yet").
+        (&mut *conn).execute(stmt).await.map_err(map_err)?;
         Ok(Box::new(PgTransaction { conn }))
     }
 
@@ -400,16 +400,13 @@ mod postgres_backend {
         }
 
         async fn commit(mut self: Box<Self>) -> Result<(), SqlError> {
-            sqlx::query("COMMIT")
-                .execute(&mut *self.conn)
-                .await
-                .map_err(map_err)?;
+            (&mut *self.conn).execute("COMMIT").await.map_err(map_err)?;
             Ok(())
         }
 
         async fn rollback(mut self: Box<Self>) -> Result<(), SqlError> {
-            sqlx::query("ROLLBACK")
-                .execute(&mut *self.conn)
+            (&mut *self.conn)
+                .execute("ROLLBACK")
                 .await
                 .map_err(map_err)?;
             Ok(())
@@ -535,7 +532,7 @@ mod mysql_backend {
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
     use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
     use sqlx::pool::PoolConnection;
-    use sqlx::{Column, MySql, Row, TypeInfo, ValueRef};
+    use sqlx::{Column, Executor, MySql, Row, TypeInfo, ValueRef};
 
     /// An external MySQL/MariaDB [`SqlBackend`] over a lazily-connecting pool.
     pub struct MySqlSqlBackend {
@@ -578,10 +575,10 @@ mod mysql_backend {
         } else {
             "START TRANSACTION"
         };
-        sqlx::query(stmt)
-            .execute(&mut *conn)
-            .await
-            .map_err(map_err)?;
+        // Transaction-control statements go through the text protocol: MySQL's
+        // prepared-statement protocol rejects START TRANSACTION / COMMIT /
+        // ROLLBACK ("not supported in the prepared statement protocol yet").
+        (&mut *conn).execute(stmt).await.map_err(map_err)?;
         Ok(Box::new(MySqlTransaction { conn }))
     }
 
@@ -616,16 +613,13 @@ mod mysql_backend {
         }
 
         async fn commit(mut self: Box<Self>) -> Result<(), SqlError> {
-            sqlx::query("COMMIT")
-                .execute(&mut *self.conn)
-                .await
-                .map_err(map_err)?;
+            (&mut *self.conn).execute("COMMIT").await.map_err(map_err)?;
             Ok(())
         }
 
         async fn rollback(mut self: Box<Self>) -> Result<(), SqlError> {
-            sqlx::query("ROLLBACK")
-                .execute(&mut *self.conn)
+            (&mut *self.conn)
+                .execute("ROLLBACK")
                 .await
                 .map_err(map_err)?;
             Ok(())

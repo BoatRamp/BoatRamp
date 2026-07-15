@@ -104,7 +104,9 @@ async fn postgres_round_trip() {
     tx.commit().await.unwrap();
     assert!(matches!(&rows.rows[0][0], SqlValue::Text(s) if s.contains("2026-07-15")));
     assert!(matches!(&rows.rows[0][1], SqlValue::Text(s) if s.contains("\"a\"")));
-    assert_eq!(rows.rows[0][2], SqlValue::Text("3.14".into()));
+    // sqlx renders an unqualified `::numeric` with base-10000 scale grouping
+    // (e.g. `3.1400`); the value is faithful, only the trailing scale varies.
+    assert!(matches!(&rows.rows[0][2], SqlValue::Text(s) if s.starts_with("3.14")));
 
     // A syntax error classifies as Syntax (SQLSTATE 42xxx).
     let mut tx = backend.begin().await.unwrap();
