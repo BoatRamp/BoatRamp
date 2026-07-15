@@ -85,6 +85,7 @@ For exchanging an identity-provider JWT for a boatramp token. See
 | Variable | Description |
 | --- | --- |
 | `BOATRAMP_SQL_TOKEN` | Auth token for a remote libsql database referenced by the SQL binding. |
+| _(your `url_env`)_ | Connection URL (a secret) for an external bring-your-own SQL database — the var name is whatever you set as `url_env` / `read_url_env` under `[handlers.bindings.sql.databases]`. See [Bring your own database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql). |
 | `BOATRAMP_FC_*` | Embedded-VMM / Firecracker compute-backend settings (kernel, rootfs, bridge, subnet, …). See [Run compute workloads](../how-to/compute.md). |
 | `BOATRAMP_VMM_SERIAL` | Attach the microVM serial console (debugging). |
 

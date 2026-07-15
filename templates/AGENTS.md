@@ -210,7 +210,9 @@ handlers: [
   `.wasm` into the deploy dir next to your static files.
 - The component is validated at `sync` (parseable + exports the handler interface).
 - Data access (kv / sql / blobstore / messaging) is **opt-in per handler** via
-  `imports`/bindings — see `docs/how-to/handler-bindings.md`.
+  `imports`/bindings — see `docs/how-to/handler-bindings.md`. The `sql` binding is
+  a managed per-site libsql database by default, or an operator-configured external
+  Postgres/MySQL opened by name (bring-your-own) — same guest code, `sql.open("name")`.
 - Background work (consumers, crons, streams) and heavier compute (containers,
   microVMs, the reverse-proxy `gateway`) exist but are advanced — reach for them
   only when a handler genuinely can’t do the job, and read the matching how-to

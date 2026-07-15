@@ -6,7 +6,7 @@ binary:
 | Crate | Responsibility |
 | --- | --- |
 | `boatramp-core` | Domain types, the streaming `Storage` trait, the pluggable `KvStore`, content-addressed deploys, routing, config, access/WAF, messaging. No runtime/engine. |
-| `boatramp-storage` | Backends: `FsStorage`, S3, SlateDB KV, Cloudflare KV, libsql SQL. |
+| `boatramp-storage` | Backends: `FsStorage`, S3/GCS/Azure blob, SlateDB + Cloudflare KV, libsql + external Postgres/MySQL SQL. |
 | `boatramp-server` | The axum HTTP server: serving pipeline, control-plane API, auth, limits. |
 | `boatramp-handlers` | The wasmtime engine + host bindings for Wasm components. |
 | `boatramp-acme` | ACME (incl. DNS-01) + the `DnsProvider` abstraction. |

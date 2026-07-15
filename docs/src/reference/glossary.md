@@ -47,6 +47,11 @@ to connected clients.
 **Import** — a host capability a handler requests (`wasi:keyvalue`, `sql`, …),
 granted only if the site's allowlist permits it.
 
+**External database** — an operator-configured Postgres/MySQL a handler or
+function opens by name through the `sql` binding (*bring-your-own*), as opposed to
+the managed per-site libsql default. Isolation is the operator's. See
+[Use handler bindings](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql).
+
 **Compute** (workload) — container or microVM execution, distinct from an
 in-process handler. Needs KVM on the host. See
 [Run compute workloads](../how-to/compute.md).
