@@ -124,6 +124,13 @@ mysql port="3306":
       -e MYSQL_ROOT_PASSWORD=boatramp \
       mysql:8
 
+# Build the embedded web console (Wasm SPA) into crates/boatramp-console/dist,
+# which the `console`-featured server binary bakes in (via build.rs). Needs
+# trunk + tailwindcss + the wasm32-unknown-unknown target (all in `nix develop`).
+# Run this before building/serving with `--features console`.
+console:
+    cd crates/boatramp-console && trunk build --release
+
 # Run the ACME DNS-01 wildcard-cert end-to-end test against a local Pebble CA.
 # The test spawns `pebble` + `pebble-challtestsrv` (provided by `nix develop`),
 # mints a throwaway CA, and drives a real `*.deploy.test` wildcard issuance.

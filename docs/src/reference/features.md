@@ -35,6 +35,7 @@ the `cargo build` command line. Some features imply others: `http3` implies
 | `cluster` | no | Self-hosted Raft cluster mode. Implies `handlers` and `slatedb`. |
 | `sql-postgres` | no | External (bring-your-own) PostgreSQL for the handler `sql` binding, opened by name. Implies `handlers`. |
 | `sql-mysql` | no | External (bring-your-own) MySQL/MariaDB for the handler `sql` binding, opened by name. Implies `handlers`. |
+| `console` | no | Bake the web management console (a Wasm SPA) into the binary and serve it at an operator-configured host+path (`[serve.console]`). Build the SPA first with `just console`. |
 
 The COSE/CWT + Cedar control-plane auth, the OCI→ext4 rootfs build, and the
 container / microVM / remote-docker compute backends are compiled into every

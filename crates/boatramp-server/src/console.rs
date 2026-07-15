@@ -27,9 +27,10 @@ use axum::{
     Router,
 };
 
-/// The console's built assets, embedded at compile time.
-static CONSOLE_DIST: include_dir::Dir<'_> =
-    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../boatramp-console/dist");
+/// The console's built assets, embedded at compile time. Staged into `OUT_DIR`
+/// by `build.rs` (from `../boatramp-console/dist`, or a placeholder when the SPA
+/// hasn't been built) so the `console` feature always compiles.
+static CONSOLE_DIST: include_dir::Dir<'_> = include_dir::include_dir!("$OUT_DIR/console-dist");
 
 /// Where the console is mounted, resolved from `[serve.console]`.
 #[derive(Clone, Debug, PartialEq, Eq)]

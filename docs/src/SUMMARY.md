@@ -28,6 +28,7 @@
 - [Restrict visitor access](./how-to/visitor-access.md)
 - [Choose & inspect a security posture](./how-to/security-posture.md)
 - [Encrypt secrets at rest](./how-to/secrets-at-rest.md)
+- [Enable the embedded web console](./how-to/web-console.md)
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
