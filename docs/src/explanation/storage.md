@@ -60,4 +60,6 @@ Every cloud backend streams reads and writes (never buffering a whole object) an
 can back [blob-change triggers](../how-to/functions.md#cloud-blob-triggers-auto-provisioning)
 once its notification pipeline is provisioned. The per-site SQL binding (libsql: a
 file per site, or a sqld namespace per site) is configured under
-`[handlers.bindings.sql]`.
+`[handlers.bindings.sql]`; a guest can also open an operator-configured external
+Postgres/MySQL by name (bring-your-own, isolation the operator's) — see
+[Bring your own database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql).

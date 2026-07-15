@@ -32,7 +32,8 @@ site does not permit is refused at activation.
   path.
 - **`sql`** — a libsql database per site. This is a real database per site, not
   schema separation, so one site's tables never collide with another's. Use it
-  for relational data and queries.
+  for relational data and queries. You can also point a name at your own external
+  Postgres/MySQL — see [Bring your own database](#bring-your-own-database-external-postgres--mysql).
 - **`wasi:blobstore`** — per-site blob storage over the server's `Storage`
   backend, key-prefixed per site. Use it for uploaded files and generated
   artifacts too large for the key/value store.
@@ -66,6 +67,73 @@ For the full field list — including `preview_mode` and the token env vars — 
 the [boatramp.cfg schema](../reference/boatramp-cfg.md). The kv, blobstore, and
 messaging bindings take no per-binding backend block; they follow the server's
 `kv` and `blobs` backends set under `serve`.
+
+## Bring your own database (external Postgres / MySQL)
+
+libsql gives every site a **managed, isolated** database for free — the right
+default for multi-tenant data. When you instead want a handler or function to
+talk to a database *you* run — an existing Postgres or MySQL, a managed service
+like Neon / Supabase / PlanetScale — declare it as a **named external database**.
+The guest opens it by name through the same interface; only the server config
+differs.
+
+Build with the engine's feature (`--features sql-postgres` and/or `sql-mysql`),
+then declare each database under `handlers.bindings.sql.databases`. The
+connection URL is a secret, so it is named indirectly through an env var:
+
+```ron
+handlers: (
+    bindings: (
+        sql: (
+            databases: {
+                // Opened by the guest as `sql.open("analytics")`.
+                "analytics": (
+                    kind: "postgres",             // or "mysql"
+                    url_env: "ANALYTICS_PG_URL",   // secret: postgres://user:pw@host/db
+                    pool_max: 16,
+                    read_only: true,               // reject writes at the engine
+                ),
+                "events": (
+                    kind: "mysql",
+                    url_env: "EVENTS_MYSQL_URL",
+                    read_url_env: "EVENTS_MYSQL_REPLICA_URL", // open-read-only → replica
+                    allow_preview: true,           // let preview deployments reach it
+                ),
+            },
+        ),
+    ),
+),
+```
+
+The guest code is unchanged — the name simply resolves to the external database
+instead of a per-site libsql one:
+
+```rust
+let db = sql::open("analytics")?;               // the configured Postgres
+let rows = db.query("SELECT id, name FROM signups WHERE country = $1",
+                    &[Value::Text(country)])?;
+```
+
+Keep these properties in mind — they are the deliberate trade-off of pointing at
+a database boatramp doesn't manage:
+
+- **Isolation is yours.** An external database is a single, *shared* endpoint:
+  every site/function that is granted the `sql` binding and opens the name
+  reaches the same database with whatever the connection URL can do (it runs
+  arbitrary SQL there). Prefer it for a single-tenant deployment or a genuinely
+  shared database; keep competing tenants' data on the managed libsql default.
+- **Previews are refused by default.** A preview deployment can't open an
+  external database unless it was declared with `allow_preview: true`, so a
+  preview never accidentally writes to your live data.
+- **Values map to the same small vocabulary.** Booleans, integers, floats, text,
+  and blobs round-trip natively; timestamps, UUIDs, `numeric`/`decimal`, and
+  JSON come back as text. A column type outside that set is a clear error asking
+  you to cast it (`SELECT col::text`). MySQL has no native boolean, so a
+  `TINYINT` (its bool) reads back as the integer `0`/`1`.
+
+See the [boatramp.cfg schema](../reference/boatramp-cfg.md#external-sql-databases)
+for the full field list and [Cargo features](../reference/features.md) for the
+build features.
 
 Tail guest output with `boatramp logs` if a binding call traps — see
 [Observe a running server](./observe.md).

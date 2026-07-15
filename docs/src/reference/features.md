@@ -33,6 +33,8 @@ the `cargo build` command line. Some features imply others: `http3` implies
 | `bundler` | no | The in-process JS/TS + CSS bundler for `boatramp bundle`. |
 | `handlers` | no | The wasmtime handler engine, component validation at `sync`, and the `sql` handler binding. |
 | `cluster` | no | Self-hosted Raft cluster mode. Implies `handlers` and `slatedb`. |
+| `sql-postgres` | no | External (bring-your-own) PostgreSQL for the handler `sql` binding, opened by name. Implies `handlers`. |
+| `sql-mysql` | no | External (bring-your-own) MySQL/MariaDB for the handler `sql` binding, opened by name. Implies `handlers`. |
 
 The COSE/CWT + Cedar control-plane auth, the OCI→ext4 rootfs build, and the
 container / microVM / remote-docker compute backends are compiled into every
