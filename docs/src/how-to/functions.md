@@ -205,11 +205,23 @@ The `function trigger add --blob` command is **identical** on every backend — 
 environment difference hides behind the storage backend. On the filesystem the
 watch is zero-config (inotify/FSEvents). On a cloud object store the native event
 pipeline must be created first, so boatramp provisions it for you — "auto-DNS, but
-for object-store events." For S3 that pipeline is an **SQS queue** + a queue access
-policy + a bucket `QueueConfiguration` (added by **read-merge-write**, so existing
-notifications are preserved and an overlapping foreign entry is refused, never
-clobbered). What boatramp creates is recorded in a managed-notification ledger and
-**retracted** when you remove the trigger, so no cloud resources leak.
+for object-store events." What boatramp creates is recorded in a managed-notification
+ledger and **retracted** when you remove the trigger, so no cloud resources leak.
+
+Each cloud backend uses its native pipeline:
+
+- **S3** (`--blobs s3`) — an **SQS queue** + a queue access policy + a bucket
+  `QueueConfiguration` (added by **read-merge-write**, so existing notifications are
+  preserved and an overlapping foreign entry is refused, never clobbered). Fully
+  auto-provisioned.
+- **GCS** (`--blobs gcs`) — a **Pub/Sub** topic + subscription + a bucket
+  `notificationConfig`. Auto-provisioned except the one-time IAM grant giving the
+  GCS service agent `roles/pubsub.publisher` on the topic (the `dry-run` recipe
+  prints it).
+- **Azure** (`--blobs azure`) — a **Storage Queue** (auto-provisioned) fed by an
+  **Event Grid** subscription. The Event Grid subscription is a one-time
+  management-plane (Azure AD) step the `dry-run` recipe prints as an `az eventgrid`
+  command; boatramp manages + consumes the queue.
 
 You pick the behavior with a **tier** in the server's `boatramp.cfg` (the elevated
 cloud credentials live server-side, not in the CLI):
@@ -218,7 +230,10 @@ cloud credentials live server-side, not in the CLI):
 serve: (
     // dry-run | provision | verify-only | refuse (default)
     blob_notify_tier: "provision",
-    blob_notify_account_id: "123456789012",   // scopes the SQS queue policy
+    // S3: the AWS account id (scopes the SQS queue policy).
+    // GCS: the GCP project id (for the topic + notificationConfig).
+    // Azure: unused (the queue shares the account's shared-key auth).
+    blob_notify_account_id: "123456789012",
 )
 ```
 

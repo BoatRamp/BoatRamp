@@ -828,7 +828,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
                 mesh: None,
             }
         });
-        return run_cluster(args, config, cluster_cfg, addr, data_dir, storage, options).await;
+        return run_cluster(
+            args,
+            config,
+            cluster_cfg,
+            addr,
+            data_dir,
+            built_blobs,
+            options,
+        )
+        .await;
     }
     #[cfg(not(feature = "cluster"))]
     if config.cluster.is_some() {
@@ -1386,10 +1395,14 @@ async fn run_cluster(
     mut cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
-    storage: Arc<dyn Storage>,
+    built_blobs: BuiltBlobs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     use boatramp_cluster::node::{build_node, ClusterParams};
+
+    // The blob backend; `built_blobs` also carries the optional FA-5b2 blob-change
+    // watch provider + tier the handler runtime is wired with below.
+    let storage = built_blobs.storage.clone();
 
     // Node-local durable Raft log/state store (distinct from the *replicated*
     // control plane the cluster serves).

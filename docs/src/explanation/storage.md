@@ -47,6 +47,17 @@ control-plane writes funnel to the writer.
 ## Selecting backends
 
 `--kv` selects the *storage*; the *frontend* is consensus only if a `[cluster]`
-config is present. `--blobs` selects the blob `Storage`. The per-site SQL
-binding (libsql: a file per site, or a sqld namespace per site) is configured
-under `[handlers.bindings.sql]`.
+config is present. `--blobs` selects the blob `Storage`:
+
+- `fs` (default) — the local filesystem (`<data-dir>/blobs`); watch-capable via
+  inotify/FSEvents.
+- `s3` — S3-compatible (AWS S3, MinIO, R2); `--features s3`.
+- `gcs` — Google Cloud Storage (`--gcs-bucket`, ADC credentials); `--features gcs`.
+- `azure` — Azure Blob Storage (`--azure-account`/`--azure-container`, shared-key
+  auth); `--features azure`.
+
+Every cloud backend streams reads and writes (never buffering a whole object) and
+can back [blob-change triggers](../how-to/functions.md#cloud-blob-triggers-auto-provisioning)
+once its notification pipeline is provisioned. The per-site SQL binding (libsql: a
+file per site, or a sqld namespace per site) is configured under
+`[handlers.bindings.sql]`.
