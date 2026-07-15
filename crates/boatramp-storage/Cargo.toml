@@ -45,6 +45,15 @@ slatedb = ["dep:slatedb", "dep:bytes"]
 # namespace per site on a shared sqld primary (cluster, read-replicable). One
 # backend; the single-node/cluster split is config, not a backend choice.
 sql = ["dep:libsql", "dep:reqwest", "tokio/sync"]
+# External bring-your-own SQL databases (impl `boatramp_core::sql` over sqlx):
+# an operator-configured Postgres/MySQL a function/handler opens by name.
+# Isolation is the operator's (their DB), so these bypass the per-site libsql
+# boundary — libsql stays the managed default. Each engine is its own feature so
+# the (heavy) sqlx tree is only pulled when actually used. Timestamp/uuid/
+# numeric/json columns are stringified through `sqlx::types` re-exports (the
+# chrono/uuid/bigdecimal/json features are set on the workspace `sqlx` dep).
+sql-postgres = ["dep:sqlx", "sqlx/postgres"]
+sql-mysql = ["dep:sqlx", "sqlx/mysql"]
 # A bounded local read-through cache over any `Storage`:
 # clustered/CF nodes front the shared object store with a hot-blob cache.
 cache = ["dep:lru", "dep:bytes"]
@@ -73,6 +82,7 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 slatedb = { workspace = true, optional = true }
 libsql = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
 
 [dev-dependencies]
