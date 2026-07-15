@@ -171,6 +171,99 @@ pub fn connect(
     }
 }
 
+/// A [`SqlBackends`](boatramp_core::sql::SqlBackends) that overlays
+/// operator-configured **external** databases on a managed `default` (libsql).
+///
+/// A guest `open(name)` for a configured name gets that shared external backend;
+/// any other name falls through to `default` — the per-site libsql file or
+/// namespace, isolation intact. External databases are **global and shared**
+/// across every site/function that opens the name (see the module docs); a
+/// preview deployment is refused an external database unless it was registered
+/// with `allow_preview`, mirroring the managed backend's safe-by-default preview
+/// policy so a preview can't reach the operator's live external database by
+/// accident.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub struct CompositeSqlBackends {
+    default: Arc<dyn boatramp_core::sql::SqlBackends>,
+    external: std::collections::HashMap<String, ExternalEntry>,
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+struct ExternalEntry {
+    backend: Arc<dyn boatramp_core::sql::SqlBackend>,
+    allow_preview: bool,
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+impl CompositeSqlBackends {
+    /// Wrap the managed `default` backend; register external databases with
+    /// [`with_external`](Self::with_external).
+    pub fn new(default: Arc<dyn boatramp_core::sql::SqlBackends>) -> Self {
+        Self {
+            default,
+            external: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a named external backend (built via [`connect`]). `allow_preview`
+    /// permits preview deployments to reach it; naming it `""` replaces the
+    /// site's default managed database with the shared external one.
+    pub fn with_external(
+        mut self,
+        name: impl Into<String>,
+        backend: Arc<dyn boatramp_core::sql::SqlBackend>,
+        allow_preview: bool,
+    ) -> Self {
+        self.external.insert(
+            name.into(),
+            ExternalEntry {
+                backend,
+                allow_preview,
+            },
+        );
+        self
+    }
+
+    /// Whether any external database is registered (else the composite is a pure
+    /// pass-through and the caller may use the `default` directly).
+    pub fn has_external(&self) -> bool {
+        !self.external.is_empty()
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait::async_trait]
+impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
+    async fn database(
+        &self,
+        site: &str,
+        name: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        if let Some(entry) = self.external.get(name) {
+            return Ok(entry.backend.clone());
+        }
+        self.default.database(site, name).await
+    }
+
+    async fn preview_database(
+        &self,
+        site: &str,
+        name: &str,
+        preview: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        if let Some(entry) = self.external.get(name) {
+            if entry.allow_preview {
+                return Ok(entry.backend.clone());
+            }
+            return Err(SqlError::Other(format!(
+                "external database `{name}` is not available to preview deployments \
+                 (set `allow_preview` on it to permit that)"
+            )));
+        }
+        self.default.preview_database(site, name, preview).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared sqlx helpers (compiled when at least one engine feature is on).
 // ---------------------------------------------------------------------------
@@ -758,5 +851,95 @@ mod tests {
         assert_eq!(mysql_class("DATETIME"), MyClass::DateTime);
         assert_eq!(mysql_class("JSON"), MyClass::Json);
         assert_eq!(mysql_class("GEOMETRY"), MyClass::Unsupported);
+    }
+
+    // A tagged fake backend whose `begin` fails with its tag, so a routing test
+    // can tell which backend the composite returned.
+    struct TagBackend(&'static str);
+
+    #[async_trait::async_trait]
+    impl boatramp_core::sql::SqlBackend for TagBackend {
+        async fn begin(
+            &self,
+        ) -> Result<Box<dyn boatramp_core::sql::SqlTransaction>, boatramp_core::sql::SqlError>
+        {
+            Err(boatramp_core::sql::SqlError::Other(self.0.to_string()))
+        }
+    }
+
+    // A fake managed default that hands out a "DEFAULT"-tagged backend for every
+    // (site, name) — its default `preview_database` delegates to `database`.
+    struct DefaultBackends;
+
+    #[async_trait::async_trait]
+    impl boatramp_core::sql::SqlBackends for DefaultBackends {
+        async fn database(
+            &self,
+            _site: &str,
+            _name: &str,
+        ) -> Result<std::sync::Arc<dyn boatramp_core::sql::SqlBackend>, boatramp_core::sql::SqlError>
+        {
+            Ok(std::sync::Arc::new(TagBackend("DEFAULT")))
+        }
+    }
+
+    // Which backend did the composite return? Its `begin` fails with the tag
+    // (the trait objects aren't `Debug`, so match rather than `unwrap_err`).
+    async fn tag(
+        result: Result<
+            std::sync::Arc<dyn boatramp_core::sql::SqlBackend>,
+            boatramp_core::sql::SqlError,
+        >,
+    ) -> String {
+        match result.unwrap().begin().await {
+            Ok(_) => panic!("expected the tagged backend's begin to fail"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_routes_by_name_and_guards_preview() {
+        use boatramp_core::sql::{SqlBackends, SqlError};
+
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_external(
+                "analytics",
+                std::sync::Arc::new(TagBackend("EXTERNAL")),
+                false,
+            )
+            .with_external(
+                "shared",
+                std::sync::Arc::new(TagBackend("EXTERNAL_PREVIEW")),
+                true,
+            );
+        assert!(composite.has_external());
+
+        // A configured name routes to its external backend; any other name falls
+        // through to the managed default.
+        assert_eq!(
+            tag(composite.database("s", "analytics").await).await,
+            "sql error: EXTERNAL"
+        );
+        assert_eq!(
+            tag(composite.database("s", "other").await).await,
+            "sql error: DEFAULT"
+        );
+
+        // A preview is refused an external database unless it opted in...
+        let err = match composite.preview_database("s", "analytics", "pr1").await {
+            Ok(_) => panic!("expected an external database to be refused in preview"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SqlError::Other(m) if m.contains("not available to preview")));
+        // ...allowed when `allow_preview` is set...
+        assert_eq!(
+            tag(composite.preview_database("s", "shared", "pr1").await).await,
+            "sql error: EXTERNAL_PREVIEW"
+        );
+        // ...and a non-external name keeps the managed backend's preview policy.
+        assert_eq!(
+            tag(composite.preview_database("s", "other", "pr1").await).await,
+            "sql error: DEFAULT"
+        );
     }
 }

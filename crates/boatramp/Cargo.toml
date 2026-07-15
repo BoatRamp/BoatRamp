@@ -20,6 +20,13 @@ s3 = ["boatramp-storage/s3"]
 gcs = ["boatramp-storage/gcs"]
 azure = ["boatramp-storage/azure"]
 cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
+# External bring-your-own SQL databases for the handler `sql` binding: an
+# operator-configured Postgres/MySQL a function/handler opens by name (via
+# `[handlers.bindings.sql.databases]`). Each implies `handlers` (the binding
+# lives in the handler engine). Isolation is the operator's; libsql stays the
+# managed per-site default.
+sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
+sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 # Durable embedded KV (the default `--kv slatedb`): transactional LSM over an
 # object_store backend.
 slatedb = ["boatramp-storage/slatedb"]
