@@ -821,6 +821,26 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // is no host-spoofing exposure). Strict `multi-tenant` on a public bind keeps
     // it off, so an unmatched host resolves only to `default_site` or 404.
     options.implicit_routing = options.posture.allow_implicit_routing || addr.ip().is_loopback();
+    // Embedded web console (`[serve.console]`): when the operator enabled it,
+    // mount the baked-in SPA at the configured host+path. Needs the `console`
+    // build feature; enabling it without the feature is a logged no-op.
+    if let Some(console) = serve_cfg.console.as_ref().filter(|c| c.enabled) {
+        #[cfg(feature = "console")]
+        {
+            options.console = Some(boatramp_server::console::ConsoleMount::resolve(
+                console.host.clone(),
+                console.path.clone(),
+            ));
+        }
+        #[cfg(not(feature = "console"))]
+        {
+            let _ = console;
+            tracing::warn!(
+                "[serve.console] enabled but this build lacks the `console` feature — \
+                 the console is not served"
+            );
+        }
+    }
     let data_dir = args
         .data_dir
         .clone()

@@ -48,6 +48,9 @@ signer-gcp = ["boatramp-server/signer-gcp"]
 signer-azure = ["boatramp-server/signer-azure"]
 signer-aws = ["boatramp-server/signer-aws"]
 signer-pkcs11 = ["boatramp-server/signer-pkcs11"]
+# Embedded web management console: bakes the `boatramp-console` Wasm SPA into the
+# binary and serves it at an operator-configured host+path (`[serve.console]`).
+console = ["boatramp-server/console"]
 # On-the-fly response compression, runtime-opt-in per site.
 compression = ["boatramp-server/compression"]
 # HTTP/3 (QUIC) serving: a UDP listener alongside the TLS
