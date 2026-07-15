@@ -2397,23 +2397,37 @@ async fn function_blob_trigger_fires_on_a_write() {
         StatusCode::OK
     );
 
-    // Let the scheduler reconcile + spawn the watcher (a few ticks), then write.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    let body: ByteStream =
-        futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed();
-    storage
-        .put(
-            "hblob/fn/counter/uploads/report.json",
-            body,
-            PutMeta::default(),
-        )
-        .await
-        .unwrap();
-
-    // The change enqueues an invocation the drain runs → counter++.
-    let hits = poll_kv(&kv, "hkv/fn/counter/hits").await;
-    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
-    assert!(n >= 1, "blob trigger did not fire: {n}");
+    // Write under the watched prefix until the trigger fires. Retrying the write
+    // makes the test robust to the scheduler's watcher-spawn timing — an FS watcher
+    // only sees events after it starts, so a single fixed-sleep write can race the
+    // spawn under parallel load (each retry is a fresh event once the watch is up).
+    use boatramp_core::kv::KvStore;
+    let mut fired = false;
+    for _ in 0..50 {
+        let body: ByteStream =
+            futures::stream::once(async { Ok(bytes::Bytes::from_static(b"{}")) }).boxed();
+        storage
+            .put(
+                "hblob/fn/counter/uploads/report.json",
+                body,
+                PutMeta::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Some(hits) = kv.get("hkv/fn/counter/hits").await.unwrap() {
+            if String::from_utf8_lossy(&hits)
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0)
+                >= 1
+            {
+                fired = true;
+                break;
+            }
+        }
+    }
+    assert!(fired, "blob trigger did not fire after repeated writes");
 
     let _ = std::fs::remove_dir_all(&root);
 }

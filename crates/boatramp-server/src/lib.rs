@@ -9291,6 +9291,7 @@ mod tests {
                 host: "10.0.0.2".into(),
                 port: 80,
             },
+            region: None,
             healthy,
             phase,
             snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {
