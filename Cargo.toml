@@ -147,6 +147,11 @@ azure_storage_blobs = { version = "0.21", default-features = false, features = [
   "enable_reqwest_rustls",
   "hmac_rust",
 ] }
+# Storage Queue for the Azure Event Grid → Storage Queue notification pipeline.
+azure_storage_queues = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+  "hmac_rust",
+] }
 
 # Durable embedded KV: transactional LSM over object storage (local fs, S3/R2,
 # GCS, ...). Compiled only with the `slatedb` feature.

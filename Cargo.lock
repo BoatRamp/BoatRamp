@@ -1167,6 +1167,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "azure_storage_queues"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7aa417d6bdda9c5c0d08b96617f0bd85e4f30142797b2a948f3c27963df8b58b"
+dependencies = [
+ "azure_core",
+ "azure_storage",
+ "futures",
+ "serde",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "azure_svc_blobstorage"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1675,6 +1690,8 @@ dependencies = [
  "azure_core",
  "azure_storage",
  "azure_storage_blobs",
+ "azure_storage_queues",
+ "base64 0.22.1",
  "boatramp-core",
  "bytes",
  "futures",

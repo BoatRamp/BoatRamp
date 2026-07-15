@@ -33,6 +33,9 @@ pub mod gcs_notify;
 #[cfg(feature = "azure")]
 pub mod azure;
 
+#[cfg(feature = "azure")]
+pub mod azure_notify;
+
 #[cfg(feature = "slatedb")]
 pub mod kv_slatedb;
 
@@ -62,6 +65,9 @@ pub use gcs_notify::GcsWatchProvider;
 
 #[cfg(feature = "azure")]
 pub use azure::{AzureOptions, AzureStorage};
+
+#[cfg(feature = "azure")]
+pub use azure_notify::AzureWatchProvider;
 
 #[cfg(feature = "slatedb")]
 pub use kv_slatedb::SlateKv;

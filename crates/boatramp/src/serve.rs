@@ -2702,13 +2702,14 @@ async fn build_blobs(
     }
 }
 
-// Storage S2: Azure storage plane only — blob-change notifications (Event Grid →
-// Storage Queue) land with the AzureWatchProvider in a later stage. Until then a
-// blob trigger on Azure is refused (`supports_watch()` false), never a silent no-op.
+// Azure storage + optional blob-change notification (Event Grid → Storage Queue,
+// FA-5b2). When a notify tier is configured the backend is consumer-wired and
+// paired with the AzureWatchProvider (the Event Grid subscription is an operator
+// step — see the provider recipe).
 #[cfg(feature = "azure")]
 async fn build_azure(
     args: &ServeArgs,
-    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
     _notify_account: Option<String>,
 ) -> Result<BuiltBlobs> {
     let (Some(account), Some(container)) =
@@ -2716,18 +2717,32 @@ async fn build_azure(
     else {
         return Err(Error::AzureConfigRequired);
     };
-    let storage = boatramp_storage::AzureStorage::connect(boatramp_storage::AzureOptions {
+    let opts = boatramp_storage::AzureOptions {
         account,
         container,
         access_key: args.azure_access_key.clone(),
         emulator: args.azure_emulator,
-    })
-    .map_err(|err| Error::AzureConnect(err.to_string()))?;
-    Ok(BuiltBlobs {
-        storage: Arc::new(storage),
-        watch_provider: None,
-        provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
-    })
+    };
+    match notify_tier {
+        Some(tier) => {
+            let (storage, provider) = boatramp_storage::AzureStorage::connect_with_notify(opts)
+                .map_err(|err| Error::AzureConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: Some(Arc::new(provider)),
+                provision_tier: tier,
+            })
+        }
+        None => {
+            let storage = boatramp_storage::AzureStorage::connect(opts)
+                .map_err(|err| Error::AzureConnect(err.to_string()))?;
+            Ok(BuiltBlobs {
+                storage: Arc::new(storage),
+                watch_provider: None,
+                provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+            })
+        }
+    }
 }
 
 #[cfg(not(feature = "azure"))]

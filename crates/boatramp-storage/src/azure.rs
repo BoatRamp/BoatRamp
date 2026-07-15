@@ -18,6 +18,7 @@ use azure_core::StatusCode;
 use azure_storage::prelude::StorageCredentials;
 use azure_storage_blobs::blob::{Blob, BlobBlockType, BlockList};
 use azure_storage_blobs::prelude::{BlobClient, BlockId, ClientBuilder, ContainerClient};
+use azure_storage_queues::prelude::QueueServiceClient;
 
 /// Size of each staged block. Azure block blobs are assembled from blocks; 8 MiB
 /// keeps the block count low while bounding the in-memory buffer to one block.
@@ -27,6 +28,10 @@ const BLOCK_SIZE: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AzureStorage {
     container: ContainerClient,
+    /// Optional Storage Queue client for the blob-change **consumer** (S4/FA-5b2).
+    /// When set, [`supports_watch`](Storage::supports_watch) is `true` and
+    /// [`watch`](Storage::watch) polls the queue provisioned for the prefix.
+    queues: Option<azure_storage_queues::prelude::QueueServiceClient>,
 }
 
 /// Connection options for [`AzureStorage::connect`].
@@ -45,7 +50,10 @@ pub struct AzureOptions {
 impl AzureStorage {
     /// Build a backend from an existing container client.
     pub fn new(container: ContainerClient) -> Self {
-        Self { container }
+        Self {
+            container,
+            queues: None,
+        }
     }
 
     /// Build a backend from [`AzureOptions`]. Uses shared-key auth from
@@ -61,6 +69,45 @@ impl AzureStorage {
             ClientBuilder::new(opts.account, credentials).container_client(opts.container)
         };
         Ok(Self::new(container))
+    }
+
+    /// The Storage Queue service client for the same account (shared-key auth), for
+    /// notification provisioning + consumption.
+    fn queue_service(opts: &AzureOptions) -> Result<QueueServiceClient, StorageError> {
+        use azure_storage_queues::QueueServiceClientBuilder;
+        if opts.emulator {
+            return Ok(QueueServiceClientBuilder::emulator().build());
+        }
+        let key = opts.access_key.clone().ok_or_else(|| {
+            StorageError::backend("Azure access key required (set --azure-access-key)")
+        })?;
+        let credentials = StorageCredentials::access_key(opts.account.clone(), key);
+        Ok(QueueServiceClient::new(opts.account.clone(), credentials))
+    }
+
+    /// Attach a Storage Queue service client so this backend can **consume**
+    /// blob-change notifications (S4/FA-5b2).
+    pub fn with_queue_notify(mut self, queues: QueueServiceClient) -> Self {
+        self.queues = Some(queues);
+        self
+    }
+
+    /// Build a notify-enabled Azure backend + its blob-change
+    /// [`AzureWatchProvider`](crate::azure_notify::AzureWatchProvider) (FA-5b2
+    /// Azure), sharing the account's shared-key auth. The storage consumes the
+    /// provisioned Storage Queue; the provider creates/retracts it (the Event Grid
+    /// subscription is an operator step — see the provider recipe).
+    pub fn connect_with_notify(
+        opts: AzureOptions,
+    ) -> Result<(Self, crate::azure_notify::AzureWatchProvider), StorageError> {
+        let storage = Self::connect(opts.clone())?;
+        let queues = Self::queue_service(&opts)?;
+        let provider = crate::azure_notify::AzureWatchProvider::new(
+            queues.clone(),
+            opts.account,
+            opts.container,
+        );
+        Ok((storage.with_queue_notify(queues), provider))
     }
 
     /// The container this backend targets.
@@ -192,6 +239,30 @@ impl Storage for AzureStorage {
             }
         }
         Ok(out)
+    }
+
+    /// Azure can watch once the Storage Queue notification consumer is wired (the
+    /// pipeline is provisioned per-prefix by
+    /// [`AzureWatchProvider`](crate::azure_notify::AzureWatchProvider) at trigger
+    /// add).
+    fn supports_watch(&self) -> bool {
+        self.queues.is_some()
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<boatramp_core::ChangeStream>, StorageError> {
+        let Some(queues) = self.queues.clone() else {
+            return Ok(None);
+        };
+        // The queue name is derived deterministically from the prefix — provider and
+        // consumer agree without a lookup table.
+        let queue = queues.queue_client(crate::azure_notify::queue_name(prefix));
+        Ok(Some(crate::azure_notify::azure_watch_stream(
+            queue,
+            prefix.to_string(),
+        )))
     }
 }
 
