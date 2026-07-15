@@ -18,6 +18,7 @@ default = ["fs", "slatedb"]
 fs = ["boatramp-storage/fs"]
 s3 = ["boatramp-storage/s3"]
 gcs = ["boatramp-storage/gcs"]
+azure = ["boatramp-storage/azure"]
 cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
 # Durable embedded KV (the default `--kv slatedb`): transactional LSM over an
 # object_store backend.

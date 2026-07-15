@@ -128,6 +128,21 @@ google-cloud-storage = { version = "0.24", default-features = false, features = 
   "auth",
 ] }
 
+# Azure Blob backend (compiled only with `--features azure`). The mature
+# `azure-sdk-for-rust` 0.21 line (the official 1.0 SDK needs rustc 1.88 > our MSRV
+# 1.82). rustls + pure-Rust HMAC, matching the no-openssl posture.
+azure_core = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+] }
+azure_storage = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+  "hmac_rust",
+] }
+azure_storage_blobs = { version = "0.21", default-features = false, features = [
+  "enable_reqwest_rustls",
+  "hmac_rust",
+] }
+
 # Durable embedded KV: transactional LSM over object storage (local fs, S3/R2,
 # GCS, ...). Compiled only with the `slatedb` feature.
 slatedb = "0.13"

@@ -56,6 +56,10 @@ pub enum Error {
     #[cfg(not(feature = "gcs"))]
     #[error("this build has no GCS support; rebuild with `--features gcs`")]
     NoGcsSupport,
+    /// `--blobs azure` selected but the binary lacks Azure support.
+    #[cfg(not(feature = "azure"))]
+    #[error("this build has no Azure support; rebuild with `--features azure`")]
+    NoAzureSupport,
     /// `--kv slatedb` selected but the binary lacks SlateDB support.
     #[cfg(not(feature = "slatedb"))]
     #[error("this build has no slatedb support; rebuild with `--features slatedb`")]
@@ -156,6 +160,14 @@ pub enum Error {
     #[cfg(feature = "gcs")]
     #[error("GCS backend: {0}")]
     GcsConnect(String),
+    /// `--blobs azure` was selected without an account/container.
+    #[cfg(feature = "azure")]
+    #[error("--azure-account and --azure-container are required for --blobs azure")]
+    AzureConfigRequired,
+    /// Connecting the Azure backend failed.
+    #[cfg(feature = "azure")]
+    #[error("Azure backend: {0}")]
+    AzureConnect(String),
     /// A handler `sql` binding named an env var that is not set.
     #[cfg(feature = "handlers")]
     #[error("handlers SQL binding: env var {0} is not set")]
@@ -453,6 +465,8 @@ enum BlobBackend {
     S3,
     /// Google Cloud Storage (requires `--features gcs`).
     Gcs,
+    /// Azure Blob Storage (requires `--features azure`).
+    Azure,
 }
 
 /// Metadata (manifest + pointer) backend.
@@ -537,6 +551,23 @@ pub struct ServeArgs {
     /// Application Default Credentials.
     #[arg(long, env = "BOATRAMP_GCS_ANONYMOUS")]
     gcs_anonymous: bool,
+
+    /// Azure storage account name (required for `--blobs azure`).
+    #[arg(long, env = "BOATRAMP_AZURE_ACCOUNT")]
+    azure_account: Option<String>,
+
+    /// Azure container name (required for `--blobs azure`).
+    #[arg(long, env = "BOATRAMP_AZURE_CONTAINER")]
+    azure_container: Option<String>,
+
+    /// Azure storage account access key (shared-key auth; required unless
+    /// `--azure-emulator`). Prefer the env var over the flag.
+    #[arg(long, env = "BOATRAMP_AZURE_ACCESS_KEY")]
+    azure_access_key: Option<String>,
+
+    /// Use the Azurite emulator (well-known dev credentials + local endpoint).
+    #[arg(long, env = "BOATRAMP_AZURE_EMULATOR")]
+    azure_emulator: bool,
 
     /// Number of deploy manifests/pointers to keep in the in-memory LRU.
     #[arg(long, default_value_t = 256)]
@@ -2667,7 +2698,45 @@ async fn build_blobs(
         }),
         BlobBackend::S3 => build_s3(args, notify_tier, notify_account).await,
         BlobBackend::Gcs => build_gcs(args, notify_tier, notify_account).await,
+        BlobBackend::Azure => build_azure(args, notify_tier, notify_account).await,
     }
+}
+
+// Storage S2: Azure storage plane only — blob-change notifications (Event Grid →
+// Storage Queue) land with the AzureWatchProvider in a later stage. Until then a
+// blob trigger on Azure is refused (`supports_watch()` false), never a silent no-op.
+#[cfg(feature = "azure")]
+async fn build_azure(
+    args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    let (Some(account), Some(container)) =
+        (args.azure_account.clone(), args.azure_container.clone())
+    else {
+        return Err(Error::AzureConfigRequired);
+    };
+    let storage = boatramp_storage::AzureStorage::connect(boatramp_storage::AzureOptions {
+        account,
+        container,
+        access_key: args.azure_access_key.clone(),
+        emulator: args.azure_emulator,
+    })
+    .map_err(|err| Error::AzureConnect(err.to_string()))?;
+    Ok(BuiltBlobs {
+        storage: Arc::new(storage),
+        watch_provider: None,
+        provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+    })
+}
+
+#[cfg(not(feature = "azure"))]
+async fn build_azure(
+    _args: &ServeArgs,
+    _notify_tier: Option<boatramp_core::blob_notify::ProvisionTier>,
+    _notify_account: Option<String>,
+) -> Result<BuiltBlobs> {
+    Err(Error::NoAzureSupport)
 }
 
 // Storage S1: GCS storage plane only — blob-change notifications (Pub/Sub) land

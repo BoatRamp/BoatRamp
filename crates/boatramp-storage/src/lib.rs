@@ -27,6 +27,9 @@ pub mod s3_notify;
 #[cfg(feature = "gcs")]
 pub mod gcs;
 
+#[cfg(feature = "azure")]
+pub mod azure;
+
 #[cfg(feature = "slatedb")]
 pub mod kv_slatedb;
 
@@ -50,6 +53,9 @@ pub use s3_notify::S3WatchProvider;
 
 #[cfg(feature = "gcs")]
 pub use gcs::{GcsOptions, GcsStorage};
+
+#[cfg(feature = "azure")]
+pub use azure::{AzureOptions, AzureStorage};
 
 #[cfg(feature = "slatedb")]
 pub use kv_slatedb::SlateKv;

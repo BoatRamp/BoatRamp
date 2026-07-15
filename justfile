@@ -71,6 +71,21 @@ gcs-emulator bucket="boatramp":
     BOATRAMP_TEST_GCS_ENDPOINT=http://localhost:4443 BOATRAMP_TEST_GCS_BUCKET={{ bucket }} \
       cargo test -p boatramp-storage --features gcs --test gcs_emulator -- --nocapture
 
+# Run the Azure Blob backend round-trip against an Azurite emulator (Docker).
+# Boots Azurite, creates the container via the Azure CLI against the well-known
+# devstoreaccount1, then runs the env-gated `azure_emulator` seam.
+azure-emulator container="boatramp":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker run -d --name boatramp-azurite -p 10000:10000 \
+      mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0 >/dev/null
+    trap 'docker rm -f boatramp-azurite >/dev/null' EXIT
+    sleep 2
+    CONN='DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
+    az storage container create --name {{ container }} --connection-string "$CONN" >/dev/null
+    BOATRAMP_TEST_AZURE_CONTAINER={{ container }} \
+      cargo test -p boatramp-storage --features azure --test azure_emulator -- --nocapture
+
 # Start a local sqld (libsql server) for the `sql` backend test. Serves
 # the hrana/HTTP protocol; runs in the foreground (Ctrl-C to stop). Namespaces
 # are enabled (the per-site isolation model — one namespace per site) with the
