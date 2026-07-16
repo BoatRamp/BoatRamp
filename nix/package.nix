@@ -54,6 +54,15 @@ rustPlatform.buildRustPackage (
       (lib.concatStringsSep "," features)
     ];
 
+    # This derivation builds the shipped *binary*; it does not run the test suite.
+    # With the batteries-included default (all features, incl. `handlers`), the
+    # cargo `checkPhase` would run non-hermetic tests — e.g. the function harness
+    # (`function::tests::harness_runs_a_component_and_asserts`) fetches template
+    # crates over the network, which the Nix sandbox forbids. Tests are covered by
+    # CI (rustup) + the nightly `--all-features` job + the flake `checks.clippy`,
+    # so skip them here rather than pull the network into the build.
+    doCheck = false;
+
     nativeBuildInputs = [ pkg-config ] ++ lib.optionals wantsS3 [ cmake ];
     buildInputs = [ openssl ];
 
