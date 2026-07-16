@@ -290,6 +290,42 @@ pub(crate) async fn start_domain_verification(
     }
 }
 
+/// `POST …/domains/:host/attach-unverified` — **admin-only** (gated at
+/// `system·admin` in [`crate::authz`]): attach a host to the site **without** an
+/// ownership proof. The admin asserts ownership out-of-band; boatramp records a
+/// verified (operator-asserted) challenge and attaches it, so the strict serving
+/// gate then treats the host as a normal verified virtualhost. A site-scoped
+/// publisher cannot reach this route — only an admin can claim an arbitrary host.
+pub(crate) async fn attach_domain_unverified(
+    State(deploy): State<DeployStore>,
+    Path((site, host)): Path<(String, String)>,
+) -> Response {
+    // A wildcard needs the DNS method to satisfy `attach_verified_domain`'s
+    // wildcard rule; an exact host uses HTTP. Either way the proof is skipped.
+    let method = if host.starts_with("*.") {
+        VerificationMethod::Dns
+    } else {
+        VerificationMethod::Http
+    };
+    if let Err(err) = deploy
+        .start_domain_verification(&site, &host, method, now_unix())
+        .await
+    {
+        return deploy_error_response(err);
+    }
+    if let Err(err) = deploy.mark_domain_verified(&site, &host).await {
+        return deploy_error_response(err);
+    }
+    match deploy.attach_verified_domain(&site, &host).await {
+        Ok(_) => (
+            StatusCode::OK,
+            format!("attached {host} to site {site} without verification (admin override)\n"),
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
 /// `DELETE …/verification` — drop a host's challenge (used when detaching the
 /// host). 204 whether or not one existed.
 pub(crate) async fn remove_domain_verification(
@@ -358,6 +394,165 @@ pub(crate) async fn check_domain_verification(
         // The probe itself failed (network/resolver) — upstream, not our fault.
         Err(err) => (StatusCode::BAD_GATEWAY, format!("{err}\n")).into_response(),
     }
+}
+
+/// The reconcile-loop interval shown on the pending page — keep in sync with the
+/// serve loop's `DOMAIN_VERIFY_RECONCILE_TICK` (60s) so the "just wait" promise is
+/// honest.
+const RECONCILE_HINT_SECS: u32 = 60;
+
+/// HTML-escape a value substituted into the pending page (the host and token are
+/// attacker-influenced, so this runs on every interpolation).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The "verification pending" holding page — an **HTTP 421 Misdirected Request**
+/// served for a non-local `Host` that isn't a verified, attached virtualhost
+/// (DV-2's mandatory-verification gate). It looks up any pending challenge for the
+/// host to show the exact token / record + path; otherwise it shows generic
+/// guidance. Self-contained HTML (no JS, no external assets) — safe on an
+/// unverified host.
+pub async fn verification_pending_page(deploy: &DeployStore, host: &str) -> Response {
+    let host_norm = host.trim_end_matches('.').to_ascii_lowercase();
+    // A pending challenge for this exact host (any site), if the operator started
+    // one — so the page can show the real token + record to publish.
+    let pending = deploy
+        .list_all_domain_verifications()
+        .await
+        .ok()
+        .and_then(|all| {
+            all.into_iter()
+                .find(|(_, v)| !v.verified && v.host == host_norm)
+        });
+    let (token, http_path) = match &pending {
+        Some((_, v)) => (v.token.clone(), v.http_challenge_path()),
+        None => (
+            "run `boatramp domain add` to start".to_string(),
+            "/.well-known/boatramp-domain-verification/<token>".to_string(),
+        ),
+    };
+    let html = include_str!("verification_pending.html")
+        .replace("{{HOST}}", &html_escape(&host_norm))
+        .replace(
+            "{{VERIFY_DNS_NAME}}",
+            &html_escape(&format!("_boatramp-verify.{host_norm}")),
+        )
+        .replace("{{VERIFY_TOKEN}}", &html_escape(&token))
+        .replace("{{VERIFY_HTTP_PATH}}", &html_escape(&http_path))
+        .replace("{{RECONCILE_SECONDS}}", &RECONCILE_HINT_SECS.to_string())
+        .replace("{{DNS_PROVIDER}}", "cloudflare")
+        .replace(
+            "{{DOCS_URL}}",
+            "https://docs.boatramp.dev/how-to/custom-domain.html",
+        );
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // No JS, no external fetches — lock it down so a future regression
+            // can't introduce a sink on this attacker-adjacent host.
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'",
+            ),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        html,
+    )
+        .into_response()
+}
+
+/// One reconcile sweep: enumerate every site's **pending** (unverified, unexpired)
+/// verification and re-run the ownership probe, attaching any that now pass.
+/// Returns the count newly attached. Per-host failures are logged and skipped so
+/// one unreachable host never stalls the sweep.
+async fn reconcile_domain_verifications(
+    deploy: &DeployStore,
+    probe: &dyn DomainProbe,
+) -> Result<usize, boatramp_core::error::DeployError> {
+    // Bound the outbound-probe fan-out per tick even across many sites: any
+    // remaining pending hosts are simply retried on the next tick. Combined with
+    // the per-site pending cap (`start_domain_verification`) this keeps the sweep
+    // from being turned into a high-rate egress amplifier.
+    const MAX_PROBES_PER_TICK: usize = 256;
+    let now = now_unix();
+    let mut attached = 0usize;
+    let mut probes = 0usize;
+    for (site, v) in deploy.list_all_domain_verifications().await? {
+        if v.verified || v.is_expired(now) {
+            continue;
+        }
+        if probes >= MAX_PROBES_PER_TICK {
+            tracing::debug!(
+                probed = probes,
+                "domain-verify reconcile: probe budget reached; remaining hosts next tick"
+            );
+            break;
+        }
+        probes += 1;
+        // Not satisfied yet, or the probe/method failed (network / a DNS method on
+        // a build without the resolver) ⇒ leave it pending and retry next tick.
+        if let Ok(true) = check_ownership(probe, &v).await {
+            if let Err(err) = deploy.mark_domain_verified(&site, &v.host).await {
+                tracing::debug!(%site, host = %v.host, %err, "domain-verify reconcile: mark failed");
+                continue;
+            }
+            match deploy.attach_verified_domain(&site, &v.host).await {
+                Ok(_) => {
+                    attached += 1;
+                    tracing::info!(%site, host = %v.host, "domain-verify reconcile: verified + attached");
+                }
+                Err(err) => {
+                    tracing::debug!(%site, host = %v.host, %err, "domain-verify reconcile: attach failed");
+                }
+            }
+        }
+    }
+    Ok(attached)
+}
+
+/// Spawn the domain-verification **auto-complete reconcile loop**: every `tick`,
+/// on the leader, re-check all pending challenges and attach any that now pass —
+/// so a challenge whose HTTP/DNS token is published (e.g. by `domain add
+/// --provider`) but never finished with `domain verify` self-heals with no
+/// operator action, and no persistent background daemon is needed beyond this
+/// tick. Mirrors [`crate::spawn_compute_reconcile`]; the leader gate makes it a
+/// single-writer in a cluster.
+pub fn spawn_domain_verify_reconcile(
+    deploy: DeployStore,
+    allow_private: bool,
+    is_leader: crate::CronLeaderGate,
+    tick: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    // One stateless probe for the loop's lifetime; `allow_private` follows the
+    // posture (a strict fleet verifies only globally-routable hosts).
+    let probe: Arc<dyn DomainProbe> = Arc::new(ServerDomainProbe::new(allow_private));
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tick);
+        // `interval` fires immediately; skip that first tick so the sweep waits a
+        // full period before its first run (the router is already serving).
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !is_leader() {
+                continue;
+            }
+            match reconcile_domain_verifications(&deploy, probe.as_ref()).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        attached = n,
+                        "domain-verify reconcile: attached pending hosts"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "domain-verify reconcile tick failed"),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -432,5 +627,110 @@ mod tests {
             .await
             .expect("the redirect must be followed to the token");
         assert_eq!(body, "verify-token-xyz");
+    }
+
+    /// A blob store the reconcile path never touches (verifications + attached
+    /// hostnames live in the KV, not in blob storage).
+    struct NullStorage;
+    #[async_trait::async_trait]
+    impl boatramp_core::Storage for NullStorage {
+        async fn get(
+            &self,
+            _: &str,
+        ) -> Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: boatramp_core::ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::unsupported("null"))
+        }
+        async fn head(
+            &self,
+            _: &str,
+        ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), boatramp_core::StorageError> {
+            Ok(())
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A probe that serves the challenge token for both HTTP and TXT — so the
+    /// challenge it's asked about always passes.
+    struct TokenProbe {
+        token: String,
+    }
+    #[async_trait::async_trait]
+    impl DomainProbe for TokenProbe {
+        async fn lookup_txt(&self, _: &str) -> Result<Vec<String>, VerifyError> {
+            Ok(vec![self.token.clone()])
+        }
+        async fn fetch_http(&self, _: &str) -> Result<String, VerifyError> {
+            Ok(self.token.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_attaches_a_now_passing_pending_host() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::domain_verify::VerificationMethod;
+        use boatramp_core::kv::MemoryKv;
+
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        // A pending HTTP challenge for a host on site `www` — not yet attached.
+        let v = deploy
+            .start_domain_verification("www", "example.com", VerificationMethod::Http, now_unix())
+            .await
+            .unwrap();
+        assert!(!v.verified);
+        assert!(deploy
+            .resolve_site_by_host("example.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        // The token is now served → one reconcile sweep verifies + attaches it.
+        let probe = TokenProbe {
+            token: v.token.clone(),
+        };
+        assert_eq!(
+            reconcile_domain_verifications(&deploy, &probe)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            deploy
+                .resolve_site_by_host("example.com")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("www")
+        );
+        // Idempotent: a second sweep sees it already verified and attaches nothing.
+        assert_eq!(
+            reconcile_domain_verifications(&deploy, &probe)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

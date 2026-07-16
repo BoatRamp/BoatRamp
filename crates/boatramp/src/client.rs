@@ -386,6 +386,27 @@ pub async fn check_domain_verification(
         .await?)
 }
 
+/// Admin-only: attach a host to the site **without** an ownership proof
+/// (`domain add --unverified`). Returns the server's confirmation text. The
+/// server gates this route at `system·admin`, so a site-scoped token gets a 403.
+pub async fn attach_domain_unverified(
+    client: &ApiClient,
+    server: &str,
+    site: &str,
+    host: &str,
+) -> Result<String> {
+    Ok(client
+        .post(format!(
+            "{server}/api/sites/{site}/domains/{}/attach-unverified",
+            host_segment(host)
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?)
+}
+
 /// Drop a host's ownership challenge (when detaching the host).
 pub async fn remove_domain_verification(
     client: &ApiClient,

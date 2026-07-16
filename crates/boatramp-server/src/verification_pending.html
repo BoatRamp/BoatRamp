@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Setting up {{HOST}}</title>
+<style>
+  :root {
+    --bg:        #0e1620;
+    --bg-card:   #16222e;
+    --bg-inset:  #0a1017;
+    --border:    #274050;
+    --text:      #eaf2f7;
+    --text-dim:  #a7bcc9;
+    --orange:    #ff6b35;
+    --teal:      #35e0c4;
+    --yellow:    #ffd23f;
+    --blue:      #2088c1;
+    --radius:    12px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: clamp(1rem, 4vw, 3rem);
+  }
+  main { width: 100%; max-width: 34rem; }
+  .mark { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 2rem; }
+  .mark svg { display: block; flex: none; }
+  .mark span { font-weight: 600; font-size: 1.05rem; letter-spacing: 0.01em; }
+  .mark .dim { color: var(--text-dim); font-weight: 400; }
+  h1 { font-size: clamp(1.5rem, 5vw, 2rem); line-height: 1.2; margin: 0 0 0.75rem; letter-spacing: -0.01em; }
+  .lead { font-size: 1.05rem; color: var(--text-dim); margin: 0 0 1.5rem; }
+  .host { font-family: var(--mono); font-size: 0.95rem; color: var(--teal); word-break: break-all; }
+  .status {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    font-size: 0.85rem; color: var(--text-dim);
+    background: var(--bg-inset); border: 1px solid var(--border);
+    border-radius: 999px; padding: 0.35rem 0.8rem; margin-bottom: 1.75rem;
+  }
+  .status .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--yellow); flex: none; position: relative; }
+  .status .dot::after {
+    content: ""; display: block; position: absolute; inset: 0;
+    border-radius: 50%; background: var(--yellow); animation: pulse 2s ease-out infinite;
+  }
+  @keyframes pulse { 0% { transform: scale(1); opacity: 0.7; } 70% { transform: scale(2.6); opacity: 0; } 100% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .status .dot::after { animation: none; } }
+  details.owner { margin-top: 1.5rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card); }
+  details.owner > summary {
+    cursor: pointer; list-style: none; padding: 0.9rem 1.1rem;
+    font-weight: 600; font-size: 0.95rem; display: flex; align-items: center;
+    gap: 0.55rem; color: var(--text); border-radius: var(--radius);
+  }
+  details.owner > summary::-webkit-details-marker { display: none; }
+  details.owner > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  .chev { margin-left: auto; transition: transform 0.15s ease; color: var(--text-dim); flex: none; }
+  @media (prefers-reduced-motion: reduce) { .chev { transition: none; } }
+  details.owner[open] > summary .chev { transform: rotate(90deg); }
+  .owner-body { padding: 0 1.1rem 1.2rem; border-top: 1px solid var(--border); margin-top: -1px; }
+  .owner-body p { color: var(--text-dim); font-size: 0.92rem; }
+  .owner-body h2 {
+    font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-dim); margin: 1.4rem 0 0.5rem; font-weight: 600;
+  }
+  .methods { display: grid; gap: 0.75rem; margin: 0.5rem 0 0; }
+  .method { background: var(--bg-inset); border: 1px solid var(--border); border-left: 3px solid var(--blue); border-radius: 8px; padding: 0.8rem 0.9rem; }
+  .method.b { border-left-color: var(--teal); }
+  .method .tag { display: inline-block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; color: var(--text-dim); margin-bottom: 0.35rem; }
+  code, kbd, pre { font-family: var(--mono); font-size: 0.86rem; }
+  code.inline { background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 0.08em 0.4em; color: var(--yellow); word-break: break-all; }
+  pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem 0.85rem; margin: 0.5rem 0 0; overflow-x: auto; color: var(--teal); line-height: 1.5; }
+  pre .c { color: var(--text-dim); }
+  .note { font-size: 0.85rem; color: var(--text-dim); border-top: 1px solid var(--border); margin-top: 1.3rem; padding-top: 1rem; }
+  .note strong { color: var(--text); font-weight: 600; }
+  a { color: var(--teal); }
+  footer { margin-top: 2.25rem; font-size: 0.8rem; color: var(--text-dim); }
+</style>
+</head>
+<body>
+<main>
+  <div class="mark">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false">
+      <circle cx="12" cy="4.4" r="2" stroke="#ff6b35" stroke-width="1.7"/>
+      <path d="M12 6.4V20" stroke="#ff6b35" stroke-width="1.7" stroke-linecap="round"/>
+      <path d="M8 10h8" stroke="#ffd23f" stroke-width="1.7" stroke-linecap="round"/>
+      <path d="M5 13c0 4 3.2 6.5 7 6.5s7-2.5 7-6.5" stroke="#35e0c4" stroke-width="1.7" stroke-linecap="round"/>
+      <path d="M5 13l-1.8 1.2M19 13l1.8 1.2" stroke="#35e0c4" stroke-width="1.7" stroke-linecap="round"/>
+    </svg>
+    <span>boatramp<span class="dim"> &middot; site setup</span></span>
+  </div>
+
+  <p class="status"><span class="dot" aria-hidden="true"></span> Verification pending</p>
+
+  <h1>This site isn&rsquo;t live here yet</h1>
+  <p class="lead">
+    The domain <span class="host">{{HOST}}</span> is being connected to its content.
+    This is a normal setup step &mdash; nothing is broken, and there&rsquo;s nothing
+    you need to do. Please check back in a little while.
+  </p>
+
+  <details class="owner">
+    <summary>
+      <span aria-hidden="true">&#128295;</span>
+      Are you the site owner?
+      <svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </summary>
+    <div class="owner-body">
+      <p>
+        <span class="host">{{HOST}}</span> points at this server, but
+        <strong style="color:var(--text)">domain ownership hasn&rsquo;t been verified yet</strong>.
+        boatramp won&rsquo;t serve content on a public hostname until it can confirm
+        you control it. Prove ownership with <em>either</em> method below.
+      </p>
+
+      <h2>Method A &mdash; DNS TXT record</h2>
+      <div class="methods"><div class="method">
+        <span class="tag">ADD THIS RECORD</span>
+<pre><span class="c">name: </span>{{VERIFY_DNS_NAME}}
+<span class="c">type: </span>TXT
+<span class="c">value:</span> {{VERIFY_TOKEN}}</pre>
+      </div></div>
+
+      <h2>Method B &mdash; HTTP token file</h2>
+      <div class="methods"><div class="method b">
+        <span class="tag">SERVE THIS FILE</span>
+<pre><span class="c">path: </span>{{VERIFY_HTTP_PATH}}
+<span class="c">body: </span>{{VERIFY_TOKEN}}</pre>
+      </div></div>
+
+      <p style="margin-top:1rem">
+        <strong style="color:var(--teal)">Often you just need to wait.</strong>
+        Once the record or file is published, boatramp finishes verification
+        automatically &mdash; usually within about {{RECONCILE_SECONDS}} seconds, via a
+        background reconcile loop. No redeploy needed.
+      </p>
+
+      <h2>Finish now from the CLI</h2>
+<pre><span class="c"># check &amp; complete verification immediately</span>
+boatramp domain verify {{HOST}}
+
+<span class="c"># or let boatramp create the DNS record for you</span>
+boatramp domain add {{HOST}} --provider {{DNS_PROVIDER}}</pre>
+
+      <p class="note">
+        <strong>Meant to serve this host without verification?</strong>
+        An admin can opt it out with
+        <code class="inline">boatramp domain add {{HOST}} --unverified</code>,
+        or set an explicit fallback with
+        <code class="inline">boatramp config set default_site &lt;site&gt;</code>.
+        See the <a href="{{DOCS_URL}}">domain verification docs</a>.
+      </p>
+    </div>
+  </details>
+
+  <footer>Served by boatramp &middot; verification pending</footer>
+</main>
+</body>
+</html>

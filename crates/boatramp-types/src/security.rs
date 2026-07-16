@@ -100,6 +100,7 @@ impl SecurityProfile {
                 ratelimit_fail_open: false,
                 allow_implicit_routing: false,
                 require_pop: false,
+                require_domain_verification: true,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -115,6 +116,7 @@ impl SecurityProfile {
                 ratelimit_fail_open: false,
                 allow_implicit_routing: true,
                 require_pop: false,
+                require_domain_verification: true,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -130,6 +132,8 @@ impl SecurityProfile {
                 ratelimit_fail_open: true,
                 allow_implicit_routing: true,
                 require_pop: false,
+                // Dev serves arbitrary test hosts locally; the gate is off.
+                require_domain_verification: false,
             },
         }
     }
@@ -182,6 +186,11 @@ pub struct PostureOverrides {
     /// (a `cnf` token *always* requires a proof regardless — this knob additionally
     /// bans plain bearer tokens fleet-wide, so a leaked bearer alone is inert).
     pub require_pop: Option<bool>,
+    /// Refuse to serve a non-local `Host` that isn't a verified, attached
+    /// virtualhost (serve the pending page instead). On under multi-/single-tenant.
+    /// Setting `false` here (file + restart) disables the gate fleet-wide; a single
+    /// host is excluded instead with an admin `domain add <host> --unverified`.
+    pub require_domain_verification: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -333,6 +342,13 @@ pub struct SecurityPosture {
     /// Require every control-plane token to be `cnf`-bound and PoP-proven
     /// (fleet-wide holder-key enforcement). Off by default.
     pub require_pop: bool,
+    /// Refuse to serve a **non-local** `Host` that is not a verified, attached
+    /// virtualhost — the request gets the "verification pending" holding page
+    /// instead of any `default_site`/implicit fallback. On under multi-/single-
+    /// tenant; off under `dev`. Local hosts (`localhost`/`*.localhost`/`*.local`/
+    /// IP literals) always serve. An operator disables it globally in
+    /// `[security]`, or excludes one host with an admin `domain add --unverified`.
+    pub require_domain_verification: bool,
 }
 
 impl Default for SecurityPosture {
@@ -381,6 +397,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.require_pop {
         base.require_pop = v;
+    }
+    if let Some(v) = o.require_domain_verification {
+        base.require_domain_verification = v;
     }
     base
 }

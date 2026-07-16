@@ -282,6 +282,11 @@ const _: () = assert!(std::mem::size_of::<Error>() <= 128);
 /// replicas.
 const COMPUTE_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How often the domain-verify reconcile loop re-checks pending challenges and
+/// auto-attaches any that now pass (so a published-but-unverified host self-heals
+/// without a manual `domain verify`).
+const DOMAIN_VERIFY_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How long a scale-to-zero workload must go without a request before it is
 /// snapshotted + parked. A requested workload is woken on demand.
 const COMPUTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -984,6 +989,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         Arc::new(|| true),
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
+    );
+
+    // Domain-verify auto-complete: periodically re-check every site's pending
+    // ownership challenges and attach any that now pass — a published token (e.g.
+    // via `domain add --provider`) converges without a manual `domain verify`.
+    let _dv_reconcile = boatramp_server::spawn_domain_verify_reconcile(
+        deploy.clone(),
+        posture.domain_verify_allow_private,
+        Arc::new(|| true),
+        DOMAIN_VERIFY_RECONCILE_TICK,
     );
 
     tracing::info!(
@@ -1797,6 +1812,19 @@ async fn run_cluster(
             Arc::new(move || boatramp_cluster::raft::is_leader(&raft, leader_node_id)),
             COMPUTE_RECONCILE_TICK,
             COMPUTE_IDLE_TIMEOUT,
+        );
+    }
+
+    // Domain-verify auto-complete reconcile — leader-gated like the compute loop,
+    // so a single node drives the sweep in the cluster.
+    {
+        let raft = node.raft.clone();
+        let dv_node_id = node.node_id;
+        let _dv_reconcile = boatramp_server::spawn_domain_verify_reconcile(
+            deploy.clone(),
+            options.posture.domain_verify_allow_private,
+            Arc::new(move || boatramp_cluster::raft::is_leader(&raft, dv_node_id)),
+            DOMAIN_VERIFY_RECONCILE_TICK,
         );
     }
 

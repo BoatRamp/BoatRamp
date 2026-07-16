@@ -14,12 +14,43 @@ name = "boatramp"
 path = "src/main.rs"
 
 [features]
-# `console` ships in every build by default (the shipped release binaries, the
-# Nix/OCI images, and a plain `cargo build`): the management console is baked in
-# unless a build explicitly opts out with `--no-default-features`. The SPA `dist/`
-# is a build artifact staged by `boatramp-server/build.rs` (a placeholder when it
-# hasn't been built — the release + Nix pipelines build the real one).
-default = ["fs", "slatedb", "console"]
+# Batteries-included by policy: the **default build enables every non-conflicting
+# feature**, so a plain `cargo build`, the Nix/OCI images, and the release binaries
+# all ship the full capability set — no more "the server was built without X". The
+# whole set is validated together by the nightly `--all-features` gate (there are
+# no mutually-exclusive features today; runtime `--blobs`/`--kv`/`--tls` selectors
+# pick among the compiled-in backends). A feature that ever genuinely *conflicts*
+# with another would be dropped from this list and shipped as its own CI/CD variant.
+# For a minimal build, opt out with `--no-default-features` (+ name what you want,
+# e.g. `--features fs,slatedb`). `console`'s SPA `dist/` is staged by
+# `boatramp-server/build.rs` (placeholder when unbuilt; the release + Nix pipelines
+# build the real one).
+default = [
+  "fs",
+  "slatedb",
+  "console",
+  "s3",
+  "gcs",
+  "azure",
+  "cloudflare-kv",
+  "sql-postgres",
+  "sql-mysql",
+  "tls",
+  "http3",
+  "acme-dns",
+  "domain-verify-dns",
+  "oidc",
+  "signer-vault",
+  "signer-gcp",
+  "signer-azure",
+  "signer-aws",
+  "signer-pkcs11",
+  "compression",
+  "bundler",
+  "handlers",
+  "cluster",
+  "operator",
+]
 fs = ["boatramp-storage/fs"]
 s3 = ["boatramp-storage/s3"]
 gcs = ["boatramp-storage/gcs"]
