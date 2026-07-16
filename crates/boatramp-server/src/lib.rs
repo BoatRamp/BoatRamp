@@ -4423,7 +4423,7 @@ async fn serve_by_host(
             // Local hosts (localhost/*.localhost/*.local/IPs) and a fleet with the
             // gate off (`[security] require_domain_verification = false`, or an
             // admin `domain add --unverified` that attached the host above) pass.
-            if effective.posture.require_domain_verification && !is_local_host(&host) {
+            if effective.posture.require_domain_verification && !is_local_host(&host, implicit.0) {
                 return verification_pending_page(&deploy, &host).await;
             }
             // (A) First host label naming a served site: `blog.localhost` → `blog`.
@@ -4478,17 +4478,23 @@ fn strip_port(host: &str) -> &str {
     }
 }
 
-/// Is `host` a **local** name exempt from mandatory domain verification —
-/// `localhost`, a `*.localhost` / `*.local` (mDNS) name, or an IP literal (which
-/// has no domain to verify)? Public DNS names are not local and must be verified.
-fn is_local_host(host: &str) -> bool {
+/// Is `host` a **local** name exempt from mandatory domain verification? The
+/// `Host` header is client-controlled, so this must not trust a spoofable public
+/// value:
+/// - a **non-global** IP literal (loopback / private / link-local — incl. `[::1]`)
+///   is local and has no domain to verify; a **global** IP literal is an attacker
+///   artifact in a public `Host` and stays gated;
+/// - `localhost` / `*.localhost` / `*.local` are honored **only when implicit
+///   routing is enabled** (a loopback bind / dev / single-tenant posture) — a
+///   public multi-tenant server must not let a spoofed `Host: x.localhost` skip
+///   the gate.
+fn is_local_host(host: &str, implicit: bool) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    // An IP literal (incl. `[::1]`) can't be domain-verified.
     let unbracketed = h.trim_start_matches('[').trim_end_matches(']');
-    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
-        return true;
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return !boatramp_core::access::is_global_ip(ip);
     }
-    h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local")
+    implicit && (h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local"))
 }
 
 #[cfg(test)]
@@ -4497,29 +4503,47 @@ mod local_host_tests {
 
     #[test]
     fn local_hosts_are_exempt_from_verification() {
-        // Local / loopback / mDNS / IP-literal hosts skip the mandatory gate…
-        for h in [
-            "localhost",
-            "LocalHost", // case-insensitive
-            "blog.localhost",
-            "printer.local",
-            "127.0.0.1",
-            "::1",
-            "[::1]",
-            "192.168.1.10",
-        ] {
-            assert!(is_local_host(h), "{h} should be local");
+        // Non-global IP literals are local regardless of posture (can't verify an
+        // IP; a private/loopback IP is local access).
+        for h in ["127.0.0.1", "::1", "[::1]", "192.168.1.10", "169.254.0.1"] {
+            assert!(
+                is_local_host(h, false),
+                "{h} should be local (non-global IP)"
+            );
+            assert!(
+                is_local_host(h, true),
+                "{h} should be local (non-global IP)"
+            );
         }
-        // …public DNS names are not local and must be verified.
+
+        // On a PUBLIC bind (implicit routing off), a spoofable client `Host` must
+        // NOT skip the gate: a global IP literal or a `.localhost`/`.local` name is
+        // an attacker artifact, not local access.
         for h in [
+            "8.8.8.8",        // global IP literal
+            "[2606:4700::1]", // global IPv6 literal
+            "localhost",      // spoofed
+            "blog.localhost", // spoofed suffix
+            "printer.local",  // spoofed mDNS
             "example.com",
-            "www.example.com",
-            "boatramp.dev",
-            "not-localhost.com",
-            "localhost.evil.com",
+            "localhost.evil.com", // classic suffix-confusion attempt
         ] {
-            assert!(!is_local_host(h), "{h} should NOT be local");
+            assert!(
+                !is_local_host(h, false),
+                "{h} must be gated on a public bind"
+            );
         }
+
+        // On a loopback / dev bind (implicit routing on), the local names ARE
+        // honored (and remain case-insensitive).
+        for h in ["localhost", "LocalHost", "blog.localhost", "printer.local"] {
+            assert!(
+                is_local_host(h, true),
+                "{h} should be local under implicit routing"
+            );
+        }
+        // …but a real public DNS name is never local, even in dev.
+        assert!(!is_local_host("boatramp.dev", true));
     }
 }
 

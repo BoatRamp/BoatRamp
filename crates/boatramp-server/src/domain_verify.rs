@@ -451,7 +451,16 @@ pub async fn verification_pending_page(deploy: &DeployStore, host: &str) -> Resp
         );
     (
         StatusCode::MISDIRECTED_REQUEST,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // No JS, no external fetches — lock it down so a future regression
+            // can't introduce a sink on this attacker-adjacent host.
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'",
+            ),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
         html,
     )
         .into_response()
@@ -465,12 +474,26 @@ async fn reconcile_domain_verifications(
     deploy: &DeployStore,
     probe: &dyn DomainProbe,
 ) -> Result<usize, boatramp_core::error::DeployError> {
+    // Bound the outbound-probe fan-out per tick even across many sites: any
+    // remaining pending hosts are simply retried on the next tick. Combined with
+    // the per-site pending cap (`start_domain_verification`) this keeps the sweep
+    // from being turned into a high-rate egress amplifier.
+    const MAX_PROBES_PER_TICK: usize = 256;
     let now = now_unix();
     let mut attached = 0usize;
+    let mut probes = 0usize;
     for (site, v) in deploy.list_all_domain_verifications().await? {
         if v.verified || v.is_expired(now) {
             continue;
         }
+        if probes >= MAX_PROBES_PER_TICK {
+            tracing::debug!(
+                probed = probes,
+                "domain-verify reconcile: probe budget reached; remaining hosts next tick"
+            );
+            break;
+        }
+        probes += 1;
         // Not satisfied yet, or the probe/method failed (network / a DNS method on
         // a build without the resolver) ⇒ leave it pending and retry next tick.
         if let Ok(true) = check_ownership(probe, &v).await {

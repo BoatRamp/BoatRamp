@@ -1142,6 +1142,25 @@ impl DeployStore {
                 return Ok(existing);
             }
         }
+        // Cap the pending set per site. An unbounded number of pending challenges
+        // would let a tenant seed many hosts that the auto-complete reconcile loop
+        // then re-probes every tick (a low-and-slow outbound-probe amplifier to
+        // arbitrary public hosts). A generous ceiling bounds both storage and the
+        // per-tick fan-out without limiting real use. (Re-running `domain add` on an
+        // existing host returns early above, so this only gates genuinely-new hosts.)
+        const MAX_PENDING_VERIFICATIONS_PER_SITE: usize = 64;
+        let pending = self
+            .list_domain_verifications(site)
+            .await?
+            .into_iter()
+            .filter(|v| !v.verified && !v.is_expired(now_unix))
+            .count();
+        if pending >= MAX_PENDING_VERIFICATIONS_PER_SITE {
+            return Err(DeployError::Conflict(format!(
+                "too many pending domain verifications for site {site} \
+                 (max {MAX_PENDING_VERIFICATIONS_PER_SITE}); verify or remove some first"
+            )));
+        }
         let verification = DomainVerification::new(host, method, now_unix);
         self.put_domain_verification(site, &verification).await?;
         Ok(verification)
@@ -3084,6 +3103,39 @@ mod tests {
                 .is_none(),
             "a stale HTTP index must not serve a token whose record is now DNS"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_verifications_are_capped_per_site() {
+        let store = store();
+        // Seed the cap's worth of distinct pending hosts — all accepted.
+        for i in 0..64 {
+            store
+                .start_domain_verification(
+                    "site",
+                    &format!("h{i}.example"),
+                    VerificationMethod::Http,
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        // One more genuinely-new host is refused (bounds the reconcile fan-out).
+        let err = store
+            .start_domain_verification("site", "overflow.example", VerificationMethod::Http, 100)
+            .await
+            .expect_err("the 65th pending host must be rejected");
+        assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
+        // Re-running an EXISTING host still works (returns early before the cap).
+        store
+            .start_domain_verification("site", "h0.example", VerificationMethod::Http, 100)
+            .await
+            .expect("re-running an existing challenge is not capped");
+        // A different site has its own budget.
+        store
+            .start_domain_verification("other", "fresh.example", VerificationMethod::Http, 100)
+            .await
+            .expect("a different site is unaffected");
     }
 
     fn store() -> DeployStore {
