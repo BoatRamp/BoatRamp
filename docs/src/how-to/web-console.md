@@ -24,6 +24,25 @@ serve: (
 
 Restart `serve` and open **`https://<your-host>/_console`**. That's it.
 
+### Turn it on at runtime (no restart)
+
+The console mount is also a **dynamic** [daemon-config](../reference/daemon-config.md)
+knob, so you can enable it on a running instance — or a whole fleet — over the
+control-plane API, with no restart and no redeploy:
+
+```sh
+boatramp config set console.enabled true          # serve it now, fleet-wide
+boatramp config set console.host console.example.com   # optional: pin the host
+boatramp config set console.path /admin                # optional: move the path
+boatramp config set console.enabled false         # turn it back off
+```
+
+The `[serve.console]` block above is the **baseline**; a `console.*` dynamic
+override wins over it (an unset override defers to the file). This is the tier to
+reach for when you can't edit the file + restart — e.g. a managed fly.io / OCI
+instance. (Needs an `admin` token; enabling the mount grants no privilege — the
+console's static assets hold no secrets and the API stays token-gated.)
+
 ### Building from source
 
 The console is a WebAssembly SPA (a Trunk build artifact), which a plain
