@@ -594,7 +594,9 @@ pub struct ServeConfig {
     /// policy (`aws:SourceAccount`). Required when `blob_notify_tier` provisions.
     pub blob_notify_account_id: Option<String>,
     /// `[serve.console]` — the embedded web management console. Absent (or
-    /// `enabled: false`) ⇒ not served.
+    /// `enabled: false`) ⇒ not served. This is the **baseline** for the dynamic
+    /// `console.*` daemon-config override, which can enable/move it at runtime
+    /// (`boatramp config set console.enabled true`) without a restart.
     pub console: Option<ConsoleConfig>,
 }
 

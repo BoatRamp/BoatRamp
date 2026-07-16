@@ -55,6 +55,15 @@ impl ConsoleMount {
             path: normalize_path(path.as_deref()),
         }
     }
+
+    /// The mount from the live [`EffectiveConfig`](boatramp_core::daemon_config::EffectiveConfig)
+    /// (`[serve.console]` baseline ⊕ the dynamic `DaemonConfig.console` override):
+    /// `Some` when the console is enabled, `None` when it is off. Read per-request
+    /// so an operator can toggle the console at runtime without a restart.
+    pub fn from_effective(eff: &boatramp_core::daemon_config::EffectiveConfig) -> Option<Self> {
+        eff.console_enabled
+            .then(|| Self::resolve(eff.console_host.clone(), eff.console_path.clone()))
+    }
 }
 
 /// Normalize a mount path: default `/_console`, collapse to a single leading
@@ -179,12 +188,20 @@ fn serve_console(mount: &ConsoleMount, req_path: &str) -> Response {
     resp
 }
 
-/// The mount config carried as middleware state.
+/// The daemon-config runtime carried as middleware state, read per-request so the
+/// console mount (enabled/host/path) reflects the live `DaemonConfig` — an operator
+/// can toggle it at runtime with no restart.
 #[derive(Clone)]
-struct ConsoleState(Arc<ConsoleMount>);
+struct ConsoleState(Arc<crate::DaemonRuntime>);
 
-/// Intercept a request for the mounted console; otherwise pass it through.
+/// Intercept a request for the mounted console; otherwise pass it through. The
+/// mount is resolved from the live effective config on every request, so a
+/// disabled console is a cheap pass-through and an enabling write takes effect on
+/// the next request.
 async fn intercept(State(state): State<ConsoleState>, req: Request, next: Next) -> Response {
+    let Some(mount) = ConsoleMount::from_effective(&state.0.effective()) else {
+        return next.run(req).await;
+    };
     let host = req
         .headers()
         .get(header::HOST)
@@ -192,21 +209,20 @@ async fn intercept(State(state): State<ConsoleState>, req: Request, next: Next) 
         .map(crate::strip_port)
         .unwrap_or("");
     let path = req.uri().path().to_string();
-    if host_matches(&state.0.host, host) && path_under(&state.0.path, &path) {
-        return serve_console(&state.0, &path);
+    if host_matches(&mount.host, host) && path_under(&mount.path, &path) {
+        return serve_console(&mount, &path);
     }
     next.run(req).await
 }
 
-/// Layer the console-intercept middleware onto `app` when a mount is configured.
-pub fn mount(app: Router, console: Option<ConsoleMount>) -> Router {
-    match console {
-        Some(m) => app.layer(axum::middleware::from_fn_with_state(
-            ConsoleState(Arc::new(m)),
-            intercept,
-        )),
-        None => app,
-    }
+/// Layer the console-intercept middleware onto `app`. Always installed (the mount
+/// is a live `DaemonConfig` value, so it can be enabled/disabled at runtime); when
+/// the console is disabled the middleware is a pass-through.
+pub fn mount(app: Router, daemon: Arc<crate::DaemonRuntime>) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(
+        ConsoleState(daemon),
+        intercept,
+    ))
 }
 
 #[cfg(test)]
@@ -242,6 +258,42 @@ mod tests {
         assert!(!path_under("/_console", "/_consolex"));
         assert!(!path_under("/_console", "/api/sites"));
         assert!(path_under("", "/anything")); // root mount
+    }
+
+    #[test]
+    fn from_effective_reflects_enabled_flag() {
+        use boatramp_core::daemon_config::{ConfigBaseline, DaemonConfig};
+        use boatramp_core::security::SecurityProfile;
+        let base = ConfigBaseline {
+            default_site: None,
+            protect_previews: false,
+            max_upload_bytes: 0,
+            upload_idle_timeout_secs: None,
+            max_concurrent_uploads: None,
+            cluster_rate_limit: false,
+            compute_vcpus: 0,
+            compute_mem_mib: 0,
+            console_enabled: false,
+            console_host: None,
+            console_path: None,
+            max_upload_ceiling: 0,
+            max_concurrent_uploads_ceiling: None,
+            posture: SecurityProfile::MultiTenant.preset(),
+        };
+        // Disabled baseline, no override ⇒ no mount (pass-through).
+        assert!(ConsoleMount::from_effective(&DaemonConfig::default().resolve(&base)).is_none());
+        // A dynamic enable produces the mount at the configured host/path.
+        let cfg = DaemonConfig {
+            console: boatramp_core::daemon_config::ConsoleSettings {
+                enabled: Some(true),
+                host: Some("admin.example.com".into()),
+                path: Some("/ui".into()),
+            },
+            ..Default::default()
+        };
+        let m = ConsoleMount::from_effective(&cfg.resolve(&base)).expect("enabled ⇒ Some");
+        assert_eq!(m.host, "admin.example.com");
+        assert_eq!(m.path, "/ui");
     }
 
     #[test]

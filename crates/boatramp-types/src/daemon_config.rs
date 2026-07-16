@@ -52,6 +52,26 @@ pub struct ComputeDefaults {
     pub mem_mib: Option<u32>,
 }
 
+/// Dynamic overrides for the embedded web console mount (`[serve.console]`). Each
+/// `None` defers to the file baseline. Making this dynamic lets an operator turn
+/// the console on/off (or move its host/path) fleet-wide with one API write, no
+/// restart. It is a safe operational toggle, not a trust relaxation: the console
+/// is a static, secret-free SPA and the control-plane API it drives stays
+/// token-gated regardless — enabling the mount grants no privilege.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsoleSettings {
+    /// Serve the console at all (overrides `[serve.console] enabled`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Host(s) the console answers on: `*` (any), an exact host, or `*.suffix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// URL path prefix it mounts at (default `/_console`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 /// Tighten-only overrides for the trust-relaxing posture knobs. A field may only
 /// carry the **safe** value; a loosening value is rejected by
 /// [`DaemonConfig::validate`]. This lets an operator harden a running fleet (e.g.
@@ -106,6 +126,9 @@ pub struct DaemonConfig {
     /// Fleet compute defaults (default kernel, advertised capacity).
     #[serde(default, skip_serializing_if = "ComputeDefaults::is_empty")]
     pub compute: ComputeDefaults,
+    /// Embedded web console overrides (enable/host/path).
+    #[serde(default, skip_serializing_if = "ConsoleSettings::is_empty")]
+    pub console: ConsoleSettings,
     /// Tighten-only posture overrides.
     #[serde(default, skip_serializing_if = "PostureTighten::is_empty")]
     pub posture: PostureTighten,
@@ -122,6 +145,7 @@ impl Default for DaemonConfig {
             max_concurrent_uploads: None,
             cluster_rate_limit: None,
             compute: ComputeDefaults::default(),
+            console: ConsoleSettings::default(),
             posture: PostureTighten::default(),
         }
     }
@@ -140,6 +164,10 @@ pub struct ConfigBaseline {
     pub cluster_rate_limit: bool,
     pub compute_vcpus: u32,
     pub compute_mem_mib: u32,
+    /// Console mount baseline from `[serve.console]` (enabled/host/path).
+    pub console_enabled: bool,
+    pub console_host: Option<String>,
+    pub console_path: Option<String>,
     /// Static ceiling for `max_upload_bytes` (`0` = no ceiling).
     pub max_upload_ceiling: u64,
     /// Static ceiling for `max_concurrent_uploads` (`None` = no ceiling).
@@ -160,10 +188,20 @@ pub struct EffectiveConfig {
     pub compute_vcpus: u32,
     pub compute_mem_mib: u32,
     pub default_kernel: Option<KernelRef>,
+    /// Resolved console mount: whether to serve it, and where.
+    pub console_enabled: bool,
+    pub console_host: Option<String>,
+    pub console_path: Option<String>,
     pub posture: SecurityPosture,
 }
 
 impl ComputeDefaults {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl ConsoleSettings {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -286,6 +324,17 @@ impl DaemonConfig {
             compute_vcpus: self.compute.vcpus.unwrap_or(base.compute_vcpus),
             compute_mem_mib: self.compute.mem_mib.unwrap_or(base.compute_mem_mib),
             default_kernel: self.compute.default_kernel.clone(),
+            console_enabled: self.console.enabled.unwrap_or(base.console_enabled),
+            console_host: self
+                .console
+                .host
+                .clone()
+                .or_else(|| base.console_host.clone()),
+            console_path: self
+                .console
+                .path
+                .clone()
+                .or_else(|| base.console_path.clone()),
             posture: self.posture.apply(base.posture),
         }
     }
@@ -352,6 +401,9 @@ mod tests {
             cluster_rate_limit: false,
             compute_vcpus: 4,
             compute_mem_mib: 1024,
+            console_enabled: false,
+            console_host: None,
+            console_path: None,
             max_upload_ceiling: 100,
             max_concurrent_uploads_ceiling: Some(8),
             posture: SecurityProfile::MultiTenant.preset(),
@@ -443,6 +495,45 @@ mod tests {
             "loosening ignored at resolve"
         );
         assert!(!eff.posture.ratelimit_fail_open);
+    }
+
+    #[test]
+    fn console_override_toggles_and_defers() {
+        // Empty defers to the (disabled) baseline.
+        let eff = DaemonConfig::default().resolve(&baseline());
+        assert!(!eff.console_enabled);
+        assert!(eff.console_host.is_none());
+
+        // A dynamic override enables it (and can move host/path) without a restart.
+        let cfg = DaemonConfig {
+            console: ConsoleSettings {
+                enabled: Some(true),
+                host: Some("console.example.com".into()),
+                path: Some("/admin".into()),
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate(&baseline()).is_ok());
+        let eff = cfg.resolve(&baseline());
+        assert!(eff.console_enabled);
+        assert_eq!(eff.console_host.as_deref(), Some("console.example.com"));
+        assert_eq!(eff.console_path.as_deref(), Some("/admin"));
+
+        // With a file baseline that enabled it, an explicit `false` turns it off.
+        let mut base = baseline();
+        base.console_enabled = true;
+        base.console_path = Some("/_console".into());
+        let off = DaemonConfig {
+            console: ConsoleSettings {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let eff = off.resolve(&base);
+        assert!(!eff.console_enabled);
+        // Unset host/path still defer to the baseline.
+        assert_eq!(eff.console_path.as_deref(), Some("/_console"));
     }
 
     #[test]

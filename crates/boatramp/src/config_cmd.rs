@@ -248,6 +248,17 @@ fn write_key(cfg: &mut DaemonConfig, key: &str, value: &str) -> Result<()> {
         }
         "compute.vcpus" => cfg.compute.vcpus = clear_or(clear, parse_u64(key, value)? as u32),
         "compute.mem_mib" => cfg.compute.mem_mib = clear_or(clear, parse_u64(key, value)? as u32),
+        // Guard the parse behind `clear` so `unset` resets to the baseline without
+        // being parsed as a bool first.
+        "console.enabled" => {
+            cfg.console.enabled = if clear {
+                None
+            } else {
+                Some(parse_bool(key, value)?)
+            }
+        }
+        "console.host" => cfg.console.host = (!clear).then(|| value.to_string()),
+        "console.path" => cfg.console.path = (!clear).then(|| value.to_string()),
         "compute.default_kernel" => {
             cfg.compute.default_kernel = if clear {
                 None
@@ -328,6 +339,15 @@ const DYNAMIC_KEYS: &[(&str, &str)] = &[
         "compute.default_kernel",
         "fleet default microVM kernel (KernelRef JSON)",
     ),
+    ("console.enabled", "serve the embedded web console"),
+    (
+        "console.host",
+        "console host pattern (* / exact / *.suffix)",
+    ),
+    (
+        "console.path",
+        "console URL path prefix (default /_console)",
+    ),
     (
         "posture.oidc_require_audience",
         "tighten-only: require an OIDC audience",
@@ -358,6 +378,20 @@ mod tests {
         // Clearing resets to the file baseline.
         write_key(&mut cfg, "default_site", "unset").unwrap();
         assert!(cfg.default_site.is_none());
+    }
+
+    #[test]
+    fn set_console_keys() {
+        let mut cfg = DaemonConfig::default();
+        write_key(&mut cfg, "console.enabled", "true").unwrap();
+        assert_eq!(cfg.console.enabled, Some(true));
+        write_key(&mut cfg, "console.host", "console.example.com").unwrap();
+        assert_eq!(cfg.console.host.as_deref(), Some("console.example.com"));
+        write_key(&mut cfg, "console.path", "/admin").unwrap();
+        assert_eq!(cfg.console.path.as_deref(), Some("/admin"));
+        // Clearing resets to the file baseline.
+        write_key(&mut cfg, "console.enabled", "unset").unwrap();
+        assert!(cfg.console.enabled.is_none());
     }
 
     #[test]

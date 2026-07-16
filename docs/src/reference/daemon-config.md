@@ -45,6 +45,9 @@ occur.
 | `compute.vcpus` | int | Advertised schedulable vCPUs. |
 | `compute.mem_mib` | int | Advertised schedulable memory (MiB). |
 | `compute.default_kernel` | KernelRef | Fleet default microVM kernel (see below). |
+| `console.enabled` | bool | Serve the embedded [web console](../how-to/web-console.md). |
+| `console.host` | string | Host the console answers on (`*`, an exact host, or `*.suffix`). |
+| `console.path` | string | URL path prefix it mounts at (default `/_console`). |
 | `posture.oidc_require_audience` | bool | **Tighten-only**: require an OIDC audience. |
 | `posture.ratelimit_fail_open` | bool | **Tighten-only**: set `false` to fail closed. |
 | `posture.allow_shared_kernel_compute` | bool | **Tighten-only**: set `false` to forbid shared-kernel compute. |

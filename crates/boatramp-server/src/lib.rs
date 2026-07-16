@@ -447,6 +447,16 @@ struct DaemonState {
 /// SIGHUP/changelog; the posture's upload cap is the ceiling a dynamic override
 /// may not exceed.
 pub fn config_baseline(options: &ServerOptions) -> boatramp_core::daemon_config::ConfigBaseline {
+    // The static `[serve.console]` mount is the baseline the dynamic
+    // `DaemonConfig.console` override layers over. `Some(mount)` ⇒ enabled at the
+    // file level; without the `console` feature there is nothing to serve.
+    #[cfg(feature = "console")]
+    let (console_enabled, console_host, console_path) = match options.console.as_ref() {
+        Some(m) => (true, Some(m.host.clone()), Some(m.path.clone())),
+        None => (false, None, None),
+    };
+    #[cfg(not(feature = "console"))]
+    let (console_enabled, console_host, console_path) = (false, None, None);
     boatramp_core::daemon_config::ConfigBaseline {
         default_site: options.default_site.clone(),
         protect_previews: options.protect_previews,
@@ -456,6 +466,9 @@ pub fn config_baseline(options: &ServerOptions) -> boatramp_core::daemon_config:
         cluster_rate_limit: options.cluster_rate_limit_kv.is_some(),
         compute_vcpus: 0,
         compute_mem_mib: 0,
+        console_enabled,
+        console_host,
+        console_path,
         max_upload_ceiling: options.posture.max_upload_bytes,
         max_concurrent_uploads_ceiling: None,
         posture: options.posture,
@@ -685,9 +698,6 @@ pub fn router_with(
     // Opt-in CORS allowlist for the control-plane API; empty ⇒ CORS off.
     // Captured before `options` is partially moved below.
     let cors_origins = options.cors_allowed_origins.clone();
-    // The embedded-console mount, captured before the partial moves below.
-    #[cfg(feature = "console")]
-    let console_mount = options.console.clone();
     // The resolved security posture rides as an extension for the gateway /
     // proxy / domain-verify / upload paths (the hardening knobs).
     let posture = options.posture;
@@ -998,11 +1008,17 @@ pub fn router_with(
             }
         }
     });
+    // A handle for the console middleware (a live read of the daemon config),
+    // captured before `daemon` is moved into the extension below.
+    #[cfg(feature = "console")]
+    let console_daemon = daemon.clone();
     let app = app.layer(Extension(daemon));
     // Embedded web console (feature `console`): a middleware that intercepts the
-    // configured host+path before the site fallback, when the operator enabled it.
+    // configured host+path before the site fallback. Always layered — the mount is
+    // a live `DaemonConfig` value, so the console can be enabled/disabled at runtime
+    // (a disabled console is a pass-through). See [`console::mount`].
     #[cfg(feature = "console")]
-    let app = console::mount(app, console_mount);
+    let app = console::mount(app, console_daemon);
     app
         // Structured access log wraps every route (public + API).
         .layer(axum::middleware::from_fn(access_log))
