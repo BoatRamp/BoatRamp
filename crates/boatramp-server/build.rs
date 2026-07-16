@@ -52,9 +52,15 @@ fn main() {
              <code>--features console</code>.</p></body></html>",
         )
         .expect("write placeholder index.html");
-        println!(
-            "cargo:warning=`console` feature is on but crates/boatramp-console/dist is empty; \
-             embedded a placeholder. Run `just console` to bake the real console assets."
-        );
+        // `console` is now a default feature, so a plain debug `cargo build` hits
+        // this path routinely — stay quiet there. Warn only for release builds,
+        // where a missing dist means a placeholder would ship (the release + Nix
+        // pipelines stage the real dist, so this should never fire in them).
+        if env::var("PROFILE").as_deref() == Ok("release") {
+            println!(
+                "cargo:warning=`console` feature is on but crates/boatramp-console/dist is empty; \
+                 embedded a placeholder. Run `just console` to bake the real console assets."
+            );
+        }
     }
 }

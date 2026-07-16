@@ -14,7 +14,12 @@ name = "boatramp"
 path = "src/main.rs"
 
 [features]
-default = ["fs", "slatedb"]
+# `console` ships in every build by default (the shipped release binaries, the
+# Nix/OCI images, and a plain `cargo build`): the management console is baked in
+# unless a build explicitly opts out with `--no-default-features`. The SPA `dist/`
+# is a build artifact staged by `boatramp-server/build.rs` (a placeholder when it
+# hasn't been built — the release + Nix pipelines build the real one).
+default = ["fs", "slatedb", "console"]
 fs = ["boatramp-storage/fs"]
 s3 = ["boatramp-storage/s3"]
 gcs = ["boatramp-storage/gcs"]

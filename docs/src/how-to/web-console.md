@@ -8,15 +8,10 @@ configure.
 
 ## Turn it on
 
-The console lives behind the `console` build feature. Build the SPA once, then
-the binary with the feature:
-
-```sh
-just console                                       # builds crates/boatramp-console/dist
-cargo build -p boatramp --release --features console   # (add your other features)
-```
-
-Then enable serving it in `boatramp.cfg`:
+Every shipped build already bakes the console in — the `console` feature is **on
+by default**, and the release binaries and the Nix/OCI images stage the real SPA.
+So on a prebuilt boatramp there's nothing to compile; you only enable *serving*
+it in `boatramp.cfg`:
 
 ```ron
 serve: (
@@ -28,6 +23,22 @@ serve: (
 ```
 
 Restart `serve` and open **`https://<your-host>/_console`**. That's it.
+
+### Building from source
+
+The console is a WebAssembly SPA (a Trunk build artifact), which a plain
+`cargo build` can't produce. So build it once first, then the binary embeds the
+real assets:
+
+```sh
+just console               # builds crates/boatramp-console/dist (needs `nix develop`)
+cargo build -p boatramp --release
+```
+
+If you build the binary *without* first building the SPA, it still compiles — a
+placeholder page is baked in instead, explaining how to build the real one. To
+leave the console out entirely, drop the default feature:
+`cargo build -p boatramp --no-default-features --features fs,slatedb`.
 
 ## Where it's served (defaults + overrides)
 
