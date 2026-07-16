@@ -290,6 +290,42 @@ pub(crate) async fn start_domain_verification(
     }
 }
 
+/// `POST …/domains/:host/attach-unverified` — **admin-only** (gated at
+/// `system·admin` in [`crate::authz`]): attach a host to the site **without** an
+/// ownership proof. The admin asserts ownership out-of-band; boatramp records a
+/// verified (operator-asserted) challenge and attaches it, so the strict serving
+/// gate then treats the host as a normal verified virtualhost. A site-scoped
+/// publisher cannot reach this route — only an admin can claim an arbitrary host.
+pub(crate) async fn attach_domain_unverified(
+    State(deploy): State<DeployStore>,
+    Path((site, host)): Path<(String, String)>,
+) -> Response {
+    // A wildcard needs the DNS method to satisfy `attach_verified_domain`'s
+    // wildcard rule; an exact host uses HTTP. Either way the proof is skipped.
+    let method = if host.starts_with("*.") {
+        VerificationMethod::Dns
+    } else {
+        VerificationMethod::Http
+    };
+    if let Err(err) = deploy
+        .start_domain_verification(&site, &host, method, now_unix())
+        .await
+    {
+        return deploy_error_response(err);
+    }
+    if let Err(err) = deploy.mark_domain_verified(&site, &host).await {
+        return deploy_error_response(err);
+    }
+    match deploy.attach_verified_domain(&site, &host).await {
+        Ok(_) => (
+            StatusCode::OK,
+            format!("attached {host} to site {site} without verification (admin override)\n"),
+        )
+            .into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
 /// `DELETE …/verification` — drop a host's challenge (used when detaching the
 /// host). 204 whether or not one existed.
 pub(crate) async fn remove_domain_verification(
@@ -358,6 +394,67 @@ pub(crate) async fn check_domain_verification(
         // The probe itself failed (network/resolver) — upstream, not our fault.
         Err(err) => (StatusCode::BAD_GATEWAY, format!("{err}\n")).into_response(),
     }
+}
+
+/// The reconcile-loop interval shown on the pending page — keep in sync with the
+/// serve loop's `DOMAIN_VERIFY_RECONCILE_TICK` (60s) so the "just wait" promise is
+/// honest.
+const RECONCILE_HINT_SECS: u32 = 60;
+
+/// HTML-escape a value substituted into the pending page (the host and token are
+/// attacker-influenced, so this runs on every interpolation).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The "verification pending" holding page — an **HTTP 421 Misdirected Request**
+/// served for a non-local `Host` that isn't a verified, attached virtualhost
+/// (DV-2's mandatory-verification gate). It looks up any pending challenge for the
+/// host to show the exact token / record + path; otherwise it shows generic
+/// guidance. Self-contained HTML (no JS, no external assets) — safe on an
+/// unverified host.
+pub async fn verification_pending_page(deploy: &DeployStore, host: &str) -> Response {
+    let host_norm = host.trim_end_matches('.').to_ascii_lowercase();
+    // A pending challenge for this exact host (any site), if the operator started
+    // one — so the page can show the real token + record to publish.
+    let pending = deploy
+        .list_all_domain_verifications()
+        .await
+        .ok()
+        .and_then(|all| {
+            all.into_iter()
+                .find(|(_, v)| !v.verified && v.host == host_norm)
+        });
+    let (token, http_path) = match &pending {
+        Some((_, v)) => (v.token.clone(), v.http_challenge_path()),
+        None => (
+            "run `boatramp domain add` to start".to_string(),
+            "/.well-known/boatramp-domain-verification/<token>".to_string(),
+        ),
+    };
+    let html = include_str!("verification_pending.html")
+        .replace("{{HOST}}", &html_escape(&host_norm))
+        .replace(
+            "{{VERIFY_DNS_NAME}}",
+            &html_escape(&format!("_boatramp-verify.{host_norm}")),
+        )
+        .replace("{{VERIFY_TOKEN}}", &html_escape(&token))
+        .replace("{{VERIFY_HTTP_PATH}}", &html_escape(&http_path))
+        .replace("{{RECONCILE_SECONDS}}", &RECONCILE_HINT_SECS.to_string())
+        .replace("{{DNS_PROVIDER}}", "cloudflare")
+        .replace(
+            "{{DOCS_URL}}",
+            "https://docs.boatramp.dev/how-to/custom-domain.html",
+        );
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
 }
 
 /// One reconcile sweep: enumerate every site's **pending** (unverified, unexpired)

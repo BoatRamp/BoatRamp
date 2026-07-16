@@ -91,6 +91,12 @@ enum DomainCommand {
         /// verify+attach. Use when the host doesn't resolve here yet.
         #[arg(long)]
         no_wait: bool,
+        /// **Admin only.** Attach the host WITHOUT proving ownership — you assert
+        /// it out-of-band. The host then serves normally (it bypasses the
+        /// mandatory-verification gate). The server refuses this for a
+        /// site-scoped token; it needs a `system·admin` token.
+        #[arg(long)]
+        unverified: bool,
     },
     /// Check a hostname's verification challenge; on success it is attached.
     Verify {
@@ -118,7 +124,14 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             method,
             provider,
             no_wait,
+            unverified,
         } => {
+            // Admin override: attach without an ownership proof.
+            if unverified {
+                let msg = client::attach_domain_unverified(&http, &server, &site, &host).await?;
+                print!("{msg}");
+                return Ok(());
+            }
             // A managed-DNS provider does the whole dance (publish TXT → poll →
             // attach) itself.
             if let Some(provider) = provider.as_deref() {

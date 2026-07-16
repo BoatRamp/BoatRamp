@@ -116,6 +116,38 @@ pending verification:
   gamma.example.com  (dns, unverified)
 ```
 
+## Verification is mandatory (and self-completing)
+
+boatramp **refuses to serve a public hostname until it is verified**. A request
+for a non-local host that isn't an attached, verified virtualhost gets a friendly
+**"verification pending"** holding page (HTTP `421`) instead of any site content —
+so a domain you don't control can never be served just by pointing its DNS here.
+Local names (`localhost`, `*.localhost`, `*.local`, and IP literals) are exempt,
+and there is no implicit "sole site becomes the catch-all": an operator sets a
+fallback explicitly with `boatramp config set default_site <site>`.
+
+You rarely have to finish by hand: a **background reconcile loop re-checks every
+pending challenge about once a minute** and attaches any that now pass, so once
+the TXT record or token file is published the host goes live on its own — no
+`domain verify` needed.
+
+**Escape hatches (both operator-only):**
+
+- Disable the gate fleet-wide in `boatramp.cfg` (needs a restart — loosening the
+  posture is deliberately not a runtime change):
+
+  ```ron
+  security: ( require_domain_verification: false ),
+  ```
+
+- Attach **one** host without a proof — an **admin-only** override that asserts
+  ownership out of band. A site-scoped publisher cannot do this (they can't claim
+  a domain they don't control); it needs a `system·admin` token:
+
+  ```sh
+  boatramp domain add store.example.com --unverified
+  ```
+
 ## Remove a domain
 
 Detach a host — attached or still pending — with `domain rm`. It stops routing

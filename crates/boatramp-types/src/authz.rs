@@ -163,6 +163,16 @@ impl Right {
             return Some(Right::new(Resource::Blobs, None, Action::Deploy));
         }
 
+        // Attaching a host **without** an ownership proof (`domain add
+        // --unverified`) is an admin-only override: it asserts ownership of an
+        // arbitrary hostname, so a site-scoped publisher must never reach it
+        // (that would let them claim someone else's domain). Gate it at
+        // `system·admin` explicitly, above the per-site branch that would
+        // otherwise map it to the site-write right.
+        if m == "POST" && path.contains("/domains/") && path.ends_with("/attach-unverified") {
+            return Some(Right::new(Resource::System, None, Action::Admin));
+        }
+
         // Per-site endpoints: `/api/sites/<site>/<sub...>`.
         if let Some(rest) = path.strip_prefix("/api/sites/") {
             let mut segs = rest.split('/');
@@ -861,6 +871,24 @@ mod tests {
             Right::required("PATCH", "/api/sites/blog/frobnicate"),
             Some(Right::new(Resource::System, None, Action::Admin))
         );
+    }
+
+    #[test]
+    fn attach_unverified_is_admin_only() {
+        // Attaching a host without a proof (`domain add --unverified`) must need
+        // system·admin — a site-write right must NOT satisfy it, so a scoped
+        // publisher can't claim an arbitrary host.
+        let required = Right::required(
+            "POST",
+            "/api/sites/blog/domains/evil.example.com/attach-unverified",
+        )
+        .expect("route is gated");
+        assert_eq!(required, Right::new(Resource::System, None, Action::Admin));
+        // A publisher's site-write right does not satisfy the admin gate.
+        let site_write = Right::new(Resource::Site, Some("blog".into()), Action::Write);
+        assert!(!site_write.satisfies(&required));
+        // A system-admin right does.
+        assert!(Right::new(Resource::System, None, Action::Admin).satisfies(&required));
     }
 
     #[test]
