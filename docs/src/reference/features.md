@@ -8,9 +8,11 @@ To turn features on when compiling, see
 
 ## Cargo build features
 
-The default set is `fs` and `slatedb`; every other feature is off unless named on
-the `cargo build` command line. Some features imply others: `http3` implies
-`tls`, `acme-dns` implies `tls`, and `cluster` implies `handlers` and `slatedb`.
+The default set is `fs`, `slatedb`, and `console`; every other feature is off
+unless named on the `cargo build` command line. Some features imply others:
+`http3` implies `tls`, `acme-dns` implies `tls`, and `cluster` implies `handlers`
+and `slatedb`. To drop a default (e.g. build without the console), pass
+`--no-default-features` and re-name the ones you want to keep.
 
 | Feature | Default | Enables |
 | --- | --- | --- |
@@ -35,6 +37,7 @@ the `cargo build` command line. Some features imply others: `http3` implies
 | `cluster` | no | Self-hosted Raft cluster mode. Implies `handlers` and `slatedb`. |
 | `sql-postgres` | no | External (bring-your-own) PostgreSQL for the handler `sql` binding, opened by name. Implies `handlers`. |
 | `sql-mysql` | no | External (bring-your-own) MySQL/MariaDB for the handler `sql` binding, opened by name. Implies `handlers`. |
+| `console` | yes | Bake the web management console (a Wasm SPA) into the binary; serve it at an operator-configured host+path (`[serve.console]`). On in every shipped build (release binaries + Nix/OCI images), which stage the built SPA in; a from-source build embeds a placeholder unless you build the SPA first with `just console`. |
 
 The COSE/CWT + Cedar control-plane auth, the OCI→ext4 rootfs build, and the
 container / microVM / remote-docker compute backends are compiled into every

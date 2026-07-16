@@ -31,8 +31,35 @@ env:
   PORTABLE_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,bundler,oidc"
 
 jobs:
+  # The web console (`console`, a default feature) is a wasm32 Trunk build — no
+  # cross-OS toolchain, so build it once here via the Nix flake and hand the dist
+  # to every native binary build as an artifact. `boatramp-server/build.rs` bakes
+  # whatever lands in `crates/boatramp-console/dist` into the binary (all targets),
+  # so every shipped binary (Linux/macOS/Windows) embeds the same real console.
+  console-dist:
+    name: console SPA (Nix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Build the console SPA
+        run: |
+          set -euo pipefail
+          nix build .#console --print-build-logs --out-link result-console
+          # Copy out of the read-only store, dereferencing symlinks, into a plain
+          # dir the upload/download-artifact pair can round-trip on every OS.
+          mkdir -p console-dist
+          cp -rL result-console/. console-dist/
+          ls -l console-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: console-dist
+          path: console-dist/
+          retention-days: 5
+
   build:
     name: build · ${{ matrix.target }}
+    needs: console-dist
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,6 +72,15 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows }
     steps:
       - uses: actions/checkout@v5
+
+      # Drop the prebuilt console SPA where `boatramp-server/build.rs` embeds it,
+      # so the default `console` feature bakes in the real assets (not the
+      # build-script placeholder). The dist is OS-independent (wasm + html/css/js).
+      - name: Fetch the prebuilt console SPA
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: crates/boatramp-console/dist
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

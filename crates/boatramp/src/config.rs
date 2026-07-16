@@ -593,6 +593,30 @@ pub struct ServeConfig {
     /// The AWS account id used to scope the provisioned SQS queue's `SendMessage`
     /// policy (`aws:SourceAccount`). Required when `blob_notify_tier` provisions.
     pub blob_notify_account_id: Option<String>,
+    /// `[serve.console]` — the embedded web management console. Absent (or
+    /// `enabled: false`) ⇒ not served.
+    pub console: Option<ConsoleConfig>,
+}
+
+/// `[serve.console]` — the embedded web console (a Wasm SPA baked into the
+/// binary with the `console` build feature). Opt-in: the static shell holds no
+/// secrets and the `/api` it drives is token-gated, so it is served
+/// **unauthenticated** at a deliberately obscure path (a bearer token can't gate
+/// a top-level browser navigation anyway — the path is the obscurity, the token
+/// is the real gate).
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsoleConfig {
+    /// Serve the embedded console (default `false`). Requires the `console` build
+    /// feature; enabling it in a build without that feature is a logged no-op.
+    pub enabled: bool,
+    /// Host(s) the console answers on: `*` (any host, the default), an exact host
+    /// (`console.example.com`), or a leading-wildcard (`*.example.com`).
+    pub host: Option<String>,
+    /// URL path prefix the console mounts at (default `/_console`). Kept under the
+    /// reserved `/_` namespace so it never collides with a published site path.
+    pub path: Option<String>,
 }
 
 /// `publish` section — where and what to deploy (the `sync` target).
@@ -981,5 +1005,29 @@ mod tests {
         assert!(serve.protect_previews);
         assert!(!serve.cluster_rate_limit);
         assert!(serve.data_dir.is_none());
+    }
+
+    #[test]
+    fn serve_console_config_parses() {
+        // Absent ⇒ no console.
+        let cfg = server(r#"( serve: ( addr: "0.0.0.0:8080" ) )"#);
+        assert!(cfg.serve.unwrap().console.is_none());
+        // Explicit console block with host + path.
+        let cfg = server(
+            r#"( serve: ( console: (
+                enabled: true,
+                host: "console.example.com",
+                path: "/_console",
+            ) ) )"#,
+        );
+        let console = cfg.serve.unwrap().console.unwrap();
+        assert!(console.enabled);
+        assert_eq!(console.host.as_deref(), Some("console.example.com"));
+        assert_eq!(console.path.as_deref(), Some("/_console"));
+        // Bare `enabled` ⇒ host/path take their (server-side) defaults.
+        let cfg = server(r#"( serve: ( console: ( enabled: true ) ) )"#);
+        let console = cfg.serve.unwrap().console.unwrap();
+        assert!(console.enabled);
+        assert!(console.host.is_none() && console.path.is_none());
     }
 }

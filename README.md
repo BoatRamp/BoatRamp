@@ -2,7 +2,9 @@
 
 # boatramp
 
-**A self-hosted, streaming-first platform for publishing the web — from a single static site to an edge-compute cluster — shipped as one binary.**
+**Launch the web from your own shore.** A self-hosted, streaming-first platform
+for publishing static sites *and the functions that run beside them* — from a
+laptop to an edge-compute cluster — shipped as one Rust binary.
 
 [![CI](https://github.com/BoatRamp/BoatRamp/actions/workflows/ci.yml/badge.svg)](https://github.com/BoatRamp/BoatRamp/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-boatramp.dev-2088c1.svg)](https://docs.boatramp.dev/)
@@ -15,9 +17,10 @@
 boatramp is what you reach for when you like how Vercel or Netlify *feel* but you
 want to **own the whole stack** — the server, the storage, the certificates, and
 the compute — on your own hardware, your cloud, or the edge. One `boatramp`
-binary is the web server, the HTTP publishing API, and the CLI. Start it on a
-laptop, drop it behind systemd on a VPS, or scale it into a Raft-replicated
-cluster with the *same commands and the same config*.
+binary is the web server, the HTTP publishing API, and the CLI, for static sites
+and the functions that run beside them. Start it on a laptop, drop it behind
+systemd on a VPS, or scale it into a Raft-replicated cluster with the *same
+commands and the same config*.
 
 > **Streaming, not buffering.** Every byte path streams: uploads flow from the
 > client straight into the backend, downloads flow from the backend straight to
@@ -41,41 +44,53 @@ cluster with the *same commands and the same config*.
 - Instant, upload-free rollback to any prior deployment
 - Framework-agnostic build step, or an in-process JS/TS + CSS bundler (Rolldown + lightningcss)
 - Named aliases for staging/preview, plus per-deploy immutable preview hosts
+- **Agent-ready**: ships an `AGENTS.md` so an AI coding agent (Claude Code, Codex, …) can build on boatramp and deploy out of the box
 
 **Serve**
-- Fast static serving with range requests, conditional GETs, and opt-in compression
-- Virtualhost routing: attach any number of hostnames to a site
+- Fast static serving with range requests, conditional GETs / strong ETags, and Brotli/gzip
+- Virtualhost routing: attach any number of hostnames (exact or wildcard) to a site
+- Redirects, rewrites, header rules, and clean URLs — with **conditional (`when`) routing** over a bounded CEL subset (edge logic without a handler)
+- Drop-in **Netlify / Cloudflare Pages** `_redirects` + `_headers` compatibility
 - Visitor access control at the edge: basic auth, IP allow/deny, and rate limiting
-- Automatic HTTPS via ACME (TLS-ALPN-01), wildcard certs via DNS-01, or your own cert
+- Automatic HTTPS via ACME (HTTP-01), wildcard certs via DNS-01 (10 managed DNS providers), or your own cert
 - HTTP/1.1, HTTP/2, and **HTTP/3 (QUIC)**
 
-**Compute at the edge**
-- **WebAssembly handlers** — run `wasi:http` components per route, validated at deploy time
-- **microVMs & containers** — run workloads in Firecracker-style microVMs (embedded VMM,
-  snapshot/restore, scale-to-zero), OCI containers (native or remote Docker), or Cloudflare Containers
-- A per-site SQL database, a durable message queue (`wasi:messaging`), and captured logs for handlers
+**Functions — everything that runs is a function**
+- One portable **WASI 0.2 component**, many doors: run it behind a route, **invoke it by name** (sync or async, durable + idempotency-keyed), put it on a **cron**, or drive it from a **queue**
+- Author in **Rust, JavaScript (jco), or Python (componentize-py)** — scaffold, build, and test locally (`function init · build · test · dev`)
+- Per-function bindings: a **SQL** database, KV, a blob store, and a durable message queue (`wasi:messaging`), plus captured logs
+- Durable **workflows** — chain functions into a DAG with fan-out, barrier fan-in, per-step retries, and saga compensation; runs survive restarts
+- Event triggers (signature-verified webhooks, blob-change events), per-invocation metering, and fail-closed rate/concurrency quotas
+
+**Compute**
+- Pick a per-function **runtime**: the Wasm sandbox, an **OCI container** (native self-jail or remote Docker), a **Firecracker-class microVM** (embedded rust-vmm, SMP, snapshot/restore, scale-to-zero), or **Cloudflare Containers**
+- The backend is a config choice — the workload and the commands don't change
 
 **Scale**
-- Self-hosted **HA clustering**: embedded Raft over a mutually-authenticated peer mesh, a real database per site
-- A built-in **reverse-proxy gateway**: publish private services through the edge with load balancing,
-  passive + active health checks, retries, and DNS-based discovery
+- Self-hosted **HA clustering**: embedded Raft over a mutually-authenticated (raw-public-key TLS) peer mesh, a real database per site
+- A built-in **reverse-proxy gateway**: publish private services through the edge with **geo-aware (nearest-region)** load balancing, passive + active health checks, retries, and DNS-based discovery
+
+**Secure**
+- Control-plane API on **COSE/CWT tokens + Cedar policies**, a pluggable signer (in-process, Vault, PKCS#11/HSM, or AWS/GCP/Azure KMS), OIDC login, per-request **DPoP** proof-of-possession, and offline delegation
+- Per-site visitor access control at the edge (basic auth, IP allow/deny, rate limiting)
 
 **Operate**
-- Control-plane API secured by **COSE/CWT tokens + Cedar policies**, with a pluggable signer
-  (in-process, Vault, PKCS#11/HSM, or AWS/GCP/Azure KMS) and OIDC login
 - Prometheus metrics, structured (JSON-optional) logs, live log tailing, and handler stats
-- Integrity scrub, garbage collection, and a web console (Yew/WASM SPA)
+- Integrity scrub, garbage collection, and a **built-in web console** (Yew/WASM SPA) served at a hidden path when enabled
 
 **Ship**
 - One static binary; the heavy backends live behind cargo features so the default build stays lean
 - Prebuilt binaries for Linux/macOS/Windows, `.deb`/`.rpm` packages, a Homebrew tap, a hardened
-  systemd unit, a NixOS module, and a reproducible OCI image
-- The **same UX on every target** — bare metal, systemd, NixOS, Docker/OCI, and Cloudflare
+  systemd unit, a **NixOS module + overlay**, a reproducible OCI image, and a **Kubernetes operator + Helm chart**
+- The **same UX on every target** — bare metal, systemd, NixOS, Docker/OCI, Kubernetes, Cloudflare, and a cluster
 
-> **Status:** boatramp is pre-1.0 (`v0.1`). The feature set above is implemented and
-> tested; interfaces may still change before the first stable release. The default
-> build (`fs` blobs + embedded KV) is the smallest, fully-functional core — every
-> other capability is an additive cargo feature.
+> **Status:** boatramp is pre-1.0 (`v0.1`) and honest about it — interfaces may
+> still shift before the first stable release, but what's here is real and
+> **dogfooded** (both [boatramp.dev](https://boatramp.dev) and
+> [docs.boatramp.dev](https://docs.boatramp.dev) run on it). The default build
+> (`fs` blobs + embedded KV) is the smallest, fully-functional core — every other
+> capability is an additive cargo feature. If you like owning your stack and
+> shaping tools early, [come crew it](https://github.com/BoatRamp/BoatRamp/discussions).
 
 ---
 
@@ -126,6 +141,12 @@ boatramp bundle      # or use the built-in Rolldown + lightningcss bundler
 
 ## Install
 
+**The one-liner** — grab the latest prebuilt binary (into `~/.local/bin`):
+
+```sh
+curl -sSf https://boatramp.dev/launch | sh
+```
+
 **From a release** — prebuilt binaries (`x86_64`/`aarch64` Linux, Intel/Apple-silicon
 macOS, `x86_64` Windows), `.deb`/`.rpm` packages, and a Homebrew tap are published on
 the [Releases](../../releases) page.
@@ -146,20 +167,26 @@ cargo build --release --features "s3,tls,handlers,cluster"   # opt into more
 
 ---
 
-## Beyond static: run code at the edge
+## Functions: everything that runs is a function
 
-boatramp serves more than files. A route can invoke a **WebAssembly handler** — a
-`wasi:http` component that boatramp validates at deploy time (parseable component,
-required export, declared-imports policy) and runs in a fuel-metered wasmtime
-engine, with a per-site SQL binding, a durable message queue, and captured logs.
+boatramp serves more than files. A **function** is one portable **WASI 0.2
+component** — write it in Rust, JavaScript, or Python — and you reach the same
+component through many doors: run it as a route **handler**, **invoke it by name**
+(sync or async, durable and idempotency-keyed), put it on a **cron**, or drive it
+from a **queue**. boatramp validates the component at deploy time (parseable
+component, required export, declared-imports policy) and runs it in a fuel-metered
+wasmtime sandbox, with a per-site **SQL** database, KV, a blob store, a durable
+message queue (`wasi:messaging`), and captured logs. Chain functions into durable
+**workflows** — fan-out, barrier fan-in, per-step retries, saga compensation — that
+survive restarts.
 
-For heavier or non-Wasm workloads, `boatramp compute` runs them in **Firecracker-style
-microVMs** (an embedded rust-vmm VMM with jailing, SMP, snapshot/restore, and
-scale-to-zero), in **OCI containers** (a native self-jailing runtime or a remote
-Docker host), or on **Cloudflare Containers**. The backend is a config choice — the
-workload and the commands don't change.
+For heavier or non-Wasm workloads, the same function targets a different
+**runtime**: an **OCI container** (a native self-jailing runtime or a remote
+Docker host), a **Firecracker-class microVM** (an embedded rust-vmm VMM with
+jailing, SMP, snapshot/restore, and scale-to-zero), or **Cloudflare Containers**.
+The runtime is a config choice — the workload and the commands don't change.
 
-See the [WebAssembly Handlers guide](https://docs.boatramp.dev/guide/handlers.html)
+See [Deploy & invoke a function](https://docs.boatramp.dev/how-to/functions.html)
 and [`examples/handlers`](examples/handlers) to get started.
 
 ---
@@ -173,12 +200,19 @@ site** (libsql: an embedded file per site on one node, a sqld namespace per site
 across the cluster). Membership is managed with signed join tokens.
 
 The built-in **gateway** turns boatramp into an edge for your own services:
-`boatramp gateway` reverse-proxies to upstream pools with load balancing, passive
-and active health checks, automatic retries, and DNS-based discovery — all behind
-the same TLS, access-control, and observability stack as your static sites.
+`boatramp gateway` reverse-proxies to upstream pools with **geo-aware
+(nearest-region)** load balancing, passive and active health checks, automatic
+retries, and DNS-based discovery — all behind the same TLS, access-control, and
+observability stack as your static sites.
 
-See [Clustering](https://docs.boatramp.dev/deployment/cluster.html) and
-[Cloudflare](https://docs.boatramp.dev/deployment/cloudflare.html).
+On Kubernetes, the same binary is the **operator**: `boatramp operator` is an
+in-cluster controller for `BoatRampCluster`/`Site`/`Function` custom resources,
+shipped with a Helm chart. One image, one version — the operator is the binary
+that serves.
+
+See [Deploy a self-hosted cluster](https://docs.boatramp.dev/how-to/deploy-cluster.html),
+[Run on Kubernetes](https://docs.boatramp.dev/how-to/kubernetes.html), and
+[Deploy on Cloudflare](https://docs.boatramp.dev/how-to/deploy-cloudflare.html).
 
 ---
 
@@ -187,19 +221,27 @@ See [Clustering](https://docs.boatramp.dev/deployment/cluster.html) and
 Backends are compile-time cargo features; `serve` then selects among the compiled-in
 options at runtime. The default build is self-contained.
 
-| Layer        | Backend                        | Feature            |
-| ------------ | ------------------------------ | ------------------ |
-| Blobs        | Filesystem                     | `fs` *(default)*   |
-| Blobs        | S3-compatible (AWS, R2, MinIO) | `s3`               |
-| Metadata KV  | Embedded LSM (SlateDB)         | `slatedb` *(default)* |
-| Metadata KV  | In-memory                      | *(always on)*      |
-| Metadata KV  | Cloudflare KV                  | `cloudflare-kv`    |
-| Handler SQL  | libsql (file or sqld namespace)| `handlers`         |
+| Layer         | Backend                          | Feature                     |
+| ------------- | -------------------------------- | --------------------------- |
+| Blobs         | Filesystem                       | `fs` *(default)*            |
+| Blobs         | S3-compatible (AWS, R2, MinIO)   | `s3`                        |
+| Blobs         | Google Cloud Storage             | `gcs`                       |
+| Blobs         | Azure Blob Storage               | `azure`                     |
+| Metadata KV   | Embedded LSM (SlateDB)           | `slatedb` *(default)*       |
+| Metadata KV   | In-memory                        | *(always on)*               |
+| Metadata KV   | Cloudflare KV                    | `cloudflare-kv`             |
+| Function SQL  | libsql (managed, file or namespace) | `handlers`               |
+| Function SQL  | External Postgres / MySQL (BYO)  | `sql-postgres` / `sql-mysql`|
 
 SlateDB is a transactional LSM store over an `object_store` backend (local disk by
 default, or S3/R2/GCS/Azure), so the same durable KV runs everywhere. Blobs are
 keyed by SHA-256; small, hot metadata is fronted by an in-memory LRU cache. The
 server never holds a whole file — or a whole site — in memory.
+
+The per-function **SQL** binding defaults to **libsql** — a managed real database
+per site (an embedded file on one node, a sqld namespace across the cluster). An
+operator can instead point named databases at an **external Postgres or MySQL**
+(bring-your-own, via `sql-postgres` / `sql-mysql`); the isolation is then theirs.
 
 ```sh
 # S3-compatible blobs (e.g. MinIO), embedded KV. AWS_* env for credentials.
@@ -217,13 +259,17 @@ trait — nothing else changes.
 
 ## Deploy anywhere, same UX
 
+*One hull, every port.*
+
 | Target                 | How                                                                    |
 | ---------------------- | --------------------------------------------------------------------- |
 | Bare metal / VPS       | Drop the binary, `boatramp serve`                                     |
 | systemd                | Hardened unit (`ProtectSystem=strict`, `CAP_NET_BIND_SERVICE` only)   |
 | NixOS                  | `services.boatramp.enable = true;` (flake module + overlay)          |
 | Docker / OCI           | Reproducible, non-root, minimal image (`nix build .#container`)       |
+| Kubernetes             | In-binary `boatramp operator` (controller) + a Helm chart            |
 | Cloudflare             | `boatramp cloudflare` generates a Worker + Containers deployment      |
+| Cluster                | `serve --mode cluster` — embedded Raft over the peer mesh             |
 
 The commands, flags, and config files are identical across all of them —
 environment differences live behind backends, never in the UX.
@@ -254,7 +300,7 @@ server: store manifest, report missing server: stream blob from Storage
 | --------------------- | ---------------------------------------------------------------------- |
 | `boatramp-types`      | Shared types: routing, config, the authz vocabulary.                   |
 | `boatramp-core`       | `Storage`/`KvStore` traits, content-addressed `DeployStore`, COSE/Cedar authz. |
-| `boatramp-storage`    | Backends: blobs (`fs`, `s3`) and KV (`SlateKv`, `CloudflareKv`, libsql). |
+| `boatramp-storage`    | Backends: blobs (`fs`, `s3`, `gcs`, `azure`), KV (`SlateKv`, `CloudflareKv`), and function SQL (libsql, external Postgres/MySQL). |
 | `boatramp-server`     | Axum HTTP server + publishing API (library).                           |
 | `boatramp-handlers`   | The WebAssembly (`wasi:http`) handler engine.                          |
 | `boatramp-firecracker`| Embedded microVM backend (rust-vmm).                                   |
@@ -264,7 +310,7 @@ server: store manifest, report missing server: stream blob from Storage
 | `boatramp-acme`       | ACME DNS-01 wildcard issuance + DNS providers.                         |
 | `boatramp-cloudflare` | Cloudflare Worker + Containers deployment generator.                   |
 | `boatramp-console`    | Web console (Yew/WASM SPA).                                            |
-| `boatramp`            | The single binary: `serve`, `sync`, and every operator command.        |
+| `boatramp`            | The single binary: `serve`, `sync`, `function`, `compute`, the k8s `operator`, and every operator command. |
 
 ---
 
@@ -296,8 +342,8 @@ nix flake check        # clippy, format/typo hooks, and the NixOS service test
 ## Documentation
 
 📖 **[docs.boatramp.dev](https://docs.boatramp.dev/)** — the full
-guide: installation, the CLI, configuration, TLS, access control, WebAssembly
-handlers, clustering, Cloudflare, and the architecture reference.
+guide: installation, the CLI, configuration, TLS, access control, functions & edge
+compute, clustering, Kubernetes, Cloudflare, and the architecture reference.
 
 The site is built from [`docs/`](docs/) (mdBook) and republished on every change.
 Preview locally with `mdbook serve docs`.

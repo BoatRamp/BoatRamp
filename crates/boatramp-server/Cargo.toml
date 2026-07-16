@@ -53,7 +53,16 @@ signer-azure = []
 signer-aws = ["dep:aws-config", "dep:aws-sdk-kms"]
 signer-pkcs11 = ["dep:cryptoki"]
 
+# The embedded web management console: bake the `boatramp-console` Wasm SPA
+# (its built `dist/`) into the binary via `include_dir` and serve it, when the
+# operator enables it, at a configurable host+path. Off by default so lean
+# builds don't carry the ~MB of Wasm; the shipped/release binary enables it.
+console = ["dep:include_dir"]
+
 [dependencies]
+# The embedded console's built assets (feature `console`), baked in at compile
+# time from `../boatramp-console/dist`.
+include_dir = { workspace = true, optional = true }
 # COSE/CWT + Cedar is the control-plane credential model — always on
 # for the server (it is the native binary's auth; `boatramp-core` keeps it opt-in
 # for library/wasm cleanliness).

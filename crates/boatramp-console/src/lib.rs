@@ -33,43 +33,93 @@ use models::WhoAmI;
 use tokens::Tokens;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
+use yew_router::prelude::*;
 
-/// Root component: the [`AuthProvider`] owns the session, then the app shows the
-/// login gate or the authenticated shell. The API base URL is empty (same-origin
-/// dogfood deploy — no CORS); a separately-hosted console sets a non-empty `base`
-/// here, and the server must allow that origin via the
-/// `ServerOptions::cors_allowed_origins` allowlist (opt-in; empty ⇒ same-origin).
+/// Root component: the [`AuthProvider`] owns the session, a [`BrowserRouter`]
+/// owns the client-side history routing, then the app shows the login gate or
+/// the authenticated shell. The router's `basename` comes from
+/// [`console_base`] (the server-injected mount path), so the console works
+/// under any path the operator mounts it at (e.g. `/_console`). The API base URL
+/// is empty (same-origin — the `/api` it drives is root-absolute regardless of
+/// the mount); a separately-hosted console sets a non-empty `base` here and the
+/// server must allow that origin via `ServerOptions::cors_allowed_origins`.
 #[function_component(App)]
 pub fn app() -> Html {
     html! {
         <AuthProvider base="">
-            <Shell />
+            <BrowserRouter basename={console_base()}>
+                <Shell />
+            </BrowserRouter>
         </AuthProvider>
     }
 }
 
-/// The view the authenticated shell is showing.
-#[derive(Clone, PartialEq)]
-enum View {
-    /// The all-sites overview (dashboard).
-    Sites,
-    /// A single site's management view (deploy ops / config / observability).
-    Site(String),
-    /// Cluster-wide maintenance (prune / scrub / certs).
-    Maintenance,
-    /// API tokens + cache invalidation (admin-scoped).
-    Tokens,
-    /// The Prometheus metrics dump (admin-scoped).
-    Metrics,
+/// The base path the console is served under, read from the
+/// `<meta name="boatramp-console-base">` the server injects when it mounts the
+/// console at a sub-path. `None` for a root-mounted deploy (no `basename`).
+fn console_base() -> Option<AttrValue> {
+    let content = web_sys::window()?
+        .document()?
+        .query_selector("meta[name=\"boatramp-console-base\"]")
+        .ok()??
+        .get_attribute("content")?;
+    (!content.is_empty() && content != "/").then(|| AttrValue::from(content))
 }
 
-/// Switches between the login view and the authenticated console, and owns the
-/// in-app navigation (a single reactive [`View`] — no router needed for this
-/// shallow tree; a deep-link router can layer on later).
+/// The console's client-side routes. Kept deliberately shallow (the per-site
+/// tabs stay component-local); paths are relative to the router `basename`.
+#[derive(Clone, Routable, PartialEq)]
+enum Route {
+    /// The all-sites overview (dashboard).
+    #[at("/")]
+    Sites,
+    /// A single site's management view (deploy ops / config / observability).
+    #[at("/sites/:name")]
+    Site { name: String },
+    /// Cluster-wide maintenance (prune / scrub / certs).
+    #[at("/maintenance")]
+    Maintenance,
+    /// API tokens + cache invalidation (admin-scoped).
+    #[at("/tokens")]
+    Tokens,
+    /// The Prometheus metrics dump (admin-scoped).
+    #[at("/metrics")]
+    Metrics,
+    /// Any unknown path redirects to the overview.
+    #[not_found]
+    #[at("/404")]
+    NotFound,
+}
+
+/// The top-nav group a route belongs to, so `/sites/:name` still lights up the
+/// "Sites" tab.
+fn nav_group(route: &Route) -> u8 {
+    match route {
+        Route::Sites | Route::Site { .. } => 0,
+        Route::Maintenance => 1,
+        Route::Tokens => 2,
+        Route::Metrics => 3,
+        Route::NotFound => 4,
+    }
+}
+
+/// Render the page for a route.
+fn switch(route: Route) -> Html {
+    match route {
+        Route::Sites => html! { <SitesPage /> },
+        Route::Site { name } => html! { <SitePage name={name} /> },
+        Route::Maintenance => html! { <Maintenance /> },
+        Route::Tokens => html! { <Tokens /> },
+        Route::Metrics => html! { <Metrics /> },
+        Route::NotFound => html! { <Redirect<Route> to={Route::Sites} /> },
+    }
+}
+
+/// Switches between the login view and the authenticated console; inside the
+/// [`BrowserRouter`], so navigation is real history routing (deep-linkable).
 #[function_component(Shell)]
 fn shell() -> Html {
     let session = use_session();
-    let view = use_state(|| View::Sites);
     // An OIDC callback error, surfaced on the login view when the redirect
     // round-trip fails (state mismatch, token-exchange error, …).
     let oidc_error = use_state(|| Option::<String>::None);
@@ -108,37 +158,6 @@ fn shell() -> Html {
         let session = session.clone();
         Callback::from(move |_| session.sign_out())
     };
-    let select_site = {
-        let view = view.clone();
-        Callback::from(move |site: String| view.set(View::Site(site)))
-    };
-    let go = |target: View, view: UseStateHandle<View>| {
-        Callback::from(move |_: MouseEvent| view.set(target.clone()))
-    };
-
-    let nav_class = |active: bool| {
-        if active {
-            "rounded-md bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-900"
-        } else {
-            "rounded-md px-3 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-800"
-        }
-    };
-
-    let content = match &*view {
-        View::Sites => html! { <Dashboard on_select={select_site.clone()} /> },
-        View::Site(site) => html! {
-            <div>
-                <button onclick={go(View::Sites, view.clone())}
-                        class="mb-4 text-sm text-slate-500 hover:text-slate-800">
-                    { "← All sites" }
-                </button>
-                <SiteDetail site={site.clone()} />
-            </div>
-        },
-        View::Maintenance => html! { <Maintenance /> },
-        View::Tokens => html! { <Tokens /> },
-        View::Metrics => html! { <Metrics /> },
-    };
 
     html! {
         <div class="min-h-screen bg-slate-50 text-slate-800">
@@ -147,22 +166,10 @@ fn shell() -> Html {
                     <div class="flex items-center gap-6">
                         <h1 class="text-lg font-semibold tracking-tight">{ "boatramp console" }</h1>
                         <nav class="flex items-center gap-1">
-                            <button onclick={go(View::Sites, view.clone())}
-                                    class={nav_class(matches!(&*view, View::Sites | View::Site(_)))}>
-                                { "Sites" }
-                            </button>
-                            <button onclick={go(View::Maintenance, view.clone())}
-                                    class={nav_class(matches!(&*view, View::Maintenance))}>
-                                { "Maintenance" }
-                            </button>
-                            <button onclick={go(View::Tokens, view.clone())}
-                                    class={nav_class(matches!(&*view, View::Tokens))}>
-                                { "Tokens" }
-                            </button>
-                            <button onclick={go(View::Metrics, view.clone())}
-                                    class={nav_class(matches!(&*view, View::Metrics))}>
-                                { "Metrics" }
-                            </button>
+                            <NavItem to={Route::Sites} label="Sites" />
+                            <NavItem to={Route::Maintenance} label="Maintenance" />
+                            <NavItem to={Route::Tokens} label="Tokens" />
+                            <NavItem to={Route::Metrics} label="Metrics" />
                         </nav>
                     </div>
                     <div class="flex items-center gap-3">
@@ -176,8 +183,62 @@ fn shell() -> Html {
                 </div>
             </header>
             <main class="mx-auto max-w-6xl px-6 py-10">
-                { content }
+                <Switch<Route> render={switch} />
             </main>
+        </div>
+    }
+}
+
+/// A top-nav item: a router [`Link`] that highlights when its route group is
+/// active (so `/sites/:name` keeps "Sites" lit).
+#[derive(Properties, PartialEq)]
+struct NavItemProps {
+    to: Route,
+    label: AttrValue,
+}
+
+#[function_component(NavItem)]
+fn nav_item(props: &NavItemProps) -> Html {
+    let active = use_route::<Route>()
+        .as_ref()
+        .is_some_and(|r| nav_group(r) == nav_group(&props.to));
+    let class = if active {
+        "rounded-md bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-900"
+    } else {
+        "rounded-md px-3 py-1.5 text-sm font-medium text-slate-500 hover:text-slate-800"
+    };
+    html! {
+        <Link<Route> to={props.to.clone()} classes={classes!(class)}>
+            { props.label.clone() }
+        </Link<Route>>
+    }
+}
+
+/// The all-sites overview; selecting a site navigates to its page.
+#[function_component(SitesPage)]
+fn sites_page() -> Html {
+    let navigator = use_navigator().expect("console is rendered inside a Router");
+    let on_select = Callback::from(move |site: String| {
+        navigator.push(&Route::Site { name: site });
+    });
+    html! { <Dashboard on_select={on_select} /> }
+}
+
+/// A single site's page: a back link to the overview plus the site detail.
+#[derive(Properties, PartialEq)]
+struct SitePageProps {
+    name: String,
+}
+
+#[function_component(SitePage)]
+fn site_page(props: &SitePageProps) -> Html {
+    html! {
+        <div>
+            <Link<Route> to={Route::Sites}
+                classes={classes!("mb-4", "inline-block", "text-sm", "text-slate-500", "hover:text-slate-800")}>
+                { "← All sites" }
+            </Link<Route>>
+            <SiteDetail site={props.name.clone()} />
         </div>
     }
 }

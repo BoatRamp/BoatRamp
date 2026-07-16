@@ -96,6 +96,52 @@
             consoleArgs // { CARGO_BUILD_TARGET = "wasm32-unknown-unknown"; }
           );
 
+          # ---- Web console SPA (also `nix build .#console`) ------------------
+          # The Yew (CSR) SPA, built to wasm32 + bundled by Trunk via crane's
+          # `buildTrunkPackage`. Defined here (not inline under `packages`) so
+          # `mkBoatramp` can stage its `dist` into the binary — `console` is a
+          # default cargo feature, so every boatramp build embeds it. The console
+          # crate is excluded from the workspace (wasm32-only) but depends on
+          # ../boatramp-types by path, so we build from the repo root with a
+          # source filter that keeps cargo sources plus the whole console subtree.
+          consolePackage = craneLib.buildTrunkPackage (
+            consoleArgs
+            // {
+              cargoArtifacts = consoleDeps;
+              # The Tailwind pre-build hook needs the CLI on PATH at build time.
+              nativeBuildInputs = [ pkgs.tailwindcss ];
+              # Version-match gotcha: this MUST equal the `wasm-bindgen` crate
+              # pinned in the crate's Cargo.toml (=0.2.121).
+              wasm-bindgen-cli = pkgs.wasm-bindgen-cli;
+
+              # crane's default runs `trunk build crates/boatramp-console/index.html`
+              # from the repo root. From there Trunk runs `cargo metadata` against
+              # the *workspace* root and tries to resolve every member — including
+              # server-only deps (aws-config, ...) that aren't in the console's
+              # vendored lock — and it also misses the crate's own Trunk.toml (the
+              # Tailwind hook). Running Trunk from inside the crate dir fixes both:
+              # `cargo metadata` then targets the crate manifest (console +
+              # boatramp-types only), exactly like the dev-shell `trunk build`.
+              buildPhaseCargoCommand = ''
+                local profileArgs=""
+                if [[ "$CARGO_PROFILE" == "release" ]]; then
+                  profileArgs="--release=true"
+                fi
+                # crane installs the prebuilt deps under ./target at the source
+                # root; pin CARGO_TARGET_DIR to that absolute path so cargo reuses
+                # them after we cd into the crate (it defaults to a relative
+                # "target", which would resolve crate-locally and rebuild).
+                export CARGO_TARGET_DIR="$PWD/target"
+                pushd crates/boatramp-console >/dev/null
+                trunk build $profileArgs index.html
+                popd >/dev/null
+              '';
+              installPhaseCommand = ''
+                cp -r crates/boatramp-console/dist $out
+              '';
+            }
+          );
+
           # The default build (server + CLI, filesystem backend) needs no native
           # libraries. These are kept around for the optional `s3` backend.
           nativeBuildInputs = [ pkgs.pkg-config ];
@@ -158,16 +204,20 @@
           '';
 
           # Build the single `boatramp` binary with an optional extra feature set
-          # on top of the defaults (`fs` + `slatedb`). The recipe lives in
-          # ./nix/package.nix (shared with `overlays.default`); here we pin it to
+          # on top of the defaults (`fs` + `slatedb` + `console`). The recipe lives
+          # in ./nix/package.nix (shared with `overlays.default`); here we pin it to
           # the rust-overlay toolchain so the flake build matches the dev shell +
-          # CI compiler. The cloud image (below) adds the `s3` (R2) +
-          # `cloudflare-kv` backends.
+          # CI compiler, and stage the built console SPA so the default `console`
+          # feature embeds the real assets (not the build-script placeholder). The
+          # cloud image (below) adds the `s3` (R2) + `cloudflare-kv` backends.
           mkBoatramp =
             {
               features ? [ ],
             }:
-            pkgs.callPackage ./nix/package.nix { inherit rustPlatform features; };
+            pkgs.callPackage ./nix/package.nix {
+              inherit rustPlatform features;
+              consoleDist = consolePackage;
+            };
 
           # The CF Containers image feature set: R2 blobs (`s3`) + a networked KV
           # for metadata (`cloudflare-kv`); TLS terminates at the edge so the `tls`
@@ -305,49 +355,10 @@
               '';
 
             # ---- Web console (`nix build .#console`) ------------------------
-            # The Yew (CSR) SPA, built to wasm32 + bundled by Trunk via crane's
-            # `buildTrunkPackage`. The console crate is excluded
-            # from the workspace (wasm32-only) but depends on ../boatramp-types by
-            # path, so we build from the repo root with a source filter that keeps
-            # cargo sources plus the whole console subtree. `consoleArgs` /
-            # `consoleDeps` are defined in the `let` block above.
-            console = craneLib.buildTrunkPackage (
-              consoleArgs
-              // {
-                cargoArtifacts = consoleDeps;
-                # The Tailwind pre-build hook needs the CLI on PATH at build time.
-                nativeBuildInputs = [ pkgs.tailwindcss ];
-                # Version-match gotcha: this MUST equal the `wasm-bindgen` crate
-                # pinned in the crate's Cargo.toml (=0.2.121).
-                wasm-bindgen-cli = pkgs.wasm-bindgen-cli;
-
-                # crane's default runs `trunk build crates/boatramp-console/index.html`
-                # from the repo root. From there Trunk runs `cargo metadata` against
-                # the *workspace* root and tries to resolve every member — including
-                # server-only deps (aws-config, ...) that aren't in the console's
-                # vendored lock — and it also misses the crate's own Trunk.toml (the
-                # Tailwind hook). Running Trunk from inside the crate dir fixes both:
-                # `cargo metadata` then targets the crate manifest (console +
-                # boatramp-types only), exactly like the dev-shell `trunk build`.
-                buildPhaseCargoCommand = ''
-                  local profileArgs=""
-                  if [[ "$CARGO_PROFILE" == "release" ]]; then
-                    profileArgs="--release=true"
-                  fi
-                  # crane installs the prebuilt deps under ./target at the source
-                  # root; pin CARGO_TARGET_DIR to that absolute path so cargo reuses
-                  # them after we cd into the crate (it defaults to a relative
-                  # "target", which would resolve crate-locally and rebuild).
-                  export CARGO_TARGET_DIR="$PWD/target"
-                  pushd crates/boatramp-console >/dev/null
-                  trunk build $profileArgs index.html
-                  popd >/dev/null
-                '';
-                installPhaseCommand = ''
-                  cp -r crates/boatramp-console/dist $out
-                '';
-              }
-            );
+            # Built in the `let` block above (`consolePackage`) so `mkBoatramp`
+            # can also stage its `dist` into the binary for the default `console`
+            # feature; exposed here as its own package for standalone builds.
+            console = consolePackage;
           }
           # ---- Container images -------------------------------------------
           # `dockerTools` builds *Linux* images, so these are Linux-only (built in

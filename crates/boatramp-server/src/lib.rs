@@ -36,6 +36,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 mod auth;
+#[cfg(feature = "console")]
+pub mod console;
 mod domain_verify;
 pub mod envelope;
 mod gateway;
@@ -394,6 +396,11 @@ pub struct ServerOptions {
     /// [`config_baseline`] + [`DaemonRuntime::new`]) so it can wake it on
     /// SIGHUP / changelog; `None` (tests, embedders) ⇒ the router builds its own.
     pub daemon_runtime: Option<Arc<DaemonRuntime>>,
+    /// The embedded web-console mount (`[serve.console]`), when the operator
+    /// enabled it and the binary was built with the `console` feature. `None` ⇒
+    /// not served. The static SPA is served unauthenticated at this host+path.
+    #[cfg(feature = "console")]
+    pub console: Option<console::ConsoleMount>,
 }
 
 /// The listener's own connection scheme (`true` = `https`), carried as an
@@ -678,6 +685,9 @@ pub fn router_with(
     // Opt-in CORS allowlist for the control-plane API; empty ⇒ CORS off.
     // Captured before `options` is partially moved below.
     let cors_origins = options.cors_allowed_origins.clone();
+    // The embedded-console mount, captured before the partial moves below.
+    #[cfg(feature = "console")]
+    let console_mount = options.console.clone();
     // The resolved security posture rides as an extension for the gateway /
     // proxy / domain-verify / upload paths (the hardening knobs).
     let posture = options.posture;
@@ -989,6 +999,10 @@ pub fn router_with(
         }
     });
     let app = app.layer(Extension(daemon));
+    // Embedded web console (feature `console`): a middleware that intercepts the
+    // configured host+path before the site fallback, when the operator enabled it.
+    #[cfg(feature = "console")]
+    let app = console::mount(app, console_mount);
     app
         // Structured access log wraps every route (public + API).
         .layer(axum::middleware::from_fn(access_log))

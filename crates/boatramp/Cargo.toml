@@ -14,7 +14,12 @@ name = "boatramp"
 path = "src/main.rs"
 
 [features]
-default = ["fs", "slatedb"]
+# `console` ships in every build by default (the shipped release binaries, the
+# Nix/OCI images, and a plain `cargo build`): the management console is baked in
+# unless a build explicitly opts out with `--no-default-features`. The SPA `dist/`
+# is a build artifact staged by `boatramp-server/build.rs` (a placeholder when it
+# hasn't been built — the release + Nix pipelines build the real one).
+default = ["fs", "slatedb", "console"]
 fs = ["boatramp-storage/fs"]
 s3 = ["boatramp-storage/s3"]
 gcs = ["boatramp-storage/gcs"]
@@ -48,6 +53,9 @@ signer-gcp = ["boatramp-server/signer-gcp"]
 signer-azure = ["boatramp-server/signer-azure"]
 signer-aws = ["boatramp-server/signer-aws"]
 signer-pkcs11 = ["boatramp-server/signer-pkcs11"]
+# Embedded web management console: bakes the `boatramp-console` Wasm SPA into the
+# binary and serves it at an operator-configured host+path (`[serve.console]`).
+console = ["boatramp-server/console"]
 # On-the-fly response compression, runtime-opt-in per site.
 compression = ["boatramp-server/compression"]
 # HTTP/3 (QUIC) serving: a UDP listener alongside the TLS
