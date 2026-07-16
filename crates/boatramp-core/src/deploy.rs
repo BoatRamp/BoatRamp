@@ -978,6 +978,31 @@ impl DeployStore {
         Ok(out)
     }
 
+    /// Every ownership challenge across **all** sites, each paired with its site
+    /// name — the enumeration behind the auto-complete reconcile loop. Scans the
+    /// whole `domainverify/` keyspace, so a challenge started before a site's
+    /// first publish (its site isn't in [`all_sites`](Self::all_sites) yet) is
+    /// still found and can self-heal.
+    pub async fn list_all_domain_verifications(
+        &self,
+    ) -> Result<Vec<(String, DomainVerification)>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix("domainverify/").await? {
+            // Key shape: `domainverify/<site>/<host>`; the site is the first
+            // segment after the prefix (site names carry no `/`).
+            let Some((site, _host)) = key
+                .strip_prefix("domainverify/")
+                .and_then(|rest| rest.split_once('/'))
+            else {
+                continue;
+            };
+            if let Some(bytes) = self.kv.get(&key).await? {
+                out.push((site.to_string(), DomainVerification::from_json(&bytes)?));
+            }
+        }
+        Ok(out)
+    }
+
     /// Find a **pending HTTP** ownership challenge matching `(host, token)`
     /// across every site — the lookup behind the self-serve edge route
     /// `/.well-known/boatramp-domain-verification/<token>`. Matches on the

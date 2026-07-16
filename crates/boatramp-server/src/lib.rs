@@ -39,6 +39,7 @@ mod auth;
 #[cfg(feature = "console")]
 pub mod console;
 mod domain_verify;
+pub use domain_verify::spawn_domain_verify_reconcile;
 pub mod envelope;
 mod gateway;
 #[cfg(feature = "http3")]
