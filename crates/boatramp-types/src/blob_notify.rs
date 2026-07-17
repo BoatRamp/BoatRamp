@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::ConfigError;
+
 /// How boatramp obtains the cloud notification pipeline for a blob-change trigger.
 /// The tiers preserve the "conceptually clear / no surprises" guarantee: boatramp
 /// either has a working watch or clearly refuses.
@@ -104,13 +106,13 @@ impl ManagedNotification {
     }
 
     /// Serialize to the stored JSON bytes.
-    pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+    pub fn to_json(&self) -> Result<Vec<u8>, ConfigError> {
+        serde_json::to_vec(self).map_err(|err| ConfigError::parse(err.to_string()))
     }
 
     /// Parse from stored JSON bytes.
-    pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    pub fn from_json(bytes: &[u8]) -> Result<Self, ConfigError> {
+        serde_json::from_slice(bytes).map_err(|err| ConfigError::parse(err.to_string()))
     }
 }
 

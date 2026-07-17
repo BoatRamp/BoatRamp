@@ -15,28 +15,19 @@ use async_trait::async_trait;
 use crate::blob_notify::{ManagedNotification, ManagedResource, ProvisionTier};
 
 /// A provisioning failure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProvisionError {
     /// The cloud API (or credential) failed.
+    #[error("notification provisioning: {0}")]
     Backend(String),
     /// The operator's `verify-only` tier found no configured pipeline.
+    #[error("no notification pipeline is configured")]
     NotConfigured,
     /// A conflict boatramp must not clobber (e.g. an S3 bucket that already has a
     /// *different* owner's notification config).
+    #[error("notification conflict: {0}")]
     Conflict(String),
 }
-
-impl std::fmt::Display for ProvisionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Backend(m) => write!(f, "notification provisioning: {m}"),
-            Self::NotConfigured => write!(f, "no notification pipeline is configured"),
-            Self::Conflict(m) => write!(f, "notification conflict: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for ProvisionError {}
 
 /// Provisions the native change-notification pipeline for one cloud object store.
 /// Every method is idempotent; `provision` returns the resources created (for the

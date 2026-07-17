@@ -51,11 +51,13 @@ pub struct ClaimedMessage {
 }
 
 /// Why a messaging operation failed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum MessagingError {
     /// A backend (storage/KV) or transport failure.
+    #[error("messaging backend error: {0}")]
     Backend(String),
     /// A stored record could not be decoded.
+    #[error("messaging decode error: {0}")]
     Decode(String),
 }
 
@@ -64,17 +66,6 @@ impl MessagingError {
         Self::Backend(err.to_string())
     }
 }
-
-impl std::fmt::Display for MessagingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Backend(m) => write!(f, "messaging backend error: {m}"),
-            Self::Decode(m) => write!(f, "messaging decode error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for MessagingError {}
 
 /// A durable pub/sub topic substrate with at-least-once consumer delivery. The
 /// concrete coordinator (single-node mutex, cluster Raft leader, Cloudflare

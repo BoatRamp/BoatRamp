@@ -41,6 +41,7 @@ messaging = ["engine"]
 
 [dependencies]
 boatramp-core.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true }
 
 wasmtime = { workspace = true, optional = true }

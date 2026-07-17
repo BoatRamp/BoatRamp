@@ -291,6 +291,18 @@ pub struct Function {
     pub config: FunctionConfig,
 }
 
+/// A [`Function`] operation named a version id the function has no record of
+/// (`rollback`/`set_alias`). A typed error so a caller can distinguish it (e.g.
+/// map it to a 404) instead of string-matching a message.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("no version {id:?} in function {function:?}")]
+pub struct UnknownVersion {
+    /// The function the operation was on.
+    pub function: String,
+    /// The version id that was not found.
+    pub id: String,
+}
+
 impl Function {
     /// A new top-level function with a single active version (the component blob).
     /// The version id **is** the component's content hash (content-addressed).
@@ -341,25 +353,28 @@ impl Function {
     }
 
     /// Point `active` at an existing version id. `Err` if the version is unknown.
-    pub fn rollback(&mut self, to: &str) -> Result<(), String> {
+    pub fn rollback(&mut self, to: &str) -> Result<(), UnknownVersion> {
         if self.versions.iter().any(|v| v.id == to) {
             self.active = to.to_string();
             Ok(())
         } else {
-            Err(format!("no version {to:?} in function {:?}", self.name))
+            Err(UnknownVersion {
+                function: self.name.clone(),
+                id: to.to_string(),
+            })
         }
     }
 
     /// Set `label` → an existing version id. `Err` if the version is unknown.
-    pub fn set_alias(&mut self, label: &str, version: &str) -> Result<(), String> {
+    pub fn set_alias(&mut self, label: &str, version: &str) -> Result<(), UnknownVersion> {
         if self.versions.iter().any(|v| v.id == version) {
             self.aliases.insert(label.to_string(), version.to_string());
             Ok(())
         } else {
-            Err(format!(
-                "no version {version:?} in function {:?}",
-                self.name
-            ))
+            Err(UnknownVersion {
+                function: self.name.clone(),
+                id: version.to_string(),
+            })
         }
     }
 

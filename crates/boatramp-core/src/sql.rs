@@ -55,13 +55,16 @@ pub struct SqlRows {
 }
 
 /// Why a SQL operation failed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SqlError {
     /// The statement could not be parsed or planned.
+    #[error("sql syntax error: {0}")]
     Syntax(String),
     /// A constraint (unique, type, foreign key, ...) was violated.
+    #[error("sql constraint error: {0}")]
     Constraint(String),
     /// Any other backend/transport error (I/O, connection, ...).
+    #[error("sql error: {0}")]
     Other(String),
 }
 
@@ -71,18 +74,6 @@ impl SqlError {
         Self::Other(err.to_string())
     }
 }
-
-impl std::fmt::Display for SqlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Syntax(m) => write!(f, "sql syntax error: {m}"),
-            Self::Constraint(m) => write!(f, "sql constraint error: {m}"),
-            Self::Other(m) => write!(f, "sql error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for SqlError {}
 
 /// A per-site SQL backend (libsql — a local file or a remote sqld namespace).
 ///

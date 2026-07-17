@@ -126,48 +126,40 @@ impl Default for Limits {
 const EPOCH_TICK_MS: u64 = 10;
 
 /// Outcome of a failed invocation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
     /// The component could not be compiled/instantiated.
+    #[error("component compile error: {0}")]
     Compile(String),
     /// The guest trapped (panic, unreachable, bad host call).
+    #[error("handler trapped: {0}")]
     Trap(String),
     /// The guest exceeded its wall-clock budget.
+    #[error("handler timed out")]
     Timeout,
     /// The guest exhausted its CPU **fuel** budget.
+    #[error("handler exhausted its CPU fuel budget")]
     OutOfFuel,
     /// The engine is at its concurrency limit.
+    #[error("handler engine at capacity")]
     Overloaded,
     /// The guest returned without producing a response.
+    #[error("handler produced no response")]
     NoResponse,
     /// An internal engine error.
+    #[error("handler engine error: {0}")]
     Internal(String),
 }
 
 impl From<wasmtime::Error> for HandlerError {
     /// wasmtime setup errors (engine/linker/config) are engine-internal.
     /// Component-compile failures are mapped to [`HandlerError::Compile`]
-    /// explicitly at the call site instead.
+    /// explicitly at the call site instead. (This deliberately stringifies rather
+    /// than carrying the source, so `Internal` stays a plain `String`.)
     fn from(err: wasmtime::Error) -> Self {
         Self::Internal(err.to_string())
     }
 }
-
-impl std::fmt::Display for HandlerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Compile(m) => write!(f, "component compile error: {m}"),
-            Self::Trap(m) => write!(f, "handler trapped: {m}"),
-            Self::Timeout => write!(f, "handler timed out"),
-            Self::OutOfFuel => write!(f, "handler exhausted its CPU fuel budget"),
-            Self::Overloaded => write!(f, "handler engine at capacity"),
-            Self::NoResponse => write!(f, "handler produced no response"),
-            Self::Internal(m) => write!(f, "handler engine error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for HandlerError {}
 
 /// Per-store host state: the WASI + WASI-HTTP contexts, the resource table, the
 /// memory limiter, and the per-site capability bindings (kv/blob/sql) this

@@ -1636,6 +1636,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.10.1",
  "lru 0.16.4",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "wasmtime",

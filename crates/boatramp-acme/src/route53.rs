@@ -66,7 +66,18 @@ impl Route53Dns {
             .change_batch(batch)
             .send()
             .await
-            .map_err(|e| DnsError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                // Route 53 signals "delete of an absent record" via an
+                // `InvalidChangeBatch` message; recognize it at this boundary so
+                // callers get a typed `DnsError::NotFound` instead of having to
+                // string-match a `Backend` message.
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("NoSuch") {
+                    DnsError::NotFound
+                } else {
+                    DnsError::Backend(msg)
+                }
+            })?;
         Ok(())
     }
 }
@@ -99,10 +110,7 @@ impl DnsProvider for Route53Dns {
     async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
         // DELETE must match the exact record set; absent → treat as success.
         match self.change(ChangeAction::Delete, record).await {
-            Ok(()) => Ok(()),
-            Err(DnsError::Backend(msg)) if msg.contains("not found") || msg.contains("NoSuch") => {
-                Ok(())
-            }
+            Ok(()) | Err(DnsError::NotFound) => Ok(()),
             Err(err) => Err(err),
         }
     }

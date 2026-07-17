@@ -190,33 +190,24 @@ pub struct Snapshot {
 }
 
 /// Why a backend operation failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// The backend doesn't support the requested operation.
+    #[error("operation not supported by this backend")]
     Unsupported,
     /// Staging the artifact failed.
+    #[error("materialize: {0}")]
     Materialize(String),
     /// Launching the replica failed.
+    #[error("launch: {0}")]
     Launch(String),
     /// Stopping the replica failed.
+    #[error("stop: {0}")]
     Stop(String),
     /// Any other failure.
+    #[error("{0}")]
     Other(String),
 }
-
-impl std::fmt::Display for BackendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unsupported => write!(f, "operation not supported by this backend"),
-            Self::Materialize(d) => write!(f, "materialize: {d}"),
-            Self::Launch(d) => write!(f, "launch: {d}"),
-            Self::Stop(d) => write!(f, "stop: {d}"),
-            Self::Other(d) => write!(f, "{d}"),
-        }
-    }
-}
-
-impl std::error::Error for BackendError {}
 
 /// A pluggable compute execution backend (VMM / container / cloudflare / docker).
 ///

@@ -52,24 +52,21 @@ pub struct DnsRecord {
 }
 
 /// Why a DNS operation failed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DnsError {
     /// Bad/absent credentials or configuration.
+    #[error("dns config error: {0}")]
     Config(String),
     /// The provider's API rejected the request or was unreachable.
+    #[error("dns backend error: {0}")]
     Backend(String),
+    /// The record to delete does not exist. `delete` treats this as success (a
+    /// retried teardown converges), so providers return it structurally instead
+    /// of encoding "already gone" in a `Backend` message that the caller then has
+    /// to string-match.
+    #[error("dns record not found")]
+    NotFound,
 }
-
-impl std::fmt::Display for DnsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config(m) => write!(f, "dns config error: {m}"),
-            Self::Backend(m) => write!(f, "dns backend error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for DnsError {}
 
 /// A DNS zone editor. Implementations are per-provider (Cloudflare, Route 53,
 /// Oracle Cloud, …); the manual one just records what an operator must do.
