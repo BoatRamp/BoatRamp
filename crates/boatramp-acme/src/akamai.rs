@@ -107,7 +107,7 @@ impl AkamaiDns {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<reqwest::StatusCode, DnsError> {
-        let timestamp = eg_timestamp(now_secs());
+        let timestamp = eg_timestamp(crate::now_secs());
         let nonce = make_nonce();
         let content_hash = match (method.as_str(), body) {
             ("POST", Some(b)) => {
@@ -215,13 +215,6 @@ fn make_nonce() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:032x}")
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[async_trait]

@@ -1,8 +1,8 @@
 //! Shared helpers for the HTTP-client subcommands (sync, deployments, rollback).
 
+use boatramp_core::time::now_unix;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use boatramp_core::config::SiteConfig;
 use boatramp_core::cose::{self, LocalSigner, PopClaims};
@@ -240,20 +240,21 @@ impl PopSigner {
     }
 }
 
-/// The current Unix time in seconds (stamps a PoP proof's `iat`).
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Resolve the server base URL from a flag, falling back to config.
 pub fn resolve_server(server: Option<String>, config: &ProjectConfig) -> Result<String> {
     let server = server
         .or_else(|| config.publish.server.clone())
         .ok_or(ClientError::NoServer)?;
     Ok(server.trim_end_matches('/').to_string())
+}
+
+/// Resolve the target server and build an authenticated client — the shared
+/// preamble of every mutating subcommand. (Was reinvented verbatim as a private
+/// `conn` in both `function` and `workflow`; it lives here so there is one.)
+pub fn connect(server: Option<String>, config: &ProjectConfig) -> Result<(String, ApiClient)> {
+    let server = resolve_server(server, config)?;
+    let http = http_client(token(config).as_deref());
+    Ok((server, http))
 }
 
 /// Resolve the (server base URL, site) target from flags, falling back to config.

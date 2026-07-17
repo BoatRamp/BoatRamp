@@ -673,13 +673,7 @@ struct OidcState(Option<Arc<oidc::OidcVerifier>>);
 #[cfg(feature = "oidc")]
 const EXCHANGE_TTL_SECS: u64 = 3600;
 
-/// The current Unix time in seconds.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use boatramp_core::time::now_unix;
 
 /// Build the application router around a [`DeployStore`], [`Auth`] config, and
 /// the WebAssembly handler runtime ([`HandlerRuntime::disabled`] for none), with

@@ -383,7 +383,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             webhook_secret_env,
             server,
         } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             // Upload the component first; the server rejects a deploy whose blob is
             // absent, so this is content-addressed staging, not a second round-trip.
             let hash = client::put_file_blob(&http, &server, &component).await?;
@@ -419,7 +419,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             );
         }
         FunctionCommand::Rollback { name, to, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let f: StoredFunction = http
                 .post(format!("{server}/api/functions/{name}/rollback"))
                 .json(&serde_json::json!({ "to": to }))
@@ -436,7 +436,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             version,
             server,
         } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             http.put(format!("{server}/api/functions/{name}/aliases/{label}"))
                 .json(&serde_json::json!({ "version": version }))
                 .send()
@@ -445,7 +445,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             println!("aliased {name}:{label} -> {}", short(&version));
         }
         FunctionCommand::Rm { name, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             http.delete(format!("{server}/api/functions/{name}"))
                 .send()
                 .await?
@@ -462,7 +462,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             version,
             server,
         } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let body = read_invoke_body(data, data_file).await?;
             let mut qs: Vec<String> = Vec::new();
             if r#async {
@@ -503,7 +503,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         FunctionCommand::Invocation { name, id, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let inv: InvocationRecord = http
                 .get(format!("{server}/api/functions/{name}/invocations/{id}"))
                 .send()
@@ -517,7 +517,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         FunctionCommand::Usage { name, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let usage: UsageView = http
                 .get(format!("{server}/api/functions/{name}/usage"))
                 .send()
@@ -577,7 +577,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
             blob,
             server,
         } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let kind = match (cron, queue, blob) {
                 (Some(schedule), None, None) => {
                     serde_json::json!({ "type": "cron", "schedule": schedule })
@@ -598,7 +598,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
             println!("added trigger {name}/{id}");
         }
         TriggerCommand::Ls { name, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let list: Vec<TriggerView> = http
                 .get(format!("{server}/api/functions/{name}/triggers"))
                 .send()
@@ -616,7 +616,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         TriggerCommand::Rm { name, id, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             http.delete(format!("{server}/api/functions/{name}/triggers/{id}"))
                 .send()
                 .await?
@@ -1039,14 +1039,6 @@ mod harness {
     fn harness_err<E: std::fmt::Display>(err: E) -> FunctionError {
         FunctionError::Harness(err.to_string())
     }
-}
-
-/// Resolve the target server and build an authenticated client — the shared
-/// preamble of every mutating `function` subcommand.
-fn conn(server: Option<String>, config: &ProjectConfig) -> Result<(String, client::ApiClient)> {
-    let server = client::resolve_server(server, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    Ok((server, http))
 }
 
 /// Fetch the functions view (all sites, or one with `?site=`).

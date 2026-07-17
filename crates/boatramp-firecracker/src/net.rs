@@ -24,13 +24,15 @@ impl HostCommand {
             args: args.iter().map(|a| a.to_string()).collect(),
         }
     }
+}
 
-    /// Render as a shell-ish line for logs/tests (not for execution).
-    pub fn display(&self) -> String {
+/// Render as a shell-ish line for logs/tests (not for execution).
+impl std::fmt::Display for HostCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.args.is_empty() {
-            self.program.clone()
+            f.write_str(&self.program)
         } else {
-            format!("{} {}", self.program, self.args.join(" "))
+            write!(f, "{} {}", self.program, self.args.join(" "))
         }
     }
 }
@@ -175,9 +177,12 @@ mod tests {
         let tap = TapNetwork::for_vm("vm1", "br-boatramp");
         let setup = tap.setup_commands();
         // create → enslave → up.
-        assert_eq!(setup[0].display(), "ip tuntap add tap-vm1 mode tap");
-        assert_eq!(setup[1].display(), "ip link set tap-vm1 master br-boatramp");
-        assert_eq!(setup[2].display(), "ip link set tap-vm1 up");
+        assert_eq!(setup[0].to_string(), "ip tuntap add tap-vm1 mode tap");
+        assert_eq!(
+            setup[1].to_string(),
+            "ip link set tap-vm1 master br-boatramp"
+        );
+        assert_eq!(setup[2].to_string(), "ip link set tap-vm1 up");
         // Teardown deletes the same device.
         let down = tap.teardown_commands();
         assert_eq!(
@@ -190,7 +195,7 @@ mod tests {
     fn node_setup_brings_up_bridge_forwarding_and_nat() {
         let net = NodeNetwork::new("10.0.0.1/24", "eth0");
         let cmds = net.setup_commands();
-        let lines: Vec<String> = cmds.iter().map(HostCommand::display).collect();
+        let lines: Vec<String> = cmds.iter().map(HostCommand::to_string).collect();
         assert!(lines.contains(&"ip link add br-boatramp type bridge".to_string()));
         assert!(lines.contains(&"ip addr add 10.0.0.1/24 dev br-boatramp".to_string()));
         assert!(lines.contains(&"sysctl -w net.ipv4.ip_forward=1".to_string()));
@@ -204,7 +209,7 @@ mod tests {
     fn node_teardown_drops_nat_table_and_bridge() {
         let net = NodeNetwork::new("10.0.0.1/24", "eth0");
         let down = net.teardown_commands();
-        assert_eq!(down[0].display(), "nft delete table ip boatramp-nat");
-        assert_eq!(down[1].display(), "ip link del br-boatramp");
+        assert_eq!(down[0].to_string(), "nft delete table ip boatramp-nat");
+        assert_eq!(down[1].to_string(), "ip link del br-boatramp");
     }
 }

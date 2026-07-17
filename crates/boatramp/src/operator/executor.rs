@@ -45,13 +45,7 @@ fn join_secret_name(brc: &BoatRampCluster) -> String {
 }
 const JOIN_KEY: &str = "ticket";
 
-/// Current Unix time (attestation freshness); a straight clock read is fine here.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use boatramp_core::time::now_unix;
 
 /// A specific pod's control-plane base URL, over the stable per-pod headless DNS
 /// (`https://<instance>-<ordinal>.<headless>.<ns>.svc:8080`). Per-pod (not the

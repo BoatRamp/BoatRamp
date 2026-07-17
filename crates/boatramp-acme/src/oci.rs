@@ -192,7 +192,7 @@ impl DnsProvider for OciDns {
     async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
         let body = serde_json::to_vec(&Self::rrset_body(record))
             .map_err(|e| DnsError::Backend(e.to_string()))?;
-        let date = imf_fixdate(now_secs());
+        let date = imf_fixdate(crate::now_secs());
         self.send(
             reqwest::Method::PUT,
             &self.rrset_path(record),
@@ -203,7 +203,7 @@ impl DnsProvider for OciDns {
     }
 
     async fn delete(&self, record: &DnsRecord) -> Result<(), DnsError> {
-        let date = imf_fixdate(now_secs());
+        let date = imf_fixdate(crate::now_secs());
         match self
             .send(
                 reqwest::Method::DELETE,
@@ -219,13 +219,6 @@ impl DnsProvider for OciDns {
             Err(err) => Err(err),
         }
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

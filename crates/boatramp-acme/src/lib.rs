@@ -51,3 +51,15 @@ pub use dns::{
     acme_challenge_name, dns01_txt_value, domain_record, preview_record, preview_wildcard,
     DnsError, DnsOp, DnsProvider, DnsRecord, ManualDnsProvider, PreviewTarget, RecordKind,
 };
+
+/// Seconds since the Unix epoch, for the request-signing timestamps the OCI and
+/// Akamai DNS providers stamp into their auth headers. (This crate is standalone,
+/// so it keeps its own tiny clock read rather than depend on `boatramp-core` for
+/// it.) Gated to the providers that use it so a lean build warns on neither.
+#[cfg(any(feature = "oci", feature = "akamai"))]
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

@@ -24,7 +24,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use boatramp_core::time::now_unix_ms;
 
 use async_trait::async_trait;
 use boatramp_core::messaging::{self, ClaimedMessage, Messaging, MessagingError, StreamHubs};
@@ -126,7 +128,7 @@ impl RaftMessaging {
     fn next_id(&self) -> String {
         format!(
             "{:013}-{:016x}-{:016x}",
-            now_ms(),
+            now_unix_ms(),
             self.node_id,
             self.seq.fetch_add(1, Ordering::Relaxed)
         )
@@ -179,13 +181,6 @@ impl RaftMessaging {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[async_trait]
 impl Messaging for RaftMessaging {
     async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MessagingError> {
@@ -226,7 +221,7 @@ impl Messaging for RaftMessaging {
         let response = self
             .propose(WriteOp::MqClaim {
                 topic: topic.to_string(),
-                now_ms: now_ms(),
+                now_ms: now_unix_ms(),
                 lease_ms: lease.as_millis() as u64,
                 max_batch: max_batch as u32,
                 max_attempts,

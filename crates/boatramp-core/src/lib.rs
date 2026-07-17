@@ -37,6 +37,8 @@ pub mod kv;
 pub mod messaging;
 pub mod mode;
 pub mod sql;
+/// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
+pub mod time;
 
 // The shared wasm-clean layer lives in `boatramp-types`; re-export it so the
 // `boatramp_core::config`/`::route`/`::matcher`/`::domain_verify`/… paths are

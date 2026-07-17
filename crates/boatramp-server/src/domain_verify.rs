@@ -12,7 +12,9 @@
 //! method returns a clear, actionable error instead of silently failing.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use boatramp_core::time::now_unix;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -25,14 +27,6 @@ use boatramp_core::domain_verify::{
 use serde::{Deserialize, Serialize};
 
 use crate::deploy_error_response;
-
-/// Seconds since the Unix epoch, for challenge timestamps.
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// The real ownership probe: fetch over HTTP (always), resolve TXT over DNS
 /// (only with the `domain-verify-dns` feature). Injected into

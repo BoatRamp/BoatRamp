@@ -333,13 +333,7 @@ pub async fn run(args: TokenArgs, config: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
-/// Current Unix time (seconds).
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use boatramp_core::time::now_unix;
 
 /// `token mint`: sign a control-plane token offline via the configured signer.
 async fn mint_offline(

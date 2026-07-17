@@ -12,8 +12,8 @@
 //! containers are first-class (create / exists / clear semantics). `error` is
 //! the WIT `string`, so methods return `Result<_, String>` directly.
 
+use boatramp_core::time::now_unix;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use boatramp_core::{ByteStream, PutMeta, Storage, StorageError};
 use bytes::Bytes;
@@ -133,13 +133,6 @@ impl<'a> BlobHost<'a> {
 
 fn estr<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// A single-chunk byte stream for [`Storage::put`].
@@ -459,7 +452,7 @@ impl blobstore::blobstore::Host for BlobHost<'_> {
         storage
             .put(
                 &format!("{prefix}{MARKER}"),
-                once_stream(Bytes::from(unix_now().to_string())),
+                once_stream(Bytes::from(now_unix().to_string())),
                 PutMeta::default(),
             )
             .await

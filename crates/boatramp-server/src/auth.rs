@@ -9,9 +9,9 @@
 //! `/api/auth/exchange`). If no root key is configured, auth is **disabled**
 //! (every request allowed — development only); public serving is never gated.
 
+use boatramp_core::time::now_unix;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -495,14 +495,6 @@ fn pop_header(request: &Request) -> Option<String> {
         .to_str()
         .ok()
         .map(str::to_string)
-}
-
-/// The current Unix time in seconds (for token TTL evaluation).
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

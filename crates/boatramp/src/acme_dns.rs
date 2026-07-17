@@ -172,7 +172,7 @@ pub async fn build_provider_opts(
 
 /// Whether a TLS SNI hostname matches a cert pattern. Exact match, or a single
 /// wildcard label (`*.suffix` matches `one-label.suffix`, not `a.b.suffix`).
-pub fn host_matches(pattern: &str, sni: &str) -> bool {
+pub fn sni_matches(pattern: &str, sni: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
         match sni.strip_suffix(suffix).and_then(|p| p.strip_suffix('.')) {
             Some(label) => !label.is_empty() && !label.contains('.'),
@@ -201,12 +201,7 @@ const RENEW_AFTER_SECS: u64 = 60 * 24 * 3600;
 
 use boatramp_acme::acme::{CertRequest, IssuedCert};
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use boatramp_core::time::now_unix;
 
 /// Load a cached cert for `domain` if present and younger than
 /// [`RENEW_AFTER_SECS`]; otherwise `None` (caller reissues).
@@ -219,7 +214,7 @@ fn load_fresh(cache_dir: &Path, domain: &str) -> Result<Option<IssuedCert>> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    if now_secs().saturating_sub(issued_at) >= RENEW_AFTER_SECS {
+    if now_unix().saturating_sub(issued_at) >= RENEW_AFTER_SECS {
         return Ok(None);
     }
     Ok(Some(IssuedCert {
@@ -248,7 +243,7 @@ fn write_cache(cache_dir: &Path, domain: &str, cert: &IssuedCert) -> Result<()> 
     // The cert chain + issuance stamp are public; only the key needs locking down.
     std::fs::write(&cert_p, &cert.certificate_pem)?;
     write_private_key(&key_p, &cert.private_key_pem)?;
-    std::fs::write(&stamp_p, now_secs().to_string())?;
+    std::fs::write(&stamp_p, now_unix().to_string())?;
     Ok(())
 }
 
@@ -334,7 +329,7 @@ impl ResolvesServerCert for SniCertResolver {
         let sni = hello.server_name()?;
         self.entries
             .iter()
-            .find(|(pattern, _)| host_matches(pattern, sni))
+            .find(|(pattern, _)| sni_matches(pattern, sni))
             .map(|(_, key)| key.clone())
     }
 }
@@ -420,28 +415,25 @@ mod tests {
 
     #[test]
     fn wildcard_matches_one_label_only() {
-        assert!(host_matches(
+        assert!(sni_matches(
             "*.deploy.example.com",
             "abc.deploy.example.com"
         ));
         // Two labels deep does not match a single-level wildcard.
-        assert!(!host_matches(
+        assert!(!sni_matches(
             "*.deploy.example.com",
             "a.b.deploy.example.com"
         ));
         // Different base.
-        assert!(!host_matches(
-            "*.deploy.example.com",
-            "abc.deploy.other.com"
-        ));
+        assert!(!sni_matches("*.deploy.example.com", "abc.deploy.other.com"));
         // Empty label.
-        assert!(!host_matches("*.deploy.example.com", ".deploy.example.com"));
+        assert!(!sni_matches("*.deploy.example.com", ".deploy.example.com"));
     }
 
     #[test]
     fn exact_match_is_case_insensitive() {
-        assert!(host_matches("example.com", "Example.COM"));
-        assert!(!host_matches("example.com", "www.example.com"));
+        assert!(sni_matches("example.com", "Example.COM"));
+        assert!(!sni_matches("example.com", "www.example.com"));
     }
 
     #[test]
@@ -471,7 +463,7 @@ mod tests {
         let scratch = Scratch(std::env::temp_dir().join(format!(
             "boatramp-acme-test-{}-{}",
             std::process::id(),
-            now_secs()
+            now_unix()
         )));
         std::fs::create_dir_all(&scratch.0).unwrap();
 

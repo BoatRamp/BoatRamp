@@ -555,7 +555,7 @@ mod tests {
 
     impl Host for RecordingHost {
         fn run_command(&self, cmd: &HostCommand) -> Result<(), ExecError> {
-            self.record(format!("run:{}", cmd.display()))
+            self.record(format!("run:{cmd}"))
         }
         fn spawn(&self, cmd: &SpawnCommand) -> Result<Pid, ExecError> {
             self.record(format!("spawn:{}", cmd.program))?;

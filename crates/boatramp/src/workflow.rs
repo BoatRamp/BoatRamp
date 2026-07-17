@@ -130,7 +130,7 @@ struct StepRunView {
 pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
     match args.command {
         WorkflowCommand::Define { name, file, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let raw = read_file(&file).await?;
             // Accept a bare steps array or a `{ "steps": [...] }` object.
             let value: serde_json::Value = serde_json::from_slice(&raw)?;
@@ -146,7 +146,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
             println!("defined workflow {name}");
         }
         WorkflowCommand::Ls { server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let list: Vec<WorkflowView> = http
                 .get(format!("{server}/api/workflows"))
                 .send()
@@ -163,7 +163,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         WorkflowCommand::Get { name, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let w: WorkflowView = http
                 .get(format!("{server}/api/workflows/{name}"))
                 .send()
@@ -186,7 +186,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         WorkflowCommand::Run { name, data, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let mut req = http.post(format!("{server}/api/workflows/{name}/runs"));
             if let Some(input) = data {
                 req = req.body(input.into_bytes());
@@ -195,7 +195,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
             println!("started run {} [{}]", run.id, run.status);
         }
         WorkflowCommand::RunStatus { name, id, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             let run: RunView = http
                 .get(format!("{server}/api/workflows/{name}/runs/{id}"))
                 .send()
@@ -209,7 +209,7 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
             }
         }
         WorkflowCommand::Rm { name, server } => {
-            let (server, http) = conn(server, config)?;
+            let (server, http) = client::connect(server, config)?;
             http.delete(format!("{server}/api/workflows/{name}"))
                 .send()
                 .await?
@@ -218,13 +218,6 @@ pub async fn run(args: WorkflowArgs, config: &ProjectConfig) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Resolve the server + an authenticated client (the shared preamble).
-fn conn(server: Option<String>, config: &ProjectConfig) -> Result<(String, client::ApiClient)> {
-    let server = client::resolve_server(server, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    Ok((server, http))
 }
 
 /// Read a steps file (`-` = stdin).

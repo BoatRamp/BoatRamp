@@ -15,9 +15,9 @@
 //! sees either the previous deployment or the new one in full — never a
 //! half-published mix. Rollback is just pointing the site at an older manifest.
 
+use crate::time::now_unix;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
@@ -67,13 +67,6 @@ pub struct GcOptions {
 
 /// Most recent activations retained per site.
 const MAX_HISTORY: usize = 100;
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Canonicalize a routing host: trimmed, no trailing dot, lower-cased. Host names
 /// are case-insensitive and a trailing dot is a legal FQDN form, so the routing
@@ -188,7 +181,7 @@ impl DeployStore {
         let created_at = existing
             .as_ref()
             .map(|m| m.created_at)
-            .unwrap_or_else(unix_now);
+            .unwrap_or_else(now_unix);
         let meta = DeployMeta {
             version: crate::SCHEMA_VERSION,
             created_at,
@@ -1747,7 +1740,7 @@ impl DeployStore {
             0,
             HistoryEntry {
                 id: id.to_string(),
-                at: unix_now(),
+                at: now_unix(),
                 meta: None,
             },
         );
@@ -1785,7 +1778,7 @@ impl DeployStore {
     /// `keep_age_secs`; with neither set, the entire history).
     async fn live_deployment_ids(&self, opts: &GcOptions) -> Result<BTreeSet<String>, DeployError> {
         let mut ids = BTreeSet::new();
-        let now = unix_now();
+        let now = now_unix();
         for key in self.kv.list_prefix("history/").await? {
             if let Some(bytes) = self.kv.get(&key).await? {
                 if let Ok(history) = serde_json::from_slice::<Vec<HistoryEntry>>(&bytes) {
@@ -1857,7 +1850,7 @@ impl DeployStore {
         opts: GcOptions,
     ) -> Result<GcReport, DeployError> {
         let live_ids = self.live_deployment_ids(&opts).await?;
-        let now = unix_now();
+        let now = now_unix();
 
         let manifest_keys = self.kv.list_prefix("manifests/").await?;
         let manifests_total = manifest_keys.len();

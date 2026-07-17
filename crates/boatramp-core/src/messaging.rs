@@ -26,7 +26,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::time::now_unix_ms;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -437,19 +439,12 @@ impl LogMessaging {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[async_trait]
 impl Messaging for LogMessaging {
     async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MessagingError> {
         let id = format!(
             "{:013}-{:016x}",
-            now_ms(),
+            now_unix_ms(),
             self.seq.fetch_add(1, Ordering::Relaxed)
         );
         // Payload first, then the index record — so the record never references
@@ -482,7 +477,7 @@ impl Messaging for LogMessaging {
         // to exactly one consumer (the per-process coordinator — a cluster swaps
         // this mutex for the Raft leader applying the same `plan_claim`).
         let _guard = self.claim_lock.lock().await;
-        let now = now_ms();
+        let now = now_unix_ms();
         let prefix = meta_prefix(topic);
         let keys = self
             .kv

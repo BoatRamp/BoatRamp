@@ -35,7 +35,7 @@ pub enum Error {
     /// A `--provider` verification-dance problem (timeout, or the `acme-dns`
     /// feature is absent from this build).
     #[error("{0}")]
-    Auto(String),
+    Verify(String),
     /// Building the DNS provider for `--provider` failed (missing credential env var).
     #[cfg(feature = "acme-dns")]
     #[error(transparent)]
@@ -135,7 +135,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             // A managed-DNS provider does the whole dance (publish TXT → poll →
             // attach) itself.
             if let Some(provider) = provider.as_deref() {
-                return add_auto(&http, &server, &site, &host, Some(provider)).await;
+                return add_via_provider(&http, &server, &site, &host, Some(provider)).await;
             }
             let verification =
                 client::start_domain_verification(&http, &server, &site, &host, Some(&method))
@@ -230,7 +230,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
 /// attach. It writes **only** the `_boatramp-verify` TXT — never the host's
 /// A/CNAME — so ownership is proven before anything is pointed at this server.
 #[cfg(feature = "acme-dns")]
-async fn add_auto(
+async fn add_via_provider(
     http: &crate::client::ApiClient,
     server: &str,
     site: &str,
@@ -245,9 +245,9 @@ async fn add_auto(
     use crate::acme_dns::{build_provider, DnsProviderKind};
 
     let provider_name = provider
-        .ok_or_else(|| Error::Auto("missing `--provider <name>` (e.g. cloudflare)".into()))?;
+        .ok_or_else(|| Error::Verify("missing `--provider <name>` (e.g. cloudflare)".into()))?;
     let kind = DnsProviderKind::from_str(provider_name, true)
-        .map_err(|e| Error::Auto(format!("unknown --provider `{provider_name}`: {e}")))?;
+        .map_err(|e| Error::Verify(format!("unknown --provider `{provider_name}`: {e}")))?;
 
     // `--auto` publishes a DNS TXT, so it is always the `dns` method.
     let verification =
@@ -291,7 +291,7 @@ async fn add_auto(
     }
 
     // Timed out: leave the TXT so a later `domain verify` still succeeds.
-    Err(Error::Auto(format!(
+    Err(Error::Verify(format!(
         "published the challenge but it did not resolve within {}s — DNS may still \
          be propagating; re-run `boatramp domain verify {host}` shortly",
         ATTEMPTS as u64 * EVERY_SECS
@@ -301,14 +301,14 @@ async fn add_auto(
 /// Without the `acme-dns` feature there is no bundled DNS provider to publish the
 /// challenge with, so `--provider` is unavailable.
 #[cfg(not(feature = "acme-dns"))]
-async fn add_auto(
+async fn add_via_provider(
     _http: &crate::client::ApiClient,
     _server: &str,
     _site: &str,
     _host: &str,
     _provider: Option<&str>,
 ) -> Result<()> {
-    Err(Error::Auto(
+    Err(Error::Verify(
         "`--provider` requires a build with `--features acme-dns`".into(),
     ))
 }

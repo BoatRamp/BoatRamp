@@ -7,7 +7,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+
+use boatramp_core::time::now_unix_ms;
 
 use boatramp_handlers::{LogSink, LogStream};
 use serde::Serialize;
@@ -158,7 +160,7 @@ impl LogSink for LogStore {
             // 1-based, so the `after = 0` sentinel ("from the start") includes
             // the very first line.
             seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
-            ts_ms: now_ms(),
+            ts_ms: now_unix_ms(),
             stream: stream.as_str().to_string(),
             line: line.to_string(),
         };
@@ -169,13 +171,6 @@ impl LogSink for LogStore {
             site.entries.pop_front();
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
