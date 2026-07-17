@@ -76,6 +76,12 @@ impl InstanceType {
     }
 }
 
+impl std::fmt::Display for InstanceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A Cloudflare Durable-Object **class name** for a workload — PascalCase, ASCII
 /// alphanumerics only (CF class names are JS identifiers). `"my-app"` →
 /// `"BoatrampMyApp"`; an empty/garbage name falls back to `"BoatrampWorkload"`.

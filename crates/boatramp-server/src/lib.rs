@@ -1536,15 +1536,6 @@ struct FunctionSummary {
     triggers: Vec<String>,
 }
 
-/// Render a function owner for the view.
-fn owner_str(owner: &boatramp_core::function::Owner) -> String {
-    use boatramp_core::function::Owner;
-    match owner {
-        Owner::Site(s) => format!("site:{s}"),
-        Owner::Project(p) => format!("project:{p}"),
-    }
-}
-
 /// `GET /api/functions[?site=…]` — the derived, **read-only** site-scoped function
 /// view (FA-1): desugar each site's active manifest into functions + triggers and
 /// resolve component paths to their blob-hash version ids. A pure projection of the
@@ -1574,12 +1565,12 @@ async fn list_functions(
             let trigs = triggers
                 .iter()
                 .filter(|t| t.target.as_ref().map(|r| r.name.as_str()) == Some(f.name.as_str()))
-                .map(render_trigger)
+                .map(|t| t.to_string())
                 .collect();
             out.push(FunctionSummary {
                 name: format!("{site}/{}", f.name),
                 owner: format!("site:{site}"),
-                runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
+                runtime: f.config.runtime.as_str().to_string(),
                 version: f.active,
                 triggers: trigs,
             });
@@ -1593,8 +1584,8 @@ async fn list_functions(
                 for f in stored {
                     out.push(FunctionSummary {
                         name: f.name.clone(),
-                        owner: owner_str(&f.owner),
-                        runtime: format!("{:?}", f.config.runtime).to_ascii_lowercase(),
+                        owner: f.owner.to_string(),
+                        runtime: f.config.runtime.as_str().to_string(),
                         version: f.active,
                         // A top-level function has a stable invoke URL (FA-3).
                         triggers: vec![format!("invoke {}", f.name)],
@@ -1605,27 +1596,6 @@ async fn list_functions(
         }
     }
     Json(out).into_response()
-}
-
-/// Render a trigger to a short one-line label for the functions view.
-fn render_trigger(t: &boatramp_core::function::Trigger) -> String {
-    use boatramp_core::function::TriggerKind;
-    match &t.kind {
-        TriggerKind::Route { path, methods, .. } => {
-            let m = if methods.is_empty() {
-                "*".to_string()
-            } else {
-                methods.join(",")
-            };
-            format!("route {m} {path}")
-        }
-        TriggerKind::Invoke { name } => format!("invoke {name}"),
-        TriggerKind::Queue { topic } => format!("queue {topic}"),
-        TriggerKind::Cron { schedule, .. } => format!("cron {schedule}"),
-        TriggerKind::Blob { prefix } => format!("blob {prefix}"),
-        TriggerKind::Webhook { path, .. } => format!("webhook {path}"),
-        TriggerKind::Stream { topics, .. } => format!("stream {}", topics.join(",")),
-    }
 }
 
 /// Body of `PUT /api/functions/:name` — deploy a version of a top-level function.

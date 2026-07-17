@@ -123,6 +123,22 @@ pub enum Scheme {
     Https,
 }
 
+impl Scheme {
+    /// The lowercase URL-scheme token (matches the serde `rename_all`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        }
+    }
+}
+
+impl std::fmt::Display for Scheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Where the gateway routes to reach a replica.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
@@ -137,11 +153,7 @@ pub struct Endpoint {
 impl Endpoint {
     /// The endpoint as a base URL (`scheme://host:port`).
     pub fn url(&self) -> String {
-        let scheme = match self.scheme {
-            Scheme::Http => "http",
-            Scheme::Https => "https",
-        };
-        format!("{scheme}://{}:{}", self.host, self.port)
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
     }
 }
 

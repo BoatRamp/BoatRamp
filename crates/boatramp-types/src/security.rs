@@ -63,6 +63,20 @@ pub enum SecurityProfile {
     Dev,
 }
 
+impl std::fmt::Display for SecurityProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SecurityProfile {
+    type Err = SecurityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_name(s).ok_or_else(|| SecurityError::UnknownProfile(s.to_string()))
+    }
+}
+
 impl SecurityProfile {
     /// Map a profile name to a built-in, if it is one.
     pub fn from_name(name: &str) -> Option<Self> {

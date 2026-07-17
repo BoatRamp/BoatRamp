@@ -32,6 +32,12 @@ impl RecordKind {
     }
 }
 
+impl std::fmt::Display for RecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single DNS record to upsert or delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRecord {

@@ -32,6 +32,15 @@ pub enum Owner {
     Project(String),
 }
 
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Owner::Site(s) => write!(f, "site:{s}"),
+            Owner::Project(p) => write!(f, "project:{p}"),
+        }
+    }
+}
+
 /// A function version's lifecycle (decision 3: `DeployPinned` is the default).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -53,6 +62,23 @@ pub enum Runtime {
     Wasm,
     Microvm,
     Container,
+}
+
+impl Runtime {
+    /// The snake_case wire term (matches the serde `rename_all`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Runtime::Wasm => "wasm",
+            Runtime::Microvm => "microvm",
+            Runtime::Container => "container",
+        }
+    }
+}
+
+impl std::fmt::Display for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A function's binding/capability config — the `HandlerConfig` capability fields
@@ -204,6 +230,28 @@ pub enum TriggerKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         publish_topic: Option<String>,
     },
+}
+
+impl std::fmt::Display for Trigger {
+    /// A short one-line label for the functions view (`route GET /x`, `queue t`, …).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            TriggerKind::Route { path, methods, .. } => {
+                let m = if methods.is_empty() {
+                    "*".to_string()
+                } else {
+                    methods.join(",")
+                };
+                write!(f, "route {m} {path}")
+            }
+            TriggerKind::Invoke { name } => write!(f, "invoke {name}"),
+            TriggerKind::Queue { topic } => write!(f, "queue {topic}"),
+            TriggerKind::Cron { schedule, .. } => write!(f, "cron {schedule}"),
+            TriggerKind::Blob { prefix } => write!(f, "blob {prefix}"),
+            TriggerKind::Webhook { path, .. } => write!(f, "webhook {path}"),
+            TriggerKind::Stream { topics, .. } => write!(f, "stream {}", topics.join(",")),
+        }
+    }
 }
 
 /// A **stored trigger** bound to a top-level function — the durable form the

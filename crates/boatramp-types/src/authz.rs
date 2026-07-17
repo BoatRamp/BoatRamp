@@ -85,6 +85,18 @@ impl Action {
     }
 }
 
+impl std::fmt::Display for Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single grant or requirement: an `action` on a `resource`, optionally scoped
 /// to a `target` (a site name for [`Resource::Site`]). A `target` of `None` on a
 /// *granted* right is a wildcard ("all targets"); a required right for a site
