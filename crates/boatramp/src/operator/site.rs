@@ -103,7 +103,7 @@ async fn apply(client: &Client, ns: &str, site: &Site) -> Result<Action> {
                 &name,
                 "Pending: cluster has no adminTokenSecret",
             )
-            .await?
+            .await?;
         }
     }
     Ok(Action::requeue(Duration::from_secs(300)))
@@ -120,7 +120,7 @@ async fn cleanup(client: &Client, ns: &str, site: &Site) -> Result<Action> {
                 .bearer_auth(&token)
                 .send()
                 .await
-                .and_then(|r| r.error_for_status());
+                .and_then(reqwest::Response::error_for_status);
         }
     }
     Ok(Action::await_change())

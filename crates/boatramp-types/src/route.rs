@@ -757,7 +757,10 @@ mod tests {
         use crate::config::HandlerConfig;
         let handler = |route: &str, methods: &[&str]| HandlerConfig {
             route: route.into(),
-            methods: methods.iter().map(|s| s.to_string()).collect(),
+            methods: methods
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             component: "h.wasm".into(),
             imports: Vec::new(),
             limits: None,

@@ -21,9 +21,9 @@ enum LbArg {
 impl From<LbArg> for LbPolicy {
     fn from(a: LbArg) -> Self {
         match a {
-            LbArg::RoundRobin => LbPolicy::RoundRobin,
-            LbArg::Random => LbPolicy::Random,
-            LbArg::Nearest => LbPolicy::Nearest,
+            LbArg::RoundRobin => Self::RoundRobin,
+            LbArg::Random => Self::Random,
+            LbArg::Nearest => Self::Nearest,
         }
     }
 }

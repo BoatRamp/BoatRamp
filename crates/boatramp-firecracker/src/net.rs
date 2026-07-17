@@ -21,7 +21,7 @@ impl HostCommand {
     pub fn new(program: &str, args: &[&str]) -> Self {
         Self {
             program: program.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
+            args: args.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 }

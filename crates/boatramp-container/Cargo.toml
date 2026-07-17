@@ -54,3 +54,6 @@ ipnet.workspace = true
 serde_json.workspace = true
 # Build an in-memory rootfs blob stream for the `materialize` staging test.
 bytes.workspace = true
+
+[lints]
+workspace = true

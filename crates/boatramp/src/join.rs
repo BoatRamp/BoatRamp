@@ -96,7 +96,7 @@ impl JoinTicket {
         let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(b64)
             .map_err(|e| JoinError::Ticket(e.to_string()))?;
-        let ticket: JoinTicket =
+        let ticket: Self =
             serde_json::from_slice(&json).map_err(|e| JoinError::Ticket(e.to_string()))?;
         if ticket.seeds.is_empty() || ticket.root_pubkeys.is_empty() || ticket.token.is_empty() {
             return Err(JoinError::Ticket(

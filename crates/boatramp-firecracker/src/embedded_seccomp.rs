@@ -141,9 +141,9 @@ pub enum SeccompError {
 impl std::fmt::Display for SeccompError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SeccompError::Prctl(e) => write!(f, "prctl no_new_privs: {e}"),
-            SeccompError::UnknownSyscall(s) => write!(f, "unknown syscall in allow-list: {s}"),
-            SeccompError::Seccomp(e) => write!(f, "seccomp: {e}"),
+            Self::Prctl(e) => write!(f, "prctl no_new_privs: {e}"),
+            Self::UnknownSyscall(s) => write!(f, "unknown syscall in allow-list: {s}"),
+            Self::Seccomp(e) => write!(f, "seccomp: {e}"),
         }
     }
 }

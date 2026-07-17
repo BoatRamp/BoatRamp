@@ -188,20 +188,22 @@ impl S3Storage {
 #[async_trait]
 impl Storage for S3Storage {
     async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|err| {
-                if err.as_service_error().is_some_and(|e| e.is_no_such_key()) {
-                    StorageError::NotFound(key.to_string())
-                } else {
-                    sdk_err(err)
-                }
-            })?;
+        let resp =
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|err| {
+                    if err.as_service_error().is_some_and(
+                        aws_sdk_s3::operation::get_object::GetObjectError::is_no_such_key,
+                    ) {
+                        StorageError::NotFound(key.to_string())
+                    } else {
+                        sdk_err(err)
+                    }
+                })?;
 
         let meta = ObjectMeta {
             key: key.to_string(),
@@ -228,21 +230,23 @@ impl Storage for S3Storage {
             Some(n) if n > 0 => format!("bytes={}-{}", offset, offset + n - 1),
             _ => format!("bytes={offset}-"),
         };
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .range(range)
-            .send()
-            .await
-            .map_err(|err| {
-                if err.as_service_error().is_some_and(|e| e.is_no_such_key()) {
-                    StorageError::NotFound(key.to_string())
-                } else {
-                    sdk_err(err)
-                }
-            })?;
+        let resp =
+            self.client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .range(range)
+                .send()
+                .await
+                .map_err(|err| {
+                    if err.as_service_error().is_some_and(
+                        aws_sdk_s3::operation::get_object::GetObjectError::is_no_such_key,
+                    ) {
+                        StorageError::NotFound(key.to_string())
+                    } else {
+                        sdk_err(err)
+                    }
+                })?;
 
         let meta = ObjectMeta {
             key: key.to_string(),
@@ -318,20 +322,22 @@ impl Storage for S3Storage {
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
-        let resp = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|err| {
-                if err.as_service_error().is_some_and(|e| e.is_not_found()) {
-                    StorageError::NotFound(key.to_string())
-                } else {
-                    sdk_err(err)
-                }
-            })?;
+        let resp =
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|err| {
+                    if err.as_service_error().is_some_and(
+                        aws_sdk_s3::operation::head_object::HeadObjectError::is_not_found,
+                    ) {
+                        StorageError::NotFound(key.to_string())
+                    } else {
+                        sdk_err(err)
+                    }
+                })?;
 
         Ok(ObjectMeta {
             key: key.to_string(),

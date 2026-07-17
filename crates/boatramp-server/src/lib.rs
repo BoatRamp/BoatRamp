@@ -570,7 +570,7 @@ struct BootstrapInner {
 
 impl BootstrapGate {
     fn new(secret: Option<&str>) -> Self {
-        BootstrapGate(secret.filter(|s| !s.is_empty()).map(|s| {
+        Self(secret.filter(|s| !s.is_empty()).map(|s| {
             Arc::new(BootstrapInner {
                 secret_hash: boatramp_core::deploy::sha256_hex(s.as_bytes()),
                 lock: tokio::sync::Mutex::new(()),
@@ -1565,7 +1565,7 @@ async fn list_functions(
             let trigs = triggers
                 .iter()
                 .filter(|t| t.target.as_ref().map(|r| r.name.as_str()) == Some(f.name.as_str()))
-                .map(|t| t.to_string())
+                .map(std::string::ToString::to_string)
                 .collect();
             out.push(FunctionSummary {
                 name: format!("{site}/{}", f.name),
@@ -4648,7 +4648,7 @@ async fn serve_request(
             let path_and_query = request
                 .uri()
                 .path_and_query()
-                .map(|pq| pq.as_str())
+                .map(axum::http::uri::PathAndQuery::as_str)
                 .unwrap_or(request_path);
             if let Some(target) = boatramp_core::config::transport_redirect(
                 &cfg.security,
@@ -4821,7 +4821,7 @@ async fn redirect_http_to_https(req: Request) -> Response {
     let path_and_query = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str())
+        .map(axum::http::uri::PathAndQuery::as_str)
         .unwrap_or("/");
     match HeaderValue::from_str(&format!("https://{host}{path_and_query}")) {
         Ok(location) => (
@@ -5928,7 +5928,7 @@ async fn proxy(request: Request, url: &str, config: &DeployConfig, client_ip: Ip
 
     let mut upstream = client.request(parts.method, parsed);
     // Forward request headers minus hop-by-hop and Host (reqwest sets Host).
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         if name == header::HOST || is_hop_by_hop(name) {
             continue;
         }
@@ -5949,7 +5949,7 @@ async fn proxy(request: Request, url: &str, config: &DeployConfig, client_ip: Ip
             // Pass response headers through, minus hop-by-hop + content-length
             // (we re-stream, so let the framing be recomputed).
             let mut headers = HeaderMap::new();
-            for (name, value) in resp.headers().iter() {
+            for (name, value) in resp.headers() {
                 if is_hop_by_hop(name) || name == header::CONTENT_LENGTH {
                     continue;
                 }
@@ -6411,7 +6411,7 @@ async fn proxy_upstream(
     let requested_host = parts.headers.get(header::HOST).cloned();
 
     let mut up = client.request(parts.method.clone(), target);
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         // reqwest sets Host from the URL (or our override below); drop the
         // client Host + hop-by-hop, and any header the upstream removes.
         if name == header::HOST
@@ -6448,7 +6448,7 @@ async fn proxy_upstream(
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut headers = HeaderMap::new();
-            for (name, value) in resp.headers().iter() {
+            for (name, value) in resp.headers() {
                 if is_hop_by_hop(name)
                     || name == header::CONTENT_LENGTH
                     || upstream
@@ -6541,7 +6541,7 @@ async fn proxy_upstream_unix(
     let mut builder = hyper::Request::builder()
         .method(parts.method.clone())
         .uri(uri);
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         if name == header::HOST
             || is_hop_by_hop(name)
             || upstream
@@ -6571,7 +6571,7 @@ async fn proxy_upstream_unix(
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut headers = HeaderMap::new();
-            for (name, value) in resp.headers().iter() {
+            for (name, value) in resp.headers() {
                 if is_hop_by_hop(name)
                     || name == header::CONTENT_LENGTH
                     || upstream
@@ -6771,7 +6771,7 @@ where
     let mut builder = hyper::Request::builder().method(method).uri(uri);
     // Forward all headers (the handshake NEEDS Connection/Upgrade/Sec-WebSocket-*),
     // replacing Host and honoring the upstream's header rewrites.
-    for (name, value) in req_headers.iter() {
+    for (name, value) in &req_headers {
         if name == header::HOST
             || upstream
                 .header_up
@@ -6814,7 +6814,7 @@ where
         });
         // Return the upstream's 101 (with its Upgrade/Sec-WebSocket-Accept headers).
         let mut headers = HeaderMap::new();
-        for (name, value) in upstream_resp.headers().iter() {
+        for (name, value) in upstream_resp.headers() {
             headers.insert(name.clone(), value.clone());
         }
         return (StatusCode::SWITCHING_PROTOCOLS, headers, Body::empty()).into_response();
@@ -6824,7 +6824,7 @@ where
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
-    for (name, value) in upstream_resp.headers().iter() {
+    for (name, value) in upstream_resp.headers() {
         if name == header::CONTENT_LENGTH {
             continue;
         }

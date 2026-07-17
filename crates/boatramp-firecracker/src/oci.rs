@@ -29,11 +29,11 @@ pub enum OciError {
 impl std::fmt::Display for OciError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OciError::Io(e) => write!(f, "io error: {e}"),
-            OciError::UnsafePath(p) => write!(f, "unsafe path in layer: {p}"),
-            OciError::Registry(m) => write!(f, "registry error: {m}"),
-            OciError::Mkfs(m) => write!(f, "mke2fs error: {m}"),
-            OciError::BadReference(m) => write!(f, "bad image reference: {m}"),
+            Self::Io(e) => write!(f, "io error: {e}"),
+            Self::UnsafePath(p) => write!(f, "unsafe path in layer: {p}"),
+            Self::Registry(m) => write!(f, "registry error: {m}"),
+            Self::Mkfs(m) => write!(f, "mke2fs error: {m}"),
+            Self::BadReference(m) => write!(f, "bad image reference: {m}"),
         }
     }
 }
@@ -42,7 +42,7 @@ impl std::error::Error for OciError {}
 
 impl From<std::io::Error> for OciError {
     fn from(e: std::io::Error) -> Self {
-        OciError::Io(e)
+        Self::Io(e)
     }
 }
 

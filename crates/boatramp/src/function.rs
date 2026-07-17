@@ -558,7 +558,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 expect_status,
                 expect_body,
             )
-            .await?
+            .await?;
         }
         #[cfg(feature = "handlers")]
         FunctionCommand::Dev { component, port } => harness::dev_serve(component, port).await?,
@@ -985,7 +985,7 @@ mod harness {
                                 let bytes = body
                                     .collect()
                                     .await
-                                    .map(|c| c.to_bytes())
+                                    .map(http_body_util::Collected::to_bytes)
                                     .unwrap_or_default();
                                 http::Response::from_parts(parts, Full::new(bytes))
                             }

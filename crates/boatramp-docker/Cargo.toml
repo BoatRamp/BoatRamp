@@ -19,3 +19,6 @@ tokio = { workspace = true, features = ["time"] }
 # `docker_live` integration test (self-skips without a daemon) needs a runtime.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 boatramp-types.workspace = true
+
+[lints]
+workspace = true

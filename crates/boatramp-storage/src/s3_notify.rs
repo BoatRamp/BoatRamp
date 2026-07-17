@@ -401,7 +401,7 @@ fn entry_from(
 ) -> NotifyEntry {
     let prefix = filter
         .and_then(|f| f.key())
-        .map(|k| k.filter_rules())
+        .map(aws_sdk_s3::types::S3KeyFilter::filter_rules)
         .into_iter()
         .flatten()
         .find(|r| {

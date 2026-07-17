@@ -71,7 +71,7 @@ impl SignerError {
     /// backends (dead when none are enabled).
     #[allow(dead_code)]
     pub(crate) fn backend(backend: &'static str, message: impl std::fmt::Display) -> Self {
-        SignerError::Backend {
+        Self::Backend {
             backend,
             message: message.to_string(),
         }
@@ -81,8 +81,8 @@ impl SignerError {
     /// baked into config on disk. Feature-gated
     /// backends only.
     #[allow(dead_code)]
-    pub(crate) fn env(name: &str) -> Result<String, SignerError> {
-        std::env::var(name).map_err(|_| SignerError::MissingEnv(name.to_string()))
+    pub(crate) fn env(name: &str) -> Result<String, Self> {
+        std::env::var(name).map_err(|_| Self::MissingEnv(name.to_string()))
     }
 }
 

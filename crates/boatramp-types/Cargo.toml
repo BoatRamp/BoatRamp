@@ -32,3 +32,6 @@ getrandom = { workspace = true, features = ["js"] }
 [dev-dependencies]
 # `domain_verify`'s tests use `#[tokio::test]`.
 tokio = { workspace = true }
+
+[lints]
+workspace = true

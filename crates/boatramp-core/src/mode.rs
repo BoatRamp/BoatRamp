@@ -45,9 +45,9 @@ impl DeploymentMode {
     /// cluster on Containers, so it shares the cluster's coordinator.
     pub fn coordinator(self) -> &'static str {
         match self {
-            DeploymentMode::SingleNode => "the process itself (in-process mutex)",
-            DeploymentMode::Cluster => "the Raft leader",
-            DeploymentMode::Cloudflare => "the Raft leader (cluster on CF Containers)",
+            Self::SingleNode => "the process itself (in-process mutex)",
+            Self::Cluster => "the Raft leader",
+            Self::Cloudflare => "the Raft leader (cluster on CF Containers)",
         }
     }
 
@@ -59,15 +59,15 @@ impl DeploymentMode {
     /// generation (`boatramp deploy --target cloudflare`). The boatramp binary
     /// itself runs unchanged in either case.
     pub fn needs_managed_deployment(self) -> bool {
-        matches!(self, DeploymentMode::Cloudflare)
+        matches!(self, Self::Cloudflare)
     }
 
     /// The lowercase, kebab-case wire/config name.
     pub fn as_str(self) -> &'static str {
         match self {
-            DeploymentMode::SingleNode => "single-node",
-            DeploymentMode::Cluster => "cluster",
-            DeploymentMode::Cloudflare => "cloudflare",
+            Self::SingleNode => "single-node",
+            Self::Cluster => "cluster",
+            Self::Cloudflare => "cloudflare",
         }
     }
 }
@@ -83,9 +83,9 @@ impl std::str::FromStr for DeploymentMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "single-node" | "single" => Ok(DeploymentMode::SingleNode),
-            "cluster" => Ok(DeploymentMode::Cluster),
-            "cloudflare" | "cf" => Ok(DeploymentMode::Cloudflare),
+            "single-node" | "single" => Ok(Self::SingleNode),
+            "cluster" => Ok(Self::Cluster),
+            "cloudflare" | "cf" => Ok(Self::Cloudflare),
             other => Err(format!(
                 "unknown deployment mode `{other}` (expected single-node | cluster | cloudflare)"
             )),

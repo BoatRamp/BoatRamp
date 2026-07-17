@@ -30,7 +30,7 @@ fn one() -> u32 {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        RetryPolicy { max_attempts: 1 }
+        Self { max_attempts: 1 }
     }
 }
 
@@ -103,7 +103,7 @@ impl Workflow {
         let mut state: BTreeMap<&str, u8> =
             self.steps.iter().map(|s| (s.id.as_str(), 0u8)).collect();
         // Iterative DFS to avoid recursion depth limits on a large workflow.
-        for root in self.steps.iter() {
+        for root in &self.steps {
             if state[root.id.as_str()] != 0 {
                 continue;
             }
@@ -226,7 +226,7 @@ impl WorkflowRun {
                 )
             })
             .collect();
-        WorkflowRun {
+        Self {
             id: id.into(),
             workflow: workflow.name.clone(),
             status: WorkflowStatus::Running,
@@ -299,7 +299,7 @@ mod tests {
         Step {
             id: id.to_string(),
             function: format!("fn-{id}"),
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            depends_on: deps.iter().map(std::string::ToString::to_string).collect(),
             retry: RetryPolicy::default(),
             compensate: None,
         }

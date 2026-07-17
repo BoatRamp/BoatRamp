@@ -145,7 +145,7 @@ pub fn build(num_cpus: u8) -> Vec<u8> {
     mpf[9] = MPC_SPEC;
     // mpf[10] = checksum (computed below); mpf[11..16] feature bytes = 0
     let mut s: u8 = 0;
-    for &b in mpf.iter() {
+    for &b in &mpf {
         s = s.wrapping_add(b);
     }
     mpf[10] = (!s).wrapping_add(1);

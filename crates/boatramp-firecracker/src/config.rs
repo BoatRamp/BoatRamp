@@ -117,7 +117,7 @@ impl FcMachine {
             .kernel_cmdline
             .clone()
             .unwrap_or_else(|| default_cmdline(&resources.guest_ip));
-        FcMachine {
+        Self {
             boot_source: BootSource {
                 kernel_image_path: resources.kernel_path.clone(),
                 boot_args,

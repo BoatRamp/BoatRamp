@@ -42,7 +42,7 @@ impl Peers {
     /// A directory seeded with `initial` entries (empty for a pure dynamic-join
     /// node that learns every peer at join time).
     pub fn new(initial: BTreeMap<NodeId, String>) -> Self {
-        Peers(Arc::new(std::sync::RwLock::new(initial)))
+        Self(Arc::new(std::sync::RwLock::new(initial)))
     }
 
     /// The base URL for `node`, if known.

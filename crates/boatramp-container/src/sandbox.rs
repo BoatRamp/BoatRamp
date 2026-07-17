@@ -42,7 +42,7 @@ impl Mount {
             source: source.to_string(),
             target: target.to_string(),
             fstype: fstype.to_string(),
-            flags: flags.iter().map(|f| f.to_string()).collect(),
+            flags: flags.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 }
@@ -163,7 +163,7 @@ impl SandboxPlan {
             memory_max_bytes: Some(u64::from(spec.mem_mib.max(1)) * 1024 * 1024),
             pids_max: Some(DEFAULT_PIDS_MAX),
         };
-        SandboxPlan {
+        Self {
             root: root.into(),
             hostname: hostname.into(),
             uid,

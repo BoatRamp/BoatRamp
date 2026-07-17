@@ -74,3 +74,6 @@ tokio = { workspace = true, features = [
 serial_test = "3"
 # Serves the mesh routers over mutual TLS in the multi-node acceptance tests.
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+
+[lints]
+workspace = true

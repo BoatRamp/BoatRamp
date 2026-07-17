@@ -62,7 +62,7 @@ impl IsolationRequirement {
     /// Whether this is the default (`Trusted`) — used to omit it from the
     /// serialized spec so existing specs keep their content hash.
     pub fn is_trusted(&self) -> bool {
-        matches!(self, IsolationRequirement::Trusted)
+        matches!(self, Self::Trusted)
     }
 }
 

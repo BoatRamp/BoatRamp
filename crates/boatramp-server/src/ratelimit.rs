@@ -89,7 +89,7 @@ pub trait RateLimitStore: Send + Sync {
 impl RateLimitStore for RateLimiter {
     async fn check(&self, site: &str, ip: IpAddr, limit: &RateLimit) -> bool {
         // The in-process bucket is a synchronous arithmetic step.
-        RateLimiter::check(self, site, ip, limit)
+        Self::check(self, site, ip, limit)
     }
 }
 

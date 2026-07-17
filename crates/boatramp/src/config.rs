@@ -32,7 +32,7 @@ pub enum ConfigError {
     File {
         path: String,
         #[source]
-        source: Box<ConfigError>,
+        source: Box<Self>,
     },
     /// The RON document failed to parse.
     #[error("invalid config syntax: {0}")]
@@ -408,8 +408,8 @@ pub enum SignerAlg {
 impl SignerAlg {
     fn to_token_alg(self) -> boatramp_core::cose::TokenAlg {
         match self {
-            SignerAlg::Es256 => boatramp_core::cose::TokenAlg::Es256,
-            SignerAlg::Ed25519 => boatramp_core::cose::TokenAlg::Ed25519,
+            Self::Es256 => boatramp_core::cose::TokenAlg::Es256,
+            Self::Ed25519 => boatramp_core::cose::TokenAlg::Ed25519,
         }
     }
 }
@@ -485,10 +485,10 @@ impl AuthSignerConfig {
     pub fn to_signer_config(&self) -> boatramp_server::signer::SignerConfig {
         use boatramp_server::signer::SignerConfig;
         match self {
-            AuthSignerConfig::Local { private_key } => SignerConfig::Local {
+            Self::Local { private_key } => SignerConfig::Local {
                 private_key: private_key.clone(),
             },
-            AuthSignerConfig::Vault {
+            Self::Vault {
                 address,
                 key,
                 token_env,
@@ -499,18 +499,18 @@ impl AuthSignerConfig {
                 token_env: token_env.clone(),
                 alg: alg.to_token_alg(),
             },
-            AuthSignerConfig::AwsKms { key_id, region } => SignerConfig::AwsKms {
+            Self::AwsKms { key_id, region } => SignerConfig::AwsKms {
                 key_id: key_id.clone(),
                 region: region.clone(),
             },
-            AuthSignerConfig::GcpKms {
+            Self::GcpKms {
                 key_version,
                 access_token_env,
             } => SignerConfig::GcpKms {
                 key_version: key_version.clone(),
                 access_token_env: access_token_env.clone(),
             },
-            AuthSignerConfig::AzureKv {
+            Self::AzureKv {
                 vault_url,
                 key,
                 key_version,
@@ -521,7 +521,7 @@ impl AuthSignerConfig {
                 key_version: key_version.clone(),
                 access_token_env: access_token_env.clone(),
             },
-            AuthSignerConfig::Pkcs11 {
+            Self::Pkcs11 {
                 module,
                 token_label,
                 key_label,

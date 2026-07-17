@@ -23,8 +23,8 @@ pub enum IpamError {
 impl std::fmt::Display for IpamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IpamError::BadCidr(c) => write!(f, "invalid IPAM CIDR: {c}"),
-            IpamError::Exhausted => write!(f, "IPAM pool exhausted"),
+            Self::BadCidr(c) => write!(f, "invalid IPAM CIDR: {c}"),
+            Self::Exhausted => write!(f, "IPAM pool exhausted"),
         }
     }
 }

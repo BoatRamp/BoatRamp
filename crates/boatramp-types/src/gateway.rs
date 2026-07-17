@@ -155,7 +155,7 @@ pub enum LbPolicy {
 
 impl LbPolicy {
     fn is_default(&self) -> bool {
-        matches!(self, LbPolicy::RoundRobin)
+        matches!(self, Self::RoundRobin)
     }
 }
 

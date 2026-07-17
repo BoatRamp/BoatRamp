@@ -77,13 +77,13 @@ pub enum KvHostError {
 
 impl From<ResourceTableError> for KvHostError {
     fn from(err: ResourceTableError) -> Self {
-        KvHostError::Other(err.to_string())
+        Self::Other(err.to_string())
     }
 }
 
 impl From<boatramp_core::kv::KvError> for KvHostError {
     fn from(err: boatramp_core::kv::KvError) -> Self {
-        KvHostError::Other(err.to_string())
+        Self::Other(err.to_string())
     }
 }
 

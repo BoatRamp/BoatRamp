@@ -84,7 +84,7 @@ impl LibsqlSql {
     /// Route this backend's read-only transactions to `replica` (its primary
     /// `db` still serves writes). Used to wire a sqld read replica behind a
     /// primary; reads on it are eventually consistent.
-    pub fn with_read_replica(mut self, replica: LibsqlSql) -> Self {
+    pub fn with_read_replica(mut self, replica: Self) -> Self {
         self.read_db = Some(replica.db);
         self
     }

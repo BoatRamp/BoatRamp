@@ -51,8 +51,8 @@ impl VerificationMethod {
     /// The stable wire/CLI spelling.
     pub fn as_str(self) -> &'static str {
         match self {
-            VerificationMethod::Dns => "dns",
-            VerificationMethod::Http => "http",
+            Self::Dns => "dns",
+            Self::Http => "http",
         }
     }
 }
@@ -62,8 +62,8 @@ impl std::str::FromStr for VerificationMethod {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "dns" | "txt" | "dns-txt" => Ok(VerificationMethod::Dns),
-            "http" | "http-token" | "token" => Ok(VerificationMethod::Http),
+            "dns" | "txt" | "dns-txt" => Ok(Self::Dns),
+            "http" | "http-token" | "token" => Ok(Self::Http),
             other => Err(ConfigError::parse(format!(
                 "unknown verification method `{other}` (expected `dns` or `http`)"
             ))),

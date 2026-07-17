@@ -403,8 +403,8 @@ impl Reject {
     /// (bad signature, malformed, wrong algorithm) is also a 401.
     fn from_token_err(err: TokenError) -> Self {
         match err {
-            TokenError::Expired => Reject::unauthorized("token expired\n"),
-            _ => Reject::unauthorized("invalid token\n"),
+            TokenError::Expired => Self::unauthorized("token expired\n"),
+            _ => Self::unauthorized("invalid token\n"),
         }
     }
 }

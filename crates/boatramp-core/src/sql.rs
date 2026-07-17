@@ -68,16 +68,16 @@ pub enum SqlError {
 impl SqlError {
     /// Wrap any displayable error as [`SqlError::Other`].
     pub fn other<E: std::fmt::Display>(err: E) -> Self {
-        SqlError::Other(err.to_string())
+        Self::Other(err.to_string())
     }
 }
 
 impl std::fmt::Display for SqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SqlError::Syntax(m) => write!(f, "sql syntax error: {m}"),
-            SqlError::Constraint(m) => write!(f, "sql constraint error: {m}"),
-            SqlError::Other(m) => write!(f, "sql error: {m}"),
+            Self::Syntax(m) => write!(f, "sql syntax error: {m}"),
+            Self::Constraint(m) => write!(f, "sql constraint error: {m}"),
+            Self::Other(m) => write!(f, "sql error: {m}"),
         }
     }
 }

@@ -470,7 +470,10 @@ mod tests {
 
     fn pool(targets: &[&str]) -> Upstream {
         Upstream {
-            targets: targets.iter().map(|s| s.to_string()).collect(),
+            targets: targets
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             ..Default::default()
         }
     }
@@ -716,7 +719,11 @@ mod tests {
             .probe_once(&EmptyResolver, t0 + Duration::from_millis(10))
             .await;
 
-        let bs: Vec<String> = up.static_backends().iter().map(|s| s.to_string()).collect();
+        let bs: Vec<String> = up
+            .static_backends()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         let seen: std::collections::HashSet<String> = (0..8)
             .flat_map(|_| state.candidates(&bs, &up, t0 + Duration::from_millis(20), None))
             .collect();

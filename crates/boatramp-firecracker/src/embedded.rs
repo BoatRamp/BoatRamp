@@ -112,10 +112,10 @@ pub enum LayoutError {
 impl std::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LayoutError::TooManyDevices { requested, max } => {
+            Self::TooManyDevices { requested, max } => {
                 write!(f, "too many MMIO devices: requested {requested}, max {max}")
             }
-            LayoutError::TooManyE820Entries { requested, max } => {
+            Self::TooManyE820Entries { requested, max } => {
                 write!(f, "too many e820 entries: requested {requested}, max {max}")
             }
         }
@@ -294,7 +294,7 @@ impl EmbeddedPlan {
             cmdline.push(' ');
             cmdline.push_str(&mmio_cmdline_arg(&d.transport));
         }
-        Ok(EmbeddedPlan {
+        Ok(Self {
             mem_regions: ram_regions(mem_bytes),
             e820: e820_entries(mem_bytes),
             devices,

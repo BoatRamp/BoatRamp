@@ -129,7 +129,7 @@ impl Caveats {
 
     /// Tighten `self` by intersecting with `other` (the deeper block). Each field
     /// takes the more restrictive value; disjoint `only_site`s make it impossible.
-    fn tighten(&mut self, other: &Caveats) {
+    fn tighten(&mut self, other: &Self) {
         self.read_only |= other.read_only;
         self.impossible |= other.impossible;
         match (self.only_site.as_deref(), other.only_site.as_deref()) {
@@ -185,8 +185,8 @@ impl Caveats {
 
     /// Decode from the CBOR produced by [`to_cbor`](Self::to_cbor); unknown/ill-typed
     /// entries are ignored (never a panic on a hostile token).
-    fn from_cbor(value: &CborValue) -> Caveats {
-        let mut caveats = Caveats::default();
+    fn from_cbor(value: &CborValue) -> Self {
+        let mut caveats = Self::default();
         let CborValue::Map(entries) = value else {
             return caveats;
         };
@@ -218,14 +218,14 @@ pub enum TokenAlg {
 impl TokenAlg {
     fn iana(self) -> iana::Algorithm {
         match self {
-            TokenAlg::Es256 => iana::Algorithm::ES256,
-            TokenAlg::Ed25519 => iana::Algorithm::EdDSA,
+            Self::Es256 => iana::Algorithm::ES256,
+            Self::Ed25519 => iana::Algorithm::EdDSA,
         }
     }
     fn label(self) -> &'static str {
         match self {
-            TokenAlg::Es256 => "es256",
-            TokenAlg::Ed25519 => "ed25519",
+            Self::Es256 => "es256",
+            Self::Ed25519 => "ed25519",
         }
     }
 }
@@ -312,8 +312,8 @@ impl LocalSigner {
     /// The private key as `"<alg>:<hex>"` (store securely; shown once).
     pub fn private_hex(&self) -> String {
         match self {
-            LocalSigner::Es256(sk) => format!("es256:{}", hex::encode(sk.to_bytes())),
-            LocalSigner::Ed25519(sk) => format!("ed25519:{}", hex::encode(sk.to_bytes())),
+            Self::Es256(sk) => format!("es256:{}", hex::encode(sk.to_bytes())),
+            Self::Ed25519(sk) => format!("ed25519:{}", hex::encode(sk.to_bytes())),
         }
     }
 }
@@ -322,28 +322,28 @@ impl LocalSigner {
 impl Signer for LocalSigner {
     fn alg(&self) -> TokenAlg {
         match self {
-            LocalSigner::Es256(_) => TokenAlg::Es256,
-            LocalSigner::Ed25519(_) => TokenAlg::Ed25519,
+            Self::Es256(_) => TokenAlg::Es256,
+            Self::Ed25519(_) => TokenAlg::Ed25519,
         }
     }
 
     fn public_key(&self) -> TokenPublicKey {
         match self {
-            LocalSigner::Es256(sk) => TokenPublicKey::Es256(*sk.verifying_key()),
-            LocalSigner::Ed25519(sk) => TokenPublicKey::Ed25519(sk.verifying_key()),
+            Self::Es256(sk) => TokenPublicKey::Es256(*sk.verifying_key()),
+            Self::Ed25519(sk) => TokenPublicKey::Ed25519(sk.verifying_key()),
         }
     }
 
     async fn sign(&self, tbs: &[u8]) -> Result<Vec<u8>, TokenError> {
         match self {
-            LocalSigner::Es256(sk) => {
+            Self::Es256(sk) => {
                 use p256::ecdsa::signature::Signer as _;
                 let sig: p256::ecdsa::Signature = sk
                     .try_sign(tbs)
                     .map_err(|e| TokenError::Signer(e.to_string()))?;
                 Ok(sig.to_bytes().to_vec())
             }
-            LocalSigner::Ed25519(sk) => {
+            Self::Ed25519(sk) => {
                 use ed25519_dalek::Signer as _;
                 let sig = sk
                     .try_sign(tbs)
@@ -367,8 +367,8 @@ impl TokenPublicKey {
     /// This key's algorithm.
     pub fn alg(&self) -> TokenAlg {
         match self {
-            TokenPublicKey::Es256(_) => TokenAlg::Es256,
-            TokenPublicKey::Ed25519(_) => TokenAlg::Ed25519,
+            Self::Es256(_) => TokenAlg::Es256,
+            Self::Ed25519(_) => TokenAlg::Ed25519,
         }
     }
 
@@ -376,13 +376,13 @@ impl TokenPublicKey {
     /// 32-byte key. This is the config trust anchor (`auth_root_public_key`).
     pub fn to_hex(&self) -> String {
         match self {
-            TokenPublicKey::Es256(vk) => {
+            Self::Es256(vk) => {
                 format!(
                     "es256:{}",
                     hex::encode(vk.to_encoded_point(true).as_bytes())
                 )
             }
-            TokenPublicKey::Ed25519(vk) => format!("ed25519:{}", hex::encode(vk.as_bytes())),
+            Self::Ed25519(vk) => format!("ed25519:{}", hex::encode(vk.as_bytes())),
         }
     }
 
@@ -409,7 +409,7 @@ impl TokenPublicKey {
     pub fn from_hex(spec: &str) -> Result<Self, TokenError> {
         let (alg, raw) = split_tagged(spec)?;
         match alg {
-            TokenAlg::Es256 => Ok(TokenPublicKey::Es256(
+            TokenAlg::Es256 => Ok(Self::Es256(
                 p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw)
                     .map_err(|e| TokenError::Key(format!("es256 public key: {e}")))?,
             )),
@@ -418,7 +418,7 @@ impl TokenPublicKey {
                     .as_slice()
                     .try_into()
                     .map_err(|_| TokenError::Key("ed25519 public key must be 32 bytes".into()))?;
-                Ok(TokenPublicKey::Ed25519(
+                Ok(Self::Ed25519(
                     ed25519_dalek::VerifyingKey::from_bytes(&bytes)
                         .map_err(|e| TokenError::Key(format!("ed25519 public key: {e}")))?,
                 ))
@@ -432,14 +432,14 @@ impl TokenPublicKey {
     /// pinned-algorithm primitives.
     pub fn verify(&self, tbs: &[u8], sig: &[u8]) -> Result<(), TokenError> {
         match self {
-            TokenPublicKey::Es256(vk) => {
+            Self::Es256(vk) => {
                 use p256::ecdsa::signature::Verifier as _;
                 let sig = p256::ecdsa::Signature::from_slice(sig)
                     .map_err(|e| TokenError::Invalid(format!("es256 signature: {e}")))?;
                 vk.verify(tbs, &sig)
                     .map_err(|_| TokenError::Invalid("signature verification failed".into()))
             }
-            TokenPublicKey::Ed25519(vk) => {
+            Self::Ed25519(vk) => {
                 let sig = ed25519_dalek::Signature::from_slice(sig)
                     .map_err(|e| TokenError::Invalid(format!("ed25519 signature: {e}")))?;
                 vk.verify_strict(tbs, &sig)
@@ -1205,7 +1205,7 @@ fn cbor_to_roles(value: &CborValue) -> Vec<GrantedRole> {
         match parts.as_slice() {
             [CborValue::Text(name)] => out.push(GrantedRole::global(name)),
             [CborValue::Text(name), CborValue::Text(target)] => {
-                out.push(GrantedRole::scoped(name, target))
+                out.push(GrantedRole::scoped(name, target));
             }
             _ => {}
         }

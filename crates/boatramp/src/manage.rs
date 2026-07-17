@@ -180,7 +180,7 @@ pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<()> {
         }
         match (&meta.branch, &meta.source) {
             (Some(branch), Some(source)) => {
-                println!("  source      {branch}@{}", &source[..source.len().min(12)])
+                println!("  source      {branch}@{}", &source[..source.len().min(12)]);
             }
             (None, Some(source)) => println!("  source      {}", &source[..source.len().min(12)]),
             (Some(branch), None) => println!("  source      {branch}"),

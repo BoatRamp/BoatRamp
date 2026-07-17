@@ -149,20 +149,20 @@ impl From<wasmtime::Error> for HandlerError {
     /// Component-compile failures are mapped to [`HandlerError::Compile`]
     /// explicitly at the call site instead.
     fn from(err: wasmtime::Error) -> Self {
-        HandlerError::Internal(err.to_string())
+        Self::Internal(err.to_string())
     }
 }
 
 impl std::fmt::Display for HandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HandlerError::Compile(m) => write!(f, "component compile error: {m}"),
-            HandlerError::Trap(m) => write!(f, "handler trapped: {m}"),
-            HandlerError::Timeout => write!(f, "handler timed out"),
-            HandlerError::OutOfFuel => write!(f, "handler exhausted its CPU fuel budget"),
-            HandlerError::Overloaded => write!(f, "handler engine at capacity"),
-            HandlerError::NoResponse => write!(f, "handler produced no response"),
-            HandlerError::Internal(m) => write!(f, "handler engine error: {m}"),
+            Self::Compile(m) => write!(f, "component compile error: {m}"),
+            Self::Trap(m) => write!(f, "handler trapped: {m}"),
+            Self::Timeout => write!(f, "handler timed out"),
+            Self::OutOfFuel => write!(f, "handler exhausted its CPU fuel budget"),
+            Self::Overloaded => write!(f, "handler engine at capacity"),
+            Self::NoResponse => write!(f, "handler produced no response"),
+            Self::Internal(m) => write!(f, "handler engine error: {m}"),
         }
     }
 }

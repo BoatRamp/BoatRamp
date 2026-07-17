@@ -165,3 +165,6 @@ hyper = { workspace = true, features = ["server", "http1"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = [
   "connect",
 ] }
+
+[lints]
+workspace = true

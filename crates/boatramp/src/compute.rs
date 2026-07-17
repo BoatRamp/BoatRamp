@@ -168,9 +168,9 @@ enum Restart {
 impl From<Restart> for RestartPolicy {
     fn from(r: Restart) -> Self {
         match r {
-            Restart::Never => RestartPolicy::Never,
-            Restart::OnFailure => RestartPolicy::OnFailure,
-            Restart::Always => RestartPolicy::Always,
+            Restart::Never => Self::Never,
+            Restart::OnFailure => Self::OnFailure,
+            Restart::Always => Self::Always,
         }
     }
 }
@@ -186,8 +186,8 @@ enum Isolation {
 impl From<Isolation> for IsolationRequirement {
     fn from(i: Isolation) -> Self {
         match i {
-            Isolation::Trusted => IsolationRequirement::Trusted,
-            Isolation::Untrusted => IsolationRequirement::Untrusted,
+            Isolation::Trusted => Self::Trusted,
+            Isolation::Untrusted => Self::Untrusted,
         }
     }
 }

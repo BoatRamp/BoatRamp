@@ -36,6 +36,19 @@ license = "MIT OR Apache-2.0"
 authors = ["Giacomo Cariello <info@giacomocariello.com>"]
 repository = "https://github.com/BoatRamp/BoatRamp"
 
+# A curated idiomaticity floor, not a blanket `pedantic` opt-in. These are the
+# high-signal, reliably auto-fixable lints from the Rust idiomaticity review
+# (`docs/rust-idiomaticity-catalog.md`); the noisy majority of `pedantic`/`nursery`
+# is deliberately left off so the signal stays high. Crates opt in via
+# `[lints] workspace = true`. CI enforces them through `clippy -D warnings`.
+[workspace.lints.clippy]
+use_self = "warn"
+redundant_closure_for_method_calls = "warn"
+explicit_iter_loop = "warn"
+explicit_into_iter_loop = "warn"
+manual_string_new = "warn"
+semicolon_if_nothing_returned = "warn"
+
 [workspace.dependencies]
 boatramp-types = { path = "crates/boatramp-types", version = "0.1.0" }
 boatramp-core = { path = "crates/boatramp-core", version = "0.1.0" }

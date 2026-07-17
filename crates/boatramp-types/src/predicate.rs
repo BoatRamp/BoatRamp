@@ -44,12 +44,12 @@ enum Value {
     Bool(bool),
     Str(String),
     Int(i64),
-    List(Vec<Value>),
+    List(Vec<Self>),
 }
 
 impl Value {
     fn as_bool(&self) -> bool {
-        matches!(self, Value::Bool(true))
+        matches!(self, Self::Bool(true))
     }
 }
 
@@ -170,7 +170,7 @@ impl Predicate {
         collect_vary(&root, &mut vary);
         vary.sort();
         vary.dedup();
-        Ok(Predicate { root, vary })
+        Ok(Self { root, vary })
     }
 
     /// The header names whose values this predicate depends on — the response
@@ -243,7 +243,7 @@ impl Template {
     /// Compile a destination template: split on `${…}`, then parse + type-check
     /// each embedded expression (which must be string-typed). Errors surface at
     /// `validate`/`sync`, never at request time.
-    pub fn compile(src: &str) -> Result<Template, ConfigError> {
+    pub fn compile(src: &str) -> Result<Self, ConfigError> {
         let mut parts = Vec::new();
         let mut vary = Vec::new();
         let bytes = src.as_bytes();
@@ -279,7 +279,7 @@ impl Template {
         }
         vary.sort();
         vary.dedup();
-        Ok(Template { parts, vary })
+        Ok(Self { parts, vary })
     }
 
     /// Expand the template against a request: interpolate each `${…}` with its
@@ -509,25 +509,25 @@ enum Expr {
     Str(String),
     Int(i64),
     Bool(bool),
-    List(Vec<Expr>),
+    List(Vec<Self>),
     /// A bare variable (`path`) or a function call (`header("x")`).
     Var(String),
     Call {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Self>,
     },
     Method {
-        recv: Box<Expr>,
+        recv: Box<Self>,
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Self>,
     },
-    Not(Box<Expr>),
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
-    Eq(Box<Expr>, Box<Expr>),
-    NotEq(Box<Expr>, Box<Expr>),
-    In(Box<Expr>, Box<Expr>),
-    Concat(Box<Expr>, Box<Expr>),
+    Not(Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Eq(Box<Self>, Box<Self>),
+    NotEq(Box<Self>, Box<Self>),
+    In(Box<Self>, Box<Self>),
+    Concat(Box<Self>, Box<Self>),
 }
 
 struct Parser {
@@ -537,7 +537,7 @@ struct Parser {
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Self { tokens, pos: 0 }
     }
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
@@ -716,10 +716,10 @@ enum Type {
 impl Type {
     fn name(self) -> &'static str {
         match self {
-            Type::Bool => "bool",
-            Type::Str => "string",
-            Type::Int => "int",
-            Type::List => "list",
+            Self::Bool => "bool",
+            Self::Str => "string",
+            Self::Int => "int",
+            Self::List => "list",
         }
     }
 }

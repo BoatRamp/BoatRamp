@@ -35,8 +35,8 @@ pub enum Owner {
 impl std::fmt::Display for Owner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Owner::Site(s) => write!(f, "site:{s}"),
-            Owner::Project(p) => write!(f, "project:{p}"),
+            Self::Site(s) => write!(f, "site:{s}"),
+            Self::Project(p) => write!(f, "project:{p}"),
         }
     }
 }
@@ -68,9 +68,9 @@ impl Runtime {
     /// The snake_case wire term (matches the serde `rename_all`).
     pub fn as_str(self) -> &'static str {
         match self {
-            Runtime::Wasm => "wasm",
-            Runtime::Microvm => "microvm",
-            Runtime::Container => "container",
+            Self::Wasm => "wasm",
+            Self::Microvm => "microvm",
+            Self::Container => "container",
         }
     }
 }
@@ -152,7 +152,7 @@ impl WebhookConfig {
 
 impl FunctionConfig {
     fn from_handler(h: &HandlerConfig) -> Self {
-        FunctionConfig {
+        Self {
             imports: h.imports.clone(),
             limits: h.limits.clone(),
             env: h.env.clone(),
@@ -162,7 +162,7 @@ impl FunctionConfig {
         }
     }
     fn from_consumer(c: &ConsumerConfig) -> Self {
-        FunctionConfig {
+        Self {
             imports: c.imports.clone(),
             ..Default::default()
         }
@@ -303,7 +303,7 @@ impl Function {
         created: u64,
     ) -> Self {
         let hash = component_hash.into();
-        Function {
+        Self {
             name: name.into(),
             owner,
             versions: vec![FunctionVersion {
@@ -576,7 +576,7 @@ pub struct Metering {
 impl Metering {
     /// A fresh aggregate for `function`.
     pub fn new(function: impl Into<String>) -> Self {
-        Metering {
+        Self {
             function: function.into(),
             ..Default::default()
         }
@@ -815,9 +815,15 @@ mod tests {
     fn handler(route: &str, component: &str, methods: &[&str], imports: &[&str]) -> HandlerConfig {
         HandlerConfig {
             route: route.into(),
-            methods: methods.iter().map(|s| s.to_string()).collect(),
+            methods: methods
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             component: component.into(),
-            imports: imports.iter().map(|s| s.to_string()).collect(),
+            imports: imports
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             limits: None,
             env: BTreeMap::new(),
         }

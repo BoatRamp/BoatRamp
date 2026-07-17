@@ -268,7 +268,7 @@ type Result<T> = std::result::Result<T, Error>;
 #[cfg(feature = "cluster")]
 impl From<boatramp_cluster::node::BootstrapError> for Error {
     fn from(e: boatramp_cluster::node::BootstrapError) -> Self {
-        Error::Bootstrap(Box::new(e))
+        Self::Bootstrap(Box::new(e))
     }
 }
 
@@ -1720,7 +1720,7 @@ async fn run_cluster(
                         "cluster: rotated mesh key on schedule"
                     ),
                     Err(err) => {
-                        tracing::error!(%err, "cluster: scheduled mesh key rotation failed")
+                        tracing::error!(%err, "cluster: scheduled mesh key rotation failed");
                     }
                 }
             }
@@ -1986,19 +1986,19 @@ async fn serve_cluster_acme_dns(
                                     match boatramp_server::quinn_server_config(h3) {
                                         Ok(qc) => endpoint.set_server_config(Some(qc)),
                                         Err(err) => {
-                                            tracing::error!(%err, "cluster acme-dns: rebuilding h3 config failed")
+                                            tracing::error!(%err, "cluster acme-dns: rebuilding h3 config failed");
                                         }
                                     }
                                 }
                                 Err(err) => {
-                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed")
+                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
                                 }
                             }
                         } else {
                             match crate::acme_dns::build_server_config(entries) {
                                 Ok(config) => tls.reload_from_config(Arc::new(config)),
                                 Err(err) => {
-                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed")
+                                    tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
                                 }
                             }
                         }
@@ -2165,19 +2165,19 @@ async fn serve_acme_dns(
                                     match boatramp_server::quinn_server_config(h3) {
                                         Ok(qc) => endpoint.set_server_config(Some(qc)),
                                         Err(err) => {
-                                            tracing::error!(%err, "acme-dns: rebuilding h3 config failed")
+                                            tracing::error!(%err, "acme-dns: rebuilding h3 config failed");
                                         }
                                     }
                                 }
                                 Err(err) => {
-                                    tracing::error!(%err, "acme-dns: rebuilding TLS config failed")
+                                    tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                                 }
                             }
                         } else {
                             match crate::acme_dns::build_server_config(entries) {
                                 Ok(config) => tls.reload_from_config(Arc::new(config)),
                                 Err(err) => {
-                                    tracing::error!(%err, "acme-dns: rebuilding TLS config failed")
+                                    tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                                 }
                             }
                         }
@@ -2360,7 +2360,7 @@ fn build_sql_backends(
     // With none configured the default is returned unchanged (and a build
     // without an external SQL engine never has to link the sqlx path).
     let databases = cfg.map(|c| &c.databases);
-    if databases.is_none_or(|d| d.is_empty()) {
+    if databases.is_none_or(std::collections::BTreeMap::is_empty) {
         return Ok(default);
     }
     let databases = databases.expect("checked non-empty above");
@@ -2626,7 +2626,7 @@ async fn serve_rpk(
         {
             Ok(att) => options.bootstrap_attestation = Some(att),
             Err(err) => {
-                tracing::warn!(%err, "could not mint the bootstrap-TLS attestation; --root-pubkey pinning unavailable")
+                tracing::warn!(%err, "could not mint the bootstrap-TLS attestation; --root-pubkey pinning unavailable");
             }
         }
     }

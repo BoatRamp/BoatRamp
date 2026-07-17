@@ -51,24 +51,24 @@ pub enum Resource {
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Resource; 6] = [
-        Resource::Site,
-        Resource::Blobs,
-        Resource::Tokens,
-        Resource::Certs,
-        Resource::Cache,
-        Resource::System,
+    pub const ALL: [Self; 6] = [
+        Self::Site,
+        Self::Blobs,
+        Self::Tokens,
+        Self::Certs,
+        Self::Cache,
+        Self::System,
     ];
 
     /// The serde term for this resource (matches `rename_all`).
     pub fn as_str(self) -> &'static str {
         match self {
-            Resource::Site => "site",
-            Resource::Blobs => "blobs",
-            Resource::Tokens => "tokens",
-            Resource::Certs => "certs",
-            Resource::Cache => "cache",
-            Resource::System => "system",
+            Self::Site => "site",
+            Self::Blobs => "blobs",
+            Self::Tokens => "tokens",
+            Self::Certs => "certs",
+            Self::Cache => "cache",
+            Self::System => "system",
         }
     }
 }
@@ -77,10 +77,10 @@ impl Action {
     /// The serde term for this action (matches `rename_all`).
     pub fn as_str(self) -> &'static str {
         match self {
-            Action::Read => "read",
-            Action::Write => "write",
-            Action::Deploy => "deploy",
-            Action::Admin => "admin",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Deploy => "deploy",
+            Self::Admin => "admin",
         }
     }
 }
@@ -130,7 +130,7 @@ impl Right {
     /// Whether holding `self` (a *granted* right) satisfies a `required` right:
     /// same resource, the granted action matches or is [`Action::Admin`], and the
     /// granted target is a wildcard (`None`/`*`) or equals the required target.
-    pub fn satisfies(&self, required: &Right) -> bool {
+    pub fn satisfies(&self, required: &Self) -> bool {
         self.resource == required.resource
             && (self.action == required.action || self.action == Action::Admin)
             && target_matches(self.target.as_deref(), required.target.as_deref())
@@ -142,7 +142,7 @@ impl Right {
     /// This is the authoritative request→right table. Unknown
     /// `/api/sites/<s>/…` subpaths fall through to the most restrictive
     /// `system · admin` so a narrow token can never reach an unmapped action.
-    pub fn required(method: &str, path: &str) -> Option<Right> {
+    pub fn required(method: &str, path: &str) -> Option<Self> {
         let m = method.to_ascii_uppercase();
         let get = m == "GET";
 
@@ -172,7 +172,7 @@ impl Right {
         // Content blobs are content-addressed (not site-specific); uploading is
         // a deploy-grade action.
         if path.starts_with("/api/blobs/") {
-            return Some(Right::new(Resource::Blobs, None, Action::Deploy));
+            return Some(Self::new(Resource::Blobs, None, Action::Deploy));
         }
 
         // Attaching a host **without** an ownership proof (`domain add
@@ -182,7 +182,7 @@ impl Right {
         // `system·admin` explicitly, above the per-site branch that would
         // otherwise map it to the site-write right.
         if m == "POST" && path.contains("/domains/") && path.ends_with("/attach-unverified") {
-            return Some(Right::new(Resource::System, None, Action::Admin));
+            return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
         // Per-site endpoints: `/api/sites/<site>/<sub...>`.
@@ -191,49 +191,49 @@ impl Right {
             let site = segs.next().unwrap_or("");
             if site.is_empty() {
                 // `/api/sites/` (trailing slash) — listing.
-                return Some(Right::new(Resource::System, None, Action::Read));
+                return Some(Self::new(Resource::System, None, Action::Read));
             }
             let target = Some(site.to_string());
             let sub: Vec<&str> = segs.filter(|s| !s.is_empty()).collect();
             let action = site_subpath_action(&m, get, &sub);
             return Some(match action {
-                Some(a) => Right::new(Resource::Site, target, a),
+                Some(a) => Self::new(Resource::Site, target, a),
                 // Unknown subpath — deny-safe.
-                None => Right::new(Resource::System, None, Action::Admin),
+                None => Self::new(Resource::System, None, Action::Admin),
             });
         }
 
         // Exact, non-site endpoints.
         let right = match path {
-            "/api/sites" => Right::new(Resource::System, None, Action::Read),
+            "/api/sites" => Self::new(Resource::System, None, Action::Read),
             // Functions (FA-1/FA-2): read the function view with `system·read` (like
             // `/api/sites`); mutating a top-level function (deploy a version, alias,
             // rollback, delete) requires `system·admin`. (A per-owner `function`
             // resource with finer invoke/deploy rights lands in FA-4.)
             p if p == "/api/functions" || p.starts_with("/api/functions/") => {
                 let action = if get { Action::Read } else { Action::Admin };
-                Right::new(Resource::System, None, action)
+                Self::new(Resource::System, None, action)
             }
             // Workflows (FA-6): read the definitions/runs with `system·read`;
             // defining a workflow, starting a run, or deleting requires
             // `system·admin`. Same shape as `/api/functions`.
             p if p == "/api/workflows" || p.starts_with("/api/workflows/") => {
                 let action = if get { Action::Read } else { Action::Admin };
-                Right::new(Resource::System, None, action)
+                Self::new(Resource::System, None, action)
             }
-            "/api/blobs" => Right::new(Resource::Blobs, None, Action::Deploy),
-            "/api/certs" => Right::new(Resource::Certs, None, Action::Read),
-            "/api/cache/invalidate" => Right::new(Resource::Cache, None, Action::Write),
-            "/api/metrics" => Right::new(Resource::System, None, Action::Read),
-            "/api/prune" | "/api/scrub" => Right::new(Resource::System, None, Action::Admin),
+            "/api/blobs" => Self::new(Resource::Blobs, None, Action::Deploy),
+            "/api/certs" => Self::new(Resource::Certs, None, Action::Read),
+            "/api/cache/invalidate" => Self::new(Resource::Cache, None, Action::Write),
+            "/api/metrics" => Self::new(Resource::System, None, Action::Read),
+            "/api/prune" | "/api/scrub" => Self::new(Resource::System, None, Action::Admin),
             p if p == "/api/tokens" || p.starts_with("/api/tokens/") => {
-                Right::new(Resource::Tokens, None, Action::Admin)
+                Self::new(Resource::Tokens, None, Action::Admin)
             }
             p if p == "/api/authz/policy" || p.starts_with("/api/authz/") => {
-                Right::new(Resource::System, None, Action::Admin)
+                Self::new(Resource::System, None, Action::Admin)
             }
             // Any other `/api/*` path: deny-safe (must hold system·admin).
-            _ => Right::new(Resource::System, None, Action::Admin),
+            _ => Self::new(Resource::System, None, Action::Admin),
         };
         Some(right)
     }
@@ -348,7 +348,7 @@ impl RightSet {
 
 impl FromIterator<Right> for RightSet {
     fn from_iter<I: IntoIterator<Item = Right>>(iter: I) -> Self {
-        let mut set = RightSet::new();
+        let mut set = Self::new();
         for r in iter {
             set.insert(r);
         }
@@ -390,9 +390,9 @@ impl GrantedRole {
     pub fn parse(spec: &str) -> Self {
         match spec.split_once(':') {
             Some((name, target)) if !target.trim().is_empty() => {
-                GrantedRole::scoped(name.trim(), target.trim())
+                Self::scoped(name.trim(), target.trim())
             }
-            _ => GrantedRole::global(spec.trim()),
+            _ => Self::global(spec.trim()),
         }
     }
 }

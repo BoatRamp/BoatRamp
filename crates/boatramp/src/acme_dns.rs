@@ -38,7 +38,7 @@ pub enum Error {
     LoadingCert {
         pattern: String,
         #[source]
-        source: Box<Error>,
+        source: Box<Self>,
     },
     /// An ACME DNS-01 issuance failed.
     #[error(transparent)]

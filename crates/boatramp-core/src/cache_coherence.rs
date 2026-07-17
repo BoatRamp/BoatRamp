@@ -171,7 +171,7 @@ impl Changelog {
 #[async_trait]
 impl ChangePublisher for Changelog {
     async fn publish(&self, keys: &[String]) {
-        Changelog::publish(self, keys).await;
+        Self::publish(self, keys).await;
     }
 }
 

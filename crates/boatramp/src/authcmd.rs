@@ -146,7 +146,7 @@ pub async fn run(args: AuthArgs, config: &ProjectConfig) -> Result<()> {
         AuthCommand::Pin { root_pubkey } => run_pin(args.server, root_pubkey, config).await?,
         AuthCommand::Policy(command) => run_policy(command, args.server, config).await?,
         AuthCommand::RotateRoot { add, retire } => {
-            run_rotate_root(add, retire, args.server, config).await?
+            run_rotate_root(add, retire, args.server, config).await?;
         }
     }
     Ok(())

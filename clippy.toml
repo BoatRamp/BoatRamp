@@ -1,0 +1,28 @@
+# Clippy configuration for the curated idiomaticity floor (see the
+# `[workspace.lints.clippy]` table in the root `Cargo.toml`).
+
+# Pin the MSRV so clippy never suggests an API newer than what the crate targets.
+msrv = "1.82"
+
+# Project/library nouns that the `doc_markdown` lint would otherwise flag as
+# "should be in backticks". Kept here so the list is ready if `doc_markdown` is
+# added to the floor later.
+doc-valid-idents = [
+  "BoatRamp",
+  "SlateDB",
+  "OpenRaft",
+  "WebAssembly",
+  "WebSocket",
+  "PKCS11",
+  "SoftHSM",
+  "libsql",
+  "sqlx",
+  "wasmtime",
+  "microVM",
+  "MicroVM",
+  "rustls",
+  "nftables",
+  "Cloudflare",
+  "DigitalOcean",
+  "..",
+]

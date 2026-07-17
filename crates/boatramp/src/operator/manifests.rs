@@ -86,9 +86,19 @@ fn service_account(namespace: &str) -> ServiceAccount {
 /// only the workload/config resources the reconcilers own. **No** cluster-admin.
 fn cluster_role() -> ClusterRole {
     let rule = |groups: &[&str], resources: &[&str], verbs: &[&str]| PolicyRule {
-        api_groups: Some(groups.iter().map(|s| s.to_string()).collect()),
-        resources: Some(resources.iter().map(|s| s.to_string()).collect()),
-        verbs: verbs.iter().map(|s| s.to_string()).collect(),
+        api_groups: Some(
+            groups
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        ),
+        resources: Some(
+            resources
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        ),
+        verbs: verbs.iter().map(std::string::ToString::to_string).collect(),
         ..Default::default()
     };
     let all = &[

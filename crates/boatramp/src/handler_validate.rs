@@ -65,8 +65,8 @@ mod imp {
     impl Role {
         fn required_export(self) -> (&'static str, &'static str) {
             match self {
-                Role::Handler => ("wasi:http", "incoming-handler"),
-                Role::Consumer => ("wasi:messaging", "incoming-handler"),
+                Self::Handler => ("wasi:http", "incoming-handler"),
+                Self::Consumer => ("wasi:messaging", "incoming-handler"),
             }
         }
     }

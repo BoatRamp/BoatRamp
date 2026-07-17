@@ -29,9 +29,9 @@ pub enum ProvisionError {
 impl std::fmt::Display for ProvisionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProvisionError::Backend(m) => write!(f, "notification provisioning: {m}"),
-            ProvisionError::NotConfigured => write!(f, "no notification pipeline is configured"),
-            ProvisionError::Conflict(m) => write!(f, "notification conflict: {m}"),
+            Self::Backend(m) => write!(f, "notification provisioning: {m}"),
+            Self::NotConfigured => write!(f, "no notification pipeline is configured"),
+            Self::Conflict(m) => write!(f, "notification conflict: {m}"),
         }
     }
 }

@@ -88,3 +88,6 @@ lru = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
+
+[lints]
+workspace = true

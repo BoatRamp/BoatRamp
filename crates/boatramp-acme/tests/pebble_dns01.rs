@@ -45,7 +45,7 @@ impl DnsProvider for ChallTestSrv {
             }))
             .send()
             .await
-            .and_then(|r| r.error_for_status())
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
     }
@@ -56,7 +56,7 @@ impl DnsProvider for ChallTestSrv {
             .json(&serde_json::json!({ "host": format!("{}.", record.name) }))
             .send()
             .await
-            .and_then(|r| r.error_for_status())
+            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| DnsError::Backend(e.to_string()))?;
         Ok(())
     }

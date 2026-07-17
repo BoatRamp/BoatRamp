@@ -121,3 +121,6 @@ tokio = { workspace = true, features = [
 # only, matching the `embedded` module + its virtio-queue dep.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 virtio-queue = { version = "0.14", features = ["test-utils"] }
+
+[lints]
+workspace = true

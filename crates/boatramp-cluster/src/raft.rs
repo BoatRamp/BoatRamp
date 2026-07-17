@@ -111,7 +111,7 @@ pub enum WriteOp {
     Delete {
         key: String,
     },
-    Batch(Vec<WriteOp>),
+    Batch(Vec<Self>),
     /// Append a message's index record (`attempts=0`, claimable now). The
     /// payload was already written to shared `Storage` by the publisher.
     MqPublish {
@@ -599,10 +599,10 @@ impl StateMachineStore {
 #[async_trait::async_trait]
 impl AppliedState for StateMachineStore {
     async fn get(&self, key: &str) -> Option<Vec<u8>> {
-        StateMachineStore::get(self, key).await
+        Self::get(self, key).await
     }
     async fn list_prefix(&self, prefix: &str) -> Vec<String> {
-        StateMachineStore::list_prefix(self, prefix).await
+        Self::list_prefix(self, prefix).await
     }
 }
 

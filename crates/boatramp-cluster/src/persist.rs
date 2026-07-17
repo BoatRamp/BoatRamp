@@ -329,10 +329,10 @@ impl PersistentStateMachine {
 #[async_trait::async_trait]
 impl crate::raft::AppliedState for PersistentStateMachine {
     async fn get(&self, key: &str) -> Option<Vec<u8>> {
-        PersistentStateMachine::get(self, key).await
+        Self::get(self, key).await
     }
     async fn list_prefix(&self, prefix: &str) -> Vec<String> {
-        PersistentStateMachine::list_prefix(self, prefix).await
+        Self::list_prefix(self, prefix).await
     }
 }
 

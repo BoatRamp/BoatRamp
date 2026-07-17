@@ -5425,7 +5425,10 @@ fn cors_app(deploy: &DeployStore, auth: Auth, allowlist: &[&str]) -> axum::Route
         auth,
         HandlerRuntime::disabled(),
         ServerOptions {
-            cors_allowed_origins: allowlist.iter().map(|s| s.to_string()).collect(),
+            cors_allowed_origins: allowlist
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             ..Default::default()
         },
     )

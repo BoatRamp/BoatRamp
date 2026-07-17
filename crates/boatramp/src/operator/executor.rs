@@ -158,7 +158,7 @@ impl ClusterApi {
         let http = crate::join::pinned_client(&base, roots, now_unix())
             .await
             .map_err(|e| Error::Other(format!("pin {base}: {e}")))?;
-        Ok(ClusterApi {
+        Ok(Self {
             http,
             base,
             token: token.to_string(),

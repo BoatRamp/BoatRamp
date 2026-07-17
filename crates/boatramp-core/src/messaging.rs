@@ -61,15 +61,15 @@ pub enum MessagingError {
 
 impl MessagingError {
     fn backend<E: std::fmt::Display>(err: E) -> Self {
-        MessagingError::Backend(err.to_string())
+        Self::Backend(err.to_string())
     }
 }
 
 impl std::fmt::Display for MessagingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessagingError::Backend(m) => write!(f, "messaging backend error: {m}"),
-            MessagingError::Decode(m) => write!(f, "messaging decode error: {m}"),
+            Self::Backend(m) => write!(f, "messaging backend error: {m}"),
+            Self::Decode(m) => write!(f, "messaging decode error: {m}"),
         }
     }
 }

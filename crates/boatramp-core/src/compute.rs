@@ -40,7 +40,7 @@ impl IsolationClass {
     /// Whether this class is strong enough for untrusted multi-tenant code
     /// (a microVM or a managed platform — never a shared-kernel container).
     pub fn is_strong(self) -> bool {
-        matches!(self, IsolationClass::VmKvm | IsolationClass::Platform)
+        matches!(self, Self::VmKvm | Self::Platform)
     }
 
     /// Whether this class satisfies a workload's isolation requirement.
@@ -127,8 +127,8 @@ impl Scheme {
     /// The lowercase URL-scheme token (matches the serde `rename_all`).
     pub fn as_str(self) -> &'static str {
         match self {
-            Scheme::Http => "http",
-            Scheme::Https => "https",
+            Self::Http => "http",
+            Self::Https => "https",
         }
     }
 }
@@ -207,11 +207,11 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendError::Unsupported => write!(f, "operation not supported by this backend"),
-            BackendError::Materialize(d) => write!(f, "materialize: {d}"),
-            BackendError::Launch(d) => write!(f, "launch: {d}"),
-            BackendError::Stop(d) => write!(f, "stop: {d}"),
-            BackendError::Other(d) => write!(f, "{d}"),
+            Self::Unsupported => write!(f, "operation not supported by this backend"),
+            Self::Materialize(d) => write!(f, "materialize: {d}"),
+            Self::Launch(d) => write!(f, "launch: {d}"),
+            Self::Stop(d) => write!(f, "stop: {d}"),
+            Self::Other(d) => write!(f, "{d}"),
         }
     }
 }

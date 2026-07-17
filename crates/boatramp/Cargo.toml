@@ -355,3 +355,6 @@ fi
 post_uninstall_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
 """
+
+[lints]
+workspace = true

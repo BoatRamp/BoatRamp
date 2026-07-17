@@ -47,13 +47,13 @@ pub enum ExecError {
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecError::Command { program, detail } => {
+            Self::Command { program, detail } => {
                 write!(f, "host command `{program}`: {detail}")
             }
-            ExecError::Spawn(d) => write!(f, "spawn firecracker: {d}"),
-            ExecError::SocketTimeout(p) => write!(f, "API socket {} never appeared", p.display()),
-            ExecError::Api { path, detail } => write!(f, "firecracker API {path}: {detail}"),
-            ExecError::Io(d) => write!(f, "io: {d}"),
+            Self::Spawn(d) => write!(f, "spawn firecracker: {d}"),
+            Self::SocketTimeout(p) => write!(f, "API socket {} never appeared", p.display()),
+            Self::Api { path, detail } => write!(f, "firecracker API {path}: {detail}"),
+            Self::Io(d) => write!(f, "io: {d}"),
         }
     }
 }
@@ -157,7 +157,7 @@ impl LaunchPlan {
         tap: &TapNetwork,
         config: &ExecutorConfig,
     ) -> Self {
-        LaunchPlan {
+        Self {
             net_setup: tap.setup_commands(),
             spawn: spawn_command(vm_id, config),
             api_socket: config.api_socket(vm_id),
@@ -170,7 +170,7 @@ impl LaunchPlan {
     /// socket as a fresh launch, but no boot sequence — the snapshot the executor
     /// loads already carries the machine config / drives / boot-source.
     pub fn for_restore(vm_id: &str, tap: &TapNetwork, config: &ExecutorConfig) -> Self {
-        LaunchPlan {
+        Self {
             net_setup: tap.setup_commands(),
             spawn: spawn_command(vm_id, config),
             api_socket: config.api_socket(vm_id),

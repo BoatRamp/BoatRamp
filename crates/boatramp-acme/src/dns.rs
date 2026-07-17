@@ -24,10 +24,10 @@ impl RecordKind {
     /// The DNS type token (`A`, `AAAA`, `CNAME`, `TXT`).
     pub fn as_str(self) -> &'static str {
         match self {
-            RecordKind::A => "A",
-            RecordKind::Aaaa => "AAAA",
-            RecordKind::Cname => "CNAME",
-            RecordKind::Txt => "TXT",
+            Self::A => "A",
+            Self::Aaaa => "AAAA",
+            Self::Cname => "CNAME",
+            Self::Txt => "TXT",
         }
     }
 }
@@ -63,8 +63,8 @@ pub enum DnsError {
 impl std::fmt::Display for DnsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DnsError::Config(m) => write!(f, "dns config error: {m}"),
-            DnsError::Backend(m) => write!(f, "dns backend error: {m}"),
+            Self::Config(m) => write!(f, "dns config error: {m}"),
+            Self::Backend(m) => write!(f, "dns backend error: {m}"),
         }
     }
 }

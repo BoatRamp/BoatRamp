@@ -47,31 +47,31 @@ impl InstanceType {
     /// The wrangler `instance_type` string.
     pub fn as_str(self) -> &'static str {
         match self {
-            InstanceType::Dev => "dev",
-            InstanceType::Basic => "basic",
-            InstanceType::Standard => "standard",
+            Self::Dev => "dev",
+            Self::Basic => "basic",
+            Self::Standard => "standard",
         }
     }
 
     /// Memory ceiling (MiB) of this tier.
     pub fn mem_mib(self) -> u32 {
         match self {
-            InstanceType::Dev => 256,
-            InstanceType::Basic => 1024,
-            InstanceType::Standard => 4096,
+            Self::Dev => 256,
+            Self::Basic => 1024,
+            Self::Standard => 4096,
         }
     }
 
     /// The smallest tier whose memory envelope holds `mem_mib` (saturating to the
     /// largest tier — the platform rejects an over-large request at deploy, which
     /// is the right place to surface it).
-    pub fn for_mem(mem_mib: u32) -> InstanceType {
-        if mem_mib <= InstanceType::Dev.mem_mib() {
-            InstanceType::Dev
-        } else if mem_mib <= InstanceType::Basic.mem_mib() {
-            InstanceType::Basic
+    pub fn for_mem(mem_mib: u32) -> Self {
+        if mem_mib <= Self::Dev.mem_mib() {
+            Self::Dev
+        } else if mem_mib <= Self::Basic.mem_mib() {
+            Self::Basic
         } else {
-            InstanceType::Standard
+            Self::Standard
         }
     }
 }
@@ -125,8 +125,8 @@ impl CfContainer {
     /// Map a workload's `spec` (at `instances` replicas) to its CF-Container
     /// entry. The image is the spec's `rootfs` (for the CF/docker backends the
     /// `rootfs` field is an OCI image reference, not a blob hash).
-    pub fn for_spec(workload: &str, spec: &ComputeSpec, instances: u32) -> CfContainer {
-        CfContainer {
+    pub fn for_spec(workload: &str, spec: &ComputeSpec, instances: u32) -> Self {
+        Self {
             class_name: class_name_for(workload),
             image: spec.rootfs.clone(),
             instances,

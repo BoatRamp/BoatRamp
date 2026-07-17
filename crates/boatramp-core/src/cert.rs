@@ -78,10 +78,10 @@ pub enum CertError {
 impl std::fmt::Display for CertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CertError::Kv(e) => write!(f, "cert store kv error: {e}"),
-            CertError::Decode(m) => write!(f, "cert decode error: {m}"),
-            CertError::Issue(m) => write!(f, "cert issuance error: {m}"),
-            CertError::Envelope(m) => write!(f, "cert key envelope error: {m}"),
+            Self::Kv(e) => write!(f, "cert store kv error: {e}"),
+            Self::Decode(m) => write!(f, "cert decode error: {m}"),
+            Self::Issue(m) => write!(f, "cert issuance error: {m}"),
+            Self::Envelope(m) => write!(f, "cert key envelope error: {m}"),
         }
     }
 }
@@ -90,7 +90,7 @@ impl std::error::Error for CertError {}
 
 impl From<KvError> for CertError {
     fn from(e: KvError) -> Self {
-        CertError::Kv(e)
+        Self::Kv(e)
     }
 }
 

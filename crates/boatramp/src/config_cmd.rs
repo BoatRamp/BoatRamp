@@ -241,10 +241,10 @@ fn write_key(cfg: &mut DaemonConfig, key: &str, value: &str) -> Result<()> {
         "cluster_rate_limit" => cfg.cluster_rate_limit = clear_or(clear, parse_bool(key, value)?),
         "max_upload_bytes" => cfg.max_upload_bytes = clear_or(clear, parse_u64(key, value)?),
         "upload_idle_timeout_secs" => {
-            cfg.upload_idle_timeout_secs = clear_or(clear, parse_u64(key, value)?)
+            cfg.upload_idle_timeout_secs = clear_or(clear, parse_u64(key, value)?);
         }
         "max_concurrent_uploads" => {
-            cfg.max_concurrent_uploads = clear_or(clear, parse_u64(key, value)?)
+            cfg.max_concurrent_uploads = clear_or(clear, parse_u64(key, value)?);
         }
         "compute.vcpus" => cfg.compute.vcpus = clear_or(clear, parse_u64(key, value)? as u32),
         "compute.mem_mib" => cfg.compute.mem_mib = clear_or(clear, parse_u64(key, value)? as u32),
@@ -272,13 +272,13 @@ fn write_key(cfg: &mut DaemonConfig, key: &str, value: &str) -> Result<()> {
             }
         }
         "posture.oidc_require_audience" => {
-            cfg.posture.oidc_require_audience = clear_or(clear, parse_bool(key, value)?)
+            cfg.posture.oidc_require_audience = clear_or(clear, parse_bool(key, value)?);
         }
         "posture.ratelimit_fail_open" => {
-            cfg.posture.ratelimit_fail_open = clear_or(clear, parse_bool(key, value)?)
+            cfg.posture.ratelimit_fail_open = clear_or(clear, parse_bool(key, value)?);
         }
         "posture.allow_shared_kernel_compute" => {
-            cfg.posture.allow_shared_kernel_compute = clear_or(clear, parse_bool(key, value)?)
+            cfg.posture.allow_shared_kernel_compute = clear_or(clear, parse_bool(key, value)?);
         }
         _ => return Err(Error::UnknownKey(key.to_string())),
     }

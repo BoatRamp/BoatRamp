@@ -24,8 +24,8 @@ impl LogStream {
     /// Stable tag for the API / log line.
     pub fn as_str(self) -> &'static str {
         match self {
-            LogStream::Stdout => "stdout",
-            LogStream::Stderr => "stderr",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
         }
     }
 }

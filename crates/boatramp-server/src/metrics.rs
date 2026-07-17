@@ -29,10 +29,10 @@ pub enum Trigger {
 impl Trigger {
     fn as_str(self) -> &'static str {
         match self {
-            Trigger::Http => "http",
-            Trigger::Cron => "cron",
-            Trigger::Consumer => "consumer",
-            Trigger::Invoke => "invoke",
+            Self::Http => "http",
+            Self::Cron => "cron",
+            Self::Consumer => "consumer",
+            Self::Invoke => "invoke",
         }
     }
 }
@@ -53,25 +53,25 @@ impl Outcome {
     pub fn from_result<T>(result: &Result<T, boatramp_handlers::HandlerError>) -> Self {
         use boatramp_handlers::HandlerError;
         match result {
-            Ok(_) => Outcome::Ok,
-            Err(HandlerError::Timeout) => Outcome::Timeout,
-            Err(HandlerError::OutOfFuel) => Outcome::OutOfFuel,
-            Err(HandlerError::Overloaded) => Outcome::Overloaded,
-            Err(HandlerError::Trap(_)) => Outcome::Trap,
+            Ok(_) => Self::Ok,
+            Err(HandlerError::Timeout) => Self::Timeout,
+            Err(HandlerError::OutOfFuel) => Self::OutOfFuel,
+            Err(HandlerError::Overloaded) => Self::Overloaded,
+            Err(HandlerError::Trap(_)) => Self::Trap,
             Err(HandlerError::Compile(_))
             | Err(HandlerError::NoResponse)
-            | Err(HandlerError::Internal(_)) => Outcome::Error,
+            | Err(HandlerError::Internal(_)) => Self::Error,
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Outcome::Ok => "ok",
-            Outcome::Timeout => "timeout",
-            Outcome::OutOfFuel => "out-of-fuel",
-            Outcome::Overloaded => "overloaded",
-            Outcome::Trap => "trap",
-            Outcome::Error => "error",
+            Self::Ok => "ok",
+            Self::Timeout => "timeout",
+            Self::OutOfFuel => "out-of-fuel",
+            Self::Overloaded => "overloaded",
+            Self::Trap => "trap",
+            Self::Error => "error",
         }
     }
 }

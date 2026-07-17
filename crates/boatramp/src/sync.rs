@@ -317,7 +317,10 @@ async fn build_manifest(dir: &Path) -> Result<(Manifest, HashMap<String, BlobSou
     let mut manifest = Manifest::default();
     let mut blobs: HashMap<String, BlobSource> = HashMap::new();
 
-    for entry in WalkDir::new(dir).into_iter().filter_map(|entry| entry.ok()) {
+    for entry in WalkDir::new(dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
         if !entry.file_type().is_file() {
             continue;
         }
