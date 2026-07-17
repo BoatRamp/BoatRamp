@@ -4801,6 +4801,18 @@ async fn oidc_exchange_mints_a_token() {
     );
 }
 
+/// A default posture with mandatory domain-verification **disabled** — the
+/// operator-excluded path (`[security] require_domain_verification = false`). The
+/// host-routing / default-site / implicit-routing tests below exercise *routing*,
+/// so they opt out of the DV-2 serve gate (which otherwise 421s any unmatched,
+/// non-local host before routing is even consulted).
+fn routing_posture() -> boatramp_core::security::SecurityPosture {
+    boatramp_core::security::SecurityPosture {
+        require_domain_verification: false,
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn unmatched_host_serves_default_site() {
     let deploy = seed().await; // site "test" with an index
@@ -4810,6 +4822,7 @@ async fn unmatched_host_serves_default_site() {
         HandlerRuntime::disabled(),
         ServerOptions {
             default_site: Some("test".to_string()),
+            posture: routing_posture(),
             ..Default::default()
         },
     );
@@ -4844,7 +4857,10 @@ async fn unmatched_host_without_default_is_404() {
         deploy,
         Auth::disabled(),
         HandlerRuntime::disabled(),
-        ServerOptions::default(),
+        ServerOptions {
+            posture: routing_posture(),
+            ..Default::default()
+        },
     );
     let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
     req.headers_mut()
@@ -4921,9 +4937,11 @@ async fn implicit_first_label_routes_to_named_site() {
 }
 
 #[tokio::test]
-async fn implicit_sole_site_served_at_root() {
-    // One site, implicit on, no default_site: an unmatched host (whose label names
-    // no site) still serves the sole site — the zero-config single-site case.
+async fn sole_site_is_not_auto_served_without_default() {
+    // A sole site is **not** implicitly served for an unmatched host: a default
+    // site must be set explicitly by the operator — there is no "sole-site
+    // auto-default". (Even with exactly one site, a zero-config unmatched host is
+    // a 404, not that site.)
     let deploy = seed().await; // only "test"
     let app = router_with(
         deploy.clone(),
@@ -4931,27 +4949,28 @@ async fn implicit_sole_site_served_at_root() {
         HandlerRuntime::disabled(),
         ServerOptions {
             implicit_routing: true,
+            posture: routing_posture(),
             ..Default::default()
         },
     );
-    let (status, body) = get_host(app, "random.example").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"<h1>home</h1>");
+    let (status, _) = get_host(app, "random.example").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Publishing a second site turns the sole-site default off (ambiguous): an
-    // unmatched, non-site-label host now 404s.
-    publish_site(&deploy, "blog", b"<h1>blog</h1>").await;
+    // Setting the default site explicitly is what makes an unmatched host serve it.
     let app = router_with(
         deploy.clone(),
         Auth::disabled(),
         HandlerRuntime::disabled(),
         ServerOptions {
             implicit_routing: true,
+            default_site: Some("test".to_string()),
+            posture: routing_posture(),
             ..Default::default()
         },
     );
-    let (status, _) = get_host(app, "random.example").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = get_host(app, "random.example").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"<h1>home</h1>");
 }
 
 #[tokio::test]
@@ -4963,7 +4982,10 @@ async fn implicit_routing_off_is_strict() {
         deploy,
         Auth::disabled(),
         HandlerRuntime::disabled(),
-        ServerOptions::default(),
+        ServerOptions {
+            posture: routing_posture(),
+            ..Default::default()
+        },
     );
     let (status, _) = get_host(app, "test.localhost").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -5015,7 +5037,10 @@ async fn daemon_config_default_site_hot_swaps() {
         deploy.clone(),
         Auth::disabled(),
         HandlerRuntime::disabled(),
-        ServerOptions::default(),
+        ServerOptions {
+            posture: routing_posture(),
+            ..Default::default()
+        },
     );
     // Baseline: an unmatched host 404s (no default_site configured).
     assert_eq!(
