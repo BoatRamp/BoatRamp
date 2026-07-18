@@ -107,6 +107,100 @@ pub struct DeployStore {
     domain_claim_lock: Arc<futures::lock::Mutex<()>>,
 }
 
+/// The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]).
+/// Every deploy key/prefix is built here, so the persisted layout is legible at a
+/// glance instead of scattered through [`DeployStore`]'s methods. The strings are
+/// the on-disk keyspace — changing one is a migration, not a refactor.
+mod keys {
+    /// A content-addressed manifest: `manifests/<id>`.
+    pub fn manifest(id: &str) -> String {
+        format!("manifests/{id}")
+    }
+
+    /// A deployment's [`DeployMeta`](super::DeployMeta): `meta/<id>`.
+    pub fn meta(id: &str) -> String {
+        format!("meta/{id}")
+    }
+
+    /// A site's active deployment pointer: `current/<site>`.
+    pub fn current(site: &str) -> String {
+        format!("current/{site}")
+    }
+
+    /// A named alias → deployment id: `alias/<site>/<name>`.
+    pub fn alias(site: &str, name: &str) -> String {
+        format!("alias/{site}/{name}")
+    }
+
+    /// The prefix listing a site's aliases: `alias/<site>/`.
+    pub fn alias_prefix(site: &str) -> String {
+        format!("alias/{site}/")
+    }
+
+    /// Sharded blob key, e.g. `ab/abcdef...`, to avoid one huge directory.
+    pub fn blob(hash: &str) -> String {
+        if hash.len() >= 2 {
+            format!("{}/{}", &hash[..2], hash)
+        } else {
+            hash.to_string()
+        }
+    }
+
+    /// The **mutable pointer** for a site: `site/<site>` → the content hash of
+    /// its current `SiteConfig`. Tiny; the only key that changes on a config
+    /// edit, so it's the only thing the shared-mode invalidation feed must carry.
+    pub fn site_pointer(site: &str) -> String {
+        format!("site/{site}")
+    }
+
+    /// The **immutable, content-addressed** config body:
+    /// `siteconfig/<hash>` → the `SiteConfig` JSON. Keyed by its own hash, so it
+    /// never changes under a key and is safe to cache forever; identical configs
+    /// across sites dedup to one blob.
+    pub fn site_config_blob(hash: &str) -> String {
+        format!("siteconfig/{hash}")
+    }
+
+    /// A registered exact host → site: `domain/<canon-host>`.
+    pub fn domain(host: &str) -> String {
+        format!("domain/{}", super::canon_host(host))
+    }
+
+    /// A registered wildcard suffix → site: `wildcard/<canon-suffix>`.
+    pub fn wildcard(suffix: &str) -> String {
+        format!("wildcard/{}", super::canon_host(suffix))
+    }
+
+    /// A pending domain-ownership challenge: `domainverify/<site>/<verify-host>`.
+    pub fn domain_verification(site: &str, host: &str) -> String {
+        format!(
+            "domainverify/{site}/{}",
+            crate::domain_verify::normalize_host(host)
+        )
+    }
+
+    /// Index key mapping an **HTTP challenge** `(host, token)` → its site, so the
+    /// unauthenticated self-serve edge route is an O(1) lookup rather than an O(N)
+    /// scan of every site's challenges (a flood-amplification vector). The token
+    /// is a 128-bit random, so carrying it in the key is safe.
+    pub fn http_challenge_index(host: &str, token: &str) -> String {
+        format!(
+            "httpchallenge/{}/{token}",
+            crate::domain_verify::normalize_host(host)
+        )
+    }
+
+    /// The immutable, content-addressed daemon-config body: `daemonconfig/<hash>`.
+    pub fn daemon_config_blob(hash: &str) -> String {
+        format!("daemonconfig/{hash}")
+    }
+
+    /// A site's activation history list: `history/<site>`.
+    pub fn history(site: &str) -> String {
+        format!("history/{site}")
+    }
+}
+
 impl DeployStore {
     /// Build a deploy store over a blob `storage` and a metadata `kv`.
     pub fn new(storage: Arc<dyn Storage>, kv: Arc<dyn KvStore>) -> Self {
@@ -123,35 +217,6 @@ impl DeployStore {
     pub async fn ready(&self) -> Result<(), DeployError> {
         self.kv.get("__readyz_probe__").await?;
         Ok(())
-    }
-
-    fn manifest_key(id: &str) -> String {
-        format!("manifests/{id}")
-    }
-
-    fn meta_key(id: &str) -> String {
-        format!("meta/{id}")
-    }
-
-    fn current_key(site: &str) -> String {
-        format!("current/{site}")
-    }
-
-    fn alias_key(site: &str, name: &str) -> String {
-        format!("alias/{site}/{name}")
-    }
-
-    fn alias_prefix(site: &str) -> String {
-        format!("alias/{site}/")
-    }
-
-    /// Sharded blob key, e.g. `ab/abcdef...`, to avoid one huge directory.
-    fn blob_key(hash: &str) -> String {
-        if hash.len() >= 2 {
-            format!("{}/{}", &hash[..2], hash)
-        } else {
-            hash.to_string()
-        }
     }
 
     /// Store a manifest (idempotent) and return its deployment id.
@@ -202,8 +267,8 @@ impl DeployStore {
         };
         self.kv
             .write_batch(vec![
-                WriteOp::Put(Self::manifest_key(&id), manifest.to_bytes()?),
-                WriteOp::Put(Self::meta_key(&id), serde_json::to_vec(&meta)?),
+                WriteOp::Put(keys::manifest(&id), manifest.to_bytes()?),
+                WriteOp::Put(keys::meta(&id), serde_json::to_vec(&meta)?),
             ])
             .await?;
         Ok(id)
@@ -211,7 +276,7 @@ impl DeployStore {
 
     /// Fetch a deployment's [`DeployMeta`], if recorded.
     pub async fn get_meta(&self, id: &str) -> Result<Option<DeployMeta>, DeployError> {
-        match self.kv.get(&Self::meta_key(id)).await? {
+        match self.kv.get(&keys::meta(id)).await? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
@@ -219,7 +284,7 @@ impl DeployStore {
 
     /// Fetch a manifest by deployment id.
     pub async fn get_manifest(&self, id: &str) -> Result<Option<Manifest>, DeployError> {
-        match self.kv.get(&Self::manifest_key(id)).await? {
+        match self.kv.get(&keys::manifest(id)).await? {
             Some(bytes) => Ok(Some(Manifest::from_bytes(&bytes)?)),
             None => Ok(None),
         }
@@ -233,10 +298,10 @@ impl DeployStore {
     /// is not unique (the caller should treat that as not-found).
     pub async fn resolve_manifest_id(&self, prefix: &str) -> Result<Option<String>, DeployError> {
         // Exact hit first (the common case; avoids a scan).
-        if self.kv.get(&Self::manifest_key(prefix)).await?.is_some() {
+        if self.kv.get(&keys::manifest(prefix)).await?.is_some() {
             return Ok(Some(prefix.to_string()));
         }
-        let key_prefix = Self::manifest_key(prefix);
+        let key_prefix = keys::manifest(prefix);
         let strip = "manifests/".len();
         let keys = self.kv.list_prefix(&key_prefix).await?;
         let mut ids = keys.iter().map(|key| &key[strip..]);
@@ -249,7 +314,7 @@ impl DeployStore {
 
     /// Whether a blob with `hash` is already stored.
     pub async fn has_blob(&self, hash: &str) -> Result<bool, DeployError> {
-        match self.storage.head(&Self::blob_key(hash)).await {
+        match self.storage.head(&keys::blob(hash)).await {
             Ok(_) => Ok(true),
             Err(StorageError::NotFound(_)) => Ok(false),
             Err(err) => Err(err.into()),
@@ -283,7 +348,7 @@ impl DeployStore {
             })
             .boxed();
 
-        let key = Self::blob_key(hash);
+        let key = keys::blob(hash);
         self.storage.put(&key, verified, PutMeta::default()).await?;
 
         let actual = hex::encode(hasher.lock().unwrap().clone().finalize());
@@ -299,7 +364,7 @@ impl DeployStore {
 
     /// Open a blob for streaming reads.
     pub async fn open_blob(&self, hash: &str) -> Result<GetObject, DeployError> {
-        Ok(self.storage.get(&Self::blob_key(hash)).await?)
+        Ok(self.storage.get(&keys::blob(hash)).await?)
     }
 
     /// Open a byte range of a blob for streaming reads (HTTP `Range`).
@@ -311,59 +376,18 @@ impl DeployStore {
     ) -> Result<GetObject, DeployError> {
         Ok(self
             .storage
-            .get_range(&Self::blob_key(hash), offset, len)
+            .get_range(&keys::blob(hash), offset, len)
             .await?)
-    }
-
-    /// The **mutable pointer** for a site: `site/<site>` → the content hash of
-    /// its current `SiteConfig`. Tiny; the only key that changes on a config
-    /// edit, so it's the only thing the shared-mode invalidation feed must carry.
-    fn site_pointer_key(site: &str) -> String {
-        format!("site/{site}")
-    }
-
-    /// The **immutable, content-addressed** config body:
-    /// `siteconfig/<hash>` → the `SiteConfig` JSON. Keyed by its own hash, so it
-    /// never changes under a key and is safe to cache forever; identical configs
-    /// across sites dedup to one blob.
-    fn site_config_blob_key(hash: &str) -> String {
-        format!("siteconfig/{hash}")
-    }
-
-    fn domain_key(host: &str) -> String {
-        format!("domain/{}", canon_host(host))
-    }
-
-    fn wildcard_key(suffix: &str) -> String {
-        format!("wildcard/{}", canon_host(suffix))
-    }
-
-    fn domain_verification_key(site: &str, host: &str) -> String {
-        format!(
-            "domainverify/{site}/{}",
-            crate::domain_verify::normalize_host(host)
-        )
-    }
-
-    /// Index key mapping an **HTTP challenge** `(host, token)` → its site, so the
-    /// unauthenticated self-serve edge route is an O(1) lookup rather than an O(N)
-    /// scan of every site's challenges (a flood-amplification vector). The token
-    /// is a 128-bit random, so carrying it in the key is safe.
-    fn http_challenge_index_key(host: &str, token: &str) -> String {
-        format!(
-            "httpchallenge/{}/{token}",
-            crate::domain_verify::normalize_host(host)
-        )
     }
 
     /// A site's [`SiteConfig`], if it has been set. Reads the `site/<site>`
     /// pointer, then the immutable `siteconfig/<hash>` body it names.
     pub async fn get_site_config(&self, site: &str) -> Result<Option<SiteConfig>, DeployError> {
-        let Some(hash) = self.kv.get(&Self::site_pointer_key(site)).await? else {
+        let Some(hash) = self.kv.get(&keys::site_pointer(site)).await? else {
             return Ok(None);
         };
         let hash = String::from_utf8_lossy(&hash).into_owned();
-        match self.kv.get(&Self::site_config_blob_key(&hash)).await? {
+        match self.kv.get(&keys::site_config_blob(&hash)).await? {
             Some(bytes) => Ok(Some(SiteConfig::from_json(&bytes)?)),
             // A dangling pointer (body GC'd out from under it) reads as unset.
             None => Ok(None),
@@ -411,12 +435,12 @@ impl DeployStore {
         // anything (the hijack guard). A host this site already owns, or one that
         // is unclaimed, passes.
         for host in config.domains.exact_hosts() {
-            self.ensure_host_claimable(&Self::domain_key(host), host, site)
+            self.ensure_host_claimable(&keys::domain(host), host, site)
                 .await?;
         }
         for wildcard in &config.domains.wildcards {
             if let Some(suffix) = wildcard.strip_prefix("*.") {
-                self.ensure_host_claimable(&Self::wildcard_key(suffix), wildcard, site)
+                self.ensure_host_claimable(&keys::wildcard(suffix), wildcard, site)
                     .await?;
             }
         }
@@ -427,29 +451,26 @@ impl DeployStore {
         let mut ops = Vec::new();
         if let Some(old) = self.get_site_config(site).await? {
             for host in old.domains.exact_hosts() {
-                ops.push(WriteOp::Delete(Self::domain_key(host)));
+                ops.push(WriteOp::Delete(keys::domain(host)));
             }
             for wildcard in &old.domains.wildcards {
                 if let Some(suffix) = wildcard.strip_prefix("*.") {
-                    ops.push(WriteOp::Delete(Self::wildcard_key(suffix)));
+                    ops.push(WriteOp::Delete(keys::wildcard(suffix)));
                 }
             }
         }
 
         // Immutable body (idempotent put) + the mutable pointer flip.
-        ops.push(WriteOp::Put(Self::site_config_blob_key(&hash), body));
-        ops.push(WriteOp::Put(
-            Self::site_pointer_key(site),
-            hash.into_bytes(),
-        ));
+        ops.push(WriteOp::Put(keys::site_config_blob(&hash), body));
+        ops.push(WriteOp::Put(keys::site_pointer(site), hash.into_bytes()));
 
         let site_bytes = site.as_bytes().to_vec();
         for host in config.domains.exact_hosts() {
-            ops.push(WriteOp::Put(Self::domain_key(host), site_bytes.clone()));
+            ops.push(WriteOp::Put(keys::domain(host), site_bytes.clone()));
         }
         for wildcard in &config.domains.wildcards {
             if let Some(suffix) = wildcard.strip_prefix("*.") {
-                ops.push(WriteOp::Put(Self::wildcard_key(suffix), site_bytes.clone()));
+                ops.push(WriteOp::Put(keys::wildcard(suffix), site_bytes.clone()));
             }
         }
         self.kv.write_batch(ops).await?;
@@ -485,12 +506,12 @@ impl DeployStore {
         // key written by `set_site_config` regardless of case / trailing dot.
         let host = canon_host(host);
         let host = host.as_str();
-        if let Some(bytes) = self.kv.get(&Self::domain_key(host)).await? {
+        if let Some(bytes) = self.kv.get(&keys::domain(host)).await? {
             return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
         }
         let mut rest = host;
         while let Some((_, parent)) = rest.split_once('.') {
-            if let Some(bytes) = self.kv.get(&Self::wildcard_key(parent)).await? {
+            if let Some(bytes) = self.kv.get(&keys::wildcard(parent)).await? {
                 return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
             }
             rest = parent;
@@ -945,11 +966,7 @@ impl DeployStore {
         site: &str,
         host: &str,
     ) -> Result<Option<DomainVerification>, DeployError> {
-        match self
-            .kv
-            .get(&Self::domain_verification_key(site, host))
-            .await?
-        {
+        match self.kv.get(&keys::domain_verification(site, host)).await? {
             Some(bytes) => Ok(Some(DomainVerification::from_json(&bytes)?)),
             None => Ok(None),
         }
@@ -1016,7 +1033,7 @@ impl DeployStore {
         // (left by a method change / new token) can never serve the wrong thing.
         let Some(site_bytes) = self
             .kv
-            .get(&Self::http_challenge_index_key(&host, token))
+            .get(&keys::http_challenge_index(&host, token))
             .await?
         else {
             return Ok(None);
@@ -1042,7 +1059,7 @@ impl DeployStore {
         verification: &DomainVerification,
     ) -> Result<(), DeployError> {
         let mut ops = vec![WriteOp::Put(
-            Self::domain_verification_key(site, &verification.host),
+            keys::domain_verification(site, &verification.host),
             verification.to_json()?,
         )];
         // Maintain the self-serve `(host, token)` index for HTTP challenges. A
@@ -1051,7 +1068,7 @@ impl DeployStore {
         // needed here.
         if verification.method == VerificationMethod::Http {
             ops.push(WriteOp::Put(
-                Self::http_challenge_index_key(&verification.host, &verification.token),
+                keys::http_challenge_index(&verification.host, &verification.token),
                 site.as_bytes().to_vec(),
             ));
         }
@@ -1195,9 +1212,9 @@ impl DeployStore {
         let Some(v) = self.get_domain_verification(site, host).await? else {
             return Ok(false);
         };
-        let mut ops = vec![WriteOp::Delete(Self::domain_verification_key(site, host))];
+        let mut ops = vec![WriteOp::Delete(keys::domain_verification(site, host))];
         if v.method == VerificationMethod::Http {
-            ops.push(WriteOp::Delete(Self::http_challenge_index_key(
+            ops.push(WriteOp::Delete(keys::http_challenge_index(
                 &v.host, &v.token,
             )));
         }
@@ -1280,14 +1297,14 @@ impl DeployStore {
             return Err(DeployError::Incomplete(missing));
         }
         self.kv
-            .put(&Self::alias_key(site, name), id.as_bytes().to_vec())
+            .put(&keys::alias(site, name), id.as_bytes().to_vec())
             .await?;
         Ok(())
     }
 
     /// Resolve a named alias to its deployment id, if set.
     pub async fn get_alias(&self, site: &str, name: &str) -> Result<Option<String>, DeployError> {
-        match self.kv.get(&Self::alias_key(site, name)).await? {
+        match self.kv.get(&keys::alias(site, name)).await? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(None),
         }
@@ -1295,7 +1312,7 @@ impl DeployStore {
 
     /// Remove a named alias; returns whether one existed.
     pub async fn remove_alias(&self, site: &str, name: &str) -> Result<bool, DeployError> {
-        let key = Self::alias_key(site, name);
+        let key = keys::alias(site, name);
         let existed = self.kv.get(&key).await?.is_some();
         if existed {
             self.kv.delete(&key).await?;
@@ -1305,7 +1322,7 @@ impl DeployStore {
 
     /// All of a site's named aliases as `name → deployment id`, sorted by name.
     pub async fn list_aliases(&self, site: &str) -> Result<BTreeMap<String, String>, DeployError> {
-        let prefix = Self::alias_prefix(site);
+        let prefix = keys::alias_prefix(site);
         let mut out = BTreeMap::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -1453,12 +1470,6 @@ impl DeployStore {
     /// How many prior generations the rollback ring retains.
     const DAEMON_HISTORY_MAX: usize = 20;
 
-    /// The immutable, content-addressed body: `daemonconfig/<hash>` → the
-    /// [`DaemonConfig`](crate::daemon_config::DaemonConfig) JSON.
-    fn daemon_config_blob_key(hash: &str) -> String {
-        format!("daemonconfig/{hash}")
-    }
-
     /// The active daemon-config **generation** (the `daemon/current` hash), if any.
     /// This is the value nodes report so an operator can confirm convergence.
     pub async fn daemon_config_generation(&self) -> Result<Option<String>, DeployError> {
@@ -1477,7 +1488,7 @@ impl DeployStore {
         let Some(hash) = self.daemon_config_generation().await? else {
             return Ok(None);
         };
-        match self.kv.get(&Self::daemon_config_blob_key(&hash)).await? {
+        match self.kv.get(&keys::daemon_config_blob(&hash)).await? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             // Dangling pointer (body GC'd) reads as unset → baseline.
             None => Ok(None),
@@ -1515,7 +1526,7 @@ impl DeployStore {
             }
         }
         let ops = vec![
-            WriteOp::Put(Self::daemon_config_blob_key(&hash), body),
+            WriteOp::Put(keys::daemon_config_blob(&hash), body),
             WriteOp::Put(
                 Self::DAEMON_HISTORY_KEY.to_string(),
                 serde_json::to_vec(&history)?,
@@ -1717,7 +1728,7 @@ impl DeployStore {
         // The atomic switch: a single KV write, so readers see the old or new
         // deployment in full, never a partial state.
         self.kv
-            .put(&Self::current_key(site), id.as_bytes().to_vec())
+            .put(&keys::current(site), id.as_bytes().to_vec())
             .await?;
 
         // Record the activation. Best-effort: `current` above is the source of
@@ -1725,10 +1736,6 @@ impl DeployStore {
         // already took effect.
         let _ = self.record_history(site, id).await;
         Ok(())
-    }
-
-    fn history_key(site: &str) -> String {
-        format!("history/{site}")
     }
 
     /// Prepend `id` to `site`'s activation history, de-duplicating by id and
@@ -1746,14 +1753,14 @@ impl DeployStore {
         );
         history.truncate(MAX_HISTORY);
         self.kv
-            .put(&Self::history_key(site), serde_json::to_vec(&history)?)
+            .put(&keys::history(site), serde_json::to_vec(&history)?)
             .await?;
         Ok(())
     }
 
     /// A site's activation history, most recent first.
     pub async fn history(&self, site: &str) -> Result<Vec<HistoryEntry>, DeployError> {
-        match self.kv.get(&Self::history_key(site)).await? {
+        match self.kv.get(&keys::history(site)).await? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
             None => Ok(Vec::new()),
         }
@@ -1914,7 +1921,7 @@ impl DeployStore {
                 self.kv.delete(key).await?;
                 // Drop the companion metadata record alongside the manifest.
                 if let Some(id) = key.strip_prefix("manifests/") {
-                    let _ = self.kv.delete(&Self::meta_key(id)).await;
+                    let _ = self.kv.delete(&keys::meta(id)).await;
                 }
             }
         }
@@ -2033,21 +2040,21 @@ impl DeployStore {
         // deletes and leave a dangling `domain/*` → deleted-site entry.
         let _claim = self.domain_claim_lock.lock().await;
         let mut batch = vec![
-            WriteOp::Delete(Self::site_pointer_key(site)),
-            WriteOp::Delete(Self::current_key(site)),
-            WriteOp::Delete(Self::history_key(site)),
+            WriteOp::Delete(keys::site_pointer(site)),
+            WriteOp::Delete(keys::current(site)),
+            WriteOp::Delete(keys::history(site)),
         ];
         if let Some(config) = self.get_site_config(site).await? {
             for host in config.domains.exact_hosts() {
-                batch.push(WriteOp::Delete(Self::domain_key(host)));
+                batch.push(WriteOp::Delete(keys::domain(host)));
             }
             for wildcard in &config.domains.wildcards {
                 if let Some(suffix) = wildcard.strip_prefix("*.") {
-                    batch.push(WriteOp::Delete(Self::wildcard_key(suffix)));
+                    batch.push(WriteOp::Delete(keys::wildcard(suffix)));
                 }
             }
         }
-        for key in self.kv.list_prefix(&Self::alias_prefix(site)).await? {
+        for key in self.kv.list_prefix(&keys::alias_prefix(site)).await? {
             batch.push(WriteOp::Delete(key));
         }
         for key in self
@@ -2063,7 +2070,7 @@ impl DeployStore {
 
     /// The deployment id currently serving `site`, if any.
     pub async fn current_id(&self, site: &str) -> Result<Option<String>, DeployError> {
-        match self.kv.get(&Self::current_key(site)).await? {
+        match self.kv.get(&keys::current(site)).await? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(None),
         }
