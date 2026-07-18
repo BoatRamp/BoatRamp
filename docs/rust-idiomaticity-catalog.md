@@ -428,3 +428,44 @@ firecracker/container/rpktls code. Gates that stay green after every change:
 
 Each campaign is its own reviewable commit and must keep all four gates green; a
 campaign that can't stay green is split smaller or bounced back to triage.
+
+---
+
+## Status — implemented (Phase 0 + Groups A/B/C/D)
+
+Phase 0 (lint floor), Group A (dedup/naming), Group B (conversion traits), and
+Group C (error modelling) landed as behaviour-preserving green commits.
+
+**Group D — `boatramp-server/src/lib.rs` monolith split (pure moves).** The
+9834-line `lib.rs` was carved into 16 cohesive, single-concern modules, each a
+reviewable commit that kept the all-features clippy, lean lane
+(`--no-default-features --features fs,slatedb`), and `cargo test` gates green.
+Pattern: extract a contiguous section, prepend a `//!` module doc + `use super::*`
+(so the child sees the parent's private items and needs no import-guessing), mark
+externally-referenced items `pub(super)` (or keep `pub` for genuine public API),
+re-export from the crate root, verify brace balance. Modules extracted:
+
+- `host` — host string helpers (strip_port / is_local_host / parse_deploy_host)
+- `serve/backends` (CLI), `function/{scaffold,build}` (CLI)
+- `content` — content negotiation, compression, range serving
+- `operator` — operator/metrics endpoints
+- `stream` — live topic streaming (SSE/WS)
+- `scheduler` — background scheduler tick loop
+- `workflow` — declarative workflow orchestration (FA-6)
+- `function_runtime` — function invoke/metering/triggers/webhooks (FA-3..5)
+- `function_api` — function management API (FA-1/FA-2)
+- `control_api` — control-plane identity + cluster + authz admin
+- `proxy` — reverse-proxy data plane + gateway dispatch + compute wake
+- `handler_dispatch` — the wasm handler execution path
+- `serve_pipeline` — host routing → resolve → serve entry/preview/proxy
+- `admin_api` — deployment/site/config/compute admin REST endpoints
+- `routes` — the application router assembly
+
+`lib.rs` finished at ~2370 lines: the crate's core public types (`HandlerRuntime`,
+`ServerOptions`, `DaemonRuntime`, `ServeError`), the `serve()`/`shutdown` entry
+points, CORS + access-log middleware, and shared response helpers — the front door
+a reader expects at the crate root. Deliberately left there rather than
+over-split into ceremony.
+
+Groups **E** (deep newtypes: Host / SiteName / id types, DTO move) and **F**
+(borderline) remain deferred for a separate job per the triage decision.
