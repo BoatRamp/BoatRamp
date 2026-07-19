@@ -58,6 +58,33 @@ boatramp deployments --site my-site
   1a09e3b4  2026-07-08 22:40  126 files
 ```
 
+## Label a deployment
+
+So you can tell at a glance what a deployment *is*, `sync` records provenance
+alongside it — shown in `status`, `deployments`, and the web console.
+
+When run inside a git repo, `sync` captures the commit SHA, branch, and (via
+`git describe --tags`) the nearest **release tag** automatically. Override any of
+them, add a free-form message, or attach arbitrary `key=value` tags:
+
+```sh
+boatramp sync ./dist --site my-site \
+  -m "hotfix: cache headers" \
+  --tag env=prod --tag ticket=ABC-123
+```
+
+`--tag` is repeatable and takes `key=value`. All of it is optional metadata: it
+never affects the (content-addressed) deployment id, and re-deploying an
+unchanged tree preserves the prior provenance. `status` shows it in full:
+
+```text
+my-site
+  deployment  4f3a2b2c
+  activated   4m ago
+  release     v1.2.3
+  tags        env=prod ticket=ABC-123
+```
+
 ## Roll back
 
 Re-activate the previous deployment. Because activation is a pointer flip, this

@@ -149,12 +149,31 @@ fn deployment_row(
     // Most-recent history entry that is *not* current is a "rollback"; activating
     // any older one is also a rollback. Activating a newer one is "roll forward".
     // We label simply by current vs not.
-    let source = entry
-        .meta
-        .as_ref()
-        .and_then(|m| m.source.as_deref().or(m.branch.as_deref()))
+    let meta = entry.meta.as_ref();
+    // Prefer the human-readable release tag, then the commit SHA, then the branch.
+    let source = meta
+        .and_then(|m| m.tag.as_deref().or(m.source.as_deref()).or(m.branch.as_deref()))
         .map(|s| s.to_string())
         .unwrap_or_else(|| "—".to_string());
+    // Hovering the provenance shows the deploy message, if any.
+    let message = meta
+        .and_then(|m| m.message.clone())
+        .unwrap_or_default();
+    let tag_pills: Html = meta
+        .map(|m| {
+            m.tags
+                .iter()
+                .map(|(k, v)| {
+                    html! {
+                        <span class="ml-1 rounded bg-slate-100 px-1.5 py-0.5 text-xs \
+                                     font-normal text-slate-600">
+                            { format!("{k}={v}") }
+                        </span>
+                    }
+                })
+                .collect::<Html>()
+        })
+        .unwrap_or_default();
 
     html! {
         <tr class="border-b border-slate-100">
@@ -165,7 +184,10 @@ fn deployment_row(
                 }
             </td>
             <td class="py-2.5 text-slate-600">{ relative_age(entry.at) }</td>
-            <td class="py-2.5 text-slate-600">{ source }</td>
+            <td class="py-2.5 text-slate-600">
+                <span title={message}>{ source }</span>
+                { tag_pills }
+            </td>
             <td class="py-2.5 text-right">
                 if is_current {
                     <span class="text-xs text-slate-400">{ "current" }</span>
