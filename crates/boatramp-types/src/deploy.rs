@@ -8,6 +8,7 @@
 //! re-exports them. The `DeployStore` plumbing that produces them stays in core.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Metadata about a deployment, captured at publish time and kept alongside the
 /// (content-addressed, immutable) manifest. It is stored separately from the
@@ -37,6 +38,15 @@ pub struct DeployMeta {
     /// Free-form deploy message, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Release tag the deploy was cut from (e.g. `git describe --tags`), if
+    /// known — the human-readable "which version" a bare `source` SHA lacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Arbitrary operator-supplied key-value tags (e.g. `env=prod`,
+    /// `ticket=ABC-123`) for identifying and filtering deploys from the CLI and
+    /// console. Ordered (`BTreeMap`) so the serialized form is stable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// Client-supplied provenance for a deployment (the mutable subset of
@@ -51,6 +61,10 @@ pub struct DeployMetaInput {
     pub author: Option<String>,
     /// Deploy message.
     pub message: Option<String>,
+    /// Release tag (e.g. `git describe --tags`).
+    pub tag: Option<String>,
+    /// Arbitrary key-value tags.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// An entry in a site's activation history.
@@ -127,5 +141,65 @@ impl ScrubReport {
     /// Whether the scrub found no corruption and no read errors.
     pub fn is_clean(&self) -> bool {
         self.mismatched.is_empty() && self.errors.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deploy_meta_tag_and_tags_round_trip() {
+        let meta = DeployMeta {
+            version: 1,
+            created_at: 42,
+            file_count: 3,
+            total_size: 99,
+            source: Some("abc123".into()),
+            branch: Some("main".into()),
+            author: None,
+            message: Some("ship it".into()),
+            tag: Some("v1.2.3".into()),
+            tags: BTreeMap::from([
+                ("env".to_string(), "prod".to_string()),
+                ("ticket".to_string(), "ABC-123".to_string()),
+            ]),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert_eq!(serde_json::from_str::<DeployMeta>(&json).unwrap(), meta);
+    }
+
+    #[test]
+    fn empty_tag_and_tags_are_omitted() {
+        let meta = DeployMeta {
+            version: 1,
+            created_at: 1,
+            file_count: 0,
+            total_size: 0,
+            source: None,
+            branch: None,
+            author: None,
+            message: None,
+            tag: None,
+            tags: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("\"tag\""),
+            "empty tag/tags must not serialize: {json}"
+        );
+        assert!(
+            !json.contains("\"tags\""),
+            "empty tags must not serialize: {json}"
+        );
+    }
+
+    #[test]
+    fn old_records_without_tag_fields_still_deserialize() {
+        // A pre-feature record (no tag/tags keys) reads back with the defaults.
+        let json = r#"{"version":1,"created_at":7,"file_count":1,"total_size":5}"#;
+        let meta: DeployMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.tag, None);
+        assert!(meta.tags.is_empty());
     }
 }

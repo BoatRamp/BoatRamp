@@ -264,6 +264,16 @@ impl DeployStore {
             message: input
                 .message
                 .or_else(|| existing.as_ref().and_then(|m| m.message.clone())),
+            tag: input
+                .tag
+                .or_else(|| existing.as_ref().and_then(|m| m.tag.clone())),
+            // Tags replace wholesale when supplied (so a re-deploy can retag);
+            // an empty input preserves the prior set, mirroring the fields above.
+            tags: if input.tags.is_empty() {
+                existing.map(|m| m.tags).unwrap_or_default()
+            } else {
+                input.tags
+            },
         };
         self.kv
             .write_batch(vec![
