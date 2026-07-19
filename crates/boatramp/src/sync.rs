@@ -64,6 +64,12 @@ pub enum Error {
     /// A filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A `--tag` value was not in `key=value` form.
+    #[error("invalid --tag {0:?}: expected key=value")]
+    InvalidTag(String),
+    /// Encoding the deploy tags for transport failed.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 /// `sync` module result; `Err` is [`Error`].
@@ -116,6 +122,11 @@ pub struct SyncArgs {
     /// Deploy author.
     #[arg(long)]
     author: Option<String>,
+
+    /// Arbitrary key-value tag, `key=value` (repeatable) — recorded with the
+    /// deployment and shown in the CLI/console (e.g. `--tag env=prod`).
+    #[arg(long = "tag", value_name = "KEY=VALUE")]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,17 +180,24 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     let client = crate::client::http_client(crate::client::token(config).as_deref());
 
     // Capture provenance: explicit flags win, else fall back to git.
-    let (git_sha, git_branch) = git_info(&dir);
+    let (git_sha, git_branch, git_tag) = git_info(&dir);
     let meta = [
         ("source", args.source.clone().or(git_sha)),
         ("branch", args.branch.clone().or(git_branch)),
         ("author", args.author.clone()),
         ("message", args.message.clone()),
+        ("tag", git_tag),
     ];
-    let query: Vec<(&str, String)> = meta
+    let mut query: Vec<(&str, String)> = meta
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k, v)))
         .collect();
+    // Arbitrary key-value tags travel as one JSON param (a query string can't
+    // carry a map, and axum's `Query` extractor rejects repeated keys).
+    let tags = parse_tags(&args.tags)?;
+    if !tags.is_empty() {
+        query.push(("tags", serde_json::to_string(&tags)?));
+    }
 
     // Negotiate the deployment: server stores the manifest and tells us which
     // blobs it still needs.
@@ -230,13 +248,34 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort `(commit SHA, branch)` for the git repo containing `dir`.
-/// Returns `None`s when git is unavailable or `dir` is not a repo.
-fn git_info(dir: &Path) -> (Option<String>, Option<String>) {
+/// Best-effort `(commit SHA, branch, release tag)` for the git repo containing
+/// `dir`. Returns `None`s when git is unavailable or `dir` is not a repo.
+fn git_info(dir: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let sha = run_git(dir, &["rev-parse", "HEAD"]);
     // A detached HEAD reports the branch as "HEAD" — treat that as unknown.
     let branch = run_git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD");
-    (sha, branch)
+    // The nearest reachable tag (`v1.2.3`, or `v1.2.3-4-gabc1234[-dirty]` when
+    // HEAD has moved past it / the tree is dirty). `describe` fails (→ `None`)
+    // when no tag is reachable, so a bare SHA is never duplicated here.
+    let tag = run_git(dir, &["describe", "--tags", "--dirty"]);
+    (sha, branch, tag)
+}
+
+/// Parse `--tag key=value` pairs into an ordered map, erroring on any entry
+/// missing `=` or with an empty key.
+fn parse_tags(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut tags = BTreeMap::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| Error::InvalidTag(pair.clone()))?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(Error::InvalidTag(pair.clone()));
+        }
+        tags.insert(key.to_string(), value.to_string());
+    }
+    Ok(tags)
 }
 
 /// Run a git command in `dir`, returning trimmed stdout on success.
@@ -493,4 +532,41 @@ fn content_type_for(path: &str) -> Option<String> {
         _ => return None,
     };
     Some(mime.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tags_builds_an_ordered_map() {
+        let tags = parse_tags(&[
+            "env=prod".to_string(),
+            "ticket=ABC-123".to_string(),
+            "note=has=equals".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.get("ticket").map(String::as_str), Some("ABC-123"));
+        // Only the first `=` splits, so values may contain `=`.
+        assert_eq!(tags.get("note").map(String::as_str), Some("has=equals"));
+    }
+
+    #[test]
+    fn parse_tags_trims_keys_and_allows_empty_values() {
+        let tags = parse_tags(&["  region = ".to_string()]).unwrap();
+        assert_eq!(tags.get("region").map(String::as_str), Some(" "));
+    }
+
+    #[test]
+    fn parse_tags_rejects_missing_equals_and_empty_key() {
+        assert!(matches!(
+            parse_tags(&["novalue".to_string()]),
+            Err(Error::InvalidTag(_))
+        ));
+        assert!(matches!(
+            parse_tags(&["=orphan".to_string()]),
+            Err(Error::InvalidTag(_))
+        ));
+    }
 }

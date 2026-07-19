@@ -22,6 +22,11 @@ pub(super) struct DeployMetaQuery {
     branch: Option<String>,
     author: Option<String>,
     message: Option<String>,
+    /// Release tag (`git describe`).
+    tag: Option<String>,
+    /// Arbitrary key-value tags, JSON-encoded (`{"env":"prod"}`) — a query
+    /// string can't carry a map, so the CLI packs it into one param.
+    tags: Option<String>,
 }
 
 impl From<DeployMetaQuery> for DeployMetaInput {
@@ -31,6 +36,13 @@ impl From<DeployMetaQuery> for DeployMetaInput {
             branch: q.branch,
             author: q.author,
             message: q.message,
+            tag: q.tag,
+            // A malformed tags param drops to empty rather than failing the
+            // deploy; the CLI is the only producer and always sends valid JSON.
+            tags: q
+                .tags
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
         }
     }
 }
@@ -655,4 +667,38 @@ pub(super) async fn invalidate_cache(
 pub(super) struct InvalidateRequest {
     #[serde(default)]
     keys: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deploy_meta_query_parses_tag_and_tags_json() {
+        let q = DeployMetaQuery {
+            source: Some("abc".into()),
+            branch: None,
+            author: None,
+            message: None,
+            tag: Some("v1.2.3".into()),
+            tags: Some(r#"{"env":"prod","ticket":"ABC-123"}"#.into()),
+        };
+        let input: DeployMetaInput = q.into();
+        assert_eq!(input.tag.as_deref(), Some("v1.2.3"));
+        assert_eq!(input.tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            input.tags.get("ticket").map(String::as_str),
+            Some("ABC-123")
+        );
+    }
+
+    #[test]
+    fn deploy_meta_query_malformed_tags_drop_to_empty() {
+        let q = DeployMetaQuery {
+            tags: Some("not json".into()),
+            ..Default::default()
+        };
+        let input: DeployMetaInput = q.into();
+        assert!(input.tags.is_empty());
+    }
 }

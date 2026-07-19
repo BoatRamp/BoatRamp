@@ -77,11 +77,15 @@ pub async fn list(args: DeploymentsArgs, config: &ProjectConfig) -> Result<()> {
     Ok(())
 }
 
-/// A compact one-line provenance summary: ` — <message> (<branch>@<sha7>)`.
+/// A compact one-line provenance summary:
+/// ` — <message> [<tag>] (<branch>@<sha7>) <k=v …>`.
 fn meta_summary(meta: &DeployMeta) -> String {
     let mut parts = Vec::new();
     if let Some(message) = meta.message.as_deref().filter(|m| !m.is_empty()) {
         parts.push(message.to_string());
+    }
+    if let Some(tag) = meta.tag.as_deref().filter(|t| !t.is_empty()) {
+        parts.push(format!("[{tag}]"));
     }
     let mut origin = String::new();
     if let Some(branch) = &meta.branch {
@@ -97,6 +101,15 @@ fn meta_summary(meta: &DeployMeta) -> String {
     }
     if !origin.is_empty() {
         parts.push(format!("({origin})"));
+    }
+    if !meta.tags.is_empty() {
+        parts.push(
+            meta.tags
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     if parts.is_empty() {
         String::new()
@@ -188,6 +201,18 @@ pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<()> {
         }
         if let Some(author) = meta.author.as_deref().filter(|a| !a.is_empty()) {
             println!("  author      {author}");
+        }
+        if let Some(tag) = meta.tag.as_deref().filter(|t| !t.is_empty()) {
+            println!("  release     {tag}");
+        }
+        if !meta.tags.is_empty() {
+            let kv = meta
+                .tags
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  tags        {kv}");
         }
     }
     Ok(())
