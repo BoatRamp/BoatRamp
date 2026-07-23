@@ -218,13 +218,7 @@ pub(super) async fn delete_site(
 /// and any trailing dot, but keep an exact host distinct from a `*.` wildcard
 /// (they are different routing entities that must not collapse together).
 fn canon_domain_entry(host: &str) -> String {
-    match host.strip_prefix("*.") {
-        Some(base) => format!(
-            "*.{}",
-            base.trim().trim_end_matches('.').to_ascii_lowercase()
-        ),
-        None => host.trim().trim_end_matches('.').to_ascii_lowercase(),
-    }
+    boatramp_core::host::Host::new(host).domain_entry()
 }
 
 /// Set a site's [`SiteConfig`] (rebuilds its host → site index).

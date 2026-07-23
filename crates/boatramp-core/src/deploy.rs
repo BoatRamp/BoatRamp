@@ -75,7 +75,7 @@ const MAX_HISTORY: usize = 100;
 /// would write a *second* `domain/<host>` entry and slip past the hijack guard,
 /// then route real traffic when a client sends that exact `Host`.
 fn canon_host(host: &str) -> String {
-    host.trim().trim_end_matches('.').to_ascii_lowercase()
+    crate::host::Host::new(host).routing_key()
 }
 
 /// Whether `key` is a sharded blob key (`ab/<64 hex>`). Used so GC never
