@@ -208,14 +208,12 @@ impl DomainVerification {
 /// leading `*.` (a wildcard is verified at its base domain, like ACME), and
 /// strip any trailing dot.
 pub fn normalize_host(host: &str) -> String {
-    let host = host.trim().trim_end_matches('.');
-    let base = host.strip_prefix("*.").unwrap_or(host);
-    base.to_ascii_lowercase()
+    crate::host::Host::new(host).verification()
 }
 
 /// The TXT record name for `host` (the host is normalized first).
 pub fn dns_record_name(host: &str) -> String {
-    format!("{DNS_RECORD_PREFIX}.{}", normalize_host(host))
+    crate::host::Host::new(host).dns_record_name()
 }
 
 /// The well-known path carrying `token` (HTTP method).

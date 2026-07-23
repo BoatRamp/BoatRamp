@@ -24,6 +24,7 @@ pub mod file;
 pub mod function;
 pub mod gateway;
 pub mod geo;
+pub mod host;
 pub mod manifest;
 pub mod matcher;
 pub mod predicate;
