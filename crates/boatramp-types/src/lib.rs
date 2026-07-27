@@ -30,6 +30,7 @@ pub mod matcher;
 pub mod predicate;
 pub mod route;
 pub mod security;
+pub mod site;
 pub mod waf;
 pub mod workflow;
 

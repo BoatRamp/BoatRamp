@@ -45,7 +45,7 @@ pub mod time;
 // unchanged. (`compute` is its own module above — it re-exports the types layer.)
 pub use boatramp_types::{
     access, authz, blob_notify, config, cron, daemon_config, dns_managed, domain_verify, function,
-    gateway, geo, host, matcher, predicate, route, security, waf, workflow,
+    gateway, geo, host, matcher, predicate, route, security, site, waf, workflow,
 };
 pub use boatramp_types::{schema_version, SCHEMA_VERSION};
 
