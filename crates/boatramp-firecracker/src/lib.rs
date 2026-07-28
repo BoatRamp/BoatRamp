@@ -26,6 +26,20 @@
 //! plumbing ([`executor::SystemHost`]) — require **Linux + `/dev/kvm`**, so
 //! they are exercised by the `--ignored` `fc_live` test.
 
+// FFI/VMM-shaped crate: `ip`/`nft` command builders, the Firecracker API model,
+// and the KVM/embedded VMM — much of it `target_os = "linux"`-gated, so the
+// workspace lint floor can't be `--fix`ed or even compiled from a non-Linux
+// host. Exempt the floor here (per the Phase-0 plan: crate-level allows for the
+// FFI-shaped crates so the floor stays strict everywhere else).
+#![allow(
+    clippy::use_self,
+    clippy::redundant_closure_for_method_calls,
+    clippy::explicit_iter_loop,
+    clippy::explicit_into_iter_loop,
+    clippy::manual_string_new,
+    clippy::semicolon_if_nothing_returned
+)]
+
 pub mod api;
 pub mod config;
 // The embedded rust-vmm boot-layout layer: pure x86_64 memory map / e820 /

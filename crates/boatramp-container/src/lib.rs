@@ -18,6 +18,19 @@
 //! The worker that *applies* a plan (the real `unshare`/`mount`/`pivot_root`/
 //! seccomp syscalls) + the `ComputeBackend` impl, Linux-only.
 
+// FFI/syscall-shaped and `target_os = "linux"`-gated: the container runtime
+// (unshare/mount/pivot_root/seccomp) can't be compiled or `--fix`ed from a
+// non-Linux host, so exempt the workspace lint floor here (per the Phase-0
+// plan's crate-level allows for the FFI-shaped crates).
+#![allow(
+    clippy::use_self,
+    clippy::redundant_closure_for_method_calls,
+    clippy::explicit_iter_loop,
+    clippy::explicit_into_iter_loop,
+    clippy::manual_string_new,
+    clippy::semicolon_if_nothing_returned
+)]
+
 /// The native container [`ComputeBackend`] (Linux): re-execs the self-jail
 /// worker, wires veth + netns, stages the rootfs.
 #[cfg(target_os = "linux")]

@@ -12,7 +12,7 @@ description = "boatramp wildcard TLS via ACME DNS-01 + a pluggable DNS-provider 
 default = []
 # The ACME DNS-01 issuance driver (instant-acme + a CSR via rcgen). Heavy; off
 # by default so a build that only needs the DNS abstraction stays lean.
-acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio", "dep:thiserror"]
+acme = ["dep:instant-acme", "dep:rcgen", "dep:tokio"]
 # DNS providers, each behind its own feature so its client deps are optional.
 cloudflare = ["dep:reqwest", "dep:serde_json"]
 route53 = ["dep:aws-config", "dep:aws-sdk-route53"]
@@ -31,6 +31,9 @@ serde = { workspace = true }
 tracing.workspace = true
 base64.workspace = true
 sha2.workspace = true
+# The `dns` module's error type (always compiled) derives `thiserror::Error`, so
+# this is a non-optional dependency, not gated behind the `acme` feature.
+thiserror.workspace = true
 
 # Optional, feature-gated.
 tokio = { workspace = true, optional = true }
@@ -38,7 +41,6 @@ reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 instant-acme = { version = "0.7", optional = true }
 rcgen = { version = "0.13", optional = true }
-thiserror = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-route53 = { version = "1", features = [
   "behavior-version-latest",
