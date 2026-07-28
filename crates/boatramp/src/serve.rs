@@ -2016,7 +2016,7 @@ async fn serve_cluster_acme_dns(
                         match crate::acme_dns::build_server_config(entries) {
                             Ok(config) => tls.reload_from_config(Arc::new(config)),
                             Err(err) => {
-                                tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed")
+                                tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
                             }
                         }
                     }
@@ -2195,7 +2195,7 @@ async fn serve_acme_dns(
                         match crate::acme_dns::build_server_config(entries) {
                             Ok(config) => tls.reload_from_config(Arc::new(config)),
                             Err(err) => {
-                                tracing::error!(%err, "acme-dns: rebuilding TLS config failed")
+                                tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                             }
                         }
                     }

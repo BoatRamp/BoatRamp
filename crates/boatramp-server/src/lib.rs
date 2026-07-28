@@ -61,7 +61,7 @@ pub(crate) use control_api::{
     cluster_revoke, cluster_rotate_key, create_join_token, create_token, get_authz_policy,
     list_root_anchors, list_tokens, put_authz_policy, remove_root_anchor, revoke_token,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "handlers"))]
 use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
 mod domain_verify;
 pub use domain_verify::{spawn_domain_verify_reconcile, verification_pending_page};
@@ -79,7 +79,7 @@ mod function_api;
 pub(crate) use function_api::{
     alias_function, deploy_function, list_functions, remove_function, rollback_function,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "handlers"))]
 use function_api::{AliasBody, FunctionUpsert, RollbackBody};
 mod gateway;
 mod host;
@@ -108,7 +108,7 @@ pub(crate) use proxy::{
 // Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
 #[cfg(feature = "handlers")]
 pub(crate) use proxy::is_upgrade_request;
-#[cfg(test)]
+#[cfg(all(test, feature = "handlers"))]
 use proxy::{gateway_addr_allowed, CLOUD_METADATA_IPV4};
 mod ratelimit;
 mod routes;
@@ -117,7 +117,7 @@ pub use routes::{router, router_with};
 mod scheduler;
 mod serve_pipeline;
 pub use serve_pipeline::http_redirect_router;
-#[cfg(test)]
+#[cfg(all(test, feature = "handlers"))]
 use serve_pipeline::{apply_vary, parse_cookie_header, parse_query_string};
 pub(crate) use serve_pipeline::{
     serve_bootstrap_identity, serve_by_host, serve_domain_challenge, serve_preview, serve_sites,
