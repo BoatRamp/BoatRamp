@@ -19,7 +19,25 @@ KEEP="${KEEP:-0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 log() { printf '\n=== %s ===\n' "$*"; }
+# On a failed run, surface *why* before the cluster is torn down — the helm/rollout
+# wait only reports `Available: 0/1`, so dump the operator's state (a crash-loop, an
+# OOMKill, an image error, pending scheduling) into the CI log.
+dump_diagnostics() {
+  log "FAILED — diagnostics ($NS)"
+  kubectl -n "$NS" get pods -o wide 2>/dev/null || true
+  kubectl -n "$NS" describe pods 2>/dev/null | sed -n '/Last State:/,+4p;/Events:/,$p' | tail -60 || true
+  # The operator Deployment and the managed cluster StatefulSet are separate
+  # failure surfaces — dump current + previous logs for both (a crash-loop only
+  # shows its cause in the previous container's log).
+  for w in deploy/boatramp-operator statefulset/prod; do
+    kubectl -n "$NS" logs "$w" --all-containers --tail=120 --prefix 2>/dev/null || true
+    kubectl -n "$NS" logs "$w" --all-containers --previous --tail=120 --prefix 2>/dev/null || true
+  done
+  kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
+}
 cleanup() {
+  rc=$?
+  [ "$rc" -ne 0 ] && dump_diagnostics
   [ "$KEEP" = "1" ] && return
   case "$PROVIDER" in
     kind) kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true ;;
@@ -81,6 +99,10 @@ kind: BoatRampCluster
 metadata: { name: prod }
 spec:
   mode: cluster
+  # Pin the image the test built + loaded into the node; without this the operator
+  # falls back to its `ghcr.io/boatramp/boatramp:latest` default, which the offline
+  # kind/k3d node can't pull (ImagePullBackOff). The operator serves it IfNotPresent.
+  image: $IMAGE
   replicas: 3
   storage: 1Gi
   posture: dev
