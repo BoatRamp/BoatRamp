@@ -103,8 +103,11 @@ mod proxy;
 pub use proxy::spawn_compute_reconcile;
 pub(crate) use proxy::{
     await_warm, compute_endpoint_regions, compute_endpoints, dispatch_gateway, has_parked_replica,
-    is_upgrade_request, proxy, COMPUTE_WAKE_TIMEOUT,
+    proxy, COMPUTE_WAKE_TIMEOUT,
 };
+// Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
+#[cfg(feature = "handlers")]
+pub(crate) use proxy::is_upgrade_request;
 #[cfg(test)]
 use proxy::{gateway_addr_allowed, CLOUD_METADATA_IPV4};
 mod ratelimit;
