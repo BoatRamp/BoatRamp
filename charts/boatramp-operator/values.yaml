@@ -22,8 +22,16 @@ resources:
     memory: 256Mi
 
 # Hardened pod/container security context (the operator needs no privileges).
+# `runAsUser`/`runAsGroup` are required alongside `runAsNonRoot`: the shipped
+# `ghcr.io/boatramp/boatramp` image runs as root (the same binary serves and
+# writes its data volume elsewhere), so without an explicit non-root uid the
+# kubelet rejects the pod with CreateContainerConfigError ("image will run as
+# root"). 65534 = nobody; the operator only talks to the API server, so it needs
+# no writable paths (readOnlyRootFilesystem stays on).
 podSecurityContext:
   runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
   seccompProfile:
     type: RuntimeDefault
 securityContext:
