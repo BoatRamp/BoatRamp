@@ -341,7 +341,7 @@ fn run_host_command(cmd: &HostCommand) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{} exited with {status}", cmd.display()))
+        Err(format!("{} exited with {status}", cmd))
     }
 }
 
