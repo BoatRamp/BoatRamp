@@ -270,63 +270,7 @@ pub fn resolve_target(
     Ok((server, site))
 }
 
-/// Fetch the manifest for a specific deployment id.
-pub async fn fetch_manifest(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    id: &str,
-) -> Result<Manifest> {
-    Ok(client
-        .get(format!("{server}/api/sites/{site}/deployments/{id}"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Fetch a site's deployment list (current + history).
-pub async fn fetch_deployments(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-) -> Result<DeploymentList> {
-    Ok(client
-        .get(format!("{server}/api/sites/{site}/deployments"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Fetch a site's config (server returns defaults if unset).
-pub async fn fetch_site_config(client: &ApiClient, server: &str, site: &str) -> Result<SiteConfig> {
-    Ok(client
-        .get(format!("{server}/api/sites/{site}/config"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Replace a site's config.
-pub async fn put_site_config(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    config: &SiteConfig,
-) -> Result<()> {
-    client
-        .put(format!("{server}/api/sites/{site}/config"))
-        .json(config)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
+// ---- control-plane requests -------------------------------------------------
 
 /// Percent-encode a host for use as a URL path segment. Hostnames are
 /// `[a-z0-9.-]` plus a leading `*.` for wildcards; only `*` needs escaping.
@@ -344,161 +288,6 @@ pub struct VerificationCheck {
     pub detail: Option<String>,
 }
 
-/// Start (or fetch the existing) ownership challenge for a host.
-pub async fn start_domain_verification(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    host: &str,
-    method: Option<&str>,
-) -> Result<DomainVerification> {
-    let mut url = format!(
-        "{server}/api/sites/{site}/domains/{}/verification",
-        host_segment(host)
-    );
-    if let Some(method) = method {
-        url.push_str(&format!("?method={method}"));
-    }
-    Ok(client
-        .post(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Run the ownership check for a host; on success the server attaches it.
-pub async fn check_domain_verification(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    host: &str,
-) -> Result<VerificationCheck> {
-    Ok(client
-        .post(format!(
-            "{server}/api/sites/{site}/domains/{}/verification/check",
-            host_segment(host)
-        ))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Admin-only: attach a host to the site **without** an ownership proof
-/// (`domain add --unverified`). Returns the server's confirmation text. The
-/// server gates this route at `system·admin`, so a site-scoped token gets a 403.
-pub async fn attach_domain_unverified(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    host: &str,
-) -> Result<String> {
-    Ok(client
-        .post(format!(
-            "{server}/api/sites/{site}/domains/{}/attach-unverified",
-            host_segment(host)
-        ))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?)
-}
-
-/// Drop a host's ownership challenge (when detaching the host).
-pub async fn remove_domain_verification(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    host: &str,
-) -> Result<()> {
-    client
-        .delete(format!(
-            "{server}/api/sites/{site}/domains/{}/verification",
-            host_segment(host)
-        ))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
-/// List all ownership challenges for a site (pending and verified).
-pub async fn list_domain_verifications(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-) -> Result<Vec<DomainVerification>> {
-    Ok(client
-        .get(format!("{server}/api/sites/{site}/domain-verifications"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Activate a deployment id for a site (the atomic switch / rollback).
-pub async fn activate(client: &ApiClient, server: &str, site: &str, id: &str) -> Result<()> {
-    client
-        .post(format!(
-            "{server}/api/sites/{site}/deployments/{id}/activate"
-        ))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
-/// Point a named alias at a deployment id.
-pub async fn set_alias(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    name: &str,
-    id: &str,
-) -> Result<()> {
-    #[derive(Serialize)]
-    struct SetAlias<'a> {
-        id: &'a str,
-    }
-    client
-        .put(format!("{server}/api/sites/{site}/aliases/{name}"))
-        .json(&SetAlias { id })
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
-/// List a site's named aliases (`name → deployment id`).
-pub async fn list_aliases(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-) -> Result<BTreeMap<String, String>> {
-    Ok(client
-        .get(format!("{server}/api/sites/{site}/aliases"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Remove a named alias.
-pub async fn remove_alias(client: &ApiClient, server: &str, site: &str, name: &str) -> Result<()> {
-    client
-        .delete(format!("{server}/api/sites/{site}/aliases/{name}"))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 /// One captured guest log line (a subset of the server's `logs::LogEntry`; the
 /// `ts_ms` field is present in the response but not needed for the tail).
 #[derive(Debug, Deserialize)]
@@ -514,85 +303,6 @@ pub struct LogsResponse {
     pub entries: Vec<LogEntry>,
     pub dropped: u64,
 }
-
-/// Fetch captured guest logs for a site: the most recent `limit` lines with
-/// `seq > after`, optionally filtered to one `stream` (`stdout`/`stderr`).
-pub async fn fetch_logs(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    limit: usize,
-    after: u64,
-    stream: Option<&str>,
-) -> Result<LogsResponse> {
-    let mut url = format!("{server}/api/sites/{site}/_boatramp/logs?limit={limit}&after={after}");
-    if let Some(stream) = stream {
-        url.push_str("&stream=");
-        url.push_str(stream);
-    }
-    Ok(client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Fetch a site's operator handler stats (raw JSON: handler invocation counters,
-/// consumer backlog/dead-letters, live stream connections).
-pub async fn fetch_handler_stats(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-) -> Result<serde_json::Value> {
-    Ok(client
-        .get(format!("{server}/api/sites/{site}/_boatramp/handlers"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?)
-}
-
-/// Run a dead-letter operation (`purge` or `redrive`) on a consumer `topic`
-/// (scope-relative; `alias` for a background-alias consumer). Returns the number
-/// of dead-lettered messages affected (`POST …/_boatramp/dlq`).
-pub async fn operate_dlq(
-    client: &ApiClient,
-    server: &str,
-    site: &str,
-    topic: &str,
-    alias: Option<&str>,
-    action: &str,
-) -> Result<usize> {
-    #[derive(Serialize)]
-    struct Request<'a> {
-        topic: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        alias: Option<&'a str>,
-        action: &'a str,
-    }
-    #[derive(Deserialize)]
-    struct DlqResponse {
-        affected: usize,
-    }
-    let resp: DlqResponse = client
-        .post(format!("{server}/api/sites/{site}/_boatramp/dlq"))
-        .json(&Request {
-            topic,
-            alias,
-            action,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(resp.affected)
-}
-
-// ---- content-addressed blobs (kernels, rootfs images, …) -------------------
 
 /// Whether `s` is a bare content-address: a 64-char lowercase hex SHA-256, as
 /// printed by [`hash_file`] / `blob put`. Distinguishes an existing blob hash
@@ -620,62 +330,6 @@ pub async fn hash_file(path: &std::path::Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).
-/// Idempotent: re-uploading an existing blob is a no-op server-side.
-pub async fn upload_blob(
-    http: &ApiClient,
-    server: &str,
-    hash: &str,
-    path: &std::path::Path,
-) -> Result<()> {
-    let file = tokio::fs::File::open(path).await?;
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-    http.put(format!("{server}/api/blobs/{hash}"))
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
-/// Hash a local file and upload it as a blob; returns its content-address.
-pub async fn put_file_blob(
-    http: &ApiClient,
-    server: &str,
-    path: &std::path::Path,
-) -> Result<String> {
-    let hash = hash_file(path).await?;
-    upload_blob(http, server, &hash, path).await?;
-    Ok(hash)
-}
-
-/// Resolve an **artifact reference** — a `--kernel` / `--rootfs` value — to a blob
-/// hash the server can stage. Accepts three forms:
-/// - a 64-hex content-address ⇒ used as-is (assumed already uploaded);
-/// - an `http(s)://` URL ⇒ downloaded to a temp file, then hashed + uploaded;
-/// - anything else ⇒ a local file path, hashed + uploaded.
-pub async fn resolve_artifact(http: &ApiClient, server: &str, value: &str) -> Result<String> {
-    if is_blob_hash(value) {
-        return Ok(value.to_string());
-    }
-    if value.starts_with("http://") || value.starts_with("https://") {
-        use tokio::io::AsyncWriteExt;
-        // Stream the URL to a temp file, then hash + upload it like a local file.
-        let mut resp = http.get(value).send().await?.error_for_status()?;
-        let tmp = std::env::temp_dir().join(format!("boatramp-artifact-{}", sanitize(value)));
-        let mut out = tokio::fs::File::create(&tmp).await?;
-        while let Some(chunk) = resp.chunk().await? {
-            out.write_all(&chunk).await?;
-        }
-        out.flush().await?;
-        drop(out);
-        let hash = put_file_blob(http, server, &tmp).await?;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Ok(hash);
-    }
-    put_file_blob(http, server, std::path::Path::new(value)).await
-}
-
 /// A filesystem-safe temp-name fragment derived from a URL (last path segment).
 fn sanitize(url: &str) -> String {
     url.rsplit('/')
@@ -691,6 +345,379 @@ fn sanitize(url: &str) -> String {
         })
         .take(64)
         .collect()
+}
+
+/// An authenticated control-plane connection: an [`ApiClient`] bound to a
+/// resolved server base URL. The request methods key off it, so the client and
+/// server base are threaded once (at construction) instead of by hand at every
+/// call site.
+pub struct ControlPlane {
+    http: ApiClient,
+    base: String,
+}
+
+impl ControlPlane {
+    /// Wrap an already-built client and resolved server base.
+    pub fn new(base: String, http: ApiClient) -> Self {
+        Self { http, base }
+    }
+
+    /// Fetch the manifest for a specific deployment id.
+    pub async fn fetch_manifest(&self, site: &str, id: &str) -> Result<Manifest> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/sites/{site}/deployments/{id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Fetch a site's deployment list (current + history).
+    pub async fn fetch_deployments(&self, site: &str) -> Result<DeploymentList> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/sites/{site}/deployments"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Fetch a site's config (server returns defaults if unset).
+    pub async fn fetch_site_config(&self, site: &str) -> Result<SiteConfig> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/sites/{site}/config"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Replace a site's config.
+    pub async fn put_site_config(&self, site: &str, config: &SiteConfig) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        client
+            .put(format!("{server}/api/sites/{site}/config"))
+            .json(config)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Start (or fetch the existing) ownership challenge for a host.
+    pub async fn start_domain_verification(
+        &self,
+        site: &str,
+        host: &str,
+        method: Option<&str>,
+    ) -> Result<DomainVerification> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        let mut url = format!(
+            "{server}/api/sites/{site}/domains/{}/verification",
+            host_segment(host)
+        );
+        if let Some(method) = method {
+            url.push_str(&format!("?method={method}"));
+        }
+        Ok(client
+            .post(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Run the ownership check for a host; on success the server attaches it.
+    pub async fn check_domain_verification(
+        &self,
+        site: &str,
+        host: &str,
+    ) -> Result<VerificationCheck> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .post(format!(
+                "{server}/api/sites/{site}/domains/{}/verification/check",
+                host_segment(host)
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Admin-only: attach a host to the site **without** an ownership proof
+    /// (`domain add --unverified`). Returns the server's confirmation text. The
+    /// server gates this route at `system·admin`, so a site-scoped token gets a 403.
+    pub async fn attach_domain_unverified(&self, site: &str, host: &str) -> Result<String> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .post(format!(
+                "{server}/api/sites/{site}/domains/{}/attach-unverified",
+                host_segment(host)
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?)
+    }
+
+    /// Drop a host's ownership challenge (when detaching the host).
+    pub async fn remove_domain_verification(&self, site: &str, host: &str) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        client
+            .delete(format!(
+                "{server}/api/sites/{site}/domains/{}/verification",
+                host_segment(host)
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// List all ownership challenges for a site (pending and verified).
+    pub async fn list_domain_verifications(&self, site: &str) -> Result<Vec<DomainVerification>> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/sites/{site}/domain-verifications"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Activate a deployment id for a site (the atomic switch / rollback).
+    pub async fn activate(&self, site: &str, id: &str) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        client
+            .post(format!(
+                "{server}/api/sites/{site}/deployments/{id}/activate"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Point a named alias at a deployment id.
+    pub async fn set_alias(&self, site: &str, name: &str, id: &str) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        #[derive(Serialize)]
+        struct SetAlias<'a> {
+            id: &'a str,
+        }
+        client
+            .put(format!("{server}/api/sites/{site}/aliases/{name}"))
+            .json(&SetAlias { id })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// List a site's named aliases (`name → deployment id`).
+    pub async fn list_aliases(&self, site: &str) -> Result<BTreeMap<String, String>> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/sites/{site}/aliases"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Remove a named alias.
+    pub async fn remove_alias(&self, site: &str, name: &str) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        client
+            .delete(format!("{server}/api/sites/{site}/aliases/{name}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Fetch captured guest logs for a site: the most recent `limit` lines with
+    /// `seq > after`, optionally filtered to one `stream` (`stdout`/`stderr`).
+    pub async fn fetch_logs(
+        &self,
+        site: &str,
+        limit: usize,
+        after: u64,
+        stream: Option<&str>,
+    ) -> Result<LogsResponse> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        let mut url =
+            format!("{server}/api/sites/{site}/_boatramp/logs?limit={limit}&after={after}");
+        if let Some(stream) = stream {
+            url.push_str("&stream=");
+            url.push_str(stream);
+        }
+        Ok(client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Fetch a site's operator handler stats (raw JSON: handler invocation counters,
+    /// consumer backlog/dead-letters, live stream connections).
+    pub async fn fetch_handler_stats(&self, site: &str) -> Result<serde_json::Value> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/sites/{site}/_boatramp/handlers"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Run a dead-letter operation (`purge` or `redrive`) on a consumer `topic`
+    /// (scope-relative; `alias` for a background-alias consumer). Returns the number
+    /// of dead-lettered messages affected (`POST …/_boatramp/dlq`).
+    pub async fn operate_dlq(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+        action: &str,
+    ) -> Result<usize> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            action: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct DlqResponse {
+            affected: usize,
+        }
+        let resp: DlqResponse = client
+            .post(format!("{server}/api/sites/{site}/_boatramp/dlq"))
+            .json(&Request {
+                topic,
+                alias,
+                action,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.affected)
+    }
+
+    /// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).
+    /// Idempotent: re-uploading an existing blob is a no-op server-side.
+    pub async fn upload_blob(&self, hash: &str, path: &std::path::Path) -> Result<()> {
+        let Self { http, base: server } = self;
+        let file = tokio::fs::File::open(path).await?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        http.put(format!("{server}/api/blobs/{hash}"))
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Hash a local file and upload it as a blob; returns its content-address.
+    pub async fn put_file_blob(&self, path: &std::path::Path) -> Result<String> {
+        let hash = hash_file(path).await?;
+        self.upload_blob(&hash, path).await?;
+        Ok(hash)
+    }
+
+    /// Resolve an **artifact reference** — a `--kernel` / `--rootfs` value — to a blob
+    /// hash the server can stage. Accepts three forms:
+    /// - a 64-hex content-address ⇒ used as-is (assumed already uploaded);
+    /// - an `http(s)://` URL ⇒ downloaded to a temp file, then hashed + uploaded;
+    /// - anything else ⇒ a local file path, hashed + uploaded.
+    pub async fn resolve_artifact(&self, value: &str) -> Result<String> {
+        if is_blob_hash(value) {
+            return Ok(value.to_string());
+        }
+        if value.starts_with("http://") || value.starts_with("https://") {
+            use tokio::io::AsyncWriteExt;
+            // Stream the URL to a temp file, then hash + upload it like a local file.
+            let mut resp = self.http.get(value).send().await?.error_for_status()?;
+            let tmp = std::env::temp_dir().join(format!("boatramp-artifact-{}", sanitize(value)));
+            let mut out = tokio::fs::File::create(&tmp).await?;
+            while let Some(chunk) = resp.chunk().await? {
+                out.write_all(&chunk).await?;
+            }
+            out.flush().await?;
+            drop(out);
+            let hash = self.put_file_blob(&tmp).await?;
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Ok(hash);
+        }
+        self.put_file_blob(std::path::Path::new(value)).await
+    }
 }
 
 #[cfg(test)]

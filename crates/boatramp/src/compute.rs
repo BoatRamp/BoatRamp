@@ -203,6 +203,7 @@ struct PutComputeRequest {
 pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
+    let cp = client::ControlPlane::new(server.clone(), http.clone());
 
     match args.command {
         ComputeCommand::Ls => {
@@ -252,9 +253,9 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             regions,
         } => {
             // `--rootfs` / `--kernel` accept a blob hash, a local file, or a URL.
-            let rootfs = client::resolve_artifact(&http, &server, &rootfs).await?;
+            let rootfs = cp.resolve_artifact(&rootfs).await?;
             let kernel = match kernel {
-                Some(k) => client::resolve_artifact(&http, &server, &k).await?,
+                Some(k) => cp.resolve_artifact(&k).await?,
                 None => String::new(), // empty ⇒ the node substitutes its default
             };
             let spec = build_spec(
@@ -315,11 +316,11 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             .map_err(|e| Error::RootfsBuild(e.to_string()))?;
             // `--kernel` accepts a blob hash, a local file, or a URL.
             let kernel = match kernel {
-                Some(k) => client::resolve_artifact(&http, &server, &k).await?,
+                Some(k) => cp.resolve_artifact(&k).await?,
                 None => String::new(), // empty ⇒ the node substitutes its default
             };
             // Hash + upload the freshly built rootfs as a content-addressed blob.
-            let rootfs = client::put_file_blob(&http, &server, &out).await?;
+            let rootfs = cp.put_file_blob(&out).await?;
             let _ = std::fs::remove_file(&out);
             eprintln!("rootfs blob {rootfs} uploaded");
             let spec = build_spec(

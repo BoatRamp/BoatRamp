@@ -58,8 +58,11 @@ pub struct DeploymentsArgs {
 /// List a site's deployment history (most recent first; `*` marks current).
 pub async fn list(args: DeploymentsArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    let list = client::fetch_deployments(&http, &server, &site).await?;
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
+    let list = cp.fetch_deployments(&site).await?;
 
     if list.deployments.is_empty() {
         println!("no deployments for {site}");
@@ -137,8 +140,11 @@ pub struct RollbackArgs {
 /// Roll a site back to its previous deployment, or to a specific id.
 pub async fn rollback(args: RollbackArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    let list = client::fetch_deployments(&http, &server, &site).await?;
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
+    let list = cp.fetch_deployments(&site).await?;
 
     let target = match &args.to {
         Some(wanted) => {
@@ -147,7 +153,7 @@ pub async fn rollback(args: RollbackArgs, config: &ProjectConfig) -> Result<()> 
         None => previous(&list).ok_or(Error::NoPreviousDeployment)?,
     };
 
-    client::activate(&http, &server, &site, &target).await?;
+    cp.activate(&site, &target).await?;
     println!("rolled back {site} -> {target}");
     Ok(())
 }
@@ -167,15 +173,18 @@ pub struct StatusArgs {
 /// Show a site's current deployment: id, age, and size.
 pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    let list = client::fetch_deployments(&http, &server, &site).await?;
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
+    let list = cp.fetch_deployments(&site).await?;
 
     let Some(current) = list.current.clone() else {
         println!("{site}: no active deployment");
         return Ok(());
     };
 
-    let manifest = client::fetch_manifest(&http, &server, &site, &current).await?;
+    let manifest = cp.fetch_manifest(&site, &current).await?;
     let files = manifest.files.len();
     let bytes: u64 = manifest.files.values().map(|entry| entry.size).sum();
     let current_entry = list.deployments.iter().find(|entry| entry.id == current);

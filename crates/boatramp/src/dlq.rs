@@ -63,14 +63,18 @@ enum DlqCommand {
 /// Entry point for `boatramp dlq`.
 pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
 
     let (action, topic, alias) = match &args.command {
         DlqCommand::Purge { topic, alias } => ("purge", topic, alias),
         DlqCommand::Redrive { topic, alias } => ("redrive", topic, alias),
     };
-    let affected =
-        client::operate_dlq(&http, &server, &site, topic, alias.as_deref(), action).await?;
+    let affected = cp
+        .operate_dlq(&site, topic, alias.as_deref(), action)
+        .await?;
     println!("{action}: {affected} dead-lettered message(s) on topic {topic:?}");
     Ok(())
 }

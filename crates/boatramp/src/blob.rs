@@ -42,11 +42,14 @@ enum BlobCommand {
 /// Entry point for `boatramp blob`.
 pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
     let server = client::resolve_server(args.server, config)?;
-    let http = client::http_client(client::token(config).as_deref());
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
 
     match args.command {
         BlobCommand::Put { file } => {
-            let hash = client::put_file_blob(&http, &server, &file).await?;
+            let hash = cp.put_file_blob(&file).await?;
             println!("{hash}");
         }
     }

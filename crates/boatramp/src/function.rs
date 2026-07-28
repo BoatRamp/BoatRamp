@@ -393,9 +393,10 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             server,
         } => {
             let (server, http) = client::connect(server, config)?;
+            let cp = client::ControlPlane::new(server.clone(), http.clone());
             // Upload the component first; the server rejects a deploy whose blob is
             // absent, so this is content-addressed staging, not a second round-trip.
-            let hash = client::put_file_blob(&http, &server, &component).await?;
+            let hash = cp.put_file_blob(&component).await?;
             let mut cfg = serde_json::Map::new();
             if let Some(r) = &runtime {
                 cfg.insert("runtime".to_string(), serde_json::json!(r));

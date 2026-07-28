@@ -115,10 +115,13 @@ enum DomainCommand {
 /// Entry point for `boatramp domain`.
 pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
 
     match args.command {
-        DomainCommand::Ls => ls(&http, &server, &site).await,
+        DomainCommand::Ls => ls(&cp, &site).await,
         DomainCommand::Add {
             host,
             method,
@@ -128,22 +131,21 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
         } => {
             // Admin override: attach without an ownership proof.
             if unverified {
-                let msg = client::attach_domain_unverified(&http, &server, &site, &host).await?;
+                let msg = cp.attach_domain_unverified(&site, &host).await?;
                 print!("{msg}");
                 return Ok(());
             }
             // A managed-DNS provider does the whole dance (publish TXT → poll →
             // attach) itself.
             if let Some(provider) = provider.as_deref() {
-                return add_via_provider(&http, &server, &site, &host, Some(provider)).await;
+                return add_via_provider(&cp, &site, &host, Some(provider)).await;
             }
-            let verification =
-                client::start_domain_verification(&http, &server, &site, &host, Some(&method))
-                    .await?;
+            let verification = cp
+                .start_domain_verification(&site, &host, Some(&method))
+                .await?;
             if verification.verified {
                 // Ownership already proven earlier — (re)attach it now.
-                let result =
-                    client::check_domain_verification(&http, &server, &site, &host).await?;
+                let result = cp.check_domain_verification(&site, &host).await?;
                 if result.attached {
                     println!("{host} is already verified and attached to {site}");
                 } else {
@@ -167,7 +169,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
                 return Ok(());
             }
             println!("\nchecking whether {host} already resolves here…");
-            match client::check_domain_verification(&http, &server, &site, &host).await {
+            match cp.check_domain_verification(&site, &host).await {
                 Ok(result) if result.passed && result.attached => {
                     println!("✓ verified {host} and attached it to {site}");
                 }
@@ -191,7 +193,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             Ok(())
         }
         DomainCommand::Verify { host } => {
-            let result = client::check_domain_verification(&http, &server, &site, &host).await?;
+            let result = cp.check_domain_verification(&site, &host).await?;
             if result.passed {
                 if result.attached {
                     println!("verified {host} and attached it to {site}");
@@ -210,15 +212,15 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
             Ok(())
         }
         DomainCommand::Rm { host } => {
-            let mut site_config = client::fetch_site_config(&http, &server, &site).await?;
+            let mut site_config = cp.fetch_site_config(&site).await?;
             let domains = &mut site_config.domains;
             if domains.primary.as_deref() == Some(host.as_str()) {
                 domains.primary = None;
             }
             domains.aliases.retain(|alias| alias != &host);
             domains.wildcards.retain(|wildcard| wildcard != &host);
-            client::put_site_config(&http, &server, &site, &site_config).await?;
-            client::remove_domain_verification(&http, &server, &site, &host).await?;
+            cp.put_site_config(&site, &site_config).await?;
+            cp.remove_domain_verification(&site, &host).await?;
             println!("detached {host} from {site}");
             Ok(())
         }
@@ -231,8 +233,7 @@ pub async fn run(args: DomainArgs, config: &ProjectConfig) -> Result<()> {
 /// A/CNAME — so ownership is proven before anything is pointed at this server.
 #[cfg(feature = "acme-dns")]
 async fn add_via_provider(
-    http: &crate::client::ApiClient,
-    server: &str,
+    cp: &crate::client::ControlPlane,
     site: &str,
     host: &str,
     provider: Option<&str>,
@@ -250,8 +251,9 @@ async fn add_via_provider(
         .map_err(|e| Error::Verify(format!("unknown --provider `{provider_name}`: {e}")))?;
 
     // `--auto` publishes a DNS TXT, so it is always the `dns` method.
-    let verification =
-        client::start_domain_verification(http, server, site, host, Some("dns")).await?;
+    let verification = cp
+        .start_domain_verification(site, host, Some("dns"))
+        .await?;
     if verification.verified {
         println!("{host} is already verified for {site}; run `domain verify {host}` to attach");
         return Ok(());
@@ -274,7 +276,7 @@ async fn add_via_provider(
     const ATTEMPTS: usize = 10;
     const EVERY_SECS: u64 = 5;
     for attempt in 1..=ATTEMPTS {
-        let result = client::check_domain_verification(http, server, site, host).await?;
+        let result = cp.check_domain_verification(site, host).await?;
         if result.passed {
             if result.attached {
                 println!("verified {host} and attached it to {site}");
@@ -302,8 +304,7 @@ async fn add_via_provider(
 /// challenge with, so `--provider` is unavailable.
 #[cfg(not(feature = "acme-dns"))]
 async fn add_via_provider(
-    _http: &crate::client::ApiClient,
-    _server: &str,
+    _cp: &crate::client::ControlPlane,
     _site: &str,
     _host: &str,
     _provider: Option<&str>,
@@ -314,8 +315,8 @@ async fn add_via_provider(
 }
 
 /// List attached hostnames plus any started-but-not-yet-attached verifications.
-async fn ls(http: &crate::client::ApiClient, server: &str, site: &str) -> Result<()> {
-    let site_config = client::fetch_site_config(http, server, site).await?;
+async fn ls(cp: &crate::client::ControlPlane, site: &str) -> Result<()> {
+    let site_config = cp.fetch_site_config(site).await?;
     let domains = &site_config.domains;
     let mut any = false;
     if let Some(primary) = &domains.primary {
@@ -343,7 +344,8 @@ async fn ls(http: &crate::client::ApiClient, server: &str, site: &str) -> Result
         .chain(domains.wildcards.iter().cloned())
         .map(|h| boatramp_core::domain_verify::normalize_host(&h))
         .collect();
-    let pending: Vec<_> = client::list_domain_verifications(http, server, site)
+    let pending: Vec<_> = cp
+        .list_domain_verifications(site)
         .await?
         .into_iter()
         .filter(|v| !attached.contains(&v.host))

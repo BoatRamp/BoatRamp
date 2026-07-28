@@ -137,8 +137,11 @@ enum TrustedProxyCommand {
 /// Entry point for `boatramp access`.
 pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    let mut site_config = client::fetch_site_config(&http, &server, &site).await?;
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
+    let mut site_config = cp.fetch_site_config(&site).await?;
     let access = &mut site_config.access;
 
     match args.command {
@@ -230,7 +233,7 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
         },
     }
 
-    client::put_site_config(&http, &server, &site, &site_config).await?;
+    cp.put_site_config(&site, &site_config).await?;
     Ok(())
 }
 

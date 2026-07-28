@@ -56,11 +56,14 @@ enum AliasCommand {
 /// Entry point for `boatramp alias`.
 pub async fn run(args: AliasArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
 
     match args.command {
         AliasCommand::Ls => {
-            let aliases = client::list_aliases(&http, &server, &site).await?;
+            let aliases = cp.list_aliases(&site).await?;
             if aliases.is_empty() {
                 println!("no aliases for {site}");
             }
@@ -70,14 +73,14 @@ pub async fn run(args: AliasArgs, config: &ProjectConfig) -> Result<()> {
         }
         AliasCommand::Set { name, deployment } => {
             // Resolve a history prefix to a full id so the server gets a real id.
-            let list = client::fetch_deployments(&http, &server, &site).await?;
+            let list = cp.fetch_deployments(&site).await?;
             let id =
                 resolve_id(&list, &deployment).ok_or_else(|| Error::NoMatch(deployment.clone()))?;
-            client::set_alias(&http, &server, &site, &name, &id).await?;
+            cp.set_alias(&site, &name, &id).await?;
             println!("alias {name} -> {} for {site}", short(&id));
         }
         AliasCommand::Rm { name } => {
-            client::remove_alias(&http, &server, &site, &name).await?;
+            cp.remove_alias(&site, &name).await?;
             println!("removed alias {name} from {site}");
         }
     }

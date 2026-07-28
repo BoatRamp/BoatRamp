@@ -47,11 +47,14 @@ pub struct LogsArgs {
 /// Entry point for `boatramp logs`.
 pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
     let stream = args.stream.as_deref();
 
     // Initial fetch: the most recent `limit` lines.
-    let first = client::fetch_logs(&http, &server, &site, args.limit, 0, stream).await?;
+    let first = cp.fetch_logs(&site, args.limit, 0, stream).await?;
     let mut cursor = first.entries.last().map(|e| e.seq).unwrap_or(0);
     for entry in &first.entries {
         print_line(entry);
@@ -70,8 +73,9 @@ pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
     // no duplicates and no gaps across polls).
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let next =
-            client::fetch_logs(&http, &server, &site, args.limit.max(1000), cursor, stream).await?;
+        let next = cp
+            .fetch_logs(&site, args.limit.max(1000), cursor, stream)
+            .await?;
         for entry in &next.entries {
             print_line(entry);
             cursor = cursor.max(entry.seq);
@@ -100,8 +104,11 @@ pub struct StatsArgs {
 /// and live stream connections.
 pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let http = client::http_client(client::token(config).as_deref());
-    let stats = client::fetch_handler_stats(&http, &server, &site).await?;
+    let cp = client::ControlPlane::new(
+        server,
+        client::http_client(client::token(config).as_deref()),
+    );
+    let stats = cp.fetch_handler_stats(&site).await?;
     println!("{}", serde_json::to_string_pretty(&stats)?);
     Ok(())
 }
