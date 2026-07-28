@@ -394,9 +394,15 @@ pub enum StartupAction {
 /// Inputs to the [`decide_startup`] founding decision.
 #[derive(Debug, Clone, Copy)]
 pub struct StartupInputs {
-    /// This node has non-empty durable Raft state (it is/was running).
-    pub has_durable_state: bool,
-    /// This node was ever admitted to a cluster (a durable, survives-wipe marker).
+    /// This node holds **committed cluster state** (persisted mesh trust) — it truly
+    /// founded or joined and can resume its membership. This is deliberately NOT
+    /// "the durable store dir exists": that dir is created merely by opening the KV,
+    /// before a first join completes, so resuming on it would wedge a joiner whose
+    /// initial join failed into an empty-trust, fail-closed mesh forever.
+    pub has_committed_state: bool,
+    /// This node's durable store dir already exists (it booted at least once). A
+    /// weaker signal than [`Self::has_committed_state`]: the dir can exist with no
+    /// committed state (a join that never finished).
     pub ever_member: bool,
     /// One or more seeds are configured (something to join).
     pub seeds_present: bool,
@@ -406,12 +412,14 @@ pub struct StartupInputs {
 
 /// Decide what a node does at startup — the single source of truth for founding
 /// vs joining vs resuming (F5). Founding is **never** inferred from "seeds are
-/// absent/unreachable right now"; it happens only on the explicit init signal,
-/// and only for a node that was never a member. Everything else with no state
-/// fails closed rather than risk a second genesis (split-brain).
+/// absent/unreachable right now"; it happens only on the explicit init signal.
+/// Resuming requires **committed** state, not a merely-created store dir, so a node
+/// whose first join never completed re-derives its action (rejoins with the
+/// operator's current ticket) instead of wedging on an empty trust set.
 pub fn decide_startup(i: &StartupInputs) -> StartupAction {
-    // A node with durable state always resumes — the highest-precedence case.
-    if i.has_durable_state {
+    // Committed cluster state (persisted trust) → resume; the highest-precedence
+    // case. A restart of a real member/founder.
+    if i.has_committed_state {
         return StartupAction::Resume;
     }
     // Ambiguous intent: founding and joining are mutually exclusive. A node
@@ -423,24 +431,24 @@ pub fn decide_startup(i: &StartupInputs) -> StartupAction {
                 .into(),
         );
     }
-    // A former member whose volume was wiped must NEVER re-found; it may only
-    // rejoin via seeds.
-    if i.ever_member {
-        return if i.seeds_present {
-            StartupAction::Join
-        } else {
-            StartupAction::FailClosed(
-                "former member with no durable state and no seeds: refusing to re-found \
-                 (F5) — provide seeds to rejoin the existing cluster"
-                    .into(),
-            )
-        };
-    }
-    // A fresh node: join if seeded, else found only on the explicit signal.
+    // No committed state. The store dir may still exist because a prior boot opened
+    // the KV but never completed founding/joining (e.g. a joiner whose first join
+    // failed after the store was created). Re-derive the action from intent rather
+    // than resuming into an unconfigured, fail-closed mesh:
+    //  - seeds present  → (re)join, redeeming the operator's current (refreshed)
+    //    join ticket; covers a fresh joiner and a crash-looping one alike.
+    //  - init requested → (re)found; `Raft::initialize` is idempotent, so this
+    //    safely completes a genesis that an earlier boot began but did not persist.
     if i.seeds_present {
         StartupAction::Join
     } else if i.init_requested {
         StartupAction::Found
+    } else if i.ever_member {
+        StartupAction::FailClosed(
+            "durable store present but holds no committed cluster state, and no seeds \
+             to rejoin: refusing to self-found (F5) — provide a join ticket/seeds"
+                .into(),
+        )
     } else {
         StartupAction::FailClosed(
             "no durable state, no seeds, and no cluster-init: refusing to self-found \
@@ -585,13 +593,15 @@ mod tests {
         ));
     }
 
-    /// The founding decision (F5): durable state resumes; a fresh node founds
-    /// only on the explicit signal and joins when seeded; a former member never
-    /// re-founds; ambiguous/empty inputs fail closed — never a silent self-found.
+    /// The founding decision (F5): committed state resumes; a fresh node founds
+    /// only on the explicit signal and joins when seeded; ambiguous/empty inputs
+    /// fail closed — never a silent self-found. Critically, a *store dir that
+    /// exists but holds no committed state* re-derives its action (so a joiner whose
+    /// first join failed rejoins) instead of resuming into an empty-trust mesh.
     #[test]
     fn startup_decision_enforces_explicit_single_shot_founding() {
         let base = StartupInputs {
-            has_durable_state: false,
+            has_committed_state: false,
             ever_member: false,
             seeds_present: false,
             init_requested: false,
@@ -602,10 +612,10 @@ mod tests {
             decide_startup(&i)
         };
 
-        // Durable state always resumes, regardless of every other input.
+        // Committed state always resumes, regardless of every other input.
         assert_eq!(
             with(|i| {
-                i.has_durable_state = true;
+                i.has_committed_state = true;
                 i.seeds_present = true;
                 i.init_requested = true;
             }),
@@ -623,7 +633,9 @@ mod tests {
             }),
             StartupAction::FailClosed(_)
         ));
-        // Former member, wiped volume, seeds → rejoin (never re-found).
+        // Store dir exists but no committed state, seeds present → REJOIN (redeem
+        // the current ticket) rather than wedge on an empty trust set. This is the
+        // crash-looping-joiner recovery.
         assert_eq!(
             with(|i| {
                 i.ever_member = true;
@@ -631,15 +643,20 @@ mod tests {
             }),
             StartupAction::Join
         );
-        // Former member, wiped volume, no seeds, even with init → fail closed
-        // (a former member never re-founds).
-        assert!(matches!(
+        // Store dir exists but no committed state, init, no seeds → re-FOUND: a
+        // founder completes a genesis an earlier boot began (initialize is
+        // idempotent), never wedging.
+        assert_eq!(
             with(|i| {
                 i.ever_member = true;
                 i.init_requested = true;
             }),
-            // init+no-seeds+ever_member: not the ambiguous case, so it reaches the
-            // ever_member branch and fails closed on "no seeds".
+            StartupAction::Found
+        );
+        // Store dir exists but no committed state, no seeds, no init → fail closed
+        // (nothing authorizes founding or joining).
+        assert!(matches!(
+            with(|i| i.ever_member = true),
             StartupAction::FailClosed(_)
         ));
         // Fresh, nothing configured → fail closed (never a silent self-found).

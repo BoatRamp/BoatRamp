@@ -1480,13 +1480,21 @@ async fn run_cluster(
         .store_dir
         .clone()
         .unwrap_or_else(|| data_dir.join("raft"));
-    // Whether this node already has durable Raft state, captured BEFORE opening
-    // (which creates the dir): the resume-vs-found/join signal (F5). A node that
-    // has ever run has this dir; a fresh node does not.
-    let had_durable_state = store_dir.exists();
+    // Whether this node's durable store dir already exists, captured BEFORE opening
+    // (which creates it). A weak "has booted before" signal — NOT the resume gate:
+    // the dir is created just by opening the KV, before a first join completes.
+    let store_dir_existed = store_dir.exists();
     let durable_kv: Arc<dyn KvStore> = Arc::new(
         boatramp_storage::SlateKv::open_local_with_flush(store_dir, CONTROL_PLANE_FLUSH).await?,
     );
+    // The real resume-vs-found/join signal (F5): whether the store holds COMMITTED
+    // cluster state (persisted mesh trust). A store dir that exists but has no
+    // committed trust means an earlier boot opened the KV but never finished its
+    // join — such a node must re-derive its action (rejoin), not resume into an
+    // empty-trust, fail-closed mesh. Checked once, over the raw store.
+    let has_committed_state = boatramp_cluster::persist::has_committed_trust(&durable_kv)
+        .await
+        .map_err(|e| Error::ClusterStartup(e.to_string()))?;
     // Keep a handle to force a final flush on graceful shutdown (SHUT-1): the
     // store is moved into the Raft stores below, so this clone is how we reach
     // its `flush` after serving stops.
@@ -1537,14 +1545,19 @@ async fn run_cluster(
         std::env::var("BOATRAMP_POD_NAME").is_ok_and(|name| name.rsplit('-').next() == Some("0"));
     let init_requested = args.cluster_init || is_operator_founder;
     let action = crate::join::decide_startup(&crate::join::StartupInputs {
-        has_durable_state: had_durable_state,
-        // A node that has ever run keeps its durable store; a wiped volume loses
-        // it, so we treat durable state as the "ever member" marker too (F5's
-        // never-re-found is enforced by requiring seeds when there's no state).
-        ever_member: had_durable_state,
+        // Resume ONLY on committed state (persisted trust) — not on a store dir that
+        // merely exists, which would wedge a joiner whose first join never finished.
+        has_committed_state,
+        // The dir already existing means this node booted before, but possibly never
+        // committed any state; kept as the weaker "ever booted" signal for messaging.
+        ever_member: store_dir_existed,
         seeds_present,
         init_requested,
     });
+    // A resuming node seeds no genesis trust here — it rehydrates its trust set
+    // from durable state inside `build_node`, so its empty-trust fail-closed check
+    // is deferred until after that (below). Captured now: the `match action` moves.
+    let is_resume = matches!(action, crate::join::StartupAction::Resume);
 
     // This node's own reachable mesh URL (advertised at join so the leader can
     // dial it), defaulting to the bind address.
@@ -1627,9 +1640,11 @@ async fn run_cluster(
         }
     }
 
-    // Fail closed: never expose an unauthenticated mesh on a non-loopback
-    // bind. An empty trust set means no peer pubkeys were configured/adopted.
-    if !cluster_cfg.listen.ip().is_loopback() && genesis_trust.is_empty() {
+    // Fail closed: never bring up a non-loopback mesh with no trusted peers.
+    // Found/Join seed `genesis_trust` right here, so they are checked now; a Resume
+    // leaves it empty on purpose and is checked after `build_node` rehydrates its
+    // trust from durable state.
+    if !cluster_cfg.listen.ip().is_loopback() && genesis_trust.is_empty() && !is_resume {
         return Err(Error::MeshUnconfigured(cluster_cfg.listen));
     }
 
@@ -1672,6 +1687,14 @@ async fn run_cluster(
         })
         .await?,
     );
+
+    // A resuming node rehydrated its trust set from durable state inside
+    // `build_node`. Only now can it fail closed on a genuinely empty trust (a wiped
+    // or corrupt volume) — otherwise the mesh would come up trusting no peer.
+    if is_resume && !cluster_cfg.listen.ip().is_loopback() && mesh_tls.trust().snapshot().is_empty()
+    {
+        return Err(Error::MeshUnconfigured(cluster_cfg.listen));
+    }
 
     // Serve this node's peer mesh over RFC 7250 raw-public-key mutual TLS 1.3:
     // every `/raft/*` + `/stream/*` request must present a trusted peer key. The

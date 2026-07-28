@@ -645,6 +645,21 @@ pub async fn build_node(params: ClusterParams) -> Result<ClusterNode, BootstrapE
     let durable_trust = crate::mesh::trust_from_keys(durable_keys.iter().map(String::as_str));
     if !durable_trust.is_empty() {
         trust.replace_all(durable_trust);
+    } else if !genesis {
+        // A dynamic joiner adopts its trust into the live set at join but — unlike
+        // the founder's `bootstrap` — never persists it, so an early restart before
+        // the leader's replication has been flushed would resume with an empty
+        // durable trust and fail closed. Persist the adopted set now (durable +
+        // flushed) so it survives a restart; replication reconciles it afterward.
+        let writes: Vec<(String, Vec<u8>)> = trust
+            .snapshot()
+            .into_iter()
+            .flat_map(|(node, keys)| {
+                keys.into_iter()
+                    .map(move |key| (crate::mesh::trust_key(node, &key), Vec::new()))
+            })
+            .collect();
+        sm.seed_local(writes).await?;
     }
     // Likewise rehydrate the peer-address directory from durable `mesh/addr/*`, so
     // a dynamically-joined node keeps its routing across restarts with no peer map.

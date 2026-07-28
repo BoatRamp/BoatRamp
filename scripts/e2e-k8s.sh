@@ -26,12 +26,15 @@ dump_diagnostics() {
   log "FAILED — diagnostics ($NS)"
   kubectl -n "$NS" get pods -o wide 2>/dev/null || true
   kubectl -n "$NS" describe pods 2>/dev/null | sed -n '/Last State:/,+4p;/Events:/,$p' | tail -60 || true
-  # The operator Deployment and the managed cluster StatefulSet are separate
-  # failure surfaces — dump current + previous logs for both (a crash-loop only
-  # shows its cause in the previous container's log).
-  for w in deploy/boatramp-operator statefulset/prod; do
-    kubectl -n "$NS" logs "$w" --all-containers --tail=120 --prefix 2>/dev/null || true
-    kubectl -n "$NS" logs "$w" --all-containers --previous --tail=120 --prefix 2>/dev/null || true
+  # The operator Deployment and each cluster pod are separate failure surfaces.
+  # Dump per pod (a `statefulset/…` selector picks one arbitrary — usually healthy —
+  # pod, so a single crashing ordinal is missed); a crash-loop only shows its cause
+  # in the *previous* container's log.
+  local pods
+  pods="$(kubectl -n "$NS" get pods -o name 2>/dev/null)"
+  for p in $pods; do
+    kubectl -n "$NS" logs "$p" --all-containers --tail=120 --prefix 2>/dev/null || true
+    kubectl -n "$NS" logs "$p" --all-containers --previous --tail=120 --prefix 2>/dev/null || true
   done
   kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
 }
@@ -100,8 +103,9 @@ metadata: { name: prod }
 spec:
   mode: cluster
   # Pin the image the test built + loaded into the node; without this the operator
-  # falls back to its `ghcr.io/boatramp/boatramp:latest` default, which the offline
-  # kind/k3d node can't pull (ImagePullBackOff). The operator serves it IfNotPresent.
+  # falls back to its ghcr.io default, which the offline kind/k3d node cannot pull
+  # (ImagePullBackOff). Backticks are avoided here: this heredoc is unquoted so
+  # \$IMAGE expands, and backticks would trigger command substitution.
   image: $IMAGE
   replicas: 3
   storage: 1Gi

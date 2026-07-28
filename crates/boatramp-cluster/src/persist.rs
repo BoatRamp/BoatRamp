@@ -324,6 +324,45 @@ impl PersistentStateMachine {
             .map(|(k, _)| k.clone())
             .collect()
     }
+
+    /// Seed applied keys locally — durable + the in-memory cache, then flush —
+    /// **without** a Raft round-trip. Used to make a dynamic joiner's adopted mesh
+    /// trust durable at join time so an early restart (before the leader's
+    /// replication has been flushed) resumes with a non-empty trust set instead of
+    /// failing closed; ordinary replication reconciles/extends it afterward.
+    pub async fn seed_local(
+        &self,
+        writes: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), StorageError<NodeId>> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let mut batch = Vec::with_capacity(writes.len());
+        {
+            let mut inner = self.inner.lock().await;
+            for (k, v) in writes {
+                batch.push(boatramp_core::kv::WriteOp::Put(sm_data_key(&k), v.clone()));
+                inner.data.insert(k, v);
+            }
+        }
+        self.kv.write_batch(batch).await.map_err(e_write_sm)?;
+        self.kv.flush().await.map_err(e_write_sm)
+    }
+}
+
+/// True if the durable store already holds **committed mesh trust** — the state a
+/// resuming node needs to authenticate and serve its peer mesh. This is what tells
+/// a node that genuinely founded/joined (and persisted trust) apart from one whose
+/// durable store dir was merely *created* by opening the KV before its first join
+/// ever completed: the latter must re-derive its startup action (found/join) rather
+/// than resume into an empty-trust, fail-closed mesh. Cheap: one prefix read over
+/// the raw store, no state-machine construction.
+pub async fn has_committed_trust(kv: &Arc<dyn KvStore>) -> Result<bool, StorageError<NodeId>> {
+    let keys = kv
+        .list_prefix(&sm_data_key(crate::mesh::TRUST_PREFIX))
+        .await
+        .map_err(e_read_sm)?;
+    Ok(!keys.is_empty())
 }
 
 #[async_trait::async_trait]
@@ -565,6 +604,54 @@ mod tests {
     #[test]
     fn passes_openraft_storage_suite() -> Result<(), StorageError<NodeId>> {
         openraft::testing::Suite::test_all(MemBuilder)
+    }
+
+    /// A dynamic joiner persists its adopted trust with `seed_local` (no Raft
+    /// round-trip) so an early restart resumes with it instead of failing closed.
+    /// The seed must be visible to the serving read path immediately *and* survive
+    /// a restart (a fresh state machine over the same durable store).
+    #[tokio::test]
+    async fn seed_local_is_durable_across_a_reopen() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let sm = PersistentStateMachine::new(kv.clone()).await.unwrap();
+        let key = crate::mesh::trust_key(42, &[1, 2, 3]);
+        sm.seed_local(vec![(key.clone(), Vec::new())])
+            .await
+            .unwrap();
+        assert_eq!(
+            sm.list_prefix(crate::mesh::TRUST_PREFIX).await,
+            vec![key.clone()],
+            "seeded trust is visible to the live read path"
+        );
+        let reopened = PersistentStateMachine::new(kv).await.unwrap();
+        assert_eq!(
+            reopened.list_prefix(crate::mesh::TRUST_PREFIX).await,
+            vec![key],
+            "seeded trust survives a restart"
+        );
+    }
+
+    /// `has_committed_trust` is the resume gate: false for a store that was only
+    /// opened (a joiner whose first join never finished), true once trust is
+    /// persisted. This is exactly what keeps a crash-looping joiner rejoining
+    /// instead of resuming into an empty-trust mesh.
+    #[tokio::test]
+    async fn has_committed_trust_tracks_persisted_trust() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        // A freshly-opened store has no committed trust → the node must NOT resume.
+        let sm = PersistentStateMachine::new(kv.clone()).await.unwrap();
+        assert!(
+            !has_committed_trust(&kv).await.unwrap(),
+            "an opened-but-empty store has no committed trust"
+        );
+        // Once trust is persisted (a completed found/join), it does.
+        sm.seed_local(vec![(crate::mesh::trust_key(7, &[9, 9]), Vec::new())])
+            .await
+            .unwrap();
+        assert!(
+            has_committed_trust(&kv).await.unwrap(),
+            "persisted trust is committed state → resume"
+        );
     }
 
     // ---- full-cluster-restart durability -----------------------------------
