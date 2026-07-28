@@ -467,5 +467,31 @@ points, CORS + access-log middleware, and shared response helpers — the front 
 a reader expects at the crate root. Deliberately left there rather than
 over-split into ceremony.
 
-Groups **E** (deep newtypes: Host / SiteName / id types, DTO move) and **F**
-(borderline) remain deferred for a separate job per the triage decision.
+**Group E — deep domain modelling.** All four campaigns landed as
+behaviour-preserving green commits on the `idiomaticity-review-e` branch:
+
+- **E1 `Host` type** — the scattered host normalization (`canon_host` /
+  `canon_domain_entry` / `normalize_host` / `dns_record_name`) converged onto a
+  borrowing `Host<'a>` in `boatramp-types/src/host.rs`; the domain-verify path
+  routes through it. Preserve-and-flag policy: structure converged byte-identically
+  with no normalization mismatch found.
+- **E2 `SiteName` newtype** — `boatramp-types/src/site.rs`, `#[serde(transparent)]`,
+  deliberately no `Deref` so a `(site, host)` transposition is a compile error in
+  both directions. Threaded through the 12 domain-verify store methods and their
+  cascade (~40 call sites).
+- **E3 CLI connection type** — the free request functions
+  `(client, server, site, …)` became methods on a `ControlPlane { http, base }`
+  struct; every method body stayed byte-identical via a
+  `let Self { http: client, base: server } = self;` destructure. URL strings
+  verified identical before/after.
+- **E4 shared wire DTOs** — `CheckResult`, `LogEntry`/`LogsResponse`,
+  `FunctionSummary` moved into `boatramp-types` (`domain_verify` / new `logs` /
+  `function`); the CLI (`client.rs`, `token.rs`, `function.rs`) and console
+  (`models.rs`) now re-export the shared types instead of re-declaring lossy
+  subsets. `TokenMeta`/`GrantedRole` were already canonical in `authz`; the CLI's
+  private copies were deleted. Field names + serde attrs kept byte-identical (the
+  reader-side omitted fields, e.g. `LogEntry.ts_ms` / `FunctionSummary.owner`, are
+  always emitted by the server, so they stay required); a `logs::wire_shape_is_stable`
+  test pins the JSON keys. The two `ApiClient`s (reqwest vs gloo-net) stay separate.
+
+Group **F** (borderline) remains deferred per the triage decision.
