@@ -26,6 +26,7 @@ use crate::config::SiteConfig;
 use crate::domain_verify::{DomainVerification, VerificationMethod};
 use crate::error::DeployError;
 use crate::kv::{KvStore, WriteOp};
+use crate::site::SiteName;
 use crate::{ByteStream, GetObject, PutMeta, Storage, StorageError};
 
 // The per-file descriptor, its precompressed variants, the immutable
@@ -973,10 +974,14 @@ impl DeployStore {
     /// The ownership-verification challenge for `(site, host)`, if one exists.
     pub async fn get_domain_verification(
         &self,
-        site: &str,
+        site: &SiteName,
         host: &str,
     ) -> Result<Option<DomainVerification>, DeployError> {
-        match self.kv.get(&keys::domain_verification(site, host)).await? {
+        match self
+            .kv
+            .get(&keys::domain_verification(site.as_str(), host))
+            .await?
+        {
             Some(bytes) => Ok(Some(DomainVerification::from_json(&bytes)?)),
             None => Ok(None),
         }
@@ -985,7 +990,7 @@ impl DeployStore {
     /// All ownership challenges for `site` (pending and verified), by host.
     pub async fn list_domain_verifications(
         &self,
-        site: &str,
+        site: &SiteName,
     ) -> Result<Vec<DomainVerification>, DeployError> {
         let prefix = format!("domainverify/{site}/");
         let mut out = Vec::new();
@@ -1048,7 +1053,7 @@ impl DeployStore {
         else {
             return Ok(None);
         };
-        let site = String::from_utf8_lossy(&site_bytes).into_owned();
+        let site = SiteName::new(String::from_utf8_lossy(&site_bytes).into_owned());
         let Some(v) = self.get_domain_verification(&site, &host).await? else {
             return Ok(None);
         };
@@ -1065,11 +1070,11 @@ impl DeployStore {
 
     async fn put_domain_verification(
         &self,
-        site: &str,
+        site: &SiteName,
         verification: &DomainVerification,
     ) -> Result<(), DeployError> {
         let mut ops = vec![WriteOp::Put(
-            keys::domain_verification(site, &verification.host),
+            keys::domain_verification(site.as_str(), &verification.host),
             verification.to_json()?,
         )];
         // Maintain the self-serve `(host, token)` index for HTTP challenges. A
@@ -1079,7 +1084,7 @@ impl DeployStore {
         if verification.method == VerificationMethod::Http {
             ops.push(WriteOp::Put(
                 keys::http_challenge_index(&verification.host, &verification.token),
-                site.as_bytes().to_vec(),
+                site.as_str().as_bytes().to_vec(),
             ));
         }
         self.kv.write_batch(ops).await?;
@@ -1091,12 +1096,12 @@ impl DeployStore {
     /// The managed-DNS ledger for `(site, host)`, if boatramp has pointed it.
     pub async fn get_managed_dns(
         &self,
-        site: &str,
+        site: &SiteName,
         host: &str,
     ) -> Result<Option<crate::dns_managed::ManagedDns>, DeployError> {
         match self
             .kv
-            .get(&crate::dns_managed::dnsmanaged_key(site, host))
+            .get(&crate::dns_managed::dnsmanaged_key(site.as_str(), host))
             .await?
         {
             Some(bytes) => Ok(Some(crate::dns_managed::ManagedDns::from_json(&bytes)?)),
@@ -1107,12 +1112,12 @@ impl DeployStore {
     /// Record (create/replace) the managed-DNS ledger entry for a host.
     pub async fn set_managed_dns(
         &self,
-        site: &str,
+        site: &SiteName,
         ledger: &crate::dns_managed::ManagedDns,
     ) -> Result<(), DeployError> {
         self.kv
             .put(
-                &crate::dns_managed::dnsmanaged_key(site, &ledger.host),
+                &crate::dns_managed::dnsmanaged_key(site.as_str(), &ledger.host),
                 ledger.to_json()?,
             )
             .await?;
@@ -1120,9 +1125,9 @@ impl DeployStore {
     }
 
     /// Drop a host's managed-DNS ledger entry (after its records are retracted).
-    pub async fn remove_managed_dns(&self, site: &str, host: &str) -> Result<(), DeployError> {
+    pub async fn remove_managed_dns(&self, site: &SiteName, host: &str) -> Result<(), DeployError> {
         self.kv
-            .delete(&crate::dns_managed::dnsmanaged_key(site, host))
+            .delete(&crate::dns_managed::dnsmanaged_key(site.as_str(), host))
             .await?;
         Ok(())
     }
@@ -1131,9 +1136,9 @@ impl DeployStore {
     /// to retract records whose host is no longer attached).
     pub async fn list_managed_dns(
         &self,
-        site: &str,
+        site: &SiteName,
     ) -> Result<Vec<crate::dns_managed::ManagedDns>, DeployError> {
-        let prefix = crate::dns_managed::dnsmanaged_site_prefix(site);
+        let prefix = crate::dns_managed::dnsmanaged_site_prefix(site.as_str());
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -1152,7 +1157,7 @@ impl DeployStore {
     /// challenge that's already `verified` is returned untouched.
     pub async fn start_domain_verification(
         &self,
-        site: &str,
+        site: &SiteName,
         host: &str,
         method: VerificationMethod,
         now_unix: u64,
@@ -1187,7 +1192,11 @@ impl DeployStore {
     }
 
     /// Whether `(site, host)` has a confirmed ownership challenge.
-    pub async fn is_domain_verified(&self, site: &str, host: &str) -> Result<bool, DeployError> {
+    pub async fn is_domain_verified(
+        &self,
+        site: &SiteName,
+        host: &str,
+    ) -> Result<bool, DeployError> {
         Ok(self
             .get_domain_verification(site, host)
             .await?
@@ -1198,7 +1207,7 @@ impl DeployStore {
     /// challenge has been started.
     pub async fn mark_domain_verified(
         &self,
-        site: &str,
+        site: &SiteName,
         host: &str,
     ) -> Result<DomainVerification, DeployError> {
         let mut verification =
@@ -1216,13 +1225,16 @@ impl DeployStore {
     /// Returns whether one existed.
     pub async fn remove_domain_verification(
         &self,
-        site: &str,
+        site: &SiteName,
         host: &str,
     ) -> Result<bool, DeployError> {
         let Some(v) = self.get_domain_verification(site, host).await? else {
             return Ok(false);
         };
-        let mut ops = vec![WriteOp::Delete(keys::domain_verification(site, host))];
+        let mut ops = vec![WriteOp::Delete(keys::domain_verification(
+            site.as_str(),
+            host,
+        ))];
         if v.method == VerificationMethod::Http {
             ops.push(WriteOp::Delete(keys::http_challenge_index(
                 &v.host, &v.token,
@@ -1244,7 +1256,7 @@ impl DeployStore {
     /// [`normalize_host`]: crate::domain_verify::normalize_host
     pub async fn attach_verified_domain(
         &self,
-        site: &str,
+        site: &SiteName,
         host: &str,
     ) -> Result<SiteConfig, DeployError> {
         if !self.is_domain_verified(site, host).await? {
@@ -1271,7 +1283,10 @@ impl DeployStore {
         // attach (to this site or another) can't interleave between our read and
         // the index write. `set_site_config_locked` runs under the same lock.
         let _claim = self.domain_claim_lock.lock().await;
-        let mut config = self.get_site_config(site).await?.unwrap_or_default();
+        let mut config = self
+            .get_site_config(site.as_str())
+            .await?
+            .unwrap_or_default();
         let domains = &mut config.domains;
         if let Some(suffix) = host.strip_prefix("*.") {
             let wildcard = format!("*.{}", suffix.trim_end_matches('.').to_ascii_lowercase());
@@ -1288,7 +1303,7 @@ impl DeployStore {
                 domains.aliases.push(host);
             }
         }
-        self.set_site_config_locked(site, &config).await?;
+        self.set_site_config_locked(site.as_str(), &config).await?;
         Ok(config)
     }
 
@@ -2568,7 +2583,7 @@ mod tests {
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
         assert!(store
-            .get_managed_dns("blog", "www.example.com")
+            .get_managed_dns(&SiteName::new("blog"), "www.example.com")
             .await
             .unwrap()
             .is_none());
@@ -2584,22 +2599,35 @@ mod tests {
             }],
             10,
         );
-        store.set_managed_dns("blog", &ledger).await.unwrap();
+        store
+            .set_managed_dns(&SiteName::new("blog"), &ledger)
+            .await
+            .unwrap();
         // Lookup normalizes the host, so a differently-cased/dotted query hits it.
         assert_eq!(
             store
-                .get_managed_dns("blog", "WWW.example.com.")
+                .get_managed_dns(&SiteName::new("blog"), "WWW.example.com.")
                 .await
                 .unwrap(),
             Some(ledger.clone())
         );
-        assert_eq!(store.list_managed_dns("blog").await.unwrap(), vec![ledger]);
+        assert_eq!(
+            store
+                .list_managed_dns(&SiteName::new("blog"))
+                .await
+                .unwrap(),
+            vec![ledger]
+        );
 
         store
-            .remove_managed_dns("blog", "www.example.com")
+            .remove_managed_dns(&SiteName::new("blog"), "www.example.com")
             .await
             .unwrap();
-        assert!(store.list_managed_dns("blog").await.unwrap().is_empty());
+        assert!(store
+            .list_managed_dns(&SiteName::new("blog"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -2744,36 +2772,46 @@ mod tests {
 
         // Start a challenge; re-starting under the same method is idempotent.
         let v1 = store
-            .start_domain_verification("blog", "example.com", VerificationMethod::Dns, 100)
+            .start_domain_verification(
+                &SiteName::new("blog"),
+                "example.com",
+                VerificationMethod::Dns,
+                100,
+            )
             .await
             .unwrap();
         let v2 = store
-            .start_domain_verification("blog", "example.com", VerificationMethod::Dns, 200)
+            .start_domain_verification(
+                &SiteName::new("blog"),
+                "example.com",
+                VerificationMethod::Dns,
+                200,
+            )
             .await
             .unwrap();
         assert_eq!(v1.token, v2.token, "same method → same pending token");
         assert!(!store
-            .is_domain_verified("blog", "example.com")
+            .is_domain_verified(&SiteName::new("blog"), "example.com")
             .await
             .unwrap());
 
         // Unverified hosts cannot be attached — the gate.
         assert!(store
-            .attach_verified_domain("blog", "example.com")
+            .attach_verified_domain(&SiteName::new("blog"), "example.com")
             .await
             .is_err());
 
         // Verify, then attach: the host enters routing as the primary.
         store
-            .mark_domain_verified("blog", "example.com")
+            .mark_domain_verified(&SiteName::new("blog"), "example.com")
             .await
             .unwrap();
         assert!(store
-            .is_domain_verified("blog", "example.com")
+            .is_domain_verified(&SiteName::new("blog"), "example.com")
             .await
             .unwrap());
         store
-            .attach_verified_domain("blog", "example.com")
+            .attach_verified_domain(&SiteName::new("blog"), "example.com")
             .await
             .unwrap();
         assert_eq!(
@@ -2786,15 +2824,20 @@ mod tests {
         );
         // A second verified host becomes an alias, not the primary.
         store
-            .start_domain_verification("blog", "www.example.com", VerificationMethod::Http, 300)
+            .start_domain_verification(
+                &SiteName::new("blog"),
+                "www.example.com",
+                VerificationMethod::Http,
+                300,
+            )
             .await
             .unwrap();
         store
-            .mark_domain_verified("blog", "www.example.com")
+            .mark_domain_verified(&SiteName::new("blog"), "www.example.com")
             .await
             .unwrap();
         let config = store
-            .attach_verified_domain("blog", "www.example.com")
+            .attach_verified_domain(&SiteName::new("blog"), "www.example.com")
             .await
             .unwrap();
         assert_eq!(config.domains.primary.as_deref(), Some("example.com"));
@@ -2802,31 +2845,40 @@ mod tests {
 
         // A wildcard is verified at its base name and attached as a wildcard.
         store
-            .start_domain_verification("blog", "*.example.com", VerificationMethod::Dns, 400)
+            .start_domain_verification(
+                &SiteName::new("blog"),
+                "*.example.com",
+                VerificationMethod::Dns,
+                400,
+            )
             .await
             .unwrap();
         // The challenge keys on the base host, so the wildcard shares it.
         assert!(store
-            .is_domain_verified("blog", "*.example.com")
+            .is_domain_verified(&SiteName::new("blog"), "*.example.com")
             .await
             .unwrap());
         let config = store
-            .attach_verified_domain("blog", "*.example.com")
+            .attach_verified_domain(&SiteName::new("blog"), "*.example.com")
             .await
             .unwrap();
         assert_eq!(config.domains.wildcards, vec!["*.example.com".to_string()]);
 
         // Listing surfaces every challenge; removing drops the record.
         assert_eq!(
-            store.list_domain_verifications("blog").await.unwrap().len(),
+            store
+                .list_domain_verifications(&SiteName::new("blog"))
+                .await
+                .unwrap()
+                .len(),
             2
         );
         assert!(store
-            .remove_domain_verification("blog", "example.com")
+            .remove_domain_verification(&SiteName::new("blog"), "example.com")
             .await
             .unwrap());
         assert!(!store
-            .is_domain_verified("blog", "example.com")
+            .is_domain_verified(&SiteName::new("blog"), "example.com")
             .await
             .unwrap());
     }
@@ -2843,15 +2895,20 @@ mod tests {
 
         // Site `a` legitimately verifies + attaches `shared.example`.
         store
-            .start_domain_verification("a", "shared.example", VerificationMethod::Http, 100)
+            .start_domain_verification(
+                &SiteName::new("a"),
+                "shared.example",
+                VerificationMethod::Http,
+                100,
+            )
             .await
             .unwrap();
         store
-            .mark_domain_verified("a", "shared.example")
+            .mark_domain_verified(&SiteName::new("a"), "shared.example")
             .await
             .unwrap();
         store
-            .attach_verified_domain("a", "shared.example")
+            .attach_verified_domain(&SiteName::new("a"), "shared.example")
             .await
             .unwrap();
         assert_eq!(
@@ -2867,15 +2924,20 @@ mod tests {
         // or a stale challenge) and tries to attach — it must be refused, not
         // silently steal the live mapping.
         store
-            .start_domain_verification("b", "shared.example", VerificationMethod::Http, 200)
+            .start_domain_verification(
+                &SiteName::new("b"),
+                "shared.example",
+                VerificationMethod::Http,
+                200,
+            )
             .await
             .unwrap();
         store
-            .mark_domain_verified("b", "shared.example")
+            .mark_domain_verified(&SiteName::new("b"), "shared.example")
             .await
             .unwrap();
         let err = store
-            .attach_verified_domain("b", "shared.example")
+            .attach_verified_domain(&SiteName::new("b"), "shared.example")
             .await
             .expect_err("second site must not hijack an attached host");
         assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
@@ -2937,15 +2999,20 @@ mod tests {
         let store = store();
         // Site `a` legitimately attaches `example.com`.
         store
-            .start_domain_verification("a", "example.com", VerificationMethod::Http, 100)
+            .start_domain_verification(
+                &SiteName::new("a"),
+                "example.com",
+                VerificationMethod::Http,
+                100,
+            )
             .await
             .unwrap();
         store
-            .mark_domain_verified("a", "example.com")
+            .mark_domain_verified(&SiteName::new("a"), "example.com")
             .await
             .unwrap();
         store
-            .attach_verified_domain("a", "example.com")
+            .attach_verified_domain(&SiteName::new("a"), "example.com")
             .await
             .unwrap();
 
@@ -2987,7 +3054,12 @@ mod tests {
 
         let store = store();
         let v = store
-            .start_domain_verification("docs", "docs.example", VerificationMethod::Http, 1_000)
+            .start_domain_verification(
+                &SiteName::new("docs"),
+                "docs.example",
+                VerificationMethod::Http,
+                1_000,
+            )
             .await
             .unwrap();
 
@@ -3028,7 +3100,12 @@ mod tests {
 
         // A DNS-method challenge is never served over the HTTP edge route.
         let dv = store
-            .start_domain_verification("dns-site", "dns.example", VerificationMethod::Dns, 1_000)
+            .start_domain_verification(
+                &SiteName::new("dns-site"),
+                "dns.example",
+                VerificationMethod::Dns,
+                1_000,
+            )
             .await
             .unwrap();
         assert!(store
@@ -3049,15 +3126,20 @@ mod tests {
 
         // HTTP-verify the base host, then try to attach the wildcard → refused.
         let http = store
-            .start_domain_verification("s", "*.example.com", VerificationMethod::Http, 100)
+            .start_domain_verification(
+                &SiteName::new("s"),
+                "*.example.com",
+                VerificationMethod::Http,
+                100,
+            )
             .await
             .unwrap();
         store
-            .mark_domain_verified("s", "*.example.com")
+            .mark_domain_verified(&SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         let err = store
-            .attach_verified_domain("s", "*.example.com")
+            .attach_verified_domain(&SiteName::new("s"), "*.example.com")
             .await
             .expect_err("wildcard with only HTTP proof must be refused");
         assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
@@ -3066,7 +3148,7 @@ mod tests {
         // the record (the old HTTP token's self-serve index entry is dropped on
         // remove), and re-proves via DNS.
         store
-            .remove_domain_verification("s", "*.example.com")
+            .remove_domain_verification(&SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         // The removed HTTP token is no longer self-servable.
@@ -3076,15 +3158,20 @@ mod tests {
             .unwrap()
             .is_none());
         store
-            .start_domain_verification("s", "*.example.com", VerificationMethod::Dns, 200)
+            .start_domain_verification(
+                &SiteName::new("s"),
+                "*.example.com",
+                VerificationMethod::Dns,
+                200,
+            )
             .await
             .unwrap();
         store
-            .mark_domain_verified("s", "*.example.com")
+            .mark_domain_verified(&SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         let cfg = store
-            .attach_verified_domain("s", "*.example.com")
+            .attach_verified_domain(&SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         assert_eq!(cfg.domains.wildcards, vec!["*.example.com".to_string()]);
@@ -3093,7 +3180,12 @@ mod tests {
         // DNS (without removal) leaves a dangling token index; the lookup loads
         // the current (DNS) record and refuses to serve the old HTTP token.
         let h2 = store
-            .start_domain_verification("s2", "host.example", VerificationMethod::Http, 300)
+            .start_domain_verification(
+                &SiteName::new("s2"),
+                "host.example",
+                VerificationMethod::Http,
+                300,
+            )
             .await
             .unwrap();
         assert!(store
@@ -3102,7 +3194,12 @@ mod tests {
             .unwrap()
             .is_some());
         store
-            .start_domain_verification("s2", "host.example", VerificationMethod::Dns, 300)
+            .start_domain_verification(
+                &SiteName::new("s2"),
+                "host.example",
+                VerificationMethod::Dns,
+                300,
+            )
             .await
             .unwrap();
         assert!(
@@ -3122,7 +3219,7 @@ mod tests {
         for i in 0..64 {
             store
                 .start_domain_verification(
-                    "site",
+                    &SiteName::new("site"),
                     &format!("h{i}.example"),
                     VerificationMethod::Http,
                     100,
@@ -3132,18 +3229,33 @@ mod tests {
         }
         // One more genuinely-new host is refused (bounds the reconcile fan-out).
         let err = store
-            .start_domain_verification("site", "overflow.example", VerificationMethod::Http, 100)
+            .start_domain_verification(
+                &SiteName::new("site"),
+                "overflow.example",
+                VerificationMethod::Http,
+                100,
+            )
             .await
             .expect_err("the 65th pending host must be rejected");
         assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
         // Re-running an EXISTING host still works (returns early before the cap).
         store
-            .start_domain_verification("site", "h0.example", VerificationMethod::Http, 100)
+            .start_domain_verification(
+                &SiteName::new("site"),
+                "h0.example",
+                VerificationMethod::Http,
+                100,
+            )
             .await
             .expect("re-running an existing challenge is not capped");
         // A different site has its own budget.
         store
-            .start_domain_verification("other", "fresh.example", VerificationMethod::Http, 100)
+            .start_domain_verification(
+                &SiteName::new("other"),
+                "fresh.example",
+                VerificationMethod::Http,
+                100,
+            )
             .await
             .expect("a different site is unaffected");
     }

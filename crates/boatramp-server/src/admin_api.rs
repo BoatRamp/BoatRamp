@@ -268,7 +268,10 @@ pub(super) async fn put_site_config(
         .filter(|host| !existing.contains(host))
         .collect();
     for host in added {
-        let verification = match deploy.get_domain_verification(&site, &host).await {
+        let verification = match deploy
+            .get_domain_verification(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+            .await
+        {
             Ok(v) => v,
             Err(err) => return deploy_error_response(err),
         };

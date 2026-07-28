@@ -239,7 +239,10 @@ pub(crate) async fn get_domain_verification(
     State(deploy): State<DeployStore>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
-    match deploy.get_domain_verification(&site, &host).await {
+    match deploy
+        .get_domain_verification(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+        .await
+    {
         Ok(Some(v)) => Json(v).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -256,7 +259,10 @@ pub(crate) async fn list_domain_verifications(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.list_domain_verifications(&site).await {
+    match deploy
+        .list_domain_verifications(&boatramp_core::site::SiteName::new(site.as_str()))
+        .await
+    {
         Ok(list) => Json(list).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -276,7 +282,12 @@ pub(crate) async fn start_domain_verification(
         },
     };
     match deploy
-        .start_domain_verification(&site, &host, method, now_unix())
+        .start_domain_verification(
+            &boatramp_core::site::SiteName::new(site.as_str()),
+            &host,
+            method,
+            now_unix(),
+        )
         .await
     {
         Ok(v) => Json(v).into_response(),
@@ -302,15 +313,26 @@ pub(crate) async fn attach_domain_unverified(
         VerificationMethod::Http
     };
     if let Err(err) = deploy
-        .start_domain_verification(&site, &host, method, now_unix())
+        .start_domain_verification(
+            &boatramp_core::site::SiteName::new(site.as_str()),
+            &host,
+            method,
+            now_unix(),
+        )
         .await
     {
         return deploy_error_response(err);
     }
-    if let Err(err) = deploy.mark_domain_verified(&site, &host).await {
+    if let Err(err) = deploy
+        .mark_domain_verified(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+        .await
+    {
         return deploy_error_response(err);
     }
-    match deploy.attach_verified_domain(&site, &host).await {
+    match deploy
+        .attach_verified_domain(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+        .await
+    {
         Ok(_) => (
             StatusCode::OK,
             format!("attached {host} to site {site} without verification (admin override)\n"),
@@ -326,7 +348,10 @@ pub(crate) async fn remove_domain_verification(
     State(deploy): State<DeployStore>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
-    match deploy.remove_domain_verification(&site, &host).await {
+    match deploy
+        .remove_domain_verification(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -339,7 +364,10 @@ pub(crate) async fn check_domain_verification(
     Extension(probe): Extension<Arc<dyn DomainProbe>>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
-    let verification = match deploy.get_domain_verification(&site, &host).await {
+    let verification = match deploy
+        .get_domain_verification(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+        .await
+    {
         Ok(Some(v)) => v,
         Ok(None) => {
             return (
@@ -353,11 +381,17 @@ pub(crate) async fn check_domain_verification(
 
     match check_ownership(probe.as_ref(), &verification).await {
         Ok(true) => {
-            let verified = match deploy.mark_domain_verified(&site, &host).await {
+            let verified = match deploy
+                .mark_domain_verified(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+                .await
+            {
                 Ok(v) => v,
                 Err(err) => return deploy_error_response(err),
             };
-            let attached = match deploy.attach_verified_domain(&site, &host).await {
+            let attached = match deploy
+                .attach_verified_domain(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+                .await
+            {
                 Ok(_) => true,
                 Err(err) => return deploy_error_response(err),
             };
@@ -491,11 +525,17 @@ async fn reconcile_domain_verifications(
         // Not satisfied yet, or the probe/method failed (network / a DNS method on
         // a build without the resolver) ⇒ leave it pending and retry next tick.
         if let Ok(true) = check_ownership(probe, &v).await {
-            if let Err(err) = deploy.mark_domain_verified(&site, &v.host).await {
+            if let Err(err) = deploy
+                .mark_domain_verified(&boatramp_core::site::SiteName::new(site.as_str()), &v.host)
+                .await
+            {
                 tracing::debug!(%site, host = %v.host, %err, "domain-verify reconcile: mark failed");
                 continue;
             }
-            match deploy.attach_verified_domain(&site, &v.host).await {
+            match deploy
+                .attach_verified_domain(&boatramp_core::site::SiteName::new(site.as_str()), &v.host)
+                .await
+            {
                 Ok(_) => {
                     attached += 1;
                     tracing::info!(%site, host = %v.host, "domain-verify reconcile: verified + attached");
@@ -691,7 +731,12 @@ mod tests {
         let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
         // A pending HTTP challenge for a host on site `www` — not yet attached.
         let v = deploy
-            .start_domain_verification("www", "example.com", VerificationMethod::Http, now_unix())
+            .start_domain_verification(
+                &boatramp_core::site::SiteName::new("www"),
+                "example.com",
+                VerificationMethod::Http,
+                now_unix(),
+            )
             .await
             .unwrap();
         assert!(!v.verified);

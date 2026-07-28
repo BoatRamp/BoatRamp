@@ -4543,7 +4543,12 @@ async fn http_redirect_router_upgrades_to_https() {
         .unwrap()
         .as_secs();
     let v = deploy
-        .start_domain_verification("docs", "docs.example", VerificationMethod::Http, now)
+        .start_domain_verification(
+            &boatramp_core::site::SiteName::new("docs"),
+            "docs.example",
+            VerificationMethod::Http,
+            now,
+        )
         .await
         .unwrap();
 
@@ -4594,7 +4599,12 @@ async fn self_serve_domain_challenge_before_host_routing() {
         .unwrap()
         .as_secs();
     let v = deploy
-        .start_domain_verification("docs", "docs.example", VerificationMethod::Http, now)
+        .start_domain_verification(
+            &boatramp_core::site::SiteName::new("docs"),
+            "docs.example",
+            VerificationMethod::Http,
+            now,
+        )
         .await
         .unwrap();
 
@@ -4625,7 +4635,12 @@ async fn self_serve_domain_challenge_before_host_routing() {
 
     // A DNS-method challenge is never served over the HTTP edge route.
     let dv = deploy
-        .start_domain_verification("d2", "dns.example", VerificationMethod::Dns, now)
+        .start_domain_verification(
+            &boatramp_core::site::SiteName::new("d2"),
+            "dns.example",
+            VerificationMethod::Dns,
+            now,
+        )
         .await
         .unwrap();
     let mut req = Request::builder()
@@ -4672,11 +4687,19 @@ async fn put_config_gate_requires_verified_new_domain() {
         .unwrap()
         .as_secs();
     deploy
-        .start_domain_verification("docs", "unowned.example", VerificationMethod::Http, now)
+        .start_domain_verification(
+            &boatramp_core::site::SiteName::new("docs"),
+            "unowned.example",
+            VerificationMethod::Http,
+            now,
+        )
         .await
         .unwrap();
     deploy
-        .mark_domain_verified("docs", "unowned.example")
+        .mark_domain_verified(
+            &boatramp_core::site::SiteName::new("docs"),
+            "unowned.example",
+        )
         .await
         .unwrap();
     let (status, _, _) = send_as(&deploy, auth, put_config(&token), [127, 0, 0, 1]).await;
