@@ -18,6 +18,7 @@ node, a self-hosted cluster, or Cloudflare Containers.
   [invoke one by name](./how-to/functions.md).
 - **Automating or integrating?** Read the
   [authentication & authorization model](./explanation/auth-model.md).
+- **Want to chat?** Join the community on [Discord](https://discord.gg/A78gHFF3F3).
 
 ## What boatramp does
 

@@ -1,5 +1,7 @@
 # Contributing
 
+Want to say hi or talk something through first? Join us on [Discord](https://discord.gg/A78gHFF3F3).
+
 boatramp is a Rust workspace. The default build is batteries-included — it enables
 every non-conflicting feature (TLS, ACME DNS-01, clustering, handlers, OIDC,
 compression, HTTP/3, the bundler, …), so a plain `cargo build` ships the full
