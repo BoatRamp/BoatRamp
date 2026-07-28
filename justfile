@@ -172,14 +172,24 @@ deploy-docs server="https://docs.boatramp.dev" site="docs":
     set -euo pipefail
     mdbook build docs
     boatramp sync docs/book --server "{{ server }}" --site "{{ site }}"
+    # docs.boatramp.dev is DNS-only (grey cloud) today, so there is no Cloudflare
+    # edge cache to purge and this step is a no-op; it only matters once the record
+    # is orange-clouded (`boatramp dns configure-domain … --proxied`). Best-effort
+    # regardless: a missing/expired CF token must never fail an otherwise-successful
+    # deploy (the docs are already served from the fly origin).
     if [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_PURGE_TOKEN:-}" ]; then
       echo "purging Cloudflare cache…"
-      curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
         -H "Authorization: Bearer ${CF_PURGE_TOKEN}" -H "Content-Type: application/json" \
-        --data '{"purge_everything":true}' >/dev/null
-      echo "  purged"
+        --data '{"purge_everything":true}' || echo 000)
+      if [ "$code" = 200 ]; then
+        echo "  purged"
+      else
+        echo "  warn: cache purge returned HTTP $code (non-fatal; docs served from the fly origin)"
+      fi
     else
-      echo "CF_ZONE_ID/CF_PURGE_TOKEN unset — skipping cache purge"
+      echo "CF_ZONE_ID/CF_PURGE_TOKEN unset — skipping cache purge (docs is DNS-only)"
     fi
 
 # Build the base image via Nix + deploy it to the fly app (rare — only when the

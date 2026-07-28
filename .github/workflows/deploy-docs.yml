@@ -78,12 +78,20 @@ jobs:
           set -euo pipefail
           ./target/release/boatramp sync docs/book \
             --server https://docs.boatramp.dev --site docs -m "${GITHUB_SHA::7}"
+          # Best-effort: docs.boatramp.dev is DNS-only today (no edge cache to
+          # purge), and a missing/expired CF token must never fail a good deploy.
+          # The purge starts mattering once the record is orange-clouded.
           if [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_PURGE_TOKEN:-}" ]; then
-            curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
               -H "Authorization: Bearer ${CF_PURGE_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data '{"purge_everything":true}' >/dev/null
-            echo "Cloudflare cache purged."
+              --data '{"purge_everything":true}' || echo 000)
+            if [ "$code" = 200 ]; then
+              echo "Cloudflare cache purged."
+            else
+              echo "::warning::cache purge returned HTTP $code (non-fatal; docs served from the fly origin)"
+            fi
           else
-            echo "CF_ZONE_ID/CF_PURGE_TOKEN unset — skipped cache purge."
+            echo "CF_ZONE_ID/CF_PURGE_TOKEN unset — skipped cache purge (docs is DNS-only)."
           fi
