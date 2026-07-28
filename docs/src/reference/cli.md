@@ -78,8 +78,8 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 | --- | --- | --- | --- |
 | `--addr <host:port>` | `BOATRAMP_ADDR` | `127.0.0.1:8080` | Bind address. |
 | `--data-dir <path>` | `BOATRAMP_DATA_DIR` | `./data` | Blob + KV root for the filesystem backends. |
-| `--blobs <fs\|s3\|gcs\|azure>` | — | `fs` | Blob backend (`s3`/`gcs`/`azure` need `--features s3`/`gcs`/`azure`). |
-| `--kv <slatedb\|memory\|cloudflare>` | — | `slatedb` | KV backend (`cloudflare` needs `--features cloudflare-kv`). |
+| `--blobs <fs\|s3\|gcs\|azure>` | — | `fs` | Blob backend (`s3`/`gcs`/`azure` are in the default build). |
+| `--kv <slatedb\|memory\|cloudflare>` | — | `slatedb` | KV backend (`cloudflare` is in the default build). |
 | `--s3-bucket <name>` | `BOATRAMP_S3_BUCKET` | — | S3 bucket (`--blobs s3`). |
 | `--s3-endpoint <url>` | `BOATRAMP_S3_ENDPOINT` | — | S3 endpoint (MinIO / R2). |
 | `--s3-region <region>` | `BOATRAMP_S3_REGION` | — | S3 region. |
@@ -294,7 +294,8 @@ Operate a self-hosted cluster's dynamic-join membership. See
 ## `boatramp operator`
 
 Run the in-binary Kubernetes operator, or print its install manifests. See
-[Run on Kubernetes](../how-to/kubernetes.md). Requires the `operator` build feature.
+[Run on Kubernetes](../how-to/kubernetes.md). The `operator` feature is in the
+default (batteries-included) build; a minimal build re-adds it with `--features operator`.
 
 | Sub-action | Description |
 | --- | --- |

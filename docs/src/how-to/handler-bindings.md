@@ -77,9 +77,10 @@ like Neon / Supabase / PlanetScale — declare it as a **named external database
 The guest opens it by name through the same interface; only the server config
 differs.
 
-Build with the engine's feature (`--features sql-postgres` and/or `sql-mysql`),
-then declare each database under `handlers.bindings.sql.databases`. The
-connection URL is a secret, so it is named indirectly through an env var:
+The `sql-postgres` / `sql-mysql` features are in the default build (a
+`--no-default-features` build re-adds them). Declare each database under
+`handlers.bindings.sql.databases`. The connection URL is a secret, so it is named
+indirectly through an env var:
 
 ```ron
 handlers: (

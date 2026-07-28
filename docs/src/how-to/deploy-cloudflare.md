@@ -11,8 +11,8 @@ there is no separate coordinator, see
 ## Before you start
 
 - `wrangler` installed and authenticated against your Cloudflare account.
-- A boatramp build with `--features cluster`. The generated `Dockerfile` builds
-  the binary with this feature, so a Docker builder is enough.
+- A boatramp build with the `cluster` feature (in the default build; the generated
+  `Dockerfile` builds it either way, so a Docker builder is enough).
 - An R2 bucket (blobs) and a D1 database (the `sql` handler binding), created
   ahead of time, with their credentials set as wrangler secrets.
 

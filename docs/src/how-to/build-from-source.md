@@ -1,9 +1,9 @@
 # Build from source
 
-Compile the `boatramp` binary (server + CLI) yourself and choose which
-capabilities to include. The default build is lean — filesystem blobs and the
-SlateDB metadata store — and every heavier capability is a cargo feature you add
-on the build command.
+Compile the `boatramp` binary (server + CLI) yourself. The default build is
+batteries-included — it enables every non-conflicting feature — so a plain
+`cargo build` gives you the full capability set. For a smaller binary you can opt
+down to just the features you want.
 
 For prebuilt archives and packages instead, see [Install boatramp](./install.md).
 
@@ -35,29 +35,33 @@ cargo build --release -p boatramp
 ```
 
 ```text
-    Finished `release` profile [optimized] target(s) in 2m 41s
+    Finished `release` profile [optimized] target(s) in 6m 05s
 ```
 
-This compiles the default features, `fs` and `slatedb`. The binary lands at
-`target/release/boatramp`.
+This is the batteries-included build: every non-conflicting feature is compiled in
+(blobs on fs/S3/GCS/Azure, TLS + ACME, HTTP/3, the handler engine, clustering, the
+Kubernetes operator, OIDC, external signers, the bundler, and the web console).
+The binary lands at `target/release/boatramp`. (A from-source build embeds a
+placeholder console unless you build the SPA first with `just console`.)
 
-## Select features
+## Build a minimal binary
 
-Name extra features with `--features`, comma-separated, to compile in more
-capabilities. This build adds HTTPS, the handler engine, and wildcard ACME
-DNS-01:
+To shrink the binary and its dependency tree, opt out of the defaults with
+`--no-default-features` and name only the features you want. The smallest useful
+build is filesystem blobs plus the SlateDB metadata store:
 
 ```sh
-cargo build --release -p boatramp --features tls,handlers,acme-dns
+cargo build --release -p boatramp --no-default-features --features fs,slatedb
 ```
 
 ```text
-    Finished `release` profile [optimized] target(s) in 3m 12s
+    Finished `release` profile [optimized] target(s) in 1m 08s
 ```
 
-Some features imply others — `acme-dns` and `http3` each pull in `tls`, and
-`cluster` pulls in `handlers` and `slatedb`. For every feature and what it
-enables, see [Cargo features & platform support](../reference/features.md).
+Add more as you need them — e.g. `--features fs,slatedb,tls,handlers` for HTTPS
+and the handler engine. Some features imply others: `acme-dns` and `http3` each
+pull in `tls`, and `cluster` pulls in `handlers` and `slatedb`. For every feature
+and what it enables, see [Cargo features & platform support](../reference/features.md).
 
 ## Build with Nix
 

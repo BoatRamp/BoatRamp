@@ -79,8 +79,8 @@ suit a single node.
 
 | Flag | Default | Alternatives |
 | --- | --- | --- |
-| `--blobs` | `fs` | `s3` (S3 / MinIO / R2 — needs `--features s3`) |
-| `--kv` | `slatedb` | `memory`, `cloudflare` (needs `--features cloudflare-kv`) |
+| `--blobs` | `fs` | `s3` (S3 / MinIO / R2 — in the default build) |
+| `--kv` | `slatedb` | `memory`, `cloudflare` (in the default build) |
 
 SlateDB runs over any object store, so a single node can keep its KV on S3/R2 as
 well. Full option list: [boatramp.cfg schema](../reference/boatramp-cfg.md).

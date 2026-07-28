@@ -3,10 +3,11 @@
 boatramp is a single binary — server and CLI in one. This page installs the
 `boatramp` binary. Pick one method, then verify.
 
-The prebuilt binary ships the lean default feature set: publish, serve, handlers,
-and TLS for most sites. For the platform matrix and what each feature adds, see
-[Cargo features & platform support](../reference/features.md); to enable extra
-features, see [Build from source](./build-from-source.md).
+The prebuilt binary is batteries-included — it ships every non-conflicting feature
+(publish, serve, handlers, TLS + ACME, HTTP/3, clustering, the Kubernetes operator,
+the web console, and all blob/KV backends). For the platform matrix and the full
+feature list, see [Cargo features & platform support](../reference/features.md); to
+build a smaller binary, see [Build from source](./build-from-source.md).
 
 Every method ends with the same verify step:
 

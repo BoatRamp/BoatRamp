@@ -1,13 +1,15 @@
 # Contributing
 
-boatramp is a Rust workspace. The default build stays lean; heavier capabilities
-(TLS, ACME DNS-01, clustering, handlers, OIDC, compression, HTTP/3, the bundler)
-are behind cargo features.
+boatramp is a Rust workspace. The default build is batteries-included — it enables
+every non-conflicting feature (TLS, ACME DNS-01, clustering, handlers, OIDC,
+compression, HTTP/3, the bundler, …), so a plain `cargo build` ships the full
+capability set. For fast local iteration you can opt down to a minimal slice.
 
 ## Building & testing
 
 ```sh
-cargo build                         # lean default
+cargo build                         # batteries-included (all features)
+cargo build --no-default-features --features fs,slatedb   # a fast, minimal slice
 cargo test --workspace              # the full suite
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check                    # advisories / bans / licenses / sources
@@ -25,7 +27,8 @@ and typos.
   `Storage` / `KvStore` / `Messaging` trait seams, never in the commands, flags,
   or config.
 - **Complete implementations.** Prefer real, validated code over stubs.
-- **Lean default build.** New heavy dependencies go behind a feature.
+- **Batteries-included, cleanly gated.** Heavy capabilities are still cargo
+  features (default-on); the `--no-default-features` lean slice must keep building.
 - **Pure logic in `boatramp-core`.** Keep routing/config/access decisions pure
   and unit-testable; push I/O and runtimes to the edges.
 

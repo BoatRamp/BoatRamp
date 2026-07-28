@@ -42,6 +42,7 @@ commands and the same config*.
 **Publish**
 - Atomic, content-addressed deployments with cross-deploy dedup and delta uploads
 - Instant, upload-free rollback to any prior deployment
+- **Deploy provenance**: annotate each deploy with a message and arbitrary `key=value` tags — with git sha/branch/tag captured automatically — surfaced in the CLI and web console
 - Framework-agnostic build step, or an in-process JS/TS + CSS bundler (Rolldown + lightningcss)
 - Named aliases for staging/preview, plus per-deploy immutable preview hosts
 - **Agent-ready**: ships an `AGENTS.md` so an AI coding agent (Claude Code, Codex, …) can build on boatramp and deploy out of the box
@@ -79,7 +80,7 @@ commands and the same config*.
 - Integrity scrub, garbage collection, and a **built-in web console** (Yew/WASM SPA) served at a hidden path when enabled
 
 **Ship**
-- One static binary; the heavy backends live behind cargo features so the default build stays lean
+- One static binary, **batteries-included**: every non-conflicting backend is compiled into the default build and selected at runtime — opt down with `--no-default-features` for a smaller binary
 - Prebuilt binaries for Linux/macOS/Windows, `.deb`/`.rpm` packages, a Homebrew tap, a hardened
   systemd unit, a **NixOS module + overlay**, a reproducible OCI image, and a **Kubernetes operator + Helm chart**
 - The **same UX on every target** — bare metal, systemd, NixOS, Docker/OCI, Kubernetes, Cloudflare, and a cluster
@@ -87,17 +88,18 @@ commands and the same config*.
 > **Status:** boatramp is pre-1.0 (`v0.1`) and honest about it — interfaces may
 > still shift before the first stable release, but what's here is real and
 > **dogfooded** (both [boatramp.dev](https://boatramp.dev) and
-> [docs.boatramp.dev](https://docs.boatramp.dev) run on it). The default build
-> (`fs` blobs + embedded KV) is the smallest, fully-functional core — every other
-> capability is an additive cargo feature. If you like owning your stack and
-> shaping tools early, [come crew it](https://github.com/BoatRamp/BoatRamp/discussions).
+> [docs.boatramp.dev](https://docs.boatramp.dev) run on it). The default build is
+> **batteries-included** — every non-conflicting backend compiled in and chosen at
+> runtime — while a `--no-default-features` slice (`fs` blobs + embedded KV) is the
+> minimal, fully-functional core. If you like owning your stack and shaping tools
+> early, [come crew it](https://github.com/BoatRamp/BoatRamp/discussions).
 
 ---
 
 ## Quick start
 
-Publish a folder in three commands. The default build needs nothing but the binary
-(filesystem blobs + an embedded KV store, state under `./data`).
+Publish a folder in three commands. Out of the box `serve` uses filesystem blobs +
+an embedded KV store (state under `./data`) — no config and no external services.
 
 ```sh
 # 1. Run the server.
@@ -161,8 +163,8 @@ nix profile install github:BoatRamp/BoatRamp   # install the binary
 **From source** (Rust 1.82+):
 
 ```sh
-cargo build --release                          # fs blobs + embedded KV
-cargo build --release --features "s3,tls,handlers,cluster"   # opt into more
+cargo build --release                                              # batteries-included: all non-conflicting backends
+cargo build --release --no-default-features --features fs,slatedb  # the minimal opt-down slice
 ```
 
 ---
@@ -218,20 +220,22 @@ See [Deploy a self-hosted cluster](https://docs.boatramp.dev/how-to/deploy-clust
 
 ## Storage backends
 
-Backends are compile-time cargo features; `serve` then selects among the compiled-in
-options at runtime. The default build is self-contained.
+Backends are compile-time cargo features; the default build compiles in **every**
+one (batteries-included) and `serve` selects among them at runtime. Opt down with
+`--no-default-features` for a smaller binary. *(runtime default)* below marks what
+`serve` picks unless you override it with `--blobs` / `--kv`.
 
-| Layer         | Backend                          | Feature                     |
-| ------------- | -------------------------------- | --------------------------- |
-| Blobs         | Filesystem                       | `fs` *(default)*            |
-| Blobs         | S3-compatible (AWS, R2, MinIO)   | `s3`                        |
-| Blobs         | Google Cloud Storage             | `gcs`                       |
-| Blobs         | Azure Blob Storage               | `azure`                     |
-| Metadata KV   | Embedded LSM (SlateDB)           | `slatedb` *(default)*       |
-| Metadata KV   | In-memory                        | *(always on)*               |
-| Metadata KV   | Cloudflare KV                    | `cloudflare-kv`             |
-| Function SQL  | libsql (managed, file or namespace) | `handlers`               |
-| Function SQL  | External Postgres / MySQL (BYO)  | `sql-postgres` / `sql-mysql`|
+| Layer         | Backend                          | Feature                      |
+| ------------- | -------------------------------- | ---------------------------- |
+| Blobs         | Filesystem                       | `fs` *(runtime default)*     |
+| Blobs         | S3-compatible (AWS, R2, MinIO)   | `s3`                         |
+| Blobs         | Google Cloud Storage             | `gcs`                        |
+| Blobs         | Azure Blob Storage               | `azure`                      |
+| Metadata KV   | Embedded LSM (SlateDB)           | `slatedb` *(runtime default)*|
+| Metadata KV   | In-memory                        | *(always on)*                |
+| Metadata KV   | Cloudflare KV                    | `cloudflare-kv`              |
+| Function SQL  | libsql (managed, file or namespace) | `handlers`                |
+| Function SQL  | External Postgres / MySQL (BYO)  | `sql-postgres` / `sql-mysql` |
 
 SlateDB is a transactional LSM store over an `object_store` backend (local disk by
 default, or S3/R2/GCS/Azure), so the same durable KV runs everywhere. Blobs are
@@ -307,6 +311,7 @@ server: store manifest, report missing server: stream blob from Storage
 | `boatramp-container`  | Native self-jailing OCI container runtime.                             |
 | `boatramp-docker`     | Remote Docker-host container backend.                                  |
 | `boatramp-cluster`    | Embedded Raft + the peer mesh.                                         |
+| `boatramp-rpktls`     | Raw-public-key TLS: the mutually-authenticated peer mesh and the `--tls rpk` control channel. |
 | `boatramp-acme`       | ACME DNS-01 wildcard issuance + DNS providers.                         |
 | `boatramp-cloudflare` | Cloudflare Worker + Containers deployment generator.                   |
 | `boatramp-console`    | Web console (Yew/WASM SPA).                                            |

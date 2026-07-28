@@ -56,6 +56,8 @@ config is present. `--blobs` selects the blob `Storage`:
 - `azure` — Azure Blob Storage (`--azure-account`/`--azure-container`, shared-key
   auth); `--features azure`.
 
+All of these backends are compiled into the default (batteries-included) build;
+the `--features` names above are only needed for a `--no-default-features` build.
 Every cloud backend streams reads and writes (never buffering a whole object) and
 can back [blob-change triggers](../how-to/functions.md#cloud-blob-triggers-auto-provisioning)
 once its notification pipeline is provisioned. The per-site SQL binding (libsql: a

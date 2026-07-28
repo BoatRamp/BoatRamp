@@ -16,19 +16,17 @@ needs it. For the wider picture, see
 - Provision the root key in your backend as an **ES256** (P-256) signing key. The
   cloud KMS backends sign ES256 only; `Vault`, `Pkcs11`, and `Local` also take
   `alg: Ed25519`.
-- Build the binary with the backend's Cargo feature.
+- Make sure the backend's Cargo feature is compiled in. All signer backends are
+  in the default (batteries-included) build; only a `--no-default-features` build
+  needs to re-add one (`--features signer-aws` / `signer-gcp` / `signer-azure` /
+  `signer-vault` / `signer-pkcs11`).
 - Put the backend's credential in an environment variable. The config names the
   variable; the secret itself never goes in the file.
 
 ## Sign through a cloud KMS (AWS)
 
-Build with `signer-aws` and point `serve.signer` at the key. AWS credentials come
-from the standard provider chain (instance role, `AWS_*` env vars), not the
-config:
-
-```sh
-cargo build --release -p boatramp --features signer-aws
-```
+Point `serve.signer` at the key. AWS credentials come from the standard provider
+chain (instance role, `AWS_*` env vars), not the config:
 
 ```ron
 serve: (
@@ -41,12 +39,8 @@ serve: (
 
 ## Sign through HashiCorp Vault
 
-Build with `signer-vault` and target a Vault Transit key. The Vault token comes
-from the environment variable named in `token_env`:
-
-```sh
-cargo build --release -p boatramp --features signer-vault
-```
+Target a Vault Transit key. The Vault token comes from the environment variable
+named in `token_env`:
 
 ```ron
 serve: (
