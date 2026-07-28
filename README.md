@@ -11,6 +11,7 @@ laptop to an edge-compute cluster — shipped as one Rust binary.
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.82+](https://img.shields.io/badge/rust-1.82%2B-orange.svg)](https://www.rust-lang.org)
 [![Single binary](https://img.shields.io/badge/deploy-single%20binary-success.svg)](#install)
+[![Discord](https://img.shields.io/discord/1531712304104607914?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/A78gHFF3F3)
 
 </div>
 
@@ -352,6 +353,14 @@ compute, clustering, Kubernetes, Cloudflare, and the architecture reference.
 
 The site is built from [`docs/`](docs/) (mdBook) and republished on every change.
 Preview locally with `mdbook serve docs`.
+
+---
+
+## Community
+
+Questions, ideas, or just want to say hi? **Join us on [Discord](https://discord.gg/A78gHFF3F3)** —
+get help, showcase what you built, and help shape the project early. Bug reports and
+feature requests go in [Issues](https://github.com/BoatRamp/BoatRamp/issues).
 
 ---
 
