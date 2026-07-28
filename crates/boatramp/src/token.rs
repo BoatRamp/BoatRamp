@@ -4,6 +4,7 @@
 //! key) and returned once; only their metadata (`authz/tokens/<id>`) is stored,
 //! so `ls` reports the metadata and `rm` revokes by the metadata id.
 
+use boatramp_core::authz::{GrantedRole, TokenMeta};
 use clap::Subcommand;
 use serde::Deserialize;
 
@@ -170,26 +171,7 @@ struct BootstrapRequest {
     ttl_secs: Option<u64>,
 }
 
-/// A granted role as reported by the server (`authz::GrantedRole`).
-#[derive(Deserialize)]
-struct Role {
-    name: String,
-    #[serde(default)]
-    target: Option<String>,
-}
-
-/// Issued-token metadata (`authz::TokenMeta`).
-#[derive(Deserialize)]
-struct TokenMeta {
-    label: String,
-    #[serde(default)]
-    roles: Vec<Role>,
-    revocation_id: String,
-    #[serde(default)]
-    expires_at: Option<u64>,
-}
-
-fn render_role(role: &Role) -> String {
+fn render_role(role: &GrantedRole) -> String {
     match &role.target {
         Some(t) => format!("{}:{}", role.name, t),
         None => role.name.clone(),

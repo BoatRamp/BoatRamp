@@ -6,25 +6,12 @@
 
 use super::*;
 
+use boatramp_core::function::FunctionSummary;
+
 /// `?site=` filter for the functions view.
 #[derive(serde::Deserialize)]
 pub(super) struct FunctionQuery {
     site: Option<String>,
-}
-
-/// One entry in the `GET /api/functions` view.
-#[derive(serde::Serialize)]
-struct FunctionSummary {
-    /// Function name (`<site>/<name>` for site-scoped; bare for top-level).
-    name: String,
-    /// Owner (`site:<site>` or `project:<project>`).
-    owner: String,
-    /// Execution substrate.
-    runtime: String,
-    /// Active version id (the component blob hash).
-    version: String,
-    /// Rendered triggers that reach this function.
-    triggers: Vec<String>,
 }
 
 /// `GET /api/functions[?site=…]` — the derived, **read-only** site-scoped function

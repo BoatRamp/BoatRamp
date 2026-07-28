@@ -29,11 +29,7 @@ impl Drop for LogStreamHandle {
 /// Stream `data:` payloads from the SSE endpoint at `url` (with the Bearer
 /// `token`), invoking `on_payload` for each parsed event. Returns a handle whose
 /// drop aborts the stream.
-pub fn open(
-    url: &str,
-    token: &str,
-    on_payload: impl Fn(String) + 'static,
-) -> LogStreamHandle {
+pub fn open(url: &str, token: &str, on_payload: impl Fn(String) + 'static) -> LogStreamHandle {
     let controller = AbortController::new().expect("AbortController");
     let signal = controller.signal();
     let url = url.to_string();

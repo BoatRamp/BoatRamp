@@ -30,9 +30,8 @@ pub fn tokens() -> Html {
 #[function_component(TokenList)]
 fn token_list() -> Html {
     let session = use_session();
-    let list = use_api(|client| async move {
-        client.get_json::<Vec<TokenMeta>>("/api/tokens").await
-    });
+    let list =
+        use_api(|client| async move { client.get_json::<Vec<TokenMeta>>("/api/tokens").await });
     // The freshly-minted plaintext token, shown once after creation.
     let minted = use_state(|| Option::<String>::None);
     let action_error = use_state(|| Option::<String>::None);
@@ -255,7 +254,9 @@ fn cache_invalidation() -> Html {
                     .collect()
             };
             if !flush_all && keys.is_empty() {
-                status.set(Some(Err("Enter at least one key, or use Flush all.".into())));
+                status.set(Some(
+                    Err("Enter at least one key, or use Flush all.".into()),
+                ));
                 return;
             }
             let count = keys.len();

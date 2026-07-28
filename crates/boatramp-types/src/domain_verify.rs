@@ -204,6 +204,22 @@ impl DomainVerification {
     }
 }
 
+/// The result of a verification check, as the `…/verification/check` endpoint
+/// returns it to a client: the challenge after the check plus whether it passed
+/// and was attached this round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckResult {
+    /// The challenge after the check (its `verified` flag reflects the outcome).
+    pub verification: DomainVerification,
+    /// Whether ownership was proven this round.
+    pub passed: bool,
+    /// Whether the host was attached to the site's config (only on `passed`).
+    pub attached: bool,
+    /// A human-readable note on failure (what was expected / why it failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Normalize a host for verification keys and queries: lowercase, strip a
 /// leading `*.` (a wildcard is verified at its base domain, like ACME), and
 /// strip any trailing dot.

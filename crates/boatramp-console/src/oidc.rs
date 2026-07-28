@@ -374,7 +374,8 @@ fn strip_query() {
     if let Some(window) = web_sys::window() {
         if let Ok(history) = window.history() {
             if let Ok(clean) = redirect_uri() {
-                let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&clean));
+                let _ =
+                    history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&clean));
             }
         }
     }

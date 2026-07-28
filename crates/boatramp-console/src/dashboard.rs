@@ -138,7 +138,9 @@ fn current_badge(state: &Fetch<DeploymentList>) -> Html {
 fn current_summary(state: &Fetch<DeploymentList>) -> Html {
     match state {
         Fetch::Loading => html! { <span class="text-slate-400">{ "…" }</span> },
-        Fetch::Failed(err) => html! { <span class="text-rose-500" title={err.to_string()}>{ "error" }</span> },
+        Fetch::Failed(err) => {
+            html! { <span class="text-rose-500" title={err.to_string()}>{ "error" }</span> }
+        }
         Fetch::Ready(list) => match &list.current {
             Some(id) => {
                 // Find this id's activation time in the history for the age.
@@ -168,7 +170,9 @@ fn deployment_count(state: &Fetch<DeploymentList>) -> Html {
 fn domains_summary(state: &Fetch<SiteConfig>) -> Html {
     match state {
         Fetch::Loading => html! { <span class="text-slate-400 text-sm">{ "…" }</span> },
-        Fetch::Failed(err) => html! { <span class="text-rose-500 text-sm" title={err.to_string()}>{ "error" }</span> },
+        Fetch::Failed(err) => {
+            html! { <span class="text-rose-500 text-sm" title={err.to_string()}>{ "error" }</span> }
+        }
         Fetch::Ready(config) => {
             let domains = &config.domains;
             let mut hosts: Vec<String> = Vec::new();

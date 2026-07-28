@@ -5,6 +5,7 @@
 //! functions — `deploy` a component version, `rollback`, `alias`, and `rm` — each
 //! carrying its own independent version line. `function invoke` lands in FA-3.
 
+use boatramp_core::function::FunctionSummary;
 use serde::Deserialize;
 
 use crate::client;
@@ -290,15 +291,6 @@ enum TriggerCommand {
 struct TriggerView {
     id: String,
     kind: serde_json::Value,
-}
-
-/// A function as the server's `/api/functions` view reports it.
-#[derive(Debug, Deserialize)]
-struct FunctionSummary {
-    name: String,
-    runtime: String,
-    version: String,
-    triggers: Vec<String>,
 }
 
 /// The stored `Function` a mutating call (`deploy`/`rollback`) echoes back — the

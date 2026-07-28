@@ -32,9 +32,10 @@ pub struct ErrorBannerProps {
 
 #[function_component(ErrorBanner)]
 pub fn error_banner(props: &ErrorBannerProps) -> Html {
-    let on_click = props.on_retry.clone().map(|cb| {
-        Callback::from(move |_: MouseEvent| cb.emit(()))
-    });
+    let on_click = props
+        .on_retry
+        .clone()
+        .map(|cb| Callback::from(move |_: MouseEvent| cb.emit(())));
     html! {
         <div class="flex items-center justify-between rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
             <p class="text-sm text-rose-700">{ &props.message }</p>

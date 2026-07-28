@@ -32,9 +32,7 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::Unauthorized => f.write_str("unauthorized — sign in again"),
-            ApiError::Forbidden => {
-                f.write_str("forbidden — your token lacks the required scope")
-            }
+            ApiError::Forbidden => f.write_str("forbidden — your token lacks the required scope"),
             ApiError::Status { code, body } if body.is_empty() => write!(f, "HTTP {code}"),
             ApiError::Status { code, body } => write!(f, "HTTP {code}: {body}"),
             ApiError::Transport(msg) => write!(f, "request failed: {msg}"),
@@ -163,8 +161,8 @@ impl ApiClient {
 
     /// `DELETE path`, expecting a 2xx with no body (204).
     pub async fn delete(&self, path: &str) -> ApiResult<()> {
-        let req =
-            self.authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::DELETE));
+        let req = self
+            .authed(RequestBuilder::new(&self.url(path)).method(gloo_net::http::Method::DELETE));
         send(req).await?;
         Ok(())
     }

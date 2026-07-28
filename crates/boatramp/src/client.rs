@@ -278,31 +278,12 @@ fn host_segment(host: &str) -> String {
     host.replace('*', "%2A")
 }
 
-/// The result of a `domain verify` check (mirrors the server's `CheckResult`).
-#[derive(Debug, Deserialize)]
-pub struct VerificationCheck {
-    pub verification: DomainVerification,
-    pub passed: bool,
-    pub attached: bool,
-    #[serde(default)]
-    pub detail: Option<String>,
-}
+/// The result of a `domain verify` check, shared with the server and console.
+pub use boatramp_core::domain_verify::CheckResult;
 
-/// One captured guest log line (a subset of the server's `logs::LogEntry`; the
-/// `ts_ms` field is present in the response but not needed for the tail).
-#[derive(Debug, Deserialize)]
-pub struct LogEntry {
-    pub seq: u64,
-    pub stream: String,
-    pub line: String,
-}
-
-/// The logs endpoint response.
-#[derive(Debug, Deserialize)]
-pub struct LogsResponse {
-    pub entries: Vec<LogEntry>,
-    pub dropped: u64,
-}
+/// The captured guest log line and logs endpoint response, shared with the
+/// server and console.
+pub use boatramp_core::logs::{LogEntry, LogsResponse};
 
 /// Whether `s` is a bare content-address: a 64-char lowercase hex SHA-256, as
 /// printed by [`hash_file`] / `blob put`. Distinguishes an existing blob hash
@@ -450,11 +431,7 @@ impl ControlPlane {
     }
 
     /// Run the ownership check for a host; on success the server attaches it.
-    pub async fn check_domain_verification(
-        &self,
-        site: &str,
-        host: &str,
-    ) -> Result<VerificationCheck> {
+    pub async fn check_domain_verification(&self, site: &str, host: &str) -> Result<CheckResult> {
         let Self {
             http: client,
             base: server,

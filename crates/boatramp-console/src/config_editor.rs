@@ -240,7 +240,9 @@ fn security_panel(props: &PanelProps) -> Html {
 
     let on_https = {
         let update = update.clone();
-        Callback::from(move |v: bool| update(&move |c: &mut SiteConfig| c.security.https_redirect = v))
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| c.security.https_redirect = v)
+        })
     };
     let on_hsts_toggle = {
         let update = update.clone();
@@ -573,7 +575,9 @@ fn waf_panel(props: &PanelProps) -> Html {
 
     let on_ua_toggle = {
         let update = update.clone();
-        Callback::from(move |v: bool| update(&move |c: &mut SiteConfig| c.access.waf.user_agent.enabled = v))
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| c.access.waf.user_agent.enabled = v)
+        })
     };
     let on_ua_deny = {
         let update = update.clone();
@@ -591,7 +595,9 @@ fn waf_panel(props: &PanelProps) -> Html {
     };
     let on_anom_toggle = {
         let update = update.clone();
-        Callback::from(move |v: bool| update(&move |c: &mut SiteConfig| c.access.waf.anomaly.enabled = v))
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| c.access.waf.anomaly.enabled = v)
+        })
     };
     let on_threshold = {
         let update = update.clone();
@@ -602,11 +608,15 @@ fn waf_panel(props: &PanelProps) -> Html {
     };
     let on_empty_ua = {
         let update = update.clone();
-        Callback::from(move |v: bool| update(&move |c: &mut SiteConfig| c.access.waf.anomaly.score_empty_user_agent = v))
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| c.access.waf.anomaly.score_empty_user_agent = v)
+        })
     };
     let on_missing_accept = {
         let update = update.clone();
-        Callback::from(move |v: bool| update(&move |c: &mut SiteConfig| c.access.waf.anomaly.score_missing_accept = v))
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| c.access.waf.anomaly.score_missing_accept = v)
+        })
     };
     let on_susp_paths = {
         let update = update.clone();

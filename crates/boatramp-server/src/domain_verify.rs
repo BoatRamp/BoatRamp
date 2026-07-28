@@ -22,9 +22,9 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::domain_verify::{
-    check_ownership, DomainProbe, DomainVerification, VerificationMethod, VerifyError,
+    check_ownership, CheckResult, DomainProbe, VerificationMethod, VerifyError,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::deploy_error_response;
 
@@ -218,20 +218,6 @@ async fn resolve_txt(name: &str) -> Result<Vec<String>, VerifyError> {
 #[derive(Debug, Deserialize)]
 pub(crate) struct StartQuery {
     method: Option<String>,
-}
-
-/// The result of a verification check, returned to the CLI.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CheckResult {
-    /// The challenge after the check (its `verified` flag reflects the outcome).
-    pub verification: DomainVerification,
-    /// Whether ownership was proven this round.
-    pub passed: bool,
-    /// Whether the host was attached to the site's config (only on `passed`).
-    pub attached: bool,
-    /// A human-readable note on failure (what was expected / why it failed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 /// `GET …/verification` — the current challenge for `(site, host)`, or 404.

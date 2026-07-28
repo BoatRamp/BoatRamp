@@ -6,7 +6,6 @@
 //! CertStatus, GcReport, ScrubReport, DomainVerification, …) is used directly
 //! from there — these are only the handful the server keeps private.
 
-use boatramp_types::domain_verify::DomainVerification;
 use serde::{Deserialize, Serialize};
 
 /// Body of `PUT /api/sites/:site/aliases/:name` — point the alias at a
@@ -17,20 +16,10 @@ pub struct SetAliasRequest {
     pub id: String,
 }
 
-/// Result of `POST /api/sites/:site/domains/:host/verification/check`
-/// (server: `CheckResult`). The challenge plus whether it passed / was attached.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CheckResult {
-    /// The challenge after the check (its `verified` flag reflects the outcome).
-    pub verification: DomainVerification,
-    /// Whether ownership was proven this round.
-    pub passed: bool,
-    /// Whether the host was attached to the site's config (only on `passed`).
-    pub attached: bool,
-    /// A human-readable note on failure (what was expected / why it failed).
-    #[serde(default)]
-    pub detail: Option<String>,
-}
+/// Result of `POST /api/sites/:site/domains/:host/verification/check`: the
+/// challenge plus whether it passed / was attached. The shared
+/// `boatramp_types::domain_verify::CheckResult`.
+pub use boatramp_types::domain_verify::CheckResult;
 
 /// Body of `POST /api/tokens` — mint a token (server: `CreateTokenRequest`).
 #[derive(Debug, Clone, Serialize)]
@@ -77,23 +66,6 @@ pub struct InvalidateRequest {
     pub keys: Vec<String>,
 }
 
-/// One captured guest log line from `GET /api/sites/:site/_boatramp/logs`
-/// (a subset of the server's `logs::LogEntry`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct LogEntry {
-    /// Monotonic sequence number (poll with `?after=<seq>` for new lines).
-    pub seq: u64,
-    /// Which stream — `stdout` or `stderr`.
-    pub stream: String,
-    /// The captured line.
-    pub line: String,
-}
-
-/// The logs endpoint response (server: `LogsResponse`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-pub struct LogsResponse {
-    /// The captured lines (most recent `limit`, with `seq > after`).
-    pub entries: Vec<LogEntry>,
-    /// Lines dropped server-side by the per-site rate cap.
-    pub dropped: u64,
-}
+/// The captured guest log line and the logs endpoint response, shared with the
+/// server and CLI (`boatramp_types::logs`).
+pub use boatramp_types::logs::{LogEntry, LogsResponse};

@@ -822,6 +822,23 @@ pub fn materialize(
         .collect()
 }
 
+/// One entry in the `GET /api/functions` view: a function plus its resolved
+/// active version and the triggers that reach it. The read-only projection the
+/// server returns and the CLI/console render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionSummary {
+    /// Function name (`<site>/<name>` for site-scoped; bare for top-level).
+    pub name: String,
+    /// Owner (`site:<site>` or `project:<project>`).
+    pub owner: String,
+    /// Execution substrate.
+    pub runtime: String,
+    /// Active version id (the component blob hash).
+    pub version: String,
+    /// Rendered triggers that reach this function.
+    pub triggers: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

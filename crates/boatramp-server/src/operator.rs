@@ -198,13 +198,10 @@ pub(super) struct LogsQuery {
     stream: Option<String>,
 }
 
-/// The logs endpoint response: recent captured lines + the rate-cap drop count.
+/// The logs endpoint response: recent captured lines + the rate-cap drop count
+/// (the shared `boatramp_types::logs::LogsResponse`).
 #[cfg(feature = "handlers")]
-#[derive(Serialize)]
-struct LogsResponse {
-    entries: Vec<logs::LogEntry>,
-    dropped: u64,
-}
+use boatramp_core::logs::LogsResponse;
 
 /// Authenticated per-site captured guest logs (`site:<site>` scope). Returns the
 /// most recent lines (newest last), optionally filtered to one stream, plus the

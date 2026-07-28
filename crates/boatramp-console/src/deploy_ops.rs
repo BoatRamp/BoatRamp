@@ -152,13 +152,16 @@ fn deployment_row(
     let meta = entry.meta.as_ref();
     // Prefer the human-readable release tag, then the commit SHA, then the branch.
     let source = meta
-        .and_then(|m| m.tag.as_deref().or(m.source.as_deref()).or(m.branch.as_deref()))
+        .and_then(|m| {
+            m.tag
+                .as_deref()
+                .or(m.source.as_deref())
+                .or(m.branch.as_deref())
+        })
         .map(|s| s.to_string())
         .unwrap_or_else(|| "—".to_string());
     // Hovering the provenance shows the deploy message, if any.
-    let message = meta
-        .and_then(|m| m.message.clone())
-        .unwrap_or_default();
+    let message = meta.and_then(|m| m.message.clone()).unwrap_or_default();
     let tag_pills: Html = meta
         .map(|m| {
             m.tags
@@ -241,7 +244,9 @@ fn aliases(props: &SiteProp) -> Html {
                 .map(|el| el.value().trim().to_string())
                 .unwrap_or_default();
             if name.is_empty() || id.is_empty() {
-                action_error.set(Some("Both an alias name and a deployment id are required.".into()));
+                action_error.set(Some(
+                    "Both an alias name and a deployment id are required.".into(),
+                ));
                 return;
             }
             let client = session.client();
@@ -254,7 +259,10 @@ fn aliases(props: &SiteProp) -> Html {
             action_error.set(None);
             spawn_local(async move {
                 match client
-                    .put_json(&format!("/api/sites/{site}/aliases/{name}"), &SetAliasRequest { id })
+                    .put_json(
+                        &format!("/api/sites/{site}/aliases/{name}"),
+                        &SetAliasRequest { id },
+                    )
                     .await
                 {
                     Ok(()) => {

@@ -29,9 +29,8 @@ pub fn maintenance() -> Html {
 /// never key material). Flags certs expiring within 14 days.
 #[function_component(Certs)]
 fn certs() -> Html {
-    let list = use_api(|client| async move {
-        client.get_json::<Vec<CertStatus>>("/api/certs").await
-    });
+    let list =
+        use_api(|client| async move { client.get_json::<Vec<CertStatus>>("/api/certs").await });
 
     let body = match &list.state {
         Fetch::Loading => html! { <Spinner label="Loading certs…" /> },
@@ -97,9 +96,7 @@ fn cert_row(cert: &CertStatus) -> Html {
 #[function_component(Prune)]
 fn prune() -> Html {
     let session = use_session();
-    let report = use_api(|client| async move {
-        client.get_json::<GcReport>("/api/prune").await
-    });
+    let report = use_api(|client| async move { client.get_json::<GcReport>("/api/prune").await });
     let result = use_state(|| Option::<Result<GcReport, String>>::None);
 
     let run_delete = {

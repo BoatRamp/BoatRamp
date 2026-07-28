@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use boatramp_core::time::now_unix_ms;
 
+use boatramp_core::logs::LogEntry;
 use boatramp_handlers::{LogSink, LogStream};
-use serde::Serialize;
 use tokio::sync::broadcast;
 
 /// Live-tail broadcast buffer: how many recent `(site, line)` events a slow SSE
@@ -26,19 +26,6 @@ const DEFAULT_CAPACITY: usize = 1000;
 const DEFAULT_RATE: u32 = 200;
 /// Token-bucket depth as a multiple of the rate (allows a short burst).
 const BURST_FACTOR: f64 = 2.0;
-
-/// One captured guest log line, as returned by the logs endpoint.
-#[derive(Clone, Serialize)]
-pub struct LogEntry {
-    /// Process-global monotonic sequence (a stable cursor for `--follow`).
-    pub seq: u64,
-    /// Capture time (Unix milliseconds).
-    pub ts_ms: u64,
-    /// Which stream it came from (`stdout` / `stderr`).
-    pub stream: String,
-    /// The line text (newline stripped).
-    pub line: String,
-}
 
 /// Per-site captured log state: a bounded ring + a token bucket.
 struct SiteLog {
