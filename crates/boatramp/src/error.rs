@@ -90,6 +90,10 @@ pub enum CliError {
     #[cfg(feature = "operator")]
     #[error(transparent)]
     Operator(#[from] crate::operator::Error),
+    /// The `mcp` command (requires `--features mcp`).
+    #[cfg(feature = "mcp")]
+    #[error(transparent)]
+    Mcp(#[from] crate::mcp::Error),
 
     /// Building the multi-threaded async (Tokio) runtime.
     #[error("building async runtime: {0}")]

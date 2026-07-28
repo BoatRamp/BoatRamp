@@ -57,6 +57,8 @@ mod workflow;
 mod join;
 mod logs;
 mod manage;
+#[cfg(feature = "mcp")]
+mod mcp;
 #[cfg(feature = "operator")]
 mod operator;
 mod security;
@@ -156,6 +158,10 @@ enum Command {
     /// (`operator run` / `operator crds` / `operator manifests`).
     #[cfg(feature = "operator")]
     Operator(operator::OperatorArgs),
+    /// Model Context Protocol server: drive one or more instances from an agent
+    /// (`mcp` / `mcp serve` over stdio; `mcp setup add/list/remove`).
+    #[cfg(feature = "mcp")]
+    Mcp(mcp::McpArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -325,6 +331,18 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `mcp` speaks the Model Context Protocol (stdio) or edits its own instance
+    // registry (`~/.config/boatramp/mcp.toml`) — it needs neither project nor
+    // server config, so handle it before loading `project.cfg`.
+    #[cfg(feature = "mcp")]
+    if matches!(cli.command, Command::Mcp(_)) {
+        let Command::Mcp(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        mcp::run(args).await?;
+        return Ok(());
+    }
+
     let path = cli.config.unwrap_or_else(|| PathBuf::from("project.cfg"));
     let config = config::ProjectConfig::load(&path)?;
 
@@ -335,6 +353,8 @@ async fn async_main() -> Result<(), CliError> {
         Command::Security(_) => unreachable!("handled above"),
         #[cfg(feature = "operator")]
         Command::Operator(_) => unreachable!("handled above"),
+        #[cfg(feature = "mcp")]
+        Command::Mcp(_) => unreachable!("handled above"),
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
         Command::Sync(args) => sync::run(args, &config).await?,
         Command::Build(args) => build::run(args, &config).await?,

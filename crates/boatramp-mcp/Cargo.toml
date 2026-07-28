@@ -1,0 +1,45 @@
+# The Model Context Protocol (MCP) server for boatramp: exposes the control-plane
+# API as MCP tools so an agent (Claude, Codex, …) can drive one or many boatramp
+# instances. Deliberately a SEPARATE crate from the `boatramp` binary: rmcp's tool
+# macros need schemars 1.x, while the binary pins schemars 0.8 for the kube
+# operator's CRD derives — two majors of one crate can't coexist, so the MCP layer
+# lives here with its own schemars and the binary just depends on it (feature-gated).
+[package]
+name = "boatramp-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "boatramp — Model Context Protocol server (drive the control plane from an agent)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The official Rust MCP SDK. `server` + `transport-io` power the stdio transport
+# (the `boatramp mcp` subcommand). The HTTP streamable-http transport (mounted on
+# `boatramp serve`) is added behind the `http` feature, which pulls rmcp's own
+# axum-based server transport.
+rmcp = { version = "1.2", features = ["server", "transport-io"] }
+# rmcp's tool macros generate schemars 1.x `JsonSchema` derives; keep it distinct
+# from the workspace's schemars 0.8 (kube CRDs) by pinning it only here.
+schemars = "1"
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Reused for the same control-plane auth the CLI uses: per-request PoP proofs
+# (COSE, behind boatramp-core's `authz` feature) and RFC 7250 raw-public-key TLS
+# pinning of the server.
+boatramp-core = { workspace = true, features = ["authz"] }
+boatramp-rpktls = { workspace = true }
+
+[features]
+# The HTTP streamable transport for the in-`serve` MCP endpoint. Behind a feature
+# so the stdio-only CLI path needn't compile rmcp's axum server stack.
+http = ["rmcp/transport-streamable-http-server"]

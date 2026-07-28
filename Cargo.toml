@@ -13,6 +13,7 @@ members = [
   "crates/boatramp-container",
   "crates/boatramp-docker",
   "crates/boatramp-cloudflare",
+  "crates/boatramp-mcp",
   "crates/boatramp",
 ]
 # WebAssembly guest examples/fixtures target wasm32-wasip2, not the host triple,

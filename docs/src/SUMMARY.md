@@ -42,6 +42,7 @@
 - [Back up & restore](./how-to/backup.md)
 - [Garbage-collect & verify integrity](./how-to/prune-scrub.md)
 - [Observe: logs, metrics, health, stats](./how-to/observe.md)
+- [Drive boatramp from an AI agent (MCP)](./how-to/mcp.md)
 - [Manage certificates in a cluster](./how-to/cluster-certs.md)
 - [Deploy a single node in production](./how-to/deploy-single-node.md)
 - [Deploy a self-hosted cluster](./how-to/deploy-cluster.md)

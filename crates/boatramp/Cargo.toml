@@ -50,6 +50,7 @@ default = [
   "handlers",
   "cluster",
   "operator",
+  "mcp",
 ]
 fs = ["boatramp-storage/fs"]
 s3 = ["boatramp-storage/s3"]
@@ -175,6 +176,11 @@ operator = [
   # The membership executor mints + encodes join tickets (crate::join, cluster).
   "cluster",
 ]
+# The `boatramp mcp` subcommand: a Model Context Protocol server (stdio) that
+# drives one or more instances from an agent. The tool surface + transport live in
+# the separate `boatramp-mcp` crate (rmcp's schemars 1.x can't share the binary
+# with the operator's schemars 0.8), so this just pulls it in.
+mcp = ["dep:boatramp-mcp"]
 
 [dependencies]
 # COSE/CWT + Cedar auth is always built into the binary: the CLI
@@ -182,6 +188,8 @@ operator = [
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
+# The MCP server (behind the `mcp` feature): the `boatramp mcp` subcommand.
+boatramp-mcp = { path = "../boatramp-mcp", optional = true }
 # RFC 7250 RPK primitives: the `--tls rpk` bootstrap listener (server, `tls`
 # feature) AND client-side server-key pinning (always available, so the CLI can
 # talk to an `--tls rpk` control plane without the `tls`/serve feature).
