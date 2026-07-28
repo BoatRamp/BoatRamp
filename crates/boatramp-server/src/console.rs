@@ -323,25 +323,30 @@ mod tests {
             r.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
-        // A real hashed asset -> its own content-type + immutable caching.
-        let js = CONSOLE_DIST
+        // A real hashed asset -> its own content-type + immutable caching. In a
+        // plain `cargo test` the embedded dist is `build.rs`'s placeholder
+        // (`index.html` only, no hashed assets), so this sub-check runs only when
+        // the real SPA has been baked in (`just console`, or the release + Nix
+        // pipelines that stage the dist).
+        if let Some(js) = CONSOLE_DIST
             .files()
             .find(|f| f.path().extension().is_some_and(|e| e == "js"))
-            .expect("dist has a .js asset");
-        let name = js.path().to_str().unwrap();
-        let r = serve_console(&mount, &format!("/_console/{name}"));
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(
-            r.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/javascript; charset=utf-8"
-        );
-        assert!(r
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .contains("immutable"));
+        {
+            let name = js.path().to_str().unwrap();
+            let r = serve_console(&mount, &format!("/_console/{name}"));
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(
+                r.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/javascript; charset=utf-8"
+            );
+            assert!(r
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("immutable"));
+        }
     }
 
     #[test]
