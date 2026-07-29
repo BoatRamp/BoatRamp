@@ -24,6 +24,7 @@ Clone the repository and change into it:
 ```sh
 git clone https://github.com/BoatRamp/BoatRamp.git
 cd BoatRamp
+git checkout v0.1.0   # build a released version; omit to build the development tip (main)
 ```
 
 ## Build the default binary

@@ -36,6 +36,20 @@ change the target directory. On Windows, run the PowerShell script:
 irm https://raw.githubusercontent.com/BoatRamp/BoatRamp/main/packaging/install/install.ps1 | iex
 ```
 
+## cargo install (crates.io)
+
+With a Rust toolchain, install the released version from
+[crates.io](https://crates.io/crates/boatramp):
+
+```sh
+cargo install boatramp --locked
+```
+
+This **compiles from source**, pulling the batteries-included feature set (wasmtime,
+TLS, cloud SDKs), so expect a sizeable build — the prebuilt binary above is faster.
+Pin a version with `cargo install boatramp@0.1.0 --locked`, or build a smaller binary
+with `--no-default-features --features …` (see [Build from source](./build-from-source.md)).
+
 ## Homebrew (macOS / Linux)
 
 ```sh
@@ -65,8 +79,9 @@ docker run -p 8080:8080 ghcr.io/boatramp/boatramp:latest serve --tls off
 Run or build straight from the flake:
 
 ```sh
-nix run github:BoatRamp/BoatRamp -- --version
-nix build github:BoatRamp/BoatRamp        # -> ./result/bin/boatramp
+nix run github:BoatRamp/BoatRamp -- --version         # the latest commit
+nix run github:BoatRamp/BoatRamp/v0.1.0 -- --version  # pin a release
+nix build github:BoatRamp/BoatRamp                    # -> ./result/bin/boatramp
 ```
 
 On NixOS, the flake ships an overlay and a declarative `services.boatramp` module

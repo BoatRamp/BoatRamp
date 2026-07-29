@@ -154,16 +154,26 @@ curl -sSf https://boatramp.dev/launch | sh
 macOS, `x86_64` Windows), `.deb`/`.rpm` packages, and a Homebrew tap are published on
 the [Releases](../../releases) page.
 
+**With cargo** — from [crates.io](https://crates.io/crates/boatramp) (compiles from
+source; needs a Rust toolchain):
+
+```sh
+cargo install boatramp --locked           # latest release, batteries-included
+cargo install boatramp@0.1.0 --locked     # pin a version
+```
+
 **With Nix** (flakes):
 
 ```sh
-nix run github:BoatRamp/BoatRamp -- serve      # run without installing
-nix profile install github:BoatRamp/BoatRamp   # install the binary
+nix run github:BoatRamp/BoatRamp -- serve         # run without installing (latest commit)
+nix run github:BoatRamp/BoatRamp/v0.1.0 -- serve  # pin a release
+nix profile install github:BoatRamp/BoatRamp      # install the binary
 ```
 
 **From source** (Rust 1.82+):
 
 ```sh
+git checkout v0.1.0                                                # the release (omit for the development tip)
 cargo build --release                                              # batteries-included: all non-conflicting backends
 cargo build --release --no-default-features --features fs,slatedb  # the minimal opt-down slice
 ```
