@@ -54,6 +54,7 @@ semicolon_if_nothing_returned = "warn"
 boatramp-types = { path = "crates/boatramp-types", version = "0.1.0" }
 boatramp-core = { path = "crates/boatramp-core", version = "0.1.0" }
 boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.1.0" }
+boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.1.0" }
 boatramp-storage = { path = "crates/boatramp-storage", version = "0.1.0" }
 boatramp-server = { path = "crates/boatramp-server", version = "0.1.0" }
 boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.1.0" }

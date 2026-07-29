@@ -189,7 +189,7 @@ boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
 # The MCP server (behind the `mcp` feature): the `boatramp mcp` subcommand.
-boatramp-mcp = { path = "../boatramp-mcp", optional = true }
+boatramp-mcp = { workspace = true, optional = true }
 # RFC 7250 RPK primitives: the `--tls rpk` bootstrap listener (server, `tls`
 # feature) AND client-side server-key pinning (always available, so the CLI can
 # talk to an `--tls rpk` control plane without the `tls`/serve feature).

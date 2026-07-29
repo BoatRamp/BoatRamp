@@ -70,7 +70,7 @@ mcp = ["dep:boatramp-mcp", "dep:rmcp", "dep:tower"]
 # time from `../boatramp-console/dist`.
 include_dir = { workspace = true, optional = true }
 # The MCP tool layer (feature `mcp`) + rmcp's HTTP transport for the `/mcp` endpoint.
-boatramp-mcp = { path = "../boatramp-mcp", optional = true }
+boatramp-mcp = { workspace = true, optional = true }
 rmcp = { version = "1.2", features = [
   "server",
   "transport-streamable-http-server",
