@@ -203,13 +203,19 @@
             fi
           '';
 
-          # Build the single `boatramp` binary with an optional extra feature set
-          # on top of the defaults (`fs` + `slatedb` + `console`). The recipe lives
-          # in ./nix/package.nix (shared with `overlays.default`); here we pin it to
-          # the rust-overlay toolchain so the flake build matches the dev shell +
-          # CI compiler, and stage the built console SPA so the default `console`
-          # feature embeds the real assets (not the build-script placeholder). The
-          # cloud image (below) adds the `s3` (R2) + `cloudflare-kv` backends.
+          # Build the single, batteries-included `boatramp` binary. The workspace
+          # default is "all non-conflicting features" (see crates/boatramp/Cargo.toml),
+          # so a plain `-p boatramp` build already compiles every backend — fs/S3/GCS/
+          # Azure blobs, SlateDB/Cloudflare KV, TLS + ACME, HTTP/3, handlers, cluster,
+          # operator, the signers, external SQL, MCP, domain-verify-dns, and the
+          # console SPA. Which backend runs is a runtime choice (`--blobs`/`--kv`/
+          # `--tls`), not a compile-time variant, so there is one binary for every
+          # image below. The recipe lives in ./nix/package.nix (shared with
+          # `overlays.default`); here we pin it to the rust-overlay toolchain so the
+          # flake build matches the dev shell + CI compiler, and stage the built
+          # console SPA so the `console` feature embeds the real assets (not the
+          # build-script placeholder). `features` still exists for a bespoke build
+          # that layers something extra, but the shipped artifacts pass none.
           mkBoatramp =
             {
               features ? [ ],
@@ -219,36 +225,19 @@
               consoleDist = consolePackage;
             };
 
-          # The CF Containers image feature set: R2 blobs (`s3`) + a networked KV
-          # for metadata (`cloudflare-kv`); TLS terminates at the edge so the `tls`
-          # feature is omitted. The cluster image
-          # (HA / Raft) is built from source by `boatramp cloudflare`'s generated
-          # Dockerfile (`--features cluster`); this is the single-instance base.
-          boatrampCloud = mkBoatramp {
-            features = [
-              "s3"
-              "cloudflare-kv"
-            ];
-          };
+          # One batteries-included binary backs `packages.default`, `nix run`, and
+          # both OCI images; they differ only in runtime posture, not compiled code.
+          # (The cluster HA / Raft image is still built from source by `boatramp
+          # cloudflare`'s generated recipe — that path is separate from this flake.)
+          boatrampBin = mkBoatramp { };
 
-          # Default (base) feature set: fs blobs + SlateDB metadata. Backs the
-          # `default` package (fly.io / any OCI host that provides a writable
-          # volume for state).
-          boatrampBase = mkBoatramp { };
-
-          # The `container` image adds `domain-verify-dns`: the reference/dogfood
-          # deployment self-hosts its own domains (e.g. docs.boatramp.dev on the
-          # same fly app), where an HTTP ownership probe can't hairpin back to the
-          # app — so it verifies ownership over public DNS-TXT instead.
-          boatrampContainer = mkBoatramp { features = [ "domain-verify-dns" ]; };
-
-          # Shared builder for the reproducible, Nix-first OCI images. The `container`
-          # (base) and `container-cloudflare` (R2 + KV) targets differ only in the
-          # binary's compiled backends and, consequently, whether they need a state
-          # volume: the base image writes fs/SlateDB state so it runs as root to own a
-          # mounted volume; the cloudflare image is stateless (R2 + KV) and stays
-          # hardened as non-root. `cacert` is included so the binary can reach
-          # R2/Cloudflare/ACME over HTTPS; TLS terminates upstream, so it listens plain.
+          # Shared builder for the reproducible, Nix-first OCI images. Both targets
+          # ship the *same* batteries-included binary and differ only in runtime
+          # posture: the base `container` runs as root so it can own a mounted state
+          # volume when using the fs/SlateDB backends; `container-cloudflare` is meant
+          # for remote state (R2 + KV), so it carries no volume and stays hardened as
+          # non-root. `cacert` is included so the binary can reach R2/Cloudflare/ACME
+          # over HTTPS; TLS typically terminates upstream, so it listens plain.
           mkImage =
             {
               pkg,
@@ -299,10 +288,9 @@
           # single `packages` definition (dotted + whole-attrset forms can't be
           # mixed). The Linux-only container image is merged in conditionally.
           packages = {
-            # The single `boatramp` binary (server + CLI) with the filesystem
-            # backend. The s3 / cloudflare-kv backends live behind cargo features
-            # so the default build stays free of heavy native dependencies.
-            default = boatrampBase;
+            # The single, batteries-included `boatramp` binary (server + CLI): every
+            # backend is compiled in and selected at runtime (`--blobs`/`--kv`/`--tls`).
+            default = boatrampBin;
 
             # ---- Reproducible microVM kernel (`nix build .#vmlinux`) --------
             # The uncompressed `vmlinux` ELF the embedded VMM boots via
@@ -362,22 +350,23 @@
           }
           # ---- Container images -------------------------------------------
           # `dockerTools` builds *Linux* images, so these are Linux-only (built in
-          # CI / on a Linux host; CF needs `x86_64-linux`). Two targets, sharing
-          # `mkImage` (above) and differing only in compiled backends:
+          # CI / on a Linux host; CF needs `x86_64-linux`). Both targets ship the
+          # same batteries-included binary via `mkImage` (above) and differ only in
+          # runtime posture:
           #
-          #   nix build .#container             base: fs + SlateDB (fly.io / volume)
-          #   nix build .#container-cloudflare  R2 (s3) + Cloudflare KV (stateless)
+          #   nix build .#container             root, for a writable state volume (fly.io)
+          #   nix build .#container-cloudflare  non-root, for remote state (R2 + KV)
           # The cluster (HA / Raft) image is still built from source by
           # `boatramp cloudflare`'s generated recipe; these are the single-instance
           # bases.
           // lib.optionalAttrs pkgs.stdenv.isLinux {
-            # Base image: default backends (fs blobs + SlateDB metadata). Runs as
-            # root so it can own a mounted state volume (e.g. a fly.io volume).
-            container = mkImage { pkg = boatrampContainer; };
-            # Cloudflare image: R2 (`s3`) blobs + Cloudflare KV metadata. State is
-            # remote so the container is stateless; stays hardened as `nobody`.
+            # Base image: runs as root so it can own a mounted state volume (e.g. a
+            # fly.io volume) when using the fs/SlateDB backends.
+            container = mkImage { pkg = boatrampBin; };
+            # Cloudflare image: the same binary, configured for remote state (R2 + KV)
+            # at runtime, so it needs no volume and stays hardened as non-root.
             container-cloudflare = mkImage {
-              pkg = boatrampCloud;
+              pkg = boatrampBin;
               user = "65534:65534";
             };
           };
