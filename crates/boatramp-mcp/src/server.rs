@@ -11,12 +11,14 @@
 
 use std::sync::Arc;
 
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_router, RoleServer, ServerHandler};
 
-use crate::client::ControlPlane;
-use crate::registry::InstanceRegistry;
+use crate::client::{ControlPlane, CALLER_BEARER};
+use crate::registry::Backend;
 
 /// Percent-encode a host for a URL path segment (mirrors the CLI: a wildcard `*`
 /// is the only path-unsafe character in a DNS host).
@@ -31,14 +33,11 @@ fn ok_json(value: &serde_json::Value) -> CallToolResult {
     )])
 }
 
-/// The MCP server: a tool router over a registry of boatramp control planes.
+/// The MCP server: a tool router over a [`Backend`] (one or many control planes).
 #[derive(Clone)]
 pub struct BoatrampMcp {
-    // Held for the derived `Clone` + the `#[tool_handler]`-generated dispatch; the
-    // macro reads it, so the dead-code lint's own note calls this out as ignored.
-    #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
-    registry: Arc<InstanceRegistry>,
+    backend: Arc<dyn Backend>,
 }
 
 // ---- tool parameter structs ------------------------------------------------
@@ -280,11 +279,11 @@ pub struct InvalidateCacheParams {
 
 #[tool_router]
 impl BoatrampMcp {
-    /// Build the server over `registry`.
-    pub fn new(registry: Arc<InstanceRegistry>) -> Self {
+    /// Build the server over a [`Backend`].
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            registry,
+            backend,
         }
     }
 
@@ -297,7 +296,7 @@ impl BoatrampMcp {
     )]
     async fn list_instances(&self) -> Result<CallToolResult, ErrorData> {
         let list: Vec<serde_json::Value> = self
-            .registry
+            .backend
             .list()
             .into_iter()
             .map(|(name, url)| serde_json::json!({ "name": name, "server": url }))
@@ -921,12 +920,18 @@ impl BoatrampMcp {
 impl BoatrampMcp {
     /// Resolve the target control plane, mapping resolution errors into the wire
     /// error the agent sees.
-    fn cp(&self, instance: Option<&str>) -> Result<&ControlPlane, ErrorData> {
-        Ok(self.registry.resolve(instance)?)
+    fn cp(&self, instance: Option<&str>) -> Result<&dyn ControlPlane, ErrorData> {
+        Ok(self.backend.resolve(instance)?)
     }
 }
 
-#[tool_handler]
+// The `ServerHandler` is implemented by hand (rather than via `#[tool_handler]`)
+// for one reason: `call_tool` receives the `RequestContext` on the SAME task the
+// tool then runs on, so it is the one place we can capture the caller's forwarded
+// bearer (injected by rmcp's HTTP transport into the request extensions) into a
+// task-local the in-process `LocalControlPlane` reads. On stdio there are no HTTP
+// parts, so the bearer is `None` and each `HttpControlPlane` uses its own token.
+// `list_tools` / `get_tool` mirror what the macro would generate.
 impl ServerHandler for BoatrampMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
@@ -938,5 +943,41 @@ impl ServerHandler for BoatrampMcp {
              API (no generic passthrough); write, delete, token, and cluster tools can be \
              DESTRUCTIVE. Authorization is enforced by the presented token's scope.",
         )
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Capture the caller's bearer from the HTTP request parts rmcp injected into
+        // the request extensions (absent on stdio), for the in-process backend.
+        let bearer = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.headers.get(http::header::AUTHORIZATION))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_string);
+        let tcc = ToolCallContext::new(self, request, context);
+        CALLER_BEARER
+            .scope(bearer, self.tool_router.call(tcc))
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
     }
 }

@@ -1,8 +1,12 @@
-//! The control-plane HTTP client the MCP tools call — the same authentication the
-//! `boatramp` CLI uses: a bearer token, optional per-request DPoP/PoP proof (COSE)
-//! when the token is `cnf`-bound, and optional RFC 7250 raw-public-key TLS pinning
-//! of the server. Exposes a small JSON call surface (`get`/`post`/`put`/`delete`)
-//! since MCP tools shuttle JSON to and from the agent.
+//! The control-plane the MCP tools call. [`ControlPlane`] is the trait the tools
+//! use (a small JSON `get`/`post`/`put`/`delete` surface); it has two impls:
+//!  - [`HttpControlPlane`] — a real HTTP client to a remote instance, with the
+//!    same auth the `boatramp` CLI uses (bearer token, optional per-request
+//!    DPoP/PoP proof for `cnf` tokens, optional RFC 7250 raw-public-key pinning).
+//!    This backs the stdio transport (which can drive many named instances).
+//!  - a `LocalControlPlane` (in `boatramp-server`) that dispatches in-process to
+//!    the serving node's own router with the caller's forwarded bearer. This backs
+//!    the in-`serve` HTTP `/mcp` endpoint.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,17 +17,73 @@ use boatramp_core::time::now_unix;
 use crate::config::{resolve_secret, InstanceConfig};
 use crate::error::{Error, Result};
 
-/// A control-plane connection: an authenticated client bound to one instance's
-/// base URL. Cloneable and cheap (an `Arc` inside `reqwest::Client`).
+tokio::task_local! {
+    /// The caller's forwarded bearer for the current HTTP `/mcp` tool dispatch. The
+    /// manual `call_tool` sets it (from the request's `Authorization` header) around
+    /// the tool's execution; a `LocalControlPlane` reads it to authorize its
+    /// in-process call with the caller's own authority. Absent on the stdio
+    /// transport (where each `HttpControlPlane` carries its own token).
+    pub static CALLER_BEARER: Option<String>;
+}
+
+/// Read the caller's forwarded bearer for the current tool dispatch, if any.
+pub fn caller_bearer() -> Option<String> {
+    CALLER_BEARER.try_with(Clone::clone).ok().flatten()
+}
+
+/// A control-plane the MCP tools issue requests against. Implementors carry their
+/// own authentication; the tools only build `(method, path, body)`.
+#[async_trait::async_trait]
+pub trait ControlPlane: Send + Sync {
+    /// Send a request to `path` (a leading-slash control-plane path) with an
+    /// optional JSON body, returning the parsed JSON response. A non-2xx status is
+    /// an [`Error::Api`] carrying the body; an empty 2xx body yields `null`.
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value>;
+
+    /// This instance's display name.
+    fn name(&self) -> &str;
+
+    /// This instance's base URL.
+    fn base_url(&self) -> &str;
+
+    /// `GET path` → JSON.
+    async fn get(&self, path: &str) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::GET, path, None).await
+    }
+    /// `POST path` with an optional JSON body → JSON.
+    async fn post(
+        &self,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::POST, path, body).await
+    }
+    /// `PUT path` with a JSON body → JSON.
+    async fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::PUT, path, Some(body)).await
+    }
+    /// `DELETE path` → JSON.
+    async fn delete(&self, path: &str) -> Result<serde_json::Value> {
+        self.call(reqwest::Method::DELETE, path, None).await
+    }
+}
+
+/// An HTTP control-plane connection: an authenticated `reqwest` client bound to one
+/// instance's base URL. Cloneable and cheap (an `Arc` inside `reqwest::Client`).
 #[derive(Clone)]
-pub struct ControlPlane {
+pub struct HttpControlPlane {
     inner: reqwest::Client,
     pop: Option<Arc<PopSigner>>,
     base: String,
     name: String,
 }
 
-impl ControlPlane {
+impl HttpControlPlane {
     /// Build a connection from an [`InstanceConfig`], resolving its token/holder
     /// secret specs. Fails if a named secret can't be resolved or TLS pinning is
     /// misconfigured.
@@ -80,21 +140,19 @@ impl ControlPlane {
             name: inst.name.clone(),
         })
     }
+}
 
-    /// This instance's name.
-    pub fn name(&self) -> &str {
+#[async_trait::async_trait]
+impl ControlPlane for HttpControlPlane {
+    fn name(&self) -> &str {
         &self.name
     }
 
-    /// This instance's base URL.
-    pub fn base_url(&self) -> &str {
+    fn base_url(&self) -> &str {
         &self.base
     }
 
-    /// Send a request to `path` (a leading-slash control-plane path) with an
-    /// optional JSON body, returning the parsed JSON response. A non-2xx status is
-    /// an [`Error::Api`] carrying the body. An empty 2xx body yields `null`.
-    pub async fn call(
+    async fn call(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -127,27 +185,6 @@ impl ControlPlane {
         }
         // Prefer structured JSON, but fall back to a string for text/plain bodies.
         Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
-    }
-
-    /// `GET path` → JSON.
-    pub async fn get(&self, path: &str) -> Result<serde_json::Value> {
-        self.call(reqwest::Method::GET, path, None).await
-    }
-    /// `POST path` with an optional JSON body → JSON.
-    pub async fn post(
-        &self,
-        path: &str,
-        body: Option<&serde_json::Value>,
-    ) -> Result<serde_json::Value> {
-        self.call(reqwest::Method::POST, path, body).await
-    }
-    /// `PUT path` with a JSON body → JSON.
-    pub async fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-        self.call(reqwest::Method::PUT, path, Some(body)).await
-    }
-    /// `DELETE path` → JSON.
-    pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {
-        self.call(reqwest::Method::DELETE, path, None).await
     }
 }
 

@@ -1647,8 +1647,10 @@ dependencies = [
 name = "boatramp-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "boatramp-core",
  "boatramp-rpktls",
+ "http 1.4.2",
  "reqwest",
  "rmcp",
  "schemars 1.2.1",

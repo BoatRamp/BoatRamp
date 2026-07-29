@@ -33,6 +33,10 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
+# The `http` types rmcp injects into the request extensions (the caller's bearer,
+# read on the HTTP `/mcp` path).
+http = "1"
 # Reused for the same control-plane auth the CLI uses: per-request PoP proofs
 # (COSE, behind boatramp-core's `authz` feature) and RFC 7250 raw-public-key TLS
 # pinning of the server.

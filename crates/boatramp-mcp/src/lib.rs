@@ -18,9 +18,10 @@ pub mod registry;
 mod server;
 pub mod setup;
 
+pub use client::{caller_bearer, ControlPlane, HttpControlPlane, CALLER_BEARER};
 pub use config::{Config, InstanceConfig};
 pub use error::{Error, Result};
-pub use registry::InstanceRegistry;
+pub use registry::{Backend, InstanceRegistry, SingleBackend};
 pub use server::BoatrampMcp;
 
 use std::sync::Arc;
@@ -30,13 +31,13 @@ use std::sync::Arc;
 pub async fn serve_stdio() -> Result<()> {
     use rmcp::ServiceExt;
     let config = Config::load()?;
-    let registry = Arc::new(InstanceRegistry::from_config(&config)?);
-    if registry.is_empty() {
+    let backend: Arc<dyn Backend> = Arc::new(InstanceRegistry::from_config(&config)?);
+    if backend.is_empty() {
         tracing::warn!(
             "no boatramp instances registered; add one with `boatramp mcp setup add <name> --server <url>`"
         );
     }
-    let server = BoatrampMcp::new(registry);
+    let server = BoatrampMcp::new(backend);
     let service = server
         .serve(rmcp::transport::stdio())
         .await
