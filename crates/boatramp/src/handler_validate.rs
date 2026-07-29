@@ -4,7 +4,7 @@
 //! For each declared handler/consumer, the component is decoded with
 //! `wit-component` and checked: it is a parseable component, it exports the
 //! role's required interface (`wasi:http/incoming-handler` for handlers,
-//! `wasi:messaging/incoming-handler` for consumers), and every interface it
+//! `boatramp:handlers/messaging-handler` for consumers), and every interface it
 //! imports is either a foundational baseline, or a capability the deploy config
 //! declared — anything else (e.g. `wasi:filesystem`) is rejected. This fails at
 //! `sync`, not at first request.
@@ -66,7 +66,10 @@ mod imp {
         fn required_export(self) -> (&'static str, &'static str) {
             match self {
                 Self::Handler => ("wasi:http", "incoming-handler"),
-                Self::Consumer => ("wasi:messaging", "incoming-handler"),
+                // Consumers export boatramp's message-delivery interface, which the
+                // engine's dispatcher calls per delivery — see boatramp-handlers
+                // `world consumer` (`boatramp:handlers/messaging-handler`).
+                Self::Consumer => ("boatramp:handlers", "messaging-handler"),
             }
         }
     }
@@ -83,8 +86,29 @@ mod imp {
         "wasi:http",
     ];
 
-    /// Capability packages that MUST appear in the handler's declared `imports`.
-    const CAP_PKGS: &[&str] = &["wasi:keyvalue", "wasi:blobstore", "wasi:messaging"];
+    /// The capability an imported `(package, interface)` belongs to, or `None`
+    /// when the interface is not a grantable capability (and so is refused).
+    ///
+    /// This table is the contract, and it is deliberately keyed on the exact
+    /// interfaces the handler engine adds to its linker (boatramp-handlers
+    /// `build_linker`), so the sync validator and the runtime host cannot drift.
+    /// The returned token is what a deploy lists in `imports` (docs
+    /// `functions.md`). `wasi:keyvalue`/`wasi:blobstore` are the standard WASI
+    /// interfaces; `sql` and messaging are boatramp's own `boatramp:handlers`
+    /// interfaces (there is no ratified `wasi:sql`, and the messaging interface
+    /// predates a stable `wasi:messaging`), matched by interface here — not by a
+    /// package-name shape.
+    fn capability_token(pkg: &str, iface: &str) -> Option<&'static str> {
+        match (pkg, iface) {
+            ("wasi:keyvalue", _) => Some("wasi:keyvalue"),
+            ("wasi:blobstore", _) => Some("wasi:blobstore"),
+            ("boatramp:handlers", "sql-query" | "sql-types") => Some("sql"),
+            ("boatramp:handlers", "messaging-producer" | "messaging-types") => {
+                Some("wasi:messaging")
+            }
+            _ => None,
+        }
+    }
 
     /// Apply the import/export policy to a component's interface labels. Pure —
     /// the security-relevant decision lives here and is exhaustively tested.
@@ -99,32 +123,29 @@ mod imp {
             return Err(format!("component does not export {req_pkg}/{req_iface}"));
         }
 
-        let declares = |pkg: &str| {
-            declared
-                .iter()
-                .any(|d| d == pkg || (d == "sql" && pkg.ends_with(":sql")))
-        };
         for (pkg, iface) in imports {
             // Foundational interfaces need no declaration.
             if BASELINE_PKGS.contains(&pkg.as_str()) {
                 continue;
             }
-            // A grantable capability (kv/blob/messaging/sql) is allowed only if
-            // declared. Declaration does NOT whitelist arbitrary packages — an
-            // unknown interface (e.g. wasi:filesystem, wasi:sockets) is always
-            // refused, even if listed in `imports`.
-            let is_capability = CAP_PKGS.contains(&pkg.as_str()) || pkg.ends_with(":sql");
-            if is_capability {
-                if declares(pkg) {
-                    continue;
+            // A grantable capability is allowed only if the deploy declared its
+            // token. Anything that maps to no capability (wasi:filesystem,
+            // wasi:sockets, an unknown boatramp:handlers interface, ...) is
+            // refused even when it appears in `imports`.
+            match capability_token(pkg, iface) {
+                Some(token) if declared.iter().any(|d| d == token) => continue,
+                Some(token) => {
+                    return Err(format!(
+                        "component imports {pkg}/{iface} (the `{token}` capability) \
+                         but the deploy does not declare it"
+                    ))
                 }
-                return Err(format!(
-                    "component imports {pkg}/{iface} but does not declare it"
-                ));
+                None => {
+                    return Err(format!(
+                        "component imports disallowed interface {pkg}/{iface}"
+                    ))
+                }
             }
-            return Err(format!(
-                "component imports disallowed interface {pkg}/{iface}"
-            ));
         }
         Ok(())
     }
@@ -259,8 +280,10 @@ mod imp {
         }
 
         #[test]
-        fn policy_rejects_unknown_allows_sql_and_baseline() {
+        fn policy_rejects_unknown_allows_baseline() {
             let exports = [lbl("wasi:http", "incoming-handler")];
+            // An unknown interface is refused even when named in `imports`:
+            // declaring does not whitelist arbitrary packages.
             let fs = [lbl("wasi:filesystem", "types")];
             assert!(check_interface_policy(
                 &fs,
@@ -269,10 +292,52 @@ mod imp {
                 Role::Handler
             )
             .is_err());
-            let sql = [lbl("wasi:sql", "readwrite")];
-            assert!(check_interface_policy(&sql, &exports, &["sql".into()], Role::Handler).is_ok());
+            // A foundational interface needs no declaration.
             let base = [lbl("wasi:clocks", "monotonic-clock")];
             assert!(check_interface_policy(&base, &exports, &[], Role::Handler).is_ok());
+        }
+
+        #[test]
+        fn policy_gates_sql_by_the_real_interface() {
+            // The host provides SQL as boatramp:handlers/{sql-query,sql-types}
+            // (boatramp-handlers world.wit + build_linker), declared as `sql`.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let sql = [
+                lbl("boatramp:handlers", "sql-query"),
+                lbl("boatramp:handlers", "sql-types"),
+            ];
+            assert!(check_interface_policy(&sql, &exports, &["sql".into()], Role::Handler).is_ok());
+            // Undeclared → rejected, and the message names the capability token.
+            let err = check_interface_policy(&sql, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`sql`"), "{err}");
+            // A package that merely *looks* like sql is not a capability — the old
+            // `ends_with(":sql")` shortcut is gone.
+            let fake = [lbl("acme:sql", "readwrite")];
+            assert!(
+                check_interface_policy(&fake, &exports, &["sql".into()], Role::Handler).is_err()
+            );
+        }
+
+        #[test]
+        fn policy_gates_messaging_producer_and_consumer_export() {
+            // A request handler may import the messaging producer under a
+            // `wasi:messaging` grant (the host interface is boatramp:handlers/*).
+            let http_export = [lbl("wasi:http", "incoming-handler")];
+            let producer = [lbl("boatramp:handlers", "messaging-producer")];
+            assert!(check_interface_policy(
+                &producer,
+                &http_export,
+                &["wasi:messaging".into()],
+                Role::Handler
+            )
+            .is_ok());
+            assert!(check_interface_policy(&producer, &http_export, &[], Role::Handler).is_err());
+
+            // A consumer must export boatramp:handlers/messaging-handler; a plain
+            // http export does not satisfy the consumer role.
+            let handler_export = [lbl("boatramp:handlers", "messaging-handler")];
+            assert!(check_interface_policy(&[], &handler_export, &[], Role::Consumer).is_ok());
+            assert!(check_interface_policy(&[], &http_export, &[], Role::Consumer).is_err());
         }
 
         #[test]
