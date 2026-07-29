@@ -231,7 +231,8 @@ publish-dry:
 # Publish every workspace crate to crates.io, in dependency order. Runs ONLY from
 # an exact `vX.Y.Z` tag matching the workspace version (the release discipline),
 # and is resumable — already-published versions are skipped, so a rerun after a
-# crates.io rate-limit stall picks up where it left off. Run `cargo login` first.
+# crates.io rate-limit stall picks up where it left off. Authenticate first: run
+# `cargo login` locally, or set CARGO_REGISTRY_TOKEN (how the release CI job runs it).
 publish:
     #!/usr/bin/env bash
     set -euo pipefail

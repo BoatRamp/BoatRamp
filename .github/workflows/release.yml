@@ -7,6 +7,10 @@
 # Tag `vX.Y.Z` to release. GHCR image is built reproducibly via the Nix flake.
 # Distro packages (.deb/.rpm) + the Homebrew tap bump are folded in as a
 # fast-follow (metadata already lives in crates/boatramp/Cargo.toml + packaging/).
+#
+# The `crates-io` job publishes the workspace to crates.io on a real tag push, but
+# only after a human approves the `crates-io` environment (crates.io is
+# irreversible: names are claimed forever and releases can only be yanked).
 
 name: Release
 
@@ -293,3 +297,36 @@ jobs:
             --version "$tag" --app-version "$tag" -d dist
           nix run nixpkgs#kubernetes-helm -- push \
             "dist/boatramp-operator-${tag}.tgz" "oci://ghcr.io/${owner}/charts"
+
+  # Publish the workspace to crates.io. Gated three ways: it runs only on a real
+  # `vX.Y.Z` tag push (never the workflow_dispatch dry run), only after `build`
+  # is green on every target, and only once a human approves the `crates-io`
+  # environment (a required-reviewer rule set in repo Settings > Environments).
+  # The environment also holds the `CRATES_IO_TOKEN` secret. The single source of
+  # truth for order + safety is `just publish`: it refuses unless HEAD is on an
+  # exact vX.Y.Z tag matching the workspace version, publishes the crates in
+  # dependency order, and is resumable (skips versions already on crates.io) so a
+  # rerun after a rate-limit stall picks up where it left off.
+  crates-io:
+    name: publish to crates.io
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: crates-io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history + tags so `just publish`'s `git describe --exact-match`
+          # resolves the vX.Y.Z tag it guards on.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Publish workspace crates (dependency order, resumable)
+        env:
+          # cargo reads the crates.io token from this env var, so no `cargo login`.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: just publish
