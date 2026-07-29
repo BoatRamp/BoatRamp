@@ -202,3 +202,59 @@ fly-image app="boatramp-docs" tag="latest":
     skopeo copy docker-archive:image.tar.gz \
       "docker://registry.fly.io/{{ app }}:{{ tag }}" --dest-creds "x:${FLY_API_TOKEN}"
     fly deploy --app "{{ app }}" --image "registry.fly.io/{{ app }}:{{ tag }}"
+
+# ---- crates.io release --------------------------------------------------------
+
+# The workspace crates in dependency (publish) order — leaf crates first, so each
+# crate's internal deps are already on crates.io by the time it publishes.
+crate_order := "boatramp-types boatramp-rpktls boatramp-acme boatramp-core boatramp-storage boatramp-cloudflare boatramp-container boatramp-docker boatramp-firecracker boatramp-mcp boatramp-cluster boatramp-handlers boatramp-server boatramp"
+
+# Dry-run the release packaging of every workspace crate (no upload). `cargo` can't
+# validate a dependent crate until its internal deps are actually on crates.io, so
+# those are reported DEFERRED (not a failure — they're validated for real when
+# published in order); only a genuine packaging problem is a FAIL. Safe anytime.
+publish-dry:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    for c in {{ crate_order }}; do
+      if out="$(cargo publish -p "$c" --dry-run --no-verify 2>&1)"; then
+        echo "OK       $c"
+      elif grep -q "no matching package named" <<<"$out"; then
+        echo "DEFERRED $c (internal deps not yet on crates.io)"
+      else
+        echo "FAIL     $c"; tail -5 <<<"$out"; rc=1
+      fi
+    done
+    exit $rc
+
+# Publish every workspace crate to crates.io, in dependency order. Runs ONLY from
+# an exact `vX.Y.Z` tag matching the workspace version (the release discipline),
+# and is resumable — already-published versions are skipped, so a rerun after a
+# crates.io rate-limit stall picks up where it left off. Run `cargo login` first.
+publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag="$(git describe --exact-match --tags 2>/dev/null || true)"
+    if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "refusing to publish: HEAD is not on a vX.Y.Z tag (got '${tag:-none}')." >&2
+      echo "tag the release first, e.g.: git tag -a vX.Y.Z -m 'boatramp X.Y.Z' && git checkout vX.Y.Z" >&2
+      exit 1
+    fi
+    ver="${tag#v}"
+    wsver="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+    if [[ "$ver" != "$wsver" ]]; then
+      echo "refusing to publish: tag $tag does not match the workspace version $wsver." >&2
+      exit 1
+    fi
+    ua="boatramp-publish (info@giacomocariello.com)"
+    for c in {{ crate_order }}; do
+      code="$(curl -s -A "$ua" -o /dev/null -w '%{http_code}' "https://crates.io/api/v1/crates/$c/$ver" || echo 000)"
+      if [[ "$code" == "200" ]]; then
+        echo "== skip $c@$ver (already on crates.io) =="
+        continue
+      fi
+      echo "== publish $c@$ver =="
+      cargo publish -p "$c"
+    done
+    echo "published all workspace crates at $ver"

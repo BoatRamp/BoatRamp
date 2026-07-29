@@ -1,0 +1,49 @@
+# Changelog
+
+All notable changes to boatramp are documented here. The format loosely follows
+[Keep a Changelog](https://keepachangelog.com); the project is pre-1.0, so the API
+(HTTP, CLI, config, and the published library crates) may change between minor
+versions.
+
+## [0.1.0]
+
+The first public release: boatramp is a self-hosted, streaming-first alternative to
+Vercel — one binary that is both the server and the CLI.
+
+### Publishing & serving
+- Atomic, immutable, content-addressed deployments with instant rollback, named
+  aliases (staging/previews), and virtualhost routing.
+- Custom domains with ownership verification (HTTP + DNS-01), automatic TLS
+  (ACME, ACME-DNS wildcard, operator certs, and a pinned raw-public-key control
+  channel), and managed DNS across many providers.
+- Visitor access control (basic auth, IP rules, rate limiting), caching, and
+  optional on-the-fly compression.
+
+### Compute
+- WebAssembly handlers and functions: sync/async/scheduled invocation, metering and
+  quotas, signed webhooks, queue/blob-change triggers, and declarative workflows;
+  bindings for kv, sql, blobstore, and messaging; Rust/JS/Python developer flows.
+- Containers and Firecracker microVMs (an embedded rust-vmm VMM), scale-to-zero, and
+  a reverse-proxy gateway with health-checked load balancing.
+
+### Storage
+- Blob backends: filesystem, S3, GCS, Azure (with their change-notification
+  providers). KV backends: SlateDB, in-memory, Cloudflare KV. External bring-your-own
+  PostgreSQL/MySQL for the `sql` binding.
+
+### Control plane & security
+- COSE/CWT tokens with Cedar RBAC, per-request DPoP proof-of-possession, offline
+  delegation, external signers (KMS/HSM/Vault/PKCS#11), and OIDC.
+- A curated security-posture model and hardened defaults.
+
+### Fleet
+- A self-hosted Raft cluster with dynamic join over a raw-public-key mutual-TLS mesh,
+  an in-binary Kubernetes operator, and a Cloudflare Containers deployment target.
+- Dynamic daemon configuration (no-restart operational knobs) and Prometheus metrics.
+
+### Interfaces
+- An embedded web management console.
+- A Model Context Protocol (MCP) server to drive one or more instances from an AI
+  agent, over stdio or an HTTP `/mcp` endpoint.
+
+[0.1.0]: https://github.com/BoatRamp/BoatRamp/releases/tag/v0.1.0
