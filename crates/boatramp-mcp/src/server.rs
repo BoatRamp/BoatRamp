@@ -3,9 +3,11 @@
 //! Every tool takes an optional `instance` (the registered name from `mcp.toml`);
 //! with a single instance it may be omitted. Tools shuttle JSON: read tools return
 //! the control plane's JSON verbatim, write tools return its confirmation. The
-//! generic [`api_request`](BoatrampMcp::api_request) tool reaches **any**
-//! control-plane endpoint — the full-scope escape hatch, including destructive
-//! operations the typed tools don't wrap.
+//! surface is a **complete, enumerated** mirror of the control-plane API — there is
+//! no generic passthrough tool; every capability (including the destructive and
+//! fleet-admin ones) is a named, described tool so calls are legible and auditable.
+//! Authorization remains the token's: a tool only succeeds if the presented token
+//! is scoped for that action.
 
 use std::sync::Arc;
 
@@ -173,14 +175,103 @@ pub struct DlqParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct ApiRequestParams {
-    /// HTTP method: GET, POST, PUT, or DELETE.
-    pub method: String,
-    /// The control-plane path, beginning with `/api/…`.
-    pub path: String,
-    /// An optional JSON request body (for POST/PUT).
+pub struct FunctionRollbackParams {
+    /// The function name.
+    pub name: String,
+    /// The version to roll back to.
+    pub to: String,
     #[serde(default)]
-    pub body: Option<serde_json::Value>,
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FunctionAliasParams {
+    /// The function name.
+    pub name: String,
+    /// The alias label (e.g. `stable`, `canary`).
+    pub label: String,
+    /// The function version the alias points at.
+    pub version: String,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DefineWorkflowParams {
+    /// The workflow name.
+    pub name: String,
+    /// The full workflow definition object (steps/inputs), per the workflow schema.
+    pub spec: serde_json::Value,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct StartRunParams {
+    /// The workflow name.
+    pub name: String,
+    /// The JSON input to start the run with (optional).
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MintTokenParams {
+    /// A human label recorded in the token's metadata.
+    pub label: String,
+    /// The roles to grant (e.g. `["admin"]`, or scoped roles).
+    pub roles: Vec<String>,
+    /// Time-to-live in seconds (omit for the server default).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// A holder (`cnf`) public key to bind the token to (for DPoP); omit for a
+    /// plain bearer.
+    #[serde(default)]
+    pub holder_pubkey: Option<String>,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TokenIdParams {
+    /// The token id (metadata id) to revoke.
+    pub id: String,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct NodeParams {
+    /// The Raft node id.
+    pub node_id: u64,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct JoinTokenParams {
+    /// Time-to-live in seconds for the minted join ticket (omit for the default).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SetDaemonConfigParams {
+    /// The full daemon-config object to apply (see get_daemon_config for the shape).
+    pub config: serde_json::Value,
+    #[serde(default)]
+    pub instance: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InvalidateCacheParams {
+    /// Specific cache keys to invalidate; omit or empty to invalidate everything.
+    #[serde(default)]
+    pub keys: Vec<String>,
     #[serde(default)]
     pub instance: Option<String>,
 }
@@ -565,33 +656,265 @@ impl BoatrampMcp {
         Ok(ok_json(&cp.get("/api/auth/whoami").await?))
     }
 
-    // ── Full-scope escape hatch ──
-
     #[tool(
-        description = "Call ANY control-plane endpoint directly: method (GET/POST/PUT/DELETE), \
-                          path (starting with /api/…), and an optional JSON body. Use this for \
-                          operations the typed tools don't cover (tokens, cluster promote/revoke, \
-                          daemon config, cache invalidation, …). POWERFUL and can be DESTRUCTIVE — \
-                          prefer a typed tool when one exists."
+        description = "Delete a site entirely (all deployments + config). DESTRUCTIVE and \
+                          irreversible."
     )]
-    async fn api_request(
+    async fn delete_site(
         &self,
-        Parameters(p): Parameters<ApiRequestParams>,
+        Parameters(p): Parameters<SiteParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let cp = self.cp(p.instance.as_deref())?;
-        let method = match p.method.to_ascii_uppercase().as_str() {
-            "GET" => reqwest::Method::GET,
-            "POST" => reqwest::Method::POST,
-            "PUT" => reqwest::Method::PUT,
-            "DELETE" => reqwest::Method::DELETE,
-            other => {
-                return Err(crate::Error::Invalid(format!("unsupported method '{other}'")).into())
-            }
-        };
-        if !p.path.starts_with('/') {
-            return Err(crate::Error::Invalid("path must start with '/'".into()).into());
+        Ok(ok_json(
+            &cp.delete(&format!("/api/sites/{}", p.site)).await?,
+        ))
+    }
+
+    // ── Functions (versioning) ──
+
+    #[tool(description = "Roll a function back to a previous version.")]
+    async fn rollback_function(
+        &self,
+        Parameters(p): Parameters<FunctionRollbackParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let body = serde_json::json!({ "to": p.to });
+        Ok(ok_json(
+            &cp.post(&format!("/api/functions/{}/rollback", p.name), Some(&body))
+                .await?,
+        ))
+    }
+
+    #[tool(
+        description = "Point a function alias label (e.g. stable, canary) at a function version."
+    )]
+    async fn set_function_alias(
+        &self,
+        Parameters(p): Parameters<FunctionAliasParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let body = serde_json::json!({ "version": p.version });
+        Ok(ok_json(
+            &cp.put(
+                &format!("/api/functions/{}/aliases/{}", p.name, p.label),
+                &body,
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(description = "List a function's triggers (crons, queue/blob event sources).")]
+    async fn list_triggers(
+        &self,
+        Parameters(p): Parameters<NamedParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(
+            &cp.get(&format!("/api/functions/{}/triggers", p.name))
+                .await?,
+        ))
+    }
+
+    // ── Workflows ──
+
+    #[tool(description = "List the declarative function workflows defined on the instance.")]
+    async fn list_workflows(
+        &self,
+        Parameters(p): Parameters<InstanceOnly>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(&cp.get("/api/workflows").await?))
+    }
+
+    #[tool(description = "Get a workflow's definition by name.")]
+    async fn get_workflow(
+        &self,
+        Parameters(p): Parameters<NamedParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(
+            &cp.get(&format!("/api/workflows/{}", p.name)).await?,
+        ))
+    }
+
+    #[tool(description = "Create or replace a workflow definition (the full spec object).")]
+    async fn define_workflow(
+        &self,
+        Parameters(p): Parameters<DefineWorkflowParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(
+            &cp.put(&format!("/api/workflows/{}", p.name), &p.spec)
+                .await?,
+        ))
+    }
+
+    #[tool(description = "Delete a workflow definition by name.")]
+    async fn delete_workflow(
+        &self,
+        Parameters(p): Parameters<NamedParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(
+            &cp.delete(&format!("/api/workflows/{}", p.name)).await?,
+        ))
+    }
+
+    #[tool(description = "Start a run of a workflow with an optional JSON input.")]
+    async fn start_workflow_run(
+        &self,
+        Parameters(p): Parameters<StartRunParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(
+            &cp.post(&format!("/api/workflows/{}/runs", p.name), p.input.as_ref())
+                .await?,
+        ))
+    }
+
+    // ── Compute + cache ──
+
+    #[tool(description = "List the instance's compute workloads (containers/microVMs).")]
+    async fn list_compute(
+        &self,
+        Parameters(p): Parameters<InstanceOnly>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(&cp.get("/api/compute").await?))
+    }
+
+    #[tool(
+        description = "Invalidate cached responses: specific keys, or everything when keys is \
+                          empty."
+    )]
+    async fn invalidate_cache(
+        &self,
+        Parameters(p): Parameters<InvalidateCacheParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let body = serde_json::json!({ "keys": p.keys });
+        Ok(ok_json(
+            &cp.post("/api/cache/invalidate", Some(&body)).await?,
+        ))
+    }
+
+    // ── Dynamic daemon config ──
+
+    #[tool(description = "Read the live daemon configuration (operational knobs; no restart).")]
+    async fn get_daemon_config(
+        &self,
+        Parameters(p): Parameters<InstanceOnly>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(&cp.get("/api/daemon/config").await?))
+    }
+
+    #[tool(
+        description = "Apply a new daemon configuration (converges live, no restart). Fetch the \
+                          current one with get_daemon_config and overlay your changes."
+    )]
+    async fn set_daemon_config(
+        &self,
+        Parameters(p): Parameters<SetDaemonConfigParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(&cp.put("/api/daemon/config", &p.config).await?))
+    }
+
+    #[tool(description = "Roll the daemon configuration back to the previous generation.")]
+    async fn rollback_daemon_config(
+        &self,
+        Parameters(p): Parameters<InstanceOnly>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(
+            &cp.post("/api/daemon/config/rollback", None).await?,
+        ))
+    }
+
+    // ── Tokens ──
+
+    #[tool(
+        description = "Mint a control-plane API token with the given roles. Returned once — \
+                          record it. DESTRUCTIVE in the sense that it grants standing access."
+    )]
+    async fn mint_token(
+        &self,
+        Parameters(p): Parameters<MintTokenParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let mut body = serde_json::json!({ "label": p.label, "roles": p.roles });
+        if let Some(ttl) = p.ttl_secs {
+            body["ttl_secs"] = serde_json::json!(ttl);
         }
-        Ok(ok_json(&cp.call(method, &p.path, p.body.as_ref()).await?))
+        if let Some(holder) = &p.holder_pubkey {
+            body["holder_pubkey"] = serde_json::json!(holder);
+        }
+        Ok(ok_json(&cp.post("/api/tokens", Some(&body)).await?))
+    }
+
+    #[tool(description = "Revoke a control-plane token by its metadata id.")]
+    async fn revoke_token(
+        &self,
+        Parameters(p): Parameters<TokenIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(&cp.delete(&format!("/api/tokens/{}", p.id)).await?))
+    }
+
+    // ── Cluster / fleet administration ──
+
+    #[tool(
+        description = "Mint a single-use cluster join ticket (for a new node to join the mesh)."
+    )]
+    async fn create_join_token(
+        &self,
+        Parameters(p): Parameters<JoinTokenParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let mut body = serde_json::json!({});
+        if let Some(ttl) = p.ttl_secs {
+            body["ttl_secs"] = serde_json::json!(ttl);
+        }
+        Ok(ok_json(
+            &cp.post("/api/cluster/join-token", Some(&body)).await?,
+        ))
+    }
+
+    #[tool(
+        description = "Promote a caught-up learner node to a voting member. Fleet-admin; changes \
+                          quorum."
+    )]
+    async fn promote_member(
+        &self,
+        Parameters(p): Parameters<NodeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let body = serde_json::json!({ "node_id": p.node_id });
+        Ok(ok_json(
+            &cp.post("/api/cluster/promote", Some(&body)).await?,
+        ))
+    }
+
+    #[tool(
+        description = "Remove a node from the cluster's Raft membership. Fleet-admin; DESTRUCTIVE."
+    )]
+    async fn revoke_member(
+        &self,
+        Parameters(p): Parameters<NodeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        let body = serde_json::json!({ "node_id": p.node_id });
+        Ok(ok_json(&cp.post("/api/cluster/revoke", Some(&body)).await?))
+    }
+
+    #[tool(description = "Rotate this node's mesh identity key. Fleet-admin.")]
+    async fn rotate_mesh_key(
+        &self,
+        Parameters(p): Parameters<InstanceOnly>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cp = self.cp(p.instance.as_deref())?;
+        Ok(ok_json(&cp.post("/api/cluster/rotate-key", None).await?))
     }
 }
 
@@ -611,8 +934,9 @@ impl ServerHandler for BoatrampMcp {
              streaming-first, single-binary Vercel alternative). Call list_instances first; when \
              more than one instance is registered, pass the 'instance' parameter on every tool \
              call. Typed tools cover sites, deployments, aliases, domains, logs, functions, and \
-             cluster/fleet ops. For anything not wrapped by a typed tool, use api_request to reach \
-             any /api/… endpoint directly. Write and api_request tools can be DESTRUCTIVE.",
+             cluster/fleet ops. The tool set is a complete, enumerated mirror of the control-plane \
+             API (no generic passthrough); write, delete, token, and cluster tools can be \
+             DESTRUCTIVE. Authorization is enforced by the presented token's scope.",
         )
     }
 }
