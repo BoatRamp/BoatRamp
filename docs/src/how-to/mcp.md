@@ -113,6 +113,15 @@ How it authenticates (this is the important part):
   would fail the proof-of-possession check. DPoP-bound setups should use the stdio
   transport, which holds the holder key and signs each call.
 
+> **Reaching `/mcp` remotely requires configuring the node's origin.** As an
+> anti-[DNS-rebinding](https://developer.mozilla.org/en-US/docs/Web/Security)
+> defence, `/mcp` accepts a request only if its `Host` header is loopback
+> (`localhost`/`127.0.0.1`/`::1`) *or* the node's configured canonical origin
+> (`[serve] pop_origin` — the same origin you set for DPoP). A co-located agent
+> (e.g. Claude Code on the same host) works out of the box; for a remote agent, set
+> `pop_origin` to the public URL you serve on. The allowlist is never emptied, so
+> the rebinding defence stays on.
+
 ## Using it
 
 Ask the agent naturally: *"list the sites on prod"*, *"what's the current
@@ -125,21 +134,26 @@ instance the agent can omit it. `list_instances` shows what's available.
 
 ### Tools
 
-Typed tools cover the common surface: `list_sites`, `get_site_config`,
+The tool set is a **complete, enumerated mirror of the control-plane API** — one
+named tool per operation, with no generic passthrough, so every call is legible in
+an audit log. It spans sites + deployments (`list_sites`, `get_site_config` /
 `put_site_config`, `list_deployments` / `current_deployment` / `get_deployment`,
-`activate_deployment`, `list_aliases` / `set_alias` / `remove_alias`,
-`list_domains` / `start_domain_verification` / `check_domain_verification` /
-`remove_domain`, `tail_logs`, `handler_stats`, `operate_dlq`, `list_functions` /
-`invoke_function` / `function_usage`, `cluster_members`, `cert_status`,
-`prune_report`, `scrub_blobs`, and `whoami`.
-
-For anything not wrapped by a typed tool (tokens, cluster promote/revoke, daemon
-config, cache invalidation, …), the `api_request` tool reaches **any** `/api/…`
-endpoint directly — full coverage of the control-plane API.
+`activate_deployment`, `delete_site`), aliases + domains (`list_aliases` /
+`set_alias` / `remove_alias`, `list_domains` / `start_domain_verification` /
+`check_domain_verification` / `remove_domain`), functions + workflows
+(`list_functions` / `invoke_function` / `function_usage` / `list_triggers` /
+`rollback_function` / `set_function_alias`, `list_workflows` / `get_workflow` /
+`define_workflow` / `delete_workflow` / `start_workflow_run`), observability
+(`tail_logs`, `handler_stats`, `operate_dlq`), fleet + config (`cluster_members` /
+`promote_member` / `revoke_member` / `rotate_mesh_key` / `create_join_token`,
+`get_daemon_config` / `set_daemon_config` / `rollback_daemon_config`,
+`invalidate_cache`, `list_compute`, `cert_status`, `prune_report`, `scrub_blobs`),
+and identity (`mint_token`, `revoke_token`, `whoami`).
 
 > **Authorization is the token's, not the agent's.** Every call carries the
-> instance's configured token, so the agent can do exactly what that token is
-> scoped to — no more. Give the agent a least-privilege token (see
+> caller's token, so the agent can do exactly what that token is scoped to — no
+> more. Give the agent a least-privilege token (see
 > [make a scoped token](./ci-token.md)); a read-only token makes the write and
-> `api_request` tools 403. Write tools and `api_request` can be **destructive**
-> (overwrite config, delete aliases/domains, purge queues) — scope accordingly.
+> fleet-admin tools `403`. The write, delete, token, and cluster tools can be
+> **destructive** (overwrite config, delete sites/aliases/domains, mint/revoke
+> tokens, change cluster membership) — scope accordingly.

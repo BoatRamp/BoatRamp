@@ -234,9 +234,12 @@ pub fn router_with(
             get(get_workflow_run_handler),
         );
     // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
-    // into the API's `require_auth` layer below).
+    // into the API's `require_auth` layer below) + the node's canonical origin, for
+    // scoping the `/mcp` anti-DNS-rebinding host allowlist to the operator's domain.
     #[cfg(feature = "mcp")]
     let mcp_auth = auth.clone();
+    #[cfg(feature = "mcp")]
+    let mcp_origin = options.pop_origin.clone();
     let api = api
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
@@ -363,7 +366,7 @@ pub fn router_with(
     // the backend router has every handler extension but not `/mcp` (no recursion).
     #[cfg(feature = "mcp")]
     let app = {
-        let mcp = crate::mcp_http::mcp_router(app.clone(), mcp_auth);
+        let mcp = crate::mcp_http::mcp_router(app.clone(), mcp_auth, mcp_origin);
         app.merge(mcp)
     };
     app

@@ -100,15 +100,32 @@ impl ControlPlane for LocalControlPlane {
 
 /// Build the `/mcp` router: rmcp's streamable-http service over this node's own
 /// control plane, gated on a valid token. `api_router` is the fully built,
-/// auth-layered `/api/*` router the tools dispatch into.
-pub(crate) fn mcp_router(api_router: Router, auth: Auth) -> Router {
+/// auth-layered `/api/*` router the tools dispatch into. `origin` is the node's
+/// configured canonical origin (`[serve] pop_origin`), used to scope rmcp's
+/// anti-DNS-rebinding `Host` allowlist so a remote agent can reach `/mcp` without
+/// disabling the defense; when unset, `/mcp` stays loopback-only.
+pub(crate) fn mcp_router(api_router: Router, auth: Auth, origin: Option<String>) -> Router {
     let local = LocalControlPlane { router: api_router };
     let backend: Arc<dyn Backend> = Arc::new(SingleBackend::new(Arc::new(local)));
     let mcp = BoatrampMcp::new(backend);
+    // rmcp's default `Host` allowlist is loopback-only (a DNS-rebinding guard: a
+    // malicious web page can't drive `http://localhost/mcp` from a browser). Keep
+    // that, and additionally allow the operator's declared public origin so a
+    // remote agent works — without ever clearing the allowlist. An empty allowlist
+    // in rmcp disables the check, so we never pass an empty one.
+    let mut allowed = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Some(authority) = origin.as_deref().and_then(origin_authority) {
+        allowed.push(authority);
+    }
+    let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed);
     let service = StreamableHttpService::new(
         move || Ok(mcp.clone()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        config,
     );
     Router::new()
         .route_service("/mcp", service)
@@ -116,6 +133,19 @@ pub(crate) fn mcp_router(api_router: Router, auth: Auth) -> Router {
             auth,
             require_valid_token,
         ))
+}
+
+/// Extract the `host[:port]` authority from a configured origin URL (e.g.
+/// `https://boatramp.example.com:8443` → `boatramp.example.com:8443`), for the
+/// `/mcp` `Host` allowlist. Returns `None` for an origin without a host.
+fn origin_authority(origin: &str) -> Option<String> {
+    let after_scheme = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    (!authority.is_empty()).then(|| authority.to_string())
 }
 
 /// Channel gate for `/mcp`: require a present, cryptographically VALID bearer (not
