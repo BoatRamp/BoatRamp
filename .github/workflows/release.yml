@@ -253,7 +253,18 @@ jobs:
           printf 'unqualified-search-registries = []\n' > "$RUNNER_TEMP/registries.conf"
           echo "CONTAINERS_REGISTRIES_CONF=$RUNNER_TEMP/registries.conf" >> "$GITHUB_ENV"
       - name: Log in to GHCR
-        run: echo "${{ github.token }}" | nix run nixpkgs#skopeo -- login ghcr.io -u ${{ github.actor }} --password-stdin
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          # Every tool in this job authenticates to ghcr.io from ~/.docker/config.json:
+          # skopeo falls back to it, and cosign/syft/helm read only it (they do NOT
+          # read skopeo's containers-auth). Write it once, directly, so the push,
+          # the keyless signing/SBOM, and the helm push all use the same creds — and
+          # so a runner-configured docker credStore can't intercept `docker login`.
+          mkdir -p "$HOME/.docker"
+          auth="$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$auth" > "$HOME/.docker/config.json"
       # Two reproducible Nix images, built on the runner arch (a multi-arch manifest
       # joins the aarch64 image in a fast-follow — needs an arm64 Nix builder):
       #   base       → ghcr.io/<owner>/boatramp             (fs + SlateDB)
