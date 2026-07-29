@@ -352,6 +352,9 @@ pub fn router_with(
     // captured before `daemon` is moved into the extension below.
     #[cfg(feature = "console")]
     let console_daemon = daemon.clone();
+    // Likewise for the `/mcp` live enable/disable kill-switch.
+    #[cfg(feature = "mcp")]
+    let mcp_daemon = daemon.clone();
     let app = app.layer(Extension(daemon));
     // Embedded web console (feature `console`): a middleware that intercepts the
     // configured host+path before the site fallback. Always layered — the mount is
@@ -366,7 +369,7 @@ pub fn router_with(
     // the backend router has every handler extension but not `/mcp` (no recursion).
     #[cfg(feature = "mcp")]
     let app = {
-        let mcp = crate::mcp_http::mcp_router(app.clone(), mcp_auth, mcp_origin);
+        let mcp = crate::mcp_http::mcp_router(app.clone(), mcp_auth, mcp_origin, mcp_daemon);
         app.merge(mcp)
     };
     app

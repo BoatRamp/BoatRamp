@@ -109,9 +109,13 @@ How it authenticates (this is the important part):
   endpoint grants nothing the token doesn't already grant. Nothing is minted, so it
   works even on verify-only nodes that hold no signing key.
 - **Use a plain bearer, not a `cnf`/DPoP token.** A holder-bound token can't be
-  re-proven for the in-process calls (the node has no holder key), so its tool calls
-  would fail the proof-of-possession check. DPoP-bound setups should use the stdio
-  transport, which holds the holder key and signs each call.
+  re-proven for the in-process calls (the node has no holder key). `/mcp` rejects one
+  at the door with a clear error rather than letting every tool call fail an opaque
+  proof check; DPoP-bound setups use the stdio transport, which holds the holder key
+  and signs each call.
+- **Kill-switch.** `/mcp` is on by default, but you can turn it off fleet-wide with
+  no restart: `boatramp config set mcp.enabled false` (it then answers `404`); set it
+  back to `true` to restore. A fast lever if you need to shut the surface off.
 
 > **Reaching `/mcp` remotely requires configuring the node's origin.** As an
 > anti-[DNS-rebinding](https://developer.mozilla.org/en-US/docs/Web/Security)

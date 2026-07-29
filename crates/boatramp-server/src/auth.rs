@@ -30,6 +30,19 @@ const POP_HEADER: HeaderName = HeaderName::from_static("boatramp-pop");
 
 use authz::ROOT_ANCHOR_PREFIX;
 
+/// The classification of a bearer presented to a session-channel gate
+/// ([`Auth::classify_channel_bearer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelBearer {
+    /// A valid, unrevoked, plain (non-`cnf`) bearer — admit the channel.
+    Valid,
+    /// A valid, unrevoked, but holder-bound (`cnf`) token — reject: a channel can't
+    /// carry a per-request PoP proof for its downstream in-process calls.
+    HolderBound,
+    /// Missing, malformed, unverifiable, expired, or revoked.
+    Invalid,
+}
+
 /// Control-plane auth configuration: the token trust anchor (root public key)
 /// plus the KV that holds the RBAC policy (`authz/policy`) and revocation markers
 /// (`authz/revoked/<id>`). `None` ⇒ auth disabled (development).
@@ -150,6 +163,28 @@ impl Auth {
             return false;
         };
         !inner.is_revoked(&verified.cti).await
+    }
+
+    /// Classify a bearer for a session-channel gate (the HTTP `/mcp` endpoint): a
+    /// channel authenticates once, then re-authorizes each operation per call, so it
+    /// needs a valid **plain** bearer. A holder-bound (`cnf`) token can't produce a
+    /// per-request PoP proof for the in-process calls, so it's reported distinctly
+    /// (the gate rejects it with a clear message rather than letting every tool call
+    /// fail an opaque PoP check).
+    pub async fn classify_channel_bearer(&self, bearer: &str) -> ChannelBearer {
+        let Some(inner) = &self.inner else {
+            return ChannelBearer::Invalid;
+        };
+        let Ok(verified) = inner.verify_credential_any(bearer, now_unix()).await else {
+            return ChannelBearer::Invalid;
+        };
+        if inner.is_revoked(&verified.cti).await {
+            return ChannelBearer::Invalid;
+        }
+        if verified.leaf_cnf.is_some() {
+            return ChannelBearer::HolderBound;
+        }
+        ChannelBearer::Valid
     }
 
     /// Verify a mesh **join token** against the primary root, then — on failure —

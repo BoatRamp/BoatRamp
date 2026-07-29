@@ -23,7 +23,8 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use tower::ServiceExt;
 
-use crate::auth::Auth;
+use crate::auth::{Auth, ChannelBearer};
+use crate::DaemonRuntime;
 
 /// The largest control-plane response we buffer from an in-process call (the API
 /// returns small JSON; this is a generous ceiling).
@@ -103,8 +104,15 @@ impl ControlPlane for LocalControlPlane {
 /// auth-layered `/api/*` router the tools dispatch into. `origin` is the node's
 /// configured canonical origin (`[serve] pop_origin`), used to scope rmcp's
 /// anti-DNS-rebinding `Host` allowlist so a remote agent can reach `/mcp` without
-/// disabling the defense; when unset, `/mcp` stays loopback-only.
-pub(crate) fn mcp_router(api_router: Router, auth: Auth, origin: Option<String>) -> Router {
+/// disabling the defense; when unset, `/mcp` stays loopback-only. `daemon` supplies
+/// the live `mcp.enabled` kill-switch (default on; `boatramp config set mcp.enabled
+/// false` turns `/mcp` off fleet-wide with no restart).
+pub(crate) fn mcp_router(
+    api_router: Router,
+    auth: Auth,
+    origin: Option<String>,
+    daemon: Arc<DaemonRuntime>,
+) -> Router {
     let local = LocalControlPlane { router: api_router };
     let backend: Arc<dyn Backend> = Arc::new(SingleBackend::new(Arc::new(local)));
     let mcp = BoatrampMcp::new(backend);
@@ -129,10 +137,30 @@ pub(crate) fn mcp_router(api_router: Router, auth: Auth, origin: Option<String>)
     );
     Router::new()
         .route_service("/mcp", service)
+        // Inner: the valid-token channel gate. Outer: the live enable/disable
+        // kill-switch (checked first, so a disabled `/mcp` 404s before auth runs).
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
             require_valid_token,
         ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            daemon,
+            mcp_enabled_gate,
+        ))
+}
+
+/// Live kill-switch for `/mcp`: when `mcp.enabled` is dynamically `false`, answer
+/// `404` as if the endpoint weren't mounted (disable it fleet-wide, no restart).
+async fn mcp_enabled_gate(
+    State(daemon): State<Arc<DaemonRuntime>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if daemon.effective().mcp_enabled {
+        next.run(request).await
+    } else {
+        (StatusCode::NOT_FOUND, "not found\n").into_response()
+    }
 }
 
 /// Extract the `host[:port]` authority from a configured origin URL (e.g.
@@ -148,19 +176,36 @@ fn origin_authority(origin: &str) -> Option<String> {
     (!authority.is_empty()).then(|| authority.to_string())
 }
 
-/// Channel gate for `/mcp`: require a present, cryptographically VALID bearer (not
-/// a specific right — each tool is separately authorized by the forwarded bearer
-/// against `/api/*`, so a scoped token opens the channel and is bounded per call).
+/// Channel gate for `/mcp`: require a present, cryptographically VALID **plain**
+/// bearer (not a specific right — each tool is separately authorized by the
+/// forwarded bearer against `/api/*`, so a scoped token opens the channel and is
+/// bounded per call). A holder-bound (`cnf`) token is rejected with a clear message
+/// (it can't sign the per-request proof the in-process calls would need). When auth
+/// is disabled (dev), `/api` is open, so `/mcp` is too.
 async fn require_valid_token(State(auth): State<Auth>, request: Request, next: Next) -> Response {
+    if auth.is_disabled() {
+        return next.run(request).await;
+    }
     let bearer = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_owned);
-    match bearer {
-        Some(b) if auth.verify_bearer(&b).await => next.run(request).await,
-        Some(_) => (StatusCode::UNAUTHORIZED, "invalid bearer token\n").into_response(),
-        None => (StatusCode::UNAUTHORIZED, "missing bearer token\n").into_response(),
+    let Some(bearer) = bearer else {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token\n").into_response();
+    };
+    match auth.classify_channel_bearer(&bearer).await {
+        ChannelBearer::Valid => next.run(request).await,
+        ChannelBearer::HolderBound => (
+            StatusCode::UNAUTHORIZED,
+            "holder-bound (cnf/DPoP) tokens are not supported over HTTP /mcp: it can't \
+             sign a per-request proof for the in-process calls. Use a plain bearer token, \
+             or the stdio transport (which holds the holder key).\n",
+        )
+            .into_response(),
+        ChannelBearer::Invalid => {
+            (StatusCode::UNAUTHORIZED, "invalid bearer token\n").into_response()
+        }
     }
 }

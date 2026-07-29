@@ -129,6 +129,9 @@ pub struct DaemonConfig {
     /// Embedded web console overrides (enable/host/path).
     #[serde(default, skip_serializing_if = "ConsoleSettings::is_empty")]
     pub console: ConsoleSettings,
+    /// HTTP `/mcp` endpoint override (a live on/off kill-switch).
+    #[serde(default, skip_serializing_if = "McpSettings::is_empty")]
+    pub mcp: McpSettings,
     /// Tighten-only posture overrides.
     #[serde(default, skip_serializing_if = "PostureTighten::is_empty")]
     pub posture: PostureTighten,
@@ -146,6 +149,7 @@ impl Default for DaemonConfig {
             cluster_rate_limit: None,
             compute: ComputeDefaults::default(),
             console: ConsoleSettings::default(),
+            mcp: McpSettings::default(),
             posture: PostureTighten::default(),
         }
     }
@@ -192,6 +196,8 @@ pub struct EffectiveConfig {
     pub console_enabled: bool,
     pub console_host: Option<String>,
     pub console_path: Option<String>,
+    /// Whether to serve the HTTP `/mcp` endpoint (default on).
+    pub mcp_enabled: bool,
     pub posture: SecurityPosture,
 }
 
@@ -202,6 +208,23 @@ impl ComputeDefaults {
 }
 
 impl ConsoleSettings {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Dynamic override for the in-`serve` HTTP MCP endpoint (`/mcp`). A live
+/// operational kill-switch: set `enabled = false` to stop serving `/mcp`
+/// fleet-wide with no restart (a security lever, not a trust relaxation — the
+/// stdio transport is unaffected). Defaults to on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpSettings {
+    /// Serve the HTTP `/mcp` endpoint at all. `None`/unset ⇒ on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl McpSettings {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -335,6 +358,9 @@ impl DaemonConfig {
                 .path
                 .clone()
                 .or_else(|| base.console_path.clone()),
+            // On unless explicitly disabled; the endpoint is compile-gated by the
+            // `mcp` feature and defaults on there, so no baseline field is needed.
+            mcp_enabled: self.mcp.enabled.unwrap_or(true),
             posture: self.posture.apply(base.posture),
         }
     }
@@ -534,6 +560,21 @@ mod tests {
         assert!(!eff.console_enabled);
         // Unset host/path still defer to the baseline.
         assert_eq!(eff.console_path.as_deref(), Some("/_console"));
+    }
+
+    #[test]
+    fn mcp_enabled_defaults_on_and_toggles_off() {
+        let base = baseline();
+        // Unset ⇒ the HTTP `/mcp` endpoint is on.
+        assert!(DaemonConfig::default().resolve(&base).mcp_enabled);
+        // An explicit dynamic disable turns it off (the runtime kill-switch).
+        let off = DaemonConfig {
+            mcp: McpSettings {
+                enabled: Some(false),
+            },
+            ..Default::default()
+        };
+        assert!(!off.resolve(&base).mcp_enabled);
     }
 
     #[test]

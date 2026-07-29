@@ -259,6 +259,13 @@ fn write_key(cfg: &mut DaemonConfig, key: &str, value: &str) -> Result<()> {
         }
         "console.host" => cfg.console.host = (!clear).then(|| value.to_string()),
         "console.path" => cfg.console.path = (!clear).then(|| value.to_string()),
+        "mcp.enabled" => {
+            cfg.mcp.enabled = if clear {
+                None
+            } else {
+                Some(parse_bool(key, value)?)
+            }
+        }
         "compute.default_kernel" => {
             cfg.compute.default_kernel = if clear {
                 None
