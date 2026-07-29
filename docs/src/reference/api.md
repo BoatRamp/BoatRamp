@@ -123,6 +123,18 @@ Present with the `handlers` feature.
 
 See [Observe a running server](../how-to/observe.md).
 
+## Agent (MCP)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST`/`GET`/`DELETE` | `/mcp` | [Model Context Protocol](../how-to/mcp.md#over-http) endpoint (streamable-http), for driving this node from an AI agent. |
+
+Unlike `/api/*`, `/mcp` is gated only by a **valid plain bearer** (not a specific
+right): each MCP tool call is separately re-authorized in-process against the
+forwarded token's scope. On by default; toggle with `mcp.enabled`
+([daemon config](./daemon-config.md)). `cnf`/DPoP tokens are rejected — use a plain
+bearer or the stdio transport.
+
 ## Public (unauthenticated) endpoints
 
 Never token-authenticated. Visitor access control (basic auth / IP rules / rate

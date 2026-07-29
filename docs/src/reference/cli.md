@@ -52,6 +52,7 @@ flags unique to each command:
 | [`compute`](#boatramp-compute) | Manage microVM compute workloads. |
 | [`blob`](#boatramp-blob) | Upload a file as a content-addressed blob. |
 | [`config`](#boatramp-config) | Read/change the dynamic daemon config (no restart). |
+| [`mcp`](#boatramp-mcp) | Run the Model Context Protocol server (drive boatramp from an AI agent). |
 | [`dns`](#boatramp-dns) | Configure DNS and issue wildcard preview certs (`acme-dns` feature). |
 | [`logs`](#boatramp-logs) | Tail a site's captured guest stdout/stderr. |
 | [`stats`](#boatramp-stats) | Show handler stats, consumer lag, and dead letters. |
@@ -410,6 +411,26 @@ fleet-wide without a restart. See the
 `config set` on a `restart`-class key (a trust anchor, posture, or listener
 setting) fails with a pointer to `boatramp.cfg` rather than silently doing
 nothing.
+
+## `boatramp mcp`
+
+Run the [Model Context Protocol](https://modelcontextprotocol.io) server so an AI
+agent (Claude, Codex, …) can drive one or more instances. Bare `boatramp mcp`
+serves over **stdio** (what a desktop agent spawns); the server can also be reached
+over **HTTP** at `/mcp` on any `boatramp serve` (on by default). See
+[Drive boatramp from an AI agent](../how-to/mcp.md).
+
+| Sub-action | Description |
+| --- | --- |
+| _(none)_ / `serve` | Serve the MCP protocol over stdio until the client disconnects. |
+| `setup add <name> --server <url> [flags]` | Register an instance in `~/.config/boatramp/mcp.toml`. |
+| `setup list` | List the registered instances. |
+| `setup remove <name>` | Remove a registered instance. |
+
+`setup add` flags: `--token <spec>` (an `env:VAR` / `path:/file` / literal token),
+`--holder-key <spec>` (a `cnf` holder key for DPoP), `--server-pubkey <hex>` (pin
+the server's raw public key), `--insecure` (skip TLS verification). Secrets are
+stored as **specs**, never resolved into the file.
 
 ## `boatramp dns`
 

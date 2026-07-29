@@ -48,6 +48,7 @@ occur.
 | `console.enabled` | bool | Serve the embedded [web console](../how-to/web-console.md). |
 | `console.host` | string | Host the console answers on (`*`, an exact host, or `*.suffix`). |
 | `console.path` | string | URL path prefix it mounts at (default `/_console`). |
+| `mcp.enabled` | bool | Serve the HTTP [`/mcp` endpoint](../how-to/mcp.md#over-http) (default on; a live kill-switch — `false` makes it `404`). |
 | `posture.oidc_require_audience` | bool | **Tighten-only**: require an OIDC audience. |
 | `posture.ratelimit_fail_open` | bool | **Tighten-only**: set `false` to fail closed. |
 | `posture.allow_shared_kernel_compute` | bool | **Tighten-only**: set `false` to forbid shared-kernel compute. |

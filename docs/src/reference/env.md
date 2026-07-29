@@ -18,6 +18,7 @@ Read by `sync`, `build`, `bundle`, and the other project commands. See
 | `BOATRAMP_TOKEN` | `publish.token` | Control-plane token. Prefer the env var so it is never on disk. |
 | `BOATRAMP_TOKEN_HOLDER_KEY` | — | Holder **private** key (`"<alg>:<hex>"`) for a PoP-bound token: every request is signed with a fresh proof. Inert unless set alongside `BOATRAMP_TOKEN` + `BOATRAMP_POP_ORIGIN`. See [PoP-bind a token](../how-to/pop-tokens.md). |
 | `BOATRAMP_POP_ORIGIN` | — | The server's canonical origin the PoP proof binds (`aud`); must equal the server's `serve.pop_origin`. |
+| `BOATRAMP_MCP_CONFIG` | — | Path to the [MCP](../how-to/mcp.md) instance registry (default `~/.config/boatramp/mcp.toml`). |
 
 ## Server (`serve`)
 

@@ -49,6 +49,7 @@ Some features imply others: `http3`/`acme-dns` imply `tls`; `cluster` implies
 | `sql-postgres` | yes | External (bring-your-own) PostgreSQL for the handler `sql` binding, opened by name. Implies `handlers`. |
 | `sql-mysql` | yes | External (bring-your-own) MySQL/MariaDB for the handler `sql` binding, opened by name. Implies `handlers`. |
 | `console` | yes | Bake the web management console (a Wasm SPA) into the binary; serve it at an operator-configured host+path (`[serve.console]`). On in every shipped build (release binaries + Nix/OCI images), which stage the built SPA in; a from-source build embeds a placeholder unless you build the SPA first with `just console`. |
+| `mcp` | yes | The [Model Context Protocol](../how-to/mcp.md) server: the `boatramp mcp` stdio subcommand + the HTTP `/mcp` endpoint on `serve`. Also enables `boatramp-server/mcp`. |
 
 Two more features are on by default but omitted from the table above:
 `domain-verify-dns` (verify a host's `_boatramp-verify` TXT over public DNS) and
