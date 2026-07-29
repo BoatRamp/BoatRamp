@@ -88,7 +88,7 @@ bollard = "0.17"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-axum = "0.7"
+axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 # Shell-completion + man-page generation for the `completions` / `man` subcommands:
 # the payload distro/Homebrew/Nix packages install.

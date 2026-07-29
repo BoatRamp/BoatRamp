@@ -287,7 +287,8 @@ pub(super) async fn serve_ws_stream(
                 // Forward a subscription payload to the client (binary frame).
                 event = downstream.next() => match event {
                     Some(payload) => {
-                        if sink.send(Message::Binary(payload)).await.is_err() {
+                        // axum 0.8's `Message::Binary` carries `Bytes` (was `Vec<u8>`).
+                        if sink.send(Message::Binary(payload.into())).await.is_err() {
                             break; // client gone
                         }
                     }

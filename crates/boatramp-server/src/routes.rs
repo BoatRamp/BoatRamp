@@ -78,50 +78,50 @@ pub fn router_with(
         .route("/api/sites", get(list_sites))
         .route("/api/functions", get(list_functions))
         .route(
-            "/api/functions/:name",
+            "/api/functions/{name}",
             put(deploy_function).delete(remove_function),
         )
-        .route("/api/functions/:name/rollback", post(rollback_function))
-        .route("/api/functions/:name/aliases/:label", put(alias_function))
+        .route("/api/functions/{name}/rollback", post(rollback_function))
+        .route("/api/functions/{name}/aliases/{label}", put(alias_function))
         .route(
-            "/api/sites/:site/deployments",
+            "/api/sites/{site}/deployments",
             post(create_deployment).get(list_deployments),
         )
-        .route("/api/blobs/:hash", put(put_blob))
+        .route("/api/blobs/{hash}", put(put_blob))
         .route(
-            "/api/sites/:site/deployments/:id/activate",
+            "/api/sites/{site}/deployments/{id}/activate",
             post(activate_deployment),
         )
-        .route("/api/sites/:site/deployments/:id", get(get_deployment))
-        .route("/api/sites/:site/current", get(current_deployment))
+        .route("/api/sites/{site}/deployments/{id}", get(get_deployment))
+        .route("/api/sites/{site}/current", get(current_deployment))
         .route(
-            "/api/sites/:site/config",
+            "/api/sites/{site}/config",
             get(get_site_config).put(put_site_config),
         )
-        .route("/api/sites/:site", axum::routing::delete(delete_site))
+        .route("/api/sites/{site}", axum::routing::delete(delete_site))
         .route(
-            "/api/sites/:site/domains/:host/verification",
+            "/api/sites/{site}/domains/{host}/verification",
             get(domain_verify::get_domain_verification)
                 .post(domain_verify::start_domain_verification)
                 .delete(domain_verify::remove_domain_verification),
         )
         .route(
-            "/api/sites/:site/domains/:host/verification/check",
+            "/api/sites/{site}/domains/{host}/verification/check",
             post(domain_verify::check_domain_verification),
         )
         .route(
-            "/api/sites/:site/domain-verifications",
+            "/api/sites/{site}/domain-verifications",
             get(domain_verify::list_domain_verifications),
         )
         // Admin-only: attach a host WITHOUT an ownership proof (`domain add
         // --unverified`). Gated at `system·admin` in `authz::Right::required`.
         .route(
-            "/api/sites/:site/domains/:host/attach-unverified",
+            "/api/sites/{site}/domains/{host}/attach-unverified",
             post(domain_verify::attach_domain_unverified),
         )
-        .route("/api/sites/:site/aliases", get(list_aliases))
+        .route("/api/sites/{site}/aliases", get(list_aliases))
         .route(
-            "/api/sites/:site/aliases/:name",
+            "/api/sites/{site}/aliases/{name}",
             put(set_alias).delete(remove_alias),
         )
         .route("/api/tokens", post(create_token).get(list_tokens))
@@ -129,7 +129,7 @@ pub fn router_with(
         // this path); the handler verifies a single-use operator-set secret. The
         // static segment takes precedence over the `/:id` route below.
         .route("/api/tokens/bootstrap", post(bootstrap_token))
-        .route("/api/tokens/:id", axum::routing::delete(revoke_token))
+        .route("/api/tokens/{id}", axum::routing::delete(revoke_token))
         // Mint a single-use mesh join token. Admin-scoped via the
         // deny-safe `Right::required` default for `/api/cluster/*`.
         .route("/api/cluster/join-token", post(create_join_token))
@@ -161,7 +161,7 @@ pub fn router_with(
             get(list_root_anchors).put(add_root_anchor),
         )
         .route(
-            "/api/auth/root/:pubkey",
+            "/api/auth/root/{pubkey}",
             axum::routing::delete(remove_root_anchor),
         )
         // Dynamic daemon config — validated + committed on the leader, replicated,
@@ -177,7 +177,7 @@ pub fn router_with(
         // *execution* needs KVM. Admin-scoped (deny-safe `Right::required`).
         .route("/api/compute", get(list_compute))
         .route(
-            "/api/compute/:name",
+            "/api/compute/{name}",
             get(get_compute).put(put_compute).delete(delete_compute),
         );
     // OIDC → token exchange: validate the IdP JWT (presented as
@@ -195,42 +195,42 @@ pub fn router_with(
     #[cfg(feature = "handlers")]
     let api = api
         .route(
-            "/api/sites/:site/_boatramp/handlers",
+            "/api/sites/{site}/_boatramp/handlers",
             get(operator_handler_stats),
         )
-        .route("/api/sites/:site/_boatramp/logs", get(operator_logs))
+        .route("/api/sites/{site}/_boatramp/logs", get(operator_logs))
         .route(
-            "/api/sites/:site/_boatramp/logs/stream",
+            "/api/sites/{site}/_boatramp/logs/stream",
             get(operator_logs_stream),
         )
-        .route("/api/sites/:site/_boatramp/dlq", post(operator_dlq))
+        .route("/api/sites/{site}/_boatramp/dlq", post(operator_dlq))
         // The function **invoke** surface (FA-3) needs the engine, so it is
         // registered only with the handlers feature.
-        .route("/api/functions/:name/invoke", post(invoke_function))
+        .route("/api/functions/{name}/invoke", post(invoke_function))
         .route(
-            "/api/functions/:name/invocations/:id",
+            "/api/functions/{name}/invocations/{id}",
             get(get_invocation_record),
         )
-        .route("/api/functions/:name/usage", get(get_function_usage))
+        .route("/api/functions/{name}/usage", get(get_function_usage))
         // Function triggers (scheduled + event sources): cron + queue triggers the
         // scheduler dispatches. Needs the engine, so behind the handlers feature.
-        .route("/api/functions/:name/triggers", get(list_triggers_handler))
+        .route("/api/functions/{name}/triggers", get(list_triggers_handler))
         .route(
-            "/api/functions/:name/triggers/:id",
+            "/api/functions/{name}/triggers/{id}",
             put(put_trigger_handler).delete(delete_trigger_handler),
         )
         // Workflow orchestration (FA-6): definitions + runs. The executor drain
         // needs the engine, so the surface is registered with the handlers feature.
         .route("/api/workflows", get(list_workflows_handler))
         .route(
-            "/api/workflows/:name",
+            "/api/workflows/{name}",
             put(define_workflow)
                 .get(get_workflow_handler)
                 .delete(delete_workflow_handler),
         )
-        .route("/api/workflows/:name/runs", post(start_workflow_run))
+        .route("/api/workflows/{name}/runs", post(start_workflow_run))
         .route(
-            "/api/workflows/:name/runs/:id",
+            "/api/workflows/{name}/runs/{id}",
             get(get_workflow_run_handler),
         );
     let api = api
@@ -261,13 +261,13 @@ pub fn router_with(
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         // Explicit by-name admin/testing route: `/_sites/<name>/…`.
-        .route("/_sites/*rest", any(serve_sites))
-        .route("/_deploy/*rest", get(serve_preview))
+        .route("/_sites/{*rest}", any(serve_sites))
+        .route("/_deploy/{*rest}", get(serve_preview))
         // Domain-ownership self-serve: serve a pending HTTP challenge token
         // before host routing, so an unattached host can verify itself. An
         // explicit route, so it wins over the `serve_by_host` fallback.
         .route(
-            "/.well-known/boatramp-domain-verification/:token",
+            "/.well-known/boatramp-domain-verification/{token}",
             get(serve_domain_challenge),
         )
         // Bootstrap-TLS identity: the root-key-signed attestation of this node's
@@ -282,7 +282,7 @@ pub fn router_with(
     // function. Needs the engine, so it is registered only with the handlers
     // feature.
     #[cfg(feature = "handlers")]
-    let app = app.route("/_webhooks/:name", post(webhook_ingress));
+    let app = app.route("/_webhooks/{name}", post(webhook_ingress));
     let app = app
         .fallback(serve_by_host)
         .with_state(deploy)

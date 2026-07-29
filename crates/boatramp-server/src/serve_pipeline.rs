@@ -527,7 +527,7 @@ pub fn http_redirect_router(
 ) -> Router {
     Router::new()
         .route(
-            "/.well-known/boatramp-domain-verification/:token",
+            "/.well-known/boatramp-domain-verification/{token}",
             get(serve_domain_challenge),
         )
         .fallback(redirect_http_to_https)
