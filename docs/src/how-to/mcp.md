@@ -6,8 +6,17 @@ natural language: list sites, inspect deployments, activate or roll back, manage
 domains and aliases, tail logs, invoke functions, and inspect the cluster. One
 agent can drive **several** boatramp instances — each registered by name.
 
-The server is the same binary you already run. It speaks MCP over **stdio** (what a
-desktop agent spawns), and is built into the default binary (the `mcp` feature).
+The server is the same binary you already run. It offers **two transports**, both
+built into the default binary (the `mcp` feature):
+
+- **stdio** — the `boatramp mcp` subcommand a desktop agent spawns. Can drive
+  **many** named instances from `~/.config/boatramp/mcp.toml`.
+- **HTTP** — a `/mcp` endpoint served by `boatramp serve` itself, for driving *that*
+  node over the network. On by default; see [Over HTTP](#over-http) below.
+
+Both expose the **same, complete, enumerated tool set** — one named tool per
+control-plane operation (no generic passthrough), so every call is legible in an
+audit log and bounded by the token's scope.
 
 ## Register your instances
 
@@ -74,6 +83,35 @@ $ claude mcp add boatramp -- boatramp mcp
 The token env vars your instance specs reference (`env:BOATRAMP_TOKEN` above) must
 be present in the process the agent spawns — set them in the `env` block (Claude
 Desktop) or your shell (Claude Code).
+
+## Over HTTP
+
+`boatramp serve` also serves the MCP protocol at **`POST /mcp`** (streamable-http),
+so an agent can drive *that* node over the network without spawning the CLI. It's
+**on by default** whenever the control-plane API is served.
+
+Point an HTTP-capable MCP client at `https://<your-node>/mcp` with an
+`Authorization: Bearer <token>` header — for Claude Code:
+
+```console
+$ claude mcp add --transport http boatramp https://boatramp.example.com/mcp \
+    --header "Authorization: Bearer $BOATRAMP_TOKEN"
+```
+
+How it authenticates (this is the important part):
+
+- **Opening the channel requires a valid token.** No token, or an invalid one, and
+  `/mcp` answers `401` — it's gated exactly like the rest of the control plane.
+- **Each tool call runs with *your* token's authority.** The endpoint forwards your
+  bearer to the node's own control-plane API in-process for every operation, so
+  authorization is re-checked per call against your token's scope. Give the agent a
+  least-privilege token and the write/destructive tools simply `403` — the HTTP
+  endpoint grants nothing the token doesn't already grant. Nothing is minted, so it
+  works even on verify-only nodes that hold no signing key.
+- **Use a plain bearer, not a `cnf`/DPoP token.** A holder-bound token can't be
+  re-proven for the in-process calls (the node has no holder key), so its tool calls
+  would fail the proof-of-possession check. DPoP-bound setups should use the stdio
+  transport, which holds the holder key and signs each call.
 
 ## Using it
 
