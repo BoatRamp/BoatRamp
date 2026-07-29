@@ -245,6 +245,13 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
       - uses: DeterminateSystems/nix-installer-action@main
+      - name: Use a v2 registries.conf for skopeo
+        run: |
+          # The runner ships a v1 /etc/containers/registries.conf that nixpkgs'
+          # skopeo (v2-only) rejects with a fatal error before it can even log in.
+          # Point every skopeo call in this job at a minimal v2 file instead.
+          printf 'unqualified-search-registries = []\n' > "$RUNNER_TEMP/registries.conf"
+          echo "CONTAINERS_REGISTRIES_CONF=$RUNNER_TEMP/registries.conf" >> "$GITHUB_ENV"
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | nix run nixpkgs#skopeo -- login ghcr.io -u ${{ github.actor }} --password-stdin
       # Two reproducible Nix images, built on the runner arch (a multi-arch manifest
