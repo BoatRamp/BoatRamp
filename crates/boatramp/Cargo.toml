@@ -180,7 +180,7 @@ operator = [
 # drives one or more instances from an agent. The tool surface + transport live in
 # the separate `boatramp-mcp` crate (rmcp's schemars 1.x can't share the binary
 # with the operator's schemars 0.8), so this just pulls it in.
-mcp = ["dep:boatramp-mcp"]
+mcp = ["dep:boatramp-mcp", "boatramp-server/mcp"]
 
 [dependencies]
 # COSE/CWT + Cedar auth is always built into the binary: the CLI

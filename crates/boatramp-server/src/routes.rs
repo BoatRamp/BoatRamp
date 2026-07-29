@@ -233,6 +233,10 @@ pub fn router_with(
             "/api/workflows/{name}/runs/{id}",
             get(get_workflow_run_handler),
         );
+    // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
+    // into the API's `require_auth` layer below).
+    #[cfg(feature = "mcp")]
+    let mcp_auth = auth.clone();
     let api = api
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
@@ -352,7 +356,17 @@ pub fn router_with(
     // (a disabled console is a pass-through). See [`console::mount`].
     #[cfg(feature = "console")]
     let app = console::mount(app, console_daemon);
+    // The in-`serve` HTTP MCP endpoint (`/mcp`): on by default when compiled. Its
+    // tools dispatch in-process through a clone of the fully-assembled app (all
+    // extensions + the API's `require_auth`), carrying the caller's forwarded
+    // bearer. Built from `app.clone()` here — before `/mcp` itself is merged in — so
+    // the backend router has every handler extension but not `/mcp` (no recursion).
+    #[cfg(feature = "mcp")]
+    let app = {
+        let mcp = crate::mcp_http::mcp_router(app.clone(), mcp_auth);
+        app.merge(mcp)
+    };
     app
-        // Structured access log wraps every route (public + API).
+        // Structured access log wraps every route (public + API + `/mcp`).
         .layer(axum::middleware::from_fn(access_log))
 }

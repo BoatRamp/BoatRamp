@@ -113,6 +113,8 @@ use proxy::{gateway_addr_allowed, CLOUD_METADATA_IPV4};
 mod ratelimit;
 mod routes;
 pub use routes::{router, router_with};
+#[cfg(feature = "mcp")]
+mod mcp_http;
 #[cfg(feature = "handlers")]
 mod scheduler;
 mod serve_pipeline;

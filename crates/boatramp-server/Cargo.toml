@@ -59,10 +59,22 @@ signer-pkcs11 = ["dep:cryptoki"]
 # builds don't carry the ~MB of Wasm; the shipped/release binary enables it.
 console = ["dep:include_dir"]
 
+# The in-`serve` HTTP MCP endpoint (`/mcp`): mounts rmcp's streamable-http tower
+# service, backed by an in-process dispatch to this node's own control-plane
+# router (carrying the caller's forwarded bearer). Pulls the shared `boatramp-mcp`
+# tool layer + rmcp + tower's `oneshot`.
+mcp = ["dep:boatramp-mcp", "dep:rmcp", "dep:tower"]
+
 [dependencies]
 # The embedded console's built assets (feature `console`), baked in at compile
 # time from `../boatramp-console/dist`.
 include_dir = { workspace = true, optional = true }
+# The MCP tool layer (feature `mcp`) + rmcp's HTTP transport for the `/mcp` endpoint.
+boatramp-mcp = { path = "../boatramp-mcp", optional = true }
+rmcp = { version = "1.2", features = [
+  "server",
+  "transport-streamable-http-server",
+], optional = true }
 # COSE/CWT + Cedar is the control-plane credential model — always on
 # for the server (it is the native binary's auth; `boatramp-core` keeps it opt-in
 # for library/wasm cleanliness).
