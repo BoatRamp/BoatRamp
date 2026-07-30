@@ -131,6 +131,26 @@ mysql port="3306":
 console:
     cd crates/boatramp-console && trunk build --release
 
+# Rebuild the committed WebAssembly example fixtures the `boatramp-handlers`
+# engine tests load (`crates/boatramp-handlers/tests/fixtures/*.wasm`). Compiles
+# each guest under `examples/handlers/*` to a `wasi:http` component and copies it
+# into place. Needs the `wasm32-wasip2` target (in `nix develop`). Run after
+# changing an example guest or a host WIT interface one links against.
+build-fixtures:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="crates/boatramp-handlers/tests/fixtures"
+    for name in http-200 kv-counter sql-counter event-consumer invoke-caller; do
+      echo "== building $name =="
+      ( cd "examples/handlers/$name" && cargo build --release --target wasm32-wasip2 )
+      # The crate emits boatramp_example_<name-with-underscores>.wasm; the fixture
+      # keeps the example's hyphenated name.
+      out="boatramp_example_${name//-/_}"
+      cp "examples/handlers/$name/target/wasm32-wasip2/release/${out}.wasm" "$dest/$name.wasm"
+      echo "   -> $dest/$name.wasm"
+    done
+    echo "fixtures rebuilt"
+
 # Run the ACME DNS-01 wildcard-cert end-to-end test against a local Pebble CA.
 # The test spawns `pebble` + `pebble-challtestsrv` (provided by `nix develop`),
 # mints a throwaway CA, and drives a real `*.deploy.test` wildcard issuance.
