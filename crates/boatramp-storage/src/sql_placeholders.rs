@@ -31,12 +31,18 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 /// The placeholder syntax the bound engine's driver expects on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlaceholderDialect {
-    /// libsql / SQLite: `?N` is native — validate only, no rewrite.
+    /// libsql / SQLite: `?N` is native — validate only, no rewrite. Constructed
+    /// only by the libsql backend.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
     Sqlite,
-    /// Postgres: `?N` → `$N` (same numbering; bound in natural order).
+    /// Postgres: `?N` → `$N` (same numbering; bound in natural order). Constructed
+    /// only by the sqlx Postgres backend.
+    #[cfg_attr(not(feature = "sql-postgres"), allow(dead_code))]
     Postgres,
     /// MySQL: `?N` → positional `?`, with the bound parameters reordered/duplicated
-    /// to the placeholders' appearance order.
+    /// to the placeholders' appearance order. Constructed only by the sqlx MySQL
+    /// backend.
+    #[cfg_attr(not(feature = "sql-mysql"), allow(dead_code))]
     MySql,
 }
 

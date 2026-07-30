@@ -161,9 +161,13 @@ impl SqlTransaction for LibsqlTxn {
         // uniformly, matching the external backends.
         let stmt =
             crate::sql_placeholders::normalize(sql, PlaceholderDialect::Sqlite, params.len())?;
+        let bound = stmt.reorder(params); // no-op for libsql (`?N` is native)
         let mut rows = self
             .conn
-            .query(&stmt.sql, libsql::params_from_iter(to_libsql(params)))
+            .query(
+                &stmt.sql,
+                libsql::params_from_iter(to_libsql(bound.as_ref())),
+            )
             .await
             .map_err(SqlError::other)?;
         let columns = (0..rows.column_count())
