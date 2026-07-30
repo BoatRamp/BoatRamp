@@ -1,6 +1,7 @@
 [package]
 name = "boatramp-storage"
 version.workspace = true
+readme.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -36,6 +36,7 @@ rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 authors = ["Giacomo Cariello <info@giacomocariello.com>"]
 repository = "https://github.com/BoatRamp/BoatRamp"
+readme = "README.md"
 
 # A curated idiomaticity floor, not a blanket `pedantic` opt-in. These are the
 # high-signal, reliably auto-fixable lints from the Rust idiomaticity review
