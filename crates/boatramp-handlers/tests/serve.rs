@@ -29,6 +29,16 @@ const HTTP_200: &[u8] = include_bytes!("fixtures/http-200.wasm");
 ///    crates/boatramp-handlers/tests/fixtures/kv-counter.wasm
 /// ```
 const KV_COUNTER: &[u8] = include_bytes!("fixtures/kv-counter.wasm");
+/// A `wasi:http` guest that calls a sibling function through the boatramp
+/// `invoke` capability and echoes the callee's response. See
+/// `examples/handlers/invoke-caller`. Regenerate with:
+/// ```sh
+/// (cd examples/handlers/invoke-caller && cargo build --release --target wasm32-wasip2)
+/// cp examples/handlers/invoke-caller/target/wasm32-wasip2/release/boatramp_example_invoke_caller.wasm \
+///    crates/boatramp-handlers/tests/fixtures/invoke-caller.wasm
+/// ```
+#[cfg(feature = "invoke")]
+const INVOKE_CALLER: &[u8] = include_bytes!("fixtures/invoke-caller.wasm");
 
 fn engine() -> HandlerEngine {
     HandlerEngine::new(Limits::default(), 16).expect("engine")
@@ -70,6 +80,86 @@ async fn cached_compile_serves_twice() {
             .expect("handler serves");
         assert_eq!(response.status(), 200);
     }
+}
+
+/// A test [`Invoker`](boatramp_handlers::Invoker) that answers every target with
+/// a canned 200 + body, so the invoke *host binding* (grant check, allowlist,
+/// depth, wire conversion) is exercised by a real guest without a second guest.
+#[cfg(feature = "invoke")]
+struct StubInvoker {
+    body: &'static [u8],
+}
+
+#[cfg(feature = "invoke")]
+#[async_trait::async_trait]
+impl boatramp_handlers::Invoker for StubInvoker {
+    async fn invoke(
+        &self,
+        _target: &str,
+        _request: boatramp_handlers::InvokeRequest,
+        _depth: u32,
+    ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+        Ok(boatramp_handlers::InvokeResponse {
+            status: 200,
+            headers: vec![],
+            body: self.body.to_vec(),
+        })
+    }
+}
+
+/// A real guest importing `boatramp:handlers/invoke` calls its `greeter` target
+/// through the host binding, and the callee's response flows back into its body.
+#[cfg(feature = "invoke")]
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_caller_reaches_a_granted_target() {
+    let engine = engine();
+    let invoker: Arc<dyn boatramp_handlers::Invoker> = Arc::new(StubInvoker { body: b"hi" });
+    let bindings = Bindings::new("test").with_invoke(invoker, vec!["greeter".into()], 0);
+    let response = engine
+        .serve("invoke-caller", INVOKE_CALLER, request(), bindings)
+        .await
+        .expect("handler serves");
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"greeter said (200): hi");
+}
+
+/// Without an invoke grant, the guest's `invoke` returns `access-denied`, which
+/// the example surfaces as a 500.
+#[cfg(feature = "invoke")]
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_caller_denied_without_grant() {
+    let engine = engine();
+    let response = engine
+        .serve("invoke-caller", INVOKE_CALLER, request(), no_caps())
+        .await
+        .expect("handler serves");
+    assert_eq!(response.status(), 500);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&body).contains("capability not granted"),
+        "{body:?}"
+    );
+}
+
+/// Granted invoke, but the requested `greeter` is outside the allowlist, so the
+/// host refuses with `target-not-allowed` before any invoker runs.
+#[cfg(feature = "invoke")]
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_caller_target_outside_allowlist() {
+    let engine = engine();
+    let invoker: Arc<dyn boatramp_handlers::Invoker> = Arc::new(StubInvoker { body: b"hi" });
+    let bindings = Bindings::new("test").with_invoke(invoker, vec!["other".into()], 0);
+    let response = engine
+        .serve("invoke-caller", INVOKE_CALLER, request(), bindings)
+        .await
+        .expect("handler serves");
+    assert_eq!(response.status(), 500);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&body).contains("not in the allowlist"),
+        "{body:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

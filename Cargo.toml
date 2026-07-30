@@ -26,6 +26,7 @@ exclude = [
   "examples/handlers/kv-counter",
   "examples/handlers/sql-counter",
   "examples/handlers/event-consumer",
+  "examples/handlers/invoke-caller",
   "crates/boatramp-console",
 ]
 
