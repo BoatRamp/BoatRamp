@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
-authors = ["Giacomo Cariello <info@giacomocariello.com>"]
+authors = ["Uranion <boatramp@uranion.ai>"]
 repository = "https://github.com/BoatRamp/BoatRamp"
 description = "boatramp web management console — a Yew (CSR) Wasm SPA over the control-plane API"
 # Workspace-excluded (root Cargo.toml `exclude`): this crate ONLY builds for
