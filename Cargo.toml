@@ -37,6 +37,15 @@ license = "MIT OR Apache-2.0"
 authors = ["Uranion <boatramp@uranion.ai>"]
 repository = "https://github.com/BoatRamp/BoatRamp"
 readme = "README.md"
+homepage = "https://boatramp.dev"
+documentation = "https://boatramp.dev"
+keywords = ["serverless", "wasm", "faas", "web-server", "static-site"]
+categories = [
+  "web-programming::http-server",
+  "wasm",
+  "network-programming",
+  "command-line-utilities",
+]
 
 # A curated idiomaticity floor, not a blanket `pedantic` opt-in. These are the
 # high-signal, reliably auto-fixable lints from the Rust idiomaticity review
