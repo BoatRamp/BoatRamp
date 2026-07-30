@@ -16,7 +16,7 @@ boatramp --version
 ```
 
 ```text
-boatramp 0.1.0
+boatramp 0.1.1
 ```
 
 ## Install script (Linux / macOS)
@@ -47,7 +47,7 @@ cargo install boatramp --locked
 
 This **compiles from source**, pulling the batteries-included feature set (wasmtime,
 TLS, cloud SDKs), so expect a sizeable build — the prebuilt binary above is faster.
-Pin a version with `cargo install boatramp@0.1.0 --locked`, or build a smaller binary
+Pin a version with `cargo install boatramp@0.1.1 --locked`, or build a smaller binary
 with `--no-default-features --features …` (see [Build from source](./build-from-source.md)).
 
 ## Homebrew (macOS / Linux)
@@ -65,7 +65,7 @@ docker run ghcr.io/boatramp/boatramp:latest --version
 ```
 
 ```text
-boatramp 0.1.0
+boatramp 0.1.1
 ```
 
 To serve, publish the port and pass `serve`:
@@ -80,7 +80,7 @@ Run or build straight from the flake:
 
 ```sh
 nix run github:BoatRamp/BoatRamp -- --version         # the latest commit
-nix run github:BoatRamp/BoatRamp/v0.1.0 -- --version  # pin a release
+nix run github:BoatRamp/BoatRamp/v0.1.1 -- --version  # pin a release
 nix build github:BoatRamp/BoatRamp                    # -> ./result/bin/boatramp
 ```
 

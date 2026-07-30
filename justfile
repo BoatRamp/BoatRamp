@@ -225,6 +225,29 @@ fly-image app="boatramp-docs" tag="latest":
 
 # ---- crates.io release --------------------------------------------------------
 
+# Bump the whole workspace to VERSION in one shot: the `[workspace.package]`
+# version every crate inherits, the internal `[workspace.dependencies]` path-dep
+# pins (which cargo requires for publishing and cargo-deny requires be non-wildcard
+# — so they must track the version, but Cargo has no way to auto-inherit them), the
+# workspace-excluded console crate, and the lockfile. Run before tagging a release.
+bump-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{ version }}"
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "not a semver: $v" >&2; exit 1; }
+    # The single `[workspace.package]` version line (the only bare `version = "..."`
+    # in the root manifest — the dep pins all end in ` }`).
+    perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' Cargo.toml
+    # The internal path-dep pins, anchored on the boatramp path so no external dep
+    # is touched.
+    perl -i -pe 's/(boatramp-[a-z]+ = \{ path = "crates\/boatramp-[a-z]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
+    # The workspace-excluded console crate (its own manifest + lockfile).
+    perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' crates/boatramp-console/Cargo.toml
+    # Refresh the lockfiles' workspace-member versions.
+    cargo update --workspace
+    ( cd crates/boatramp-console && cargo update --workspace )
+    echo "bumped workspace to $v"
+
 # The workspace crates in dependency (publish) order — leaf crates first, so each
 # crate's internal deps are already on crates.io by the time it publishes.
 crate_order := "boatramp-types boatramp-rpktls boatramp-acme boatramp-core boatramp-storage boatramp-cloudflare boatramp-container boatramp-docker boatramp-firecracker boatramp-mcp boatramp-cluster boatramp-handlers boatramp-server boatramp"

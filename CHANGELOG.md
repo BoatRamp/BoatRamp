@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.1.1]
+
+### Added
+- **Function-to-function invoke.** A function can call a sibling **in-process** via
+  the new `invoke` capability (a `boatramp:handlers/invoke` WIT interface), instead
+  of a network round-trip. Calls are gated by a per-function wildcard target
+  allowlist (`invoke_targets`), capped at a maximum call depth to stop invocation
+  loops, and the callee is quota-admitted and metered exactly like an external
+  invoke. New `examples/handlers/invoke-caller` guest and a `just build-fixtures`
+  recipe to rebuild the example test fixtures.
+
+### Changed
+- **crates.io metadata.** Every published crate now carries the project README,
+  `homepage`/`documentation` (https://boatramp.dev), `keywords`, and `categories`,
+  and the package authors are set to Uranion — so the crate pages are complete.
+- Updated the vendored `spin` lockfile entries off the yanked 0.9.8/0.10.0.
+
+[0.1.1]: https://github.com/BoatRamp/BoatRamp/releases/tag/v0.1.1
+
 ## [0.1.0]
 
 The first public release: boatramp is a self-hosted, streaming-first alternative to

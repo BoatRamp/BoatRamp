@@ -31,7 +31,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
@@ -62,19 +62,19 @@ manual_string_new = "warn"
 semicolon_if_nothing_returned = "warn"
 
 [workspace.dependencies]
-boatramp-types = { path = "crates/boatramp-types", version = "0.1.0" }
-boatramp-core = { path = "crates/boatramp-core", version = "0.1.0" }
-boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.1.0" }
-boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.1.0" }
-boatramp-storage = { path = "crates/boatramp-storage", version = "0.1.0" }
-boatramp-server = { path = "crates/boatramp-server", version = "0.1.0" }
-boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.1.0" }
-boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.1.0" }
-boatramp-acme = { path = "crates/boatramp-acme", version = "0.1.0" }
-boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.1.0" }
-boatramp-container = { path = "crates/boatramp-container", version = "0.1.0" }
-boatramp-docker = { path = "crates/boatramp-docker", version = "0.1.0" }
-boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.1.0" }
+boatramp-types = { path = "crates/boatramp-types", version = "0.1.1" }
+boatramp-core = { path = "crates/boatramp-core", version = "0.1.1" }
+boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.1.1" }
+boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.1.1" }
+boatramp-storage = { path = "crates/boatramp-storage", version = "0.1.1" }
+boatramp-server = { path = "crates/boatramp-server", version = "0.1.1" }
+boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.1.1" }
+boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.1.1" }
+boatramp-acme = { path = "crates/boatramp-acme", version = "0.1.1" }
+boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.1.1" }
+boatramp-container = { path = "crates/boatramp-container", version = "0.1.1" }
+boatramp-docker = { path = "crates/boatramp-docker", version = "0.1.1" }
+boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.1.1" }
 
 tokio = { version = "1", features = [
   "rt-multi-thread",
