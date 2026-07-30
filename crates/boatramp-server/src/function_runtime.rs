@@ -129,7 +129,7 @@ async fn execute_sync(
     idem_key: Option<String>,
 ) -> Response {
     let (response, duration_ms) =
-        execute_function(inner, deploy, function, component, request).await;
+        execute_function(inner, deploy, function, component, request, 0).await;
     let Some(key) = idem_key else {
         // No capture on the plain streaming path: meter counts + duration + a
         // head-status success signal (byte totals are metered on the buffered
@@ -282,6 +282,7 @@ pub(super) async fn execute_function(
     function: &boatramp_core::function::Function,
     component: &str,
     request: Request,
+    depth: u32,
 ) -> (Response, u64) {
     // Concurrency quota (held through the head, mirroring the site permit).
     let _permit = match acquire_function_permit(inner, &function.name, &function.config.quota) {
@@ -302,7 +303,7 @@ pub(super) async fn execute_function(
         Err(response) => return (response, 0),
     };
     let scope = format!("fn/{}", function.name);
-    let bindings = build_function_bindings(inner, &scope, &function.config).await;
+    let bindings = build_function_bindings(inner, &scope, &function.config, depth).await;
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
@@ -341,6 +342,7 @@ async fn build_function_bindings(
     inner: &HandlerRuntimeInner,
     scope: &str,
     config: &boatramp_core::function::FunctionConfig,
+    depth: u32,
 ) -> boatramp_handlers::Bindings {
     let granted = |name: &str| config.imports.iter().any(|i| i == name);
     let mut bindings = boatramp_handlers::Bindings::new(scope);
@@ -362,6 +364,15 @@ async fn build_function_bindings(
     if granted("wasi:messaging") {
         if let Some(messaging) = &inner.messaging {
             bindings = bindings.with_messaging(format!("{scope}/"), messaging.clone());
+        }
+    }
+    // Function-to-function invoke (FI): granted only when the function imports
+    // `invoke`, names at least one allowed target, and the runtime has an invoker
+    // (set at serve startup). `depth` is this function's position in the call
+    // chain; the host caps the next hop.
+    if granted("invoke") && !config.invoke_targets.is_empty() {
+        if let Some(invoker) = inner.invoker.get() {
+            bindings = bindings.with_invoke(invoker.clone(), config.invoke_targets.clone(), depth);
         }
     }
     inner.logs.configure(scope, None);
@@ -401,13 +412,147 @@ fn function_limits(
 /// the function sees a clean request, not the control-plane envelope.
 #[cfg(feature = "handlers")]
 fn prepare_invoke_request(mut request: Request) -> Request {
-    if let Ok(uri) = format!("http://{INVOKE_AUTHORITY}/").parse() {
-        *request.uri_mut() = uri;
+    // An internal function-to-function call has already built an absolute
+    // `http://function.invoke/<path>` URI and wants its path preserved; only the
+    // external control-plane path (a relative `/api/functions/.../invoke` URI)
+    // is collapsed to the clean root the function sees.
+    let already_internal = request
+        .uri()
+        .authority()
+        .is_some_and(|a| a.host() == INVOKE_AUTHORITY);
+    if !already_internal {
+        if let Ok(uri) = format!("http://{INVOKE_AUTHORITY}/").parse() {
+            *request.uri_mut() = uri;
+        }
     }
     request
         .headers_mut()
         .insert(header::HOST, HeaderValue::from_static(INVOKE_AUTHORITY));
     request
+}
+
+/// The function-to-function invoke resolver (FI): backs the `invoke` capability
+/// the engine grants a function. It holds the deploy store (to resolve + read the
+/// target) and a `Weak` back to the handler runtime (to execute on the same
+/// engine), so the engine can call *up* into the full invoke machinery — resolve
+/// the target, admit it against its own quota, run it at the next call depth, and
+/// meter it — exactly as the external `POST /invoke` path does.
+#[cfg(feature = "handlers")]
+pub(crate) struct FunctionInvoker {
+    deploy: DeployStore,
+    runtime: std::sync::Weak<HandlerRuntimeInner>,
+}
+
+#[cfg(feature = "handlers")]
+impl FunctionInvoker {
+    pub(crate) fn new(deploy: DeployStore, runtime: std::sync::Weak<HandlerRuntimeInner>) -> Self {
+        Self { deploy, runtime }
+    }
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_handlers::Invoker for FunctionInvoker {
+    async fn invoke(
+        &self,
+        target: &str,
+        request: boatramp_handlers::InvokeRequest,
+        depth: u32,
+    ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+        use boatramp_handlers::InvokeError;
+        let Some(inner) = self.runtime.upgrade() else {
+            return Err(InvokeError::Failed(
+                "handler runtime is shutting down".into(),
+            ));
+        };
+        // Resolve the target by name to its active version's component.
+        let function = match self.deploy.get_function(target).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return Err(InvokeError::NotFound),
+            Err(err) => return Err(InvokeError::Failed(err.to_string())),
+        };
+        let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+            return Err(InvokeError::NotFound);
+        };
+        let bytes_in = request.body.len() as u64;
+        let axum_request = match build_internal_request(request) {
+            Ok(req) => req,
+            Err(err) => return Err(InvokeError::Failed(err)),
+        };
+        // Rate-limit the callee against its own quota, as an external call would.
+        // A rejection is the callee's response (429), surfaced to the caller.
+        if let Err(response) = admit_by_quota(&inner, &self.deploy, &function).await {
+            return Ok(buffer_invoke_response(response).await);
+        }
+        let (response, duration_ms) = execute_function(
+            &inner,
+            &self.deploy,
+            &function,
+            &component,
+            axum_request,
+            depth,
+        )
+        .await;
+        let invoke_response = buffer_invoke_response(response).await;
+        let sample = boatramp_core::function::MeteringSample {
+            success: invoke_response.status < 500,
+            duration_ms,
+            bytes_in,
+            bytes_out: invoke_response.body.len() as u64,
+        };
+        record_metering(&inner, &self.deploy, &function.name, &sample).await;
+        Ok(invoke_response)
+    }
+}
+
+/// Turn an internal [`InvokeRequest`](boatramp_handlers::InvokeRequest) into the
+/// HTTP request the callee runs against, at `http://function.invoke/<path>` so
+/// [`prepare_invoke_request`] preserves the guest-chosen path. `Err` carries a
+/// human reason for a malformed method/header.
+#[cfg(feature = "handlers")]
+fn build_internal_request(request: boatramp_handlers::InvokeRequest) -> Result<Request, String> {
+    let path = if request.path.starts_with('/') {
+        request.path.clone()
+    } else {
+        format!("/{}", request.path)
+    };
+    let mut builder = axum::http::Request::builder()
+        .method(request.method.as_str())
+        .uri(format!("http://{INVOKE_AUTHORITY}{path}"));
+    for (name, value) in &request.headers {
+        // The host is set by `prepare_invoke_request`; a guest-supplied one is
+        // dropped so it can't spoof the authority.
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_slice());
+    }
+    builder
+        .body(axum::body::Body::from(request.body))
+        .map_err(|err| err.to_string())
+}
+
+/// Buffer a [`Response`] into an [`InvokeResponse`](boatramp_handlers::InvokeResponse):
+/// status + all headers + body. A body over the internal cap (or a stream error)
+/// yields an empty body but keeps the status/headers, so the caller still sees
+/// the outcome.
+#[cfg(feature = "handlers")]
+async fn buffer_invoke_response(response: Response) -> boatramp_handlers::InvokeResponse {
+    let status = response.status().as_u16();
+    let headers: Vec<(String, Vec<u8>)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ASYNC_BODY_BYTES)
+        .await
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    boatramp_handlers::InvokeResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 /// Buffer a response into `(status, content-type, body)` — for idempotency
@@ -517,7 +662,7 @@ async fn run_queued_invocation(
         .unwrap_or(0);
     let request = build_stored_request(&inv);
     let (response, duration_ms) =
-        execute_function(inner, deploy, function, &component, request).await;
+        execute_function(inner, deploy, function, &component, request, 0).await;
     let (status, content_type, body) = capture_response(response).await;
     // A function that returns a 5xx from the engine wrapper (timeout/trap/etc.)
     // is a delivery failure worth retrying; any response the guest itself
@@ -951,7 +1096,7 @@ async fn dispatch_function_queue(
         let bytes_in = msg.payload.len() as u64;
         let request = build_webhook_request(None, msg.payload.clone());
         let (response, duration_ms) =
-            execute_function(inner, deploy, function, &component, request).await;
+            execute_function(inner, deploy, function, &component, request, 0).await;
         let (status, _content_type, body) = capture_response(response).await;
         let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
             && status != StatusCode::GATEWAY_TIMEOUT
@@ -1049,7 +1194,7 @@ pub(super) async fn webhook_ingress(
     let bytes_in = body.len() as u64;
     let request = build_webhook_request(content_type, body.to_vec());
     let (response, duration_ms) =
-        execute_function(inner, &deploy, &function, &component, request).await;
+        execute_function(inner, &deploy, &function, &component, request, 0).await;
     let sample = boatramp_core::function::MeteringSample {
         success: response.status().as_u16() < 500,
         duration_ms,

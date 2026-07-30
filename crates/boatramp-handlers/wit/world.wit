@@ -141,3 +141,63 @@ world consumer {
   import messaging-producer;
   export messaging-handler;
 }
+
+/// Value types for the `invoke` capability: a small HTTP-shaped request/response
+/// so one function can call another the same way the platform invokes it from
+/// the outside (functions are `wasi:http` handlers, so the natural call shape is
+/// an HTTP request/response). Bodies are buffered `list<u8>` — internal calls are
+/// request/response, not streams.
+interface invoke-types {
+  /// One header: field name and its raw value bytes.
+  record header {
+    name: string,
+    value: list<u8>,
+  }
+
+  /// A call to a sibling function. `path` is the request target the callee sees
+  /// (path plus any query); `method`, `headers`, and `body` pass through verbatim.
+  record invoke-request {
+    method: string,
+    path: string,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  /// The callee's buffered response.
+  record invoke-response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  /// Why an invoke failed.
+  variant error {
+    /// The `invoke` capability was not granted to this function.
+    access-denied,
+    /// The target is not permitted by this function's invoke allowlist. Carries
+    /// the rejected target name.
+    target-not-allowed(string),
+    /// No function is registered under the target name. Carries the name.
+    not-found(string),
+    /// The maximum function-to-function call depth was exceeded (loop guard).
+    loop-detected,
+    /// The callee ran but failed (trap, timeout, overload, ...). Carries a reason.
+    failed(string),
+  }
+}
+
+/// The `invoke` capability: call another function in-process and get its
+/// response, without leaving the sandbox for a network round-trip. The callable
+/// targets are an operator-configured allowlist (each entry may use `*`
+/// wildcards); the host caps call depth so functions cannot invoke in a loop.
+interface invoke {
+  use invoke-types.{invoke-request, invoke-response, error};
+
+  /// Invoke the function named `target` with `request`, returning its response.
+  invoke: func(target: string, request: invoke-request) -> result<invoke-response, error>;
+}
+
+/// The invoke capability world (imported into request handlers / functions).
+world invoke-host {
+  import invoke;
+}

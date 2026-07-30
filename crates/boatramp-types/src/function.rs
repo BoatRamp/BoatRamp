@@ -105,6 +105,13 @@ pub struct FunctionConfig {
     /// Signed inbound-webhook ingress (FA-5). Absent ⇒ no webhook endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<WebhookConfig>,
+    /// Function-to-function invoke allowlist (FI): the target names this function
+    /// may call through the `invoke` capability. Each entry may use `*` wildcards
+    /// (`*` = any sibling, `img-*` = a family, `resize` = one literal). Deny by
+    /// default: empty ⇒ the function cannot invoke anything, even if it imports
+    /// `invoke`. Only consulted when `imports` contains `invoke`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub invoke_targets: Vec<String>,
 }
 
 /// The signature scheme a webhook is verified under (FA-5).
@@ -159,6 +166,7 @@ impl FunctionConfig {
             runtime: Runtime::default(),
             quota: FunctionQuota::default(),
             webhook: None,
+            invoke_targets: Vec::new(),
         }
     }
     fn from_consumer(c: &ConsumerConfig) -> Self {

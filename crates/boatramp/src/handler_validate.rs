@@ -106,6 +106,7 @@ mod imp {
             ("boatramp:handlers", "messaging-producer" | "messaging-types") => {
                 Some("wasi:messaging")
             }
+            ("boatramp:handlers", "invoke" | "invoke-types") => Some("invoke"),
             _ => None,
         }
     }
@@ -316,6 +317,23 @@ mod imp {
             assert!(
                 check_interface_policy(&fake, &exports, &["sql".into()], Role::Handler).is_err()
             );
+        }
+
+        #[test]
+        fn policy_gates_invoke_by_the_real_interface() {
+            // The host provides function-to-function invoke as
+            // boatramp:handlers/{invoke,invoke-types}, declared as `invoke`.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let invoke = [
+                lbl("boatramp:handlers", "invoke"),
+                lbl("boatramp:handlers", "invoke-types"),
+            ];
+            assert!(
+                check_interface_policy(&invoke, &exports, &["invoke".into()], Role::Handler)
+                    .is_ok()
+            );
+            let err = check_interface_policy(&invoke, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`invoke`"), "{err}");
         }
 
         #[test]

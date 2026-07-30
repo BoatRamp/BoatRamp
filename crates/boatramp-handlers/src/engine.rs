@@ -449,6 +449,10 @@ impl HandlerEngine {
         bindings::messaging::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::messaging::MessagingHost::new(state.bindings.messaging())
         })?;
+        #[cfg(feature = "invoke")]
+        bindings::invoke::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::invoke::InvokeHost::new(state.bindings.invoke())
+        })?;
         Ok(linker)
     }
 

@@ -243,6 +243,11 @@ struct HandlerRuntimeInner {
     /// dry-run (recipe) / provision / verify-only / refuse. Unset reads as the
     /// fail-closed default (`Refuse`).
     provision_tier: std::sync::OnceLock<boatramp_core::blob_notify::ProvisionTier>,
+    /// The function-to-function invoke resolver (FI): backs the `invoke`
+    /// capability. Set once at startup with the deploy store (a self-referential
+    /// `Weak` back to this runtime), so a granted function can call a sibling
+    /// in-process. Unset ⇒ the `invoke` capability is not offered.
+    invoker: std::sync::OnceLock<Arc<dyn boatramp_handlers::Invoker>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -287,7 +292,23 @@ impl HandlerRuntime {
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
                 watch_provider: std::sync::OnceLock::new(),
                 provision_tier: std::sync::OnceLock::new(),
+                invoker: std::sync::OnceLock::new(),
             })),
+        }
+    }
+
+    /// Wire the function-to-function invoke resolver (FI). Set once at startup,
+    /// after the deploy store exists: it holds a `Weak` back to this runtime plus
+    /// the deploy store, so a function granted `invoke` can resolve + run a
+    /// sibling in-process. A no-op runtime (no `inner`) leaves it unset, and the
+    /// `invoke` capability is then simply never granted.
+    #[cfg(feature = "handlers")]
+    pub fn set_invoker(&self, deploy: DeployStore) {
+        if let Some(inner) = self.inner.as_ref() {
+            let invoker: Arc<dyn boatramp_handlers::Invoker> = Arc::new(
+                function_runtime::FunctionInvoker::new(deploy, Arc::downgrade(inner)),
+            );
+            let _ = inner.invoker.set(invoker);
         }
     }
 
@@ -2161,6 +2182,70 @@ mod tests {
     /// used here as a cron target so a fire is observable as a counter bump.
     const KV_COUNTER: &[u8] =
         include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    /// The function-to-function invoke resolver (FI): a resolvable target runs on
+    /// the real engine and its response is buffered back + metered; an unknown
+    /// target is `NotFound`. (The caller-side capability gate — allowlist, depth,
+    /// deny-by-default — is unit-tested in `boatramp_handlers::bindings::invoke`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn function_invoker_runs_target_buffers_and_meters() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::function::{Function, FunctionVersion, Lifecycle, Owner};
+        use boatramp_handlers::{HandlerEngine, InvokeError, InvokeRequest, Limits};
+        use futures::StreamExt;
+
+        // The committed `http-200` fixture is the invoke *target* (a wasi:http
+        // guest that returns 200); it needs no fixture of its own to be a callee.
+        const HTTP_200: &[u8] =
+            include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        let hash = boatramp_core::deploy::sha256_hex(HTTP_200);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let function = Function {
+            name: "target".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: Default::default(),
+        };
+        deploy.put_function(&function).await.unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        rt.set_invoker(deploy.clone());
+        let invoker = rt.inner.as_ref().unwrap().invoker.get().unwrap().clone();
+
+        let request = || InvokeRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![],
+            body: vec![],
+        };
+
+        // A resolvable target runs on the engine and returns its 200.
+        let response = invoker.invoke("target", request(), 1).await.unwrap();
+        assert_eq!(response.status, 200);
+
+        // The call was metered against the target function.
+        let metering = deploy.get_metering("target").await.unwrap().unwrap();
+        assert_eq!(metering.invocations, 1);
+
+        // An unknown target is NotFound (never reaches the engine).
+        let err = invoker.invoke("ghost", request(), 1).await.unwrap_err();
+        assert!(matches!(err, InvokeError::NotFound));
+    }
 
     /// The cron driver: a due cron fires its route (loopback), once per
     /// matching minute (dedup), and with `overlap: Skip` a fire is skipped while

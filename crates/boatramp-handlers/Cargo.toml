@@ -1,6 +1,7 @@
 [package]
 name = "boatramp-handlers"
 version.workspace = true
+readme.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -38,6 +39,10 @@ sql = ["engine"]
 # `boatramp_core::messaging::Messaging` substrate. (Consumer dispatch is the
 # server's job.)
 messaging = ["engine"]
+# The `invoke` binding: one function calls another in-process via the server's
+# `Invoker` (resolution + metering live a layer up). Needs async-trait for the
+# object-safe `Invoker` trait.
+invoke = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true
@@ -55,6 +60,8 @@ hyper = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+# For the object-safe `Invoker` trait behind the `invoke` feature.
+async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

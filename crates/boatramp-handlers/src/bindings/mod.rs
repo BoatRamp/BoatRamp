@@ -21,6 +21,8 @@ use boatramp_core::sql::SqlBackend;
 use boatramp_core::Storage;
 
 pub mod blobstore;
+#[cfg(feature = "invoke")]
+pub mod invoke;
 pub mod keyvalue;
 #[cfg(feature = "messaging")]
 pub mod messaging;
@@ -43,6 +45,10 @@ pub struct Bindings {
     /// `None` = messaging not granted.
     #[cfg(feature = "messaging")]
     messaging: Option<messaging::MessagingBinding>,
+    /// The `invoke` grant (function-to-function calls): the resolver, the target
+    /// allowlist, and this invocation's call depth. `None` = invoke not granted.
+    #[cfg(feature = "invoke")]
+    invoke: Option<invoke::InvokeBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -158,5 +164,30 @@ impl Bindings {
     #[cfg(feature = "messaging")]
     pub(crate) fn messaging(&self) -> Option<&messaging::MessagingBinding> {
         self.messaging.as_ref()
+    }
+
+    /// Grant the `invoke` capability: `invoker` resolves + runs a target,
+    /// `targets` is the allowlist of callable names (`*`-wildcards allowed), and
+    /// `depth` is this invocation's position in the call chain (the host caps the
+    /// next hop at [`invoke::MAX_INVOKE_DEPTH`](invoke::MAX_INVOKE_DEPTH)).
+    #[cfg(feature = "invoke")]
+    pub fn with_invoke(
+        mut self,
+        invoker: Arc<dyn invoke::Invoker>,
+        targets: Vec<String>,
+        depth: u32,
+    ) -> Self {
+        self.invoke = Some(invoke::InvokeBinding {
+            invoker,
+            targets,
+            depth,
+        });
+        self
+    }
+
+    /// The granted invoke binding, if any.
+    #[cfg(feature = "invoke")]
+    pub(crate) fn invoke(&self) -> Option<&invoke::InvokeBinding> {
+        self.invoke.as_ref()
     }
 }

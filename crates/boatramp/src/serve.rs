@@ -973,6 +973,10 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     }
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv);
+    // Wire the function-to-function invoke resolver now the deploy store exists,
+    // so a function granted `invoke` can call a sibling in-process (FI).
+    #[cfg(feature = "handlers")]
+    handlers.set_invoker(deploy.clone());
 
     // Compute reconcile loop. Single-node is always
     // the "leader". Backends are built from the `[compute]` config + capability
@@ -1819,6 +1823,9 @@ async fn run_cluster(
 
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv);
+    // Wire the function-to-function invoke resolver (FI), as in the single-node path.
+    #[cfg(feature = "handlers")]
+    handlers.set_invoker(deploy.clone());
 
     // Compute reconcile loop — leader-gated like cron.
     {

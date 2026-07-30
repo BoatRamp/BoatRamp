@@ -27,7 +27,8 @@ another WASI 0.2 host (`wasmtime`, Spin, `workerd`), and — because the contrac
 the component model, not a boatramp API — it is not locked to us. Instantiation is
 sub-millisecond, the memory footprint is small, and the sandbox is strong: the
 guest can only touch the host capabilities you grant (`wasi:keyvalue`,
-`sql`, `wasi:blobstore`, `wasi:messaging`). Reach for a function first.
+`sql`, `wasi:blobstore`, `wasi:messaging`, and `invoke` — calling another
+function in-process). Reach for a function first.
 
 ## Triggers: the many doors to one function
 
@@ -61,6 +62,38 @@ A function has an **owner**, and the owner sets how it is addressed and versione
   label like `prod` at a version, `rollback` independently — and it is invoked by
   name. This is the FaaS surface: see
   [Deploy & invoke a function](../how-to/functions.md).
+
+## Calling another function in-process
+
+A function reaches a sibling **by name**, without leaving the sandbox for a network
+round-trip, through the `invoke` capability. It is the same HTTP-shaped call the
+platform uses to invoke a function from the outside — method, path, headers, body
+in; status, headers, body back — but it dispatches on the same node, in-process, so
+there is no re-authentication, no extra hop, and the call is metered and
+rate-limited against the *callee's* own quota exactly as an external invoke is.
+
+Grant it like any other capability: the function must import `invoke`, and — because
+letting a compromised function reach *any* internal function would be a real blast
+radius — the operator names an **allowlist** of callable targets. Each entry may use
+`*` wildcards, so one mechanism spans the whole range:
+
+```ron
+// project.cfg — a function that may call one family and one specific sibling
+(
+  imports: ["invoke"],
+  invoke_targets: ["img-*", "audit-log"],  // deny by default: empty ⇒ can call nothing
+)
+```
+
+`["*"]` lets it call any sibling; `["resize"]` exactly one. A call to a name outside
+the list is refused (`target-not-allowed`) before the callee runs. The host also
+caps the function-to-function call **depth**, so a cycle (A→B→A) is stopped with
+`loop-detected` rather than nesting until the node is exhausted — the one guard that
+makes reentrant invocation safe.
+
+Reach for `invoke` to compose functions directly (a thin API function fanning out to
+workers); reach for a [workflow](../how-to/workflows.md) when you want *declarative*
+orchestration with retries, compensation, and durable state.
 
 ## The runtime is a knob, not a different thing
 
