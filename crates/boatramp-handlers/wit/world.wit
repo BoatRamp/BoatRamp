@@ -64,7 +64,10 @@ interface sql-query {
   /// A handle to one of the site's named databases.
   resource database {
     /// Run a row-returning statement (e.g. `SELECT`). Parameter placeholders
-    /// use SQLite syntax (`?1`, `?2`, …); `params` bind them positionally.
+    /// use **numbered SQLite syntax** (`?1`, `?2`, …) on *every* backend — the
+    /// host rewrites them to the engine's native form (Postgres `$N`, MySQL `?`)
+    /// for an external database, so guest SQL stays portable. Writing native
+    /// `$N` / `:name` is rejected. `params` bind positionally by number.
     query: func(statement: string, params: list<value>) -> result<query-result, error>;
 
     /// Run a non-row statement (`INSERT`/`UPDATE`/`DELETE`/DDL); `params` bind

@@ -5,6 +5,27 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.1.2]
+
+### Changed
+- **BREAKING (external SQL): one placeholder syntax everywhere.** The handler
+  `sql` binding's contract is now **numbered `?N` placeholders** (`?1`, `?2`, …)
+  on *every* backend. The external Postgres/MySQL backends previously passed
+  statements through to the driver, so they required the engine's *native* syntax
+  (Postgres `$1`, MySQL `?`); they now take the same `?N` as the managed libsql
+  default and the host rewrites to the native form. Statements are validated
+  fail-closed — native `$N`, bare `?`, `:name`/`@name`, out-of-range indices, and
+  placeholder/parameter miscounts are **rejected** rather than silently bound to
+  the wrong value (closing a cross-tenant wrong-parameter hazard at the `sql`
+  scoping boundary).
+  **Migration:** in guest SQL that targets an external Postgres/MySQL database,
+  change native placeholders to `?N` (mechanical: `$1`→`?1`; a bare `?` →
+  `?1`/`?2`/… in order). Casts move onto the placeholder: `$1::int` → `?1::int`.
+  SQL against the managed libsql default is unaffected. Adds a `sqlparser`
+  dependency (dialect-aware tokenizer) behind the `sql*` features.
+
+[0.1.2]: https://github.com/BoatRamp/BoatRamp/releases/tag/v0.1.2
+
 ## [0.1.1]
 
 ### Added

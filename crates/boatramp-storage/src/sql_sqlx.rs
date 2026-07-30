@@ -35,12 +35,21 @@
 //! (ISO-8601 / canonical form). A column type outside that set is a clear error
 //! naming the type and suggesting a `::text` cast — never a silent wrong value.
 //!
+//! ## Placeholders
+//! The `sql` binding's contract is **numbered `?N` placeholders** (`?1`, `?2`, …)
+//! on every engine — the SQLite/libsql form the WIT interface documents. This
+//! backend rewrites them to the engine's native syntax before execution (Postgres
+//! `$N`; MySQL positional `?`), via [`sql_placeholders`](crate::sql_placeholders),
+//! which also **validates** the statement fail-closed (rejecting native `$N`, bare
+//! `?`, `:name`/`@name`, out-of-range indices, and parameter miscounts) — writing
+//! native `$N`/`?` in guest SQL is refused, not silently accepted.
+//!
 //! ## `NULL` parameter typing
 //! A positional `NULL` bind carries no SQL type in the vocabulary, so it is sent
 //! with text affinity. Postgres is strict about parameter types, so a `NULL`
 //! bound against a non-text column may need an explicit cast on the placeholder
-//! (e.g. `$1::int`); MySQL coerces and is unaffected. Actual (non-null) values
-//! bind with their natural type.
+//! (e.g. `?1::int`, which becomes `$1::int`); MySQL coerces and is unaffected.
+//! Actual (non-null) values bind with their natural type.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -315,6 +324,7 @@ macro_rules! bind_params {
 #[cfg(feature = "sql-postgres")]
 mod postgres_backend {
     use super::{map_err, ExternalSqlOptions};
+    use crate::sql_placeholders::PlaceholderDialect;
     use async_trait::async_trait;
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
     use sqlx::pool::PoolConnection;
@@ -388,13 +398,27 @@ mod postgres_backend {
     #[async_trait]
     impl SqlTransaction for PgTransaction {
         async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<SqlRows, SqlError> {
-            let q = bind_params!(sqlx::query(sql), params);
+            // Rewrite the `?N` contract to Postgres `$N` (same numbering ⇒ natural
+            // bind order) and reject any non-canonical placeholder / miscount.
+            let stmt = crate::sql_placeholders::normalize(
+                sql,
+                PlaceholderDialect::Postgres,
+                params.len(),
+            )?;
+            let bound = stmt.reorder(params);
+            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
         }
 
         async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
-            let q = bind_params!(sqlx::query(sql), params);
+            let stmt = crate::sql_placeholders::normalize(
+                sql,
+                PlaceholderDialect::Postgres,
+                params.len(),
+            )?;
+            let bound = stmt.reorder(params);
+            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
         }
@@ -528,6 +552,7 @@ mod postgres_backend {
 #[cfg(feature = "sql-mysql")]
 mod mysql_backend {
     use super::{map_err, ExternalSqlOptions};
+    use crate::sql_placeholders::PlaceholderDialect;
     use async_trait::async_trait;
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
     use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
@@ -601,13 +626,21 @@ mod mysql_backend {
     #[async_trait]
     impl SqlTransaction for MySqlTransaction {
         async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<SqlRows, SqlError> {
-            let q = bind_params!(sqlx::query(sql), params);
+            // Rewrite the `?N` contract to MySQL positional `?`, reordering the
+            // bound parameters to the placeholders' appearance order.
+            let stmt =
+                crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
+            let bound = stmt.reorder(params);
+            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
         }
 
         async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
-            let q = bind_params!(sqlx::query(sql), params);
+            let stmt =
+                crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
+            let bound = stmt.reorder(params);
+            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
         }

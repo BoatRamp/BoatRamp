@@ -107,13 +107,20 @@ handlers: (
 ```
 
 The guest code is unchanged — the name simply resolves to the external database
-instead of a per-site libsql one:
+instead of a per-site libsql one, and the **placeholders stay `?N`** on every
+engine (the host rewrites them to Postgres `$N` / MySQL `?` for you):
 
 ```rust
 let db = sql::open("analytics")?;               // the configured Postgres
-let rows = db.query("SELECT id, name FROM signups WHERE country = $1",
+let rows = db.query("SELECT id, name FROM signups WHERE country = ?1",
                     &[Value::Text(country)])?;
 ```
+
+> **Placeholders are always `?1`, `?2`, …** — the SQLite-style numbered form —
+> regardless of which engine backs the database. Writing native Postgres `$1` (or
+> a `:name` placeholder) is rejected, so the same SQL is portable across the
+> managed libsql default and an external Postgres/MySQL. Need a cast for a strict
+> Postgres type? Put it on the placeholder: `?1::int`.
 
 Keep these properties in mind — they are the deliberate trade-off of pointing at
 a database boatramp doesn't manage:

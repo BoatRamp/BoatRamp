@@ -44,6 +44,8 @@ pub mod kv_cloudflare;
 
 #[cfg(feature = "sql")]
 pub mod sql_libsql;
+#[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-mysql"))]
+mod sql_placeholders;
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod sql_sqlx;

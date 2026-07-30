@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::sql_placeholders::PlaceholderDialect;
 use async_trait::async_trait;
 use boatramp_core::deploy::sha256_hex;
 use boatramp_core::sql::{
@@ -155,9 +156,14 @@ struct LibsqlTxn {
 #[async_trait]
 impl SqlTransaction for LibsqlTxn {
     async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<SqlRows, SqlError> {
+        // Validate the `?N` placeholder contract (libsql speaks it natively, so no
+        // rewrite); this rejects non-canonical placeholders + parameter miscounts
+        // uniformly, matching the external backends.
+        let stmt =
+            crate::sql_placeholders::normalize(sql, PlaceholderDialect::Sqlite, params.len())?;
         let mut rows = self
             .conn
-            .query(sql, libsql::params_from_iter(to_libsql(params)))
+            .query(&stmt.sql, libsql::params_from_iter(to_libsql(params)))
             .await
             .map_err(SqlError::other)?;
         let columns = (0..rows.column_count())
@@ -175,8 +181,10 @@ impl SqlTransaction for LibsqlTxn {
     }
 
     async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+        let stmt =
+            crate::sql_placeholders::normalize(sql, PlaceholderDialect::Sqlite, params.len())?;
         self.conn
-            .execute(sql, libsql::params_from_iter(to_libsql(params)))
+            .execute(&stmt.sql, libsql::params_from_iter(to_libsql(params)))
             .await
             .map_err(SqlError::other)
     }
