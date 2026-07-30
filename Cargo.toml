@@ -34,7 +34,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
-authors = ["Giacomo Cariello <info@giacomocariello.com>"]
+authors = ["Uranion <boatramp@uranion.ai>"]
 repository = "https://github.com/BoatRamp/BoatRamp"
 readme = "README.md"
 
