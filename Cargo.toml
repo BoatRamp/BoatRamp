@@ -39,7 +39,7 @@ authors = ["Uranion <boatramp@uranion.ai>"]
 repository = "https://github.com/BoatRamp/BoatRamp"
 readme = "README.md"
 homepage = "https://boatramp.dev"
-documentation = "https://boatramp.dev"
+documentation = "https://docs.boatramp.dev"
 keywords = ["serverless", "wasm", "faas", "web-server", "static-site"]
 categories = [
   "web-programming::http-server",
