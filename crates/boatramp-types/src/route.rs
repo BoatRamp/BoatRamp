@@ -765,6 +765,7 @@ mod tests {
             imports: Vec::new(),
             limits: None,
             env: BTreeMap::new(),
+            invoke_targets: Vec::new(),
         };
         let handlers = vec![
             handler("/api/orders/*", &["GET", "POST"]),

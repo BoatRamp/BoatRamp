@@ -866,6 +866,7 @@ mod tests {
                 .collect(),
             limits: None,
             env: BTreeMap::new(),
+            invoke_targets: Vec::new(),
         }
     }
 

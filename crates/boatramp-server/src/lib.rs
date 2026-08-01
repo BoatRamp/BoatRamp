@@ -2288,6 +2288,7 @@ mod tests {
                     imports: vec!["wasi:keyvalue".into()],
                     limits: None,
                     env: std::collections::BTreeMap::new(),
+                    invoke_targets: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),
@@ -2407,6 +2408,7 @@ mod tests {
                     imports: vec!["wasi:keyvalue".into()],
                     limits: None,
                     env: std::collections::BTreeMap::new(),
+                    invoke_targets: Vec::new(),
                 }],
                 crons: vec![CronConfig {
                     schedule: "* * * * *".into(),

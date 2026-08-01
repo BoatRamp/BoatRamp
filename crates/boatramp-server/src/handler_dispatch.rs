@@ -70,6 +70,10 @@ pub(super) async fn dispatch_handler(
         &handler.imports,
         site_handlers,
         &handler.env,
+        &handler.invoke_targets,
+        // A site handler is the entry point of a call chain (reached over HTTP), so it
+        // invokes siblings at depth 0; the host caps each subsequent hop.
+        0,
     )
     .await;
 
@@ -268,6 +272,8 @@ pub(super) async fn build_bindings(
     imports: &[String],
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     deploy_env: &std::collections::BTreeMap<String, String>,
+    invoke_targets: &[String],
+    depth: u32,
 ) -> boatramp_handlers::Bindings {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -302,6 +308,19 @@ pub(super) async fn build_bindings(
         // previews can't touch live topics.
         if let Some(messaging) = &inner.messaging {
             bindings = bindings.with_messaging(format!("{scope}/"), messaging.clone());
+        }
+    }
+    // Function-to-function invoke (FI): a site handler reached over HTTP can call
+    // sibling functions in-process — mirroring the top-level-function path
+    // (`function_runtime::build_function_bindings`). Granted only when the site allows
+    // `invoke`, the handler imports it and names at least one allowed target, and the
+    // runtime has an invoker (set at serve startup). A handler is the *root* of a call
+    // chain, so it invokes at depth 0; the host caps the next hop. The callee's own
+    // Authorization comes from the invoke-request headers, so the guest-side ambient
+    // bearer forwarding reaches it unchanged.
+    if granted("invoke") && !invoke_targets.is_empty() {
+        if let Some(invoker) = inner.invoker.get() {
+            bindings = bindings.with_invoke(invoker.clone(), invoke_targets.to_vec(), depth);
         }
     }
     // Capture stdout/stderr for *every* invocation — not a

@@ -305,6 +305,9 @@ pub(super) async fn run_scheduler_tick(
                         site_handlers,
                         // Consumers have no deploy `env`; site secrets still apply.
                         &std::collections::BTreeMap::new(),
+                        // Consumers do not get the invoke capability (no allowlist field).
+                        &[],
+                        0,
                     )
                     .await;
                     acked += dispatch_consumer_batch(
@@ -437,6 +440,10 @@ async fn fire_cron(
         &handler.imports,
         site_handlers,
         &handler.env,
+        // A cron-triggered handler is also the root of a call chain (depth 0); its
+        // invoke allowlist applies the same as on the HTTP path.
+        &handler.invoke_targets,
+        0,
     )
     .await;
     let limits = effective_limits(site_handlers, handler);

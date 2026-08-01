@@ -91,6 +91,29 @@ caps the function-to-function call **depth**, so a cycle (A→B→A) is stopped 
 `loop-detected` rather than nesting until the node is exhausted — the one guard that
 makes reentrant invocation safe.
 
+The same grant is available to a **site handler** (a `routing.handlers` route in
+`project.cfg`), so a request handler reached over HTTP with the end user's bearer can
+also fan out to sibling functions — the mesh-orchestrator shape. Give the handler
+`imports: ["invoke"]` and its own `invoke_targets`, gated by the site's
+`allow_imports`, exactly as for a function:
+
+```ron
+// project.cfg — a route handler that authenticates the user, then calls workers
+routing: (
+  handlers: [
+    ( route: "/agent/**", component: "orchestrator.wasm", methods: ["POST"],
+      imports: ["invoke"],
+      invoke_targets: ["tool-*"] ),  // deny by default: empty ⇒ can call nothing
+  ],
+),
+```
+
+A handler is the root of a call chain (depth 0), and — unlike the platform's external
+function-invoke path, which stamps the control-plane token — an in-process `invoke`
+passes the caller's request headers through verbatim, so the user's `Authorization`
+reaches the callee unchanged (the guest-side [shim forwards it
+automatically](../how-to/handler-bindings.md)).
+
 Reach for `invoke` to compose functions directly (a thin API function fanning out to
 workers); reach for a [workflow](../how-to/workflows.md) when you want *declarative*
 orchestration with retries, compensation, and durable state.

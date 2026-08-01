@@ -224,6 +224,7 @@ impl DeployConfig {
 /// `sql` is the one generic non-`wasi:` interface.
 const KNOWN_IMPORTS: &[&str] = &[
     "sql",
+    "invoke",
     "wasi:http",
     "wasi:io",
     "wasi:keyvalue",
@@ -426,6 +427,15 @@ pub struct HandlerConfig {
     /// Static environment variables (never secrets).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Function-to-function invoke allowlist (FI): the target names this handler may
+    /// call through the `invoke` capability (same contract as
+    /// [`FunctionConfig::invoke_targets`](crate::function::FunctionConfig)). Each entry
+    /// may use `*` wildcards (`*` = any function, `img-*` = a family, `resize` = one
+    /// literal). Deny by default: empty ⇒ the handler cannot invoke anything, even if it
+    /// imports `invoke`. Only consulted when `imports` contains `invoke` and the site's
+    /// `allow_imports` permits it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invoke_targets: Vec<String>,
 }
 
 /// Per-handler resource limits.
@@ -873,6 +883,7 @@ mod tests {
                 imports: Vec::new(),
                 limits: None,
                 env: BTreeMap::from([("AWS_KEY".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string())]),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         };

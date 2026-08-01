@@ -1499,6 +1499,7 @@ async fn handler_route_dispatches_through_engine() {
             imports: vec!["wasi:keyvalue".to_string()],
             limits: None,
             env: BTreeMap::new(),
+            invoke_targets: Vec::new(),
         }],
         ..Default::default()
     };
@@ -2740,6 +2741,7 @@ async fn activation_during_traffic_drops_no_requests() {
         imports: vec!["wasi:keyvalue".to_string()],
         limits: None,
         env: BTreeMap::new(),
+        invoke_targets: Vec::new(),
     };
     // Two distinct deployments serving the same handler. B adds a (non-matching)
     // redirect so its manifest hashes differently — a real `current` flip.
@@ -2886,6 +2888,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                 imports: vec!["wasi:keyvalue".to_string()],
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3000,6 +3003,7 @@ async fn activation_refuses_broken_component() {
                 imports: Vec::new(),
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3093,6 +3097,7 @@ async fn activation_refuses_disallowed_import() {
                 imports: vec!["wasi:keyvalue".to_string()],
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3178,6 +3183,7 @@ async fn activation_refuses_oversized_component() {
                 imports: vec!["wasi:keyvalue".to_string()],
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3266,6 +3272,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                 imports: vec!["sql".to_string()],
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3384,6 +3391,7 @@ async fn per_site_timeout_cap_applies() {
                 imports: Vec::new(),
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -3861,6 +3869,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 imports: vec!["wasi:keyvalue".to_string()],
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
                 topic: "orders/created".to_string(),
@@ -3993,6 +4002,7 @@ async fn guest_logs_captured_and_served() {
                 imports: Vec::new(),
                 limits: None,
                 env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -4202,6 +4212,7 @@ async fn handler_env_injected_host_env_not_inherited() {
                 imports: Vec::new(),
                 limits: None,
                 env: BTreeMap::from([("GREETING".to_string(), "hello".to_string())]),
+                invoke_targets: Vec::new(),
             }],
             ..Default::default()
         },
@@ -5580,4 +5591,169 @@ async fn cors_off_by_default_no_headers() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+}
+
+// ---- FI: site handlers can invoke sibling functions (mesh orchestrator) ------
+
+/// Deploy the `invoke-caller` guest as a **site handler** (`GET /run`, imports
+/// `invoke`) with `allow_imports`/`invoke_targets` as given, plus an `http-200`
+/// function named `greeter` as its invoke target. Dispatch a request through the real
+/// `router()` and return `(status, body, deploy)`. This mirrors the top-level-function
+/// invoke path — only the caller is a site handler reached over HTTP.
+#[cfg(feature = "handlers")]
+async fn mesh_dispatch(
+    allow_imports: Vec<String>,
+    invoke_targets: Vec<String>,
+) -> (StatusCode, String, DeployStore) {
+    use boatramp_core::config::{DeployConfig, HandlerConfig, HandlersSiteConfig, SiteConfig};
+    use boatramp_core::function::{Function, FunctionVersion, Lifecycle, Owner};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const INVOKE_CALLER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/invoke-caller.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    // The caller (site handler) blob.
+    let caller_hash = sha256_hex(INVOKE_CALLER);
+    let caller_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(INVOKE_CALLER)) }).boxed();
+    deploy.put_blob(&caller_hash, caller_stream).await.unwrap();
+
+    // The callee: a `greeter` function (an http-200 guest that returns a body).
+    let greeter_hash = sha256_hex(HTTP_200);
+    let greeter_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy
+        .put_blob(&greeter_hash, greeter_stream)
+        .await
+        .unwrap();
+    deploy
+        .put_function(&Function {
+            name: "greeter".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: greeter_hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "caller.wasm".to_string(),
+        FileEntry {
+            hash: caller_hash.clone(),
+            size: INVOKE_CALLER.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/run".into(),
+                methods: Vec::new(),
+                component: "caller.wasm".into(),
+                imports: vec!["invoke".into()],
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets,
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy.activate("orch", &id).await.unwrap();
+    deploy
+        .set_site_config(
+            "orch",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    allow_imports,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    // The invoker resolves + runs sibling functions — the same one the top-level
+    // function path uses (`set_invoker`).
+    runtime.set_invoker(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/_sites/orch/run")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned(), deploy)
+}
+
+/// A site handler granted `invoke` with the target on its allowlist reaches the sibling
+/// function and echoes its response — and the callee is metered (quota-admitted) exactly
+/// as on the top-level invoke path.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn site_handler_invokes_a_granted_sibling() {
+    let (status, body, deploy) = mesh_dispatch(vec!["invoke".into()], vec!["greeter".into()]).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The invoke-caller guest echoes `greeter said (<status>): <callee-body>`.
+    assert!(body.starts_with("greeter said (200):"), "body: {body}");
+    // Quota-admission: the callee ran and was metered against `greeter`.
+    let metering = deploy.get_metering("greeter").await.unwrap().unwrap();
+    assert_eq!(metering.invocations, 1);
+}
+
+/// A target outside the handler's `invoke_targets` is refused by the host with
+/// `target-not-allowed`, before the callee runs.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn site_handler_invoke_target_outside_allowlist() {
+    let (status, body, deploy) = mesh_dispatch(vec!["invoke".into()], vec!["other".into()]).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert!(body.contains("not in the allowlist"), "body: {body}");
+    // The callee never ran.
+    assert!(deploy.get_metering("greeter").await.unwrap().is_none());
+}
+
+/// Deny-by-default: `invoke` is imported and allowed, but the handler names **no**
+/// targets, so the capability is not wired and the guest's invoke is access-denied.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn site_handler_empty_targets_cannot_invoke() {
+    let (status, body, _) = mesh_dispatch(vec!["invoke".into()], Vec::new()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert!(body.contains("capability not granted"), "body: {body}");
+}
+
+/// The site can withhold `invoke` entirely: with the capability off the site's
+/// `allow_imports`, it is not wired even though the handler names targets.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn site_handler_invoke_withheld_by_site() {
+    let (status, body, _) = mesh_dispatch(Vec::new(), vec!["greeter".into()]).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert!(body.contains("capability not granted"), "body: {body}");
 }
