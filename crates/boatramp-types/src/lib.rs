@@ -29,6 +29,7 @@ pub mod logs;
 pub mod manifest;
 pub mod matcher;
 pub mod predicate;
+pub mod project;
 pub mod route;
 pub mod security;
 pub mod site;

@@ -36,6 +36,7 @@ pub mod kernel_trust;
 pub mod kv;
 pub mod messaging;
 pub mod mode;
+pub mod project;
 pub mod sql;
 /// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
 pub mod time;
