@@ -695,6 +695,69 @@ impl ControlPlane {
         }
         self.put_file_blob(std::path::Path::new(value)).await
     }
+
+    // ---- projects (0.2.0) ---------------------------------------------------
+
+    /// List every project (`GET /api/projects`).
+    pub async fn list_projects(&self) -> Result<Vec<serde_json::Value>> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/projects"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Create a project (`POST /api/projects`); returns the created project.
+    pub async fn create_project(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .post(format!("{server}/api/projects"))
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Read a project (`GET /api/projects/<name>`).
+    pub async fn get_project(&self, name: &str) -> Result<serde_json::Value> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/projects/{name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Delete a project (`DELETE /api/projects/<name>`). The server refuses a
+    /// non-empty project or the reserved `default`.
+    pub async fn delete_project(&self, name: &str) -> Result<()> {
+        let Self {
+            http: client,
+            base: server,
+        } = self;
+        client
+            .delete(format!("{server}/api/projects/{name}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

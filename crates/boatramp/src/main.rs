@@ -62,6 +62,7 @@ mod mcp;
 mod migrate;
 #[cfg(feature = "operator")]
 mod operator;
+mod project;
 mod security;
 mod serve;
 mod sync;
@@ -131,6 +132,9 @@ enum Command {
     /// Migrate a pre-0.2.0 control-plane store to the project-scoped layout
     /// (`--dry-run` to preview; `--stage`/`--finalize` for a soak window).
     Migrate(migrate::MigrateArgs),
+    /// Manage projects — the owning Workspace above sites/functions/compute
+    /// (`project create|ls|show|rm`).
+    Project(project::ProjectArgs),
     /// Configure DNS + issue wildcard preview certs (requires `--features acme-dns`).
     #[cfg(feature = "acme-dns")]
     Dns(dns::DnsArgs),
@@ -384,6 +388,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Status(args) => manage::status(args, &config).await?,
         Command::Domain(args) => domains::run(args, &config).await?,
         Command::Alias(args) => alias::run(args, &config).await?,
+        Command::Project(args) => project::run(args, &config).await?,
         Command::Access(args) => access::run(args, &config).await?,
         Command::Token(args) => token::run(args, &config).await?,
         Command::Cluster(args) => cluster::run(args, &config).await?,
