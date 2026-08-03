@@ -1328,7 +1328,7 @@ async fn compute_api_crud() {
     let body = serde_json::json!({
         "spec": {
             "version": 1,
-            "rootfs": "a".repeat(64),
+            "root": { "rootfs": "a".repeat(64) },
             "kernel": "b".repeat(64),
             "vcpus": 1,
             "mem_mib": 256,
