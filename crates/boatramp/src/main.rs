@@ -59,6 +59,7 @@ mod logs;
 mod manage;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod migrate;
 #[cfg(feature = "operator")]
 mod operator;
 mod security;
@@ -127,6 +128,9 @@ enum Command {
     Blob(blob::BlobArgs),
     /// Read/change the dynamic daemon config (get/set/rollback/apply, no restart).
     Config(config_cmd::ConfigArgs),
+    /// Migrate a pre-0.2.0 control-plane store to the project-scoped layout
+    /// (`--dry-run` to preview; `--stage`/`--finalize` for a soak window).
+    Migrate(migrate::MigrateArgs),
     /// Configure DNS + issue wildcard preview certs (requires `--features acme-dns`).
     #[cfg(feature = "acme-dns")]
     Dns(dns::DnsArgs),
@@ -320,6 +324,18 @@ async fn async_main() -> Result<(), CliError> {
         return Ok(());
     }
 
+    // `migrate` operates on the same control-plane store `serve` opens, so it reads
+    // the server daemon config (`boatramp.cfg`) — not the project config.
+    if matches!(cli.command, Command::Migrate(_)) {
+        let path = cli.config.unwrap_or_else(|| PathBuf::from("boatramp.cfg"));
+        let config = config::ServerConfig::load(&path)?;
+        let Command::Migrate(args) = cli.command else {
+            unreachable!("guarded by matches! above")
+        };
+        migrate::run(args, &config).await?;
+        return Ok(());
+    }
+
     // `operator` talks to the Kubernetes API (or just emits manifests) — it needs
     // neither the project nor the server config.
     #[cfg(feature = "operator")]
@@ -351,6 +367,7 @@ async fn async_main() -> Result<(), CliError> {
     match cli.command {
         Command::Serve(_) => unreachable!("handled above"),
         Command::Security(_) => unreachable!("handled above"),
+        Command::Migrate(_) => unreachable!("handled above"),
         #[cfg(feature = "operator")]
         Command::Operator(_) => unreachable!("handled above"),
         #[cfg(feature = "mcp")]

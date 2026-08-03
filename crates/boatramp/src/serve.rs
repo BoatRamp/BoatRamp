@@ -7,12 +7,15 @@ use std::sync::Arc;
 use boatramp_core::cache_coherence::Changelog;
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::kv::{CachedKv, KvStore};
+use boatramp_core::migrate;
 use clap::ValueEnum;
 
 use crate::config::ServerConfig;
 
 mod backends;
 
+/// The control-plane KV builder, reused by the standalone `boatramp migrate` command.
+pub(crate) use backends::build_kv as build_control_plane_kv;
 use backends::{build_blobs, build_kv};
 
 /// Control-plane flush interval for SlateDB. Deploys are serialized and a human
@@ -267,6 +270,24 @@ pub enum Error {
     #[cfg(feature = "handlers")]
     #[error(transparent)]
     Handler(#[from] boatramp_handlers::HandlerError),
+    /// The control-plane store holds pre-0.2.0 (layout 1) data and has not been
+    /// migrated to the project-scoped layout. Refusing to serve so a half-read
+    /// store can't silently drop sites/functions. Run `boatramp migrate` (or start
+    /// with `--auto-migrate`).
+    #[error(
+        "the control-plane store is not migrated to the project-scoped (0.2.0) layout; \
+         run `boatramp migrate` first, or start `serve --auto-migrate`"
+    )]
+    UnmigratedStore,
+    /// Running the store migration failed.
+    #[error("store migration failed: {0}")]
+    Migrate(String),
+}
+
+impl From<boatramp_core::migrate::MigrateError> for Error {
+    fn from(e: boatramp_core::migrate::MigrateError) -> Self {
+        Self::Migrate(e.to_string())
+    }
 }
 
 /// `serve` module result; `Err` is [`Error`].
@@ -511,7 +532,7 @@ enum BlobBackend {
 
 /// Metadata (manifest + pointer) backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum KvBackend {
+pub(crate) enum KvBackend {
     /// Transactional LSM over object storage; durable local default
     /// (`<data-dir>/kv-slate`). Requires `--features slatedb` (on by default).
     Slatedb,
@@ -561,6 +582,12 @@ pub struct ServeArgs {
     /// Metadata (KV) backend.
     #[arg(long, value_enum, default_value_t = KvBackend::Slatedb)]
     kv: KvBackend,
+
+    /// Migrate a pre-0.2.0 (layout 1) control-plane store to the project-scoped
+    /// layout at startup instead of refusing to serve. Off by default so the
+    /// re-key is an explicit, one-time operator action (`boatramp migrate`).
+    #[arg(long)]
+    auto_migrate: bool,
 
     /// S3 bucket (required for `--blobs s3`).
     #[arg(long, env = "BOATRAMP_S3_BUCKET")]
@@ -904,7 +931,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         return Err(Error::NoClusterSupport);
     }
 
-    let kv_backend = build_kv(&args, &data_dir).await?;
+    let kv_backend = build_kv(args.kv, &data_dir).await?;
     // Shared-mode coherence: when several processes share
     // one KV, publish each write to a changelog over the *uncached* backend and
     // poll it to invalidate peer-changed keys.
@@ -917,6 +944,37 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         cached = cached.with_publisher(changelog.clone());
     }
     let kv: Arc<dyn KvStore> = Arc::new(cached);
+
+    // Layout guard (0.2.0): refuse to serve a store still on the pre-project layout
+    // 1 — a half-read store would silently drop sites/functions/compute. The operator
+    // migrates explicitly (`boatramp migrate`); `--auto-migrate` opts into an in-place
+    // one-shot migration here. A `2-dual` store serves fine (reads are off the new
+    // keys) and only needs a later `boatramp migrate --finalize` to reclaim old keys.
+    match migrate::status(kv.as_ref()).await? {
+        migrate::Status::Ready => {}
+        migrate::Status::Dual => tracing::warn!(
+            "control-plane store is in the 2-dual soak window; \
+             run `boatramp migrate --finalize` to reclaim the old-layout keys"
+        ),
+        migrate::Status::NeedsMigration => {
+            if args.auto_migrate {
+                tracing::warn!(
+                    "control-plane store is on the pre-0.2.0 layout; running a one-shot \
+                     project re-keying migration (--auto-migrate)"
+                );
+                let report =
+                    migrate::migrate(kv.as_ref(), migrate::MigrateOptions::one_shot()).await?;
+                tracing::info!(
+                    rekeyed = report.total_rekeyed(),
+                    owner_entries = report.owner_entries,
+                    "control-plane store migrated to the project-scoped layout"
+                );
+            } else {
+                return Err(Error::UnmigratedStore);
+            }
+        }
+    }
+
     // Handle for a final flush on graceful shutdown (SHUT-1): `kv` is moved into
     // the deploy store below; this clone reaches its backing store's `flush`.
     let kv_handle = kv.clone();

@@ -72,6 +72,9 @@ pub enum CliError {
     /// The `config` command.
     #[error(transparent)]
     ConfigCmd(#[from] crate::config_cmd::Error),
+    /// The `migrate` command.
+    #[error(transparent)]
+    Migrate(#[from] crate::migrate::Error),
     /// The `logs` / `stats` commands.
     #[error(transparent)]
     Logs(#[from] crate::logs::Error),

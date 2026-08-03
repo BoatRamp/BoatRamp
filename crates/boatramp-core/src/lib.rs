@@ -35,6 +35,8 @@ pub mod ipam;
 pub mod kernel_trust;
 pub mod kv;
 pub mod messaging;
+/// Online, resumable migration of a pre-0.2.0 store to the project-scoped layout.
+pub mod migrate;
 pub mod mode;
 pub mod project;
 pub mod sql;

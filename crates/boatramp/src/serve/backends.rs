@@ -190,8 +190,8 @@ async fn build_s3(
     Err(Error::NoS3Support)
 }
 
-pub(super) async fn build_kv(args: &ServeArgs, data_dir: &Path) -> Result<Arc<dyn KvStore>> {
-    match args.kv {
+pub(crate) async fn build_kv(kv: KvBackend, data_dir: &Path) -> Result<Arc<dyn KvStore>> {
+    match kv {
         KvBackend::Slatedb => build_slatedb_kv(data_dir).await,
         KvBackend::Memory => Ok(Arc::new(MemoryKv::new())),
         KvBackend::Cloudflare => build_cloudflare_kv(),
