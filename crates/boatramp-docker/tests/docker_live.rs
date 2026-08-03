@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use boatramp_core::compute::{ComputeBackend, Health, LaunchRequest};
 use boatramp_docker::DockerBackend;
-use boatramp_types::compute::{ComputeSpec, IsolationRequirement, RestartPolicy};
+use boatramp_types::compute::{ComputeSpec, IsolationRequirement, RestartPolicy, RootSource};
 
 /// A small, widely-cached image with a long-lived entrypoint (no port needed —
 /// health is daemon-`inspect` based).
@@ -23,7 +23,7 @@ const TEST_IMAGE: &str = "alpine:3.20";
 fn spec() -> ComputeSpec {
     ComputeSpec {
         version: 1,
-        rootfs: TEST_IMAGE.to_string(),
+        root: RootSource::Image(TEST_IMAGE.to_string()),
         kernel: String::new(),
         kernel_cmdline: None,
         vcpus: 1,

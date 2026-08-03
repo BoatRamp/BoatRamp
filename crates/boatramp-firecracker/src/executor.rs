@@ -493,14 +493,14 @@ impl Host for SystemHost {
 mod tests {
     use super::*;
     use crate::config::MachineResources;
-    use boatramp_types::compute::{ComputeSpec, RestartPolicy};
+    use boatramp_types::compute::{ComputeSpec, RestartPolicy, RootSource};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     fn machine() -> FcMachine {
         let spec = ComputeSpec {
             version: 1,
-            rootfs: "r".repeat(64),
+            root: RootSource::Rootfs("r".repeat(64)),
             kernel: "k".repeat(64),
             kernel_cmdline: None,
             vcpus: 1,

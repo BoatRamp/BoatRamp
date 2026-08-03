@@ -19,7 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, Scheme,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -226,7 +226,17 @@ impl ComputeBackend for ContainerBackend {
     }
 
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
-        let dir = self.stage_rootfs(&spec.rootfs).await?;
+        // The native container runtime stages + unpacks a **tar** rootfs archive; an
+        // image reference belongs to `docker`, an ext4 image to the micro-VM.
+        let hash = match &spec.root {
+            RootSource::Tar(hash) => hash,
+            RootSource::Image(_) | RootSource::Rootfs(_) => {
+                return Err(BackendError::Materialize(
+                    "container backend requires a tar rootfs archive (RootSource::Tar)".into(),
+                ))
+            }
+        };
+        let dir = self.stage_rootfs(hash).await?;
         Ok(Artifact::Rootfs {
             dir: dir.display().to_string(),
         })
@@ -815,7 +825,7 @@ mod tests {
     fn spec_for(hash: &str) -> ComputeSpec {
         ComputeSpec {
             version: 1,
-            rootfs: hash.into(),
+            root: RootSource::Tar(hash.into()),
             kernel: String::new(),
             kernel_cmdline: None,
             vcpus: 1,

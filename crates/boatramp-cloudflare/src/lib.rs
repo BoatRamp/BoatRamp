@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource,
 };
 
 /// A Cloudflare Containers instance tier. The vCPU/memory envelope is fixed by
@@ -122,13 +122,13 @@ pub struct CfContainer {
 }
 
 impl CfContainer {
-    /// Map a workload's `spec` (at `instances` replicas) to its CF-Container
-    /// entry. The image is the spec's `rootfs` (for the CF/docker backends the
-    /// `rootfs` field is an OCI image reference, not a blob hash).
+    /// Map a workload's `spec` (at `instances` replicas) to its CF-Container entry.
+    /// The image is the spec's [`RootSource::Image`] reference; the CF backend rejects
+    /// a non-image source at `materialize`, so this mapper reads the reference directly.
     pub fn for_spec(workload: &str, spec: &ComputeSpec, instances: u32) -> Self {
         Self {
             class_name: class_name_for(workload),
-            image: spec.rootfs.clone(),
+            image: spec.root.as_str().to_string(),
             instances,
             instance_type: InstanceType::for_mem(spec.mem_mib),
         }
@@ -201,16 +201,22 @@ impl ComputeBackend for CloudflareBackend {
     }
 
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
-        // For the CF backend the spec's `rootfs` is an OCI image reference the
-        // platform pulls; nothing to stage locally.
-        if spec.rootfs.is_empty() {
-            return Err(BackendError::Materialize(
-                "cloudflare backend needs an OCI image reference in spec.rootfs".into(),
-            ));
-        }
-        Ok(Artifact::Image {
-            reference: spec.rootfs.clone(),
-        })
+        // The CF backend pulls an OCI image reference; nothing to stage locally. An
+        // ext4 rootfs is not runnable here.
+        let reference = match &spec.root {
+            RootSource::Image(reference) if !reference.is_empty() => reference.clone(),
+            RootSource::Image(_) => {
+                return Err(BackendError::Materialize(
+                    "cloudflare backend needs a non-empty OCI image reference".into(),
+                ))
+            }
+            RootSource::Tar(_) | RootSource::Rootfs(_) => {
+                return Err(BackendError::Materialize(
+                    "cloudflare backend requires an image reference (RootSource::Image)".into(),
+                ))
+            }
+        };
+        Ok(Artifact::Image { reference })
     }
 
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
@@ -261,7 +267,7 @@ mod tests {
     fn spec(mem_mib: u32, image: &str) -> ComputeSpec {
         ComputeSpec {
             version: 1,
-            rootfs: image.into(),
+            root: RootSource::Image(image.into()),
             kernel: String::new(),
             kernel_cmdline: None,
             vcpus: 1,

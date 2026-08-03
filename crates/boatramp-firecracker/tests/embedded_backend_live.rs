@@ -63,10 +63,10 @@ fn ip(args: &[&str]) -> bool {
 }
 
 fn sample_spec() -> ComputeSpec {
-    use boatramp_types::compute::{IsolationRequirement, RestartPolicy};
+    use boatramp_types::compute::{IsolationRequirement, RestartPolicy, RootSource};
     ComputeSpec {
         version: 1,
-        rootfs: "r".repeat(64),
+        root: RootSource::Rootfs("r".repeat(64)),
         kernel: "k".repeat(64),
         // Deterministic cmdline: the guest gets `.2` (first pool IP) + a `/bin/sh`
         // init so the read-only squashfs stays alive for the probe. The backend

@@ -353,14 +353,15 @@ Manage Firecracker microVM compute workloads. See
 | `build <name> …` | Build an ext4 rootfs from an OCI image, upload it, and set the workload (needs `mke2fs`). |
 | `rm <name>` | Remove a workload (its replicas are stopped). |
 
-`set` flags (`build` shares the runtime flags and replaces `--rootfs` with
-`--image` + `--size-mib`):
+`set` takes exactly one **root-filesystem source** (matched to the substrate);
+`build` instead takes `--image` + `--size-mib` and produces a `--rootfs` source:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rootfs <hash\|file\|url>` | — | The ext4 rootfs image (`set` only). A blob hash, a local file, or a URL (file/URL is uploaded for you). Required. |
-| `--image <ref>` | — | OCI image to build a rootfs from (`build` only). Required. |
-| `--kernel <hash\|file\|url>` | — | The vmlinux kernel the microVM boots — a blob hash, a local file, or a URL. Required. See [the kernel note](#the-kernel-blob). |
+| `--image <ref>` | — | An OCI image reference the runtime pulls (`set`: docker/cloudflare). On `build`, the OCI image to build an ext4 rootfs *from*. |
+| `--tar <hash\|file\|url>` | — | A tar rootfs archive for the native `container` substrate (`set` only). A blob hash, a local file, or a URL (file/URL is uploaded). |
+| `--rootfs <hash\|file\|url>` | — | A rootfs filesystem image (a block device — `ext4` by default, or any filesystem the guest kernel mounts) for the `firecracker` micro-VM (`set` only). A blob hash, a local file, or a URL (file/URL is uploaded). |
+| `--kernel <hash\|file\|url>` | — | The vmlinux kernel the micro-VM boots (a `--rootfs` / `build` workload) — a blob hash, a local file, or a URL. See [the kernel note](#the-kernel-blob). |
 | `--size-mib <n>` | `1024` | ext4 rootfs image size (`build` only). |
 | `--port <n>` | — | In-guest TCP port the app listens on. Required. |
 | `--vcpus <n>` | `1` | Virtual CPUs. |

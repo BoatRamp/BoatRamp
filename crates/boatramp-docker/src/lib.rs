@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, Scheme,
+    InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource, Scheme,
 };
 use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
@@ -130,9 +130,16 @@ impl ComputeBackend for DockerBackend {
     }
 
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
-        // For the docker backend the spec's `rootfs` is an OCI **image
-        // reference** the daemon can pull (registry/repo:tag or a digest).
-        let reference = spec.rootfs.clone();
+        // The docker backend pulls an OCI **image reference** (registry/repo:tag or a
+        // digest); an ext4 rootfs is not runnable here.
+        let reference = match &spec.root {
+            RootSource::Image(reference) => reference.clone(),
+            RootSource::Tar(_) | RootSource::Rootfs(_) => {
+                return Err(BackendError::Materialize(
+                    "docker backend requires an image reference (RootSource::Image)".into(),
+                ))
+            }
+        };
         let options = CreateImageOptions {
             from_image: reference.clone(),
             ..Default::default()

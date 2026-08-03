@@ -30,7 +30,7 @@ use boatramp_core::ipam::IpPool;
 use boatramp_firecracker::config::{FcMachine, MachineResources};
 use boatramp_firecracker::executor::{Executor, ExecutorConfig, SystemHost};
 use boatramp_firecracker::net::{NodeNetwork, TapNetwork};
-use boatramp_types::compute::{ComputeSpec, RestartPolicy};
+use boatramp_types::compute::{ComputeSpec, RestartPolicy, RootSource};
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
@@ -39,7 +39,7 @@ fn env(key: &str) -> Option<String> {
 fn spec() -> ComputeSpec {
     ComputeSpec {
         version: 1,
-        rootfs: "0".repeat(64),
+        root: RootSource::Rootfs("0".repeat(64)),
         kernel: "0".repeat(64),
         kernel_cmdline: None,
         vcpus: 1,

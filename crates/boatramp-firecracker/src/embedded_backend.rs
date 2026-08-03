@@ -33,7 +33,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, Scheme, Snapshot, VolumeRef,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot, VolumeRef,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -663,7 +663,17 @@ impl ComputeBackend for EmbeddedVmmBackend {
     }
 
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
-        let rootfs_path = self.stage_blob(&spec.rootfs, "rootfs", ".ext4").await?;
+        // The microVM boots an `ext4` rootfs; an OCI image reference must be built into
+        // one first (`compute build`), so it is not runnable here directly.
+        let rootfs_hash = match &spec.root {
+            RootSource::Rootfs(hash) => hash,
+            RootSource::Image(_) | RootSource::Tar(_) => {
+                return Err(BackendError::Materialize(
+                    "embedded VMM requires a rootfs image (RootSource::Rootfs)".into(),
+                ))
+            }
+        };
+        let rootfs_path = self.stage_blob(rootfs_hash, "rootfs", ".ext4").await?;
         let kernel_path = self.stage_blob(&spec.kernel, "kernels", "").await?;
         // Verify-before-boot: the staged kernel is ring-0 code, so it clears the
         // posture bar (content hash — always; allow-list + signature under strict)

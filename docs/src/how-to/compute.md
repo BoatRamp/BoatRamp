@@ -19,7 +19,7 @@ filesystem. Supply a Firecracker-compatible uncompressed Linux kernel (`vmlinux`
 — build one, or use a released microVM kernel — provisioned once and shared across
 every workload.
 
-`--kernel` (like `--rootfs`) accepts any of three forms: a **local file**, a
+`--kernel` (like `--tar` / `--rootfs`) accepts any of three forms: a **local file**, a
 **URL**, or a **blob hash** already in the store. Point it straight at a file or
 URL and the CLI uploads it for you:
 
@@ -131,12 +131,21 @@ Under the strict `multi-tenant` security posture, shared-kernel (container)
 compute is disabled, so every workload runs in a microVM regardless of
 `--isolation`. See [Choose a security posture](./security-posture.md).
 
-## Set a workload from existing blobs
+## Set a workload from an existing source
 
-If you already pushed a rootfs and kernel, register the workload directly with
-`compute set` (same flags as `build`, minus the image build):
+`compute set` registers a workload from a **root-filesystem source** — exactly one
+of, matched to the substrate you want:
+
+- `--image <ref>` — an OCI image reference the runtime pulls (`docker` / `cloudflare`).
+- `--tar <hash|file|url>` — a tar rootfs archive the native `container` runtime unpacks.
+- `--rootfs <hash|file|url>` — a rootfs filesystem image (a block device; `ext4` by
+  default) the `firecracker` micro-VM attaches.
 
 ```sh
+# A registry image on the docker backend (e.g. a database):
+boatramp compute set pg --image pgvector/pgvector:pg16 --port 5432 --env POSTGRES_PASSWORD=pw
+
+# A pre-built ext4 rootfs + kernel on the micro-VM backend:
 boatramp compute set api \
   --rootfs <rootfs-blob-hash> --kernel <vmlinux-blob-hash> \
   --port 8080 --replicas 3 \

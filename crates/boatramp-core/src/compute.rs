@@ -878,7 +878,7 @@ mod tests {
     fn spec(vcpus: u32, mem_mib: u32) -> ComputeSpec {
         ComputeSpec {
             version: 1,
-            rootfs: "r".repeat(64),
+            root: RootSource::Rootfs("r".repeat(64)),
             kernel: "k".repeat(64),
             kernel_cmdline: None,
             vcpus,

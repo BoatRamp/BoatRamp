@@ -186,13 +186,13 @@ impl SandboxPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boatramp_types::compute::{IsolationRequirement, RestartPolicy};
+    use boatramp_types::compute::{IsolationRequirement, RestartPolicy, RootSource};
     use std::collections::BTreeMap;
 
     fn spec(vcpus: u32, mem_mib: u32) -> ComputeSpec {
         ComputeSpec {
             version: 1,
-            rootfs: "r".repeat(64),
+            root: RootSource::Tar("r".repeat(64)),
             kernel: "k".repeat(64),
             kernel_cmdline: None,
             vcpus,

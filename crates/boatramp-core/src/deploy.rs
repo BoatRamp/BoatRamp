@@ -3309,11 +3309,13 @@ mod tests {
 
     #[tokio::test]
     async fn compute_store_round_trips() {
-        use crate::compute::{ComputeSpec, ComputeWorkload, PlacementConstraints, RestartPolicy};
+        use crate::compute::{
+            ComputeSpec, ComputeWorkload, PlacementConstraints, RestartPolicy, RootSource,
+        };
         let s = store();
         let spec = ComputeSpec {
             version: crate::SCHEMA_VERSION,
-            rootfs: "r".repeat(64),
+            root: RootSource::Rootfs("r".repeat(64)),
             kernel: "k".repeat(64),
             kernel_cmdline: None,
             vcpus: 1,

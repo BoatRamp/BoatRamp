@@ -1,13 +1,23 @@
-//! The `compute` subcommand: define/list/remove Firecracker microVM workloads.
-//! The control plane is uniform (runs anywhere); only execution
-//! needs a KVM node. `set` takes a rootfs + kernel as a **blob hash, a local
-//! file, or a URL** (a file/URL is uploaded for you, like `blob put`); building
-//! an `ext4` rootfs from an OCI image is done by `compute build`.
+//! The `compute` subcommand: define/list/remove workloads across the compute
+//! substrates (micro-VM / container / docker). The control plane is uniform (runs
+//! anywhere); only execution needs a capable node. `set` picks the workload's
+//! **root-filesystem source** — exactly one of, matched to the target substrate:
+//!   * `--image <ref>` — an **OCI image reference** the runtime pulls (docker /
+//!     cloudflare); passed through verbatim.
+//!   * `--tar <artifact>` — a **tar rootfs archive** the native `container` runtime
+//!     stages + unpacks.
+//!   * `--rootfs <artifact>` — a **rootfs filesystem image** (a block device; `ext4`
+//!     by default, or any filesystem the guest kernel mounts) the `firecracker`
+//!     micro-VM stages + attaches.
+//!
+//! A `--tar`/`--rootfs` artifact is a blob hash, a local file, or a URL (a file/URL is
+//! uploaded like `blob put`). `compute build` builds an `ext4` rootfs *from* an OCI
+//! image (needs `mke2fs`).
 
 use std::collections::BTreeMap;
 
 use boatramp_core::compute::{
-    ComputeSpec, IsolationRequirement, PlacementConstraints, RestartPolicy,
+    ComputeSpec, IsolationRequirement, PlacementConstraints, RestartPolicy, RootSource,
 };
 use clap::Subcommand;
 use serde::Serialize;
@@ -33,6 +43,10 @@ pub enum Error {
     /// An `--env` argument was not `K=V`.
     #[error("--env must be K=V, got {0:?}")]
     BadEnv(String),
+    /// The `--image` / `--tar` / `--rootfs` root-filesystem source was not specified
+    /// correctly (none, or more than one).
+    #[error("{0}")]
+    Args(String),
     /// Building the ext4 rootfs from the OCI image failed.
     #[error("rootfs build failed: {0}")]
     RootfsBuild(String),
@@ -65,11 +79,23 @@ enum ComputeCommand {
     Set {
         /// Workload name.
         name: String,
-        /// ext4 rootfs image: a blob hash, a local file, or a URL (file/URL is uploaded).
-        #[arg(long)]
-        rootfs: String,
+        /// An **OCI image reference** (`repo:tag` or a digest) a runtime pulls, e.g.
+        /// `pgvector/pgvector:pg16`. For the docker / cloudflare substrates. Passed
+        /// through verbatim (not uploaded). Exactly one of --image / --tar / --rootfs.
+        #[arg(long, group = "root")]
+        image: Option<String>,
+        /// A **tar rootfs archive**: a blob hash, a local file, or a URL (file/URL is
+        /// uploaded). For the native `container` substrate (staged + unpacked).
+        #[arg(long, group = "root")]
+        tar: Option<String>,
+        /// A **rootfs filesystem image** (a block device — `ext4` by default, or any
+        /// filesystem the guest kernel mounts): a blob hash, a local file, or a URL
+        /// (file/URL is uploaded). For the `firecracker` micro-VM (staged + attached).
+        #[arg(long, group = "root")]
+        rootfs: Option<String>,
         /// vmlinux kernel: a blob hash, a local file, or a URL (file/URL is
-        /// uploaded). Omit to use the node's configured default kernel.
+        /// uploaded). Omit to use the node's configured default kernel. Applies only
+        /// to a `--rootfs` (micro-VM) workload.
         #[arg(long)]
         kernel: Option<String>,
         /// Virtual CPUs.
@@ -239,6 +265,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
         }
         ComputeCommand::Set {
             name,
+            image,
+            tar,
             rootfs,
             kernel,
             vcpus,
@@ -252,14 +280,31 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             isolation,
             regions,
         } => {
-            // `--rootfs` / `--kernel` accept a blob hash, a local file, or a URL.
-            let rootfs = cp.resolve_artifact(&rootfs).await?;
+            // Exactly one of `--image` (an OCI reference, verbatim), `--tar` (a rootfs
+            // archive, uploaded), or `--rootfs` (a rootfs filesystem image, uploaded)
+            // picks the root-filesystem source. Clap's `root` group enforces at-most-one.
+            let root = match (image, tar, rootfs) {
+                (Some(i), None, None) => RootSource::Image(i),
+                (None, Some(t), None) => RootSource::Tar(cp.resolve_artifact(&t).await?),
+                (None, None, Some(r)) => RootSource::Rootfs(cp.resolve_artifact(&r).await?),
+                (None, None, None) => {
+                    return Err(Error::Args(
+                        "one of --image, --tar, or --rootfs is required".into(),
+                    ))
+                }
+                _ => {
+                    return Err(Error::Args(
+                        "give only one of --image, --tar, or --rootfs".into(),
+                    ))
+                }
+            };
+            // `--kernel` accepts a blob hash, a local file, or a URL.
             let kernel = match kernel {
                 Some(k) => cp.resolve_artifact(&k).await?,
                 None => String::new(), // empty ⇒ the node substitutes its default
             };
             let spec = build_spec(
-                rootfs,
+                root,
                 kernel,
                 vcpus,
                 mem_mib,
@@ -324,7 +369,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             let _ = std::fs::remove_file(&out);
             eprintln!("rootfs blob {rootfs} uploaded");
             let spec = build_spec(
-                rootfs,
+                RootSource::Rootfs(rootfs),
                 kernel,
                 vcpus,
                 mem_mib,
@@ -352,7 +397,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
 /// Assemble a [`ComputeSpec`] from CLI fields (parsing `K=V` env pairs).
 #[allow(clippy::too_many_arguments)]
 fn build_spec(
-    rootfs: String,
+    root: RootSource,
     kernel: String,
     vcpus: u32,
     mem_mib: u32,
@@ -372,7 +417,7 @@ fn build_spec(
     }
     Ok(ComputeSpec {
         version: boatramp_core::SCHEMA_VERSION,
-        rootfs,
+        root,
         kernel,
         kernel_cmdline: None,
         vcpus,

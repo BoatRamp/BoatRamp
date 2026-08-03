@@ -66,6 +66,41 @@ impl IsolationRequirement {
     }
 }
 
+/// The source of a workload's **root filesystem**. Each variant is one concrete
+/// artifact form, matched 1:1 to the backends that accept it — modelled explicitly
+/// rather than overloading one string, because an image reference, a tar archive, and
+/// a rootfs block image are genuinely different things and a mismatch should be a
+/// typed error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootSource {
+    /// An **OCI image reference** (`repo:tag` or a digest) a runtime **pulls** from a
+    /// registry; its unpacked layers become the root filesystem. Backends: `docker`,
+    /// `cloudflare`. [`ComputeSpec::kernel`] does not apply.
+    Image(String),
+    /// A **tar rootfs archive** — a blob hash in the shared store — that the node
+    /// **stages and unpacks** into a directory to run. Backend: the native `container`
+    /// runtime. [`ComputeSpec::kernel`] does not apply.
+    Tar(String),
+    /// A **rootfs filesystem image** — a blob hash in the shared store — that the node
+    /// **stages and attaches** as the guest's root **block device**. The filesystem is
+    /// opaque to boatramp: the guest kernel mounts whatever it finds (`ext4` by
+    /// default, since `compute build` uses `mke2fs`, but any kernel-supported
+    /// filesystem works). Backend: the `firecracker` micro-VM, which pairs it with
+    /// [`ComputeSpec::kernel`].
+    Rootfs(String),
+}
+
+impl RootSource {
+    /// The underlying reference string (an image reference for [`RootSource::Image`],
+    /// a blob hash for [`RootSource::Tar`] / [`RootSource::Rootfs`]).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Image(s) | Self::Tar(s) | Self::Rootfs(s) => s,
+        }
+    }
+}
+
 /// A persistent volume attached to the guest (a host block image, snapshotted
 /// to blob storage for durability). Opt-in; the default rootfs is read-only with
 /// an ephemeral scratch drive.
@@ -89,9 +124,12 @@ pub struct ComputeSpec {
     /// Pinned schema discriminant (`v1`).
     #[serde(default = "crate::schema_version")]
     pub version: u32,
-    /// Blob hash of the `ext4` rootfs image.
-    pub rootfs: String,
-    /// Blob hash of the `vmlinux` kernel (shared across workloads).
+    /// The source of the workload's root filesystem: an OCI image reference, a tar
+    /// rootfs archive, or a rootfs filesystem image, per the target substrate (see
+    /// [`RootSource`]).
+    pub root: RootSource,
+    /// Blob hash of the `vmlinux` kernel (shared across workloads). Applies only to
+    /// the micro-VM substrate (a [`RootSource::Rootfs`] source); ignored otherwise.
     pub kernel: String,
     /// Kernel boot cmdline override; `None` uses the executor default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,7 +232,7 @@ mod tests {
     fn spec() -> ComputeSpec {
         ComputeSpec {
             version: crate::SCHEMA_VERSION,
-            rootfs: "a".repeat(64),
+            root: RootSource::Rootfs("a".repeat(64)),
             kernel: "b".repeat(64),
             kernel_cmdline: None,
             vcpus: 2,
