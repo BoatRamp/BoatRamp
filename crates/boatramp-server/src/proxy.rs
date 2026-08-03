@@ -5,6 +5,7 @@
 //! the serve scope in via `use super::*`.
 
 use super::*;
+use boatramp_core::project::ProjectRef;
 
 /// Reverse-proxy a GET to an absolute upstream URL, streaming the response.
 ///
@@ -274,7 +275,7 @@ pub(super) async fn dispatch_gateway(
 /// Empty (→ 502) when no healthy replica exists.
 pub(super) async fn compute_endpoints(deploy: &DeployStore, workload: &str) -> Vec<String> {
     deploy
-        .list_replica_states(workload)
+        .list_replica_states(ProjectRef::DEFAULT, workload)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -292,7 +293,7 @@ pub(super) async fn compute_endpoint_regions(
     workload: &str,
 ) -> std::collections::BTreeMap<String, String> {
     deploy
-        .list_replica_states(workload)
+        .list_replica_states(ProjectRef::DEFAULT, workload)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -314,7 +315,7 @@ pub(super) const COMPUTE_WAKE_TIMEOUT: std::time::Duration = std::time::Duration
 /// [`Zero`]: boatramp_core::compute::ReplicaPhase::Zero
 pub(super) async fn has_parked_replica(deploy: &DeployStore, workload: &str) -> bool {
     deploy
-        .list_replica_states(workload)
+        .list_replica_states(ProjectRef::DEFAULT, workload)
         .await
         .unwrap_or_default()
         .iter()

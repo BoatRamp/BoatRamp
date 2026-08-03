@@ -6,6 +6,7 @@
 //! `use super::*`.
 
 use super::*;
+use boatramp_core::project::ProjectRef;
 
 /// A request's network identity, threaded into the serving pipeline for
 /// access control: the socket peer plus the shared rate limiter.
@@ -177,7 +178,7 @@ pub(super) async fn serve_by_host(
         .await;
     }
     match deploy.resolve_site_by_host(&host).await {
-        Ok(Some(site)) => {
+        Ok(Some(owner)) => {
             let visitor = Visitor {
                 peer: peer.ip(),
                 limiter: limiter.as_ref(),
@@ -185,7 +186,7 @@ pub(super) async fn serve_by_host(
             // Host-routed: transport/canonical redirects + HSTS apply.
             serve_request(
                 &deploy,
-                &site,
+                &owner.site,
                 &request_path,
                 request,
                 &visitor,
@@ -215,7 +216,12 @@ pub(super) async fn serve_by_host(
             // (A) First host label naming a served site: `blog.localhost` → `blog`.
             if implicit.0 {
                 let label = host.split('.').next().unwrap_or("");
-                if !label.is_empty() && matches!(deploy.current_id(label).await, Ok(Some(_))) {
+                if !label.is_empty()
+                    && matches!(
+                        deploy.current_id(ProjectRef::DEFAULT, label).await,
+                        Ok(Some(_))
+                    )
+                {
                     let visitor = Visitor {
                         peer: peer.ip(),
                         limiter: limiter.as_ref(),
@@ -278,11 +284,11 @@ async fn serve_host_preview(
         Err(err) => return deploy_error_response(err),
     };
     let site = match deploy.resolve_site_by_host(site_host).await {
-        Ok(site) => site,
+        Ok(owner) => owner.map(|o| o.site),
         Err(err) => return deploy_error_response(err),
     };
     let site_config = match &site {
-        Some(site) => match deploy.get_site_config(site).await {
+        Some(site) => match deploy.get_site_config(ProjectRef::DEFAULT, site).await {
             Ok(config) => config,
             Err(err) => return deploy_error_response(err),
         },
@@ -322,7 +328,7 @@ async fn serve_request(
     host_routed: bool,
 ) -> Response {
     // Load the site config once (for access policy + client-IP resolution).
-    let site_config = match deploy.get_site_config(site).await {
+    let site_config = match deploy.get_site_config(ProjectRef::DEFAULT, site).await {
         Ok(config) => config,
         Err(err) => return deploy_error_response(err),
     };
@@ -435,7 +441,7 @@ async fn serve_request(
         }
     }
 
-    let manifest = match deploy.current_manifest(site).await {
+    let manifest = match deploy.current_manifest(ProjectRef::DEFAULT, site).await {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return not_found(),
         Err(err) => return deploy_error_response(err),
@@ -700,13 +706,13 @@ pub(super) async fn serve_preview(
         .map(strip_port);
     let site = match site {
         Some(host) => match deploy.resolve_site_by_host(host).await {
-            Ok(site) => site,
+            Ok(owner) => owner.map(|o| o.site),
             Err(err) => return deploy_error_response(err),
         },
         None => None,
     };
     let site_config = match &site {
-        Some(site) => match deploy.get_site_config(site).await {
+        Some(site) => match deploy.get_site_config(ProjectRef::DEFAULT, site).await {
             Ok(config) => config,
             Err(err) => return deploy_error_response(err),
         },

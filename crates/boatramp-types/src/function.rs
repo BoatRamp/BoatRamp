@@ -641,39 +641,58 @@ impl Metering {
     }
 }
 
-/// KV keyspace for a function (mirrors the deploy/alias immutability model).
 pub mod keys {
+    //! KV keyspace for a function (mirrors the deploy/alias immutability model), all
+    //! **project-scoped** under `project/<proj>/…` (0.2.0). `project` is passed as a
+    //! bare `&str` (this crate is wasm-clean and has no `ProjectRef`); callers in
+    //! `boatramp-core` pass `ProjectRef::as_str()`.
+
     /// Function metadata.
-    pub fn meta(name: &str) -> String {
-        format!("functions/{name}")
+    pub fn meta(project: &str, name: &str) -> String {
+        format!("project/{project}/functions/{name}")
     }
     /// An immutable version.
-    pub fn version(name: &str, id: &str) -> String {
-        format!("functions/{name}/versions/{id}")
+    pub fn version(project: &str, name: &str, id: &str) -> String {
+        format!("project/{project}/functions/{name}/versions/{id}")
     }
     /// A named alias → version id.
-    pub fn alias(name: &str, label: &str) -> String {
-        format!("functions/{name}/alias/{label}")
+    pub fn alias(project: &str, name: &str, label: &str) -> String {
+        format!("project/{project}/functions/{name}/alias/{label}")
     }
     /// A trigger bound to the function.
-    pub fn trigger(name: &str, id: &str) -> String {
-        format!("functions/{name}/triggers/{id}")
+    pub fn trigger(project: &str, name: &str, id: &str) -> String {
+        format!("project/{project}/functions/{name}/triggers/{id}")
     }
     /// A durable invocation record.
-    pub fn invocation(name: &str, id: &str) -> String {
-        format!("functions/{name}/invocations/{id}")
+    pub fn invocation(project: &str, name: &str, id: &str) -> String {
+        format!("project/{project}/functions/{name}/invocations/{id}")
     }
     /// The prefix under which all of a function's invocations live (queue scan).
-    pub fn invocations_prefix(name: &str) -> String {
-        format!("functions/{name}/invocations/")
+    pub fn invocations_prefix(project: &str, name: &str) -> String {
+        format!("project/{project}/functions/{name}/invocations/")
     }
     /// An idempotency key → invocation id pointer.
-    pub fn idempotency(name: &str, key: &str) -> String {
-        format!("functions/{name}/idem/{key}")
+    pub fn idempotency(project: &str, name: &str, key: &str) -> String {
+        format!("project/{project}/functions/{name}/idem/{key}")
     }
     /// The function's usage-metering aggregate (FA-4).
-    pub fn metering(name: &str) -> String {
-        format!("metering/{name}")
+    pub fn metering(project: &str, name: &str) -> String {
+        format!("project/{project}/metering/{name}")
+    }
+
+    /// The prefix listing every function record in a project (`meta` keys). A
+    /// function record's key has no further `/` after its name, so a lister filters
+    /// on that to skip the per-function sub-records.
+    pub fn functions_prefix(project: &str) -> String {
+        format!("project/{project}/functions/")
+    }
+    /// The prefix listing a function's triggers.
+    pub fn triggers_prefix(project: &str, name: &str) -> String {
+        format!("project/{project}/functions/{name}/triggers/")
+    }
+    /// The prefix listing every metering aggregate in a project.
+    pub fn metering_prefix(project: &str) -> String {
+        format!("project/{project}/metering/")
     }
 }
 
@@ -1210,28 +1229,42 @@ mod tests {
 
     #[test]
     fn keyspace_is_stable() {
-        assert_eq!(keys::meta("resize"), "functions/resize");
         assert_eq!(
-            keys::version("resize", "v1"),
-            "functions/resize/versions/v1"
-        );
-        assert_eq!(keys::alias("resize", "prod"), "functions/resize/alias/prod");
-        assert_eq!(
-            keys::trigger("resize", "t1"),
-            "functions/resize/triggers/t1"
+            keys::meta("default", "resize"),
+            "project/default/functions/resize"
         );
         assert_eq!(
-            keys::invocation("resize", "inv-1"),
-            "functions/resize/invocations/inv-1"
+            keys::version("default", "resize", "v1"),
+            "project/default/functions/resize/versions/v1"
         );
         assert_eq!(
-            keys::invocations_prefix("resize"),
-            "functions/resize/invocations/"
+            keys::alias("default", "resize", "prod"),
+            "project/default/functions/resize/alias/prod"
         );
         assert_eq!(
-            keys::idempotency("resize", "k-1"),
-            "functions/resize/idem/k-1"
+            keys::trigger("default", "resize", "t1"),
+            "project/default/functions/resize/triggers/t1"
         );
-        assert_eq!(keys::metering("resize"), "metering/resize");
+        assert_eq!(
+            keys::invocation("default", "resize", "inv-1"),
+            "project/default/functions/resize/invocations/inv-1"
+        );
+        assert_eq!(
+            keys::invocations_prefix("default", "resize"),
+            "project/default/functions/resize/invocations/"
+        );
+        assert_eq!(
+            keys::idempotency("default", "resize", "k-1"),
+            "project/default/functions/resize/idem/k-1"
+        );
+        assert_eq!(
+            keys::metering("default", "resize"),
+            "project/default/metering/resize"
+        );
+        // A project other than the default keys under its own segment.
+        assert_eq!(
+            keys::meta("acme", "resize"),
+            "project/acme/functions/resize"
+        );
     }
 }

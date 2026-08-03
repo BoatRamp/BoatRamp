@@ -276,18 +276,24 @@ impl WorkflowRun {
 }
 
 /// KV keyspace for workflows (definitions + runs), mirroring the function keyspace.
+/// All keys are **project-scoped** under `project/<proj>/…` (0.2.0); `project` is a
+/// bare `&str` (this crate is wasm-clean).
 pub mod keys {
     /// A workflow definition.
-    pub fn definition(name: &str) -> String {
-        format!("workflows/{name}")
+    pub fn definition(project: &str, name: &str) -> String {
+        format!("project/{project}/workflows/{name}")
     }
     /// A workflow run.
-    pub fn run(name: &str, id: &str) -> String {
-        format!("workflows/{name}/runs/{id}")
+    pub fn run(project: &str, name: &str, id: &str) -> String {
+        format!("project/{project}/workflows/{name}/runs/{id}")
     }
     /// The prefix under which all of a workflow's runs live.
-    pub fn runs_prefix(name: &str) -> String {
-        format!("workflows/{name}/runs/")
+    pub fn runs_prefix(project: &str, name: &str) -> String {
+        format!("project/{project}/workflows/{name}/runs/")
+    }
+    /// The prefix listing every workflow definition in a project.
+    pub fn definitions_prefix(project: &str) -> String {
+        format!("project/{project}/workflows/")
     }
 }
 
@@ -398,8 +404,17 @@ mod tests {
 
     #[test]
     fn keyspace_is_stable() {
-        assert_eq!(keys::definition("etl"), "workflows/etl");
-        assert_eq!(keys::run("etl", "r1"), "workflows/etl/runs/r1");
-        assert_eq!(keys::runs_prefix("etl"), "workflows/etl/runs/");
+        assert_eq!(
+            keys::definition("default", "etl"),
+            "project/default/workflows/etl"
+        );
+        assert_eq!(
+            keys::run("default", "etl", "r1"),
+            "project/default/workflows/etl/runs/r1"
+        );
+        assert_eq!(
+            keys::runs_prefix("default", "etl"),
+            "project/default/workflows/etl/runs/"
+        );
     }
 }

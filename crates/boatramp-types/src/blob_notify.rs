@@ -138,14 +138,19 @@ pub fn prefix_slug(prefix: &str) -> String {
     }
 }
 
-/// KV key for the notification ledger of `(function, prefix)`.
-pub fn blobnotify_key(function: &str, prefix: &str) -> String {
-    format!("blobnotify/{function}/{}", prefix_slug(prefix))
+/// KV key for the notification ledger of `(function, prefix)`, **project-scoped**
+/// (0.2.0): `project/<proj>/blobnotify/<function>/<prefix-slug>`. `project` is a
+/// bare `&str` (this crate is wasm-clean).
+pub fn blobnotify_key(project: &str, function: &str, prefix: &str) -> String {
+    format!(
+        "project/{project}/blobnotify/{function}/{}",
+        prefix_slug(prefix)
+    )
 }
 
 /// The KV key prefix for a function's notification ledgers (for enumeration).
-pub fn blobnotify_function_prefix(function: &str) -> String {
-    format!("blobnotify/{function}/")
+pub fn blobnotify_function_prefix(project: &str, function: &str) -> String {
+    format!("project/{project}/blobnotify/{function}/")
 }
 
 #[cfg(test)]
@@ -158,10 +163,13 @@ mod tests {
         assert_eq!(prefix_slug("/"), "root");
         assert_eq!(prefix_slug(""), "root");
         assert_eq!(
-            blobnotify_key("ingest", "uploads/"),
-            "blobnotify/ingest/uploads"
+            blobnotify_key("default", "ingest", "uploads/"),
+            "project/default/blobnotify/ingest/uploads"
         );
-        assert_eq!(blobnotify_function_prefix("ingest"), "blobnotify/ingest/");
+        assert_eq!(
+            blobnotify_function_prefix("default", "ingest"),
+            "project/default/blobnotify/ingest/"
+        );
     }
 
     #[test]

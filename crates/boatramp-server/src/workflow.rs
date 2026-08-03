@@ -5,6 +5,7 @@
 //! `use super::*`.
 
 use super::*;
+use boatramp_core::project::ProjectRef;
 
 /// Max request body buffered as a workflow run's initial input.
 #[cfg(feature = "handlers")]
@@ -32,7 +33,7 @@ pub(super) async fn define_workflow(
     if let Err(reason) = workflow.validate() {
         return (StatusCode::BAD_REQUEST, format!("{reason}\n")).into_response();
     }
-    if let Err(err) = deploy.put_workflow(&workflow).await {
+    if let Err(err) = deploy.put_workflow(ProjectRef::DEFAULT, &workflow).await {
         return deploy_error_response(err);
     }
     Json(workflow).into_response()
@@ -41,7 +42,7 @@ pub(super) async fn define_workflow(
 /// `GET /api/workflows` (FA-6) — list workflow definitions. `system·read`.
 #[cfg(feature = "handlers")]
 pub(super) async fn list_workflows_handler(State(deploy): State<DeployStore>) -> Response {
-    match deploy.list_workflows().await {
+    match deploy.list_workflows(ProjectRef::DEFAULT).await {
         Ok(mut list) => {
             list.sort_by(|a, b| a.name.cmp(&b.name));
             Json(list).into_response()
@@ -56,7 +57,7 @@ pub(super) async fn get_workflow_handler(
     State(deploy): State<DeployStore>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.get_workflow(&name).await {
+    match deploy.get_workflow(ProjectRef::DEFAULT, &name).await {
         Ok(Some(w)) => Json(w).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response(),
         Err(err) => deploy_error_response(err),
@@ -70,7 +71,7 @@ pub(super) async fn delete_workflow_handler(
     State(deploy): State<DeployStore>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.delete_workflow(&name).await {
+    match deploy.delete_workflow(ProjectRef::DEFAULT, &name).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -85,7 +86,7 @@ pub(super) async fn start_workflow_run(
     Path(name): Path<String>,
     request: Request,
 ) -> Response {
-    let workflow = match deploy.get_workflow(&name).await {
+    let workflow = match deploy.get_workflow(ProjectRef::DEFAULT, &name).await {
         Ok(Some(w)) => w,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response()
@@ -106,7 +107,7 @@ pub(super) async fn start_workflow_run(
     let id = new_invocation_id();
     let input_b64 = (!body.is_empty()).then(|| b64_encode(&body));
     let run = boatramp_core::workflow::WorkflowRun::start(&workflow, id, input_b64, now);
-    if let Err(err) = deploy.put_workflow_run(&run).await {
+    if let Err(err) = deploy.put_workflow_run(ProjectRef::DEFAULT, &run).await {
         return deploy_error_response(err);
     }
     (StatusCode::ACCEPTED, Json(run)).into_response()
@@ -119,7 +120,10 @@ pub(super) async fn get_workflow_run_handler(
     State(deploy): State<DeployStore>,
     Path((name, id)): Path<(String, String)>,
 ) -> Response {
-    match deploy.get_workflow_run(&name, &id).await {
+    match deploy
+        .get_workflow_run(ProjectRef::DEFAULT, &name, &id)
+        .await
+    {
         Ok(Some(run)) => Json(run).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -138,7 +142,10 @@ pub(super) async fn drain_workflow_runs(
     deploy: &DeployStore,
     workflow: &boatramp_core::workflow::Workflow,
 ) {
-    let runs = match deploy.list_workflow_runs(&workflow.name).await {
+    let runs = match deploy
+        .list_workflow_runs(ProjectRef::DEFAULT, &workflow.name)
+        .await
+    {
         Ok(runs) => runs,
         Err(err) => {
             tracing::warn!(workflow = %workflow.name, %err, "listing workflow runs failed");
@@ -196,7 +203,7 @@ async fn advance_workflow_run(
         run.status = boatramp_core::workflow::WorkflowStatus::Succeeded;
     }
     run.updated = now_unix();
-    let _ = deploy.put_workflow_run(&run).await;
+    let _ = deploy.put_workflow_run(ProjectRef::DEFAULT, &run).await;
 }
 
 /// Run a single step's function (active version) with `input` as its request body.
@@ -209,7 +216,10 @@ async fn run_workflow_step(
     step: &boatramp_core::workflow::Step,
     input: Vec<u8>,
 ) -> Option<Vec<u8>> {
-    let function = match deploy.get_function(&step.function).await {
+    let function = match deploy
+        .get_function(ProjectRef::DEFAULT, &step.function)
+        .await
+    {
         Ok(Some(f)) => f,
         _ => return None,
     };
@@ -241,7 +251,10 @@ async fn compensate_run(
             continue;
         };
         if let Some(compensate_fn) = &step.compensate {
-            if let Ok(Some(function)) = deploy.get_function(compensate_fn).await {
+            if let Ok(Some(function)) = deploy
+                .get_function(ProjectRef::DEFAULT, compensate_fn)
+                .await
+            {
                 if let Some(component) = function.resolve(&function.active).map(str::to_owned) {
                     let request = build_step_request(Vec::new());
                     // Best-effort rollback; its outcome does not change the verdict.

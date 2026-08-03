@@ -1215,6 +1215,7 @@ mod drain_tests {
 mod tests {
     use super::*;
     use boatramp_core::cose::{LocalSigner, TokenAlg};
+    use boatramp_core::project::ProjectRef;
 
     #[test]
     fn query_string_parses_and_url_decodes() {
@@ -1432,7 +1433,11 @@ mod tests {
             body_json(remove_function(State(deploy.clone()), Path("greeter".to_string())).await)
                 .await;
         assert_eq!(st, StatusCode::NO_CONTENT);
-        assert!(deploy.get_function("greeter").await.unwrap().is_none());
+        assert!(deploy
+            .get_function(ProjectRef::DEFAULT, "greeter")
+            .await
+            .unwrap()
+            .is_none());
 
         // Deploying a component whose blob was never uploaded is a 400.
         let empty = DeployStore::new(
@@ -1966,13 +1971,19 @@ mod tests {
         assert!(!has_parked_replica(&deploy, "w").await);
         // A running replica → false (it's serving, not parked).
         deploy
-            .set_replica_state(&observed_state("w", true, ReplicaPhase::Running))
+            .set_replica_state(
+                ProjectRef::DEFAULT,
+                &observed_state("w", true, ReplicaPhase::Running),
+            )
             .await
             .unwrap();
         assert!(!has_parked_replica(&deploy, "w").await);
         // A parked (Zero) replica → true (wakeable).
         deploy
-            .set_replica_state(&observed_state("w", false, ReplicaPhase::Zero))
+            .set_replica_state(
+                ProjectRef::DEFAULT,
+                &observed_state("w", false, ReplicaPhase::Zero),
+            )
             .await
             .unwrap();
         assert!(has_parked_replica(&deploy, "w").await);
@@ -1991,7 +2002,10 @@ mod tests {
 
         // A healthy replica → returned promptly.
         deploy
-            .set_replica_state(&observed_state("w", true, ReplicaPhase::Running))
+            .set_replica_state(
+                ProjectRef::DEFAULT,
+                &observed_state("w", true, ReplicaPhase::Running),
+            )
             .await
             .unwrap();
         let warm = await_warm(&deploy, "w", std::time::Duration::from_secs(5)).await;
@@ -2116,9 +2130,13 @@ mod tests {
             ..Default::default()
         };
         let id = deploy.put_manifest(&manifest).await.unwrap();
-        deploy.activate("blog", &id).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
         deploy
             .set_site_config(
+                ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
                     handlers: Some(HandlersSiteConfig {
@@ -2220,7 +2238,10 @@ mod tests {
             aliases: Default::default(),
             config: Default::default(),
         };
-        deploy.put_function(&function).await.unwrap();
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
 
         let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
         let rt = HandlerRuntime::new(engine, kv, storage, None, None);
@@ -2239,7 +2260,11 @@ mod tests {
         assert_eq!(response.status, 200);
 
         // The call was metered against the target function.
-        let metering = deploy.get_metering("target").await.unwrap().unwrap();
+        let metering = deploy
+            .get_metering(ProjectRef::DEFAULT, "target")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(metering.invocations, 1);
 
         // An unknown target is NotFound (never reaches the engine).
@@ -2300,9 +2325,13 @@ mod tests {
             ..Default::default()
         };
         let id = deploy.put_manifest(&manifest).await.unwrap();
-        deploy.activate("blog", &id).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
         deploy
             .set_site_config(
+                ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
                     handlers: Some(HandlersSiteConfig {
@@ -2420,9 +2449,13 @@ mod tests {
             ..Default::default()
         };
         let id = deploy.put_manifest(&manifest).await.unwrap();
-        deploy.activate("blog", &id).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "blog", &id)
+            .await
+            .unwrap();
         deploy
             .set_site_config(
+                ProjectRef::DEFAULT,
                 "blog",
                 &SiteConfig {
                     handlers: Some(HandlersSiteConfig {

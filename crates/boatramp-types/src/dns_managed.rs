@@ -1,6 +1,7 @@
 //! Ledger of DNS records boatramp created on the operator's behalf, so they can
 //! be **retracted** when a custom domain is detached (`domain rm`) or its site
-//! deleted. Persisted in the control-plane KV under `dnsmanaged/<site>/<host>`.
+//! deleted. Persisted in the control-plane KV under
+//! `project/<proj>/dnsmanaged/<site>/<host>` (project-scoped, 0.2.0).
 //!
 //! The record set is stored string-typed (a serializable mirror of the acme
 //! `DnsRecord`) so this crate needn't depend on `boatramp-acme`; the retraction
@@ -10,16 +11,17 @@ use serde::{Deserialize, Serialize};
 
 /// KV key for the managed-records ledger of `host` under `site`. The host is
 /// normalized (lowercased, no `*.`/trailing dot), matching the verification key.
-pub fn dnsmanaged_key(site: &str, host: &str) -> String {
+/// `project` is a bare `&str` (this crate is wasm-clean).
+pub fn dnsmanaged_key(project: &str, site: &str, host: &str) -> String {
     format!(
-        "dnsmanaged/{site}/{}",
+        "project/{project}/dnsmanaged/{site}/{}",
         crate::domain_verify::normalize_host(host)
     )
 }
 
 /// The KV key prefix for a site's managed-record ledgers (for enumeration).
-pub fn dnsmanaged_site_prefix(site: &str) -> String {
-    format!("dnsmanaged/{site}/")
+pub fn dnsmanaged_site_prefix(project: &str, site: &str) -> String {
+    format!("project/{project}/dnsmanaged/{site}/")
 }
 
 /// One DNS record boatramp created — a serializable mirror of the acme
@@ -129,10 +131,13 @@ mod tests {
     #[test]
     fn key_normalizes_the_host() {
         assert_eq!(
-            dnsmanaged_key("blog", "*.WWW.Example.com."),
-            "dnsmanaged/blog/www.example.com"
+            dnsmanaged_key("default", "blog", "*.WWW.Example.com."),
+            "project/default/dnsmanaged/blog/www.example.com"
         );
-        assert_eq!(dnsmanaged_site_prefix("blog"), "dnsmanaged/blog/");
+        assert_eq!(
+            dnsmanaged_site_prefix("default", "blog"),
+            "project/default/dnsmanaged/blog/"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@
 
 use super::*;
 
+use boatramp_core::project::ProjectRef;
+
 /// The authority the engine sees for an invoked function. `wasi:http` needs a
 /// scheme + authority; the public control-plane path is the host's concern, so
 /// every function is invoked at `http://function.invoke/`.
@@ -66,7 +68,7 @@ pub(super) async fn invoke_function(
     let Some(inner) = handlers.inner.as_ref() else {
         return handler_unavailable();
     };
-    let function = match deploy.get_function(&name).await {
+    let function = match deploy.get_function(ProjectRef::DEFAULT, &name).await {
         Ok(Some(f)) => f,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
@@ -92,9 +94,13 @@ pub(super) async fn invoke_function(
     // captured result, or `202` + id while the async call is still in flight).
     // Checked *before* the quota so a replay never spends the rate budget.
     if let Some(key) = &idem_key {
-        match deploy.get_idempotency(&name, key).await {
+        match deploy
+            .get_idempotency(ProjectRef::DEFAULT, &name, key)
+            .await
+        {
             Ok(Some(id)) => {
-                if let Ok(Some(inv)) = deploy.get_invocation(&name, &id).await {
+                if let Ok(Some(inv)) = deploy.get_invocation(ProjectRef::DEFAULT, &name, &id).await
+                {
                     return replay_invocation(&inv);
                 }
             }
@@ -172,10 +178,13 @@ async fn execute_sync(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(&inv).await {
+    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
         return deploy_error_response(err);
     }
-    if let Err(err) = deploy.put_idempotency(&function.name, &key, &id).await {
+    if let Err(err) = deploy
+        .put_idempotency(ProjectRef::DEFAULT, &function.name, &key, &id)
+        .await
+    {
         return deploy_error_response(err);
     }
     rebuild_response(status, content_type.as_deref(), body)
@@ -222,11 +231,14 @@ async fn enqueue_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(&inv).await {
+    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
         return deploy_error_response(err);
     }
     if let Some(key) = &idem_key {
-        if let Err(err) = deploy.put_idempotency(&function.name, key, &id).await {
+        if let Err(err) = deploy
+            .put_idempotency(ProjectRef::DEFAULT, &function.name, key, &id)
+            .await
+        {
             return deploy_error_response(err);
         }
     }
@@ -240,7 +252,7 @@ pub(super) async fn get_invocation_record(
     State(deploy): State<DeployStore>,
     Path((name, id)): Path<(String, String)>,
 ) -> Response {
-    match deploy.get_invocation(&name, &id).await {
+    match deploy.get_invocation(ProjectRef::DEFAULT, &name, &id).await {
         Ok(Some(inv)) => Json(inv).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -466,7 +478,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             ));
         };
         // Resolve the target by name to its active version's component.
-        let function = match self.deploy.get_function(target).await {
+        let function = match self.deploy.get_function(ProjectRef::DEFAULT, target).await {
             Ok(Some(f)) => f,
             Ok(None) => return Err(InvokeError::NotFound),
             Err(err) => return Err(InvokeError::Failed(err.to_string())),
@@ -612,7 +624,10 @@ pub(super) async fn drain_function_invocations(
     deploy: &DeployStore,
     function: &boatramp_core::function::Function,
 ) {
-    let queued = match deploy.list_invocations(&function.name).await {
+    let queued = match deploy
+        .list_invocations(ProjectRef::DEFAULT, &function.name)
+        .await
+    {
         Ok(list) => list,
         Err(err) => {
             tracing::warn!(function = %function.name, %err, "listing invocations failed");
@@ -645,13 +660,13 @@ async fn run_queued_invocation(
         // The pinned version is gone (rolled off / pruned) — unrunnable, so fail.
         inv.status = InvocationStatus::Failed;
         inv.updated = now_unix();
-        let _ = deploy.put_invocation(&inv).await;
+        let _ = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await;
         return;
     };
     inv.status = InvocationStatus::Running;
     inv.attempts = inv.attempts.saturating_add(1);
     inv.updated = now_unix();
-    if let Err(err) = deploy.put_invocation(&inv).await {
+    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
         tracing::warn!(function = %function.name, %err, "marking invocation running failed");
         return;
     }
@@ -683,7 +698,7 @@ async fn run_queued_invocation(
         inv.status = InvocationStatus::Queued;
     }
     inv.updated = now_unix();
-    let _ = deploy.put_invocation(&inv).await;
+    let _ = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await;
     // Meter a settled attempt (a requeue-for-retry is not yet a completed
     // invocation, so only the terminal transition is metered).
     if matches!(
@@ -776,7 +791,10 @@ async fn admit_by_quota(
     let lock = function_meter_lock(inner, &function.name);
     let _guard = lock.lock().await;
     let now = now_unix();
-    let mut metering = match deploy.get_metering(&function.name).await {
+    let mut metering = match deploy
+        .get_metering(ProjectRef::DEFAULT, &function.name)
+        .await
+    {
         Ok(Some(m)) => m,
         Ok(None) => boatramp_core::function::Metering::new(&function.name),
         Err(err) => return Err(deploy_error_response(err)),
@@ -788,7 +806,7 @@ async fn admit_by_quota(
         )
             .into_response());
     }
-    if let Err(err) = deploy.put_metering(&metering).await {
+    if let Err(err) = deploy.put_metering(ProjectRef::DEFAULT, &metering).await {
         return Err(deploy_error_response(err));
     }
     Ok(())
@@ -807,7 +825,7 @@ async fn record_metering(
     let lock = function_meter_lock(inner, function);
     let _guard = lock.lock().await;
     let now = now_unix();
-    let mut metering = match deploy.get_metering(function).await {
+    let mut metering = match deploy.get_metering(ProjectRef::DEFAULT, function).await {
         Ok(Some(m)) => m,
         Ok(None) => boatramp_core::function::Metering::new(function),
         Err(err) => {
@@ -816,7 +834,7 @@ async fn record_metering(
         }
     };
     metering.record(sample, now);
-    if let Err(err) = deploy.put_metering(&metering).await {
+    if let Err(err) = deploy.put_metering(ProjectRef::DEFAULT, &metering).await {
         tracing::warn!(function, %err, "writing metering failed");
     }
 }
@@ -828,7 +846,7 @@ pub(super) async fn get_function_usage(
     State(deploy): State<DeployStore>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.get_metering(&name).await {
+    match deploy.get_metering(ProjectRef::DEFAULT, &name).await {
         Ok(Some(m)) => Json(m).into_response(),
         // No invocations yet ⇒ a zeroed aggregate, so the CLI always has a shape.
         Ok(None) => Json(boatramp_core::function::Metering::new(name)).into_response(),
@@ -849,7 +867,7 @@ pub(super) async fn put_trigger_handler(
     Path((name, id)): Path<(String, String)>,
     Json(kind): Json<boatramp_core::function::TriggerKind>,
 ) -> Response {
-    match deploy.get_function(&name).await {
+    match deploy.get_function(ProjectRef::DEFAULT, &name).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
@@ -909,7 +927,10 @@ pub(super) async fn put_trigger_handler(
         kind,
         last_fired_minute: None,
     };
-    if let Err(err) = deploy.put_trigger(&name, &trigger).await {
+    if let Err(err) = deploy
+        .put_trigger(ProjectRef::DEFAULT, &name, &trigger)
+        .await
+    {
         return deploy_error_response(err);
     }
     Json(trigger).into_response()
@@ -922,7 +943,7 @@ pub(super) async fn list_triggers_handler(
     State(deploy): State<DeployStore>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.list_triggers(&name).await {
+    match deploy.list_triggers(ProjectRef::DEFAULT, &name).await {
         Ok(mut list) => {
             list.sort_by(|a, b| a.id.cmp(&b.id));
             Json(list).into_response()
@@ -945,14 +966,14 @@ pub(super) async fn delete_trigger_handler(
     // to retract before the trigger record is gone.
     if let (Some(inner), Ok(Some(trigger))) = (
         handlers.inner.as_ref(),
-        deploy.get_trigger(&name, &id).await,
+        deploy.get_trigger(ProjectRef::DEFAULT, &name, &id).await,
     ) {
         if let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
             (&trigger.kind, inner.watch_provider.get())
         {
             let storage_prefix = blob_storage_prefix(&name, prefix);
             if let Ok(Some(record)) = deploy
-                .get_managed_notification(&name, &storage_prefix)
+                .get_managed_notification(ProjectRef::DEFAULT, &name, &storage_prefix)
                 .await
             {
                 if let Err(err) = boatramp_core::blob_provision::retract_watch(
@@ -967,7 +988,7 @@ pub(super) async fn delete_trigger_handler(
             }
         }
     }
-    match deploy.delete_trigger(&name, &id).await {
+    match deploy.delete_trigger(ProjectRef::DEFAULT, &name, &id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -995,7 +1016,10 @@ pub(super) async fn dispatch_function_triggers(
     now: &CronNow,
 ) {
     use boatramp_core::function::TriggerKind;
-    let triggers = match deploy.list_triggers(&function.name).await {
+    let triggers = match deploy
+        .list_triggers(ProjectRef::DEFAULT, &function.name)
+        .await
+    {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!(function = %function.name, %err, "listing triggers failed");
@@ -1016,7 +1040,9 @@ pub(super) async fn dispatch_function_triggers(
                 }
                 enqueue_scheduled_invocation(deploy, function).await;
                 trigger.last_fired_minute = Some(now.minute_stamp);
-                let _ = deploy.put_trigger(&function.name, &trigger).await;
+                let _ = deploy
+                    .put_trigger(ProjectRef::DEFAULT, &function.name, &trigger)
+                    .await;
             }
             TriggerKind::Queue { topic } => {
                 dispatch_function_queue(inner, deploy, function, topic).await;
@@ -1050,7 +1076,7 @@ async fn enqueue_scheduled_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(&inv).await {
+    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
         tracing::warn!(function = %function.name, %err, "enqueuing scheduled invocation failed");
     }
 }
@@ -1134,7 +1160,7 @@ pub(super) async fn webhook_ingress(
     let Some(inner) = handlers.inner.as_ref() else {
         return handler_unavailable();
     };
-    let function = match deploy.get_function(&name).await {
+    let function = match deploy.get_function(ProjectRef::DEFAULT, &name).await {
         Ok(Some(f)) => f,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()

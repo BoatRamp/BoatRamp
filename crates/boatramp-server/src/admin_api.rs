@@ -6,6 +6,7 @@
 //! `use super::*`.
 
 use super::*;
+use boatramp_core::project::ProjectRef;
 
 #[derive(Serialize)]
 struct CreateDeploymentResponse {
@@ -128,7 +129,7 @@ pub(super) async fn activate_deployment(
     // site can't satisfy, or whose components don't compile, must not flip.
     match deploy.get_manifest(&id).await {
         Ok(Some(manifest)) => {
-            let site_config = match deploy.get_site_config(&site).await {
+            let site_config = match deploy.get_site_config(ProjectRef::DEFAULT, &site).await {
                 Ok(config) => config,
                 Err(err) => return deploy_error_response(err),
             };
@@ -144,7 +145,7 @@ pub(super) async fn activate_deployment(
         Ok(None) => {}
         Err(err) => return deploy_error_response(err),
     }
-    match deploy.activate(&site, &id).await {
+    match deploy.activate(ProjectRef::DEFAULT, &site, &id).await {
         Ok(()) => {
             srvmetrics::server_metrics().record_activation();
             StatusCode::NO_CONTENT.into_response()
@@ -163,7 +164,7 @@ pub(super) async fn current_deployment(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.current_id(&site).await {
+    match deploy.current_id(ProjectRef::DEFAULT, &site).await {
         Ok(deployment) => Json(CurrentResponse { site, deployment }).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -174,7 +175,7 @@ pub(super) async fn list_deployments(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.deployments(&site).await {
+    match deploy.deployments(ProjectRef::DEFAULT, &site).await {
         Ok(list) => Json(list).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -184,7 +185,7 @@ pub(super) async fn list_deployments(
 /// `GET /api/sites` — every known site name (admin-scoped). Backs the web UI /
 /// tooling site navigation.
 pub(super) async fn list_sites(State(deploy): State<DeployStore>) -> Response {
-    match deploy.all_sites().await {
+    match deploy.all_sites(ProjectRef::DEFAULT).await {
         Ok(sites) => Json(sites).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -194,7 +195,7 @@ pub(super) async fn get_site_config(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.get_site_config(&site).await {
+    match deploy.get_site_config(ProjectRef::DEFAULT, &site).await {
         Ok(config) => Json(config.unwrap_or_default()).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -208,7 +209,7 @@ pub(super) async fn delete_site(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.delete_site(&site).await {
+    match deploy.delete_site(ProjectRef::DEFAULT, &site).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -234,7 +235,7 @@ pub(super) async fn put_site_config(
     Path(site): Path<String>,
     Json(config): Json<SiteConfig>,
 ) -> Response {
-    let current = match deploy.get_site_config(&site).await {
+    let current = match deploy.get_site_config(ProjectRef::DEFAULT, &site).await {
         Ok(c) => c.unwrap_or_default(),
         Err(err) => return deploy_error_response(err),
     };
@@ -269,7 +270,11 @@ pub(super) async fn put_site_config(
         .collect();
     for host in added {
         let verification = match deploy
-            .get_domain_verification(&boatramp_core::site::SiteName::new(site.as_str()), &host)
+            .get_domain_verification(
+                ProjectRef::DEFAULT,
+                &boatramp_core::site::SiteName::new(site.as_str()),
+                &host,
+            )
             .await
         {
             Ok(v) => v,
@@ -297,7 +302,10 @@ pub(super) async fn put_site_config(
                 .into_response();
         }
     }
-    match deploy.set_site_config(&site, &config).await {
+    match deploy
+        .set_site_config(ProjectRef::DEFAULT, &site, &config)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -367,7 +375,7 @@ pub(super) async fn rollback_daemon_config(
 
 /// List all compute workloads.
 pub(super) async fn list_compute(State(deploy): State<DeployStore>) -> Response {
-    match deploy.list_compute_workloads().await {
+    match deploy.list_compute_workloads(ProjectRef::DEFAULT).await {
         Ok(mut workloads) => {
             workloads.sort_by(|a, b| a.name.cmp(&b.name));
             Json(workloads).into_response()
@@ -381,7 +389,10 @@ pub(super) async fn get_compute(
     State(deploy): State<DeployStore>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.get_compute_workload(&name).await {
+    match deploy
+        .get_compute_workload(ProjectRef::DEFAULT, &name)
+        .await
+    {
         Ok(Some(workload)) => Json(workload).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such workload\n").into_response(),
         Err(err) => deploy_error_response(err),
@@ -455,7 +466,10 @@ pub(super) async fn put_compute(
         replicas: request.replicas,
         placement: request.placement,
     };
-    match deploy.set_compute_workload(&workload).await {
+    match deploy
+        .set_compute_workload(ProjectRef::DEFAULT, &workload)
+        .await
+    {
         Ok(()) => (
             StatusCode::CREATED,
             Json(PutComputeResponse { spec: spec_hash }),
@@ -470,7 +484,10 @@ pub(super) async fn delete_compute(
     State(deploy): State<DeployStore>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.delete_compute_workload(&name).await {
+    match deploy
+        .delete_compute_workload(ProjectRef::DEFAULT, &name)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such workload\n").into_response(),
         Err(err) => deploy_error_response(err),
@@ -562,7 +579,10 @@ pub(super) async fn set_alias(
     Path((site, name)): Path<(String, String)>,
     Json(request): Json<SetAliasRequest>,
 ) -> Response {
-    match deploy.set_alias(&site, &name, &request.id).await {
+    match deploy
+        .set_alias(ProjectRef::DEFAULT, &site, &name, &request.id)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -573,7 +593,7 @@ pub(super) async fn list_aliases(
     State(deploy): State<DeployStore>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.list_aliases(&site).await {
+    match deploy.list_aliases(ProjectRef::DEFAULT, &site).await {
         Ok(map) => Json(map).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -584,7 +604,7 @@ pub(super) async fn remove_alias(
     State(deploy): State<DeployStore>,
     Path((site, name)): Path<(String, String)>,
 ) -> Response {
-    match deploy.remove_alias(&site, &name).await {
+    match deploy.remove_alias(ProjectRef::DEFAULT, &site, &name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such alias\n").into_response(),
         Err(err) => deploy_error_response(err),

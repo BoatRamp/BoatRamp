@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub use boatramp_types::compute::*;
 
 use crate::deploy::DeployStore;
+use crate::project::ProjectRef;
 
 // ---------------------------------------------------------------------------
 // Backend trait + value types
@@ -452,17 +453,20 @@ pub struct ObservedInstance {
     pub snapshot: Option<Snapshot>,
 }
 
-/// KV key prefix for observed replica state.
-pub const REPLICA_STATE_PREFIX: &str = "compute_state/";
-
-/// The observed-state key for a workload's replica.
-pub fn replica_state_key(workload: &str, replica: u32) -> String {
-    format!("{REPLICA_STATE_PREFIX}{workload}/{replica}")
+/// The observed-state key for a workload's replica, **project-scoped** (0.2.0):
+/// `project/<proj>/compute_state/<workload>/<replica>`.
+pub fn replica_state_key(project: &str, workload: &str, replica: u32) -> String {
+    format!("project/{project}/compute_state/{workload}/{replica}")
 }
 
-/// The key prefix listing a workload's replica states.
-pub fn replica_state_prefix(workload: &str) -> String {
-    format!("{REPLICA_STATE_PREFIX}{workload}/")
+/// The key prefix listing one workload's replica states within a project.
+pub fn replica_state_prefix(project: &str, workload: &str) -> String {
+    format!("project/{project}/compute_state/{workload}/")
+}
+
+/// The key prefix listing **every** replica state in a project (all workloads).
+pub fn replica_states_project_prefix(project: &str) -> String {
+    format!("project/{project}/compute_state/")
 }
 
 /// A reconcile action the driver executes against a backend.
@@ -675,7 +679,10 @@ pub async fn reconcile_once(
         .iter()
         .map(|(id, b)| (id.clone(), b.capabilities()))
         .collect();
-    for workload in deploy.list_compute_workloads().await? {
+    // Fan out over every project's workloads (compute is project-scoped in 0.2.0).
+    // The owning project threads through every replica-state read/write below.
+    for (project_name, workload) in deploy.list_compute_workloads_all().await? {
+        let project = ProjectRef::new(&project_name);
         let Some(spec) = deploy.get_compute_spec(&workload.active).await? else {
             report
                 .errors
@@ -685,7 +692,7 @@ pub async fn reconcile_once(
 
         // Observed replica state + a health refresh (skipping parked Zero
         // replicas — they're intentionally down).
-        let mut observed = deploy.list_replica_states(&workload.name).await?;
+        let mut observed = deploy.list_replica_states(project, &workload.name).await?;
         for state in &mut observed {
             if state.phase == ReplicaPhase::Zero {
                 continue;
@@ -722,7 +729,7 @@ pub async fn reconcile_once(
                     };
                     let node_region = region_of_node(nodes, node);
                     match launch_one(b.as_ref(), &wl, replica, node, node_region, &spec).await {
-                        Ok(state) => match deploy.set_replica_state(&state).await {
+                        Ok(state) => match deploy.set_replica_state(project, &state).await {
                             Ok(()) => report.launched += 1,
                             Err(e) => report.errors.push(format!("{wl}/{replica}: persist: {e}")),
                         },
@@ -742,7 +749,7 @@ pub async fn reconcile_once(
                         }
                     }
                     match deploy
-                        .delete_replica_state(&handle.workload, handle.replica)
+                        .delete_replica_state(project, &handle.workload, handle.replica)
                         .await
                     {
                         Ok(()) => report.stopped += 1,
@@ -773,7 +780,7 @@ pub async fn reconcile_once(
                                 snapshot: Some(snapshot),
                                 ..obs
                             };
-                            match deploy.set_replica_state(&parked).await {
+                            match deploy.set_replica_state(project, &parked).await {
                                 Ok(()) => report.slept += 1,
                                 Err(e) => report.errors.push(format!(
                                     "{}/{}: persist zero: {e}",
@@ -813,7 +820,7 @@ pub async fn reconcile_once(
                                 phase: ReplicaPhase::Running,
                                 snapshot: None,
                             };
-                            match deploy.set_replica_state(&state).await {
+                            match deploy.set_replica_state(project, &state).await {
                                 Ok(()) => report.woke += 1,
                                 Err(e) => report.errors.push(format!(
                                     "{}/{}: persist running: {e}",
@@ -1628,13 +1635,16 @@ mod tests {
         s.scale_to_zero = true;
         let hash = deploy.put_compute_spec(&s).await.unwrap();
         deploy
-            .set_compute_workload(&ComputeWorkload {
-                version: 1,
-                name: "w".into(),
-                active: hash,
-                replicas: 1,
-                placement: Default::default(),
-            })
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
             .await
             .unwrap();
         let mut backends: BackendRegistry = BTreeMap::new();
@@ -1665,7 +1675,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.slept, 1, "{:?}", r.errors);
-        let parked = deploy.list_replica_states("w").await.unwrap();
+        let parked = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
         assert_eq!(parked.len(), 1);
         assert_eq!(parked[0].phase, ReplicaPhase::Zero);
         assert!(parked[0].snapshot.is_some(), "carries its snapshot");
@@ -1694,7 +1707,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.woke, 1, "{:?}", r.errors);
-        let woken = deploy.list_replica_states("w").await.unwrap();
+        let woken = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
         assert_eq!(woken.len(), 1);
         assert_eq!(woken[0].phase, ReplicaPhase::Running);
         assert!(woken[0].snapshot.is_none());
@@ -1707,13 +1723,16 @@ mod tests {
         let s = spec(1, 128);
         let hash = deploy.put_compute_spec(&s).await.unwrap();
         deploy
-            .set_compute_workload(&ComputeWorkload {
-                version: 1,
-                name: "w".into(),
-                active: hash.clone(),
-                replicas: 2,
-                placement: Default::default(),
-            })
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash.clone(),
+                    replicas: 2,
+                    placement: Default::default(),
+                },
+            )
             .await
             .unwrap();
         let nodes = vec![fake_node()];
@@ -1727,7 +1746,10 @@ mod tests {
             .unwrap();
         assert_eq!((r.launched, r.stopped), (2, 0), "{:?}", r.errors);
         assert!(r.errors.is_empty(), "{:?}", r.errors);
-        let states = deploy.list_replica_states("w").await.unwrap();
+        let states = deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap();
         assert_eq!(states.len(), 2);
         // FA-8: each launched replica inherits its node's region tag.
         assert!(
@@ -1743,19 +1765,26 @@ mod tests {
 
         // Scale to zero → both stopped + state cleared.
         deploy
-            .set_compute_workload(&ComputeWorkload {
-                version: 1,
-                name: "w".into(),
-                active: hash,
-                replicas: 0,
-                placement: Default::default(),
-            })
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 0,
+                    placement: Default::default(),
+                },
+            )
             .await
             .unwrap();
         let r3 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive)
             .await
             .unwrap();
         assert_eq!(r3.stopped, 2);
-        assert!(deploy.list_replica_states("w").await.unwrap().is_empty());
+        assert!(deploy
+            .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

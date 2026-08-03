@@ -4,6 +4,8 @@
 //! `handlers`-gated; it pulls the serve-pipeline scope in via `use super::*`.
 
 use super::*;
+#[cfg(feature = "handlers")]
+use boatramp_core::project::ProjectRef;
 
 #[cfg(feature = "handlers")]
 impl HandlerRuntimeInner {
@@ -156,18 +158,18 @@ async fn collect_consumer_stats(
     site: &str,
 ) -> Result<Vec<ConsumerStat>, DeployError> {
     let mut out = Vec::new();
-    let Some(site_config) = deploy.get_site_config(site).await? else {
+    let Some(site_config) = deploy.get_site_config(ProjectRef::DEFAULT, site).await? else {
         return Ok(out);
     };
     let Some(site_handlers) = site_config.handlers.as_ref().filter(|h| h.enabled) else {
         return Ok(out);
     };
     let mut active: Vec<(String, String)> = Vec::new();
-    if let Some(id) = deploy.current_id(site).await? {
+    if let Some(id) = deploy.current_id(ProjectRef::DEFAULT, site).await? {
         active.push((id, site.to_string()));
     }
     for alias in &site_handlers.background_aliases {
-        if let Some(id) = deploy.get_alias(site, alias).await? {
+        if let Some(id) = deploy.get_alias(ProjectRef::DEFAULT, site, alias).await? {
             active.push((id, format!("{site}/{alias}")));
         }
     }
@@ -304,7 +306,7 @@ pub(super) async fn prometheus_metrics(
             let mut rows = Vec::new();
             // Best-effort: a deploy-store error just omits the gauges rather
             // than failing the whole scrape.
-            if let Ok(sites) = deploy.list_sites().await {
+            if let Ok(sites) = deploy.list_sites(ProjectRef::DEFAULT).await {
                 for site in sites {
                     if let Ok(stats) =
                         collect_consumer_stats(&deploy, messaging.as_ref(), &site).await
@@ -325,7 +327,7 @@ pub(super) async fn prometheus_metrics(
         }
         // Function usage series (FA-4), from the persisted metering aggregates.
         // Best-effort: a store error omits the block rather than failing the scrape.
-        if let Ok(mut usage) = deploy.list_metering().await {
+        if let Ok(mut usage) = deploy.list_metering(ProjectRef::DEFAULT).await {
             if !usage.is_empty() {
                 usage.sort_by(|a, b| a.function.cmp(&b.function));
                 body.push_str(

@@ -21,6 +21,7 @@ use boatramp_core::deploy::{sha256_hex, DeployStore, FileEntry, Manifest, Varian
 use boatramp_core::domain_verify::{DomainProbe, DomainVerification, VerifyError};
 use boatramp_core::gateway::{GatewayConfig, GatewayRoute, HeaderOps, PassiveHealth, Upstream};
 use boatramp_core::kv::MemoryKv;
+use boatramp_core::project::ProjectRef;
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_server::{router, router_with, Auth, HandlerRuntime, ServerLimits, ServerOptions};
 use futures::StreamExt;
@@ -222,7 +223,10 @@ async fn seed() -> DeployStore {
     assert_eq!(big_hash, sha256_hex(BIG));
 
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("test", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "test", &id)
+        .await
+        .unwrap();
     deploy
 }
 
@@ -490,6 +494,7 @@ async fn gateway_proxies_to_declared_upstream() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -555,6 +560,7 @@ async fn gateway_refuses_site_private_upstream_under_multi_tenant() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -597,6 +603,7 @@ async fn gateway_refuses_site_unix_upstream_under_multi_tenant() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -664,6 +671,7 @@ async fn gateway_load_balances_and_fails_over_a_pool() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -774,6 +782,7 @@ async fn gateway_proxies_to_unix_socket_upstream() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -865,6 +874,7 @@ async fn gateway_bridges_websocket_upgrade() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -974,6 +984,7 @@ async fn virtualhost_routing() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -999,6 +1010,7 @@ async fn transport_redirects_and_hsts() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -1079,6 +1091,7 @@ async fn forwarded_proto_ignored_from_untrusted_peer() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -1423,6 +1436,7 @@ async fn access_control_basic_auth_and_ip() {
     // Basic auth required.
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 access: AccessConfig {
@@ -1462,6 +1476,7 @@ async fn access_control_basic_auth_and_ip() {
     // IP deny: block the test client (127.0.0.1).
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 access: AccessConfig {
@@ -1546,11 +1561,15 @@ async fn handler_route_dispatches_through_engine() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
 
     // Site grants the keyvalue capability.
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -1631,7 +1650,7 @@ async fn deploy_test_function(
         Lifecycle::Independent,
         0,
     );
-    deploy.put_function(&f).await.unwrap();
+    deploy.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
     hash
 }
 
@@ -1823,7 +1842,7 @@ async fn deploy_quota_function(
         Lifecycle::Independent,
         0,
     );
-    deploy.put_function(&f).await.unwrap();
+    deploy.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
     hash
 }
 
@@ -1968,7 +1987,7 @@ async fn deploy_webhook_function(
         Lifecycle::Independent,
         0,
     );
-    deploy.put_function(&f).await.unwrap();
+    deploy.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
     hash
 }
 
@@ -2339,7 +2358,10 @@ async fn function_cron_trigger_runs_a_scheduled_invocation() {
     assert!(n >= 1, "counter did not advance: {n}");
 
     // A durable, succeeded invocation was recorded for the fire.
-    let invs = deploy.list_invocations("counter").await.unwrap();
+    let invs = deploy
+        .list_invocations(ProjectRef::DEFAULT, "counter")
+        .await
+        .unwrap();
     assert!(invs.iter().any(|i| matches!(
         i.status,
         boatramp_core::function::InvocationStatus::Succeeded
@@ -2607,7 +2629,7 @@ async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
         &["hblob/fn/counter/uploads/".to_string()]
     );
     let record = deploy
-        .get_managed_notification("counter", "hblob/fn/counter/uploads/")
+        .get_managed_notification(ProjectRef::DEFAULT, "counter", "hblob/fn/counter/uploads/")
         .await
         .unwrap()
         .expect("ledger records the provisioned pipeline");
@@ -2625,7 +2647,7 @@ async fn function_blob_trigger_provisions_and_retracts_via_cloud_provider() {
     );
     assert_eq!(provider.retracted.lock().unwrap().len(), 1);
     assert!(deploy
-        .get_managed_notification("counter", "hblob/fn/counter/uploads/")
+        .get_managed_notification(ProjectRef::DEFAULT, "counter", "hblob/fn/counter/uploads/")
         .await
         .unwrap()
         .is_none());
@@ -2687,7 +2709,7 @@ async fn function_blob_trigger_dry_run_returns_recipe_and_refuse_fails_closed() 
     );
     assert!(provider.provisioned.lock().unwrap().is_empty());
     assert!(deploy
-        .list_managed_notifications("counter")
+        .list_managed_notifications(ProjectRef::DEFAULT, "counter")
         .await
         .unwrap()
         .is_empty());
@@ -2807,10 +2829,14 @@ async fn activation_during_traffic_drops_no_requests() {
     let id_a = deploy.put_manifest(&manifest_a).await.unwrap();
     let id_b = deploy.put_manifest(&manifest_b).await.unwrap();
     assert_ne!(id_a, id_b, "deployments must be distinct for a real flip");
-    deploy.activate("blog", &id_a).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id_a)
+        .await
+        .unwrap();
 
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -2851,7 +2877,10 @@ async fn activation_during_traffic_drops_no_requests() {
         tokio::spawn(async move {
             for i in 0..40 {
                 let id = if i % 2 == 0 { &id_b } else { &id_a };
-                deploy.activate("blog", id).await.unwrap();
+                deploy
+                    .activate(ProjectRef::DEFAULT, "blog", id)
+                    .await
+                    .unwrap();
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
@@ -2937,6 +2966,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
     // The site answers on blog.local and grants keyvalue to handlers.
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 domains: DomainConfig {
@@ -3049,6 +3079,7 @@ async fn activation_refuses_broken_component() {
     let id = deploy.put_manifest(&manifest).await.unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3091,7 +3122,13 @@ async fn activation_refuses_broken_component() {
     );
 
     // Nothing flipped: the site has no current deployment.
-    assert_eq!(deploy.current_id("blog").await.unwrap(), None);
+    assert_eq!(
+        deploy
+            .current_id(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// Activation is refused when a handler requests an import the site does not
@@ -3144,6 +3181,7 @@ async fn activation_refuses_disallowed_import() {
     // Handlers enabled, but keyvalue NOT in the allow-list.
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3177,7 +3215,13 @@ async fn activation_refuses_disallowed_import() {
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(deploy.current_id("blog").await.unwrap(), None);
+    assert_eq!(
+        deploy
+            .current_id(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// A component larger than the posture's `max_component_bytes` is
@@ -3230,6 +3274,7 @@ async fn activation_refuses_oversized_component() {
     // Handlers enabled with the import allowed, so the *size* gate is what fires.
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3264,7 +3309,13 @@ async fn activation_refuses_oversized_component() {
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(deploy.current_id("blog").await.unwrap(), None);
+    assert_eq!(
+        deploy
+            .current_id(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// A component serving requests with **sql** end to end through the
@@ -3318,6 +3369,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
     let id = deploy.put_manifest(&manifest).await.unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3437,6 +3489,7 @@ async fn per_site_timeout_cap_applies() {
     let id = deploy.put_manifest(&manifest).await.unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3456,7 +3509,10 @@ async fn per_site_timeout_cap_applies() {
         )
         .await
         .unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
 
     // Engine default timeout is 10s; the site caps it to 50ms.
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
@@ -3514,9 +3570,13 @@ async fn stream_route_fans_out_text_and_binary_events() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3616,9 +3676,13 @@ async fn stream_per_site_connection_cap_returns_503() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3700,9 +3764,13 @@ async fn websocket_stream_fans_out_and_publishes() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3772,6 +3840,7 @@ async fn operator_dlq_endpoint_redrives_and_purges() {
     let deploy = DeployStore::new(storage.clone(), kv.clone());
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -3918,9 +3987,13 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -4046,9 +4119,13 @@ async fn guest_logs_captured_and_served() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -4163,6 +4240,7 @@ async fn preview_host_form_serves_deployment_by_id() {
     // Site `blog` answers to example.com; current deployment is v2.
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 domains: DomainConfig {
@@ -4174,7 +4252,10 @@ async fn preview_host_form_serves_deployment_by_id() {
         )
         .await
         .unwrap();
-    deploy.activate("blog", &id2).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id2)
+        .await
+        .unwrap();
 
     let app = router(deploy, Auth::disabled(), HandlerRuntime::disabled());
     let get_host = |app: axum::Router, host: &str| {
@@ -4256,9 +4337,13 @@ async fn handler_env_injected_host_env_not_inherited() {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("blog", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "blog",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -4351,7 +4436,10 @@ async fn domain_verification_flow_gates_attachment() {
     let challenge: DomainVerification = serde_json::from_slice(&body).unwrap();
     assert!(!challenge.verified);
     assert_eq!(challenge.host, "app.example.com");
-    let cfg = deploy.get_site_config("test").await.unwrap();
+    let cfg = deploy
+        .get_site_config(ProjectRef::DEFAULT, "test")
+        .await
+        .unwrap();
     assert!(
         cfg.is_none_or(|c| c.domains.primary.is_none()),
         "unverified host must not be attached"
@@ -4384,10 +4472,15 @@ async fn domain_verification_flow_gates_attachment() {
             .resolve_site_by_host("app.example.com")
             .await
             .unwrap()
+            .map(|o| o.site)
             .as_deref(),
         Some("test")
     );
-    let cfg = deploy.get_site_config("test").await.unwrap().unwrap();
+    let cfg = deploy
+        .get_site_config(ProjectRef::DEFAULT, "test")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cfg.domains.primary.as_deref(), Some("app.example.com"));
 
     // 4. The challenge is listed (verified); deleting it drops the record.
@@ -4476,7 +4569,10 @@ async fn cache_control_smart_defaults_for_assets_and_html() {
         })
         .await
         .unwrap();
-    deploy.activate("fp", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "fp", &id)
+        .await
+        .unwrap();
 
     // Fingerprinted asset → immutable, no config or header rule needed.
     let (status, headers, _) = send(&deploy, get("/_sites/fp/assets/app.a1b2c3d4.js")).await;
@@ -4566,14 +4662,22 @@ async fn activate_is_visible_immediately_through_cache() {
     let a = publish(b"<h1>A</h1>").await;
     let b = publish(b"<h1>B</h1>").await;
 
-    deploy.activate("s", &a).await.unwrap();
+    deploy.activate(ProjectRef::DEFAULT, "s", &a).await.unwrap();
     // First read caches `current/s`.
-    let m = deploy.current_manifest("s").await.unwrap().unwrap();
+    let m = deploy
+        .current_manifest(ProjectRef::DEFAULT, "s")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(m.id().unwrap(), a);
 
     // Re-activate: the write-through cache must now reflect B, not stale A.
-    deploy.activate("s", &b).await.unwrap();
-    let m = deploy.current_manifest("s").await.unwrap().unwrap();
+    deploy.activate(ProjectRef::DEFAULT, "s", &b).await.unwrap();
+    let m = deploy
+        .current_manifest(ProjectRef::DEFAULT, "s")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(m.id().unwrap(), b);
 }
 
@@ -4592,6 +4696,7 @@ async fn http_redirect_router_upgrades_to_https() {
         .as_secs();
     let v = deploy
         .start_domain_verification(
+            ProjectRef::DEFAULT,
             &boatramp_core::site::SiteName::new("docs"),
             "docs.example",
             VerificationMethod::Http,
@@ -4648,6 +4753,7 @@ async fn self_serve_domain_challenge_before_host_routing() {
         .as_secs();
     let v = deploy
         .start_domain_verification(
+            ProjectRef::DEFAULT,
             &boatramp_core::site::SiteName::new("docs"),
             "docs.example",
             VerificationMethod::Http,
@@ -4684,6 +4790,7 @@ async fn self_serve_domain_challenge_before_host_routing() {
     // A DNS-method challenge is never served over the HTTP edge route.
     let dv = deploy
         .start_domain_verification(
+            ProjectRef::DEFAULT,
             &boatramp_core::site::SiteName::new("d2"),
             "dns.example",
             VerificationMethod::Dns,
@@ -4736,6 +4843,7 @@ async fn put_config_gate_requires_verified_new_domain() {
         .as_secs();
     deploy
         .start_domain_verification(
+            ProjectRef::DEFAULT,
             &boatramp_core::site::SiteName::new("docs"),
             "unowned.example",
             VerificationMethod::Http,
@@ -4745,6 +4853,7 @@ async fn put_config_gate_requires_verified_new_domain() {
         .unwrap();
     deploy
         .mark_domain_verified(
+            ProjectRef::DEFAULT,
             &boatramp_core::site::SiteName::new("docs"),
             "unowned.example",
         )
@@ -4959,7 +5068,10 @@ async fn publish_site(deploy: &DeployStore, site: &str, body: &'static [u8]) {
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate(site, &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, site, &id)
+        .await
+        .unwrap();
 }
 
 /// A `GET /` against `app` with the given `Host`, returning `(status, body)`.
@@ -5071,6 +5183,7 @@ async fn explicit_domain_beats_implicit_first_label() {
     publish_site(&deploy, "blog", b"<h1>blog</h1>").await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -5194,6 +5307,7 @@ async fn waf_blocks_by_user_agent_and_anomaly() {
     let deploy = seed().await;
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 // Attach a domain so the host fallback resolves to this site and
@@ -5292,7 +5406,10 @@ async fn oversized_variant_is_not_served() {
         })
         .await
         .unwrap();
-    deploy.activate("v", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "v", &id)
+        .await
+        .unwrap();
 
     let mut req = get("/_sites/v/a.js");
     req.headers_mut()
@@ -5310,7 +5427,7 @@ async fn oversized_variant_is_not_served() {
 async fn protected_previews_require_a_token() {
     let deploy = seed().await;
     let id = deploy
-        .current_manifest("test")
+        .current_manifest(ProjectRef::DEFAULT, "test")
         .await
         .unwrap()
         .unwrap()
@@ -5361,6 +5478,7 @@ async fn on_the_fly_compression_for_variantless_responses() {
     let deploy = seed().await; // index.html (text/html) has no precompressed variant
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "test",
             &SiteConfig {
                 domains: DomainConfig {
@@ -5457,6 +5575,7 @@ async fn list_sites_endpoint() {
     let deploy = seed().await; // site "test" has a current deployment
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "configured",
             &SiteConfig::default(), // a site with config but no deployment
         )
@@ -5669,19 +5788,22 @@ async fn mesh_dispatch(
         .await
         .unwrap();
     deploy
-        .put_function(&Function {
-            name: "greeter".into(),
-            owner: Owner::Project("default".into()),
-            versions: vec![FunctionVersion {
-                id: "v1".into(),
-                component: greeter_hash.clone(),
-                created: 0,
-                lifecycle: Lifecycle::Independent,
-            }],
-            active: "v1".into(),
-            aliases: Default::default(),
-            config: Default::default(),
-        })
+        .put_function(
+            ProjectRef::DEFAULT,
+            &Function {
+                name: "greeter".into(),
+                owner: Owner::Project("default".into()),
+                versions: vec![FunctionVersion {
+                    id: "v1".into(),
+                    component: greeter_hash.clone(),
+                    created: 0,
+                    lifecycle: Lifecycle::Independent,
+                }],
+                active: "v1".into(),
+                aliases: Default::default(),
+                config: Default::default(),
+            },
+        )
         .await
         .unwrap();
 
@@ -5712,9 +5834,13 @@ async fn mesh_dispatch(
         ..Default::default()
     };
     let id = deploy.put_manifest(&manifest).await.unwrap();
-    deploy.activate("orch", &id).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "orch", &id)
+        .await
+        .unwrap();
     deploy
         .set_site_config(
+            ProjectRef::DEFAULT,
             "orch",
             &SiteConfig {
                 handlers: Some(HandlersSiteConfig {
@@ -5759,7 +5885,11 @@ async fn site_handler_invokes_a_granted_sibling() {
     // The invoke-caller guest echoes `greeter said (<status>): <callee-body>`.
     assert!(body.starts_with("greeter said (200):"), "body: {body}");
     // Quota-admission: the callee ran and was metered against `greeter`.
-    let metering = deploy.get_metering("greeter").await.unwrap().unwrap();
+    let metering = deploy
+        .get_metering(ProjectRef::DEFAULT, "greeter")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(metering.invocations, 1);
 }
 
@@ -5772,7 +5902,11 @@ async fn site_handler_invoke_target_outside_allowlist() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
     assert!(body.contains("not in the allowlist"), "body: {body}");
     // The callee never ran.
-    assert!(deploy.get_metering("greeter").await.unwrap().is_none());
+    assert!(deploy
+        .get_metering(ProjectRef::DEFAULT, "greeter")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Deny-by-default: `invoke` is imported and allowed, but the handler names **no**

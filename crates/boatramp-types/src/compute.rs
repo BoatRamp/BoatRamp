@@ -14,17 +14,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::sha256_hex;
 
-/// KV key prefix for the mutable per-workload desired state.
-pub const WORKLOAD_PREFIX: &str = "compute/";
-/// KV key prefix for immutable, content-addressed compute specs.
+/// KV key prefix for immutable, content-addressed compute specs. Stays **global**
+/// (a content hash is a self-authenticating capability; specs dedup across projects).
 pub const SPEC_PREFIX: &str = "computever/";
 
-/// The mutable desired-state key for a workload.
-pub fn workload_key(name: &str) -> String {
-    format!("{WORKLOAD_PREFIX}{name}")
+/// The mutable desired-state key for a workload, **project-scoped** (0.2.0):
+/// `project/<proj>/compute/<name>`. `project` is a bare `&str` (this crate is
+/// wasm-clean); `boatramp-core` callers pass `ProjectRef::as_str()`.
+pub fn workload_key(project: &str, name: &str) -> String {
+    format!("project/{project}/compute/{name}")
 }
 
-/// The immutable spec key for a content hash.
+/// The prefix listing every workload's desired state in a project.
+pub fn workloads_prefix(project: &str) -> String {
+    format!("project/{project}/compute/")
+}
+
+/// The immutable spec key for a content hash (global CAS).
 pub fn spec_key(hash: &str) -> String {
     format!("{SPEC_PREFIX}{hash}")
 }
@@ -284,7 +290,13 @@ mod tests {
 
     #[test]
     fn keyspace_helpers() {
-        assert_eq!(workload_key("api"), "compute/api");
+        assert_eq!(
+            workload_key("default", "api"),
+            "project/default/compute/api"
+        );
+        assert_eq!(workload_key("acme", "api"), "project/acme/compute/api");
+        assert_eq!(workloads_prefix("default"), "project/default/compute/");
+        // The spec body is content-addressed and stays global (dedup across projects).
         assert_eq!(spec_key("deadbeef"), "computever/deadbeef");
     }
 

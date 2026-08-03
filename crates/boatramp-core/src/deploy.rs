@@ -26,6 +26,7 @@ use crate::config::SiteConfig;
 use crate::domain_verify::{DomainVerification, VerificationMethod};
 use crate::error::DeployError;
 use crate::kv::{KvStore, WriteOp};
+use crate::project::{DomainOwner, ProjectRef};
 use crate::site::SiteName;
 use crate::{ByteStream, GetObject, PutMeta, Storage, StorageError};
 
@@ -108,37 +109,61 @@ pub struct DeployStore {
     domain_claim_lock: Arc<futures::lock::Mutex<()>>,
 }
 
-/// The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]).
-/// Every deploy key/prefix is built here, so the persisted layout is legible at a
-/// glance instead of scattered through [`DeployStore`]'s methods. The strings are
-/// the on-disk keyspace — changing one is a migration, not a refactor.
 mod keys {
-    /// A content-addressed manifest: `manifests/<id>`.
+    //! The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]),
+    //! so the persisted layout is legible at a glance instead of scattered through
+    //! [`DeployStore`]'s methods. The strings are the on-disk keyspace — changing one is
+    //! a migration, not a refactor.
+    //!
+    //! Two classes, split by the 0.2.0 **project** re-keying:
+    //!
+    //! - **Project-scoped** (mutable, per-name): a [`ProjectRef`] first arg puts the
+    //!   record under `project/<proj>/…`. The compiler enforces the project is
+    //!   supplied — a site name can't be passed where a project is meant.
+    //! - **Global** (unchanged): content-addressed dedup-shared bodies (`manifests/`,
+    //!   `meta/`, blobs, `siteconfig/`, `daemonconfig/`) — a content hash is a
+    //!   self-authenticating capability, so bodies dedup across projects — and the
+    //!   global-uniqueness domain-routing index (`domain/`, `wildcard/`,
+    //!   `httpchallenge/`), whose **value** now carries the owning `(project, site)`.
+
+    use crate::project::ProjectRef;
+
+    /// A content-addressed manifest: `manifests/<id>` (global CAS).
     pub fn manifest(id: &str) -> String {
         format!("manifests/{id}")
     }
 
-    /// A deployment's [`DeployMeta`](super::DeployMeta): `meta/<id>`.
+    /// A deployment's [`DeployMeta`](super::DeployMeta): `meta/<id>` (global CAS).
     pub fn meta(id: &str) -> String {
         format!("meta/{id}")
     }
 
-    /// A site's active deployment pointer: `current/<site>`.
-    pub fn current(site: &str) -> String {
-        format!("current/{site}")
+    /// A site's active deployment pointer: `project/<proj>/current/<site>`.
+    pub fn current(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/current/{site}")
     }
 
-    /// A named alias → deployment id: `alias/<site>/<name>`.
-    pub fn alias(site: &str, name: &str) -> String {
-        format!("alias/{site}/{name}")
+    /// The prefix listing a project's active-deployment pointers.
+    pub fn current_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/current/")
     }
 
-    /// The prefix listing a site's aliases: `alias/<site>/`.
-    pub fn alias_prefix(site: &str) -> String {
-        format!("alias/{site}/")
+    /// A named alias → deployment id: `project/<proj>/alias/<site>/<name>`.
+    pub fn alias(project: ProjectRef<'_>, site: &str, name: &str) -> String {
+        format!("project/{project}/alias/{site}/{name}")
     }
 
-    /// Sharded blob key, e.g. `ab/abcdef...`, to avoid one huge directory.
+    /// The prefix listing a site's aliases: `project/<proj>/alias/<site>/`.
+    pub fn alias_prefix(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/alias/{site}/")
+    }
+
+    /// The prefix listing **every** alias in a project (all sites).
+    pub fn alias_project_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/alias/")
+    }
+
+    /// Sharded blob key, e.g. `ab/abcdef...`, to avoid one huge directory (global CAS).
     pub fn blob(hash: &str) -> String {
         if hash.len() >= 2 {
             format!("{}/{}", &hash[..2], hash)
@@ -147,43 +172,63 @@ mod keys {
         }
     }
 
-    /// The **mutable pointer** for a site: `site/<site>` → the content hash of
-    /// its current `SiteConfig`. Tiny; the only key that changes on a config
+    /// The **mutable pointer** for a site: `project/<proj>/site/<site>` → the content
+    /// hash of its current `SiteConfig`. Tiny; the only key that changes on a config
     /// edit, so it's the only thing the shared-mode invalidation feed must carry.
-    pub fn site_pointer(site: &str) -> String {
-        format!("site/{site}")
+    pub fn site_pointer(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/site/{site}")
+    }
+
+    /// The prefix listing a project's site-config pointers.
+    pub fn site_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/site/")
     }
 
     /// The **immutable, content-addressed** config body:
     /// `siteconfig/<hash>` → the `SiteConfig` JSON. Keyed by its own hash, so it
     /// never changes under a key and is safe to cache forever; identical configs
-    /// across sites dedup to one blob.
+    /// across sites (and projects) dedup to one blob. Global CAS.
     pub fn site_config_blob(hash: &str) -> String {
         format!("siteconfig/{hash}")
     }
 
-    /// A registered exact host → site: `domain/<canon-host>`.
+    /// A registered exact host → owner: `domain/<canon-host>`. The **key** is global
+    /// (hosts are globally unique); the stored **value** is the owning
+    /// `(project, site)` (see [`DomainOwner`](crate::project::DomainOwner)).
     pub fn domain(host: &str) -> String {
         format!("domain/{}", super::canon_host(host))
     }
 
-    /// A registered wildcard suffix → site: `wildcard/<canon-suffix>`.
+    /// A registered wildcard suffix → owner: `wildcard/<canon-suffix>` (global key,
+    /// owner in the value).
     pub fn wildcard(suffix: &str) -> String {
         format!("wildcard/{}", super::canon_host(suffix))
     }
 
-    /// A pending domain-ownership challenge: `domainverify/<site>/<verify-host>`.
-    pub fn domain_verification(site: &str, host: &str) -> String {
+    /// A pending domain-ownership challenge:
+    /// `project/<proj>/domainverify/<site>/<verify-host>`.
+    pub fn domain_verification(project: ProjectRef<'_>, site: &str, host: &str) -> String {
         format!(
-            "domainverify/{site}/{}",
+            "project/{project}/domainverify/{site}/{}",
             crate::domain_verify::normalize_host(host)
         )
     }
 
-    /// Index key mapping an **HTTP challenge** `(host, token)` → its site, so the
+    /// The prefix listing a site's pending domain challenges.
+    pub fn domain_verification_prefix(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/domainverify/{site}/")
+    }
+
+    /// The prefix listing **every** pending domain challenge in a project.
+    pub fn domain_verification_project_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/domainverify/")
+    }
+
+    /// Index key mapping an **HTTP challenge** `(host, token)` → its owner, so the
     /// unauthenticated self-serve edge route is an O(1) lookup rather than an O(N)
     /// scan of every site's challenges (a flood-amplification vector). The token
-    /// is a 128-bit random, so carrying it in the key is safe.
+    /// is a 128-bit random, so carrying it in the key is safe. Global key; the value
+    /// carries the owning `(project, site)`.
     pub fn http_challenge_index(host: &str, token: &str) -> String {
         format!(
             "httpchallenge/{}/{token}",
@@ -191,14 +236,33 @@ mod keys {
         )
     }
 
-    /// The immutable, content-addressed daemon-config body: `daemonconfig/<hash>`.
+    /// The immutable, content-addressed daemon-config body: `daemonconfig/<hash>`
+    /// (global CAS + a control-plane singleton).
     pub fn daemon_config_blob(hash: &str) -> String {
         format!("daemonconfig/{hash}")
     }
 
-    /// A site's activation history list: `history/<site>`.
-    pub fn history(site: &str) -> String {
-        format!("history/{site}")
+    /// A site's activation history list: `project/<proj>/history/<site>`.
+    pub fn history(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/history/{site}")
+    }
+
+    /// The prefix listing a project's activation-history lists.
+    pub fn history_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/history/")
+    }
+
+    /// The root prefix under which **all** project-scoped records live. A cross-
+    /// project fan-out (`_all` list variants, GC) discovers the project set by
+    /// scanning this and splitting out the segment after it.
+    pub const PROJECT_ROOT: &str = "project/";
+
+    /// The project name owning a project-scoped `key` (the segment right after
+    /// [`PROJECT_ROOT`]), or `None` if `key` is not project-scoped.
+    pub fn project_of_key(key: &str) -> Option<&str> {
+        key.strip_prefix(PROJECT_ROOT)
+            .and_then(|rest| rest.split('/').next())
+            .filter(|p| !p.is_empty())
     }
 }
 
@@ -393,8 +457,12 @@ impl DeployStore {
 
     /// A site's [`SiteConfig`], if it has been set. Reads the `site/<site>`
     /// pointer, then the immutable `siteconfig/<hash>` body it names.
-    pub async fn get_site_config(&self, site: &str) -> Result<Option<SiteConfig>, DeployError> {
-        let Some(hash) = self.kv.get(&keys::site_pointer(site)).await? else {
+    pub async fn get_site_config(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<Option<SiteConfig>, DeployError> {
+        let Some(hash) = self.kv.get(&keys::site_pointer(project, site)).await? else {
             return Ok(None);
         };
         let hash = String::from_utf8_lossy(&hash).into_owned();
@@ -426,11 +494,12 @@ impl DeployStore {
     /// follow-up, not reachable in the dominant single-node topology.
     pub async fn set_site_config(
         &self,
+        project: ProjectRef<'_>,
         site: &str,
         config: &SiteConfig,
     ) -> Result<(), DeployError> {
         let _claim = self.domain_claim_lock.lock().await;
-        self.set_site_config_locked(site, config).await
+        self.set_site_config_locked(project, site, config).await
     }
 
     /// [`set_site_config`](Self::set_site_config) assuming the domain-claim lock
@@ -439,19 +508,21 @@ impl DeployStore {
     /// is not reentrant).
     async fn set_site_config_locked(
         &self,
+        project: ProjectRef<'_>,
         site: &str,
         config: &SiteConfig,
     ) -> Result<(), DeployError> {
-        // Refuse any host/wildcard already claimed by another site before writing
-        // anything (the hijack guard). A host this site already owns, or one that
-        // is unclaimed, passes.
+        let owner = DomainOwner::new(project.as_str(), site);
+        // Refuse any host/wildcard already claimed by another (project, site) before
+        // writing anything (the hijack guard). A host this site already owns, or one
+        // that is unclaimed, passes.
         for host in config.domains.exact_hosts() {
-            self.ensure_host_claimable(&keys::domain(host), host, site)
+            self.ensure_host_claimable(&keys::domain(host), host, &owner)
                 .await?;
         }
         for wildcard in &config.domains.wildcards {
             if let Some(suffix) = wildcard.strip_prefix("*.") {
-                self.ensure_host_claimable(&keys::wildcard(suffix), wildcard, site)
+                self.ensure_host_claimable(&keys::wildcard(suffix), wildcard, &owner)
                     .await?;
             }
         }
@@ -460,7 +531,7 @@ impl DeployStore {
         let hash = sha256_hex(&body);
 
         let mut ops = Vec::new();
-        if let Some(old) = self.get_site_config(site).await? {
+        if let Some(old) = self.get_site_config(project, site).await? {
             for host in old.domains.exact_hosts() {
                 ops.push(WriteOp::Delete(keys::domain(host)));
             }
@@ -473,15 +544,20 @@ impl DeployStore {
 
         // Immutable body (idempotent put) + the mutable pointer flip.
         ops.push(WriteOp::Put(keys::site_config_blob(&hash), body));
-        ops.push(WriteOp::Put(keys::site_pointer(site), hash.into_bytes()));
+        ops.push(WriteOp::Put(
+            keys::site_pointer(project, site),
+            hash.into_bytes(),
+        ));
 
-        let site_bytes = site.as_bytes().to_vec();
+        // The domain-routing index value carries the owning `(project, site)` so a
+        // request `Host` resolves to both (the key stays global — hosts are unique).
+        let owner_bytes = owner.to_bytes();
         for host in config.domains.exact_hosts() {
-            ops.push(WriteOp::Put(keys::domain(host), site_bytes.clone()));
+            ops.push(WriteOp::Put(keys::domain(host), owner_bytes.clone()));
         }
         for wildcard in &config.domains.wildcards {
             if let Some(suffix) = wildcard.strip_prefix("*.") {
-                ops.push(WriteOp::Put(keys::wildcard(suffix), site_bytes.clone()));
+                ops.push(WriteOp::Put(keys::wildcard(suffix), owner_bytes.clone()));
             }
         }
         self.kv.write_batch(ops).await?;
@@ -489,58 +565,67 @@ impl DeployStore {
     }
 
     /// Error with [`DeployError::Conflict`] if index `key` (a `domain/<host>` or
-    /// `wildcard/<suffix>` entry) is already held by a site other than `site`.
+    /// `wildcard/<suffix>` entry) is already held by an owner other than `owner`.
     /// `label` is the host as written, for the message. Must be called with the
-    /// domain-claim lock held.
+    /// domain-claim lock held. The stored value is a tolerant
+    /// [`DomainOwner`] (a bare-string legacy value reads as the `default` project).
     async fn ensure_host_claimable(
         &self,
         key: &str,
         label: &str,
-        site: &str,
+        owner: &DomainOwner,
     ) -> Result<(), DeployError> {
         if let Some(bytes) = self.kv.get(key).await? {
-            let owner = String::from_utf8_lossy(&bytes);
-            if owner != site {
+            let held = DomainOwner::from_bytes(&bytes);
+            if &held != owner {
                 return Err(DeployError::Conflict(format!(
-                    "{label} is already attached to site `{owner}`"
+                    "{label} is already attached to site `{}` in project `{}`",
+                    held.site, held.project
                 )));
             }
         }
         Ok(())
     }
 
-    /// Resolve a request `Host` to a site: exact match first, then wildcard
-    /// suffixes from most specific to least (so `*.example.com` matches
-    /// `a.b.example.com`).
-    pub async fn resolve_site_by_host(&self, host: &str) -> Result<Option<String>, DeployError> {
+    /// Resolve a request `Host` to its owning `(project, site)`: exact match first,
+    /// then wildcard suffixes from most specific to least (so `*.example.com`
+    /// matches `a.b.example.com`). The index value is a tolerant [`DomainOwner`]
+    /// (a legacy bare-string value reads as the `default` project).
+    pub async fn resolve_site_by_host(
+        &self,
+        host: &str,
+    ) -> Result<Option<DomainOwner>, DeployError> {
         // Canonicalize once so the `Host` a client sends matches the canonical
         // key written by `set_site_config` regardless of case / trailing dot.
         let host = canon_host(host);
         let host = host.as_str();
         if let Some(bytes) = self.kv.get(&keys::domain(host)).await? {
-            return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+            return Ok(Some(DomainOwner::from_bytes(&bytes)));
         }
         let mut rest = host;
         while let Some((_, parent)) = rest.split_once('.') {
             if let Some(bytes) = self.kv.get(&keys::wildcard(parent)).await? {
-                return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+                return Ok(Some(DomainOwner::from_bytes(&bytes)));
             }
             rest = parent;
         }
         Ok(None)
     }
 
-    /// Every known site name, sorted and de-duplicated. A site is "known" if it
-    /// has a current deployment (`current/<site>`), a config (`site/<site>`), or
-    /// activation history (`history/<site>`) — so a configured-but-not-yet-
-    /// deployed site (or vice versa) still appears. Backs `GET /api/sites`.
-    /// (Broader than [`list_sites`](Self::list_sites), which is just the
-    /// currently-deployed sites the scheduler runs.)
-    pub async fn all_sites(&self) -> Result<Vec<String>, DeployError> {
+    /// Every known site name in `project`, sorted and de-duplicated. A site is
+    /// "known" if it has a current deployment, a config, or activation history —
+    /// so a configured-but-not-yet-deployed site (or vice versa) still appears.
+    /// Backs `GET /api/sites`. (Broader than [`list_sites`](Self::list_sites),
+    /// which is just the currently-deployed sites the scheduler runs.)
+    pub async fn all_sites(&self, project: ProjectRef<'_>) -> Result<Vec<String>, DeployError> {
         let mut sites = BTreeSet::new();
-        for prefix in ["current/", "site/", "history/"] {
-            for key in self.kv.list_prefix(prefix).await? {
-                if let Some(name) = key.strip_prefix(prefix) {
+        for prefix in [
+            keys::current_prefix(project),
+            keys::site_prefix(project),
+            keys::history_prefix(project),
+        ] {
+            for key in self.kv.list_prefix(&prefix).await? {
+                if let Some(name) = key.strip_prefix(&prefix) {
                     if !name.is_empty() {
                         sites.insert(name.to_string());
                     }
@@ -550,17 +635,51 @@ impl DeployStore {
         Ok(sites.into_iter().collect())
     }
 
+    /// Every `(project, site)` known across **all** projects — the cross-project
+    /// fan-out backing the scheduler and admin surfaces. Discovers the project set
+    /// by scanning [`keys::PROJECT_ROOT`], then unions each project's `all_sites`.
+    pub async fn all_sites_all(&self) -> Result<Vec<(String, String)>, DeployError> {
+        let mut out = Vec::new();
+        for project in self.discover_projects().await? {
+            for site in self.all_sites(ProjectRef::new(&project)).await? {
+                out.push((project.clone(), site));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The distinct project names with any record in the store (the segment after
+    /// [`keys::PROJECT_ROOT`]). Independent of whether a `projectmeta/<name>`
+    /// pointer exists, so a fan-out reaches projects created only implicitly (e.g.
+    /// pre-migration data re-keyed under `default`).
+    pub async fn discover_projects(&self) -> Result<Vec<String>, DeployError> {
+        let mut projects = BTreeSet::new();
+        for key in self.kv.list_prefix(keys::PROJECT_ROOT).await? {
+            if let Some(p) = keys::project_of_key(&key) {
+                projects.insert(p.to_string());
+            }
+        }
+        Ok(projects.into_iter().collect())
+    }
+
     // ---- Top-level functions (PLAN-faas FA-2) --------------------------------
     // Independently-versioned functions stored as one JSON record per name under
-    // `functions/<name>`, referencing content-addressed component blobs. Reuses the
-    // blob store + KV; the deploy/alias immutability model applies (a version id is
-    // its component's content hash).
+    // `project/<proj>/functions/<name>`, referencing content-addressed component
+    // blobs. Reuses the blob store + KV; the deploy/alias immutability model applies
+    // (a version id is its component's content hash).
 
     /// Store a top-level function's record (its versions, active, aliases).
-    pub async fn put_function(&self, f: &crate::function::Function) -> Result<(), DeployError> {
+    pub async fn put_function(
+        &self,
+        project: ProjectRef<'_>,
+        f: &crate::function::Function,
+    ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(f).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
-            .put(&crate::function::keys::meta(&f.name), bytes)
+            .put(
+                &crate::function::keys::meta(project.as_str(), &f.name),
+                bytes,
+            )
             .await?;
         Ok(())
     }
@@ -568,9 +687,14 @@ impl DeployStore {
     /// Load a stored function record, if any.
     pub async fn get_function(
         &self,
+        project: ProjectRef<'_>,
         name: &str,
     ) -> Result<Option<crate::function::Function>, DeployError> {
-        match self.kv.get(&crate::function::keys::meta(name)).await? {
+        match self
+            .kv
+            .get(&crate::function::keys::meta(project.as_str(), name))
+            .await?
+        {
             Some(bytes) => Ok(Some(
                 serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
             )),
@@ -578,17 +702,19 @@ impl DeployStore {
         }
     }
 
-    /// List all stored (top-level) functions.
+    /// List all stored (top-level) functions in `project`.
     ///
-    /// Only the `functions/<name>` *meta* keys are function records; the
-    /// `functions/<name>/{versions,alias,triggers,invocations,idem}/…` sub-keys
+    /// Only the `…/functions/<name>` *meta* keys are function records; the
+    /// `…/functions/<name>/{versions,alias,triggers,invocations,idem}/…` sub-keys
     /// are skipped by requiring the suffix to hold no further `/`.
     pub async fn list_stored_functions(
         &self,
+        project: ProjectRef<'_>,
     ) -> Result<Vec<crate::function::Function>, DeployError> {
+        let prefix = crate::function::keys::functions_prefix(project.as_str());
         let mut out = Vec::new();
-        for key in self.kv.list_prefix("functions/").await? {
-            if key["functions/".len()..].contains('/') {
+        for key in self.kv.list_prefix(&prefix).await? {
+            if key[prefix.len()..].contains('/') {
                 continue;
             }
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -602,8 +728,12 @@ impl DeployStore {
 
     /// Delete a stored function. Returns whether it existed. The component blobs
     /// are content-addressed + shared, so they are left to `prune`.
-    pub async fn delete_function(&self, name: &str) -> Result<bool, DeployError> {
-        let key = crate::function::keys::meta(name);
+    pub async fn delete_function(
+        &self,
+        project: ProjectRef<'_>,
+        name: &str,
+    ) -> Result<bool, DeployError> {
+        let key = crate::function::keys::meta(project.as_str(), name);
         let existed = self.kv.get(&key).await?.is_some();
         self.kv.delete(&key).await?;
         Ok(existed)
@@ -614,13 +744,14 @@ impl DeployStore {
     /// Persist (create or replace) a stored trigger on a function.
     pub async fn put_trigger(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         trigger: &crate::function::FunctionTrigger,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(trigger).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
             .put(
-                &crate::function::keys::trigger(function, &trigger.id),
+                &crate::function::keys::trigger(project.as_str(), function, &trigger.id),
                 bytes,
             )
             .await?;
@@ -630,12 +761,17 @@ impl DeployStore {
     /// Load one stored trigger, if any.
     pub async fn get_trigger(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         id: &str,
     ) -> Result<Option<crate::function::FunctionTrigger>, DeployError> {
         match self
             .kv
-            .get(&crate::function::keys::trigger(function, id))
+            .get(&crate::function::keys::trigger(
+                project.as_str(),
+                function,
+                id,
+            ))
             .await?
         {
             Some(bytes) => Ok(Some(
@@ -648,9 +784,10 @@ impl DeployStore {
     /// List a function's stored triggers.
     pub async fn list_triggers(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
     ) -> Result<Vec<crate::function::FunctionTrigger>, DeployError> {
-        let prefix = format!("functions/{function}/triggers/");
+        let prefix = crate::function::keys::triggers_prefix(project.as_str(), function);
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -663,8 +800,13 @@ impl DeployStore {
     }
 
     /// Delete a stored trigger. Returns whether it existed.
-    pub async fn delete_trigger(&self, function: &str, id: &str) -> Result<bool, DeployError> {
-        let key = crate::function::keys::trigger(function, id);
+    pub async fn delete_trigger(
+        &self,
+        project: ProjectRef<'_>,
+        function: &str,
+        id: &str,
+    ) -> Result<bool, DeployError> {
+        let key = crate::function::keys::trigger(project.as_str(), function, id);
         let existed = self.kv.get(&key).await?.is_some();
         self.kv.delete(&key).await?;
         Ok(existed)
@@ -675,12 +817,13 @@ impl DeployStore {
     /// Persist (create or update) an invocation record.
     pub async fn put_invocation(
         &self,
+        project: ProjectRef<'_>,
         inv: &crate::function::Invocation,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(inv).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
             .put(
-                &crate::function::keys::invocation(&inv.function, &inv.id),
+                &crate::function::keys::invocation(project.as_str(), &inv.function, &inv.id),
                 bytes,
             )
             .await?;
@@ -690,12 +833,17 @@ impl DeployStore {
     /// Load one invocation record, if any.
     pub async fn get_invocation(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         id: &str,
     ) -> Result<Option<crate::function::Invocation>, DeployError> {
         match self
             .kv
-            .get(&crate::function::keys::invocation(function, id))
+            .get(&crate::function::keys::invocation(
+                project.as_str(),
+                function,
+                id,
+            ))
             .await?
         {
             Some(bytes) => Ok(Some(
@@ -708,9 +856,10 @@ impl DeployStore {
     /// List a function's invocation records (queue scan / poll listing).
     pub async fn list_invocations(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
     ) -> Result<Vec<crate::function::Invocation>, DeployError> {
-        let prefix = crate::function::keys::invocations_prefix(function);
+        let prefix = crate::function::keys::invocations_prefix(project.as_str(), function);
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -726,13 +875,14 @@ impl DeployStore {
     /// is the raw invocation id.
     pub async fn put_idempotency(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         key: &str,
         invocation_id: &str,
     ) -> Result<(), DeployError> {
         self.kv
             .put(
-                &crate::function::keys::idempotency(function, key),
+                &crate::function::keys::idempotency(project.as_str(), function, key),
                 invocation_id.as_bytes().to_vec(),
             )
             .await?;
@@ -742,12 +892,17 @@ impl DeployStore {
     /// Resolve an idempotency key to its invocation id, if one was recorded.
     pub async fn get_idempotency(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         key: &str,
     ) -> Result<Option<String>, DeployError> {
         match self
             .kv
-            .get(&crate::function::keys::idempotency(function, key))
+            .get(&crate::function::keys::idempotency(
+                project.as_str(),
+                function,
+                key,
+            ))
             .await?
         {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
@@ -760,11 +915,12 @@ impl DeployStore {
     /// The usage aggregate for a function, if any has been recorded.
     pub async fn get_metering(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
     ) -> Result<Option<crate::function::Metering>, DeployError> {
         match self
             .kv
-            .get(&crate::function::keys::metering(function))
+            .get(&crate::function::keys::metering(project.as_str(), function))
             .await?
         {
             Some(bytes) => Ok(Some(
@@ -777,19 +933,28 @@ impl DeployStore {
     /// Persist a function's usage aggregate.
     pub async fn put_metering(
         &self,
+        project: ProjectRef<'_>,
         metering: &crate::function::Metering,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(metering).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
-            .put(&crate::function::keys::metering(&metering.function), bytes)
+            .put(
+                &crate::function::keys::metering(project.as_str(), &metering.function),
+                bytes,
+            )
             .await?;
         Ok(())
     }
 
-    /// List every function's usage aggregate (the `functions usage` fan-out).
-    pub async fn list_metering(&self) -> Result<Vec<crate::function::Metering>, DeployError> {
+    /// List every function's usage aggregate in `project` (the `functions usage`
+    /// fan-out).
+    pub async fn list_metering(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Vec<crate::function::Metering>, DeployError> {
+        let prefix = crate::function::keys::metering_prefix(project.as_str());
         let mut out = Vec::new();
-        for key in self.kv.list_prefix("metering/").await? {
+        for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
                 if let Ok(m) = serde_json::from_slice(&bytes) {
                     out.push(m);
@@ -805,6 +970,7 @@ impl DeployStore {
     /// blob-change trigger, so it can be retracted later.
     pub async fn put_managed_notification(
         &self,
+        project: ProjectRef<'_>,
         record: &crate::blob_notify::ManagedNotification,
     ) -> Result<(), DeployError> {
         let bytes = record
@@ -812,7 +978,11 @@ impl DeployStore {
             .map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
             .put(
-                &crate::blob_notify::blobnotify_key(&record.function, &record.prefix),
+                &crate::blob_notify::blobnotify_key(
+                    project.as_str(),
+                    &record.function,
+                    &record.prefix,
+                ),
                 bytes,
             )
             .await?;
@@ -822,12 +992,17 @@ impl DeployStore {
     /// The notification ledger entry for `(function, prefix)`, if any.
     pub async fn get_managed_notification(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         prefix: &str,
     ) -> Result<Option<crate::blob_notify::ManagedNotification>, DeployError> {
         match self
             .kv
-            .get(&crate::blob_notify::blobnotify_key(function, prefix))
+            .get(&crate::blob_notify::blobnotify_key(
+                project.as_str(),
+                function,
+                prefix,
+            ))
             .await?
         {
             Some(bytes) => Ok(Some(
@@ -841,9 +1016,10 @@ impl DeployStore {
     /// All notification ledger entries for a function.
     pub async fn list_managed_notifications(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
     ) -> Result<Vec<crate::blob_notify::ManagedNotification>, DeployError> {
-        let prefix = crate::blob_notify::blobnotify_function_prefix(function);
+        let prefix = crate::blob_notify::blobnotify_function_prefix(project.as_str(), function);
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -858,11 +1034,16 @@ impl DeployStore {
     /// Drop a notification ledger entry (after its resources are retracted).
     pub async fn remove_managed_notification(
         &self,
+        project: ProjectRef<'_>,
         function: &str,
         prefix: &str,
     ) -> Result<(), DeployError> {
         self.kv
-            .delete(&crate::blob_notify::blobnotify_key(function, prefix))
+            .delete(&crate::blob_notify::blobnotify_key(
+                project.as_str(),
+                function,
+                prefix,
+            ))
             .await?;
         Ok(())
     }
@@ -872,11 +1053,15 @@ impl DeployStore {
     /// Persist a workflow definition.
     pub async fn put_workflow(
         &self,
+        project: ProjectRef<'_>,
         workflow: &crate::workflow::Workflow,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(workflow).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
-            .put(&crate::workflow::keys::definition(&workflow.name), bytes)
+            .put(
+                &crate::workflow::keys::definition(project.as_str(), &workflow.name),
+                bytes,
+            )
             .await?;
         Ok(())
     }
@@ -884,11 +1069,12 @@ impl DeployStore {
     /// Load a workflow definition, if any.
     pub async fn get_workflow(
         &self,
+        project: ProjectRef<'_>,
         name: &str,
     ) -> Result<Option<crate::workflow::Workflow>, DeployError> {
         match self
             .kv
-            .get(&crate::workflow::keys::definition(name))
+            .get(&crate::workflow::keys::definition(project.as_str(), name))
             .await?
         {
             Some(bytes) => Ok(Some(
@@ -898,12 +1084,17 @@ impl DeployStore {
         }
     }
 
-    /// List all workflow definitions (skips the `workflows/<name>/runs/…` sub-keys
-    /// by requiring the suffix to hold no further `/`).
-    pub async fn list_workflows(&self) -> Result<Vec<crate::workflow::Workflow>, DeployError> {
+    /// List all workflow definitions in `project` (skips the
+    /// `…/workflows/<name>/runs/…` sub-keys by requiring the suffix to hold no
+    /// further `/`).
+    pub async fn list_workflows(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Vec<crate::workflow::Workflow>, DeployError> {
+        let prefix = crate::workflow::keys::definitions_prefix(project.as_str());
         let mut out = Vec::new();
-        for key in self.kv.list_prefix("workflows/").await? {
-            if key["workflows/".len()..].contains('/') {
+        for key in self.kv.list_prefix(&prefix).await? {
+            if key[prefix.len()..].contains('/') {
                 continue;
             }
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -917,8 +1108,12 @@ impl DeployStore {
 
     /// Delete a workflow definition. Returns whether it existed. Runs are left in
     /// place (terminal history); `prune` removes them.
-    pub async fn delete_workflow(&self, name: &str) -> Result<bool, DeployError> {
-        let key = crate::workflow::keys::definition(name);
+    pub async fn delete_workflow(
+        &self,
+        project: ProjectRef<'_>,
+        name: &str,
+    ) -> Result<bool, DeployError> {
+        let key = crate::workflow::keys::definition(project.as_str(), name);
         let existed = self.kv.get(&key).await?.is_some();
         self.kv.delete(&key).await?;
         Ok(existed)
@@ -927,11 +1122,15 @@ impl DeployStore {
     /// Persist (create or update) a workflow run.
     pub async fn put_workflow_run(
         &self,
+        project: ProjectRef<'_>,
         run: &crate::workflow::WorkflowRun,
     ) -> Result<(), DeployError> {
         let bytes = serde_json::to_vec(run).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
-            .put(&crate::workflow::keys::run(&run.workflow, &run.id), bytes)
+            .put(
+                &crate::workflow::keys::run(project.as_str(), &run.workflow, &run.id),
+                bytes,
+            )
             .await?;
         Ok(())
     }
@@ -939,12 +1138,13 @@ impl DeployStore {
     /// Load one workflow run, if any.
     pub async fn get_workflow_run(
         &self,
+        project: ProjectRef<'_>,
         workflow: &str,
         id: &str,
     ) -> Result<Option<crate::workflow::WorkflowRun>, DeployError> {
         match self
             .kv
-            .get(&crate::workflow::keys::run(workflow, id))
+            .get(&crate::workflow::keys::run(project.as_str(), workflow, id))
             .await?
         {
             Some(bytes) => Ok(Some(
@@ -957,9 +1157,10 @@ impl DeployStore {
     /// List a workflow's runs (the executor drain scan / poll listing).
     pub async fn list_workflow_runs(
         &self,
+        project: ProjectRef<'_>,
         workflow: &str,
     ) -> Result<Vec<crate::workflow::WorkflowRun>, DeployError> {
-        let prefix = crate::workflow::keys::runs_prefix(workflow);
+        let prefix = crate::workflow::keys::runs_prefix(project.as_str(), workflow);
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -974,12 +1175,13 @@ impl DeployStore {
     /// The ownership-verification challenge for `(site, host)`, if one exists.
     pub async fn get_domain_verification(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<Option<DomainVerification>, DeployError> {
         match self
             .kv
-            .get(&keys::domain_verification(site.as_str(), host))
+            .get(&keys::domain_verification(project, site.as_str(), host))
             .await?
         {
             Some(bytes) => Ok(Some(DomainVerification::from_json(&bytes)?)),
@@ -990,9 +1192,10 @@ impl DeployStore {
     /// All ownership challenges for `site` (pending and verified), by host.
     pub async fn list_domain_verifications(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
     ) -> Result<Vec<DomainVerification>, DeployError> {
-        let prefix = format!("domainverify/{site}/");
+        let prefix = keys::domain_verification_prefix(project, site.as_str());
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -1003,33 +1206,42 @@ impl DeployStore {
         Ok(out)
     }
 
-    /// Every ownership challenge across **all** sites, each paired with its site
-    /// name — the enumeration behind the auto-complete reconcile loop. Scans the
-    /// whole `domainverify/` keyspace, so a challenge started before a site's
-    /// first publish (its site isn't in [`all_sites`](Self::all_sites) yet) is
-    /// still found and can self-heal.
+    /// Every ownership challenge across **all** projects, each paired with its
+    /// owning `(project, site)` — the enumeration behind the auto-complete
+    /// reconcile loop. Fans out over [`discover_projects`](Self::discover_projects)
+    /// and scans each project's `domainverify/` keyspace, so a challenge started
+    /// before a site's first publish (its site isn't in
+    /// [`all_sites`](Self::all_sites) yet) is still found and can self-heal.
     pub async fn list_all_domain_verifications(
         &self,
-    ) -> Result<Vec<(String, DomainVerification)>, DeployError> {
+    ) -> Result<Vec<(String, String, DomainVerification)>, DeployError> {
         let mut out = Vec::new();
-        for key in self.kv.list_prefix("domainverify/").await? {
-            // Key shape: `domainverify/<site>/<host>`; the site is the first
-            // segment after the prefix (site names carry no `/`).
-            let Some((site, _host)) = key
-                .strip_prefix("domainverify/")
-                .and_then(|rest| rest.split_once('/'))
-            else {
-                continue;
-            };
-            if let Some(bytes) = self.kv.get(&key).await? {
-                out.push((site.to_string(), DomainVerification::from_json(&bytes)?));
+        for project in self.discover_projects().await? {
+            let pref = ProjectRef::new(&project);
+            let scan = keys::domain_verification_project_prefix(pref);
+            for key in self.kv.list_prefix(&scan).await? {
+                // Key shape: `project/<proj>/domainverify/<site>/<host>`; the site
+                // is the first segment after the scan prefix (no `/` in a site name).
+                let Some((site, _host)) = key
+                    .strip_prefix(&scan)
+                    .and_then(|rest| rest.split_once('/'))
+                else {
+                    continue;
+                };
+                if let Some(bytes) = self.kv.get(&key).await? {
+                    out.push((
+                        project.clone(),
+                        site.to_string(),
+                        DomainVerification::from_json(&bytes)?,
+                    ));
+                }
             }
         }
         Ok(out)
     }
 
     /// Find a **pending HTTP** ownership challenge matching `(host, token)`
-    /// across every site — the lookup behind the self-serve edge route
+    /// across every project/site — the lookup behind the self-serve edge route
     /// `/.well-known/boatramp-domain-verification/<token>`. Matches on the
     /// normalized host, the HTTP method, an exact token match, and a non-expired
     /// challenge (`now_unix` gates the TTL), so a host pointed at this server can
@@ -1043,18 +1255,23 @@ impl DeployStore {
         now_unix: u64,
     ) -> Result<Option<DomainVerification>, DeployError> {
         let host = crate::domain_verify::normalize_host(host);
-        // O(1): the `(host, token)` index names the owning site directly. Then
-        // load and **fully re-validate** the challenge — so a stale index entry
-        // (left by a method change / new token) can never serve the wrong thing.
-        let Some(site_bytes) = self
+        // O(1): the `(host, token)` index names the owning `(project, site)`
+        // directly (tolerant of the legacy bare-site value). Then load and **fully
+        // re-validate** the challenge — so a stale index entry (left by a method
+        // change / new token) can never serve the wrong thing.
+        let Some(owner_bytes) = self
             .kv
             .get(&keys::http_challenge_index(&host, token))
             .await?
         else {
             return Ok(None);
         };
-        let site = SiteName::new(String::from_utf8_lossy(&site_bytes).into_owned());
-        let Some(v) = self.get_domain_verification(&site, &host).await? else {
+        let owner = DomainOwner::from_bytes(&owner_bytes);
+        let site = SiteName::new(owner.site);
+        let Some(v) = self
+            .get_domain_verification(ProjectRef::new(&owner.project), &site, &host)
+            .await?
+        else {
             return Ok(None);
         };
         if v.method == VerificationMethod::Http
@@ -1070,21 +1287,23 @@ impl DeployStore {
 
     async fn put_domain_verification(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         verification: &DomainVerification,
     ) -> Result<(), DeployError> {
         let mut ops = vec![WriteOp::Put(
-            keys::domain_verification(site.as_str(), &verification.host),
+            keys::domain_verification(project, site.as_str(), &verification.host),
             verification.to_json()?,
         )];
-        // Maintain the self-serve `(host, token)` index for HTTP challenges. A
-        // stale entry left by a later method/token change is harmless — the
-        // lookup re-validates the loaded challenge — so no delete-on-replace is
-        // needed here.
+        // Maintain the self-serve `(host, token)` index for HTTP challenges. Its
+        // value carries the owning `(project, site)` so the self-serve edge route
+        // can resolve the project-scoped challenge. A stale entry left by a later
+        // method/token change is harmless — the lookup re-validates the loaded
+        // challenge — so no delete-on-replace is needed here.
         if verification.method == VerificationMethod::Http {
             ops.push(WriteOp::Put(
                 keys::http_challenge_index(&verification.host, &verification.token),
-                site.as_str().as_bytes().to_vec(),
+                DomainOwner::new(project.as_str(), site.as_str()).to_bytes(),
             ));
         }
         self.kv.write_batch(ops).await?;
@@ -1096,12 +1315,17 @@ impl DeployStore {
     /// The managed-DNS ledger for `(site, host)`, if boatramp has pointed it.
     pub async fn get_managed_dns(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<Option<crate::dns_managed::ManagedDns>, DeployError> {
         match self
             .kv
-            .get(&crate::dns_managed::dnsmanaged_key(site.as_str(), host))
+            .get(&crate::dns_managed::dnsmanaged_key(
+                project.as_str(),
+                site.as_str(),
+                host,
+            ))
             .await?
         {
             Some(bytes) => Ok(Some(crate::dns_managed::ManagedDns::from_json(&bytes)?)),
@@ -1112,12 +1336,13 @@ impl DeployStore {
     /// Record (create/replace) the managed-DNS ledger entry for a host.
     pub async fn set_managed_dns(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         ledger: &crate::dns_managed::ManagedDns,
     ) -> Result<(), DeployError> {
         self.kv
             .put(
-                &crate::dns_managed::dnsmanaged_key(site.as_str(), &ledger.host),
+                &crate::dns_managed::dnsmanaged_key(project.as_str(), site.as_str(), &ledger.host),
                 ledger.to_json()?,
             )
             .await?;
@@ -1125,9 +1350,18 @@ impl DeployStore {
     }
 
     /// Drop a host's managed-DNS ledger entry (after its records are retracted).
-    pub async fn remove_managed_dns(&self, site: &SiteName, host: &str) -> Result<(), DeployError> {
+    pub async fn remove_managed_dns(
+        &self,
+        project: ProjectRef<'_>,
+        site: &SiteName,
+        host: &str,
+    ) -> Result<(), DeployError> {
         self.kv
-            .delete(&crate::dns_managed::dnsmanaged_key(site.as_str(), host))
+            .delete(&crate::dns_managed::dnsmanaged_key(
+                project.as_str(),
+                site.as_str(),
+                host,
+            ))
             .await?;
         Ok(())
     }
@@ -1136,9 +1370,10 @@ impl DeployStore {
     /// to retract records whose host is no longer attached).
     pub async fn list_managed_dns(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
     ) -> Result<Vec<crate::dns_managed::ManagedDns>, DeployError> {
-        let prefix = crate::dns_managed::dnsmanaged_site_prefix(site.as_str());
+        let prefix = crate::dns_managed::dnsmanaged_site_prefix(project.as_str(), site.as_str());
         let mut out = Vec::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -1157,12 +1392,13 @@ impl DeployStore {
     /// challenge that's already `verified` is returned untouched.
     pub async fn start_domain_verification(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
         method: VerificationMethod,
         now_unix: u64,
     ) -> Result<DomainVerification, DeployError> {
-        if let Some(existing) = self.get_domain_verification(site, host).await? {
+        if let Some(existing) = self.get_domain_verification(project, site, host).await? {
             if existing.verified || existing.method == method {
                 return Ok(existing);
             }
@@ -1175,7 +1411,7 @@ impl DeployStore {
         // existing host returns early above, so this only gates genuinely-new hosts.)
         const MAX_PENDING_VERIFICATIONS_PER_SITE: usize = 64;
         let pending = self
-            .list_domain_verifications(site)
+            .list_domain_verifications(project, site)
             .await?
             .into_iter()
             .filter(|v| !v.verified && !v.is_expired(now_unix))
@@ -1187,18 +1423,20 @@ impl DeployStore {
             )));
         }
         let verification = DomainVerification::new(host, method, now_unix);
-        self.put_domain_verification(site, &verification).await?;
+        self.put_domain_verification(project, site, &verification)
+            .await?;
         Ok(verification)
     }
 
     /// Whether `(site, host)` has a confirmed ownership challenge.
     pub async fn is_domain_verified(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<bool, DeployError> {
         Ok(self
-            .get_domain_verification(site, host)
+            .get_domain_verification(project, site, host)
             .await?
             .is_some_and(|v| v.verified))
     }
@@ -1207,17 +1445,19 @@ impl DeployStore {
     /// challenge has been started.
     pub async fn mark_domain_verified(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<DomainVerification, DeployError> {
-        let mut verification =
-            self.get_domain_verification(site, host)
-                .await?
-                .ok_or_else(|| {
-                    DeployError::NotFound(format!("no verification challenge for {host}"))
-                })?;
+        let mut verification = self
+            .get_domain_verification(project, site, host)
+            .await?
+            .ok_or_else(|| {
+                DeployError::NotFound(format!("no verification challenge for {host}"))
+            })?;
         verification.verified = true;
-        self.put_domain_verification(site, &verification).await?;
+        self.put_domain_verification(project, site, &verification)
+            .await?;
         Ok(verification)
     }
 
@@ -1225,13 +1465,15 @@ impl DeployStore {
     /// Returns whether one existed.
     pub async fn remove_domain_verification(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<bool, DeployError> {
-        let Some(v) = self.get_domain_verification(site, host).await? else {
+        let Some(v) = self.get_domain_verification(project, site, host).await? else {
             return Ok(false);
         };
         let mut ops = vec![WriteOp::Delete(keys::domain_verification(
+            project,
             site.as_str(),
             host,
         ))];
@@ -1256,10 +1498,11 @@ impl DeployStore {
     /// [`normalize_host`]: crate::domain_verify::normalize_host
     pub async fn attach_verified_domain(
         &self,
+        project: ProjectRef<'_>,
         site: &SiteName,
         host: &str,
     ) -> Result<SiteConfig, DeployError> {
-        if !self.is_domain_verified(site, host).await? {
+        if !self.is_domain_verified(project, site, host).await? {
             return Err(DeployError::NotFound(format!(
                 "{host} is not verified for {site}; run domain verification first"
             )));
@@ -1269,7 +1512,7 @@ impl DeployStore {
         // for a wildcard cert for the same reason).
         if host.trim_start().starts_with("*.")
             && self
-                .get_domain_verification(site, host)
+                .get_domain_verification(project, site, host)
                 .await?
                 .map(|v| v.method)
                 != Some(VerificationMethod::Dns)
@@ -1284,7 +1527,7 @@ impl DeployStore {
         // the index write. `set_site_config_locked` runs under the same lock.
         let _claim = self.domain_claim_lock.lock().await;
         let mut config = self
-            .get_site_config(site.as_str())
+            .get_site_config(project, site.as_str())
             .await?
             .unwrap_or_default();
         let domains = &mut config.domains;
@@ -1303,7 +1546,8 @@ impl DeployStore {
                 domains.aliases.push(host);
             }
         }
-        self.set_site_config_locked(site.as_str(), &config).await?;
+        self.set_site_config_locked(project, site.as_str(), &config)
+            .await?;
         Ok(config)
     }
 
@@ -1312,7 +1556,13 @@ impl DeployStore {
     /// Like [`activate`](Self::activate), this refuses a deployment whose blobs
     /// are not all present, so an alias never resolves to an incomplete deploy.
     /// Aliased deployments are retention-protected from garbage collection.
-    pub async fn set_alias(&self, site: &str, name: &str, id: &str) -> Result<(), DeployError> {
+    pub async fn set_alias(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        name: &str,
+        id: &str,
+    ) -> Result<(), DeployError> {
         let manifest = self
             .get_manifest(id)
             .await?
@@ -1322,22 +1572,32 @@ impl DeployStore {
             return Err(DeployError::Incomplete(missing));
         }
         self.kv
-            .put(&keys::alias(site, name), id.as_bytes().to_vec())
+            .put(&keys::alias(project, site, name), id.as_bytes().to_vec())
             .await?;
         Ok(())
     }
 
     /// Resolve a named alias to its deployment id, if set.
-    pub async fn get_alias(&self, site: &str, name: &str) -> Result<Option<String>, DeployError> {
-        match self.kv.get(&keys::alias(site, name)).await? {
+    pub async fn get_alias(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        name: &str,
+    ) -> Result<Option<String>, DeployError> {
+        match self.kv.get(&keys::alias(project, site, name)).await? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(None),
         }
     }
 
     /// Remove a named alias; returns whether one existed.
-    pub async fn remove_alias(&self, site: &str, name: &str) -> Result<bool, DeployError> {
-        let key = keys::alias(site, name);
+    pub async fn remove_alias(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        name: &str,
+    ) -> Result<bool, DeployError> {
+        let key = keys::alias(project, site, name);
         let existed = self.kv.get(&key).await?.is_some();
         if existed {
             self.kv.delete(&key).await?;
@@ -1346,8 +1606,12 @@ impl DeployStore {
     }
 
     /// All of a site's named aliases as `name → deployment id`, sorted by name.
-    pub async fn list_aliases(&self, site: &str) -> Result<BTreeMap<String, String>, DeployError> {
-        let prefix = keys::alias_prefix(site);
+    pub async fn list_aliases(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<BTreeMap<String, String>, DeployError> {
+        let prefix = keys::alias_prefix(project, site);
         let mut out = BTreeMap::new();
         for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -1614,15 +1878,17 @@ impl DeployStore {
         }
     }
 
-    /// Set (replacing) a workload's desired state at `compute/<name>`. Activation
-    /// is this pointer write — atomic, like a deployment's `current`.
+    /// Set (replacing) a workload's desired state at
+    /// `project/<proj>/compute/<name>`. Activation is this pointer write — atomic,
+    /// like a deployment's `current`.
     pub async fn set_compute_workload(
         &self,
+        project: ProjectRef<'_>,
         workload: &crate::compute::ComputeWorkload,
     ) -> Result<(), DeployError> {
         self.kv
             .put(
-                &crate::compute::workload_key(&workload.name),
+                &crate::compute::workload_key(project.as_str(), &workload.name),
                 serde_json::to_vec(workload)?,
             )
             .await?;
@@ -1632,20 +1898,27 @@ impl DeployStore {
     /// Read a workload's desired state.
     pub async fn get_compute_workload(
         &self,
+        project: ProjectRef<'_>,
         name: &str,
     ) -> Result<Option<crate::compute::ComputeWorkload>, DeployError> {
-        match self.kv.get(&crate::compute::workload_key(name)).await? {
+        match self
+            .kv
+            .get(&crate::compute::workload_key(project.as_str(), name))
+            .await?
+        {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
     }
 
-    /// List all compute workloads' desired state.
+    /// List a project's compute workloads' desired state.
     pub async fn list_compute_workloads(
         &self,
+        project: ProjectRef<'_>,
     ) -> Result<Vec<crate::compute::ComputeWorkload>, DeployError> {
+        let prefix = crate::compute::workloads_prefix(project.as_str());
         let mut out = Vec::new();
-        for key in self.kv.list_prefix(crate::compute::WORKLOAD_PREFIX).await? {
+        for key in self.kv.list_prefix(&prefix).await? {
             if let Some(bytes) = self.kv.get(&key).await? {
                 if let Ok(w) = serde_json::from_slice::<crate::compute::ComputeWorkload>(&bytes) {
                     out.push(w);
@@ -1655,10 +1928,31 @@ impl DeployStore {
         Ok(out)
     }
 
+    /// List **every** compute workload across **all** projects, each paired with
+    /// its owning project — the cross-project fan-out the scheduler runs.
+    pub async fn list_compute_workloads_all(
+        &self,
+    ) -> Result<Vec<(String, crate::compute::ComputeWorkload)>, DeployError> {
+        let mut out = Vec::new();
+        for project in self.discover_projects().await? {
+            for w in self
+                .list_compute_workloads(ProjectRef::new(&project))
+                .await?
+            {
+                out.push((project.clone(), w));
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove a workload's desired state (the executor then stops its replicas).
     /// Returns whether one existed.
-    pub async fn delete_compute_workload(&self, name: &str) -> Result<bool, DeployError> {
-        let key = crate::compute::workload_key(name);
+    pub async fn delete_compute_workload(
+        &self,
+        project: ProjectRef<'_>,
+        name: &str,
+    ) -> Result<bool, DeployError> {
+        let key = crate::compute::workload_key(project.as_str(), name);
         let existed = self.kv.get(&key).await?.is_some();
         if existed {
             self.kv.delete(&key).await?;
@@ -1666,15 +1960,21 @@ impl DeployStore {
         Ok(existed)
     }
 
-    /// Persist a replica's observed state at `compute_state/<workload>/<replica>`
-    /// (the reconcile loop's record + the gateway's upstream source).
+    /// Persist a replica's observed state at
+    /// `project/<proj>/compute_state/<workload>/<replica>` (the reconcile loop's
+    /// record + the gateway's upstream source).
     pub async fn set_replica_state(
         &self,
+        project: ProjectRef<'_>,
         state: &crate::compute::ObservedInstance,
     ) -> Result<(), DeployError> {
         self.kv
             .put(
-                &crate::compute::replica_state_key(&state.handle.workload, state.handle.replica),
+                &crate::compute::replica_state_key(
+                    project.as_str(),
+                    &state.handle.workload,
+                    state.handle.replica,
+                ),
                 serde_json::to_vec(state)?,
             )
             .await?;
@@ -1684,12 +1984,16 @@ impl DeployStore {
     /// List a workload's observed replica states.
     pub async fn list_replica_states(
         &self,
+        project: ProjectRef<'_>,
         workload: &str,
     ) -> Result<Vec<crate::compute::ObservedInstance>, DeployError> {
         let mut out = Vec::new();
         for key in self
             .kv
-            .list_prefix(&crate::compute::replica_state_prefix(workload))
+            .list_prefix(&crate::compute::replica_state_prefix(
+                project.as_str(),
+                workload,
+            ))
             .await?
         {
             if let Some(bytes) = self.kv.get(&key).await? {
@@ -1703,22 +2007,22 @@ impl DeployStore {
         Ok(out)
     }
 
-    /// List **all** observed replica states across workloads (the gateway's
-    /// dynamic-pool source).
+    /// List **all** observed replica states across every project's workloads (the
+    /// gateway's dynamic-pool source). Fans out over
+    /// [`discover_projects`](Self::discover_projects).
     pub async fn list_all_replica_states(
         &self,
     ) -> Result<Vec<crate::compute::ObservedInstance>, DeployError> {
         let mut out = Vec::new();
-        for key in self
-            .kv
-            .list_prefix(crate::compute::REPLICA_STATE_PREFIX)
-            .await?
-        {
-            if let Some(bytes) = self.kv.get(&key).await? {
-                if let Ok(state) =
-                    serde_json::from_slice::<crate::compute::ObservedInstance>(&bytes)
-                {
-                    out.push(state);
+        for project in self.discover_projects().await? {
+            let prefix = crate::compute::replica_states_project_prefix(&project);
+            for key in self.kv.list_prefix(&prefix).await? {
+                if let Some(bytes) = self.kv.get(&key).await? {
+                    if let Ok(state) =
+                        serde_json::from_slice::<crate::compute::ObservedInstance>(&bytes)
+                    {
+                        out.push(state);
+                    }
                 }
             }
         }
@@ -1728,11 +2032,16 @@ impl DeployStore {
     /// Remove a replica's observed state.
     pub async fn delete_replica_state(
         &self,
+        project: ProjectRef<'_>,
         workload: &str,
         replica: u32,
     ) -> Result<(), DeployError> {
         self.kv
-            .delete(&crate::compute::replica_state_key(workload, replica))
+            .delete(&crate::compute::replica_state_key(
+                project.as_str(),
+                workload,
+                replica,
+            ))
             .await?;
         Ok(())
     }
@@ -1740,7 +2049,12 @@ impl DeployStore {
     /// Atomically point `site` at deployment `id`.
     ///
     /// Refuses to activate a deployment whose blobs are not all present.
-    pub async fn activate(&self, site: &str, id: &str) -> Result<(), DeployError> {
+    pub async fn activate(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        id: &str,
+    ) -> Result<(), DeployError> {
         let manifest = self
             .get_manifest(id)
             .await?
@@ -1753,20 +2067,25 @@ impl DeployStore {
         // The atomic switch: a single KV write, so readers see the old or new
         // deployment in full, never a partial state.
         self.kv
-            .put(&keys::current(site), id.as_bytes().to_vec())
+            .put(&keys::current(project, site), id.as_bytes().to_vec())
             .await?;
 
         // Record the activation. Best-effort: `current` above is the source of
         // truth, so a history-write failure must not fail an activation that
         // already took effect.
-        let _ = self.record_history(site, id).await;
+        let _ = self.record_history(project, site, id).await;
         Ok(())
     }
 
     /// Prepend `id` to `site`'s activation history, de-duplicating by id and
     /// keeping at most [`MAX_HISTORY`] entries.
-    async fn record_history(&self, site: &str, id: &str) -> Result<(), DeployError> {
-        let mut history = self.history(site).await.unwrap_or_default();
+    async fn record_history(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        id: &str,
+    ) -> Result<(), DeployError> {
+        let mut history = self.history(project, site).await.unwrap_or_default();
         history.retain(|entry| entry.id != id);
         history.insert(
             0,
@@ -1778,14 +2097,18 @@ impl DeployStore {
         );
         history.truncate(MAX_HISTORY);
         self.kv
-            .put(&keys::history(site), serde_json::to_vec(&history)?)
+            .put(&keys::history(project, site), serde_json::to_vec(&history)?)
             .await?;
         Ok(())
     }
 
     /// A site's activation history, most recent first.
-    pub async fn history(&self, site: &str) -> Result<Vec<HistoryEntry>, DeployError> {
-        match self.kv.get(&keys::history(site)).await? {
+    pub async fn history(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<Vec<HistoryEntry>, DeployError> {
+        match self.kv.get(&keys::history(project, site)).await? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
             None => Ok(Vec::new()),
         }
@@ -1793,13 +2116,17 @@ impl DeployStore {
 
     /// A site's current deployment plus its activation history, each history
     /// entry joined with its [`DeployMeta`] provenance (when recorded).
-    pub async fn deployments(&self, site: &str) -> Result<DeploymentList, DeployError> {
-        let mut deployments = self.history(site).await?;
+    pub async fn deployments(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<DeploymentList, DeployError> {
+        let mut deployments = self.history(project, site).await?;
         for entry in &mut deployments {
             entry.meta = self.get_meta(&entry.id).await?;
         }
         Ok(DeploymentList {
-            current: self.current_id(site).await?,
+            current: self.current_id(project, site).await?,
             deployments,
         })
     }
@@ -1808,29 +2135,38 @@ impl DeployStore {
     /// pointer, every named alias, and the history entries the retention policy
     /// in `opts` keeps (most-recent `keep_last` and/or anything within
     /// `keep_age_secs`; with neither set, the entire history).
+    ///
+    /// **Cross-project union.** Blob and manifest bodies are global CAS, shared
+    /// across projects; reachability is therefore the **union** over every
+    /// project's live set — a body is collectable only if *no* project references
+    /// it. This fans out over [`discover_projects`](Self::discover_projects) and
+    /// scans each project's `history/`, `current/`, and `alias/` families.
     async fn live_deployment_ids(&self, opts: &GcOptions) -> Result<BTreeSet<String>, DeployError> {
         let mut ids = BTreeSet::new();
         let now = now_unix();
-        for key in self.kv.list_prefix("history/").await? {
-            if let Some(bytes) = self.kv.get(&key).await? {
-                if let Ok(history) = serde_json::from_slice::<Vec<HistoryEntry>>(&bytes) {
-                    for (idx, entry) in history.iter().enumerate() {
-                        let within_count = opts.keep_last.is_none_or(|n| idx < n);
-                        let within_age = opts
-                            .keep_age_secs
-                            .is_some_and(|age| now.saturating_sub(entry.at) <= age);
-                        if within_count || within_age {
-                            ids.insert(entry.id.clone());
+        for project in self.discover_projects().await? {
+            let pref = ProjectRef::new(&project);
+            for key in self.kv.list_prefix(&keys::history_prefix(pref)).await? {
+                if let Some(bytes) = self.kv.get(&key).await? {
+                    if let Ok(history) = serde_json::from_slice::<Vec<HistoryEntry>>(&bytes) {
+                        for (idx, entry) in history.iter().enumerate() {
+                            let within_count = opts.keep_last.is_none_or(|n| idx < n);
+                            let within_age = opts
+                                .keep_age_secs
+                                .is_some_and(|age| now.saturating_sub(entry.at) <= age);
+                            if within_count || within_age {
+                                ids.insert(entry.id.clone());
+                            }
                         }
                     }
                 }
             }
-        }
-        // `current` pointers and named aliases are always live.
-        for prefix in ["current/", "alias/"] {
-            for key in self.kv.list_prefix(prefix).await? {
-                if let Some(bytes) = self.kv.get(&key).await? {
-                    ids.insert(String::from_utf8_lossy(&bytes).into_owned());
+            // `current` pointers and named aliases are always live.
+            for prefix in [keys::current_prefix(pref), keys::alias_project_prefix(pref)] {
+                for key in self.kv.list_prefix(&prefix).await? {
+                    if let Some(bytes) = self.kv.get(&key).await? {
+                        ids.insert(String::from_utf8_lossy(&bytes).into_owned());
+                    }
                 }
             }
         }
@@ -1926,10 +2262,16 @@ impl DeployStore {
         // it). Tiny KV entries, cleaned under `prune` (not counted in the
         // blob/manifest totals, which are deploy-content concepts).
         if prune {
+            // Union of site-config hashes referenced by **any** project's site
+            // pointers — a `siteconfig/<hash>` body is global CAS, so it stays
+            // while any project references it.
             let mut referenced_configs: BTreeSet<String> = BTreeSet::new();
-            for pointer in self.kv.list_prefix("site/").await? {
-                if let Some(bytes) = self.kv.get(&pointer).await? {
-                    referenced_configs.insert(String::from_utf8_lossy(&bytes).into_owned());
+            for project in self.discover_projects().await? {
+                let site_prefix = keys::site_prefix(ProjectRef::new(&project));
+                for pointer in self.kv.list_prefix(&site_prefix).await? {
+                    if let Some(bytes) = self.kv.get(&pointer).await? {
+                        referenced_configs.insert(String::from_utf8_lossy(&bytes).into_owned());
+                    }
                 }
             }
             for key in self.kv.list_prefix("siteconfig/").await? {
@@ -2041,35 +2383,51 @@ impl DeployStore {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    /// Every site that has a current deployment (i.e. a `current/<site>`
-    /// pointer). Used by the background scheduler to find which sites' consumers
-    /// and crons to run.
-    pub async fn list_sites(&self) -> Result<Vec<String>, DeployError> {
-        let prefix = "current/";
-        let keys = self.kv.list_prefix(prefix).await?;
+    /// Every site in `project` that has a current deployment (i.e. a
+    /// `project/<proj>/current/<site>` pointer). Used by the background scheduler
+    /// to find which sites' consumers and crons to run.
+    pub async fn list_sites(&self, project: ProjectRef<'_>) -> Result<Vec<String>, DeployError> {
+        let prefix = keys::current_prefix(project);
+        let keys = self.kv.list_prefix(&prefix).await?;
         Ok(keys
             .into_iter()
-            .filter_map(|k| k.strip_prefix(prefix).map(str::to_string))
+            .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
             .collect())
+    }
+
+    /// Every `(project, site)` with a current deployment across **all** projects —
+    /// the cross-project fan-out for the scheduler/operator.
+    pub async fn list_sites_all(&self) -> Result<Vec<(String, String)>, DeployError> {
+        let mut out = Vec::new();
+        for project in self.discover_projects().await? {
+            for site in self.list_sites(ProjectRef::new(&project)).await? {
+                out.push((project.clone(), site));
+            }
+        }
+        Ok(out)
     }
 
     /// Delete a site and its routing/config state (the Kubernetes operator's
     /// `Site` finalizer). Removes the config pointer, the current-deployment
     /// pointer, activation history, aliases, the domain-routing entries the site
-    /// owns (so its hosts free up), and any pending domain verifications. The
-    /// content-addressed deployment manifests + blobs are shared and left to
-    /// `prune`. Idempotent (deleting an absent site is a no-op).
-    pub async fn delete_site(&self, site: &str) -> Result<(), DeployError> {
+    /// owns (so its hosts free up), and any pending domain verifications — all
+    /// within `project`. The content-addressed deployment manifests + blobs are
+    /// shared and left to `prune`. Idempotent (deleting an absent site is a no-op).
+    pub async fn delete_site(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<(), DeployError> {
         use crate::kv::WriteOp;
         // Hold the domain-claim lock so a concurrent attach can't race the routing
         // deletes and leave a dangling `domain/*` → deleted-site entry.
         let _claim = self.domain_claim_lock.lock().await;
         let mut batch = vec![
-            WriteOp::Delete(keys::site_pointer(site)),
-            WriteOp::Delete(keys::current(site)),
-            WriteOp::Delete(keys::history(site)),
+            WriteOp::Delete(keys::site_pointer(project, site)),
+            WriteOp::Delete(keys::current(project, site)),
+            WriteOp::Delete(keys::history(project, site)),
         ];
-        if let Some(config) = self.get_site_config(site).await? {
+        if let Some(config) = self.get_site_config(project, site).await? {
             for host in config.domains.exact_hosts() {
                 batch.push(WriteOp::Delete(keys::domain(host)));
             }
@@ -2079,12 +2437,16 @@ impl DeployStore {
                 }
             }
         }
-        for key in self.kv.list_prefix(&keys::alias_prefix(site)).await? {
+        for key in self
+            .kv
+            .list_prefix(&keys::alias_prefix(project, site))
+            .await?
+        {
             batch.push(WriteOp::Delete(key));
         }
         for key in self
             .kv
-            .list_prefix(&format!("domainverify/{site}/"))
+            .list_prefix(&keys::domain_verification_prefix(project, site))
             .await?
         {
             batch.push(WriteOp::Delete(key));
@@ -2094,16 +2456,24 @@ impl DeployStore {
     }
 
     /// The deployment id currently serving `site`, if any.
-    pub async fn current_id(&self, site: &str) -> Result<Option<String>, DeployError> {
-        match self.kv.get(&keys::current(site)).await? {
+    pub async fn current_id(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<Option<String>, DeployError> {
+        match self.kv.get(&keys::current(project, site)).await? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(None),
         }
     }
 
     /// The manifest currently serving `site`, if any.
-    pub async fn current_manifest(&self, site: &str) -> Result<Option<Manifest>, DeployError> {
-        match self.current_id(site).await? {
+    pub async fn current_manifest(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<Option<Manifest>, DeployError> {
+        match self.current_id(project, site).await? {
             Some(id) => self.get_manifest(&id).await,
             None => Ok(None),
         }
@@ -2113,8 +2483,13 @@ impl DeployStore {
     ///
     /// Applies a directory-index fallback: an empty/trailing-slash path, or a
     /// path with no matching file, falls back to `<path>/index.html`.
-    pub async fn resolve(&self, site: &str, path: &str) -> Result<Option<FileEntry>, DeployError> {
-        let Some(manifest) = self.current_manifest(site).await? else {
+    pub async fn resolve(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        path: &str,
+    ) -> Result<Option<FileEntry>, DeployError> {
+        let Some(manifest) = self.current_manifest(project, site).await? else {
             return Ok(None);
         };
         Ok(lookup(&manifest, path))
@@ -2225,13 +2600,123 @@ mod tests {
         }
     }
 
+    /// An in-memory blob store, so a GC test can observe real blob deletion.
+    #[derive(Default)]
+    struct MemStorage {
+        objects: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for MemStorage {
+        async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
+            let bytes = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            let size = bytes.len() as u64;
+            let body: ByteStream =
+                futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) }).boxed();
+            Ok(GetObject {
+                meta: ObjectMeta {
+                    key: key.to_string(),
+                    size: Some(size),
+                    ..Default::default()
+                },
+                body,
+            })
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            self.get(key).await
+        }
+        async fn put(
+            &self,
+            key: &str,
+            mut body: ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk?);
+            }
+            let size = buf.len() as u64;
+            self.objects.lock().unwrap().insert(key.to_string(), buf);
+            Ok(ObjectMeta {
+                key: key.to_string(),
+                size: Some(size),
+                ..Default::default()
+            })
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StorageError> {
+            let map = self.objects.lock().unwrap();
+            let bytes = map
+                .get(key)
+                .ok_or_else(|| StorageError::NotFound(key.to_string()))?;
+            Ok(ObjectMeta {
+                key: key.to_string(),
+                size: Some(bytes.len() as u64),
+                ..Default::default()
+            })
+        }
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .map(|k| ObjectMeta {
+                    key: k.clone(),
+                    ..Default::default()
+                })
+                .collect())
+        }
+    }
+
+    /// A single blob (`hash`) written to storage.
+    fn once_bytes(b: &'static [u8]) -> ByteStream {
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(b)) }).boxed()
+    }
+
+    /// A manifest referencing the given `(path, blob-hash)` files.
+    fn manifest_with(files: &[(&str, &str)]) -> Manifest {
+        let mut m = Manifest::default();
+        for (path, hash) in files {
+            m.files.insert(
+                (*path).to_string(),
+                FileEntry {
+                    hash: (*hash).to_string(),
+                    size: 1,
+                    content_type: None,
+                    variants: Default::default(),
+                },
+            );
+        }
+        m
+    }
+
     #[tokio::test]
     async fn function_storage_versioning_alias_rollback() {
         use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
         use crate::kv::MemoryKv;
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
-        assert!(store.list_stored_functions().await.unwrap().is_empty());
+        assert!(store
+            .list_stored_functions(ProjectRef::DEFAULT)
+            .await
+            .unwrap()
+            .is_empty());
 
         let mut f = Function::new(
             "resize",
@@ -2241,25 +2726,51 @@ mod tests {
             Lifecycle::Independent,
             1,
         );
-        store.put_function(&f).await.unwrap();
+        store.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
         assert_eq!(
-            store.get_function("resize").await.unwrap().unwrap().active,
+            store
+                .get_function(ProjectRef::DEFAULT, "resize")
+                .await
+                .unwrap()
+                .unwrap()
+                .active,
             "hashA"
         );
-        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_stored_functions(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // A new version + an alias, persisted and read back.
         f.upsert_version("hashB", Lifecycle::Independent, 2);
         f.set_alias("prod", "hashA").unwrap();
-        store.put_function(&f).await.unwrap();
-        let got = store.get_function("resize").await.unwrap().unwrap();
+        store.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
+        let got = store
+            .get_function(ProjectRef::DEFAULT, "resize")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.active, "hashB");
         assert_eq!(got.aliases.get("prod").map(String::as_str), Some("hashA"));
 
         // Delete is idempotent + reports prior existence.
-        assert!(store.delete_function("resize").await.unwrap());
-        assert!(store.get_function("resize").await.unwrap().is_none());
-        assert!(!store.delete_function("resize").await.unwrap());
+        assert!(store
+            .delete_function(ProjectRef::DEFAULT, "resize")
+            .await
+            .unwrap());
+        assert!(store
+            .get_function(ProjectRef::DEFAULT, "resize")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .delete_function(ProjectRef::DEFAULT, "resize")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -2280,7 +2791,7 @@ mod tests {
             Lifecycle::Independent,
             1,
         );
-        store.put_function(&f).await.unwrap();
+        store.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
 
         let mut inv = Invocation {
             id: "inv-1".into(),
@@ -2296,16 +2807,19 @@ mod tests {
             created: 10,
             updated: 10,
         };
-        store.put_invocation(&inv).await.unwrap();
         store
-            .put_idempotency("greeter", "key-1", "inv-1")
+            .put_invocation(ProjectRef::DEFAULT, &inv)
+            .await
+            .unwrap();
+        store
+            .put_idempotency(ProjectRef::DEFAULT, "greeter", "key-1", "inv-1")
             .await
             .unwrap();
 
         // Read back, resolve the idempotency pointer, and list.
         assert_eq!(
             store
-                .get_invocation("greeter", "inv-1")
+                .get_invocation(ProjectRef::DEFAULT, "greeter", "inv-1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -2313,12 +2827,29 @@ mod tests {
             InvocationStatus::Queued
         );
         assert_eq!(
-            store.get_idempotency("greeter", "key-1").await.unwrap(),
+            store
+                .get_idempotency(ProjectRef::DEFAULT, "greeter", "key-1")
+                .await
+                .unwrap(),
             Some("inv-1".to_string())
         );
-        assert_eq!(store.list_invocations("greeter").await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_invocations(ProjectRef::DEFAULT, "greeter")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         // The invocation + idempotency sub-keys must not be mistaken for functions.
-        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_stored_functions(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Transition to a terminal, captured result.
         inv.status = InvocationStatus::Succeeded;
@@ -2329,9 +2860,12 @@ mod tests {
             body_b64: "aGVsbG8=".into(),
         });
         inv.updated = 20;
-        store.put_invocation(&inv).await.unwrap();
+        store
+            .put_invocation(ProjectRef::DEFAULT, &inv)
+            .await
+            .unwrap();
         let got = store
-            .get_invocation("greeter", "inv-1")
+            .get_invocation(ProjectRef::DEFAULT, "greeter", "inv-1")
             .await
             .unwrap()
             .unwrap();
@@ -2340,7 +2874,7 @@ mod tests {
 
         // An unrecorded key resolves to nothing.
         assert!(store
-            .get_idempotency("greeter", "absent")
+            .get_idempotency(ProjectRef::DEFAULT, "greeter", "absent")
             .await
             .unwrap()
             .is_none());
@@ -2378,7 +2912,7 @@ mod tests {
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
         assert!(store
-            .get_managed_notification("ingest", "uploads/")
+            .get_managed_notification(ProjectRef::DEFAULT, "ingest", "uploads/")
             .await
             .unwrap()
             .is_none());
@@ -2400,14 +2934,14 @@ mod tests {
             crate::blob_provision::ProvisionOutcome::Ready
         ));
         let record = store
-            .get_managed_notification("ingest", "uploads/")
+            .get_managed_notification(ProjectRef::DEFAULT, "ingest", "uploads/")
             .await
             .unwrap()
             .expect("the pipeline is recorded in the store ledger");
         assert_eq!(record.provider, "mock");
         assert_eq!(
             store
-                .list_managed_notifications("ingest")
+                .list_managed_notifications(ProjectRef::DEFAULT, "ingest")
                 .await
                 .unwrap()
                 .len(),
@@ -2417,7 +2951,7 @@ mod tests {
         // Retract removes the ledger entry.
         retract_watch(&provider, &record, &store).await.unwrap();
         assert!(store
-            .get_managed_notification("ingest", "uploads/")
+            .get_managed_notification(ProjectRef::DEFAULT, "ingest", "uploads/")
             .await
             .unwrap()
             .is_none());
@@ -2429,8 +2963,16 @@ mod tests {
         use crate::workflow::{Step, Workflow, WorkflowRun};
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
-        assert!(store.get_workflow("etl").await.unwrap().is_none());
-        assert!(store.list_workflows().await.unwrap().is_empty());
+        assert!(store
+            .get_workflow(ProjectRef::DEFAULT, "etl")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_workflows(ProjectRef::DEFAULT)
+            .await
+            .unwrap()
+            .is_empty());
 
         let wf = Workflow {
             name: "etl".into(),
@@ -2451,25 +2993,70 @@ mod tests {
                 },
             ],
         };
-        store.put_workflow(&wf).await.unwrap();
-        assert_eq!(store.get_workflow("etl").await.unwrap().unwrap(), wf);
-        assert_eq!(store.list_workflows().await.unwrap().len(), 1);
+        store.put_workflow(ProjectRef::DEFAULT, &wf).await.unwrap();
+        assert_eq!(
+            store
+                .get_workflow(ProjectRef::DEFAULT, "etl")
+                .await
+                .unwrap()
+                .unwrap(),
+            wf
+        );
+        assert_eq!(
+            store
+                .list_workflows(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // A run is stored under the workflow's runs prefix — not mistaken for a def.
         let run = WorkflowRun::start(&wf, "r1", None, 5);
-        store.put_workflow_run(&run).await.unwrap();
+        store
+            .put_workflow_run(ProjectRef::DEFAULT, &run)
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_workflow_run("etl", "r1").await.unwrap().unwrap(),
+            store
+                .get_workflow_run(ProjectRef::DEFAULT, "etl", "r1")
+                .await
+                .unwrap()
+                .unwrap(),
             run
         );
-        assert_eq!(store.list_workflow_runs("etl").await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_workflow_runs(ProjectRef::DEFAULT, "etl")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         // The run sub-key must not appear in the definition list.
-        assert_eq!(store.list_workflows().await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_workflows(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Delete reports prior existence + is idempotent.
-        assert!(store.delete_workflow("etl").await.unwrap());
-        assert!(store.get_workflow("etl").await.unwrap().is_none());
-        assert!(!store.delete_workflow("etl").await.unwrap());
+        assert!(store
+            .delete_workflow(ProjectRef::DEFAULT, "etl")
+            .await
+            .unwrap());
+        assert!(store
+            .get_workflow(ProjectRef::DEFAULT, "etl")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .delete_workflow(ProjectRef::DEFAULT, "etl")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -2488,8 +3075,12 @@ mod tests {
             Lifecycle::Independent,
             1,
         );
-        store.put_function(&f).await.unwrap();
-        assert!(store.list_triggers("worker").await.unwrap().is_empty());
+        store.put_function(ProjectRef::DEFAULT, &f).await.unwrap();
+        assert!(store
+            .list_triggers(ProjectRef::DEFAULT, "worker")
+            .await
+            .unwrap()
+            .is_empty());
 
         let cron = FunctionTrigger {
             id: "tick".into(),
@@ -2499,7 +3090,10 @@ mod tests {
             },
             last_fired_minute: None,
         };
-        store.put_trigger("worker", &cron).await.unwrap();
+        store
+            .put_trigger(ProjectRef::DEFAULT, "worker", &cron)
+            .await
+            .unwrap();
         let queue = FunctionTrigger {
             id: "jobs".into(),
             kind: TriggerKind::Queue {
@@ -2507,23 +3101,47 @@ mod tests {
             },
             last_fired_minute: None,
         };
-        store.put_trigger("worker", &queue).await.unwrap();
+        store
+            .put_trigger(ProjectRef::DEFAULT, "worker", &queue)
+            .await
+            .unwrap();
 
-        assert_eq!(store.list_triggers("worker").await.unwrap().len(), 2);
         assert_eq!(
-            store.get_trigger("worker", "tick").await.unwrap().unwrap(),
+            store
+                .list_triggers(ProjectRef::DEFAULT, "worker")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .get_trigger(ProjectRef::DEFAULT, "worker", "tick")
+                .await
+                .unwrap()
+                .unwrap(),
             cron
         );
         // Trigger sub-keys don't leak into the function list.
-        assert_eq!(store.list_stored_functions().await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_stored_functions(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Dedup state persists through an update.
         let mut fired = cron.clone();
         fired.last_fired_minute = Some(42);
-        store.put_trigger("worker", &fired).await.unwrap();
+        store
+            .put_trigger(ProjectRef::DEFAULT, "worker", &fired)
+            .await
+            .unwrap();
         assert_eq!(
             store
-                .get_trigger("worker", "tick")
+                .get_trigger(ProjectRef::DEFAULT, "worker", "tick")
                 .await
                 .unwrap()
                 .unwrap()
@@ -2532,9 +3150,22 @@ mod tests {
         );
 
         // Delete reports prior existence + is idempotent.
-        assert!(store.delete_trigger("worker", "tick").await.unwrap());
-        assert!(!store.delete_trigger("worker", "tick").await.unwrap());
-        assert_eq!(store.list_triggers("worker").await.unwrap().len(), 1);
+        assert!(store
+            .delete_trigger(ProjectRef::DEFAULT, "worker", "tick")
+            .await
+            .unwrap());
+        assert!(!store
+            .delete_trigger(ProjectRef::DEFAULT, "worker", "tick")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .list_triggers(ProjectRef::DEFAULT, "worker")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2543,7 +3174,11 @@ mod tests {
         use crate::kv::MemoryKv;
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
-        assert!(store.get_metering("a").await.unwrap().is_none());
+        assert!(store
+            .get_metering(ProjectRef::DEFAULT, "a")
+            .await
+            .unwrap()
+            .is_none());
 
         let mut ma = Metering::new("a");
         ma.record(
@@ -2555,7 +3190,7 @@ mod tests {
             },
             10,
         );
-        store.put_metering(&ma).await.unwrap();
+        store.put_metering(ProjectRef::DEFAULT, &ma).await.unwrap();
 
         let mut mb = Metering::new("b");
         mb.record(
@@ -2567,12 +3202,28 @@ mod tests {
             },
             11,
         );
-        store.put_metering(&mb).await.unwrap();
+        store.put_metering(ProjectRef::DEFAULT, &mb).await.unwrap();
 
         // Each function's aggregate is stored + read independently.
-        assert_eq!(store.get_metering("a").await.unwrap().unwrap().successes, 1);
-        assert_eq!(store.get_metering("b").await.unwrap().unwrap().failures, 1);
-        let all = store.list_metering().await.unwrap();
+        assert_eq!(
+            store
+                .get_metering(ProjectRef::DEFAULT, "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .successes,
+            1
+        );
+        assert_eq!(
+            store
+                .get_metering(ProjectRef::DEFAULT, "b")
+                .await
+                .unwrap()
+                .unwrap()
+                .failures,
+            1
+        );
+        let all = store.list_metering(ProjectRef::DEFAULT).await.unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -2583,7 +3234,11 @@ mod tests {
 
         let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
         assert!(store
-            .get_managed_dns(&SiteName::new("blog"), "www.example.com")
+            .get_managed_dns(
+                ProjectRef::DEFAULT,
+                &SiteName::new("blog"),
+                "www.example.com"
+            )
             .await
             .unwrap()
             .is_none());
@@ -2600,31 +3255,39 @@ mod tests {
             10,
         );
         store
-            .set_managed_dns(&SiteName::new("blog"), &ledger)
+            .set_managed_dns(ProjectRef::DEFAULT, &SiteName::new("blog"), &ledger)
             .await
             .unwrap();
         // Lookup normalizes the host, so a differently-cased/dotted query hits it.
         assert_eq!(
             store
-                .get_managed_dns(&SiteName::new("blog"), "WWW.example.com.")
+                .get_managed_dns(
+                    ProjectRef::DEFAULT,
+                    &SiteName::new("blog"),
+                    "WWW.example.com."
+                )
                 .await
                 .unwrap(),
             Some(ledger.clone())
         );
         assert_eq!(
             store
-                .list_managed_dns(&SiteName::new("blog"))
+                .list_managed_dns(ProjectRef::DEFAULT, &SiteName::new("blog"))
                 .await
                 .unwrap(),
             vec![ledger]
         );
 
         store
-            .remove_managed_dns(&SiteName::new("blog"), "www.example.com")
+            .remove_managed_dns(
+                ProjectRef::DEFAULT,
+                &SiteName::new("blog"),
+                "www.example.com",
+            )
             .await
             .unwrap();
         assert!(store
-            .list_managed_dns(&SiteName::new("blog"))
+            .list_managed_dns(ProjectRef::DEFAULT, &SiteName::new("blog"))
             .await
             .unwrap()
             .is_empty());
@@ -2645,11 +3308,20 @@ mod tests {
             },
             ..Default::default()
         };
-        store.set_site_config("blog", &config).await.unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "blog", &config)
+            .await
+            .unwrap();
 
         let resolved = |host: &'static str| {
             let store = store.clone();
-            async move { store.resolve_site_by_host(host).await.unwrap() }
+            async move {
+                store
+                    .resolve_site_by_host(host)
+                    .await
+                    .unwrap()
+                    .map(|o| o.site)
+            }
         };
         assert_eq!(resolved("example.com").await.as_deref(), Some("blog")); // exact primary
         assert_eq!(resolved("www.example.com").await.as_deref(), Some("blog")); // exact alias
@@ -2659,7 +3331,7 @@ mod tests {
 
         // Clearing the domains drops the index entries.
         store
-            .set_site_config("blog", &SiteConfig::default())
+            .set_site_config(ProjectRef::DEFAULT, "blog", &SiteConfig::default())
             .await
             .unwrap();
         assert_eq!(resolved("example.com").await, None);
@@ -2679,47 +3351,68 @@ mod tests {
         let mut cfg = SiteConfig::default();
         cfg.security.https_redirect = true;
         // Two different sites with identical config dedup to one body blob.
-        store.set_site_config("s1", &cfg).await.unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "s1", &cfg)
+            .await
+            .unwrap();
         let mut cfg2 = cfg.clone();
         cfg2.security.https_redirect = false;
-        store.set_site_config("s2", &cfg2).await.unwrap();
-        store.set_site_config("s3", &cfg).await.unwrap(); // identical to s1
+        store
+            .set_site_config(ProjectRef::DEFAULT, "s2", &cfg2)
+            .await
+            .unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "s3", &cfg)
+            .await
+            .unwrap(); // identical to s1
 
         // Pointers exist for each site; bodies are deduped (s1 == s3 → one blob).
         let bodies = kv.list_prefix("siteconfig/").await.unwrap();
         assert_eq!(bodies.len(), 2, "s1/s3 share a body; s2 distinct");
-        let pointers = kv.list_prefix("site/").await.unwrap();
+        let pointers = kv.list_prefix("project/default/site/").await.unwrap();
         assert_eq!(pointers.len(), 3);
 
         // Round-trips.
         assert!(
             store
-                .get_site_config("s1")
+                .get_site_config(ProjectRef::DEFAULT, "s1")
                 .await
                 .unwrap()
                 .unwrap()
                 .security
                 .https_redirect
         );
-        assert_eq!(store.get_site_config("missing").await.unwrap(), None);
+        assert_eq!(
+            store
+                .get_site_config(ProjectRef::DEFAULT, "missing")
+                .await
+                .unwrap(),
+            None
+        );
 
         // Editing s1 flips its pointer and orphans its old body; GC reclaims it
         // (s3 still references it, so it survives until s3 changes too).
         let mut edited = cfg.clone();
         edited.security.frame_options = Some("DENY".into());
-        store.set_site_config("s1", &edited).await.unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "s1", &edited)
+            .await
+            .unwrap();
         store.collect_garbage(true).await.unwrap();
         // s1's old body is still referenced by s3 → not collected.
         assert_eq!(kv.list_prefix("siteconfig/").await.unwrap().len(), 3);
         // Now change s3 too; the old shared body becomes orphaned and is GC'd.
-        store.set_site_config("s3", &edited).await.unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "s3", &edited)
+            .await
+            .unwrap();
         store.collect_garbage(true).await.unwrap();
         let remaining = kv.list_prefix("siteconfig/").await.unwrap();
         assert_eq!(remaining.len(), 2, "orphaned shared body reclaimed");
         // Everything still reads correctly after GC.
         assert!(
             store
-                .get_site_config("s1")
+                .get_site_config(ProjectRef::DEFAULT, "s1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -2728,7 +3421,7 @@ mod tests {
         );
         assert!(
             !store
-                .get_site_config("s2")
+                .get_site_config(ProjectRef::DEFAULT, "s2")
                 .await
                 .unwrap()
                 .unwrap()
@@ -2773,6 +3466,7 @@ mod tests {
         // Start a challenge; re-starting under the same method is idempotent.
         let v1 = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("blog"),
                 "example.com",
                 VerificationMethod::Dns,
@@ -2782,6 +3476,7 @@ mod tests {
             .unwrap();
         let v2 = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("blog"),
                 "example.com",
                 VerificationMethod::Dns,
@@ -2791,27 +3486,27 @@ mod tests {
             .unwrap();
         assert_eq!(v1.token, v2.token, "same method → same pending token");
         assert!(!store
-            .is_domain_verified(&SiteName::new("blog"), "example.com")
+            .is_domain_verified(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .unwrap());
 
         // Unverified hosts cannot be attached — the gate.
         assert!(store
-            .attach_verified_domain(&SiteName::new("blog"), "example.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .is_err());
 
         // Verify, then attach: the host enters routing as the primary.
         store
-            .mark_domain_verified(&SiteName::new("blog"), "example.com")
+            .mark_domain_verified(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .unwrap();
         assert!(store
-            .is_domain_verified(&SiteName::new("blog"), "example.com")
+            .is_domain_verified(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .unwrap());
         store
-            .attach_verified_domain(&SiteName::new("blog"), "example.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .unwrap();
         assert_eq!(
@@ -2819,12 +3514,14 @@ mod tests {
                 .resolve_site_by_host("example.com")
                 .await
                 .unwrap()
+                .map(|o| o.site)
                 .as_deref(),
             Some("blog")
         );
         // A second verified host becomes an alias, not the primary.
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("blog"),
                 "www.example.com",
                 VerificationMethod::Http,
@@ -2833,11 +3530,19 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_domain_verified(&SiteName::new("blog"), "www.example.com")
+            .mark_domain_verified(
+                ProjectRef::DEFAULT,
+                &SiteName::new("blog"),
+                "www.example.com",
+            )
             .await
             .unwrap();
         let config = store
-            .attach_verified_domain(&SiteName::new("blog"), "www.example.com")
+            .attach_verified_domain(
+                ProjectRef::DEFAULT,
+                &SiteName::new("blog"),
+                "www.example.com",
+            )
             .await
             .unwrap();
         assert_eq!(config.domains.primary.as_deref(), Some("example.com"));
@@ -2846,6 +3551,7 @@ mod tests {
         // A wildcard is verified at its base name and attached as a wildcard.
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("blog"),
                 "*.example.com",
                 VerificationMethod::Dns,
@@ -2855,11 +3561,11 @@ mod tests {
             .unwrap();
         // The challenge keys on the base host, so the wildcard shares it.
         assert!(store
-            .is_domain_verified(&SiteName::new("blog"), "*.example.com")
+            .is_domain_verified(ProjectRef::DEFAULT, &SiteName::new("blog"), "*.example.com")
             .await
             .unwrap());
         let config = store
-            .attach_verified_domain(&SiteName::new("blog"), "*.example.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("blog"), "*.example.com")
             .await
             .unwrap();
         assert_eq!(config.domains.wildcards, vec!["*.example.com".to_string()]);
@@ -2867,18 +3573,18 @@ mod tests {
         // Listing surfaces every challenge; removing drops the record.
         assert_eq!(
             store
-                .list_domain_verifications(&SiteName::new("blog"))
+                .list_domain_verifications(ProjectRef::DEFAULT, &SiteName::new("blog"))
                 .await
                 .unwrap()
                 .len(),
             2
         );
         assert!(store
-            .remove_domain_verification(&SiteName::new("blog"), "example.com")
+            .remove_domain_verification(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .unwrap());
         assert!(!store
-            .is_domain_verified(&SiteName::new("blog"), "example.com")
+            .is_domain_verified(ProjectRef::DEFAULT, &SiteName::new("blog"), "example.com")
             .await
             .unwrap());
     }
@@ -2896,6 +3602,7 @@ mod tests {
         // Site `a` legitimately verifies + attaches `shared.example`.
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("a"),
                 "shared.example",
                 VerificationMethod::Http,
@@ -2904,11 +3611,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_domain_verified(&SiteName::new("a"), "shared.example")
+            .mark_domain_verified(ProjectRef::DEFAULT, &SiteName::new("a"), "shared.example")
             .await
             .unwrap();
         store
-            .attach_verified_domain(&SiteName::new("a"), "shared.example")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("a"), "shared.example")
             .await
             .unwrap();
         assert_eq!(
@@ -2916,6 +3623,7 @@ mod tests {
                 .resolve_site_by_host("shared.example")
                 .await
                 .unwrap()
+                .map(|o| o.site)
                 .as_deref(),
             Some("a")
         );
@@ -2925,6 +3633,7 @@ mod tests {
         // silently steal the live mapping.
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("b"),
                 "shared.example",
                 VerificationMethod::Http,
@@ -2933,11 +3642,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_domain_verified(&SiteName::new("b"), "shared.example")
+            .mark_domain_verified(ProjectRef::DEFAULT, &SiteName::new("b"), "shared.example")
             .await
             .unwrap();
         let err = store
-            .attach_verified_domain(&SiteName::new("b"), "shared.example")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("b"), "shared.example")
             .await
             .expect_err("second site must not hijack an attached host");
         assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
@@ -2952,7 +3661,7 @@ mod tests {
             ..Default::default()
         };
         let err = store
-            .set_site_config("b", &stolen)
+            .set_site_config(ProjectRef::DEFAULT, "b", &stolen)
             .await
             .expect_err("set_site_config must refuse another site's host");
         assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
@@ -2963,6 +3672,7 @@ mod tests {
                 .resolve_site_by_host("shared.example")
                 .await
                 .unwrap()
+                .map(|o| o.site)
                 .as_deref(),
             Some("a")
         );
@@ -2977,12 +3687,16 @@ mod tests {
             },
             ..Default::default()
         };
-        store.set_site_config("a", &readd).await.unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "a", &readd)
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .resolve_site_by_host("www.shared.example")
                 .await
                 .unwrap()
+                .map(|o| o.site)
                 .as_deref(),
             Some("a")
         );
@@ -3000,6 +3714,7 @@ mod tests {
         // Site `a` legitimately attaches `example.com`.
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("a"),
                 "example.com",
                 VerificationMethod::Http,
@@ -3008,11 +3723,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_domain_verified(&SiteName::new("a"), "example.com")
+            .mark_domain_verified(ProjectRef::DEFAULT, &SiteName::new("a"), "example.com")
             .await
             .unwrap();
         store
-            .attach_verified_domain(&SiteName::new("a"), "example.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("a"), "example.com")
             .await
             .unwrap();
 
@@ -3026,7 +3741,7 @@ mod tests {
                 ..Default::default()
             };
             let err = store
-                .set_site_config("b", &cfg)
+                .set_site_config(ProjectRef::DEFAULT, "b", &cfg)
                 .await
                 .expect_err("variant claim must be refused");
             assert!(
@@ -3038,7 +3753,12 @@ mod tests {
         // Routing folds case + trailing dot to the one owner.
         for h in ["example.com", "Example.com", "EXAMPLE.COM", "example.com."] {
             assert_eq!(
-                store.resolve_site_by_host(h).await.unwrap().as_deref(),
+                store
+                    .resolve_site_by_host(h)
+                    .await
+                    .unwrap()
+                    .map(|o| o.site)
+                    .as_deref(),
                 Some("a"),
                 "host {h:?} must resolve to site a"
             );
@@ -3055,6 +3775,7 @@ mod tests {
         let store = store();
         let v = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("docs"),
                 "docs.example",
                 VerificationMethod::Http,
@@ -3101,6 +3822,7 @@ mod tests {
         // A DNS-method challenge is never served over the HTTP edge route.
         let dv = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("dns-site"),
                 "dns.example",
                 VerificationMethod::Dns,
@@ -3127,6 +3849,7 @@ mod tests {
         // HTTP-verify the base host, then try to attach the wildcard → refused.
         let http = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("s"),
                 "*.example.com",
                 VerificationMethod::Http,
@@ -3135,11 +3858,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_domain_verified(&SiteName::new("s"), "*.example.com")
+            .mark_domain_verified(ProjectRef::DEFAULT, &SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         let err = store
-            .attach_verified_domain(&SiteName::new("s"), "*.example.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("s"), "*.example.com")
             .await
             .expect_err("wildcard with only HTTP proof must be refused");
         assert!(matches!(err, DeployError::Conflict(_)), "got {err:?}");
@@ -3148,7 +3871,7 @@ mod tests {
         // the record (the old HTTP token's self-serve index entry is dropped on
         // remove), and re-proves via DNS.
         store
-            .remove_domain_verification(&SiteName::new("s"), "*.example.com")
+            .remove_domain_verification(ProjectRef::DEFAULT, &SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         // The removed HTTP token is no longer self-servable.
@@ -3159,6 +3882,7 @@ mod tests {
             .is_none());
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("s"),
                 "*.example.com",
                 VerificationMethod::Dns,
@@ -3167,11 +3891,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_domain_verified(&SiteName::new("s"), "*.example.com")
+            .mark_domain_verified(ProjectRef::DEFAULT, &SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         let cfg = store
-            .attach_verified_domain(&SiteName::new("s"), "*.example.com")
+            .attach_verified_domain(ProjectRef::DEFAULT, &SiteName::new("s"), "*.example.com")
             .await
             .unwrap();
         assert_eq!(cfg.domains.wildcards, vec!["*.example.com".to_string()]);
@@ -3181,6 +3905,7 @@ mod tests {
         // the current (DNS) record and refuses to serve the old HTTP token.
         let h2 = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("s2"),
                 "host.example",
                 VerificationMethod::Http,
@@ -3195,6 +3920,7 @@ mod tests {
             .is_some());
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("s2"),
                 "host.example",
                 VerificationMethod::Dns,
@@ -3219,6 +3945,7 @@ mod tests {
         for i in 0..64 {
             store
                 .start_domain_verification(
+                    ProjectRef::DEFAULT,
                     &SiteName::new("site"),
                     &format!("h{i}.example"),
                     VerificationMethod::Http,
@@ -3230,6 +3957,7 @@ mod tests {
         // One more genuinely-new host is refused (bounds the reconcile fan-out).
         let err = store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("site"),
                 "overflow.example",
                 VerificationMethod::Http,
@@ -3241,6 +3969,7 @@ mod tests {
         // Re-running an EXISTING host still works (returns early before the cap).
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("site"),
                 "h0.example",
                 VerificationMethod::Http,
@@ -3251,6 +3980,7 @@ mod tests {
         // A different site has its own budget.
         store
             .start_domain_verification(
+                ProjectRef::DEFAULT,
                 &SiteName::new("other"),
                 "fresh.example",
                 VerificationMethod::Http,
@@ -3343,12 +4073,35 @@ mod tests {
             replicas: 3,
             placement: PlacementConstraints::default(),
         };
-        s.set_compute_workload(&workload).await.unwrap();
-        assert_eq!(s.get_compute_workload("api").await.unwrap(), Some(workload));
-        assert_eq!(s.list_compute_workloads().await.unwrap().len(), 1);
-        assert!(s.delete_compute_workload("api").await.unwrap());
-        assert!(!s.delete_compute_workload("api").await.unwrap());
-        assert!(s.list_compute_workloads().await.unwrap().is_empty());
+        s.set_compute_workload(ProjectRef::DEFAULT, &workload)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_compute_workload(ProjectRef::DEFAULT, "api")
+                .await
+                .unwrap(),
+            Some(workload)
+        );
+        assert_eq!(
+            s.list_compute_workloads(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(s
+            .delete_compute_workload(ProjectRef::DEFAULT, "api")
+            .await
+            .unwrap());
+        assert!(!s
+            .delete_compute_workload(ProjectRef::DEFAULT, "api")
+            .await
+            .unwrap());
+        assert!(s
+            .list_compute_workloads(ProjectRef::DEFAULT)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// A distinct, blob-free manifest (distinguished only by its config), so it
@@ -3415,21 +4168,44 @@ mod tests {
 
         // Unknown deployment cannot be aliased.
         assert!(matches!(
-            store.set_alias("blog", "staging", "deadbeef").await,
+            store
+                .set_alias(ProjectRef::DEFAULT, "blog", "staging", "deadbeef")
+                .await,
             Err(DeployError::NotFound(_))
         ));
 
-        store.set_alias("blog", "staging", &id).await.unwrap();
+        store
+            .set_alias(ProjectRef::DEFAULT, "blog", "staging", &id)
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_alias("blog", "staging").await.unwrap(),
+            store
+                .get_alias(ProjectRef::DEFAULT, "blog", "staging")
+                .await
+                .unwrap(),
             Some(id.clone())
         );
-        let aliases = store.list_aliases("blog").await.unwrap();
+        let aliases = store
+            .list_aliases(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap();
         assert_eq!(aliases.get("staging"), Some(&id));
 
-        assert!(store.remove_alias("blog", "staging").await.unwrap());
-        assert!(!store.remove_alias("blog", "staging").await.unwrap());
-        assert_eq!(store.get_alias("blog", "staging").await.unwrap(), None);
+        assert!(store
+            .remove_alias(ProjectRef::DEFAULT, "blog", "staging")
+            .await
+            .unwrap());
+        assert!(!store
+            .remove_alias(ProjectRef::DEFAULT, "blog", "staging")
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get_alias(ProjectRef::DEFAULT, "blog", "staging")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -3443,9 +4219,18 @@ mod tests {
         let id1 = store.put_manifest(&m1).await.unwrap();
         let id2 = store.put_manifest(&m2).await.unwrap();
         let id3 = store.put_manifest(&m3).await.unwrap();
-        store.activate("blog", &id1).await.unwrap();
-        store.activate("blog", &id2).await.unwrap();
-        store.activate("blog", &id3).await.unwrap();
+        store
+            .activate(ProjectRef::DEFAULT, "blog", &id1)
+            .await
+            .unwrap();
+        store
+            .activate(ProjectRef::DEFAULT, "blog", &id2)
+            .await
+            .unwrap();
+        store
+            .activate(ProjectRef::DEFAULT, "blog", &id3)
+            .await
+            .unwrap();
 
         // Default: full history kept, nothing collectable.
         let report = store.collect_garbage(false).await.unwrap();
@@ -3453,7 +4238,10 @@ mod tests {
 
         // keep_last = 1 keeps only the most recent (== current id3); id1 and id2
         // become orphans. An alias to id1 rescues it.
-        store.set_alias("blog", "pinned", &id1).await.unwrap();
+        store
+            .set_alias(ProjectRef::DEFAULT, "blog", "pinned", &id1)
+            .await
+            .unwrap();
         let report = store
             .collect_garbage_with(
                 false,
@@ -3525,34 +4313,228 @@ mod tests {
         let mut cfg = SiteConfig::default();
         cfg.domains.primary = Some("blog.example".into());
         cfg.domains.wildcards = vec!["*.preview.blog.example".into()];
-        store.set_site_config("blog", &cfg).await.unwrap();
+        store
+            .set_site_config(ProjectRef::DEFAULT, "blog", &cfg)
+            .await
+            .unwrap();
         // A real deployment so the alias points at something valid.
         let id = store.put_manifest(&empty_manifest(true)).await.unwrap();
-        store.set_alias("blog", "stable", &id).await.unwrap();
+        store
+            .set_alias(ProjectRef::DEFAULT, "blog", "stable", &id)
+            .await
+            .unwrap();
 
         // Present: config stored + its hosts route to it.
-        assert!(store.get_site_config("blog").await.unwrap().is_some());
+        assert!(store
+            .get_site_config(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             store
                 .resolve_site_by_host("blog.example")
                 .await
                 .unwrap()
+                .map(|o| o.site)
                 .as_deref(),
             Some("blog")
         );
 
-        store.delete_site("blog").await.unwrap();
+        store
+            .delete_site(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap();
 
         // Gone: config pointer, domain routing (host freed), aliases.
-        assert!(store.get_site_config("blog").await.unwrap().is_none());
+        assert!(store
+            .get_site_config(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap()
+            .is_none());
         assert!(store
             .resolve_site_by_host("blog.example")
             .await
             .unwrap()
             .is_none());
-        assert!(store.list_aliases("blog").await.unwrap().is_empty());
+        assert!(store
+            .list_aliases(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap()
+            .is_empty());
 
         // Idempotent — deleting an absent site is a no-op.
-        store.delete_site("blog").await.unwrap();
+        store
+            .delete_site(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_blob_reachability_is_a_cross_project_union() {
+        use crate::kv::MemoryKv;
+        // A real blob store so blob deletion is observable.
+        let store = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+
+        // Three blobs: `shared` (referenced by project acme), `keep` (project shop's
+        // current), and `dead` (referenced by no live deployment anywhere). The blob
+        // key is the content hash, so hash the actual bytes (put_blob verifies it).
+        let shared = sha256_hex(b"shared-blob");
+        let keep = sha256_hex(b"keep-blob");
+        let dead = sha256_hex(b"dead-blob");
+        store
+            .put_blob(&shared, once_bytes(b"shared-blob"))
+            .await
+            .unwrap();
+        store
+            .put_blob(&keep, once_bytes(b"keep-blob"))
+            .await
+            .unwrap();
+        store
+            .put_blob(&dead, once_bytes(b"dead-blob"))
+            .await
+            .unwrap();
+
+        let m_shared = manifest_with(&[("index.html", &shared)]);
+        let m_keep = manifest_with(&[("index.html", &keep)]);
+        let m_dead = manifest_with(&[("old.html", &dead)]);
+        let id_shared = store.put_manifest(&m_shared).await.unwrap();
+        let id_keep = store.put_manifest(&m_keep).await.unwrap();
+        let id_dead = store.put_manifest(&m_dead).await.unwrap();
+
+        // Project "acme": current → the shared manifest (its only reference to `shared`).
+        let acme = ProjectRef::new("acme");
+        store.activate(acme, "site", &id_shared).await.unwrap();
+        // Project "shop": activated the shared manifest first, then `keep`, so with
+        // keep_last=1 the shared manifest is an ORPHAN *within shop* — its survival
+        // depends entirely on acme still referencing it (the cross-project union).
+        let shop = ProjectRef::new("shop");
+        store.activate(shop, "site", &id_shared).await.unwrap();
+        store.activate(shop, "site", &id_keep).await.unwrap();
+        // `m_dead` is stored but never activated in any project.
+
+        let report = store
+            .collect_garbage_with(
+                true,
+                GcOptions {
+                    keep_last: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The truly-dead manifest and its unshared blob are collected.
+        assert!(store.get_manifest(&id_dead).await.unwrap().is_none());
+        assert!(
+            !store.has_blob(&dead).await.unwrap(),
+            "dead blob is reclaimed"
+        );
+        assert_eq!(report.manifests_removed, 1, "only the dead manifest goes");
+
+        // The shared manifest + blob SURVIVE: orphaned in shop but current in acme.
+        // A per-project (non-union) GC would have wrongly collected them.
+        assert!(
+            store.get_manifest(&id_shared).await.unwrap().is_some(),
+            "shared manifest kept by acme's reference"
+        );
+        assert!(
+            store.has_blob(&shared).await.unwrap(),
+            "shared blob kept — reachability is the union across projects"
+        );
+        // shop's current is untouched.
+        assert!(store.has_blob(&keep).await.unwrap());
+        assert_eq!(
+            store.current_id(acme, "site").await.unwrap().as_deref(),
+            Some(id_shared.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn same_site_name_in_two_projects_is_isolated() {
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let acme = ProjectRef::new("acme");
+        let shop = ProjectRef::new("shop");
+
+        // Two projects each have a site literally named "www" — independent records.
+        let id_a = store.put_manifest(&empty_manifest(false)).await.unwrap();
+        let id_b = store.put_manifest(&empty_manifest(true)).await.unwrap();
+        store.activate(acme, "www", &id_a).await.unwrap();
+        store.activate(shop, "www", &id_b).await.unwrap();
+
+        // Distinct current pointers — no cross-talk.
+        assert_eq!(
+            store.current_id(acme, "www").await.unwrap().as_deref(),
+            Some(id_a.as_str())
+        );
+        assert_eq!(
+            store.current_id(shop, "www").await.unwrap().as_deref(),
+            Some(id_b.as_str())
+        );
+        assert_ne!(id_a, id_b);
+
+        // Distinct configs + aliases keyed under each project.
+        let mut cfg_a = SiteConfig::default();
+        cfg_a.domains.primary = Some("acme.example".into());
+        store.set_site_config(acme, "www", &cfg_a).await.unwrap();
+        let mut cfg_b = SiteConfig::default();
+        cfg_b.domains.primary = Some("shop.example".into());
+        store.set_site_config(shop, "www", &cfg_b).await.unwrap();
+        store
+            .set_alias(acme, "www", "staging", &id_a)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_site_config(acme, "www")
+                .await
+                .unwrap()
+                .unwrap()
+                .domains
+                .primary
+                .as_deref(),
+            Some("acme.example")
+        );
+        assert_eq!(
+            store
+                .get_site_config(shop, "www")
+                .await
+                .unwrap()
+                .unwrap()
+                .domains
+                .primary
+                .as_deref(),
+            Some("shop.example")
+        );
+        // acme's alias is not visible under shop.
+        assert!(store
+            .get_alias(acme, "www", "staging")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_alias(shop, "www", "staging")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.list_aliases(shop, "www").await.unwrap().is_empty());
+
+        // Each host resolves to its owning (project, site); deleting one leaves the other.
+        assert_eq!(
+            store.resolve_site_by_host("acme.example").await.unwrap(),
+            Some(DomainOwner::new("acme", "www"))
+        );
+        assert_eq!(
+            store.resolve_site_by_host("shop.example").await.unwrap(),
+            Some(DomainOwner::new("shop", "www"))
+        );
+        store.delete_site(acme, "www").await.unwrap();
+        assert!(store.get_site_config(acme, "www").await.unwrap().is_none());
+        assert!(
+            store.get_site_config(shop, "www").await.unwrap().is_some(),
+            "deleting acme/www must not touch shop/www"
+        );
+        assert!(store.current_id(shop, "www").await.unwrap().is_some());
     }
 }

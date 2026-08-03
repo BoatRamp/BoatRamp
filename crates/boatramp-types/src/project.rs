@@ -143,6 +143,26 @@ impl DomainOwner {
             site: site.into(),
         }
     }
+
+    /// The canonical stored form of a domain-index value: the `{project, site}`
+    /// JSON object.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("DomainOwner serializes")
+    }
+
+    /// Read a domain-index value, tolerant of **three** on-disk forms so a reader
+    /// never breaks mid-migration:
+    /// 1. the current `{project, site}` JSON object;
+    /// 2. a JSON bare string `"blog"` → `(default, "blog")`;
+    /// 3. a **raw, unquoted** site name `blog` (the pre-0.2.0 layout, written as
+    ///    `site.as_bytes()` — not valid JSON) → `(default, "blog")`.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if let Ok(owner) = serde_json::from_slice::<Self>(bytes) {
+            return owner;
+        }
+        // Legacy layout-1 value: the bare site name stored as raw bytes.
+        Self::new(DEFAULT_PROJECT, String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 impl<'de> Deserialize<'de> for DomainOwner {
@@ -220,5 +240,27 @@ mod tests {
         let round: DomainOwner =
             serde_json::from_slice(&serde_json::to_vec(&full).unwrap()).unwrap();
         assert_eq!(round, full);
+    }
+
+    #[test]
+    fn domain_owner_from_bytes_tolerates_all_layouts() {
+        // Current object form round-trips.
+        let owner = DomainOwner::new("acme", "shop");
+        assert_eq!(DomainOwner::from_bytes(&owner.to_bytes()), owner);
+        // JSON bare string → default project.
+        assert_eq!(
+            DomainOwner::from_bytes(b"\"blog\""),
+            DomainOwner::new(DEFAULT_PROJECT, "blog")
+        );
+        // Pre-0.2.0 raw (unquoted) site name, not valid JSON → default project.
+        assert_eq!(
+            DomainOwner::from_bytes(b"blog"),
+            DomainOwner::new(DEFAULT_PROJECT, "blog")
+        );
+        // A raw site name that looks like a JSON scalar still reads as a site name.
+        assert_eq!(
+            DomainOwner::from_bytes(b"123"),
+            DomainOwner::new(DEFAULT_PROJECT, "123")
+        );
     }
 }

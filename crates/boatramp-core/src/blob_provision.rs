@@ -127,15 +127,20 @@ pub trait LedgerSink: Send + Sync {
 }
 
 /// The real ledger is the control-plane store.
+///
+/// The blob-notify ledger is project-scoped like every function record. This seam
+/// carries no project, so it targets [`ProjectRef::DEFAULT`] — correct while
+/// functions live under the default project; threading a caller-supplied project
+/// through the `LedgerSink` trait is a Step-7 follow-up (per-project blob triggers).
 #[async_trait]
 impl LedgerSink for crate::deploy::DeployStore {
     async fn put(&self, record: &ManagedNotification) -> Result<(), ProvisionError> {
-        self.put_managed_notification(record)
+        self.put_managed_notification(crate::project::ProjectRef::DEFAULT, record)
             .await
             .map_err(|e| ProvisionError::Backend(e.to_string()))
     }
     async fn delete(&self, function: &str, prefix: &str) -> Result<(), ProvisionError> {
-        self.remove_managed_notification(function, prefix)
+        self.remove_managed_notification(crate::project::ProjectRef::DEFAULT, function, prefix)
             .await
             .map_err(|e| ProvisionError::Backend(e.to_string()))
     }
@@ -194,7 +199,11 @@ mod tests {
             self.entries
                 .lock()
                 .unwrap()
-                .get(&crate::blob_notify::blobnotify_key(function, prefix))
+                .get(&crate::blob_notify::blobnotify_key(
+                    crate::project::ProjectRef::DEFAULT.as_str(),
+                    function,
+                    prefix,
+                ))
                 .cloned()
         }
         fn len(&self) -> usize {
@@ -205,7 +214,11 @@ mod tests {
     impl LedgerSink for MemLedger {
         async fn put(&self, record: &ManagedNotification) -> Result<(), ProvisionError> {
             self.entries.lock().unwrap().insert(
-                crate::blob_notify::blobnotify_key(&record.function, &record.prefix),
+                crate::blob_notify::blobnotify_key(
+                    crate::project::ProjectRef::DEFAULT.as_str(),
+                    &record.function,
+                    &record.prefix,
+                ),
                 record.clone(),
             );
             Ok(())
@@ -214,7 +227,11 @@ mod tests {
             self.entries
                 .lock()
                 .unwrap()
-                .remove(&crate::blob_notify::blobnotify_key(function, prefix));
+                .remove(&crate::blob_notify::blobnotify_key(
+                    crate::project::ProjectRef::DEFAULT.as_str(),
+                    function,
+                    prefix,
+                ));
             Ok(())
         }
     }

@@ -4,6 +4,7 @@
 //! `handlers`-gated; pulls the serve-pipeline scope in via `use super::*`.
 
 use super::*;
+use boatramp_core::project::ProjectRef;
 
 /// How often the scheduler polls each active consumer for messages.
 #[cfg(feature = "handlers")]
@@ -133,14 +134,14 @@ async fn reconcile_blob_watchers(
         }
         return;
     }
-    let functions = match deploy.list_stored_functions().await {
+    let functions = match deploy.list_stored_functions(ProjectRef::DEFAULT).await {
         Ok(f) => f,
         Err(_) => return,
     };
     let mut desired = std::collections::HashSet::new();
     for function in functions {
         let triggers = deploy
-            .list_triggers(&function.name)
+            .list_triggers(ProjectRef::DEFAULT, &function.name)
             .await
             .unwrap_or_default();
         for trigger in triggers {
@@ -234,7 +235,7 @@ async fn enqueue_blob_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(&inv).await {
+    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
         tracing::warn!(function = %function.name, %err, "enqueuing blob invocation failed");
     }
 }
@@ -254,8 +255,8 @@ pub(super) async fn run_scheduler_tick(
     use std::sync::atomic::Ordering;
     let mut acked = 0;
     let mut cron_handles = Vec::new();
-    for site in deploy.list_sites().await? {
-        let Some(site_config) = deploy.get_site_config(&site).await? else {
+    for site in deploy.list_sites(ProjectRef::DEFAULT).await? {
+        let Some(site_config) = deploy.get_site_config(ProjectRef::DEFAULT, &site).await? else {
             continue;
         };
         let Some(site_handlers) = site_config.handlers.as_ref().filter(|h| h.enabled) else {
@@ -264,11 +265,11 @@ pub(super) async fn run_scheduler_tick(
         // Active deployments: the current one (production, namespace `{site}`)
         // plus each background alias (namespace `{site}/{alias}`). Never previews.
         let mut active: Vec<(String, String)> = Vec::new();
-        if let Some(id) = deploy.current_id(&site).await? {
+        if let Some(id) = deploy.current_id(ProjectRef::DEFAULT, &site).await? {
             active.push((id, site.clone()));
         }
         for alias in &site_handlers.background_aliases {
-            if let Some(id) = deploy.get_alias(&site, alias).await? {
+            if let Some(id) = deploy.get_alias(ProjectRef::DEFAULT, &site, alias).await? {
                 active.push((id, format!("{site}/{alias}")));
             }
         }
@@ -391,14 +392,14 @@ pub(super) async fn run_scheduler_tick(
     // cluster-wide; the drain runs inline so the outcome is settled this tick.
     let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
     if invoke_enabled {
-        for function in deploy.list_stored_functions().await? {
+        for function in deploy.list_stored_functions(ProjectRef::DEFAULT).await? {
             // Fire due triggers first (a cron enqueues an invocation this tick),
             // then drain the queue so a just-enqueued call runs without waiting.
             dispatch_function_triggers(inner, deploy, &function, &now).await;
             drain_function_invocations(inner, deploy, &function).await;
         }
         // --- workflow runs (FA-6), same leader gate ---
-        for workflow in deploy.list_workflows().await? {
+        for workflow in deploy.list_workflows(ProjectRef::DEFAULT).await? {
             drain_workflow_runs(inner, deploy, &workflow).await;
         }
     }
