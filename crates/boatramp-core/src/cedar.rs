@@ -9,15 +9,19 @@
 //! Model:
 //! - **Principal** = `BR::Principal::"self"`, a member of one `BR::Role::"<name>"`
 //!   group per granted role, carrying a `<role>_sites : Set<String>` attribute for
-//!   every target-scoped role (the site names it was granted that role on; always
-//!   present, possibly empty).
-//! - **Resource** = `BR::<Resource>::"<id>"`; only `BR::Site` carries a `name` attr
-//!   (the requested site), which the site-scoping guard reads.
+//!   every target-scoped role (the raw grant targets — a `"<project>/<site>"` for a
+//!   site role, a bare `"<project>"` for a project role; always present, possibly empty).
+//! - **Resource** = `BR::<Resource>::"<id>"`. The two target-scoped resources carry
+//!   attributes the scoping guards read: `BR::Site` a `name` (the full `project/site`)
+//!   and a `project` (its project segment); `BR::Project` a `name` (the project).
 //! - **Action** = `BR::Action::"<action>"` with `read`/`write`/`deploy` parented to
 //!   `admin`, so an `admin` grant (`action in [BR::Action::"admin"]`) covers every
 //!   action — mirroring `Right::satisfies`' "granted Admin ⇒ any action".
-//! - **Site scoping** is `when { principal.<role>_sites.contains(resource.name) }`,
-//!   mirroring `target_matches`. `AnyTarget` templates emit no `when` (wildcard).
+//! - **Target scoping**, mirroring `target_matches`: a `RoleTarget` template guards on
+//!   `principal.<role>_sites.contains(resource.name)` (exact `project/site` or project);
+//!   a `ProjectWildcard` template (a project role's per-site right) guards on
+//!   `…contains(resource.project)`, matching every site whose project segment is granted;
+//!   an `AnyTarget` template emits no `when` (a global wildcard).
 //!
 //! Default-deny throughout: any entity/request construction error yields `false`.
 
@@ -76,7 +80,7 @@ impl CompiledCedar {
         let scoped_roles = policy
             .roles
             .iter()
-            .filter(|(_, templates)| templates.iter().any(|t| t.scope == TargetScope::RoleTarget))
+            .filter(|(_, templates)| templates.iter().any(|t| t.scope.is_targeted()))
             .map(|(name, _)| name.clone())
             .collect();
         Ok(Self {
@@ -141,11 +145,20 @@ fn generate_policy_text(policy: &AuthzPolicy) -> String {
             let action = action_scope(t.action);
             let resource_ty = resource_type(t.resource);
             let guard = match t.scope {
-                // Bind the request's site to the roles' granted sites, mirroring
+                // Bind the request's target to the role's granted targets, mirroring
                 // `target_matches(Some(g), required)`. `Set::contains` is Cedar set
-                // membership (`in` is entity-hierarchy membership — wrong here).
+                // membership (`in` is entity-hierarchy membership — wrong here). The
+                // granted set holds the raw grant target (a `"<project>/<site>"` for a
+                // site role, or a bare `"<project>"` for a project role).
                 TargetScope::RoleTarget => {
                     format!(" when {{ principal.{role}_sites.contains(resource.name) }}")
+                }
+                // A project role's per-site right: match the request's site by its
+                // *project* segment against the granted project names, mirroring the
+                // `"<project>/*"` wildcard in `target_matches`. Reads the Site
+                // resource's `project` attribute (only Site permits use this scope).
+                TargetScope::ProjectWildcard => {
+                    format!(" when {{ principal.{role}_sites.contains(resource.project) }}")
                 }
                 // Wildcard grant: matches any resource of that type.
                 TargetScope::AnyTarget => String::new(),
@@ -173,6 +186,7 @@ fn action_scope(action: Action) -> String {
 fn resource_type(resource: Resource) -> &'static str {
     match resource {
         Resource::Site => "Site",
+        Resource::Project => "Project",
         Resource::Blobs => "Blobs",
         Resource::Tokens => "Tokens",
         Resource::Certs => "Certs",
@@ -210,13 +224,30 @@ fn principal_entity(
     Ok(Entity::new(principal_uid.clone(), attrs, parents)?)
 }
 
-/// Build the resource entity for a required right. `Site` is keyed + attributed by
-/// the requested site name (read by the scoping guard); other resources are global
-/// singletons keyed by their type term, needing no attributes.
+/// Build the resource entity for a required right. The two target-scoped resources
+/// carry attributes the scoping guards read: `Site` is keyed by its full
+/// `"<project>/<site>"` target and carries both `name` (the full target, for a site
+/// grant) and `project` (its project segment, for a project-wildcard grant); `Project`
+/// is keyed + `name`-attributed by the project. Other resources are global singletons
+/// keyed by their type term, needing no attributes.
 fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Error>> {
     let ty = resource_type(required.resource);
     let (id, attrs) = match required.resource {
         Resource::Site => {
+            let name = required.target.clone().unwrap_or_default();
+            let project = boatramp_types::authz::project_of(&name).to_string();
+            let mut a = HashMap::new();
+            a.insert(
+                "name".to_string(),
+                RestrictedExpression::new_string(name.clone()),
+            );
+            a.insert(
+                "project".to_string(),
+                RestrictedExpression::new_string(project),
+            );
+            (name, a)
+        }
+        Resource::Project => {
             let name = required.target.clone().unwrap_or_default();
             let mut a = HashMap::new();
             a.insert(
@@ -277,7 +308,17 @@ mod tests {
     /// `policy.rights_for(roles).allows(required)`.
     fn assert_faithful(policy: &AuthzPolicy, rolesets: &[Vec<GrantedRole>]) {
         let cedar = CompiledCedar::compile(policy).expect("compile");
-        let targets = [None, Some("blog".to_string()), Some("shop".to_string())];
+        let targets = [
+            None,
+            Some("blog".to_string()),
+            Some("shop".to_string()),
+            // Project-qualified site targets + bare project targets (0.2.0), so the
+            // gate covers `Resource::Project` and the project-wildcard site scope.
+            Some("acme".to_string()),
+            Some("acme/blog".to_string()),
+            Some("acme/shop".to_string()),
+            Some("other/blog".to_string()),
+        ];
         for roles in rolesets {
             let expected_set: RightSet = policy.rights_for(roles);
             for &resource in &Resource::ALL {
@@ -333,6 +374,22 @@ mod tests {
             vec![
                 GrantedRole::global("ghost"),
                 GrantedRole::scoped("viewer", "blog"),
+            ],
+            // Project roles (0.2.0): the tenant boundary + project-wildcard site scope
+            // must match the oracle across every (resource, action, target).
+            vec![GrantedRole::scoped("project_admin", "acme")],
+            vec![GrantedRole::scoped("project_publisher", "acme")],
+            vec![GrantedRole::scoped("project_viewer", "acme")],
+            vec![GrantedRole::global("project_admin")], // no target → contributes only Blobs
+            // A project-qualified site role alongside a project role.
+            vec![
+                GrantedRole::scoped("publisher", "acme/blog"),
+                GrantedRole::scoped("project_viewer", "acme"),
+            ],
+            // Two projects at once — coverage must stay scoped to each.
+            vec![
+                GrantedRole::scoped("project_admin", "acme"),
+                GrantedRole::scoped("project_viewer", "other"),
             ],
         ]
     }

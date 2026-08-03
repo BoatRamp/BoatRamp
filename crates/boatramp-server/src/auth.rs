@@ -277,8 +277,12 @@ impl Auth {
                 "token not authorized for this resource\n",
             ));
         }
-        let policy = inner.policy().await;
-        if policy.authorize(&verified.roles, &required) {
+        let (policy, compiled) = inner.policy().await;
+        // Normalize legacy grants (a pre-0.2.0 `publisher:blog` reads as the `default`
+        // project) so a site name minted before the project re-keying still authorizes
+        // its now project-qualified route.
+        let roles = policy.normalize_grants(&verified.roles);
+        if compiled.authorize(&roles, &required) {
             Ok(())
         } else {
             Err(Reject::forbidden(
@@ -386,8 +390,11 @@ impl AuthInner {
     /// Load + compile the RBAC policy from `authz/policy` into a Cedar authorizer,
     /// falling back to the built-in default when absent, unreadable, or
     /// uncompilable (a malformed stored policy must never brick the control plane
-    /// — it is logged and the default used).
-    async fn policy(&self) -> CompiledCedar {
+    /// — it is logged and the default used). Returns the raw [`AuthzPolicy`] too, so
+    /// the caller can [`normalize_grants`](AuthzPolicy::normalize_grants) (legacy
+    /// bare-site grants → the `default` project) with the same policy the authorizer
+    /// compiled from.
+    async fn policy(&self) -> (AuthzPolicy, CompiledCedar) {
         let stored = match self.kv.get(authz::POLICY_KEY).await {
             Ok(Some(bytes)) => match serde_json::from_slice::<AuthzPolicy>(&bytes) {
                 Ok(p) => Some(p),
@@ -404,11 +411,13 @@ impl AuthInner {
         };
         let policy = stored.unwrap_or_else(AuthzPolicy::default_policy);
         match CompiledCedar::compile(&policy) {
-            Ok(c) => c,
+            Ok(c) => (policy, c),
             Err(err) => {
                 tracing::warn!(%err, "authz/policy failed to compile; using the default policy");
-                CompiledCedar::compile(&AuthzPolicy::default_policy())
-                    .expect("the default policy always compiles")
+                let default = AuthzPolicy::default_policy();
+                let compiled =
+                    CompiledCedar::compile(&default).expect("the default policy always compiles");
+                (default, compiled)
             }
         }
     }

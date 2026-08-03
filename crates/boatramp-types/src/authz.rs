@@ -30,13 +30,19 @@ pub enum Action {
     Admin,
 }
 
-/// A class of control-plane resource a [`Right`] governs. Only [`Resource::Site`]
-/// is target-scoped (the target is a site name); the rest are global.
+/// A class of control-plane resource a [`Right`] governs. Two are **target-scoped**:
+/// [`Resource::Site`] (target = `"<project>/<site>"`, the 0.2.0 project-qualified
+/// form) and [`Resource::Project`] (target = `"<project>"`, governing the project's
+/// **own** resources — functions, compute, workflows, and the project entity itself).
+/// The rest are global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Resource {
-    /// A single site (`target` = site name): deployments, config, aliases, …
+    /// A single site (`target` = `"<project>/<site>"`): deployments, config, aliases, …
     Site,
+    /// A project (`target` = `"<project>"`): its functions, compute, workflows, and
+    /// project-level config/CRUD. The owning + tenant boundary above a site.
+    Project,
     /// Content-addressed blob uploads (`PUT /api/blobs/<hash>`).
     Blobs,
     /// API token management (`/api/tokens`).
@@ -51,8 +57,9 @@ pub enum Resource {
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Site,
+        Self::Project,
         Self::Blobs,
         Self::Tokens,
         Self::Certs,
@@ -64,6 +71,7 @@ impl Resource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Site => "site",
+            Self::Project => "project",
             Self::Blobs => "blobs",
             Self::Tokens => "tokens",
             Self::Certs => "certs",
@@ -185,7 +193,51 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
-        // Per-site endpoints: `/api/sites/<site>/<sub...>`.
+        // Project-scoped endpoints: `/api/projects/<proj>/<rest...>` (0.2.0).
+        if let Some(rest) = path.strip_prefix("/api/projects/") {
+            let mut segs = rest.split('/');
+            let proj = segs.next().unwrap_or("");
+            if proj.is_empty() {
+                // `/api/projects/` (trailing slash) — listing.
+                return Some(Self::new(Resource::System, None, Action::Read));
+            }
+            let sub: Vec<&str> = segs.filter(|s| !s.is_empty()).collect();
+            return Some(match sub.split_first() {
+                // The project entity itself: read, or manage (admin).
+                None => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Admin },
+                ),
+                // A site within the project: `.../sites/<site>/<site-sub...>`.
+                Some((&"sites", tail)) => {
+                    let site = tail.first().copied().unwrap_or("");
+                    if site.is_empty() {
+                        return Some(Self::new(
+                            Resource::Project,
+                            Some(proj.to_string()),
+                            Action::Read,
+                        ));
+                    }
+                    let site_sub: Vec<&str> = tail.iter().skip(1).copied().collect();
+                    match site_subpath_action(&m, get, &site_sub) {
+                        Some(a) => Self::new(Resource::Site, Some(format!("{proj}/{site}")), a),
+                        // Unknown subpath — deny-safe.
+                        None => Self::new(Resource::System, None, Action::Admin),
+                    }
+                }
+                // Project-owned resources (functions/compute/workflows/config/…):
+                // read with `Project·Read`, mutate with `Project·Deploy`.
+                Some(_) => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Deploy },
+                ),
+            });
+        }
+
+        // Legacy per-site endpoints: `/api/sites/<site>/<sub...>`. The site lives in
+        // the `default` project post-migration, so the target is project-qualified.
         if let Some(rest) = path.strip_prefix("/api/sites/") {
             let mut segs = rest.split('/');
             let site = segs.next().unwrap_or("");
@@ -193,7 +245,7 @@ impl Right {
                 // `/api/sites/` (trailing slash) — listing.
                 return Some(Self::new(Resource::System, None, Action::Read));
             }
-            let target = Some(site.to_string());
+            let target = Some(format!("{}/{site}", crate::project::DEFAULT_PROJECT));
             let sub: Vec<&str> = segs.filter(|s| !s.is_empty()).collect();
             let action = site_subpath_action(&m, get, &sub);
             return Some(match action {
@@ -204,22 +256,31 @@ impl Right {
         }
 
         // Exact, non-site endpoints.
+        let default_project = crate::project::DEFAULT_PROJECT.to_string();
         let right = match path {
             "/api/sites" => Self::new(Resource::System, None, Action::Read),
-            // Functions (FA-1/FA-2): read the function view with `system·read` (like
-            // `/api/sites`); mutating a top-level function (deploy a version, alias,
-            // rollback, delete) requires `system·admin`. (A per-owner `function`
-            // resource with finer invoke/deploy rights lands in FA-4.)
-            p if p == "/api/functions" || p.starts_with("/api/functions/") => {
+            // Listing projects is a node-level read; creating one is a node-admin act
+            // (only `/api/projects` exactly — a specific project is handled above).
+            "/api/projects" => {
                 let action = if get { Action::Read } else { Action::Admin };
                 Self::new(Resource::System, None, action)
             }
-            // Workflows (FA-6): read the definitions/runs with `system·read`;
-            // defining a workflow, starting a run, or deleting requires
-            // `system·admin`. Same shape as `/api/functions`.
+            // Functions (FA-1/FA-2) are **project-owned** (0.2.0): read the view with
+            // `project·read`, mutate (deploy a version, alias, rollback, delete) with
+            // `project·deploy`, scoped to the default project for the legacy path.
+            p if p == "/api/functions" || p.starts_with("/api/functions/") => {
+                let action = if get { Action::Read } else { Action::Deploy };
+                Self::new(Resource::Project, Some(default_project.clone()), action)
+            }
+            // Workflows (FA-6) are project-owned too; same shape as `/api/functions`.
             p if p == "/api/workflows" || p.starts_with("/api/workflows/") => {
-                let action = if get { Action::Read } else { Action::Admin };
-                Self::new(Resource::System, None, action)
+                let action = if get { Action::Read } else { Action::Deploy };
+                Self::new(Resource::Project, Some(default_project.clone()), action)
+            }
+            // Compute workloads (project-owned): read/deploy within the default project.
+            p if p == "/api/compute" || p.starts_with("/api/compute/") => {
+                let action = if get { Action::Read } else { Action::Deploy };
+                Self::new(Resource::Project, Some(default_project.clone()), action)
             }
             "/api/blobs" => Self::new(Resource::Blobs, None, Action::Deploy),
             "/api/certs" => Self::new(Resource::Certs, None, Action::Read),
@@ -299,12 +360,24 @@ fn site_subpath_action(method: &str, get: bool, sub: &[&str]) -> Option<Action> 
     }
 }
 
-/// Whether a granted target (wildcard `None`/`*`, or a specific site) covers a
-/// required target.
+/// The project segment of a `"<project>/<site>"` target (the part before the first
+/// `/`), or the whole string when it carries no `/` (a bare project target).
+pub fn project_of(target: &str) -> &str {
+    target.split_once('/').map_or(target, |(p, _)| p)
+}
+
+/// Whether a granted target covers a required target:
+/// - `None`/`*` — global wildcard, covers everything;
+/// - `"<project>/*"` — a project wildcard, covers any `"<project>/<site>"` (the
+///   required target's project segment must equal `<project>`);
+/// - anything else — an exact string match.
 fn target_matches(granted: Option<&str>, required: Option<&str>) -> bool {
     match granted {
         None | Some("*") => true,
-        Some(g) => required == Some(g),
+        Some(g) => match g.strip_suffix("/*") {
+            Some(project) => required.is_some_and(|r| project_of(r) == project),
+            None => required == Some(g),
+        },
     }
 }
 
@@ -356,8 +429,18 @@ impl FromIterator<Right> for RightSet {
     }
 }
 
+/// What a target-scoped role's grant target names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A per-site role: target is `"<project>/<site>"`.
+    Site,
+    /// A per-project role: target is a bare `"<project>"`.
+    Project,
+}
+
 /// A role granted to a principal: a role `name` from the [`AuthzPolicy`], plus an
-/// optional `target` (a site name) for target-scoped roles.
+/// optional `target` for target-scoped roles — a `"<project>/<site>"` for a site
+/// role, or a bare `"<project>"` for a project role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantedRole {
     /// The role name (a key in [`AuthzPolicy::roles`]).
@@ -403,8 +486,21 @@ impl GrantedRole {
 pub enum TargetScope {
     /// Wildcard/global: the expanded right has `target = None`.
     AnyTarget,
-    /// Bind to the granted role instance's target (target-scoped roles).
+    /// Bind to the granted role instance's target verbatim (a site role's
+    /// `"<project>/<site>"`, or a project role's `"<project>"`).
     RoleTarget,
+    /// A **project role** granting a per-site right over *every* site in its project:
+    /// the granted target is a bare project name `"<project>"` and the expanded right
+    /// gets the project-wildcard target `"<project>/*"`, which
+    /// [`target_matches`](Right::satisfies) treats as covering any `"<project>/<site>"`.
+    ProjectWildcard,
+}
+
+impl TargetScope {
+    /// Whether this scope binds a target (so its role is target-scoped).
+    pub fn is_targeted(self) -> bool {
+        matches!(self, Self::RoleTarget | Self::ProjectWildcard)
+    }
 }
 
 /// One right a role grants, before binding to a concrete target.
@@ -434,6 +530,16 @@ impl RightTemplate {
             resource,
             action,
             scope: TargetScope::RoleTarget,
+        }
+    }
+
+    /// A project-wildcard right template (`ProjectWildcard`): a per-site right a
+    /// project role confers over every site in the project.
+    pub fn project_wildcard(resource: Resource, action: Action) -> Self {
+        Self {
+            resource,
+            action,
+            scope: TargetScope::ProjectWildcard,
         }
     }
 }
@@ -509,6 +615,43 @@ impl AuthzPolicy {
             ],
         );
 
+        // project-admin (project) — full control of the project: its own resources
+        // (functions/compute/workflows/config, via `Project·Admin`) AND every site in
+        // it (`Site·Admin` over the project wildcard) + blob uploads.
+        roles.insert(
+            "project_admin".to_string(),
+            vec![
+                RightTemplate::scoped(Resource::Project, Action::Admin),
+                RightTemplate::project_wildcard(Resource::Site, Action::Admin),
+                RightTemplate::any(Resource::Blobs, Action::Deploy),
+            ],
+        );
+
+        // project-publisher (project) — ship + configure any site in the project and
+        // manage its functions/compute (write + deploy + read), but not admin the
+        // project entity (no membership/role changes).
+        roles.insert(
+            "project_publisher".to_string(),
+            vec![
+                RightTemplate::scoped(Resource::Project, Action::Read),
+                RightTemplate::scoped(Resource::Project, Action::Write),
+                RightTemplate::scoped(Resource::Project, Action::Deploy),
+                RightTemplate::project_wildcard(Resource::Site, Action::Read),
+                RightTemplate::project_wildcard(Resource::Site, Action::Write),
+                RightTemplate::project_wildcard(Resource::Site, Action::Deploy),
+                RightTemplate::any(Resource::Blobs, Action::Deploy),
+            ],
+        );
+
+        // project-viewer (project) — read-only across the whole project.
+        roles.insert(
+            "project_viewer".to_string(),
+            vec![
+                RightTemplate::scoped(Resource::Project, Action::Read),
+                RightTemplate::project_wildcard(Resource::Site, Action::Read),
+            ],
+        );
+
         Self {
             version: crate::SCHEMA_VERSION,
             roles,
@@ -519,13 +662,62 @@ impl AuthzPolicy {
     pub fn role_takes_target(&self, role: &str) -> bool {
         self.roles
             .get(role)
-            .is_some_and(|ts| ts.iter().any(|t| t.scope == TargetScope::RoleTarget))
+            .is_some_and(|ts| ts.iter().any(|t| t.scope.is_targeted()))
+    }
+
+    /// What kind of target a role's grant carries: a per-site `"<project>/<site>"`
+    /// ([`TargetKind::Site`], a role with a Site `RoleTarget` template) or a bare
+    /// `"<project>"` ([`TargetKind::Project`], a role with a `ProjectWildcard` or a
+    /// non-Site `RoleTarget` template). `None` for a global role. Used to normalize a
+    /// legacy site-only grant to the `default` project ([`normalize_grants`]).
+    ///
+    /// [`normalize_grants`]: Self::normalize_grants
+    pub fn role_target_kind(&self, role: &str) -> Option<TargetKind> {
+        let templates = self.roles.get(role)?;
+        let mut site = false;
+        let mut project = false;
+        for t in templates {
+            match t.scope {
+                TargetScope::RoleTarget if t.resource == Resource::Site => site = true,
+                TargetScope::RoleTarget => project = true,
+                TargetScope::ProjectWildcard => project = true,
+                TargetScope::AnyTarget => {}
+            }
+        }
+        // A Site `RoleTarget` role is per-site; a project role (ProjectWildcard, or a
+        // `RoleTarget` on the Project resource) is per-project.
+        if site {
+            Some(TargetKind::Site)
+        } else if project {
+            Some(TargetKind::Project)
+        } else {
+            None
+        }
+    }
+
+    /// Normalize legacy grants for 0.2.0: a **site** role granted a bare target with
+    /// no project segment (a pre-project token, e.g. `publisher:blog`) is read as the
+    /// `default` project (`publisher:default/blog`). Project and global roles, and any
+    /// already-qualified `"<project>/<site>"` target, pass through unchanged. Run once
+    /// at token→roles ingestion, before either [`rights_for`](Self::rights_for) or the
+    /// Cedar authorizer, so both decide on the same normalized grants.
+    pub fn normalize_grants(&self, roles: &[GrantedRole]) -> Vec<GrantedRole> {
+        roles
+            .iter()
+            .map(|g| match (&g.target, self.role_target_kind(&g.name)) {
+                (Some(t), Some(TargetKind::Site)) if !t.contains('/') => {
+                    GrantedRole::scoped(&g.name, format!("{}/{t}", crate::project::DEFAULT_PROJECT))
+                }
+                _ => g.clone(),
+            })
+            .collect()
     }
 
     /// Expand a principal's granted roles into the concrete [`RightSet`] they
     /// confer under this policy. A target-scoped template on a role granted
     /// without a target contributes nothing (defensive). This is the pure RBAC
-    /// expansion the Cedar authorizer reproduces as a policy set.
+    /// expansion the Cedar authorizer reproduces as a policy set. Callers pass
+    /// grants already normalized by [`normalize_grants`](Self::normalize_grants).
     pub fn rights_for(&self, roles: &[GrantedRole]) -> RightSet {
         let mut set = RightSet::new();
         for granted in roles {
@@ -537,6 +729,12 @@ impl AuthzPolicy {
                     TargetScope::AnyTarget => None,
                     TargetScope::RoleTarget => match &granted.target {
                         Some(x) => Some(x.clone()),
+                        None => continue,
+                    },
+                    // A project role's per-site right covers every site in its
+                    // project: expand the bare project target to `"<project>/*"`.
+                    TargetScope::ProjectWildcard => match &granted.target {
+                        Some(x) => Some(format!("{x}/*")),
                         None => continue,
                     },
                 };
@@ -701,7 +899,7 @@ mod tests {
                 "/api/sites/blog/deployments",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Deploy,
                 )),
             ),
@@ -710,7 +908,7 @@ mod tests {
                 "/api/sites/blog/deployments",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -719,7 +917,7 @@ mod tests {
                 "/api/sites/blog/deployments/d1",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -728,7 +926,7 @@ mod tests {
                 "/api/sites/blog/deployments/d1/activate",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Deploy,
                 )),
             ),
@@ -737,7 +935,7 @@ mod tests {
                 "/api/sites/blog/current",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -746,7 +944,7 @@ mod tests {
                 "/api/sites/blog/config",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -755,7 +953,7 @@ mod tests {
                 "/api/sites/blog/config",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Write,
                 )),
             ),
@@ -764,7 +962,7 @@ mod tests {
                 "/api/sites/blog/domains/x.example.com/verification",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -773,7 +971,7 @@ mod tests {
                 "/api/sites/blog/domains/x.example.com/verification",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Write,
                 )),
             ),
@@ -782,7 +980,7 @@ mod tests {
                 "/api/sites/blog/domains/x.example.com/verification",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Write,
                 )),
             ),
@@ -791,7 +989,7 @@ mod tests {
                 "/api/sites/blog/domains/x.example.com/verification/check",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -800,7 +998,7 @@ mod tests {
                 "/api/sites/blog/domain-verifications",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -809,7 +1007,7 @@ mod tests {
                 "/api/sites/blog/aliases/www",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Write,
                 )),
             ),
@@ -818,7 +1016,7 @@ mod tests {
                 "/api/sites/blog/aliases",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -827,7 +1025,7 @@ mod tests {
                 "/api/sites/blog/_boatramp/handlers",
                 Some(Right::new(
                     Resource::Site,
-                    Some("blog".into()),
+                    Some("default/blog".into()),
                     Action::Read,
                 )),
             ),
@@ -1004,5 +1202,175 @@ mod tests {
         let policy = AuthzPolicy::default_policy();
         let rights = policy.rights_for(&[GrantedRole::global("nonesuch")]);
         assert!(rights.is_empty());
+    }
+
+    // ---- 0.2.0 project scoping ---------------------------------------------
+
+    #[test]
+    fn legacy_site_grant_normalizes_to_default_project() {
+        let policy = AuthzPolicy::default_policy();
+        // A pre-project token `publisher:blog` reads as the default project.
+        let n = policy.normalize_grants(&[GrantedRole::scoped("publisher", "blog")]);
+        assert_eq!(n, vec![GrantedRole::scoped("publisher", "default/blog")]);
+        // An already-qualified site grant, a project grant, and a global grant pass
+        // through untouched (a project name must NOT gain a `default/` prefix).
+        let untouched = [
+            GrantedRole::scoped("publisher", "acme/blog"),
+            GrantedRole::scoped("project_admin", "acme"),
+            GrantedRole::global("admin"),
+        ];
+        assert_eq!(policy.normalize_grants(&untouched), untouched);
+    }
+
+    #[test]
+    fn project_admin_covers_its_project_but_not_another() {
+        let policy = AuthzPolicy::default_policy();
+        let rights = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        // Every site in acme, at every action.
+        for action in [Action::Read, Action::Write, Action::Deploy, Action::Admin] {
+            assert!(
+                rights.allows(&Right::new(
+                    Resource::Site,
+                    Some("acme/blog".into()),
+                    action
+                )),
+                "project-admin:acme covers acme/blog·{action:?}"
+            );
+        }
+        // The project's own resources (functions/compute via Project).
+        assert!(rights.allows(&Right::new(
+            Resource::Project,
+            Some("acme".into()),
+            Action::Deploy
+        )));
+        assert!(rights.allows(&Right::new(
+            Resource::Project,
+            Some("acme".into()),
+            Action::Admin
+        )));
+        // But NOT another project's sites or project resource — the tenant boundary.
+        assert!(!rights.allows(&Right::new(
+            Resource::Site,
+            Some("shop/blog".into()),
+            Action::Read
+        )));
+        assert!(!rights.allows(&Right::new(
+            Resource::Project,
+            Some("shop".into()),
+            Action::Read
+        )));
+        // A bare/global site target is not covered by a project-scoped grant.
+        assert!(!rights.allows(&Right::new(
+            Resource::Site,
+            Some("blog".into()),
+            Action::Read
+        )));
+    }
+
+    #[test]
+    fn project_viewer_is_read_only_across_the_project() {
+        let policy = AuthzPolicy::default_policy();
+        let rights = policy.rights_for(&[GrantedRole::scoped("project_viewer", "acme")]);
+        assert!(rights.allows(&Right::new(
+            Resource::Site,
+            Some("acme/blog".into()),
+            Action::Read
+        )));
+        assert!(rights.allows(&Right::new(
+            Resource::Project,
+            Some("acme".into()),
+            Action::Read
+        )));
+        // No writes/deploys anywhere.
+        assert!(!rights.allows(&Right::new(
+            Resource::Site,
+            Some("acme/blog".into()),
+            Action::Write
+        )));
+        assert!(!rights.allows(&Right::new(
+            Resource::Project,
+            Some("acme".into()),
+            Action::Deploy
+        )));
+    }
+
+    #[test]
+    fn project_publisher_ships_but_cannot_admin_the_project() {
+        let policy = AuthzPolicy::default_policy();
+        let rights = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        assert!(rights.allows(&Right::new(
+            Resource::Site,
+            Some("acme/blog".into()),
+            Action::Deploy
+        )));
+        assert!(rights.allows(&Right::new(
+            Resource::Project,
+            Some("acme".into()),
+            Action::Deploy
+        )));
+        assert!(rights.allows(&Right::new(Resource::Blobs, None, Action::Deploy)));
+        // Admin of the project entity (membership/roles) is reserved for project-admin.
+        assert!(!rights.allows(&Right::new(
+            Resource::Project,
+            Some("acme".into()),
+            Action::Admin
+        )));
+    }
+
+    #[test]
+    fn required_maps_project_paths() {
+        // A site within a project.
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/sites/blog/deployments"),
+            Some(Right::new(
+                Resource::Site,
+                Some("acme/blog".into()),
+                Action::Deploy
+            ))
+        );
+        // A project-owned resource (a function): read vs mutate.
+        assert_eq!(
+            Right::required("GET", "/api/projects/acme/functions/resize"),
+            Some(Right::new(
+                Resource::Project,
+                Some("acme".into()),
+                Action::Read
+            ))
+        );
+        assert_eq!(
+            Right::required("POST", "/api/projects/acme/functions/resize/versions"),
+            Some(Right::new(
+                Resource::Project,
+                Some("acme".into()),
+                Action::Deploy
+            ))
+        );
+        // The project entity itself.
+        assert_eq!(
+            Right::required("DELETE", "/api/projects/acme"),
+            Some(Right::new(
+                Resource::Project,
+                Some("acme".into()),
+                Action::Admin
+            ))
+        );
+        // Listing/creating projects is node-level.
+        assert_eq!(
+            Right::required("GET", "/api/projects"),
+            Some(Right::new(Resource::System, None, Action::Read))
+        );
+        assert_eq!(
+            Right::required("POST", "/api/projects"),
+            Some(Right::new(Resource::System, None, Action::Admin))
+        );
+        // Legacy top-level functions map to the default project now.
+        assert_eq!(
+            Right::required("GET", "/api/functions"),
+            Some(Right::new(
+                Resource::Project,
+                Some("default".into()),
+                Action::Read
+            ))
+        );
     }
 }
