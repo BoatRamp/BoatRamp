@@ -129,7 +129,9 @@ pub struct ComputeSpec {
     /// [`RootSource`]).
     pub root: RootSource,
     /// Blob hash of the `vmlinux` kernel (shared across workloads). Applies only to
-    /// the micro-VM substrate (a [`RootSource::Rootfs`] source); ignored otherwise.
+    /// the micro-VM substrate (a [`RootSource::Rootfs`] source); ignored otherwise, so
+    /// an image/tar workload omits it (empty ⇒ absent from the wire + the content hash).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kernel: String,
     /// Kernel boot cmdline override; `None` uses the executor default.
     #[serde(default, skip_serializing_if = "Option::is_none")]

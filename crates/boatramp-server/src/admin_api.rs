@@ -419,18 +419,26 @@ pub(super) async fn put_compute(
     Path(name): Path<String>,
     Json(mut request): Json<PutComputeRequest>,
 ) -> Response {
-    // A workload that omits its kernel uses the node's fleet **default kernel**
-    // (from dynamic daemon config). Substituted at set time; the kernel is
-    // verified against the posture bar at boot. No kernel and no default ⇒ a clear
+    // A kernel applies only to the micro-VM source (`RootSource::Rootfs` boots
+    // `vmlinux` + a rootfs image). For an OCI image (docker/cloudflare) or a tar
+    // rootfs (native container) the kernel is ignored, so we neither require nor
+    // substitute one — leaving it empty keeps the stored spec (and its content hash)
+    // honest. A micro-VM workload that omits its kernel uses the node's fleet
+    // **default kernel** (from dynamic daemon config), substituted at set time and
+    // verified against the posture bar at boot; no kernel and no default ⇒ a clear
     // error rather than a cryptic backend failure.
-    if request.spec.kernel.is_empty() {
+    if matches!(
+        request.spec.root,
+        boatramp_core::compute::RootSource::Rootfs(_)
+    ) && request.spec.kernel.is_empty()
+    {
         match daemon.effective().default_kernel.as_ref() {
             Some(k) => request.spec.kernel = k.source.clone(),
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    "workload has no kernel and no default kernel is configured; set one \
-                     with `boatramp config set compute.default_kernel …`\n",
+                    "micro-VM workload has no kernel and no default kernel is configured; set \
+                     one with `boatramp config set compute.default_kernel …`\n",
                 )
                     .into_response()
             }

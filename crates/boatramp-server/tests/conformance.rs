@@ -1379,6 +1379,43 @@ async fn compute_api_crud() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// A kernel is required only for the micro-VM (`RootSource::Rootfs`) source. An OCI
+/// image (docker/cloudflare) or a tar rootfs (native container) needs none, so a
+/// kernel-less `--image` workload must be accepted; a kernel-less micro-VM workload
+/// with no configured default kernel must still be refused.
+#[tokio::test]
+async fn put_compute_kernel_only_required_for_microvm() {
+    let deploy = seed().await;
+    let (auth, admin) = token_auth(&[GrantedRole::global("admin")]).await;
+
+    // An image source with no kernel is accepted (previously 400'd on the kernel gate).
+    let img = serde_json::json!({
+        "spec": { "root": { "image": "alpine:3.20" }, "vcpus": 1, "mem_mib": 64, "port": 0 },
+        "replicas": 1
+    });
+    let put = with_bearer(json_request("PUT", "/api/compute/img", &img), &admin);
+    let (status, _, body) = send_as(&deploy, auth.clone(), put, [127, 0, 0, 1]).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "image workload without a kernel must be accepted: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // A micro-VM (rootfs) source with no kernel and no configured default is refused.
+    let vm = serde_json::json!({
+        "spec": { "root": { "rootfs": "a".repeat(64) }, "vcpus": 1, "mem_mib": 64, "port": 0 },
+        "replicas": 1
+    });
+    let put = with_bearer(json_request("PUT", "/api/compute/vm", &vm), &admin);
+    let (status, _, _) = send_as(&deploy, auth, put, [127, 0, 0, 1]).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "micro-VM workload without a kernel or default must be refused"
+    );
+}
+
 #[tokio::test]
 async fn access_control_basic_auth_and_ip() {
     let deploy = seed().await;
