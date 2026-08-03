@@ -631,6 +631,8 @@ pub struct PublishConfig {
     pub site: Option<String>,
     /// API token for the control plane (or set `BOATRAMP_TOKEN`).
     pub token: Option<String>,
+    /// Project this site belongs to (overrides with `--project` / `BOATRAMP_PROJECT`).
+    pub project: Option<String>,
 }
 
 /// `build` section.

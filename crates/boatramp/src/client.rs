@@ -240,6 +240,17 @@ impl PopSigner {
     }
 }
 
+/// Resolve the target project: `[publish].project` in config (which `main` has already
+/// overlaid with `--project` / `BOATRAMP_PROJECT`), else the `default` project.
+pub fn resolve_project(config: &ProjectConfig) -> String {
+    config
+        .publish
+        .project
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| boatramp_core::project::DEFAULT_PROJECT.to_string())
+}
+
 /// Resolve the server base URL from a flag, falling back to config.
 pub fn resolve_server(server: Option<String>, config: &ProjectConfig) -> Result<String> {
     let server = server
@@ -335,22 +346,39 @@ fn sanitize(url: &str) -> String {
 pub struct ControlPlane {
     http: ApiClient,
     base: String,
+    project: String,
 }
 
 impl ControlPlane {
     /// Wrap an already-built client and resolved server base.
-    pub fn new(base: String, http: ApiClient) -> Self {
-        Self { http, base }
+    pub fn new(base: String, http: ApiClient, project: String) -> Self {
+        Self {
+            http,
+            base,
+            project,
+        }
+    }
+
+    /// The site-collection URL segment: `sites` for the default project (byte-identical
+    /// legacy `/api/sites/...`), else `projects/<proj>/sites` for a named project.
+    fn sites_seg(&self) -> String {
+        if self.project == boatramp_core::project::DEFAULT_PROJECT {
+            "sites".to_string()
+        } else {
+            format!("projects/{}/sites", self.project)
+        }
     }
 
     /// Fetch the manifest for a specific deployment id.
     pub async fn fetch_manifest(&self, site: &str, id: &str) -> Result<Manifest> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
-            .get(format!("{server}/api/sites/{site}/deployments/{id}"))
+            .get(format!("{server}/api/{seg}/{site}/deployments/{id}"))
             .send()
             .await?
             .error_for_status()?
@@ -360,12 +388,14 @@ impl ControlPlane {
 
     /// Fetch a site's deployment list (current + history).
     pub async fn fetch_deployments(&self, site: &str) -> Result<DeploymentList> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
-            .get(format!("{server}/api/sites/{site}/deployments"))
+            .get(format!("{server}/api/{seg}/{site}/deployments"))
             .send()
             .await?
             .error_for_status()?
@@ -375,12 +405,14 @@ impl ControlPlane {
 
     /// Fetch a site's config (server returns defaults if unset).
     pub async fn fetch_site_config(&self, site: &str) -> Result<SiteConfig> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
-            .get(format!("{server}/api/sites/{site}/config"))
+            .get(format!("{server}/api/{seg}/{site}/config"))
             .send()
             .await?
             .error_for_status()?
@@ -390,12 +422,14 @@ impl ControlPlane {
 
     /// Replace a site's config.
     pub async fn put_site_config(&self, site: &str, config: &SiteConfig) -> Result<()> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         client
-            .put(format!("{server}/api/sites/{site}/config"))
+            .put(format!("{server}/api/{seg}/{site}/config"))
             .json(config)
             .send()
             .await?
@@ -410,12 +444,14 @@ impl ControlPlane {
         host: &str,
         method: Option<&str>,
     ) -> Result<DomainVerification> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         let mut url = format!(
-            "{server}/api/sites/{site}/domains/{}/verification",
+            "{server}/api/{seg}/{site}/domains/{}/verification",
             host_segment(host)
         );
         if let Some(method) = method {
@@ -432,13 +468,15 @@ impl ControlPlane {
 
     /// Run the ownership check for a host; on success the server attaches it.
     pub async fn check_domain_verification(&self, site: &str, host: &str) -> Result<CheckResult> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
             .post(format!(
-                "{server}/api/sites/{site}/domains/{}/verification/check",
+                "{server}/api/{seg}/{site}/domains/{}/verification/check",
                 host_segment(host)
             ))
             .send()
@@ -452,13 +490,15 @@ impl ControlPlane {
     /// (`domain add --unverified`). Returns the server's confirmation text. The
     /// server gates this route at `system·admin`, so a site-scoped token gets a 403.
     pub async fn attach_domain_unverified(&self, site: &str, host: &str) -> Result<String> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
             .post(format!(
-                "{server}/api/sites/{site}/domains/{}/attach-unverified",
+                "{server}/api/{seg}/{site}/domains/{}/attach-unverified",
                 host_segment(host)
             ))
             .send()
@@ -470,13 +510,15 @@ impl ControlPlane {
 
     /// Drop a host's ownership challenge (when detaching the host).
     pub async fn remove_domain_verification(&self, site: &str, host: &str) -> Result<()> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         client
             .delete(format!(
-                "{server}/api/sites/{site}/domains/{}/verification",
+                "{server}/api/{seg}/{site}/domains/{}/verification",
                 host_segment(host)
             ))
             .send()
@@ -487,12 +529,14 @@ impl ControlPlane {
 
     /// List all ownership challenges for a site (pending and verified).
     pub async fn list_domain_verifications(&self, site: &str) -> Result<Vec<DomainVerification>> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
-            .get(format!("{server}/api/sites/{site}/domain-verifications"))
+            .get(format!("{server}/api/{seg}/{site}/domain-verifications"))
             .send()
             .await?
             .error_for_status()?
@@ -502,13 +546,15 @@ impl ControlPlane {
 
     /// Activate a deployment id for a site (the atomic switch / rollback).
     pub async fn activate(&self, site: &str, id: &str) -> Result<()> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         client
             .post(format!(
-                "{server}/api/sites/{site}/deployments/{id}/activate"
+                "{server}/api/{seg}/{site}/deployments/{id}/activate"
             ))
             .send()
             .await?
@@ -518,16 +564,18 @@ impl ControlPlane {
 
     /// Point a named alias at a deployment id.
     pub async fn set_alias(&self, site: &str, name: &str, id: &str) -> Result<()> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         #[derive(Serialize)]
         struct SetAlias<'a> {
             id: &'a str,
         }
         client
-            .put(format!("{server}/api/sites/{site}/aliases/{name}"))
+            .put(format!("{server}/api/{seg}/{site}/aliases/{name}"))
             .json(&SetAlias { id })
             .send()
             .await?
@@ -537,12 +585,14 @@ impl ControlPlane {
 
     /// List a site's named aliases (`name → deployment id`).
     pub async fn list_aliases(&self, site: &str) -> Result<BTreeMap<String, String>> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
-            .get(format!("{server}/api/sites/{site}/aliases"))
+            .get(format!("{server}/api/{seg}/{site}/aliases"))
             .send()
             .await?
             .error_for_status()?
@@ -552,12 +602,14 @@ impl ControlPlane {
 
     /// Remove a named alias.
     pub async fn remove_alias(&self, site: &str, name: &str) -> Result<()> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         client
-            .delete(format!("{server}/api/sites/{site}/aliases/{name}"))
+            .delete(format!("{server}/api/{seg}/{site}/aliases/{name}"))
             .send()
             .await?
             .error_for_status()?;
@@ -573,12 +625,14 @@ impl ControlPlane {
         after: u64,
         stream: Option<&str>,
     ) -> Result<LogsResponse> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         let mut url =
-            format!("{server}/api/sites/{site}/_boatramp/logs?limit={limit}&after={after}");
+            format!("{server}/api/{seg}/{site}/_boatramp/logs?limit={limit}&after={after}");
         if let Some(stream) = stream {
             url.push_str("&stream=");
             url.push_str(stream);
@@ -595,12 +649,14 @@ impl ControlPlane {
     /// Fetch a site's operator handler stats (raw JSON: handler invocation counters,
     /// consumer backlog/dead-letters, live stream connections).
     pub async fn fetch_handler_stats(&self, site: &str) -> Result<serde_json::Value> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
-            .get(format!("{server}/api/sites/{site}/_boatramp/handlers"))
+            .get(format!("{server}/api/{seg}/{site}/_boatramp/handlers"))
             .send()
             .await?
             .error_for_status()?
@@ -618,9 +674,11 @@ impl ControlPlane {
         alias: Option<&str>,
         action: &str,
     ) -> Result<usize> {
+        let seg = self.sites_seg();
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         #[derive(Serialize)]
         struct Request<'a> {
@@ -634,7 +692,7 @@ impl ControlPlane {
             affected: usize,
         }
         let resp: DlqResponse = client
-            .post(format!("{server}/api/sites/{site}/_boatramp/dlq"))
+            .post(format!("{server}/api/{seg}/{site}/_boatramp/dlq"))
             .json(&Request {
                 topic,
                 alias,
@@ -651,7 +709,9 @@ impl ControlPlane {
     /// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).
     /// Idempotent: re-uploading an existing blob is a no-op server-side.
     pub async fn upload_blob(&self, hash: &str, path: &std::path::Path) -> Result<()> {
-        let Self { http, base: server } = self;
+        let Self {
+            http, base: server, ..
+        } = self;
         let file = tokio::fs::File::open(path).await?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
         http.put(format!("{server}/api/blobs/{hash}"))
@@ -703,6 +763,7 @@ impl ControlPlane {
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
             .get(format!("{server}/api/projects"))
@@ -718,6 +779,7 @@ impl ControlPlane {
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
             .post(format!("{server}/api/projects"))
@@ -734,6 +796,7 @@ impl ControlPlane {
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         Ok(client
             .get(format!("{server}/api/projects/{name}"))
@@ -750,6 +813,7 @@ impl ControlPlane {
         let Self {
             http: client,
             base: server,
+            ..
         } = self;
         client
             .delete(format!("{server}/api/projects/{name}"))
@@ -781,6 +845,44 @@ mod tests {
         assert!(!is_blob_hash("./vmlinux"));
         assert!(!is_blob_hash("https://example.com/vmlinux"));
         assert!(!is_blob_hash(&"g".repeat(64)), "g is not a hex digit");
+    }
+
+    #[test]
+    fn sites_seg_is_legacy_for_default_project() {
+        let cp = |project: &str| {
+            ControlPlane::new(
+                "https://cp.example".into(),
+                build_client(None, None, None, None),
+                project.into(),
+            )
+        };
+        // Default project keeps the byte-identical legacy `sites` segment.
+        assert_eq!(
+            cp(boatramp_core::project::DEFAULT_PROJECT).sites_seg(),
+            "sites"
+        );
+        // A named project scopes under `projects/<name>/sites`.
+        assert_eq!(cp("acme").sites_seg(), "projects/acme/sites");
+    }
+
+    #[test]
+    fn resolve_project_falls_back_to_default() {
+        use crate::config::ProjectConfig;
+        // No `[publish].project` → the `default` project.
+        let mut config = ProjectConfig::default();
+        assert_eq!(
+            resolve_project(&config),
+            boatramp_core::project::DEFAULT_PROJECT
+        );
+        // An empty string is treated as unset (still `default`).
+        config.publish.project = Some(String::new());
+        assert_eq!(
+            resolve_project(&config),
+            boatramp_core::project::DEFAULT_PROJECT
+        );
+        // A named project wins.
+        config.publish.project = Some("acme".into());
+        assert_eq!(resolve_project(&config), "acme");
     }
 
     #[test]

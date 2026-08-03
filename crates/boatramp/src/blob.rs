@@ -45,6 +45,7 @@ pub async fn run(args: BlobArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
 
     match args.command {

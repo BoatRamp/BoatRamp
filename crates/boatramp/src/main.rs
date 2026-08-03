@@ -78,6 +78,11 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// Target project for site-scoped commands (default `default`;
+    /// falls back to `[publish].project`; env `BOATRAMP_PROJECT`).
+    #[arg(long, global = true, env = "BOATRAMP_PROJECT")]
+    project: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -364,7 +369,12 @@ async fn async_main() -> Result<(), CliError> {
     }
 
     let path = cli.config.unwrap_or_else(|| PathBuf::from("project.cfg"));
-    let config = config::ProjectConfig::load(&path)?;
+    let mut config = config::ProjectConfig::load(&path)?;
+    // The global `--project` / `BOATRAMP_PROJECT` flag wins over `[publish].project`
+    // in the config file; unset leaves the config value (or the `default` project).
+    if let Some(project) = cli.project.clone() {
+        config.publish.project = Some(project);
+    }
 
     // Each arm propagates its module's typed error into `CliError` via `?`; the
     // `#[from]` impls on `CliError` make every command's error a single dispatch.

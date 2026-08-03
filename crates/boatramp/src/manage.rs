@@ -61,6 +61,7 @@ pub async fn list(args: DeploymentsArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
     let list = cp.fetch_deployments(&site).await?;
 
@@ -143,6 +144,7 @@ pub async fn rollback(args: RollbackArgs, config: &ProjectConfig) -> Result<()> 
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
     let list = cp.fetch_deployments(&site).await?;
 
@@ -176,6 +178,7 @@ pub async fn status(args: StatusArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
     let list = cp.fetch_deployments(&site).await?;
 

@@ -66,6 +66,7 @@ pub async fn run(args: DlqArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
 
     let (action, topic, alias) = match &args.command {

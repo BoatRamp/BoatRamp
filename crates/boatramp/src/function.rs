@@ -385,7 +385,11 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             server,
         } => {
             let (server, http) = client::connect(server, config)?;
-            let cp = client::ControlPlane::new(server.clone(), http.clone());
+            let cp = client::ControlPlane::new(
+                server.clone(),
+                http.clone(),
+                client::resolve_project(config),
+            );
             // Upload the component first; the server rejects a deploy whose blob is
             // absent, so this is content-addressed staging, not a second round-trip.
             let hash = cp.put_file_blob(&component).await?;

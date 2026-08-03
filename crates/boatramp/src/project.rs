@@ -66,7 +66,10 @@ enum ProjectCommand {
 /// Entry point for `boatramp project`.
 pub async fn run(args: ProjectArgs, config: &ProjectConfig) -> Result<()> {
     let (server, http) = client::connect(args.server, config)?;
-    let cp = client::ControlPlane::new(server, http);
+    // The `project` subcommand only calls project-collection endpoints (list/create/
+    // get/delete), which are not site-scoped, so the resolved project is inert here —
+    // passed only to satisfy the constructor.
+    let cp = client::ControlPlane::new(server, http, client::resolve_project(config));
 
     match args.command {
         ProjectCommand::Create {

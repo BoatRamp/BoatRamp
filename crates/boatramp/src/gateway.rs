@@ -217,6 +217,7 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
     let mut site_config = cp.fetch_site_config(&site).await?;
     let gateway = site_config

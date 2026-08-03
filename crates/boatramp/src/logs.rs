@@ -50,6 +50,7 @@ pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
     let stream = args.stream.as_deref();
 
@@ -107,6 +108,7 @@ pub async fn stats(args: StatsArgs, config: &ProjectConfig) -> Result<()> {
     let cp = client::ControlPlane::new(
         server,
         client::http_client(client::token(config).as_deref()),
+        client::resolve_project(config),
     );
     let stats = cp.fetch_handler_stats(&site).await?;
     println!("{}", serde_json::to_string_pretty(&stats)?);

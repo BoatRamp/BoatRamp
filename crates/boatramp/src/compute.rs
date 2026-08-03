@@ -229,7 +229,11 @@ struct PutComputeRequest {
 pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
-    let cp = client::ControlPlane::new(server.clone(), http.clone());
+    let cp = client::ControlPlane::new(
+        server.clone(),
+        http.clone(),
+        client::resolve_project(config),
+    );
 
     match args.command {
         ComputeCommand::Ls => {
