@@ -24,7 +24,7 @@ Clone the repository and change into it:
 ```sh
 git clone https://github.com/BoatRamp/BoatRamp.git
 cd BoatRamp
-git checkout v0.1.2   # build a released version; omit to build the development tip (main)
+git checkout v0.2.0   # build a released version; omit to build the development tip (main)
 ```
 
 ## Build the default binary
@@ -74,7 +74,7 @@ nix build
 ```
 
 ```text
-/nix/store/…-boatramp-0.1.2
+/nix/store/…-boatramp-0.2.0
 ```
 
 The result is symlinked at `result/bin/boatramp`. Enter the dev shell with
@@ -88,7 +88,7 @@ The result is symlinked at `result/bin/boatramp`. Enter the dev shell with
 ```
 
 ```text
-boatramp 0.1.2
+boatramp 0.2.0
 ```
 
 ## See also

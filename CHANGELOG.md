@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.0]
+
+### Added
+- **Function-to-function invoke for site handlers (mesh orchestrator).** A site
+  handler (a `routing.handlers` route) reached over HTTP with the end user's bearer
+  can now call sibling functions **in-process** via the `invoke` capability, exactly
+  like a top-level function. `HandlerConfig` gains `invoke_targets` (the same
+  deny-by-default, `*`-wildcard allowlist as `FunctionConfig.invoke_targets`), and
+  `invoke` is a recognized handler import — gated by the site's `allow_imports`, the
+  handler's `imports`, and a non-empty `invoke_targets`. The callee is quota-admitted
+  and depth-capped as on the top-level path, and the caller's `Authorization` is
+  forwarded to the callee unchanged.
+
+### Changed
+- **BREAKING (compute): the root-filesystem source is a typed `RootSource`.**
+  `ComputeSpec.rootfs` was one overloaded string that meant a different thing per
+  backend — an OCI image reference (docker/cloudflare), a tar rootfs archive (native
+  container), or a rootfs filesystem image (firecracker micro-VM). It is now
+  `root: RootSource { Image | Tar | Rootfs }`, one variant per artifact form, matched
+  1:1 to the backends that accept it (a mismatch is a typed error, not a silent
+  runtime failure). `boatramp compute set` now takes exactly one of `--image`,
+  `--tar`, or `--rootfs` (previously a file-only `--rootfs` that could not carry an
+  image reference and hard-coded ext4).
+  **Migration:** re-declare compute workloads with the source flag that matches the
+  target substrate — `--image <ref>` for docker/cloudflare, `--tar <artifact>` for the
+  native container runtime, `--rootfs <artifact>` for the micro-VM. Stored
+  `ComputeSpec` JSON changes shape (`"rootfs": "…"` → `"root": {"image"|"tar"|"rootfs": "…"}`).
+
+[0.2.0]: https://github.com/BoatRamp/BoatRamp/releases/tag/v0.2.0
+
 ## [0.1.2]
 
 ### Changed
