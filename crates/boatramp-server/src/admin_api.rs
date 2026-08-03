@@ -6,7 +6,6 @@
 //! `use super::*`.
 
 use super::*;
-use boatramp_core::project::ProjectRef;
 
 #[derive(Serialize)]
 struct CreateDeploymentResponse {
@@ -123,13 +122,14 @@ pub(super) async fn put_blob(
 pub(super) async fn activate_deployment(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((site, id)): Path<(String, String)>,
 ) -> Response {
     // Activation compile-gate: a deploy whose handlers the
     // site can't satisfy, or whose components don't compile, must not flip.
     match deploy.get_manifest(&id).await {
         Ok(Some(manifest)) => {
-            let site_config = match deploy.get_site_config(ProjectRef::DEFAULT, &site).await {
+            let site_config = match deploy.get_site_config(project.as_ref(), &site).await {
                 Ok(config) => config,
                 Err(err) => return deploy_error_response(err),
             };
@@ -145,7 +145,7 @@ pub(super) async fn activate_deployment(
         Ok(None) => {}
         Err(err) => return deploy_error_response(err),
     }
-    match deploy.activate(ProjectRef::DEFAULT, &site, &id).await {
+    match deploy.activate(project.as_ref(), &site, &id).await {
         Ok(()) => {
             srvmetrics::server_metrics().record_activation();
             StatusCode::NO_CONTENT.into_response()
@@ -162,9 +162,10 @@ struct CurrentResponse {
 
 pub(super) async fn current_deployment(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.current_id(ProjectRef::DEFAULT, &site).await {
+    match deploy.current_id(project.as_ref(), &site).await {
         Ok(deployment) => Json(CurrentResponse { site, deployment }).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -173,9 +174,10 @@ pub(super) async fn current_deployment(
 /// List a site's deployment history (most recent first), with the current id.
 pub(super) async fn list_deployments(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.deployments(ProjectRef::DEFAULT, &site).await {
+    match deploy.deployments(project.as_ref(), &site).await {
         Ok(list) => Json(list).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -184,8 +186,11 @@ pub(super) async fn list_deployments(
 /// Get a site's [`SiteConfig`] (defaults if unset).
 /// `GET /api/sites` — every known site name (admin-scoped). Backs the web UI /
 /// tooling site navigation.
-pub(super) async fn list_sites(State(deploy): State<DeployStore>) -> Response {
-    match deploy.all_sites(ProjectRef::DEFAULT).await {
+pub(super) async fn list_sites(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    match deploy.all_sites(project.as_ref()).await {
         Ok(sites) => Json(sites).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -193,9 +198,10 @@ pub(super) async fn list_sites(State(deploy): State<DeployStore>) -> Response {
 
 pub(super) async fn get_site_config(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.get_site_config(ProjectRef::DEFAULT, &site).await {
+    match deploy.get_site_config(project.as_ref(), &site).await {
         Ok(config) => Json(config.unwrap_or_default()).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -207,9 +213,10 @@ pub(super) async fn get_site_config(
 /// shared and left to `prune`. Idempotent.
 pub(super) async fn delete_site(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.delete_site(ProjectRef::DEFAULT, &site).await {
+    match deploy.delete_site(project.as_ref(), &site).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -232,10 +239,11 @@ fn canon_domain_entry(host: &str) -> String {
 /// config edits (which read-modify-write the current config) are unaffected.
 pub(super) async fn put_site_config(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(site): Path<String>,
     Json(config): Json<SiteConfig>,
 ) -> Response {
-    let current = match deploy.get_site_config(ProjectRef::DEFAULT, &site).await {
+    let current = match deploy.get_site_config(project.as_ref(), &site).await {
         Ok(c) => c.unwrap_or_default(),
         Err(err) => return deploy_error_response(err),
     };
@@ -271,7 +279,7 @@ pub(super) async fn put_site_config(
     for host in added {
         let verification = match deploy
             .get_domain_verification(
-                ProjectRef::DEFAULT,
+                project.as_ref(),
                 &boatramp_core::site::SiteName::new(site.as_str()),
                 &host,
             )
@@ -303,7 +311,7 @@ pub(super) async fn put_site_config(
         }
     }
     match deploy
-        .set_site_config(ProjectRef::DEFAULT, &site, &config)
+        .set_site_config(project.as_ref(), &site, &config)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -374,8 +382,11 @@ pub(super) async fn rollback_daemon_config(
 }
 
 /// List all compute workloads.
-pub(super) async fn list_compute(State(deploy): State<DeployStore>) -> Response {
-    match deploy.list_compute_workloads(ProjectRef::DEFAULT).await {
+pub(super) async fn list_compute(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    match deploy.list_compute_workloads(project.as_ref()).await {
         Ok(mut workloads) => {
             workloads.sort_by(|a, b| a.name.cmp(&b.name));
             Json(workloads).into_response()
@@ -387,12 +398,10 @@ pub(super) async fn list_compute(State(deploy): State<DeployStore>) -> Response 
 /// Get one workload's desired state.
 pub(super) async fn get_compute(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy
-        .get_compute_workload(ProjectRef::DEFAULT, &name)
-        .await
-    {
+    match deploy.get_compute_workload(project.as_ref(), &name).await {
         Ok(Some(workload)) => Json(workload).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such workload\n").into_response(),
         Err(err) => deploy_error_response(err),
@@ -427,6 +436,7 @@ struct PutComputeResponse {
 pub(super) async fn put_compute(
     State(deploy): State<DeployStore>,
     Extension(daemon): Extension<Arc<DaemonRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     Json(mut request): Json<PutComputeRequest>,
 ) -> Response {
@@ -467,7 +477,7 @@ pub(super) async fn put_compute(
         placement: request.placement,
     };
     match deploy
-        .set_compute_workload(ProjectRef::DEFAULT, &workload)
+        .set_compute_workload(project.as_ref(), &workload)
         .await
     {
         Ok(()) => (
@@ -482,10 +492,11 @@ pub(super) async fn put_compute(
 /// Delete a workload (the scheduler then stops its replicas).
 pub(super) async fn delete_compute(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
     match deploy
-        .delete_compute_workload(ProjectRef::DEFAULT, &name)
+        .delete_compute_workload(project.as_ref(), &name)
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -576,11 +587,12 @@ pub(super) struct SetAliasRequest {
 /// Point a named alias at a deployment id.
 pub(super) async fn set_alias(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((site, name)): Path<(String, String)>,
     Json(request): Json<SetAliasRequest>,
 ) -> Response {
     match deploy
-        .set_alias(ProjectRef::DEFAULT, &site, &name, &request.id)
+        .set_alias(project.as_ref(), &site, &name, &request.id)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -591,9 +603,10 @@ pub(super) async fn set_alias(
 /// List a site's named aliases (`name → deployment id`).
 pub(super) async fn list_aliases(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(site): Path<String>,
 ) -> Response {
-    match deploy.list_aliases(ProjectRef::DEFAULT, &site).await {
+    match deploy.list_aliases(project.as_ref(), &site).await {
         Ok(map) => Json(map).into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -602,9 +615,10 @@ pub(super) async fn list_aliases(
 /// Remove a named alias.
 pub(super) async fn remove_alias(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((site, name)): Path<(String, String)>,
 ) -> Response {
-    match deploy.remove_alias(ProjectRef::DEFAULT, &site, &name).await {
+    match deploy.remove_alias(project.as_ref(), &site, &name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such alias\n").into_response(),
         Err(err) => deploy_error_response(err),

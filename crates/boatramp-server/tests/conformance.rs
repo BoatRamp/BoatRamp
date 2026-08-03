@@ -5928,3 +5928,147 @@ async fn site_handler_invoke_withheld_by_site() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
     assert!(body.contains("capability not granted"), "body: {body}");
 }
+
+// ---- 0.2.0 project-scoped API ---------------------------------------------
+
+/// A `/api/projects/<proj>/…` request operates on that project's data, and the
+/// legacy `/api/sites/<site>/…` route stays scoped to the `default` project — the
+/// tenant boundary is enforced end-to-end through the `project_scope` rewrite +
+/// `ProjectContext` threading, not just in the store.
+#[tokio::test]
+async fn project_route_scopes_resources_and_isolates_the_default_project() {
+    use boatramp_core::project::ProjectRef;
+    let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+
+    // Create the project.
+    let (status, _, _) = send(
+        &deploy,
+        json_request(
+            "POST",
+            "/api/projects",
+            &serde_json::json!({"name": "acme"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _, body) = send(&deploy, get("/api/projects")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("\"acme\""));
+
+    // PUT a site config under the project, via `/api/projects/acme/sites/blog/config`.
+    // A distinctive non-domain field (a CSP header) so the round-trip is observable
+    // without tripping the (correct) unverified-domain gate on a `domains` change.
+    let cfg = serde_json::to_value(SiteConfig {
+        security: SecurityConfig {
+            csp: Some("acme-policy".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .unwrap();
+    let (status, _, body) = send(
+        &deploy,
+        json_request("PUT", "/api/projects/acme/sites/blog/config", &cfg),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "PUT: {status} — {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // GET it back through the project route: it round-trips (the CSP is set).
+    let (status, _, body) = send(&deploy, get("/api/projects/acme/sites/blog/config")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("acme-policy"),
+        "acme/blog config: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The legacy default-project route sees the DEFAULT (no CSP) — isolation.
+    let (status, _, body) = send(&deploy, get("/api/sites/blog/config")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !String::from_utf8_lossy(&body).contains("acme-policy"),
+        "default project must not see acme's site: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Store-level confirmation: the config lives under acme, not default.
+    assert!(deploy
+        .get_site_config(ProjectRef::new("acme"), "blog")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(deploy
+        .get_site_config(ProjectRef::DEFAULT, "blog")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Deleting a non-empty project is refused; deleting the site then the project works.
+    let (status, _, _) = send(
+        &deploy,
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/projects/acme")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, _) = send(
+        &deploy,
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/projects/acme/sites/blog")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(
+        &deploy,
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/projects/acme")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// A `project_admin:acme` token authorizes writes to project `acme` but is refused
+/// (403) on project `shop` — the authz runs on the original project-qualified path.
+#[tokio::test]
+async fn project_admin_token_cannot_cross_projects() {
+    let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+    let (auth, token) = token_auth(&[GrantedRole::scoped("project_admin", "acme")]).await;
+    let cfg = serde_json::to_value(SiteConfig::default()).unwrap();
+
+    // Its own project: allowed (a 2xx, not a 401/403).
+    let req = with_bearer(
+        json_request("PUT", "/api/projects/acme/sites/blog/config", &cfg),
+        &token,
+    );
+    let (status, _, _) = send_as(&deploy, auth.clone(), req, [127, 0, 0, 1]).await;
+    assert!(
+        status.is_success(),
+        "project_admin:acme must write acme; got {status}"
+    );
+
+    // Another project: forbidden.
+    let req = with_bearer(
+        json_request("PUT", "/api/projects/shop/sites/blog/config", &cfg),
+        &token,
+    );
+    let (status, _, _) = send_as(&deploy, auth, req, [127, 0, 0, 1]).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "project_admin:acme must NOT write shop"
+    );
+}

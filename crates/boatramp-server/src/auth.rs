@@ -462,7 +462,14 @@ pub async fn require_auth(State(auth): State<Auth>, request: Request, next: Next
         return (StatusCode::UNAUTHORIZED, "missing bearer token\n").into_response();
     };
     let method = request.method().as_str().to_owned();
-    let path = request.uri().path().to_owned();
+    // Authorize (and PoP-bind) the path the client actually sent: for a project-scoped
+    // request the `project_scope` layer rewrote the URI to its global form but stashed
+    // the original `/api/projects/<proj>/…` path here, so `Right::required` still sees
+    // the project-qualified path and enforces the project-scoped right.
+    let path = match request.extensions().get::<crate::OriginalPath>() {
+        Some(original) => original.0.clone(),
+        None => request.uri().path().to_owned(),
+    };
     let pop_proof = pop_header(&request);
 
     // On a write, bind the request body into the PoP proof: buffer it (up to a

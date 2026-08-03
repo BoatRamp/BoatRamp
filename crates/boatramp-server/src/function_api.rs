@@ -7,7 +7,6 @@
 use super::*;
 
 use boatramp_core::function::FunctionSummary;
-use boatramp_core::project::ProjectRef;
 
 /// `?site=` filter for the functions view.
 #[derive(serde::Deserialize)]
@@ -22,19 +21,20 @@ pub(super) struct FunctionQuery {
 /// `system·read`.
 pub(super) async fn list_functions(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     axum::extract::Query(query): axum::extract::Query<FunctionQuery>,
 ) -> Response {
     use boatramp_core::function;
     let sites = match &query.site {
         Some(s) => vec![s.clone()],
-        None => match deploy.all_sites(ProjectRef::DEFAULT).await {
+        None => match deploy.all_sites(project.as_ref()).await {
             Ok(s) => s,
             Err(err) => return deploy_error_response(err),
         },
     };
     let mut out: Vec<FunctionSummary> = Vec::new();
     for site in sites {
-        let manifest = match deploy.current_manifest(ProjectRef::DEFAULT, &site).await {
+        let manifest = match deploy.current_manifest(project.as_ref(), &site).await {
             Ok(Some(m)) => m,
             Ok(None) => continue,
             Err(err) => return deploy_error_response(err),
@@ -58,7 +58,7 @@ pub(super) async fn list_functions(
     // Top-level (independently-stored) functions — FA-2. A `?site=` filter is
     // site-scoped only, so it excludes these.
     if query.site.is_none() {
-        match deploy.list_stored_functions(ProjectRef::DEFAULT).await {
+        match deploy.list_stored_functions(project.as_ref()).await {
             Ok(stored) => {
                 for f in stored {
                     out.push(FunctionSummary {
@@ -97,6 +97,7 @@ pub(super) struct FunctionUpsert {
 /// `system·admin`.
 pub(super) async fn deploy_function(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     Json(body): Json<FunctionUpsert>,
 ) -> Response {
@@ -113,7 +114,7 @@ pub(super) async fn deploy_function(
         Err(err) => return deploy_error_response(err),
     }
     let now = now_unix();
-    let f = match deploy.get_function(ProjectRef::DEFAULT, &name).await {
+    let f = match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(mut existing)) => {
             existing.config = body.config;
             existing.upsert_version(&body.component, body.lifecycle, now);
@@ -131,7 +132,7 @@ pub(super) async fn deploy_function(
         ),
         Err(err) => return deploy_error_response(err),
     };
-    if let Err(err) = deploy.put_function(ProjectRef::DEFAULT, &f).await {
+    if let Err(err) = deploy.put_function(project.as_ref(), &f).await {
         return deploy_error_response(err);
     }
     Json(f).into_response()
@@ -146,13 +147,14 @@ pub(super) struct RollbackBody {
 /// `POST /api/functions/:name/rollback` (FA-2) — point active at a prior version.
 pub(super) async fn rollback_function(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     Json(body): Json<RollbackBody>,
 ) -> Response {
-    match deploy.get_function(ProjectRef::DEFAULT, &name).await {
+    match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(mut f)) => match f.rollback(&body.to) {
             Ok(()) => {
-                if let Err(err) = deploy.put_function(ProjectRef::DEFAULT, &f).await {
+                if let Err(err) = deploy.put_function(project.as_ref(), &f).await {
                     return deploy_error_response(err);
                 }
                 Json(f).into_response()
@@ -173,13 +175,14 @@ pub(super) struct AliasBody {
 /// `PUT /api/functions/:name/aliases/:label` (FA-2) — point a label at a version.
 pub(super) async fn alias_function(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((name, label)): Path<(String, String)>,
     Json(body): Json<AliasBody>,
 ) -> Response {
-    match deploy.get_function(ProjectRef::DEFAULT, &name).await {
+    match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(mut f)) => match f.set_alias(&label, &body.version) {
             Ok(()) => {
-                if let Err(err) = deploy.put_function(ProjectRef::DEFAULT, &f).await {
+                if let Err(err) = deploy.put_function(project.as_ref(), &f).await {
                     return deploy_error_response(err);
                 }
                 Json(f).into_response()
@@ -195,9 +198,10 @@ pub(super) async fn alias_function(
 /// Content-addressed component blobs are shared and left to `prune`.
 pub(super) async fn remove_function(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.delete_function(ProjectRef::DEFAULT, &name).await {
+    match deploy.delete_function(project.as_ref(), &name).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }

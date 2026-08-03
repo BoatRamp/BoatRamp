@@ -23,6 +23,7 @@ pub(super) struct WorkflowBody {
 #[cfg(feature = "handlers")]
 pub(super) async fn define_workflow(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     Json(body): Json<WorkflowBody>,
 ) -> Response {
@@ -33,7 +34,7 @@ pub(super) async fn define_workflow(
     if let Err(reason) = workflow.validate() {
         return (StatusCode::BAD_REQUEST, format!("{reason}\n")).into_response();
     }
-    if let Err(err) = deploy.put_workflow(ProjectRef::DEFAULT, &workflow).await {
+    if let Err(err) = deploy.put_workflow(project.as_ref(), &workflow).await {
         return deploy_error_response(err);
     }
     Json(workflow).into_response()
@@ -41,8 +42,11 @@ pub(super) async fn define_workflow(
 
 /// `GET /api/workflows` (FA-6) — list workflow definitions. `system·read`.
 #[cfg(feature = "handlers")]
-pub(super) async fn list_workflows_handler(State(deploy): State<DeployStore>) -> Response {
-    match deploy.list_workflows(ProjectRef::DEFAULT).await {
+pub(super) async fn list_workflows_handler(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    match deploy.list_workflows(project.as_ref()).await {
         Ok(mut list) => {
             list.sort_by(|a, b| a.name.cmp(&b.name));
             Json(list).into_response()
@@ -55,9 +59,10 @@ pub(super) async fn list_workflows_handler(State(deploy): State<DeployStore>) ->
 #[cfg(feature = "handlers")]
 pub(super) async fn get_workflow_handler(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.get_workflow(ProjectRef::DEFAULT, &name).await {
+    match deploy.get_workflow(project.as_ref(), &name).await {
         Ok(Some(w)) => Json(w).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response(),
         Err(err) => deploy_error_response(err),
@@ -69,9 +74,10 @@ pub(super) async fn get_workflow_handler(
 #[cfg(feature = "handlers")]
 pub(super) async fn delete_workflow_handler(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.delete_workflow(ProjectRef::DEFAULT, &name).await {
+    match deploy.delete_workflow(project.as_ref(), &name).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -83,10 +89,11 @@ pub(super) async fn delete_workflow_handler(
 #[cfg(feature = "handlers")]
 pub(super) async fn start_workflow_run(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     request: Request,
 ) -> Response {
-    let workflow = match deploy.get_workflow(ProjectRef::DEFAULT, &name).await {
+    let workflow = match deploy.get_workflow(project.as_ref(), &name).await {
         Ok(Some(w)) => w,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no workflow {name:?}\n")).into_response()
@@ -107,7 +114,7 @@ pub(super) async fn start_workflow_run(
     let id = new_invocation_id();
     let input_b64 = (!body.is_empty()).then(|| b64_encode(&body));
     let run = boatramp_core::workflow::WorkflowRun::start(&workflow, id, input_b64, now);
-    if let Err(err) = deploy.put_workflow_run(ProjectRef::DEFAULT, &run).await {
+    if let Err(err) = deploy.put_workflow_run(project.as_ref(), &run).await {
         return deploy_error_response(err);
     }
     (StatusCode::ACCEPTED, Json(run)).into_response()
@@ -118,12 +125,10 @@ pub(super) async fn start_workflow_run(
 #[cfg(feature = "handlers")]
 pub(super) async fn get_workflow_run_handler(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((name, id)): Path<(String, String)>,
 ) -> Response {
-    match deploy
-        .get_workflow_run(ProjectRef::DEFAULT, &name, &id)
-        .await
-    {
+    match deploy.get_workflow_run(project.as_ref(), &name, &id).await {
         Ok(Some(run)) => Json(run).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,

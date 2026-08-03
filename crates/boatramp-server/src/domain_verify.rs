@@ -224,11 +224,12 @@ pub(crate) struct StartQuery {
 /// `GET …/verification` — the current challenge for `(site, host)`, or 404.
 pub(crate) async fn get_domain_verification(
     State(deploy): State<DeployStore>,
+    Extension(project): Extension<crate::ProjectContext>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
     match deploy
         .get_domain_verification(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
         )
@@ -248,11 +249,12 @@ pub(crate) async fn get_domain_verification(
 /// (pending and verified), so the CLI can show in-progress verifications.
 pub(crate) async fn list_domain_verifications(
     State(deploy): State<DeployStore>,
+    Extension(project): Extension<crate::ProjectContext>,
     Path(site): Path<String>,
 ) -> Response {
     match deploy
         .list_domain_verifications(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
         )
         .await
@@ -265,6 +267,7 @@ pub(crate) async fn list_domain_verifications(
 /// `POST …/verification?method=` — start (or return) a challenge.
 pub(crate) async fn start_domain_verification(
     State(deploy): State<DeployStore>,
+    Extension(project): Extension<crate::ProjectContext>,
     Path((site, host)): Path<(String, String)>,
     Query(query): Query<StartQuery>,
 ) -> Response {
@@ -277,7 +280,7 @@ pub(crate) async fn start_domain_verification(
     };
     match deploy
         .start_domain_verification(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
             method,
@@ -298,6 +301,7 @@ pub(crate) async fn start_domain_verification(
 /// publisher cannot reach this route — only an admin can claim an arbitrary host.
 pub(crate) async fn attach_domain_unverified(
     State(deploy): State<DeployStore>,
+    Extension(project): Extension<crate::ProjectContext>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
     // A wildcard needs the DNS method to satisfy `attach_verified_domain`'s
@@ -309,7 +313,7 @@ pub(crate) async fn attach_domain_unverified(
     };
     if let Err(err) = deploy
         .start_domain_verification(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
             method,
@@ -321,7 +325,7 @@ pub(crate) async fn attach_domain_unverified(
     }
     if let Err(err) = deploy
         .mark_domain_verified(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
         )
@@ -331,7 +335,7 @@ pub(crate) async fn attach_domain_unverified(
     }
     match deploy
         .attach_verified_domain(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
         )
@@ -350,11 +354,12 @@ pub(crate) async fn attach_domain_unverified(
 /// host). 204 whether or not one existed.
 pub(crate) async fn remove_domain_verification(
     State(deploy): State<DeployStore>,
+    Extension(project): Extension<crate::ProjectContext>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
     match deploy
         .remove_domain_verification(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
         )
@@ -370,11 +375,12 @@ pub(crate) async fn remove_domain_verification(
 pub(crate) async fn check_domain_verification(
     State(deploy): State<DeployStore>,
     Extension(probe): Extension<Arc<dyn DomainProbe>>,
+    Extension(project): Extension<crate::ProjectContext>,
     Path((site, host)): Path<(String, String)>,
 ) -> Response {
     let verification = match deploy
         .get_domain_verification(
-            ProjectRef::DEFAULT,
+            project.as_ref(),
             &boatramp_core::site::SiteName::new(site.as_str()),
             &host,
         )
@@ -395,7 +401,7 @@ pub(crate) async fn check_domain_verification(
         Ok(true) => {
             let verified = match deploy
                 .mark_domain_verified(
-                    ProjectRef::DEFAULT,
+                    project.as_ref(),
                     &boatramp_core::site::SiteName::new(site.as_str()),
                     &host,
                 )
@@ -406,7 +412,7 @@ pub(crate) async fn check_domain_verification(
             };
             let attached = match deploy
                 .attach_verified_domain(
-                    ProjectRef::DEFAULT,
+                    project.as_ref(),
                     &boatramp_core::site::SiteName::new(site.as_str()),
                     &host,
                 )

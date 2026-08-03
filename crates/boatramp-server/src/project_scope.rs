@@ -1,0 +1,198 @@
+//! Project-scoped request routing (0.2.0): the `/api/projects/<proj>/…` per-resource
+//! surface reuses the existing site/function/compute/workflow handlers by **rewriting**
+//! the path to its unscoped `/api/…` form before routing, while carrying the tenant
+//! project in a request extension the handlers thread into the store.
+//!
+//! ## Security
+//!
+//! The rewrite is the one place a project-scoped URL becomes a global handler URL, so
+//! it is **whitelisted**: only the genuinely project-owned resource families
+//! ([`PROJECT_SCOPED_FAMILIES`] — `sites`, `functions`, `compute`, `workflows`) are
+//! rewritten. A `/api/projects/<proj>/tokens` (or any non-family sub-path) is **not**
+//! rewritten, so it never reaches the global `/api/tokens` handler with mere
+//! project authority — it simply 404s. The project-entity paths (`/api/projects` and
+//! `/api/projects/<proj>`) are their own routes and are never rewritten.
+//!
+//! Authorization is unaffected: [`super::auth::require_auth`] reads the **original**
+//! (pre-rewrite) path from the [`OriginalPath`] extension, so `Right::required` still
+//! sees `/api/projects/<proj>/…` and enforces the project-scoped right — and the DPoP
+//! proof still binds the path the client actually signed.
+
+use axum::extract::Request;
+use axum::http::Uri;
+use axum::middleware::Next;
+use axum::response::Response;
+
+use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
+
+/// The resource families a `/api/projects/<proj>/<family>/…` URL may address — the
+/// only sub-paths the middleware rewrites onto their global `/api/<family>/…`
+/// handlers. Everything else under a project (tokens, authz, daemon, …) is **not**
+/// project-owned and must not be reachable via the project path.
+pub const PROJECT_SCOPED_FAMILIES: &[&str] = &["sites", "functions", "compute", "workflows"];
+
+/// The tenant project a request targets, injected as a request extension by
+/// [`project_scope`]. Handlers read it (defaulting to `default` when absent) and thread
+/// it into their store calls. Cloneable so `Extension<ProjectContext>` works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectContext(pub String);
+
+impl ProjectContext {
+    /// The default-project context (the value for every legacy `/api/…` route).
+    pub fn default_project() -> Self {
+        Self(DEFAULT_PROJECT.to_string())
+    }
+
+    /// A borrowing [`ProjectRef`] for threading into `DeployStore` calls.
+    pub fn as_ref(&self) -> ProjectRef<'_> {
+        ProjectRef::new(&self.0)
+    }
+}
+
+impl Default for ProjectContext {
+    fn default() -> Self {
+        Self::default_project()
+    }
+}
+
+/// The original request path, stashed by [`project_scope`] before a rewrite so the
+/// auth layer authorizes (and PoP-binds) the path the client actually sent.
+#[derive(Debug, Clone)]
+pub struct OriginalPath(pub String);
+
+/// The routing decision for a request path.
+struct Scope {
+    /// The tenant project (`default` for a legacy/unscoped path).
+    project: String,
+    /// The rewritten path, when the URL is a project-scoped per-resource path.
+    rewrite: Option<String>,
+}
+
+/// Classify a request `path`: extract the tenant project and, for a whitelisted
+/// project-scoped resource path, the rewritten unscoped path.
+fn scope_of(path: &str) -> Scope {
+    let Some(rest) = path.strip_prefix("/api/projects/") else {
+        // Not project-scoped (a legacy `/api/…` route, or a non-api path): default.
+        return Scope {
+            project: DEFAULT_PROJECT.to_string(),
+            rewrite: None,
+        };
+    };
+    match rest.split_once('/') {
+        // `/api/projects/<proj>/<family>/…`: rewrite to `/api/<family>/…` **iff** the
+        // family is project-ownable; otherwise leave it (→ 404, never a global handler).
+        Some((proj, sub)) if !proj.is_empty() && !sub.is_empty() => {
+            let family = sub.split('/').next().unwrap_or("");
+            let rewrite = PROJECT_SCOPED_FAMILIES
+                .contains(&family)
+                .then(|| format!("/api/{sub}"));
+            Scope {
+                project: proj.to_string(),
+                rewrite,
+            }
+        }
+        // `/api/projects/<proj>` (bare) or `/api/projects/`: the project entity itself,
+        // handled by its own route — carry the tenant, do not rewrite.
+        _ => {
+            let proj = rest.trim_end_matches('/');
+            Scope {
+                project: if proj.is_empty() {
+                    DEFAULT_PROJECT.to_string()
+                } else {
+                    proj.to_string()
+                },
+                rewrite: None,
+            }
+        }
+    }
+}
+
+/// Middleware (applied outermost on the control-plane API, before routing): derive the
+/// [`ProjectContext`] tenant from the path and, for a whitelisted project-scoped
+/// resource path, rewrite the URI to its global form (stashing the original path in
+/// [`OriginalPath`] for the auth layer). A no-op for every non-project path.
+pub async fn project_scope(mut request: Request, next: Next) -> Response {
+    let scope = scope_of(request.uri().path());
+    request
+        .extensions_mut()
+        .insert(ProjectContext(scope.project));
+    if let Some(new_path) = scope.rewrite {
+        let original = request.uri().path().to_string();
+        rewrite_path(request.uri_mut(), &new_path);
+        request.extensions_mut().insert(OriginalPath(original));
+    }
+    next.run(request).await
+}
+
+/// Replace a URI's path (preserving the query + any scheme/authority), for the
+/// project→global rewrite. A server-side origin-form URI keeps its `None`
+/// scheme/authority; a proxied absolute-form request round-trips them.
+fn rewrite_path(uri: &mut Uri, new_path: &str) {
+    let mut parts = uri.clone().into_parts();
+    let pq = match uri.query() {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path.to_string(),
+    };
+    if let Ok(path_and_query) = pq.parse() {
+        parts.path_and_query = Some(path_and_query);
+        if let Ok(rebuilt) = Uri::from_parts(parts) {
+            *uri = rebuilt;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_and_non_api_paths_default_and_are_not_rewritten() {
+        for p in ["/api/sites/blog/config", "/healthz", "/api/tokens"] {
+            let s = scope_of(p);
+            assert_eq!(s.project, "default");
+            assert!(s.rewrite.is_none());
+        }
+    }
+
+    #[test]
+    fn project_resource_paths_rewrite_to_the_global_handler() {
+        let s = scope_of("/api/projects/acme/sites/blog/config");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/sites/blog/config"));
+
+        let s = scope_of("/api/projects/acme/functions/resize/versions");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/functions/resize/versions"));
+
+        let s = scope_of("/api/projects/acme/compute/api");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/compute/api"));
+    }
+
+    #[test]
+    fn non_whitelisted_project_subpaths_are_never_rewritten() {
+        // A global-only resource under a project path must NOT reach its global
+        // handler with mere project authority — no rewrite (→ 404).
+        for sub in [
+            "tokens",
+            "authz/policy",
+            "daemon/config",
+            "prune",
+            "blobs/abc",
+        ] {
+            let s = scope_of(&format!("/api/projects/acme/{sub}"));
+            assert_eq!(s.project, "acme");
+            assert!(s.rewrite.is_none(), "{sub} must not rewrite");
+        }
+    }
+
+    #[test]
+    fn project_entity_paths_carry_the_tenant_without_rewrite() {
+        let s = scope_of("/api/projects/acme");
+        assert_eq!(s.project, "acme");
+        assert!(s.rewrite.is_none());
+        // `/api/projects` (list/create) is not under the prefix → default, no rewrite.
+        let s = scope_of("/api/projects");
+        assert_eq!(s.project, "default");
+        assert!(s.rewrite.is_none());
+    }
+}

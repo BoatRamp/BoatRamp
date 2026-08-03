@@ -61,6 +61,7 @@ pub(super) fn new_invocation_id() -> String {
 pub(super) async fn invoke_function(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     axum::extract::Query(query): axum::extract::Query<InvokeQuery>,
     request: Request,
@@ -68,7 +69,7 @@ pub(super) async fn invoke_function(
     let Some(inner) = handlers.inner.as_ref() else {
         return handler_unavailable();
     };
-    let function = match deploy.get_function(ProjectRef::DEFAULT, &name).await {
+    let function = match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(f)) => f,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
@@ -94,13 +95,9 @@ pub(super) async fn invoke_function(
     // captured result, or `202` + id while the async call is still in flight).
     // Checked *before* the quota so a replay never spends the rate budget.
     if let Some(key) = &idem_key {
-        match deploy
-            .get_idempotency(ProjectRef::DEFAULT, &name, key)
-            .await
-        {
+        match deploy.get_idempotency(project.as_ref(), &name, key).await {
             Ok(Some(id)) => {
-                if let Ok(Some(inv)) = deploy.get_invocation(ProjectRef::DEFAULT, &name, &id).await
-                {
+                if let Ok(Some(inv)) = deploy.get_invocation(project.as_ref(), &name, &id).await {
                     return replay_invocation(&inv);
                 }
             }
@@ -111,14 +108,31 @@ pub(super) async fn invoke_function(
 
     // Rate-limit quota (FA-4), fail-closed → 429, charged once at entry for both
     // sync and async (a drain retry does not re-charge).
-    if let Err(response) = admit_by_quota(inner, &deploy, &function).await {
+    if let Err(response) = admit_by_quota(inner, &deploy, project.as_ref(), &function).await {
         return response;
     }
 
     if is_async {
-        enqueue_invocation(&deploy, &function, &component, request, idem_key).await
+        enqueue_invocation(
+            &deploy,
+            project.as_ref(),
+            &function,
+            &component,
+            request,
+            idem_key,
+        )
+        .await
     } else {
-        execute_sync(inner, &deploy, &function, &component, request, idem_key).await
+        execute_sync(
+            inner,
+            &deploy,
+            project.as_ref(),
+            &function,
+            &component,
+            request,
+            idem_key,
+        )
+        .await
     }
 }
 
@@ -129,6 +143,7 @@ pub(super) async fn invoke_function(
 async fn execute_sync(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     component: &str,
     request: Request,
@@ -146,7 +161,7 @@ async fn execute_sync(
             bytes_in: 0,
             bytes_out: 0,
         };
-        record_metering(inner, deploy, &function.name, &sample).await;
+        record_metering(inner, deploy, project, &function.name, &sample).await;
         return response;
     };
     // Capture so the outcome can be replayed under the idempotency key.
@@ -157,7 +172,7 @@ async fn execute_sync(
         bytes_in: 0,
         bytes_out: body.len() as u64,
     };
-    record_metering(inner, deploy, &function.name, &sample).await;
+    record_metering(inner, deploy, project, &function.name, &sample).await;
     let now = now_unix();
     let id = new_invocation_id();
     let inv = boatramp_core::function::Invocation {
@@ -178,11 +193,11 @@ async fn execute_sync(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
+    if let Err(err) = deploy.put_invocation(project, &inv).await {
         return deploy_error_response(err);
     }
     if let Err(err) = deploy
-        .put_idempotency(ProjectRef::DEFAULT, &function.name, &key, &id)
+        .put_idempotency(project, &function.name, &key, &id)
         .await
     {
         return deploy_error_response(err);
@@ -195,6 +210,7 @@ async fn execute_sync(
 #[cfg(feature = "handlers")]
 async fn enqueue_invocation(
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     component: &str,
     request: Request,
@@ -231,12 +247,12 @@ async fn enqueue_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
+    if let Err(err) = deploy.put_invocation(project, &inv).await {
         return deploy_error_response(err);
     }
     if let Some(key) = &idem_key {
         if let Err(err) = deploy
-            .put_idempotency(ProjectRef::DEFAULT, &function.name, key, &id)
+            .put_idempotency(project, &function.name, key, &id)
             .await
         {
             return deploy_error_response(err);
@@ -250,9 +266,10 @@ async fn enqueue_invocation(
 #[cfg(feature = "handlers")]
 pub(super) async fn get_invocation_record(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((name, id)): Path<(String, String)>,
 ) -> Response {
-    match deploy.get_invocation(ProjectRef::DEFAULT, &name, &id).await {
+    match deploy.get_invocation(project.as_ref(), &name, &id).await {
         Ok(Some(inv)) => Json(inv).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -493,7 +510,9 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
         };
         // Rate-limit the callee against its own quota, as an external call would.
         // A rejection is the callee's response (429), surfaced to the caller.
-        if let Err(response) = admit_by_quota(&inner, &self.deploy, &function).await {
+        if let Err(response) =
+            admit_by_quota(&inner, &self.deploy, ProjectRef::DEFAULT, &function).await
+        {
             return Ok(buffer_invoke_response(response).await);
         }
         let (response, duration_ms) = execute_function(
@@ -512,7 +531,14 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             bytes_in,
             bytes_out: invoke_response.body.len() as u64,
         };
-        record_metering(&inner, &self.deploy, &function.name, &sample).await;
+        record_metering(
+            &inner,
+            &self.deploy,
+            ProjectRef::DEFAULT,
+            &function.name,
+            &sample,
+        )
+        .await;
         Ok(invoke_response)
     }
 }
@@ -711,7 +737,7 @@ async fn run_queued_invocation(
             bytes_in,
             bytes_out: body.len() as u64,
         };
-        record_metering(inner, deploy, &function.name, &sample).await;
+        record_metering(inner, deploy, ProjectRef::DEFAULT, &function.name, &sample).await;
     }
 }
 
@@ -782,6 +808,7 @@ fn acquire_function_permit(
 async fn admit_by_quota(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
 ) -> Result<(), Response> {
     let quota = &function.config.quota;
@@ -791,10 +818,7 @@ async fn admit_by_quota(
     let lock = function_meter_lock(inner, &function.name);
     let _guard = lock.lock().await;
     let now = now_unix();
-    let mut metering = match deploy
-        .get_metering(ProjectRef::DEFAULT, &function.name)
-        .await
-    {
+    let mut metering = match deploy.get_metering(project, &function.name).await {
         Ok(Some(m)) => m,
         Ok(None) => boatramp_core::function::Metering::new(&function.name),
         Err(err) => return Err(deploy_error_response(err)),
@@ -806,7 +830,7 @@ async fn admit_by_quota(
         )
             .into_response());
     }
-    if let Err(err) = deploy.put_metering(ProjectRef::DEFAULT, &metering).await {
+    if let Err(err) = deploy.put_metering(project, &metering).await {
         return Err(deploy_error_response(err));
     }
     Ok(())
@@ -819,13 +843,14 @@ async fn admit_by_quota(
 async fn record_metering(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &str,
     sample: &boatramp_core::function::MeteringSample,
 ) {
     let lock = function_meter_lock(inner, function);
     let _guard = lock.lock().await;
     let now = now_unix();
-    let mut metering = match deploy.get_metering(ProjectRef::DEFAULT, function).await {
+    let mut metering = match deploy.get_metering(project, function).await {
         Ok(Some(m)) => m,
         Ok(None) => boatramp_core::function::Metering::new(function),
         Err(err) => {
@@ -834,7 +859,7 @@ async fn record_metering(
         }
     };
     metering.record(sample, now);
-    if let Err(err) = deploy.put_metering(ProjectRef::DEFAULT, &metering).await {
+    if let Err(err) = deploy.put_metering(project, &metering).await {
         tracing::warn!(function, %err, "writing metering failed");
     }
 }
@@ -844,9 +869,10 @@ async fn record_metering(
 #[cfg(feature = "handlers")]
 pub(super) async fn get_function_usage(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.get_metering(ProjectRef::DEFAULT, &name).await {
+    match deploy.get_metering(project.as_ref(), &name).await {
         Ok(Some(m)) => Json(m).into_response(),
         // No invocations yet ⇒ a zeroed aggregate, so the CLI always has a shape.
         Ok(None) => Json(boatramp_core::function::Metering::new(name)).into_response(),
@@ -864,10 +890,11 @@ pub(super) async fn get_function_usage(
 pub(super) async fn put_trigger_handler(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((name, id)): Path<(String, String)>,
     Json(kind): Json<boatramp_core::function::TriggerKind>,
 ) -> Response {
-    match deploy.get_function(ProjectRef::DEFAULT, &name).await {
+    match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
@@ -927,10 +954,7 @@ pub(super) async fn put_trigger_handler(
         kind,
         last_fired_minute: None,
     };
-    if let Err(err) = deploy
-        .put_trigger(ProjectRef::DEFAULT, &name, &trigger)
-        .await
-    {
+    if let Err(err) = deploy.put_trigger(project.as_ref(), &name, &trigger).await {
         return deploy_error_response(err);
     }
     Json(trigger).into_response()
@@ -941,9 +965,10 @@ pub(super) async fn put_trigger_handler(
 #[cfg(feature = "handlers")]
 pub(super) async fn list_triggers_handler(
     State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
 ) -> Response {
-    match deploy.list_triggers(ProjectRef::DEFAULT, &name).await {
+    match deploy.list_triggers(project.as_ref(), &name).await {
         Ok(mut list) => {
             list.sort_by(|a, b| a.id.cmp(&b.id));
             Json(list).into_response()
@@ -960,20 +985,21 @@ pub(super) async fn list_triggers_handler(
 pub(super) async fn delete_trigger_handler(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path((name, id)): Path<(String, String)>,
 ) -> Response {
     // Look the trigger up first: a `Blob` trigger may own a provisioned pipeline
     // to retract before the trigger record is gone.
     if let (Some(inner), Ok(Some(trigger))) = (
         handlers.inner.as_ref(),
-        deploy.get_trigger(ProjectRef::DEFAULT, &name, &id).await,
+        deploy.get_trigger(project.as_ref(), &name, &id).await,
     ) {
         if let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
             (&trigger.kind, inner.watch_provider.get())
         {
             let storage_prefix = blob_storage_prefix(&name, prefix);
             if let Ok(Some(record)) = deploy
-                .get_managed_notification(ProjectRef::DEFAULT, &name, &storage_prefix)
+                .get_managed_notification(project.as_ref(), &name, &storage_prefix)
                 .await
             {
                 if let Err(err) = boatramp_core::blob_provision::retract_watch(
@@ -988,7 +1014,7 @@ pub(super) async fn delete_trigger_handler(
             }
         }
     }
-    match deploy.delete_trigger(ProjectRef::DEFAULT, &name, &id).await {
+    match deploy.delete_trigger(project.as_ref(), &name, &id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
     }
@@ -1133,7 +1159,7 @@ async fn dispatch_function_queue(
             bytes_in,
             bytes_out: body.len() as u64,
         };
-        record_metering(inner, deploy, &function.name, &sample).await;
+        record_metering(inner, deploy, ProjectRef::DEFAULT, &function.name, &sample).await;
         if delivered {
             let _ = messaging.ack(&msg).await;
         } else {
@@ -1154,13 +1180,14 @@ async fn dispatch_function_queue(
 pub(super) async fn webhook_ingress(
     State(deploy): State<DeployStore>,
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
     Path(name): Path<String>,
     request: Request,
 ) -> Response {
     let Some(inner) = handlers.inner.as_ref() else {
         return handler_unavailable();
     };
-    let function = match deploy.get_function(ProjectRef::DEFAULT, &name).await {
+    let function = match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(f)) => f,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, format!("no function {name:?}\n")).into_response()
@@ -1211,7 +1238,7 @@ pub(super) async fn webhook_ingress(
         return (StatusCode::UNAUTHORIZED, "invalid webhook signature\n").into_response();
     }
     // Rate-limit quota (fail-closed) applies to a verified webhook like any invoke.
-    if let Err(response) = admit_by_quota(inner, &deploy, &function).await {
+    if let Err(response) = admit_by_quota(inner, &deploy, project.as_ref(), &function).await {
         return response;
     }
     let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
@@ -1227,7 +1254,7 @@ pub(super) async fn webhook_ingress(
         bytes_in,
         bytes_out: 0,
     };
-    record_metering(inner, &deploy, &function.name, &sample).await;
+    record_metering(inner, &deploy, project.as_ref(), &function.name, &sample).await;
     response
 }
 

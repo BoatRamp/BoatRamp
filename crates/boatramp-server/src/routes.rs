@@ -76,6 +76,14 @@ pub fn router_with(
     // Control-plane API — gated by the auth middleware.
     let api = Router::new()
         .route("/api/sites", get(list_sites))
+        // Projects (0.2.0): the owning Workspace. Entity CRUD; the per-resource
+        // `/api/projects/{proj}/sites/…` surface is served by the site/function/…
+        // handlers via the `project_scope` rewrite layer added below.
+        .route("/api/projects", get(list_projects).post(create_project))
+        .route(
+            "/api/projects/{proj}",
+            get(get_project).delete(delete_project),
+        )
         .route("/api/functions", get(list_functions))
         .route(
             "/api/functions/{name}",
@@ -372,7 +380,15 @@ pub fn router_with(
         let mcp = crate::mcp_http::mcp_router(app.clone(), mcp_auth, mcp_origin, mcp_daemon);
         app.merge(mcp)
     };
-    app
-        // Structured access log wraps every route (public + API + `/mcp`).
+    // Project-scope rewrite must run *before* routing so `/api/projects/{proj}/sites/…`
+    // is rewritten to its global form (and tagged with its `ProjectContext`) before the
+    // route/fallback is chosen. A `Router::layer` runs *after* routing, so instead wrap
+    // the fully-assembled app as the `fallback_service` of a thin outer router: every
+    // request hits that fallback, so the outer layer runs for all of them ahead of the
+    // inner router's own routing. `access_log` stays outermost (it logs the original
+    // path the client sent); `project_scope` is a no-op for every non-project path.
+    Router::new()
+        .fallback_service(app)
+        .layer(axum::middleware::from_fn(project_scope))
         .layer(axum::middleware::from_fn(access_log))
 }

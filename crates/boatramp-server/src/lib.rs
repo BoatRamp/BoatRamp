@@ -110,6 +110,10 @@ pub(crate) use proxy::{
 pub(crate) use proxy::is_upgrade_request;
 #[cfg(all(test, feature = "handlers"))]
 use proxy::{gateway_addr_allowed, CLOUD_METADATA_IPV4};
+mod project_api;
+pub(crate) use project_api::{create_project, delete_project, get_project, list_projects};
+mod project_scope;
+pub(crate) use project_scope::{project_scope, OriginalPath, ProjectContext};
 mod ratelimit;
 mod routes;
 pub use routes::{router, router_with};
@@ -1361,6 +1365,7 @@ mod tests {
         let (st, body) = body_json(
             deploy_function(
                 State(deploy.clone()),
+                axum::extract::Extension(crate::ProjectContext::default()),
                 Path("greeter".to_string()),
                 Json(FunctionUpsert {
                     component: v1.clone(),
@@ -1378,6 +1383,7 @@ mod tests {
         let (_, body) = body_json(
             deploy_function(
                 State(deploy.clone()),
+                axum::extract::Extension(crate::ProjectContext::default()),
                 Path("greeter".to_string()),
                 Json(FunctionUpsert {
                     component: v2.clone(),
@@ -1395,6 +1401,7 @@ mod tests {
         let (st, body) = body_json(
             rollback_function(
                 State(deploy.clone()),
+                axum::extract::Extension(crate::ProjectContext::default()),
                 Path("greeter".to_string()),
                 Json(RollbackBody { to: v1.clone() }),
             )
@@ -1407,6 +1414,7 @@ mod tests {
         // Rolling back to an unknown version is a 400 (plain-text body).
         let resp = rollback_function(
             State(deploy.clone()),
+            axum::extract::Extension(crate::ProjectContext::default()),
             Path("greeter".to_string()),
             Json(RollbackBody { to: "c".repeat(64) }),
         )
@@ -1417,6 +1425,7 @@ mod tests {
         let (st, body) = body_json(
             alias_function(
                 State(deploy.clone()),
+                axum::extract::Extension(crate::ProjectContext::default()),
                 Path(("greeter".to_string(), "prod".to_string())),
                 Json(AliasBody {
                     version: v2.clone(),
@@ -1429,9 +1438,15 @@ mod tests {
         assert_eq!(body["aliases"]["prod"], v2);
 
         // Remove → 204, and it's gone.
-        let (st, _) =
-            body_json(remove_function(State(deploy.clone()), Path("greeter".to_string())).await)
-                .await;
+        let (st, _) = body_json(
+            remove_function(
+                State(deploy.clone()),
+                axum::extract::Extension(crate::ProjectContext::default()),
+                Path("greeter".to_string()),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(st, StatusCode::NO_CONTENT);
         assert!(deploy
             .get_function(ProjectRef::DEFAULT, "greeter")
@@ -1446,6 +1461,7 @@ mod tests {
         );
         let resp = deploy_function(
             State(empty),
+            axum::extract::Extension(crate::ProjectContext::default()),
             Path("orphan".to_string()),
             Json(FunctionUpsert {
                 component: v1.clone(),
