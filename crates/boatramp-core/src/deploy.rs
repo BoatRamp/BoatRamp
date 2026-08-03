@@ -2046,6 +2046,120 @@ impl DeployStore {
         Ok(())
     }
 
+    // ---- Projects (the owning Workspace boundary, 0.2.0) -------------------
+    // A project is content-addressed + atomically activated exactly like a site: an
+    // immutable `projectver/<hash>` spec body, a mutable `projectmeta/<name>` pointer,
+    // and a bounded history ring. Membership is positional — the `project/<name>/`
+    // prefix is the authoritative member set — with `owner/<kind>/<name>` a derived
+    // reverse index.
+
+    /// Create or update a project: store its content-addressed spec body (idempotent)
+    /// and flip the `projectmeta/<name>` pointer to it, recording the prior pointer in
+    /// the history ring for rollback.
+    pub async fn put_project(&self, p: &crate::project::Project) -> Result<String, DeployError> {
+        let hash = p.id();
+        let body = serde_json::to_vec(p).map_err(|e| DeployError::Serde(e.to_string()))?;
+        let pointer = crate::project::pointer_key(&p.name);
+        // Record the currently-active version in history (most-recent first, capped),
+        // so a `rollback_project` can restore it.
+        let mut history: Vec<String> =
+            match self.kv.get(&crate::project::history_key(&p.name)).await? {
+                Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                None => Vec::new(),
+            };
+        if let Some(current) = self.kv.get(&pointer).await? {
+            let current = String::from_utf8_lossy(&current).into_owned();
+            if current != hash {
+                history.retain(|h| h != &current);
+                history.insert(0, current);
+                history.truncate(MAX_HISTORY);
+            }
+        }
+        self.kv
+            .write_batch(vec![
+                WriteOp::Put(crate::project::spec_key(&hash), body),
+                WriteOp::Put(pointer, hash.clone().into_bytes()),
+                WriteOp::Put(
+                    crate::project::history_key(&p.name),
+                    serde_json::to_vec(&history).map_err(|e| DeployError::Serde(e.to_string()))?,
+                ),
+            ])
+            .await?;
+        Ok(hash)
+    }
+
+    /// Load a project's active version, if it exists.
+    pub async fn get_project(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::project::Project>, DeployError> {
+        let Some(hash) = self.kv.get(&crate::project::pointer_key(name)).await? else {
+            return Ok(None);
+        };
+        let hash = String::from_utf8_lossy(&hash).into_owned();
+        match self.kv.get(&crate::project::spec_key(&hash)).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None), // dangling pointer (body GC'd) reads as absent
+        }
+    }
+
+    /// Every declared project, sorted by name. (A project may also exist only
+    /// *implicitly* as a `project/<name>/` key prefix without a `projectmeta`
+    /// pointer — see [`discover_projects`](Self::discover_projects) for that union.)
+    pub async fn list_projects(&self) -> Result<Vec<crate::project::Project>, DeployError> {
+        let mut out = Vec::new();
+        for key in self.kv.list_prefix(crate::project::POINTER_PREFIX).await? {
+            let Some(name) = key.strip_prefix(crate::project::POINTER_PREFIX) else {
+                continue;
+            };
+            if !name.is_empty() {
+                if let Some(p) = self.get_project(name).await? {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Delete a project's pointer + history. Refuses (with [`DeployError::Conflict`])
+    /// while the project still owns any resource — a project is deleted only once
+    /// empty, so a stray site/function/compute can't be silently orphaned. The
+    /// content-addressed spec bodies are shared + left to `prune`. Deleting the
+    /// reserved `default` project is refused outright.
+    pub async fn delete_project(&self, name: &str) -> Result<bool, DeployError> {
+        if name == crate::project::DEFAULT_PROJECT {
+            return Err(DeployError::Conflict(
+                "the `default` project cannot be deleted".to_string(),
+            ));
+        }
+        let existed = self
+            .kv
+            .get(&crate::project::pointer_key(name))
+            .await?
+            .is_some();
+        // Refuse if any owned resource remains under `project/<name>/`.
+        if !self
+            .kv
+            .list_prefix(&crate::project::resource_prefix(name))
+            .await?
+            .is_empty()
+        {
+            return Err(DeployError::Conflict(format!(
+                "project `{name}` still owns resources; delete its sites/functions/compute first"
+            )));
+        }
+        self.kv
+            .write_batch(vec![
+                WriteOp::Delete(crate::project::pointer_key(name)),
+                WriteOp::Delete(crate::project::history_key(name)),
+            ])
+            .await?;
+        Ok(existed)
+    }
+
     /// Atomically point `site` at deployment `id`.
     ///
     /// Refuses to activate a deployment whose blobs are not all present.
@@ -4536,5 +4650,48 @@ mod tests {
             "deleting acme/www must not touch shop/www"
         );
         assert!(store.current_id(shop, "www").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn project_entity_crud_and_delete_guard() {
+        use crate::project::Project;
+        let store = store();
+        let acme = Project {
+            version: crate::SCHEMA_VERSION,
+            name: "acme".into(),
+            created_at: 1,
+            meta: Default::default(),
+            config: Default::default(),
+            secrets_ref: None,
+        };
+        // Create + read back; content-addressed id round-trips.
+        let hash = store.put_project(&acme).await.unwrap();
+        assert_eq!(hash, acme.id());
+        assert_eq!(store.get_project("acme").await.unwrap(), Some(acme.clone()));
+        assert!(store.get_project("ghost").await.unwrap().is_none());
+        assert_eq!(store.list_projects().await.unwrap(), vec![acme.clone()]);
+
+        // Delete refuses while the project owns a resource…
+        store
+            .set_site_config(ProjectRef::new("acme"), "www", &SiteConfig::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.delete_project("acme").await,
+            Err(DeployError::Conflict(_))
+        ));
+        // …and succeeds once it is empty.
+        store
+            .delete_site(ProjectRef::new("acme"), "www")
+            .await
+            .unwrap();
+        assert!(store.delete_project("acme").await.unwrap());
+        assert!(store.get_project("acme").await.unwrap().is_none());
+
+        // The reserved default project can never be deleted.
+        assert!(matches!(
+            store.delete_project("default").await,
+            Err(DeployError::Conflict(_))
+        ));
     }
 }
