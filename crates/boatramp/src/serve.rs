@@ -1824,6 +1824,41 @@ async fn run_cluster(
 
     // The control-plane KvStore + messaging are the cluster facades.
     let kv: Arc<dyn KvStore> = node.kv.clone();
+
+    // Layout guard (0.2.0), cluster path — the same fail-closed gate the single-node
+    // path applies: refuse to serve a store still on the pre-project layout 1, since a
+    // half-read store would silently drop sites/functions/compute. `node.kv` is the
+    // replicated RaftKv facade, so a `--auto-migrate` here writes through Raft consensus
+    // (a follower's writes forward to the leader) and every migration step is idempotent
+    // + re-verifying — so even a concurrent racer converges rather than corrupts, no
+    // CAS/leader-election needed. The load-bearing case is the founder (the leader,
+    // authoritative for its own store) booting on legacy data; a joiner only ever
+    // reaches an already-running cluster, which this guard kept from serving unmigrated.
+    match migrate::status(kv.as_ref()).await? {
+        migrate::Status::Ready => {}
+        migrate::Status::Dual => tracing::warn!(
+            "control-plane store is in the dual soak window; \
+             run `boatramp migrate --finalize` to reclaim the old-layout keys"
+        ),
+        migrate::Status::NeedsMigration => {
+            if args.auto_migrate {
+                tracing::warn!(
+                    "control-plane store is below the current schema version; running a \
+                     one-shot migration through the cluster (--auto-migrate)"
+                );
+                let report =
+                    migrate::migrate(kv.as_ref(), migrate::MigrateOptions::one_shot()).await?;
+                tracing::info!(
+                    rekeyed = report.total_rekeyed(),
+                    owner_entries = report.owner_entries,
+                    "control-plane store migrated to the project-scoped layout"
+                );
+            } else {
+                return Err(Error::UnmigratedStore);
+            }
+        }
+    }
+
     // Cluster-wide rate limiting shares the *replicated* RaftKv across nodes.
     if args.cluster_rate_limit || config.serve.as_ref().is_some_and(|s| s.cluster_rate_limit) {
         options.cluster_rate_limit_kv = Some(kv.clone());
