@@ -7,6 +7,19 @@ versions.
 
 ## [0.2.0]
 
+### Security
+- **Project tenant isolation of the guest data plane.** A managed handler's / function's
+  `wasi:keyvalue`, `wasi:blobstore`, `sql`, and `wasi:messaging` namespaces are now
+  scoped to the owning project, so two projects that each own a same-named site or
+  function no longer share one data namespace. The reserved `default` project keeps the
+  pre-project (unprefixed) keys, so an existing single-project store is byte-identical and
+  needs no data migration. (Side effect: function `sql` databases, previously ungranted
+  due to a name-validation bug, now open correctly and are per-project isolated.)
+- **Resource-name validation.** Project / site / function / compute / workflow names are
+  rejected at the write boundary if they contain a path separator, `*`, whitespace, or a
+  control character (or are `.`/`..`), closing store-key integrity and authz-target
+  edge cases.
+
 ### Added
 - **First-class Projects — the multi-site owning + tenant boundary.** A **project**
   (Uchron's *Workspace*) owns many sites plus their functions and compute, and is the
