@@ -52,6 +52,7 @@ fn spec() -> ComputeSpec {
         volumes: vec![],
         isolation: boatramp_types::compute::IsolationRequirement::Trusted,
         prefer_backend: None,
+        bindings: vec![],
     }
 }
 

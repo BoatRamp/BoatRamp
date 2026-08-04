@@ -172,6 +172,69 @@ pub struct ComputeSpec {
     /// the scheduler honors it when the backend is eligible, else falls back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_backend: Option<String>,
+    /// Managed resources this workload depends on — the opaque-process analogue of a
+    /// handler's `imports`. boatramp resolves each to a **tenant-scoped** endpoint +
+    /// credential at launch and injects the address into the guest env, so a workload
+    /// reaches the managed `sql` (and, later, kv/blob/messaging) without a hand-glued
+    /// URL. Empty ⇒ omitted from the wire + the content hash (back-compat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<ComputeBinding>,
+}
+
+/// A managed-resource dependency a compute workload declares. It names a *resource*,
+/// never a project: the owning project comes from the workload's key
+/// (`project/<proj>/compute/<name>`), so a workload cannot request another tenant's
+/// data. boatramp resolves it at launch and injects the endpoint into the guest env.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputeBinding {
+    /// Which managed resource kind.
+    pub kind: BindingKind,
+    /// The named database/store within the kind (`""` = the site default, matching
+    /// `sql.open("")`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The env var the resolved endpoint URL is injected as; `None` ⇒ the kind default
+    /// (`sql` → `BOATRAMP_SQL_URL`). The credential is injected as `<url_env>_AUTH_TOKEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_env: Option<String>,
+}
+
+/// The managed-resource kinds a [`ComputeBinding`] may name. Phase 0 implements `Sql`;
+/// the others are reserved for the shared resolver mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingKind {
+    /// The managed `sql` database (per-site libsql, or a named external DB).
+    Sql,
+    /// Per-site key-value store (Phase 2).
+    Kv,
+    /// Per-site blob store (Phase 2).
+    Blob,
+    /// Per-site pub/sub + queues (Phase 2).
+    Messaging,
+}
+
+impl ComputeBinding {
+    /// The env var the endpoint URL is injected as (explicit `url_env`, else the kind
+    /// default). The auth token is injected as this name plus `_AUTH_TOKEN`.
+    pub fn url_env(&self) -> String {
+        self.url_env
+            .clone()
+            .unwrap_or_else(|| self.kind.default_url_env().to_string())
+    }
+}
+
+impl BindingKind {
+    /// The default env var an endpoint of this kind is injected as.
+    pub fn default_url_env(self) -> &'static str {
+        match self {
+            Self::Sql => "BOATRAMP_SQL_URL",
+            Self::Kv => "BOATRAMP_KV_URL",
+            Self::Blob => "BOATRAMP_BLOB_URL",
+            Self::Messaging => "BOATRAMP_MESSAGING_URL",
+        }
+    }
 }
 
 impl ComputeSpec {
@@ -253,7 +316,47 @@ mod tests {
             volumes: vec![],
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            bindings: vec![],
         }
+    }
+
+    #[test]
+    fn empty_bindings_do_not_change_the_spec_hash() {
+        // A spec that declares no bindings serializes without the field, so it hashes
+        // identically to a pre-bindings spec (back-compat).
+        let a = spec();
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(!json.contains("bindings"), "empty bindings are omitted");
+
+        // Declaring a binding is recorded and changes the content hash.
+        let mut b = spec();
+        b.bindings = vec![ComputeBinding {
+            kind: BindingKind::Sql,
+            name: String::new(),
+            url_env: None,
+        }];
+        assert_ne!(a.id(), b.id(), "a declared binding changes the id");
+        assert!(serde_json::to_string(&b).unwrap().contains("bindings"));
+    }
+
+    #[test]
+    fn binding_kind_parses_lowercase_and_url_env_defaults_per_kind() {
+        assert_eq!(
+            serde_json::from_str::<BindingKind>("\"sql\"").unwrap(),
+            BindingKind::Sql
+        );
+        let sql = ComputeBinding {
+            kind: BindingKind::Sql,
+            name: String::new(),
+            url_env: None,
+        };
+        assert_eq!(sql.url_env(), "BOATRAMP_SQL_URL");
+        let custom = ComputeBinding {
+            kind: BindingKind::Sql,
+            name: "analytics".into(),
+            url_env: Some("ANALYTICS_URL".into()),
+        };
+        assert_eq!(custom.url_env(), "ANALYTICS_URL");
     }
 
     #[test]

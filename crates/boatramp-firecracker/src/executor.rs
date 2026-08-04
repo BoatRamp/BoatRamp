@@ -513,6 +513,7 @@ mod tests {
             volumes: vec![],
             isolation: boatramp_types::compute::IsolationRequirement::Trusted,
             prefer_backend: None,
+            bindings: vec![],
         };
         let resources = MachineResources {
             kernel_path: "/k/vmlinux".into(),

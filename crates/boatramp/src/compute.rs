@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use boatramp_core::compute::{
-    ComputeSpec, IsolationRequirement, PlacementConstraints, RestartPolicy, RootSource,
+    BindingKind, ComputeBinding, ComputeSpec, IsolationRequirement, PlacementConstraints,
+    RestartPolicy, RootSource,
 };
 use clap::Subcommand;
 use serde::Serialize;
@@ -129,6 +130,11 @@ enum ComputeCommand {
         /// Allowed region (repeatable; empty = any).
         #[arg(long = "region")]
         regions: Vec<String>,
+        /// Managed binding the workload depends on, `<kind>[:<name>]` (repeatable):
+        /// `sql` binds the site database, `sql:analytics` a named external DB. The
+        /// endpoint URL + token are injected into the guest env (`BOATRAMP_SQL_URL`).
+        #[arg(long = "bind")]
+        bind: Vec<String>,
     },
     /// Build an ext4 rootfs from an OCI image, upload it, and set the workload.
     /// Needs the `e2fsprogs` `mke2fs` tool on this host.
@@ -176,6 +182,9 @@ enum ComputeCommand {
         /// Allowed region (repeatable).
         #[arg(long = "region")]
         regions: Vec<String>,
+        /// Managed binding, `<kind>[:<name>]` (repeatable) — see `compute set --bind`.
+        #[arg(long = "bind")]
+        bind: Vec<String>,
     },
     /// Remove a workload (its replicas are stopped).
     Rm {
@@ -287,6 +296,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             scale_to_zero,
             isolation,
             regions,
+            bind,
         } => {
             // Exactly one of `--image` (an OCI reference, verbatim), `--tar` (a rootfs
             // archive, uploaded), or `--rootfs` (a rootfs filesystem image, uploaded)
@@ -322,6 +332,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 restart,
                 scale_to_zero,
                 isolation,
+                parse_bindings(&bind)?,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             println!("workload {name} set (spec {hash})");
@@ -341,6 +352,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             scale_to_zero,
             isolation,
             regions,
+            bind,
         } => {
             // Build the ext4 rootfs locally from the OCI image (needs mke2fs).
             // The init that execs the workload is baked in from the entrypoint
@@ -387,6 +399,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 restart,
                 scale_to_zero,
                 isolation,
+                parse_bindings(&bind)?,
             )?;
             let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             println!("workload {name} built + set (spec {hash})");
@@ -415,6 +428,7 @@ fn build_spec(
     restart: Restart,
     scale_to_zero: bool,
     isolation: Isolation,
+    bindings: Vec<ComputeBinding>,
 ) -> Result<ComputeSpec> {
     let mut env_map = BTreeMap::new();
     for pair in env {
@@ -438,7 +452,31 @@ fn build_spec(
         volumes: vec![],
         isolation: isolation.into(),
         prefer_backend: None,
+        bindings,
     })
+}
+
+/// Parse `--bind <kind>[:<name>]` flags into [`ComputeBinding`]s. `sql` binds the
+/// site default database; `sql:analytics` binds the named external DB.
+fn parse_bindings(flags: &[String]) -> Result<Vec<ComputeBinding>> {
+    flags
+        .iter()
+        .map(|raw| {
+            let (kind, name) = raw.split_once(':').unwrap_or((raw.as_str(), ""));
+            let kind = match kind {
+                "sql" => BindingKind::Sql,
+                "kv" => BindingKind::Kv,
+                "blob" => BindingKind::Blob,
+                "messaging" => BindingKind::Messaging,
+                other => return Err(Error::Args(format!("unknown binding kind `{other}`"))),
+            };
+            Ok(ComputeBinding {
+                kind,
+                name: name.to_string(),
+                url_env: None,
+            })
+        })
+        .collect()
 }
 
 /// PUT a workload's desired state; returns the stored spec hash.

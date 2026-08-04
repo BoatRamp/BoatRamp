@@ -205,6 +205,7 @@ mod tests {
             volumes: vec![],
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
+            bindings: vec![],
         }
     }
 
