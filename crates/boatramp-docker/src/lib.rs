@@ -21,13 +21,41 @@ use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum};
+use bollard::models::{
+    HostConfig, PortBinding, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
+};
 use bollard::Docker;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// How the remote-Docker backend reports a launched workload's reachable endpoint.
+///
+/// The default `Published` publishes the container port on the host loopback
+/// (`127.0.0.1:<ephemeral>`) and routes to that, so it works whenever `boatramp
+/// serve` runs on the host — including Docker Desktop / macOS, where the daemon runs
+/// in a VM and the container bridge IP is **not** host-routable. Binding to loopback
+/// (not `0.0.0.0`) keeps the workload port off the network, matching the hardened
+/// posture.
+///
+/// `Bridge` routes to the container's bridge IP directly (the pre-0.2.1 behavior). It
+/// is only reachable when `serve` shares the daemon's network — e.g. `serve` itself
+/// runs in a container on the same Docker bridge (docker-out-of-docker) — but avoids
+/// publishing a host port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerEndpoint {
+    /// Publish the container port on `127.0.0.1:<ephemeral>` and route there (default).
+    #[default]
+    Published,
+    /// Route to the container's bridge IP directly (serve must share the network).
+    Bridge,
+}
 
 /// The remote-Docker compute backend: a connected Engine API client.
 pub struct DockerBackend {
     docker: Docker,
+    endpoint: DockerEndpoint,
 }
 
 impl DockerBackend {
@@ -36,12 +64,24 @@ impl DockerBackend {
     pub fn connect() -> Result<Self, BackendError> {
         let docker = Docker::connect_with_defaults()
             .map_err(|e| BackendError::Other(format!("connect to docker: {e}")))?;
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            endpoint: DockerEndpoint::default(),
+        })
     }
 
     /// Wrap an already-connected client (for tests / custom transports).
     pub fn with_client(docker: Docker) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            endpoint: DockerEndpoint::default(),
+        }
+    }
+
+    /// Select how a launched workload's endpoint is reported (see [`DockerEndpoint`]).
+    pub fn with_endpoint(mut self, endpoint: DockerEndpoint) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// Whether the daemon answers a `ping` — used to decide whether to register
@@ -167,14 +207,31 @@ impl ComputeBackend for DockerBackend {
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
-        let host_config = hardened_host_config(req.spec.mem_mib, req.spec.vcpus, req.spec.restart);
-        let config = Config {
+        let port = req.spec.port;
+        let port_key = format!("{port}/tcp");
+        let mut host_config =
+            hardened_host_config(req.spec.mem_mib, req.spec.vcpus, req.spec.restart);
+        let mut config = Config {
             image: Some(reference),
             cmd: Some(req.spec.entrypoint.clone()),
             env: Some(env),
-            host_config: Some(host_config),
             ..Default::default()
         };
+        // In the default `Published` mode, publish the container port on the host
+        // loopback with an ephemeral host port (discovered after start), so a
+        // host-native `serve` can reach it even when the bridge IP is not host-routable
+        // (Docker Desktop / macOS). `Bridge` leaves the container unpublished.
+        if self.endpoint == DockerEndpoint::Published {
+            config.exposed_ports = Some(HashMap::from([(port_key.clone(), HashMap::new())]));
+            host_config.port_bindings = Some(HashMap::from([(
+                port_key.clone(),
+                Some(vec![PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some("0".to_string()),
+                }]),
+            )]));
+        }
+        config.host_config = Some(host_config);
 
         // Best-effort clean of a stale container with the same name, then create.
         let _ = self
@@ -203,18 +260,25 @@ impl ComputeBackend for DockerBackend {
             .await
             .map_err(|e| BackendError::Launch(format!("start {name}: {e}")))?;
 
-        let ip = self.container_ip(&created.id).await?;
-        let port = req.spec.port;
+        // Reachable endpoint: the published host loopback port (default), or the
+        // container's bridge IP + in-container port (`Bridge`).
+        let (host, endpoint_port) = match self.endpoint {
+            DockerEndpoint::Published => (
+                "127.0.0.1".to_string(),
+                self.published_host_port(&created.id, &port_key).await?,
+            ),
+            DockerEndpoint::Bridge => (self.container_ip(&created.id).await?, port),
+        };
         Ok(Instance {
             handle: InstanceHandle {
                 workload: req.workload.clone(),
                 replica: req.replica,
-                backend_ref: encode_ref(&name, &ip, port),
+                backend_ref: encode_ref(&name, &host, endpoint_port),
             },
             endpoint: Endpoint {
                 scheme: Scheme::Http,
-                host: ip,
-                port,
+                host,
+                port: endpoint_port,
             },
         })
     }
@@ -284,11 +348,45 @@ impl DockerBackend {
         }
         Err(BackendError::Launch("container has no IP address".into()))
     }
+
+    /// The host port Docker assigned to a published container port (`<port>/tcp`),
+    /// read back from the container's network settings after start.
+    async fn published_host_port(&self, id: &str, port_key: &str) -> Result<u16, BackendError> {
+        let info = self
+            .docker
+            .inspect_container(id, None)
+            .await
+            .map_err(|e| BackendError::Launch(format!("inspect {id}: {e}")))?;
+        info.network_settings
+            .and_then(|ns| ns.ports)
+            .and_then(|mut ports| ports.remove(port_key).flatten())
+            .and_then(|bindings| bindings.into_iter().next())
+            .and_then(|b| b.host_port)
+            .and_then(|hp| hp.parse::<u16>().ok())
+            .ok_or_else(|| {
+                BackendError::Launch(format!("no published host port for {port_key} on {id}"))
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_endpoint_defaults_to_published_and_parses_lowercase() {
+        // Default is the portable, host-reachable mode.
+        assert_eq!(DockerEndpoint::default(), DockerEndpoint::Published);
+        // Config deserializes the lowercase names.
+        assert_eq!(
+            serde_json::from_str::<DockerEndpoint>("\"published\"").unwrap(),
+            DockerEndpoint::Published
+        );
+        assert_eq!(
+            serde_json::from_str::<DockerEndpoint>("\"bridge\"").unwrap(),
+            DockerEndpoint::Bridge
+        );
+    }
 
     #[test]
     fn name_and_ref_round_trip() {

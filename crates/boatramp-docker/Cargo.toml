@@ -18,12 +18,14 @@ boatramp-core.workspace = true
 async-trait.workspace = true
 bollard.workspace = true
 futures.workspace = true
+serde.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 # `docker_live` integration test (self-skips without a daemon) needs a runtime.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 boatramp-types.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

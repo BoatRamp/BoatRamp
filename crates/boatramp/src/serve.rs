@@ -415,6 +415,7 @@ async fn build_compute(
     // Remote docker: register only if a daemon actually answers.
     match boatramp_docker::DockerBackend::connect() {
         Ok(docker) => {
+            let docker = docker.with_endpoint(cfg.docker_endpoint);
             if docker.reachable().await {
                 backends.insert("docker".to_string(), std::sync::Arc::new(docker));
             } else {

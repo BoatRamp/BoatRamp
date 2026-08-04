@@ -198,6 +198,12 @@ pub struct ComputeConfig {
     /// each request to the nearest replica by its node's region — no manual
     /// `--region` map. `None` ⇒ region-agnostic.
     pub region: Option<String>,
+    /// How the remote-Docker backend reports a workload's reachable endpoint.
+    /// `published` (default) publishes the container port on `127.0.0.1:<ephemeral>`
+    /// so a host-native `serve` reaches it on any daemon (incl. Docker Desktop /
+    /// macOS, where the bridge IP is not host-routable); `bridge` routes to the
+    /// container bridge IP directly (only when `serve` shares the daemon's network).
+    pub docker_endpoint: boatramp_docker::DockerEndpoint,
 }
 
 /// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
@@ -226,6 +232,7 @@ impl Default for ComputeConfig {
                 "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
             ],
             region: None,
+            docker_endpoint: boatramp_docker::DockerEndpoint::default(),
         }
     }
 }
