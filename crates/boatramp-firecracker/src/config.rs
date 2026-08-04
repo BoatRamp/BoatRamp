@@ -98,6 +98,32 @@ fn default_cmdline(guest_ip: &str) -> String {
     )
 }
 
+/// Encode a workload's runtime `env` as a ` boatramp.env=<hex>` kernel-cmdline
+/// fragment the guest init (`vminit`) decodes and merges over the baked
+/// `/etc/boatramp/env` — the launch-time env channel for microVMs, since the rootfs
+/// env is baked read-only at `compute build` time. The payload is the hex of the
+/// NUL-joined `KEY=VALUE\0…` pairs (hex avoids cmdline quoting); empty env ⇒ empty
+/// string. Non-secret env: the cmdline is world-readable in the guest
+/// (`/proc/cmdline`); a secret binding token wants MMDS/vsock (a later refinement).
+pub(crate) fn env_cmdline_fragment(env: &std::collections::BTreeMap<String, String>) -> String {
+    if env.is_empty() {
+        return String::new();
+    }
+    let mut blob = Vec::new();
+    for (k, v) in env {
+        blob.extend_from_slice(k.as_bytes());
+        blob.push(b'=');
+        blob.extend_from_slice(v.as_bytes());
+        blob.push(0);
+    }
+    let mut hex = String::with_capacity(blob.len() * 2);
+    for b in blob {
+        hex.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+        hex.push(char::from_digit(u32::from(b & 0xf), 16).unwrap());
+    }
+    format!(" boatramp.env={hex}")
+}
+
 /// The conventional gateway for a `/24`: the `.1` of the guest's network.
 fn gateway_ip(guest_ip: &str) -> String {
     match guest_ip.rsplit_once('.') {
@@ -113,10 +139,13 @@ impl FcMachine {
     /// scratch is a second drive. The boot args use the spec's cmdline override
     /// or a sane default that brings up the guest IP.
     pub fn from_spec(spec: &ComputeSpec, resources: &MachineResources) -> Self {
-        let boot_args = spec
-            .kernel_cmdline
-            .clone()
-            .unwrap_or_else(|| default_cmdline(&resources.guest_ip));
+        let boot_args = format!(
+            "{}{}",
+            spec.kernel_cmdline
+                .clone()
+                .unwrap_or_else(|| default_cmdline(&resources.guest_ip)),
+            env_cmdline_fragment(&spec.env),
+        );
         Self {
             boot_source: BootSource {
                 kernel_image_path: resources.kernel_path.clone(),
@@ -215,6 +244,27 @@ mod tests {
         s.kernel_cmdline = Some("custom args".into());
         let m = FcMachine::from_spec(&s, &resources());
         assert_eq!(m.boot_source.boot_args, "custom args");
+    }
+
+    #[test]
+    fn runtime_env_is_appended_as_a_hex_cmdline_fragment() {
+        // Empty env ⇒ no fragment (the cmdline is unchanged).
+        let mut s0 = spec();
+        s0.kernel_cmdline = Some("base".into());
+        assert_eq!(
+            FcMachine::from_spec(&s0, &resources())
+                .boot_source
+                .boot_args,
+            "base"
+        );
+        // `K=v\0` = bytes 4b 3d 76 00 ⇒ the hex `vminit` decodes back to `K=v`.
+        let mut s = spec();
+        s.kernel_cmdline = Some("base".into());
+        s.env = BTreeMap::from([("K".to_string(), "v".to_string())]);
+        assert_eq!(
+            FcMachine::from_spec(&s, &resources()).boot_source.boot_args,
+            "base boatramp.env=4b3d7600"
+        );
     }
 
     #[test]

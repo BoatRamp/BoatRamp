@@ -74,6 +74,37 @@ static void split_nul(char *buf, int len, char **out, int maxn) {
     out[n] = 0;
 }
 
+/* Find `needle` in buf[0..len); returns a pointer into buf, or 0. */
+static char *find_sub(char *buf, int len, const char *needle) {
+    int nl = slen(needle);
+    for (int i = 0; i + nl <= len; i++) {
+        int j = 0;
+        while (j < nl && buf[i + j] == needle[j]) j++;
+        if (j == nl) return &buf[i];
+    }
+    return 0;
+}
+
+/* Hex nibble value, or -1 for a non-hex char (which ends the run). */
+static int hexv(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode hex from p (until a non-hex byte or `end`) into out[0..cap); returns bytes. */
+static int hexdec(char *p, char *end, char *out, int cap) {
+    int n = 0;
+    while (p + 1 < end && n < cap) {
+        int hi = hexv(p[0]), lo = hexv(p[1]);
+        if (hi < 0 || lo < 0) break;
+        out[n++] = (char)((hi << 4) | lo);
+        p += 2;
+    }
+    return n;
+}
+
 static void mount_fs(const char *src, const char *target, const char *fstype) {
     sys(SYS_mkdir, (long)target, 0755, 0, 0, 0);            /* no-op if it exists */
     sys(SYS_mount, (long)src, (long)target, (long)fstype, 0, 0); /* best-effort */
@@ -84,6 +115,8 @@ static char argv_buf[8192];
 static char env_buf[8192];
 static char cwd_buf[1024];
 static char mounts_buf[2048];
+static char cmdline_buf[16384];
+static char renv_buf[8192];
 static char *argv[256];
 static char *envp[256];
 static char *mounts[128];
@@ -110,9 +143,36 @@ void _start(void) {
     if (al <= 0) die("vminit: missing /etc/boatramp/argv\n");
     split_nul(argv_buf, al, argv, 256);
 
+    /* Runtime env from the kernel cmdline (boatramp.env=<hex NUL-joined K=V>) — the
+     * launch-time channel, since the baked /etc/boatramp/env is on the read-only
+     * rootfs. Runtime entries go FIRST in envp, so they override the baked env. */
+    int rn = 0;
+    int cml = read_file("/proc/cmdline", cmdline_buf, sizeof cmdline_buf);
+    if (cml > 0) {
+        char *p = find_sub(cmdline_buf, cml, "boatramp.env=");
+        if (p) {
+            p += slen("boatramp.env=");
+            int rl = hexdec(p, cmdline_buf + cml, renv_buf, sizeof renv_buf);
+            int i = 0;
+            while (i < rl && rn < 255) {
+                envp[rn++] = &renv_buf[i];
+                while (i < rl && renv_buf[i]) i++;
+                i++; /* skip the NUL terminator */
+            }
+        }
+    }
+    /* Baked image env, appended after the runtime entries. */
     int el = read_file("/etc/boatramp/env", env_buf, sizeof env_buf);
     if (el < 0) el = 0;
-    split_nul(env_buf, el, envp, 256);
+    {
+        int n = rn, i = 0;
+        while (i < el && n < 255) {
+            envp[n++] = &env_buf[i];
+            while (i < el && env_buf[i]) i++;
+            i++;
+        }
+        envp[n] = 0;
+    }
 
     int cl = read_file("/etc/boatramp/cwd", cwd_buf, sizeof cwd_buf - 1);
     if (cl > 0) {

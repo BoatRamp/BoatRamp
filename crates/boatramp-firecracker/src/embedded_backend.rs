@@ -357,6 +357,10 @@ pub struct WorkerConfig {
     /// Kernel cmdline override (`None` ⇒ the default serial + `root=/dev/vda` +
     /// static `ip=`); the virtio-MMIO `device=` fragments are always appended.
     pub cmdline_override: Option<String>,
+    /// The ` boatramp.env=<hex>` cmdline fragment delivering the workload's runtime
+    /// `env` to the guest init (empty ⇒ none). See [`crate::config::env_cmdline_fragment`].
+    #[serde(default)]
+    pub env_cmdline: String,
     /// The pre-created host tap to attach to (parent enslaves it to the bridge).
     pub tap_name: String,
     /// The guest's static IP (kernel `ip=` autoconfig; also derives the MAC).
@@ -575,7 +579,9 @@ pub fn run_jailed_worker(cfg: WorkerConfig) -> Result<(), String> {
             .cmdline_override
             .clone()
             .unwrap_or_else(|| default_cmdline(&cfg.guest_ip, &cfg.gateway));
-        let cmdline = format!("{base} {mmio}");
+        // Append the runtime-env fragment (`vminit` decodes + merges it over the baked
+        // env) — the launch-time env channel for microVMs.
+        let cmdline = format!("{base} {mmio}{}", cfg.env_cmdline);
 
         let vmm = EmbeddedVmm::with_irqchip(u64::from(cfg.mem_mib) * MIB, cfg.vcpus)
             .map_err(|e| format!("create vm: {e}"))?;
@@ -731,6 +737,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
             rootfs_path,
             kernel_path,
             cmdline_override: req.spec.kernel_cmdline.clone(),
+            env_cmdline: crate::config::env_cmdline_fragment(&req.spec.env),
             tap_name: tap.tap_name.clone(),
             guest_ip: ip.to_string(),
             gateway: self.gateway.clone(),
