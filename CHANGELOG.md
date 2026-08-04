@@ -8,6 +8,26 @@ versions.
 ## [0.2.0]
 
 ### Added
+- **First-class Projects — the multi-site owning + tenant boundary.** A **project**
+  (Uchron's *Workspace*) owns many sites plus their functions and compute, and is the
+  tenant boundary a managed handler's row-level scope resolves to. New `boatramp
+  project {create,ls,show,rm}` and a `/api/projects` + `/api/projects/<proj>/…` control
+  surface; a global `--project` flag (falling back to `[publish].project` →
+  `BOATRAMP_PROJECT` → the reserved `default` project) targets the site-scoped commands.
+  A site's name is now unique only *within* its project, so two projects can each own a
+  `blog`, and their sites, crons, consumers, async invocations, and workflow runs are
+  scheduled independently. Cedar gains a `Project` resource with `project_admin`/
+  `project_publisher`/`project_viewer` roles; a project-admin token cannot touch a
+  sibling project.
+- **`boatramp apply` — declarative project reconcile.** One RON manifest (`apply.cfg`)
+  declares a whole project — its member sites (each a content dir + optional build +
+  routing + site config), top-level functions, and compute workloads — and `apply`
+  reconciles it in a single pass: sites reuse the content-addressed deploy flow (upload
+  only the missing blobs, then activate), functions and compute are create-or-replace.
+  It is **pure upsert and never prunes**, so declarative and imperative (CLI/API)
+  management coexist. `--dry-run` prints the plan and mutates nothing.
+- **Kubernetes `Site`/`Function` CRDs gain an optional `project`** — a k8s-managed site
+  reconciles to its project's control-plane API (empty ⇒ `default`).
 - **Function-to-function invoke for site handlers (mesh orchestrator).** A site
   handler (a `routing.handlers` route) reached over HTTP with the end user's bearer
   can now call sibling functions **in-process** via the `invoke` capability, exactly
@@ -19,6 +39,24 @@ versions.
   forwarded to the callee unchanged.
 
 ### Changed
+- **BREAKING (data model): every resource is owned by a project; the store is
+  re-keyed under `project/<proj>/…`.** Sites, functions, compute, workflows,
+  invocations, metering, aliases, and domain verifications are now stored per project
+  (content-addressed bodies — manifests, blobs, site/compute config — stay global and
+  deduped; the domain-routing index stays a global key whose value carries the owning
+  `(project, site)`). Pre-existing resources belong to the reserved `default` project,
+  so a single-site user's URLs and behaviour are unchanged (`/api/sites/<name>` and an
+  omitted `--project` are byte-identical to before). Garbage collection now unions
+  reachability across *all* projects, so a blob shared between two projects is never
+  collected while either still references it.
+  **Migration required.** An existing (pre-0.2.0) store must be migrated to the
+  project-scoped layout before it will serve: run `boatramp migrate` (supports
+  `--dry-run`, a `--stage` copy-then-soak, and `--finalize`), or start the server with
+  `serve --auto-migrate`. The migration is online, idempotent, and resumable
+  (copy-before-delete with a `schema/version` cursor); no content-addressed body ever
+  moves — only the mutable per-name pointers re-key and the domain index values are
+  rewritten to `{project: "default", site}`. `serve` refuses an unmigrated store unless
+  `--auto-migrate` is set.
 - **BREAKING (compute): the root-filesystem source is a typed `RootSource`.**
   `ComputeSpec.rootfs` was one overloaded string that meant a different thing per
   backend — an OCI image reference (docker/cloudflare), a tar rootfs archive (native
