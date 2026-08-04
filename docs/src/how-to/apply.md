@@ -36,7 +36,12 @@ left untouched. There is deliberately no `--prune`.
     ],
 
     functions: [
-        ( name: "resize", component: "resize.wasm", runtime: "wasm" ),
+        (
+            name: "resize", component: "resize.wasm", runtime: "wasm",
+            imports: ["sql", "invoke"],           // requested host capabilities
+            env: { "IDP_JWKS": "https://idp/.well-known/jwks.json" },
+            invoke_targets: ["thumbnail", "img-*"],  // deny-by-default invoke allowlist
+        ),
     ],
 
     compute: [
@@ -55,9 +60,12 @@ Each `sites[]` entry is a slug plus:
 - `config` — the mutable [`SiteConfig`](../reference/siteconfig.md) (domains, access,
   handlers enablement …), PUT after the deployment activates.
 
-`functions[]` mirror `boatramp function deploy` (a component path plus an optional
-`runtime` and `webhook_secret_env`). `compute[]` carry a raw `spec` PUT straight to
-the compute endpoint, the same body `boatramp compute set` builds.
+`functions[]` mirror `boatramp function deploy`: a `component` path plus an optional
+`runtime`, `webhook_secret_env`, and — parity with a site handler — `imports`
+(requested capabilities like `sql` / `invoke`), `env` (static, non-secret vars),
+`invoke_targets` (the deny-by-default function-to-function allowlist), and `limits`.
+`compute[]` carry a raw `spec` PUT straight to the compute endpoint, the same body
+`boatramp compute set` builds.
 
 ## 2. Preview the plan
 

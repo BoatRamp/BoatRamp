@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use boatramp_core::config::{DeployConfig, SiteConfig};
+use boatramp_core::config::{DeployConfig, HandlerLimits, SiteConfig};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -122,6 +122,20 @@ pub struct ApplyFunction {
     /// (never the secret itself).
     #[serde(default)]
     pub webhook_secret_env: Option<String>,
+    /// Requested host capabilities (`sql`, `wasi:keyvalue`, `invoke`, …), gated by
+    /// the function import policy — parity with a site handler's `imports`.
+    #[serde(default)]
+    pub imports: Vec<String>,
+    /// Static, non-secret environment variables passed to the function.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Function-to-function invoke allowlist (deny-by-default; `*` wildcards). Only
+    /// consulted when `imports` contains `invoke`.
+    #[serde(default)]
+    pub invoke_targets: Vec<String>,
+    /// Optional resource limits (memory / timeout / fuel).
+    #[serde(default)]
+    pub limits: Option<HandlerLimits>,
 }
 
 /// One compute workload in the manifest.
@@ -346,6 +360,18 @@ async fn apply_function(
     if let Some(secret_env) = &function.webhook_secret_env {
         cfg.insert("webhook".to_string(), json!({ "secret_env": secret_env }));
     }
+    if !function.imports.is_empty() {
+        cfg.insert("imports".to_string(), json!(function.imports));
+    }
+    if !function.env.is_empty() {
+        cfg.insert("env".to_string(), json!(function.env));
+    }
+    if !function.invoke_targets.is_empty() {
+        cfg.insert("invoke_targets".to_string(), json!(function.invoke_targets));
+    }
+    if let Some(limits) = &function.limits {
+        cfg.insert("limits".to_string(), json!(limits));
+    }
     // Top-level functions carry their own independent version line.
     let body = json!({
         "component": hash,
@@ -429,7 +455,12 @@ mod tests {
                     ),
                 ],
                 functions: [
-                    ( name: "resize", component: "resize.wasm", runtime: "wasm" ),
+                    (
+                        name: "resize", component: "resize.wasm", runtime: "wasm",
+                        imports: ["sql", "invoke"],
+                        env: { "IDP_JWKS": "https://idp/.well-known/jwks.json" },
+                        invoke_targets: ["thumbnail", "img-*"],
+                    ),
                 ],
                 compute: [
                     ( name: "api", spec: { "replicas": 2 } ),
@@ -461,9 +492,18 @@ mod tests {
         );
 
         assert_eq!(manifest.functions.len(), 1);
-        assert_eq!(manifest.functions[0].name, "resize");
-        assert_eq!(manifest.functions[0].component, "resize.wasm");
-        assert_eq!(manifest.functions[0].runtime.as_deref(), Some("wasm"));
+        let f = &manifest.functions[0];
+        assert_eq!(f.name, "resize");
+        assert_eq!(f.component, "resize.wasm");
+        assert_eq!(f.runtime.as_deref(), Some("wasm"));
+        // The declarative surface now carries a function's capabilities, env, and
+        // invoke allowlist — parity with a site handler (the apply.cfg gap).
+        assert_eq!(f.imports, ["sql", "invoke"]);
+        assert_eq!(
+            f.env.get("IDP_JWKS").map(String::as_str),
+            Some("https://idp/.well-known/jwks.json")
+        );
+        assert_eq!(f.invoke_targets, ["thumbnail", "img-*"]);
 
         assert_eq!(manifest.compute.len(), 1);
         assert_eq!(manifest.compute[0].name, "api");
