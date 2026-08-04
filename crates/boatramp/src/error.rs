@@ -23,6 +23,9 @@ pub enum CliError {
     /// The `sync` command.
     #[error(transparent)]
     Sync(#[from] crate::sync::Error),
+    /// The `apply` command.
+    #[error(transparent)]
+    Apply(#[from] crate::apply::Error),
     /// The `build` / `validate` commands.
     #[error(transparent)]
     Build(#[from] crate::build::Error),

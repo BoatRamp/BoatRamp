@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 /// RON parse options shared by both loaders: `implicit_some` lets optional fields
 /// be written as bare values (`server: "..."`, not `Some("...")`).
-fn ron_options() -> ron::Options {
+pub(crate) fn ron_options() -> ron::Options {
     ron::Options::default().with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
 }
 

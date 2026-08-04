@@ -339,6 +339,17 @@ fn sanitize(url: &str) -> String {
         .collect()
 }
 
+/// The control plane's reply to a deployment negotiation (`POST …/deployments`):
+/// the new deployment id and the blob hashes it is still missing (the ones the
+/// client must upload). Shared by `sync` and `apply`.
+#[derive(Debug, Deserialize)]
+pub struct CreateDeploymentResponse {
+    /// The created deployment's id.
+    pub id: String,
+    /// Blob hashes the server does not yet have and needs uploaded.
+    pub missing: Vec<String>,
+}
+
 /// An authenticated control-plane connection: an [`ApiClient`] bound to a
 /// resolved server base URL. The request methods key off it, so the client and
 /// server base are threaded once (at construction) instead of by hand at every
@@ -366,6 +377,26 @@ impl ControlPlane {
             "sites".to_string()
         } else {
             format!("projects/{}/sites", self.project)
+        }
+    }
+
+    /// The function-collection URL segment: `functions` for the default project
+    /// (byte-identical legacy `/api/functions/...`), else `projects/<proj>/functions`.
+    fn functions_seg(&self) -> String {
+        if self.project == boatramp_core::project::DEFAULT_PROJECT {
+            "functions".to_string()
+        } else {
+            format!("projects/{}/functions", self.project)
+        }
+    }
+
+    /// The compute-collection URL segment: `compute` for the default project
+    /// (byte-identical legacy `/api/compute/...`), else `projects/<proj>/compute`.
+    fn compute_seg(&self) -> String {
+        if self.project == boatramp_core::project::DEFAULT_PROJECT {
+            "compute".to_string()
+        } else {
+            format!("projects/{}/compute", self.project)
         }
     }
 
@@ -560,6 +591,108 @@ impl ControlPlane {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// Negotiate a new deployment for a site (project-scoped): POST the manifest;
+    /// the server stores it and replies with the blob hashes it is still missing.
+    /// `query` carries deploy provenance (source/branch/author/message/tags).
+    pub async fn create_deployment(
+        &self,
+        site: &str,
+        manifest: &Manifest,
+        query: &[(&str, String)],
+    ) -> Result<CreateDeploymentResponse> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .post(format!("{server}/api/{seg}/{site}/deployments"))
+            .query(query)
+            .json(manifest)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Upload one missing blob by its content-address (streams a `File`, sends a
+    /// `Memory` variant's bytes). Idempotent server-side. Mirrors the two-arm body
+    /// of [`crate::sync::upload_blob`] but returns [`ClientError`] (its `File`/
+    /// `Memory` open-and-send maps cleanly onto our `Io`/`Http` variants).
+    pub async fn upload_blob_source(
+        &self,
+        hash: &str,
+        source: &crate::sync::BlobSource,
+    ) -> Result<()> {
+        use crate::sync::BlobSource;
+        let Self {
+            http, base: server, ..
+        } = self;
+        let body = match source {
+            BlobSource::File(path) => {
+                let file = tokio::fs::File::open(path).await?;
+                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file))
+            }
+            BlobSource::Memory(bytes) => reqwest::Body::from(bytes.clone()),
+        };
+        http.put(format!("{server}/api/blobs/{hash}"))
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Deploy (create/replace) a top-level function (project-scoped): PUT the
+    /// function record body (`{ component, config, lifecycle }`). Returns the
+    /// server's stored record verbatim.
+    pub async fn deploy_function(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let seg = self.functions_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .put(format!("{server}/api/{seg}/{name}"))
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Create/replace a compute workload (project-scoped): PUT the
+    /// `PutComputeRequest`-shaped `body` straight to the server (it validates).
+    /// Returns the server's stored record verbatim.
+    pub async fn put_compute(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let seg = self.compute_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .put(format!("{server}/api/{seg}/{name}"))
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     /// Point a named alias at a deployment id.

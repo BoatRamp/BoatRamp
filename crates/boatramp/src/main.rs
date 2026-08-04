@@ -27,6 +27,7 @@ mod access;
 #[cfg(feature = "acme-dns")]
 mod acme_dns;
 mod alias;
+mod apply;
 mod authcmd;
 mod blob;
 mod build;
@@ -96,6 +97,9 @@ enum Command {
     Serve(serve::ServeArgs),
     /// Build (optional) and publish a folder as a new atomic deployment.
     Sync(sync::SyncArgs),
+    /// Reconcile a whole project (sites + functions + compute) to a declarative
+    /// manifest (`apply.cfg`); `--dry-run` prints the plan.
+    Apply(apply::ApplyArgs),
     /// Run the configured build command only.
     Build(build::BuildArgs),
     /// Bundle JS/TS (Rolldown) + CSS (lightningcss) in-process (`bundler` feature).
@@ -388,6 +392,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Mcp(_) => unreachable!("handled above"),
         Command::Completions { .. } | Command::Man => unreachable!("handled above"),
         Command::Sync(args) => sync::run(args, &config).await?,
+        Command::Apply(args) => apply::run(args, &config).await?,
         Command::Build(args) => build::run(args, &config).await?,
         Command::Bundle(args) => bundle::run(args, &config).await?,
         Command::Validate(args) => build::validate(args)?,

@@ -16,7 +16,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use boatramp_core::deploy::{FileEntry, Manifest, Variant};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
@@ -129,12 +128,6 @@ pub struct SyncArgs {
     tags: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateDeploymentResponse {
-    id: String,
-    missing: Vec<String>,
-}
-
 /// Entry point for `boatramp sync`.
 pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) =
@@ -201,7 +194,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
 
     // Negotiate the deployment: server stores the manifest and tells us which
     // blobs it still needs.
-    let created: CreateDeploymentResponse = client
+    let created: crate::client::CreateDeploymentResponse = client
         .post(format!("{server}/api/sites/{site}/deployments"))
         .query(&query)
         .json(&manifest)
@@ -344,7 +337,7 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 
 /// Where a blob's bytes come from when uploading: streamed from disk (identity
 /// content) or held in memory (a precompressed variant produced at sync).
-enum BlobSource {
+pub(crate) enum BlobSource {
     File(PathBuf),
     Memory(Vec<u8>),
 }
@@ -352,7 +345,7 @@ enum BlobSource {
 /// Walk `dir`, hashing each file into a manifest (with precompressed `br`/`gzip`
 /// variants for compressible types) and recording where each unique blob — both
 /// identity and variant — can be read from locally for upload.
-async fn build_manifest(dir: &Path) -> Result<(Manifest, HashMap<String, BlobSource>)> {
+pub(crate) async fn build_manifest(dir: &Path) -> Result<(Manifest, HashMap<String, BlobSource>)> {
     let mut manifest = Manifest::default();
     let mut blobs: HashMap<String, BlobSource> = HashMap::new();
 
@@ -490,7 +483,7 @@ async fn hash_file(path: &Path) -> Result<(String, u64)> {
 }
 
 /// Upload a blob to the server, streaming from disk or sending in-memory bytes.
-async fn upload_blob(
+pub(crate) async fn upload_blob(
     client: &crate::client::ApiClient,
     server: &str,
     hash: &str,
