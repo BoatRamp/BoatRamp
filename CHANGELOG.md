@@ -69,7 +69,10 @@ versions.
   (copy-before-delete with a `schema/version` cursor); no content-addressed body ever
   moves — only the mutable per-name pointers re-key and the domain index values are
   rewritten to `{project: "default", site}`. `serve` refuses an unmigrated store unless
-  `--auto-migrate` is set.
+  `--auto-migrate` is set. The store migration is now a **versioned migration
+  mechanism** — an ordered registry of forward-only migrations the engine walks by a
+  monotonic `schema/version`, composed of reusable copy/verify/rewrite steps — so future
+  breaking store changes are additive registry entries, not one-off codemods.
 - **BREAKING (compute): the root-filesystem source is a typed `RootSource`.**
   `ComputeSpec.rootfs` was one overloaded string that meant a different thing per
   backend — an OCI image reference (docker/cloudflare), a tar rootfs archive (native
