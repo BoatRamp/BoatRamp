@@ -127,23 +127,47 @@ pub enum PreviewSqlMode {
 /// storage-agnostic.
 #[async_trait]
 pub trait SqlBackends: Send + Sync {
-    /// Open (or reuse) the database called `name` for `site` (the empty name is
-    /// the site's default database). Per-site isolation is the implementation's
-    /// responsibility — a handler can only ever reach its own site's data.
-    async fn database(&self, site: &str, name: &str) -> Result<Arc<dyn SqlBackend>, SqlError>;
+    /// Open (or reuse) the database called `name` for `site` within tenant
+    /// `project` (the empty name is the site's default database). Per-tenant +
+    /// per-site isolation is the implementation's responsibility — a handler can
+    /// only ever reach its own project's site's data.
+    ///
+    /// `project` and `site` are **separately** validated by the implementation
+    /// and composed internally via
+    /// [`ProjectRef::qualified`](crate::project::ProjectRef::qualified) (the
+    /// reserved `default` project keeps the byte-identical, pre-project identity
+    /// for back-compat; any other project prefixes `"<project>/"`). Passing a
+    /// single already-composed `"<project>/<site>"` string as `site` would be
+    /// rejected — the two names are kept apart so each is validated on its own.
+    async fn database(
+        &self,
+        project: &str,
+        site: &str,
+        name: &str,
+    ) -> Result<Arc<dyn SqlBackend>, SqlError>;
 
     /// Open (or reuse) the database for a **preview** deployment `preview` of
-    /// `site`. The implementation applies its configured [`PreviewSqlMode`].
-    /// The default is [`PreviewSqlMode::Empty`] — an isolated database keyed by
-    /// site+preview, so a preview can never touch live state.
+    /// `site` within tenant `project`. The implementation applies its configured
+    /// [`PreviewSqlMode`]. The default is [`PreviewSqlMode::Empty`] — an isolated
+    /// database keyed by project+site+preview, so a preview can never touch live
+    /// state. The default composition qualifies `site` by `project` first, then
+    /// appends the trusted `_preview/{preview}` suffix (both from validated
+    /// parts), and delegates to [`database`](Self::database) under the reserved
+    /// `default` project so the already-qualified identity is not re-qualified.
     async fn preview_database(
         &self,
+        project: &str,
         site: &str,
         name: &str,
         preview: &str,
     ) -> Result<Arc<dyn SqlBackend>, SqlError> {
-        self.database(&format!("{site}/_preview/{preview}"), name)
-            .await
+        let qualified = crate::project::ProjectRef::new(project).qualified(site);
+        self.database(
+            crate::project::DEFAULT_PROJECT,
+            &format!("{qualified}/_preview/{preview}"),
+            name,
+        )
+        .await
     }
 }
 

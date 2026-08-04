@@ -2404,6 +2404,105 @@ mod tests {
             .is_none());
     }
 
+    /// BR-TEN-1 (Critical) gate: a same-named **function** in two tenant
+    /// projects must NOT share one guest kv namespace. Two functions both named
+    /// `store` — one in `acme`, one in `globex` — each writes to guest kv key
+    /// `hits` (via the committed `kv-counter` fixture, whose default bucket key
+    /// is `hits`). We assert the writes land under DISTINCT host kv keys
+    /// (`hkv/acme/fn/store/hits` vs `hkv/globex/fn/store/hits`) and that neither
+    /// aliases the bare pre-project key (`hkv/fn/store/hits`). A third `store`
+    /// under the reserved `default` project is asserted to keep exactly that bare
+    /// key (back-compat: no data migration for a pre-project store).
+    ///
+    /// This is a real end-to-end kv-isolation assertion driven through the live
+    /// engine (`execute_function`) with the existing `kv-counter` fixture — the
+    /// preferred form over unit-testing scope construction — because that
+    /// exercises the actual `build_function_bindings` scope path a guest sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_kv_is_isolated_between_same_named_functions_in_two_projects() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::function::{
+            Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
+        };
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use futures::StreamExt;
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // The `kv-counter` fixture increments a "hits" counter in its default kv
+        // bucket, so a single invocation writes `<scope>/hits`.
+        let hash = boatramp_core::deploy::sha256_hex(KV_COUNTER);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(KV_COUNTER)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+
+        // A single `store` function definition (imports `wasi:keyvalue`); the
+        // guest binding scope comes from the `project` passed to
+        // `execute_function`, not from the function's `owner`, so one definition
+        // suffices to prove per-tenant scoping.
+        let store = Function {
+            name: "store".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: FunctionConfig {
+                imports: vec!["wasi:keyvalue".into()],
+                ..Default::default()
+            },
+        };
+        let acme = ProjectRef::new("acme");
+        let globex = ProjectRef::new("globex");
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+        let inner = rt.inner.as_ref().unwrap();
+
+        let request = || {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // Invoke `store` in each of the two non-default projects, plus once in
+        // `default`, all named identically.
+        let component = store.resolve(&store.active).unwrap().to_owned();
+        for project in [acme, globex, ProjectRef::DEFAULT] {
+            let (response, _) =
+                execute_function(inner, &deploy, project, &store, &component, request(), 0).await;
+            assert!(response.status().is_success(), "invocation should succeed");
+        }
+
+        // The three writes landed under THREE distinct host kv keys: the two
+        // tenants are project-qualified, and `default` keeps the bare key.
+        assert_eq!(
+            kv.get("hkv/acme/fn/store/hits").await.unwrap(),
+            Some(b"1".to_vec()),
+            "acme's write must be tenant-qualified"
+        );
+        assert_eq!(
+            kv.get("hkv/globex/fn/store/hits").await.unwrap(),
+            Some(b"1".to_vec()),
+            "globex's write must be tenant-qualified"
+        );
+        assert_eq!(
+            kv.get("hkv/fn/store/hits").await.unwrap(),
+            Some(b"1".to_vec()),
+            "the default project must keep the byte-identical pre-project key"
+        );
+        // Sanity: had the fix regressed, all three would have collided on the
+        // bare key and it would read "3", not "1".
+    }
+
     /// The cron driver: a due cron fires its route (loopback), once per
     /// matching minute (dedup), and with `overlap: Skip` a fire is skipped while
     /// a previous one is still running.

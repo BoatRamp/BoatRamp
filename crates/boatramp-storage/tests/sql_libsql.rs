@@ -52,8 +52,8 @@ async fn factory_local_gives_each_site_its_own_file() {
         rows.rows.into_iter().flatten().collect()
     }
 
-    let alpha = backends.database("alpha", "").await.unwrap();
-    let beta = backends.database("beta", "").await.unwrap();
+    let alpha = backends.database("default", "alpha", "").await.unwrap();
+    let beta = backends.database("default", "beta", "").await.unwrap();
     write_secret(alpha.as_ref(), "alpha-secret").await;
     write_secret(beta.as_ref(), "beta-secret").await;
     assert_eq!(
@@ -66,7 +66,7 @@ async fn factory_local_gives_each_site_its_own_file() {
     );
 
     // A site's named database is a separate file from its default.
-    let alpha_logs = backends.database("alpha", "logs").await.unwrap();
+    let alpha_logs = backends.database("default", "alpha", "logs").await.unwrap();
     write_secret(alpha_logs.as_ref(), "alpha-logs-secret").await;
     assert_eq!(
         read_secret(alpha_logs.as_ref()).await,
@@ -208,10 +208,13 @@ async fn factory_gives_each_site_its_own_namespace() {
     }
 
     let alpha = backends
-        .database("alpha", "")
+        .database("default", "alpha", "")
         .await
         .expect("alpha namespace");
-    let beta = backends.database("beta", "").await.expect("beta namespace");
+    let beta = backends
+        .database("default", "beta", "")
+        .await
+        .expect("beta namespace");
     write_secret(alpha.as_ref(), "alpha-secret").await;
     write_secret(beta.as_ref(), "beta-secret").await;
 
@@ -227,7 +230,7 @@ async fn factory_gives_each_site_its_own_namespace() {
 
     // A site's named database is a different namespace from its default.
     let alpha_logs = backends
-        .database("alpha", "logs")
+        .database("default", "alpha", "logs")
         .await
         .expect("alpha logs namespace");
     write_secret(alpha_logs.as_ref(), "alpha-logs-secret").await;

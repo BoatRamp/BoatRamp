@@ -33,10 +33,19 @@ pub(super) async fn dispatch_handler(
     // land in their own namespace and can never touch live state. Grants are
     // unaffected — they come from the site's HandlersSiteConfig,
     // so a preview can do only what the site already allows.
-    let scope = match preview {
+    //
+    // The base identity is then **project-qualified** (BR-TEN-1): a same-named
+    // site in two tenant projects must not share one kv/blob/messaging/logs
+    // namespace or one concurrency semaphore. `default` → byte-identical to the
+    // pre-project layout (no data migration); any other project prefixes
+    // `"<project>/"`. SQL is resolved separately below (its provider qualifies
+    // internally, so it takes the raw `site` + `project`, not this scope).
+    let project_ref = boatramp_core::project::ProjectRef::new(project);
+    let base = match preview {
         Some(id) => format!("{site}/_preview/{id}"),
         None => site.to_string(),
     };
+    let scope = project_ref.qualified(&base);
     // Add the standard reverse-proxy fields the guest expects (X-Forwarded-*)
     // *before* the URI rewrite drops the public host context. This is the only
     // request mutation the host makes beyond the URI; no application semantics.
@@ -259,9 +268,12 @@ pub(super) async fn read_blob_fully(deploy: &DeployStore, hash: &str) -> Result<
 /// Grant the per-site bindings the handler requested *and* the site allows
 /// (effective imports = deploy ∩ site), served from the runtime's backends.
 ///
-/// `scope` is the binding *identity* (the site for live serving, or
-/// `{site}/_preview/{id}` for a preview) — kv/blob land under it, isolated. SQL
-/// is resolved against the real `site`: for a preview the runtime applies the
+/// `scope` is the binding *identity* — the project-qualified site for live
+/// serving (`{site}` for the `default` project, `{project}/{site}` otherwise),
+/// or its `.../_preview/{id}` form for a preview — kv/blob/messaging/logs land
+/// under it, tenant- and preview-isolated. SQL is resolved against the raw
+/// `project` + `site` (the provider qualifies + validates them itself, so it is
+/// *not* handed the composite `scope`): for a preview the runtime applies the
 /// operator's configured [`PreviewSqlMode`](boatramp_core::sql::PreviewSqlMode)
 /// (empty / branch / shared) rather than blindly using the scoped name.
 #[cfg(feature = "handlers")]
@@ -295,9 +307,18 @@ pub(super) async fn build_bindings(
         // gets one per the configured preview mode. A provider error is logged
         // and left ungranted so the guest sees `access denied`, not a 500.
         if let Some(provider) = &inner.sql {
+            // The SQL provider validates + qualifies `project` and `site`
+            // internally (it rejects a `/`-bearing composite `site`), so pass the
+            // *raw* project + bare site here — never the already-qualified
+            // `scope`. This tenant-isolates the SQL identity the same way as
+            // kv/blob above, without double-qualifying.
             let opened = match preview {
-                Some(id) => provider.preview_database(site, "", id).await,
-                None => provider.database(site, "").await,
+                Some(id) => {
+                    provider
+                        .preview_database(project.as_str(), site, "", id)
+                        .await
+                }
+                None => provider.database(project.as_str(), site, "").await,
             };
             match opened {
                 Ok(backend) => bindings = bindings.with_sql("", backend),

@@ -193,9 +193,12 @@ pub(super) async fn spawn_blob_watcher(
     function: boatramp_core::function::Function,
     prefix: &str,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    // The function's blobstore lives under `hblob/fn/<name>/`; the trigger prefix
-    // is relative to that namespace (same key the provisioner + ledger use).
-    let storage_prefix = blob_storage_prefix(&function.name, prefix);
+    // The function's blobstore lives under its **project-qualified** namespace
+    // (`hblob/fn/<name>/` for `default`, `hblob/{project}/fn/<name>/` otherwise);
+    // the trigger prefix is relative to it (same key the provisioner + ledger
+    // use, so a watcher and the ledger/provisioner agree).
+    let project_ref = ProjectRef::new(&project);
+    let storage_prefix = blob_storage_prefix(project_ref, &function.name, prefix);
     let mut stream = match inner.storage.watch(&storage_prefix).await {
         Ok(Some(stream)) => stream,
         Ok(None) => return None,
@@ -204,7 +207,10 @@ pub(super) async fn spawn_blob_watcher(
             return None;
         }
     };
-    let namespace = format!("hblob/fn/{}/", function.name);
+    let namespace = format!(
+        "hblob/{}/",
+        project_ref.qualified(&format!("fn/{}", function.name))
+    );
     Some(tokio::spawn(async move {
         use futures::StreamExt;
         while let Some(change) = stream.next().await {

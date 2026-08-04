@@ -315,7 +315,10 @@ pub(super) async fn execute_function(
     depth: u32,
 ) -> (Response, u64) {
     // Concurrency quota (held through the head, mirroring the site permit).
-    let _permit = match acquire_function_permit(inner, &function.name, &function.config.quota) {
+    // Keyed by the **project-qualified** function identity so a same-named
+    // function in another tenant can't starve this one's semaphore.
+    let permit_key = project.qualified(&function.name);
+    let _permit = match acquire_function_permit(inner, &permit_key, &function.config.quota) {
         Ok(permit) => permit,
         Err(()) => {
             return (
@@ -332,8 +335,17 @@ pub(super) async fn execute_function(
         Ok(bytes) => bytes,
         Err(response) => return (response, 0),
     };
-    let scope = format!("fn/{}", function.name);
-    let bindings = build_function_bindings(inner, project, &scope, &function.config, depth).await;
+    // Project-qualify the guest binding scope (BR-TEN-1): a same-named function
+    // in two tenants must not share one kv/blob/messaging/logs namespace.
+    // `default` → bare `fn/<name>` (byte-identical, back-compat).
+    let fn_ident = format!("fn/{}", function.name);
+    let scope = project.qualified(&fn_ident);
+    // The SQL provider qualifies + validates `project` + `site` itself, so it
+    // takes the *raw* `fn/<name>` identity (it composes the same `default →
+    // fn/<name>`, `non-default → {project}/fn/<name>` the `scope` above carries)
+    // — never the already-qualified `scope`, to avoid double-qualifying.
+    let bindings =
+        build_function_bindings(inner, project, &scope, &fn_ident, &function.config, depth).await;
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
@@ -372,6 +384,7 @@ async fn build_function_bindings(
     inner: &HandlerRuntimeInner,
     project: ProjectRef<'_>,
     scope: &str,
+    sql_site: &str,
     config: &boatramp_core::function::FunctionConfig,
     depth: u32,
 ) -> boatramp_handlers::Bindings {
@@ -386,7 +399,15 @@ async fn build_function_bindings(
     }
     if granted("sql") {
         if let Some(provider) = &inner.sql {
-            match provider.database(scope, "").await {
+            // `sql_site` is the *raw* `fn/<name>` identity; the provider
+            // qualifies it by `project` internally (default → `fn/<name>`,
+            // else `{project}/fn/<name>` — matching `scope`) and validates it
+            // segment-wise, so we pass the raw identity, never the already
+            // project-qualified `scope`. (Before this fix the function path
+            // passed the `/`-bearing `fn/<name>` as the `site` arg, which the
+            // provider's `validate_db_name` rejected — function SQL was silently
+            // ungranted; segment-wise validation now accepts the composite.)
+            match provider.database(project.as_str(), sql_site, "").await {
                 Ok(backend) => bindings = bindings.with_sql("", backend),
                 Err(err) => tracing::warn!(scope, %err, "opening function SQL database failed"),
             }
@@ -788,7 +809,10 @@ fn build_stored_request(inv: &boatramp_core::function::Invocation) -> Request {
 
 /// The per-function lock serializing its metering + rate-limit read-modify-write,
 /// created on first use so concurrent invocations of one function can't lose an
-/// update (the KV is get/put, not atomic-increment).
+/// update (the KV is get/put, not atomic-increment). `name` is the
+/// **project-qualified** function identity (the callers pass
+/// `project.qualified(&function.name)`), so a same-named function in two tenants
+/// gets two independent locks.
 #[cfg(feature = "handlers")]
 fn function_meter_lock(inner: &HandlerRuntimeInner, name: &str) -> Arc<tokio::sync::Mutex<()>> {
     inner
@@ -802,7 +826,9 @@ fn function_meter_lock(inner: &HandlerRuntimeInner, name: &str) -> Arc<tokio::sy
 
 /// Acquire a permit from the function's concurrency semaphore (created on first
 /// use) when it sets a `max_concurrent` quota; `Ok(None)` if uncapped, `Err(())`
-/// when at the limit (the caller turns that into a `503`).
+/// when at the limit (the caller turns that into a `503`). `name` is the
+/// **project-qualified** function identity (`project.qualified(&function.name)`),
+/// so a same-named function in another tenant can't starve this one's budget.
 #[cfg(feature = "handlers")]
 fn acquire_function_permit(
     inner: &HandlerRuntimeInner,
@@ -835,7 +861,11 @@ async fn admit_by_quota(
     if quota.max_invocations.is_none() {
         return Ok(());
     }
-    let lock = function_meter_lock(inner, &function.name);
+    // Serialize on the **project-qualified** function identity so a same-named
+    // function in another tenant can't share (and contend on) this lock. The
+    // metering *store* keys are already project-scoped; this only fixes the
+    // in-memory lock key.
+    let lock = function_meter_lock(inner, &project.qualified(&function.name));
     let _guard = lock.lock().await;
     let now = now_unix();
     let mut metering = match deploy.get_metering(project, &function.name).await {
@@ -867,7 +897,9 @@ async fn record_metering(
     function: &str,
     sample: &boatramp_core::function::MeteringSample,
 ) {
-    let lock = function_meter_lock(inner, function);
+    // Project-qualified lock key (see `admit_by_quota`) — the metering store
+    // itself is already project-scoped, this just isolates the in-memory lock.
+    let lock = function_meter_lock(inner, &project.qualified(function));
     let _guard = lock.lock().await;
     let now = now_unix();
     let mut metering = match deploy.get_metering(project, function).await {
@@ -942,7 +974,7 @@ pub(super) async fn put_trigger_handler(
         // provisioned per the operator tier before the watch can fire. A
         // self-watching backend (fs) has no provider and needs nothing.
         if let Some(provider) = inner.watch_provider.get() {
-            let storage_prefix = blob_storage_prefix(&name, prefix);
+            let storage_prefix = blob_storage_prefix(project.as_ref(), &name, prefix);
             let tier = inner.provision_tier.get().copied().unwrap_or_default();
             match boatramp_core::blob_provision::ensure_watch(
                 provider.as_ref(),
@@ -1017,7 +1049,7 @@ pub(super) async fn delete_trigger_handler(
         if let (boatramp_core::function::TriggerKind::Blob { prefix }, Some(provider)) =
             (&trigger.kind, inner.watch_provider.get())
         {
-            let storage_prefix = blob_storage_prefix(&name, prefix);
+            let storage_prefix = blob_storage_prefix(project.as_ref(), &name, prefix);
             if let Ok(Some(record)) = deploy
                 .get_managed_notification(project.as_ref(), &name, &storage_prefix)
                 .await
@@ -1041,13 +1073,22 @@ pub(super) async fn delete_trigger_handler(
 }
 
 /// The full storage key prefix a function's `Blob { prefix }` trigger watches:
-/// the function's blobstore namespace (`hblob/fn/<name>/`) joined with the
-/// trigger-relative prefix. The provisioner (bucket-notification filter), the
-/// notification ledger, and the `spawn_blob_watcher` consumer all key off this,
-/// so they must agree.
+/// the function's **project-qualified** blobstore namespace
+/// (`hblob/{qualified(project, fn/<name>)}/` — `hblob/fn/<name>/` for the
+/// `default` project, `hblob/{project}/fn/<name>/` otherwise, matching the
+/// function's blob binding) joined with the trigger-relative prefix. The
+/// provisioner (bucket-notification filter), the notification ledger, and the
+/// `spawn_blob_watcher` consumer all key off this, so they must agree.
 #[cfg(feature = "handlers")]
-pub(super) fn blob_storage_prefix(function: &str, trigger_prefix: &str) -> String {
-    format!("hblob/fn/{function}/{trigger_prefix}")
+pub(super) fn blob_storage_prefix(
+    project: ProjectRef<'_>,
+    function: &str,
+    trigger_prefix: &str,
+) -> String {
+    format!(
+        "hblob/{}/{trigger_prefix}",
+        project.qualified(&format!("fn/{function}"))
+    )
 }
 
 /// Dispatch a function's stored triggers on a scheduler tick: fire due **cron**
@@ -1140,7 +1181,11 @@ async fn dispatch_function_queue(
     let Some(messaging) = inner.messaging.clone() else {
         return;
     };
-    let namespaced = format!("fn/{}/{topic}", function.name);
+    // Project-qualify the substrate topic so a same-named function's queue in
+    // two tenants stays distinct (matches the function's messaging binding
+    // namespace, `{qualified(project, fn/<name>)}/`). `default` → bare
+    // `fn/<name>/<topic>` (back-compat).
+    let namespaced = project.qualified(&format!("fn/{}/{topic}", function.name));
     let batch = match messaging
         .claim(
             &namespaced,

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::sql_placeholders::PlaceholderDialect;
 use async_trait::async_trait;
 use boatramp_core::deploy::sha256_hex;
+use boatramp_core::project::ProjectRef;
 use boatramp_core::sql::{
     PreviewSqlMode, SqlBackend, SqlBackends, SqlError, SqlRows, SqlTransaction, SqlValue,
 };
@@ -360,7 +361,10 @@ impl LibsqlSqlBackends {
         }
     }
 
-    /// The binding identity for a preview deployment's database.
+    /// The binding identity for a preview deployment's database. `site` here is
+    /// the **already project-qualified** site identity (bare `site` for the
+    /// `default` project, `"<project>/<site>"` otherwise); both it and `preview`
+    /// come from separately-validated parts, so the composed scope is safe.
     fn preview_scope(site: &str, preview: &str) -> String {
         format!("{site}/_preview/{preview}")
     }
@@ -446,36 +450,50 @@ impl LibsqlSqlBackends {
 
 #[async_trait]
 impl SqlBackends for LibsqlSqlBackends {
-    async fn database(&self, site: &str, name: &str) -> Result<Arc<dyn SqlBackend>, SqlError> {
-        validate_db_name("site", site)?;
+    async fn database(
+        &self,
+        project: &str,
+        site: &str,
+        name: &str,
+    ) -> Result<Arc<dyn SqlBackend>, SqlError> {
+        // `project` is a single path/namespace component (no `/`); `site` is a
+        // site identity that may be a **trusted composite** the caller already
+        // built from validated parts (the `fn/<name>` function-SQL identity — a
+        // literal `fn` segment plus the function name — is the one case that
+        // carries a `/`; each `/`-separated segment is validated on its own).
+        // They are then composed into the internal identity: the bare `site` for
+        // the reserved `default` project (byte-identical to the pre-project
+        // layout — no migration) else `"<project>/<site>"`, which `local_path`
+        // joins as subdirs and `namespace`/`dns_token` hashes.
+        validate_db_name("project", project)?;
+        validate_site_ident(site)?;
         validate_db_name("database", name)?;
-        let key = (site.to_string(), name.to_string());
-        let mut cache = self.cache.lock().await;
-        if let Some(backend) = cache.get(&key) {
-            return Ok(backend.clone());
-        }
-        let backend: Arc<dyn SqlBackend> = Arc::new(self.open_one(site, name).await?);
-        cache.insert(key, backend.clone());
-        Ok(backend)
+        let ident = ProjectRef::new(project).qualified(site);
+        self.database_ident(&ident, name).await
     }
 
     async fn preview_database(
         &self,
+        project: &str,
         site: &str,
         name: &str,
         preview: &str,
     ) -> Result<Arc<dyn SqlBackend>, SqlError> {
-        validate_db_name("site", site)?;
+        validate_db_name("project", project)?;
+        validate_site_ident(site)?;
         validate_db_name("database", name)?;
         validate_db_name("preview", preview)?;
+        // Project-qualify the site first (default → bare, back-compat), so the
+        // preview namespace nests under the tenant's site identity.
+        let ident = ProjectRef::new(project).qualified(site);
         match self.preview_mode {
             // The preview shares the site's live database (reads + writes real
             // data). No isolation — opt in only when intended.
-            PreviewSqlMode::Shared => self.database(site, name).await,
+            PreviewSqlMode::Shared => self.database_ident(&ident, name).await,
 
             // A fresh isolated database, optionally seeded by the init script.
             PreviewSqlMode::Empty => {
-                let scope = Self::preview_scope(site, preview);
+                let scope = Self::preview_scope(&ident, preview);
                 let key = (scope.clone(), name.to_string());
                 let mut cache = self.cache.lock().await;
                 if let Some(backend) = cache.get(&key) {
@@ -500,7 +518,7 @@ impl SqlBackends for LibsqlSqlBackends {
                          with a remote sqld",
                     ));
                 };
-                let scope = Self::preview_scope(site, preview);
+                let scope = Self::preview_scope(&ident, preview);
                 let key = (scope.clone(), name.to_string());
                 let mut cache = self.cache.lock().await;
                 if let Some(backend) = cache.get(&key) {
@@ -512,7 +530,7 @@ impl SqlBackends for LibsqlSqlBackends {
                         std::fs::create_dir_all(parent).map_err(SqlError::other)?;
                     }
                     // Snapshot the live db into the preview's file.
-                    let live = self.open_one(site, name).await?;
+                    let live = self.open_one(&ident, name).await?;
                     live.vacuum_into(&preview_path).await?;
                 }
                 let backend: Arc<dyn SqlBackend> =
@@ -521,6 +539,28 @@ impl SqlBackends for LibsqlSqlBackends {
                 Ok(backend)
             }
         }
+    }
+}
+
+impl LibsqlSqlBackends {
+    /// Open (or reuse) the database `name` for an **already project-qualified**
+    /// site identity `ident` (`site` for `default`, `"<project>/<site>"`
+    /// otherwise, or a trusted `.../_preview/...` scope). The identity is
+    /// composed only from separately-validated parts by the `SqlBackends`
+    /// methods above, so it is safe to key/hash/path verbatim.
+    async fn database_ident(
+        &self,
+        ident: &str,
+        name: &str,
+    ) -> Result<Arc<dyn SqlBackend>, SqlError> {
+        let key = (ident.to_string(), name.to_string());
+        let mut cache = self.cache.lock().await;
+        if let Some(backend) = cache.get(&key) {
+            return Ok(backend.clone());
+        }
+        let backend: Arc<dyn SqlBackend> = Arc::new(self.open_one(ident, name).await?);
+        cache.insert(key, backend.clone());
+        Ok(backend)
     }
 }
 
@@ -567,6 +607,32 @@ fn validate_db_name(kind: &str, value: &str) -> Result<(), SqlError> {
              '..' and NUL)"
         )))
     }
+}
+
+/// Validate a **site identity** for the `SqlBackends` boundary. Unlike a plain
+/// `validate_db_name`, this accepts a *trusted composite* identity built from
+/// validated parts — specifically the `fn/<name>` function-SQL identity (a
+/// literal `fn` segment plus the function name). Each `/`-separated segment must
+/// individually pass [`validate_db_name`], so no segment can be `..`, hidden,
+/// empty, or carry a stray path/NUL byte: the composite still can't traverse
+/// (`fn/../evil` is rejected on the `..` segment), and the `/` we compose stays
+/// ours. The bare-site case (no `/`) reduces to a single `validate_db_name`,
+/// preserving the pre-existing behaviour for live/preview site databases.
+fn validate_site_ident(site: &str) -> Result<(), SqlError> {
+    if site.is_empty() {
+        return validate_db_name("site", site);
+    }
+    for segment in site.split('/') {
+        // A `/`-separated segment must be a valid, non-empty component (an empty
+        // segment means a leading/trailing/double slash — rejected).
+        if segment.is_empty() {
+            return Err(SqlError::other(format!(
+                "invalid site name {site:?}: empty path segment"
+            )));
+        }
+        validate_db_name("site", segment)?;
+    }
+    Ok(())
 }
 
 /// A DNS-label-safe token from arbitrary input: `[a-z0-9]` only (so it's valid
@@ -682,35 +748,69 @@ mod tests {
         );
     }
 
-    /// End-to-end via the public `SqlBackends` API: an unsafe `site`, `name`, or
-    /// preview id is rejected (no file is ever created outside `dir`), while a
-    /// normal name opens fine and its path stays under `dir`.
+    /// End-to-end via the public `SqlBackends` API: an unsafe `project`, `site`,
+    /// `name`, or preview id is rejected (no file is ever created outside `dir`),
+    /// while a normal name opens fine and its path stays under `dir`.
     #[tokio::test]
     async fn database_rejects_traversal_names() {
         let dir = factory_dir("traversal");
         let backends = LibsqlSqlBackends::local(dir.clone());
+        // `project`, `name` and `preview` are single components — a `/` (or any
+        // traversal shape) is rejected outright.
         for bad in ["..", "../../etc", "a/b", "a\\b", ".hidden"] {
             assert!(
-                matches!(backends.database(bad, "").await, Err(SqlError::Other(_))),
-                "site {bad:?} should be rejected"
+                matches!(
+                    backends.database(bad, "blog", "").await,
+                    Err(SqlError::Other(_))
+                ),
+                "project {bad:?} should be rejected"
             );
             assert!(
                 matches!(
-                    backends.database("blog", bad).await,
+                    backends.database("default", "blog", bad).await,
                     Err(SqlError::Other(_))
                 ),
                 "name {bad:?} should be rejected"
             );
             assert!(
                 matches!(
-                    backends.preview_database("blog", "", bad).await,
+                    backends.preview_database("default", "blog", "", bad).await,
                     Err(SqlError::Other(_))
                 ),
                 "preview {bad:?} should be rejected"
             );
         }
-        // A normal site/name is accepted, and its file lands under `dir`.
-        backends.database("my-site_1", "my-db_1").await.unwrap();
+        // `site` may be a **trusted composite** (`fn/<name>`), so it validates
+        // *segment-wise*: a traversal or a bad segment is still rejected, but a
+        // composite of valid segments (`fn/blog`) is accepted.
+        for bad in [
+            "..",
+            "../../etc",
+            "a\\b",
+            ".hidden",
+            "fn/..",
+            "a//b",
+            "/leading",
+            "trailing/",
+        ] {
+            assert!(
+                matches!(
+                    backends.database("default", bad, "").await,
+                    Err(SqlError::Other(_))
+                ),
+                "site {bad:?} should be rejected"
+            );
+        }
+        // A valid composite site identity (the function-SQL `fn/<name>` shape)
+        // is accepted and lands under `dir`.
+        backends.database("default", "fn/blog", "").await.unwrap();
+        assert!(dir.join("fn/blog.db").exists());
+        // A normal site/name is accepted, and its file lands under `dir`. The
+        // `default` project keeps the pre-project on-disk layout (bare site).
+        backends
+            .database("default", "my-site_1", "my-db_1")
+            .await
+            .unwrap();
         let path = LibsqlSqlBackends::local_path(&dir, "my-site_1", "my-db_1");
         assert!(path.starts_with(&dir));
         assert!(!path.components().any(|c| c.as_os_str() == ".."));
@@ -908,11 +1008,14 @@ mod tests {
     #[tokio::test]
     async fn preview_empty_is_isolated_from_live() {
         let backends = LibsqlSqlBackends::local(factory_dir("empty"));
-        let live = backends.database("blog", "").await.unwrap();
+        let live = backends.database("default", "blog", "").await.unwrap();
         put(&live, "CREATE TABLE t (v TEXT)").await;
         put(&live, "INSERT INTO t VALUES ('live')").await;
         // The preview is a fresh, separate database — the live table isn't there.
-        let preview = backends.preview_database("blog", "", "pr1").await.unwrap();
+        let preview = backends
+            .preview_database("default", "blog", "", "pr1")
+            .await
+            .unwrap();
         put(&preview, "CREATE TABLE t (v TEXT)").await;
         put(&preview, "INSERT INTO t VALUES ('preview')").await;
         assert_eq!(
@@ -933,7 +1036,10 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS seed (v INTEGER); INSERT INTO seed VALUES (42);".into(),
             ),
         );
-        let preview = backends.preview_database("blog", "", "pr1").await.unwrap();
+        let preview = backends
+            .preview_database("default", "blog", "", "pr1")
+            .await
+            .unwrap();
         assert_eq!(
             one(&preview, "SELECT v FROM seed").await,
             vec![SqlValue::Integer(42)]
@@ -944,11 +1050,14 @@ mod tests {
     async fn preview_branch_copies_live_then_diverges() {
         let backends = LibsqlSqlBackends::local(factory_dir("branch"))
             .with_preview_policy(PreviewSqlMode::Branch, None);
-        let live = backends.database("blog", "").await.unwrap();
+        let live = backends.database("default", "blog", "").await.unwrap();
         put(&live, "CREATE TABLE t (v TEXT)").await;
         put(&live, "INSERT INTO t VALUES ('live-data')").await;
         // Branch sees the live data (copied), but writes stay in the copy.
-        let preview = backends.preview_database("blog", "", "pr1").await.unwrap();
+        let preview = backends
+            .preview_database("default", "blog", "", "pr1")
+            .await
+            .unwrap();
         assert_eq!(
             one(&preview, "SELECT v FROM t").await,
             vec![SqlValue::Text("live-data".into())]
@@ -968,15 +1077,55 @@ mod tests {
     async fn preview_shared_uses_live_database() {
         let backends = LibsqlSqlBackends::local(factory_dir("shared"))
             .with_preview_policy(PreviewSqlMode::Shared, None);
-        let live = backends.database("blog", "").await.unwrap();
+        let live = backends.database("default", "blog", "").await.unwrap();
         put(&live, "CREATE TABLE t (v TEXT)").await;
         put(&live, "INSERT INTO t VALUES ('x')").await;
         // Shared = the same database: the preview sees and writes live data.
-        let preview = backends.preview_database("blog", "", "pr1").await.unwrap();
+        let preview = backends
+            .preview_database("default", "blog", "", "pr1")
+            .await
+            .unwrap();
         put(&preview, "INSERT INTO t VALUES ('y')").await;
         assert_eq!(
             one(&live, "SELECT count(*) FROM t").await,
             vec![SqlValue::Integer(2)]
+        );
+    }
+
+    /// Tenant isolation (BR-TEN-1): the same site name in two different projects
+    /// resolves to **distinct** databases, and the reserved `default` project
+    /// keeps the byte-identical pre-project on-disk path (back-compat).
+    #[tokio::test]
+    async fn same_site_in_two_projects_is_isolated_and_default_is_backcompat() {
+        let dir = factory_dir("tenant");
+        let backends = LibsqlSqlBackends::local(dir.clone());
+        // Two projects, same site name.
+        let acme = backends.database("acme", "blog", "").await.unwrap();
+        let globex = backends.database("globex", "blog", "").await.unwrap();
+        put(&acme, "CREATE TABLE t (v TEXT)").await;
+        put(&acme, "INSERT INTO t VALUES ('acme')").await;
+        put(&globex, "CREATE TABLE t (v TEXT)").await;
+        put(&globex, "INSERT INTO t VALUES ('globex')").await;
+        // Each project sees only its own row — no cross-tenant leak.
+        assert_eq!(
+            one(&acme, "SELECT v FROM t").await,
+            vec![SqlValue::Text("acme".into())]
+        );
+        assert_eq!(
+            one(&globex, "SELECT v FROM t").await,
+            vec![SqlValue::Text("globex".into())]
+        );
+        // On disk, a non-default project nests the site under `<project>/`,
+        // while `default` keeps the bare `<site>.db` (byte-identical, no
+        // migration).
+        assert!(dir.join("acme/blog.db").exists());
+        assert!(dir.join("globex/blog.db").exists());
+        let default_db = backends.database("default", "blog", "").await.unwrap();
+        put(&default_db, "CREATE TABLE t (v TEXT)").await;
+        assert!(dir.join("blog.db").exists());
+        assert_eq!(
+            LibsqlSqlBackends::local_path(&dir, "blog", ""),
+            dir.join("blog.db")
         );
     }
 }

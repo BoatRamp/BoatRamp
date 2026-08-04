@@ -245,17 +245,23 @@ impl CompositeSqlBackends {
 impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
     async fn database(
         &self,
+        project: &str,
         site: &str,
         name: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        // An external database is a single *shared* endpoint by design (see the
+        // type docs): every project/site opening the name reaches it. Only the
+        // managed `default` fall-through is per-tenant, and it qualifies the
+        // site by `project` itself.
         if let Some(entry) = self.external.get(name) {
             return Ok(entry.backend.clone());
         }
-        self.default.database(site, name).await
+        self.default.database(project, site, name).await
     }
 
     async fn preview_database(
         &self,
+        project: &str,
         site: &str,
         name: &str,
         preview: &str,
@@ -269,7 +275,9 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
                  (set `allow_preview` on it to permit that)"
             )));
         }
-        self.default.preview_database(site, name, preview).await
+        self.default
+            .preview_database(project, site, name, preview)
+            .await
     }
 }
 
@@ -902,6 +910,7 @@ mod tests {
     impl boatramp_core::sql::SqlBackends for DefaultBackends {
         async fn database(
             &self,
+            _project: &str,
             _site: &str,
             _name: &str,
         ) -> Result<std::sync::Arc<dyn boatramp_core::sql::SqlBackend>, boatramp_core::sql::SqlError>
@@ -944,28 +953,37 @@ mod tests {
         // A configured name routes to its external backend; any other name falls
         // through to the managed default.
         assert_eq!(
-            tag(composite.database("s", "analytics").await).await,
+            tag(composite.database("default", "s", "analytics").await).await,
             "sql error: EXTERNAL"
         );
         assert_eq!(
-            tag(composite.database("s", "other").await).await,
+            tag(composite.database("default", "s", "other").await).await,
             "sql error: DEFAULT"
         );
 
         // A preview is refused an external database unless it opted in...
-        let err = match composite.preview_database("s", "analytics", "pr1").await {
+        let err = match composite
+            .preview_database("default", "s", "analytics", "pr1")
+            .await
+        {
             Ok(_) => panic!("expected an external database to be refused in preview"),
             Err(e) => e,
         };
         assert!(matches!(err, SqlError::Other(m) if m.contains("not available to preview")));
         // ...allowed when `allow_preview` is set...
         assert_eq!(
-            tag(composite.preview_database("s", "shared", "pr1").await).await,
+            tag(composite
+                .preview_database("default", "s", "shared", "pr1")
+                .await)
+            .await,
             "sql error: EXTERNAL_PREVIEW"
         );
         // ...and a non-external name keeps the managed backend's preview policy.
         assert_eq!(
-            tag(composite.preview_database("s", "other", "pr1").await).await,
+            tag(composite
+                .preview_database("default", "s", "other", "pr1")
+                .await)
+            .await,
             "sql error: DEFAULT"
         );
     }

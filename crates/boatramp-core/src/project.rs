@@ -25,6 +25,23 @@ impl<'a> ProjectRef<'a> {
     pub fn as_str(&self) -> &'a str {
         self.0
     }
+
+    /// Project-qualify a guest **data-plane** namespace `base` (a handler/function
+    /// binding scope, a SQL identity, a messaging topic, or a blob-watch storage
+    /// prefix): the bare `base` for the reserved `default` project — so a
+    /// pre-project / single-project store keeps byte-identical keys and needs no
+    /// data migration — else `"<project>/<base>"`. Project names are validated to
+    /// carry no `/` ([`validate_resource_name`]), so the single separator is
+    /// unambiguous. This is the tenant boundary for the guest **data** plane
+    /// (kv/blob/sql/messaging/logs), parallel to the `project/<proj>/…` keys the
+    /// control plane already uses.
+    pub fn qualified(&self, base: &str) -> String {
+        if self.0 == DEFAULT_PROJECT {
+            base.to_string()
+        } else {
+            format!("{}/{base}", self.0)
+        }
+    }
 }
 
 impl<'a> From<&'a str> for ProjectRef<'a> {
