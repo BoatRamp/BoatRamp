@@ -36,6 +36,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 mod admin_api;
+pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;
 pub(crate) use admin_api::{
