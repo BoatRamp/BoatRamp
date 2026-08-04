@@ -25,8 +25,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine as _;
-use boatramp_core::sql::{SqlBackend, SqlValue};
+use boatramp_core::compute::{BindingKind, ComputeBinding, ComputeBindingResolver};
+use boatramp_core::sql::{SqlBackend, SqlBackends, SqlValue};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::sync::RwLock;
 
 /// The shim's token → resolved backend registry, shared with the HTTP handler.
@@ -63,6 +66,114 @@ impl SqlShim {
             .route("/v2/pipeline", post(pipeline))
             .route("/v3/pipeline", post(pipeline))
             .with_state(self.clone())
+    }
+}
+
+/// Resolves a workload's `sql` [`ComputeBinding`]s to a shim endpoint + credential
+/// injected into the guest env. Holds the same `SqlBackends` provider a handler uses,
+/// the shim registry, the guest-reachable shim base URL, and a per-node secret used
+/// to derive a token that is **deterministic** (recomputable at release / re-register
+/// without persisting it) yet **unguessable** (keyed by the secret).
+pub struct SqlShimResolver {
+    provider: Arc<dyn SqlBackends>,
+    shim: SqlShim,
+    base_url: String,
+    secret: [u8; 32],
+}
+
+impl SqlShimResolver {
+    /// `base_url` is the shim URL reachable from the guest (e.g. the compute bridge
+    /// gateway); `secret` is a per-node random used only to key the token derivation.
+    pub fn new(
+        provider: Arc<dyn SqlBackends>,
+        shim: SqlShim,
+        base_url: String,
+        secret: [u8; 32],
+    ) -> Self {
+        Self {
+            provider,
+            shim,
+            base_url,
+            secret,
+        }
+    }
+
+    /// A deterministic, unguessable bearer token for one `(project, workload, replica,
+    /// binding)` — `HMAC-SHA256(secret, project ∥ workload ∥ replica ∥ kind ∥ name)`.
+    fn token(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        binding: &ComputeBinding,
+    ) -> String {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.secret).expect("hmac accepts any key len");
+        for part in [
+            project.as_bytes(),
+            workload.as_bytes(),
+            binding.name.as_bytes(),
+        ] {
+            mac.update(part);
+            mac.update(&[0]);
+        }
+        mac.update(&replica.to_le_bytes());
+        mac.update(format!("{:?}", binding.kind).as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+}
+
+#[async_trait::async_trait]
+impl ComputeBindingResolver for SqlShimResolver {
+    async fn resolve(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+    ) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        for binding in bindings {
+            // Phase 0 implements the `sql` kind; the others are reserved.
+            if binding.kind != BindingKind::Sql {
+                continue;
+            }
+            // The workload name is its site identity; resolve the SAME tenant-scoped
+            // backend a handler for that site would get.
+            let backend = match self
+                .provider
+                .database(project, workload, &binding.name)
+                .await
+            {
+                Ok(backend) => backend,
+                Err(err) => {
+                    tracing::warn!(%project, %workload, error = %err, "sql binding: resolve failed");
+                    continue;
+                }
+            };
+            let token = self.token(project, workload, replica, binding);
+            self.shim.register(token.clone(), backend).await;
+            let url_env = binding.url_env();
+            env.push((url_env.clone(), self.base_url.clone()));
+            env.push((format!("{url_env}_AUTH_TOKEN"), token));
+        }
+        env
+    }
+
+    async fn release(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+    ) {
+        for binding in bindings {
+            if binding.kind == BindingKind::Sql {
+                self.shim
+                    .deregister(&self.token(project, workload, replica, binding))
+                    .await;
+            }
+        }
     }
 }
 
@@ -352,6 +463,20 @@ mod tests {
         }
     }
 
+    /// A provider that hands out a fresh fake backend for any (project, site, name).
+    struct FakeProvider;
+    #[async_trait]
+    impl SqlBackends for FakeProvider {
+        async fn database(
+            &self,
+            _project: &str,
+            _site: &str,
+            _name: &str,
+        ) -> Result<Arc<dyn SqlBackend>, SqlError> {
+            Ok(Arc::new(FakeBackend::default()))
+        }
+    }
+
     async fn post(
         shim: &SqlShim,
         token: Option<&str>,
@@ -433,6 +558,49 @@ mod tests {
         assert_eq!(
             json["results"][0]["response"]["result"]["affected_row_count"],
             7
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_registers_a_working_token_and_release_revokes() {
+        let shim = SqlShim::new();
+        let resolver = SqlShimResolver::new(
+            Arc::new(FakeProvider),
+            shim.clone(),
+            "http://10.0.0.1:9999".to_string(),
+            [7u8; 32],
+        );
+        let bindings = vec![ComputeBinding {
+            kind: BindingKind::Sql,
+            name: String::new(),
+            url_env: None,
+        }];
+
+        let env = resolver.resolve("acme", "api", 0, &bindings).await;
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("BOATRAMP_SQL_URL").as_deref(),
+            Some("http://10.0.0.1:9999")
+        );
+        let token = get("BOATRAMP_SQL_URL_AUTH_TOKEN").expect("token env is injected");
+
+        // The shim now authorizes that token …
+        let body = serde_json::json!({ "requests": [{ "type": "close" }] });
+        assert_eq!(
+            post(&shim, Some(&token), body.clone()).await.0,
+            StatusCode::OK
+        );
+        // … resolving again is idempotent (same deterministic token) …
+        assert_eq!(
+            resolver.resolve("acme", "api", 0, &bindings).await,
+            env,
+            "token derivation is deterministic"
+        );
+        // … and release revokes it.
+        resolver.release("acme", "api", 0, &bindings).await;
+        assert_eq!(
+            post(&shim, Some(&token), body).await.0,
+            StatusCode::UNAUTHORIZED
         );
     }
 

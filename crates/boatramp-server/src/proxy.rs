@@ -345,6 +345,7 @@ pub(super) async fn await_warm(
 /// backend registry + node inventory to converge each workload's replicas. A
 /// no-op while not leader or with an empty registry. Detached for the server's
 /// lifetime; the same leader-gating pattern as cron/cert issuance.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_compute_reconcile(
     deploy: DeployStore,
     backends: boatramp_core::compute::BackendRegistry,
@@ -353,6 +354,7 @@ pub fn spawn_compute_reconcile(
     is_leader: CronLeaderGate,
     tick: std::time::Duration,
     idle_timeout: std::time::Duration,
+    resolver: Option<std::sync::Arc<dyn boatramp_core::compute::ComputeBindingResolver>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // drive scale-to-zero from the gateway's per-workload activity —
@@ -370,7 +372,12 @@ pub fn spawn_compute_reconcile(
                 continue;
             }
             match boatramp_core::compute::reconcile_once(
-                &deploy, &backends, &nodes, &policy, &activity,
+                &deploy,
+                &backends,
+                &nodes,
+                &policy,
+                &activity,
+                resolver.as_deref(),
             )
             .await
             {

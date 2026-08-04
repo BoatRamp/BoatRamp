@@ -1074,6 +1074,12 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         Arc::new(|| true),
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
+        // Compute-bindings resolver (PLAN-compute-bindings Phase 0): the mechanism
+        // (declaration + hrana sql-shim + SqlShimResolver + reconcile injection) is in
+        // place and unit-tested; activation here — construct a SqlShimResolver from the
+        // sql provider + a per-node secret, spawn the shim listener on the compute
+        // bridge gateway, and pass Some(resolver) — is the live-integration seam.
+        None,
     );
 
     // Domain-verify auto-complete: periodically re-check every site's pending
@@ -1969,6 +1975,9 @@ async fn run_cluster(
             Arc::new(move || boatramp_cluster::raft::is_leader(&raft, leader_node_id)),
             COMPUTE_RECONCILE_TICK,
             COMPUTE_IDLE_TIMEOUT,
+            // Compute-bindings resolver: see the single-node path — activation is the
+            // live-integration seam.
+            None,
         );
     }
 

@@ -657,6 +657,35 @@ pub struct ReconcileReport {
     pub errors: Vec<String>,
 }
 
+/// Resolves a workload's declared [`ComputeBinding`]s (PLAN-compute-bindings) to
+/// env vars injected into the guest at launch, registering any backing shim state.
+/// The concrete impl (the sql-shim resolver) lives server-side, where the
+/// `SqlBackends` provider + the shim listener are; the reconcile only calls this
+/// trait. All methods are keyed by `(project, workload, replica)` and **idempotent**,
+/// so the reconcile can call `resolve` for every running replica each tick to keep
+/// the shim registry populated across a restart.
+#[async_trait]
+pub trait ComputeBindingResolver: Send + Sync {
+    /// Resolve `bindings` to `(env_key, env_value)` pairs to inject into the guest,
+    /// registering the shim state for `(project, workload, replica)`.
+    async fn resolve(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+    ) -> Vec<(String, String)>;
+
+    /// Release the shim state for a torn-down replica.
+    async fn release(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+        bindings: &[ComputeBinding],
+    );
+}
+
 /// One reconcile pass: for every workload, refresh replica health, compute the
 /// plan ([`reconcile_plan`]), and execute it against the chosen backends —
 /// launching/stopping replicas and persisting their observed state (which the
@@ -672,6 +701,7 @@ pub async fn reconcile_once(
     nodes: &[Node],
     policy: &BackendPolicy,
     activity: &dyn ActivitySource,
+    resolver: Option<&dyn ComputeBindingResolver>,
 ) -> Result<ReconcileReport, crate::error::DeployError> {
     let mut report = ReconcileReport::default();
     // Per-backend capabilities (the planner gates scale-to-zero on them).
@@ -704,6 +734,26 @@ pub async fn reconcile_once(
             }
         }
 
+        // Keep the shim registry populated for every running replica (idempotent),
+        // so a workload's bindings keep working across a server restart while the
+        // guest is still up.
+        if let Some(resolver) = resolver {
+            if !spec.bindings.is_empty() {
+                for state in &observed {
+                    if state.phase == ReplicaPhase::Running {
+                        resolver
+                            .resolve(
+                                &project_name,
+                                &workload.name,
+                                state.handle.replica,
+                                &spec.bindings,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
         let workload_activity = activity.activity(&workload.name).await;
         for action in reconcile_plan(
             &workload,
@@ -728,7 +778,25 @@ pub async fn reconcile_once(
                         continue;
                     };
                     let node_region = region_of_node(nodes, node);
-                    match launch_one(b.as_ref(), &wl, replica, node, node_region, &spec).await {
+                    // Resolve declared bindings → env injected into the guest (registers
+                    // the shim token for this replica).
+                    let binding_env = match resolver {
+                        Some(r) if !spec.bindings.is_empty() => {
+                            r.resolve(&project_name, &wl, replica, &spec.bindings).await
+                        }
+                        _ => Vec::new(),
+                    };
+                    match launch_one(
+                        b.as_ref(),
+                        &wl,
+                        replica,
+                        node,
+                        node_region,
+                        &spec,
+                        &binding_env,
+                    )
+                    .await
+                    {
                         Ok(state) => match deploy.set_replica_state(project, &state).await {
                             Ok(()) => report.launched += 1,
                             Err(e) => report.errors.push(format!("{wl}/{replica}: persist: {e}")),
@@ -757,6 +825,19 @@ pub async fn reconcile_once(
                             "{}/{}: forget: {e}",
                             handle.workload, handle.replica
                         )),
+                    }
+                    // Revoke this replica's shim tokens.
+                    if let Some(resolver) = resolver {
+                        if !spec.bindings.is_empty() {
+                            resolver
+                                .release(
+                                    &project_name,
+                                    &handle.workload,
+                                    handle.replica,
+                                    &spec.bindings,
+                                )
+                                .await;
+                        }
                     }
                 }
                 Action::Snapshot { handle } => {
@@ -856,8 +937,15 @@ async fn launch_one(
     node: u64,
     node_region: Option<String>,
     spec: &ComputeSpec,
+    extra_env: &[(String, String)],
 ) -> Result<ObservedInstance, BackendError> {
     let artifact = backend.materialize(spec).await?;
+    // Fold the resolved binding env into the launched spec. The workload's own env
+    // wins on a collision, so a hand-set value is never clobbered by a binding.
+    let mut spec = spec.clone();
+    for (k, v) in extra_env {
+        spec.env.entry(k.clone()).or_insert_with(|| v.clone());
+    }
     let instance = backend
         .launch(&LaunchRequest {
             workload: workload.to_string(),
@@ -1660,6 +1748,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
         )
         .await
         .unwrap();
@@ -1672,6 +1761,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle),
+            None,
         )
         .await
         .unwrap();
@@ -1692,6 +1782,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle),
+            None,
         )
         .await
         .unwrap();
@@ -1704,6 +1795,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
         )
         .await
         .unwrap();
@@ -1742,7 +1834,7 @@ mod tests {
         let policy = BackendPolicy::default();
 
         // Pass 1: launches both replicas + persists their state.
-        let r = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive)
+        let r = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive, None)
             .await
             .unwrap();
         assert_eq!((r.launched, r.stopped), (2, 0), "{:?}", r.errors);
@@ -1759,7 +1851,7 @@ mod tests {
         );
 
         // Pass 2: already converged (FakeBackend reports Healthy) → no-op.
-        let r2 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive)
+        let r2 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive, None)
             .await
             .unwrap();
         assert_eq!((r2.launched, r2.stopped), (0, 0));
@@ -1778,7 +1870,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let r3 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive)
+        let r3 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive, None)
             .await
             .unwrap();
         assert_eq!(r3.stopped, 2);
