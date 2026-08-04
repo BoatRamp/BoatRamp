@@ -50,14 +50,34 @@ A site's `handlers`, `consumers`, and `crons` *are* functions with triggers, and
 top-level function adds its own version line so it can be invoked, aliased, and
 rolled back on its own. See [Functions: the compute primitive](./functions.md).
 
+## A project owns sites, functions, and compute
+
+Sites, functions, and compute workloads do not float free — each belongs to
+exactly one **project** (a *Workspace*, in Uchron terms). A project is the owning
+group above the site and the **tenant boundary**: the resources it holds are keyed
+under its own namespace, scheduled independently, and a managed handler's
+row-level scope resolves to the owning project. Two projects can each own a `blog`
+without collision — a site name is unique only *within* its project.
+
+Membership is mandatory, but invisible until you need it. Every pre-project
+resource belongs to the reserved **`default`** project, and omitting a project
+targets `default`, so a single-project user's URLs and behaviour are unchanged — a
+lone site is simply a project of one. When you do want isolation, `boatramp
+project create` makes a new one, a global `--project` flag targets it, and Cedar
+`project_admin` / `project_publisher` / `project_viewer` roles scope a token to it
+so it cannot touch a sibling. See [Organize sites into a project](../how-to/projects.md).
+
 ## Three configuration tiers
 
 Configuration is split by audience across three surfaces, so each concern lives
 where the right person controls it:
 
-- **`project.cfg`** — the per-project client config, authored beside your code
+- **`project.cfg`** — the per-site client config, authored beside your code
   and read by `sync`, `build`, and `validate`. It covers where and how to
-  publish, an optional build step, and deploy-scoped `routing`. See
+  publish (including the owning `project`), an optional build step, and
+  deploy-scoped `routing`. To declare a whole project — many sites plus its
+  functions and compute — in one manifest, see
+  [`boatramp apply`](../how-to/apply.md). See
   [`project.cfg`](../reference/project-cfg.md).
 - **`boatramp.cfg`** — the server config, read by `serve`. It covers the bind
   address, storage backends, TLS, request limits, and any `cluster` section. See

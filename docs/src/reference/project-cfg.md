@@ -31,6 +31,11 @@ Sections:
 | `server` | url | Server base URL. Flag `--server`, env `BOATRAMP_SERVER`. |
 | `site` | string | Site to publish to. Flag `--site`, env `BOATRAMP_SITE`. |
 | `token` | string | Control-plane token. Prefer `BOATRAMP_TOKEN` so it is not on disk. |
+| `project` | string | The [project](../how-to/projects.md) this config's site belongs to; overridden by `--project` / `BOATRAMP_PROJECT`, defaults to `default`. |
+
+See also the separate [`apply.cfg`](../how-to/apply.md) project manifest, which
+declares a whole project — its member sites, top-level functions, and compute
+workloads — as one applied unit.
 
 ## `build`
 

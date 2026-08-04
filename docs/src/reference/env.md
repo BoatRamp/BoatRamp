@@ -15,6 +15,7 @@ Read by `sync`, `build`, `bundle`, and the other project commands. See
 | --- | --- | --- |
 | `BOATRAMP_SERVER` | `publish.server` | Server base URL. |
 | `BOATRAMP_SITE` | `publish.site` | Site to publish to. |
+| `BOATRAMP_PROJECT` | `publish.project` | Target [project](../how-to/projects.md) for site-scoped commands; falls back to `[publish].project`, then the `default` project. |
 | `BOATRAMP_TOKEN` | `publish.token` | Control-plane token. Prefer the env var so it is never on disk. |
 | `BOATRAMP_TOKEN_HOLDER_KEY` | — | Holder **private** key (`"<alg>:<hex>"`) for a PoP-bound token: every request is signed with a fresh proof. Inert unless set alongside `BOATRAMP_TOKEN` + `BOATRAMP_POP_ORIGIN`. See [PoP-bind a token](../how-to/pop-tokens.md). |
 | `BOATRAMP_POP_ORIGIN` | — | The server's canonical origin the PoP proof binds (`aud`); must equal the server's `serve.pop_origin`. |

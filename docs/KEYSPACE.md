@@ -24,22 +24,59 @@ bytes. `boatramp scrub` re-hashes each to detect drift.
 
 ## KV (control plane)
 
+Since 0.2.0 the control-plane keyspace is re-keyed for **projects** (a migration —
+see `docs/src/how-to/migrate-to-projects.md`). Mutable per-name records move under
+`project/<proj>/…` (pre-project resources land in the reserved `default` project, so
+under `project/default/…`); content-addressed bodies stay global and dedup across all
+projects; the domain-routing index keeps a global **key** whose **value** now carries
+the owning `(project, site)`.
+
+### Global — content-addressed bodies, project pointers & singletons
+
 | Key | Value |
 | --- | --- |
 | `manifests/<id>` | a deployment `Manifest` (file→hash map + `DeployConfig`); `<id>` is the manifest's content hash |
 | `meta/<id>` | `DeployMeta` for a deployment (created-at, sizes, source/branch/author/message) |
-| `current/<site>` | the live deployment id for a site |
-| `history/<site>` | the site's activation log (`HistoryEntry[]`) |
-| `alias/<site>/<name>` | a named alias (`staging`, `preview-…`) → deployment id |
-| `site/<site>` | **mutable pointer** → the content hash of the site's current `SiteConfig` (the only key that changes on a config edit) |
-| `siteconfig/<hash>` | **immutable, content-addressed** `SiteConfig` body (domains, security, access, compression, handler policy); keyed by its hash → caches forever, dedups across sites |
-| `domain/<host>` | exact host → site name (virtualhost routing index) |
-| `wildcard/<suffix>` | wildcard suffix → site name (e.g. `example.com` for `*.example.com`) |
-| `domainverify/<site>/<host>` | a `DomainVerification` ownership challenge |
+| `siteconfig/<hash>` | **immutable, content-addressed** `SiteConfig` body (domains, security, access, compression, handler policy); keyed by its hash → caches forever, dedups across sites & projects |
+| `daemonconfig/<hash>` | **immutable, content-addressed** dynamic-daemon-config body |
+| `projectver/<hash>` | **immutable, content-addressed** `Project` spec body |
+| `projectmeta/<proj>` | **mutable pointer** → the content hash of a project's current spec |
+| `owner/<kind>/<name>` | reverse index: a resource `(kind, name)` → its owning project (single-membership guard) |
 | `authz/policy` | the RBAC `AuthzPolicy` (roles → right templates); absent ⇒ the built-in default |
 | `authz/tokens/<id>` | `TokenMeta` for an issued token (label, roles, timestamps); keyed by its authority revocation id. The token itself is never stored |
 | `authz/revoked/<id>` | a revocation marker (presence ⇒ the token with that authority revocation id, and its attenuations, is revoked) |
 | `cert/<domain>` | a `StoredCert` (chain + key + expiry) — the cluster-managed cert store |
+
+### Global — domain-routing index (key global, value carries the owner)
+
+| Key | Value |
+| --- | --- |
+| `domain/<host>` | exact host → `DomainOwner { project, site }` (a bare-string value reads as the `default` project, back-compat) |
+| `wildcard/<suffix>` | wildcard suffix → `DomainOwner { project, site }` (e.g. `example.com` for `*.example.com`) |
+| `httpchallenge/<host>/<token>` | O(1) index for the self-serve HTTP-01 edge route → the owning `(project, site)` |
+
+### Project-scoped (`project/<proj>/…`, mutable per-name)
+
+| Key | Value |
+| --- | --- |
+| `project/<proj>/current/<site>` | the live deployment id for a site |
+| `project/<proj>/history/<site>` | the site's activation log (`HistoryEntry[]`) |
+| `project/<proj>/alias/<site>/<name>` | a named alias (`staging`, `preview-…`) → deployment id |
+| `project/<proj>/site/<site>` | **mutable pointer** → the content hash of the site's current `SiteConfig` |
+| `project/<proj>/domainverify/<site>/<host>` | a `DomainVerification` ownership challenge |
+| `project/<proj>/dnsmanaged/<site>/…` | managed-DNS reconciliation state |
+| `project/<proj>/functions/<name>` | a function's metadata (current version pointer) |
+| `project/<proj>/functions/<name>/versions/<id>` | an immutable function version |
+| `project/<proj>/functions/<name>/alias/<label>` | a function alias → version |
+| `project/<proj>/functions/<name>/triggers/<id>` | an event trigger (webhook/queue/cron/blob) |
+| `project/<proj>/functions/<name>/invocations/<id>` | an async invocation record |
+| `project/<proj>/functions/<name>/idem/<key>` | an idempotency marker |
+| `project/<proj>/metering/<name>` | a function's usage/quota counters |
+| `project/<proj>/blobnotify/<function>/…` | blob-change watch state |
+| `project/<proj>/compute/<name>` | a compute workload spec pointer |
+| `project/<proj>/compute_state/<workload>/<replica>` | a replica's lifecycle/snapshot state |
+| `project/<proj>/workflows/<name>` | a declarative workflow definition |
+| `project/<proj>/workflows/<name>/runs/<id>` | a workflow run |
 
 ### Messaging (handler `wasi:messaging`)
 
@@ -48,6 +85,9 @@ bytes. `boatramp scrub` re-hashes each to detect drift.
 | `mq/<topic>/<id>` | a queued `Record` |
 | `mqp/<topic>/<id>` | in-flight (claimed/processing) marker |
 | `mqdead/<topic>/<id>` | a dead-lettered record |
+
+The `<topic>` is project-qualified for a non-`default` project (`<proj>/<topic>`); the
+`default` project's topics stay unprefixed (byte-identical to pre-0.2.0).
 
 ### Cluster Raft store (cluster mode only)
 
@@ -73,11 +113,12 @@ plane the cluster serves), written by `boatramp_cluster::persist`:
   which commits as one durable, atomic flush.
 - The control-plane KV is fronted by a **write-through** LRU (`CachedKv`): every
   `put`/`delete`/`write_batch` updates the cache, so an `activate` is visible
-  immediately (no stale `current/<site>`).
+  immediately (no stale `project/<proj>/current/<site>`).
 - **Immutable vs mutable keys** (matters for cache coherence — see
   `ARCHITECTURE-kv.md`): content-addressed keys (`manifests/<id>`,
-  `siteconfig/<hash>`, blobs) are immutable — safe to cache forever and never in
-  the shared-mode invalidation feed. Only the mutable pointers/config
-  (`current/<site>`, `site/<site>`, `domain/`, `authz/`, `cert/`, …) need
-  invalidation. Coordination state (`ratelimit/<site>/<ip>`, messaging `mqp/…`)
-  is **never cached** (read through the uncached backend).
+  `siteconfig/<hash>`, `projectver/<hash>`, blobs) are immutable — safe to cache
+  forever and never in the shared-mode invalidation feed. Only the mutable
+  pointers/config (`project/<proj>/current/<site>`, `project/<proj>/site/<site>`,
+  `projectmeta/`, `domain/`, `authz/`, `cert/`, …) need invalidation. Coordination
+  state (`ratelimit/<site>/<ip>`, messaging `mqp/…`) is **never cached** (read
+  through the uncached backend).

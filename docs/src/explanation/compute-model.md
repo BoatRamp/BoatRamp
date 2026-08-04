@@ -20,11 +20,29 @@ kernel, isolated with a jailed worker, namespaces, cgroups, and a seccomp filter
 It runs any Linux program, starts quickly, and is memory-efficient, but it shares
 the kernel — so it is appropriate for code you trust.
 
-**microVM** — the same OCI image run inside a Firecracker-class virtual machine
-with its own kernel. It gives hardware-level isolation for untrusted or
-tenant-supplied code, at the cost of a heavier boot and a kernel per instance.
+**microVM** — a rootfs image run inside a Firecracker-class virtual machine
+with its own kernel (build one from an OCI image with `compute build`). It gives
+hardware-level isolation for untrusted or tenant-supplied code, at the cost of a
+heavier boot and a kernel per instance.
 boatramp ships both an external-Firecracker backend and an embedded rust-vmm
 backend; a microVM backend is available on Linux hosts with `/dev/kvm`.
+
+## The root filesystem is typed
+
+A non-Wasm runtime boots from a **root filesystem source**, and the three
+substrates accept three different artifact forms. Since 0.2.0 this is a typed
+`RootSource` with one variant per form — not one overloaded string — so a mismatch
+is a typed error at declare time rather than a silent runtime failure:
+
+- **`image`** — an OCI image reference the backend pulls (the `docker` and
+  `cloudflare` substrates).
+- **`tar`** — a tar rootfs archive, unpacked for the native `container` runtime.
+- **`rootfs`** — a rootfs filesystem image (a block device; `ext4` by default),
+  which the `firecracker` microVM mounts alongside its kernel.
+
+`boatramp compute set` takes exactly one of `--image` / `--tar` / `--rootfs`,
+matched to the target substrate; `compute build` produces a `rootfs` from an OCI
+image. See [Run a container or microVM](../how-to/compute.md).
 
 ## Choosing
 

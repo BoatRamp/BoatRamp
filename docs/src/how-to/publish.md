@@ -24,8 +24,11 @@ activated my-site -> 4f3a2b2c
 ```
 
 Re-running `sync` on an unchanged tree uploads nothing. Change one file and only
-that blob uploads before the site flips. Preview a publish without writing
-anything:
+that blob uploads before the site flips. Every command on this page also accepts a
+global `--project <name>` (env `BOATRAMP_PROJECT`, or `[publish].project`);
+omitting it targets the reserved `default` project — byte-identical to pre-0.2.0.
+See [Organize sites into a project](./projects.md). Preview a publish without
+writing anything:
 
 ```sh
 boatramp sync ./dist --site my-site --dry-run

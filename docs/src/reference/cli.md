@@ -26,6 +26,7 @@ flags unique to each command:
 | --- | --- | --- |
 | `--server <url>` | `BOATRAMP_SERVER` | Server base URL (overrides `publish.server`). |
 | `--site <name>` | `BOATRAMP_SITE` | Target site (overrides `publish.site`). |
+| `--project <name>` | `BOATRAMP_PROJECT` | Target [project](../how-to/projects.md) for site-scoped commands. Falls back to `[publish].project` → the reserved `default` project; omitting it is byte-identical to pre-0.2.0. |
 | — | `BOATRAMP_SERVER_PUBKEY` | Pin the control plane to a `--tls rpk` server's raw public key (the hex it prints at startup). See [Reach the control plane on day zero](../how-to/bootstrap-tls.md). |
 
 ## Commands
@@ -33,6 +34,9 @@ flags unique to each command:
 | Command | What it does |
 | --- | --- |
 | [`serve`](#boatramp-serve) | Run the HTTP server and publishing API. |
+| [`project`](#boatramp-project) | Manage projects — the Workspace that owns sites, functions, and compute. |
+| [`apply`](#boatramp-apply) | Reconcile a whole project (sites + functions + compute) from a declarative `apply.cfg` manifest. |
+| [`migrate`](#boatramp-migrate) | Migrate a pre-0.2.0 control-plane store to the project-scoped layout. |
 | [`sync <dir>`](#boatramp-sync) | Build (optional) and publish a folder as a new atomic deployment. |
 | [`build`](#boatramp-build) | Run the configured build command only. |
 | [`bundle`](#boatramp-bundle) | Bundle JS/TS + CSS in-process (`bundler` feature). |
@@ -135,6 +139,7 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 | `--default-site <name>` | `BOATRAMP_DEFAULT_SITE` | — | Site served for an unmatched `Host` (see [addressing](../explanation/addressing.md)). |
 | `--pop-origin <url>` | `BOATRAMP_POP_ORIGIN` | — | Canonical origin a per-request proof-of-possession must bind. Required for holder-bound (`cnf`/PoP) tokens. See [PoP-bind a token](../how-to/pop-tokens.md). |
 | `--protect-previews` | `BOATRAMP_PROTECT_PREVIEWS` | `false` | Require a token to view `/_deploy` previews. |
+| `--auto-migrate` | — | `false` | Migrate a pre-0.2.0 store to the project-scoped layout at startup instead of refusing to serve. The migration is online, idempotent, and resumable; see [`migrate`](#boatramp-migrate) for the explicit operator step. |
 | `--cluster-rate-limit` | `BOATRAMP_CLUSTER_RATE_LIMIT` | `false` | Rate-limit cluster-wide via the KV, not per node. |
 | `--shared-cache-coherence` | `BOATRAMP_SHARED_CACHE_COHERENCE` | `false` | Keep the config cache coherent across processes sharing one KV. |
 | `--cluster-init` | `BOATRAMP_CLUSTER_INIT` | `false` | **Found** a new cluster from this node (explicit, one-time). See [Deploy a cluster](../how-to/deploy-cluster.md). |
@@ -145,6 +150,57 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 boatramp serve --config boatramp.cfg \
   --addr 0.0.0.0:8080 --tls acme --acme-domain pad.example.com
 ```
+
+## `boatramp project`
+
+Manage [projects](../how-to/projects.md) — the Workspace that owns sites,
+functions, and compute, and is the tenant boundary a handler's row-level scope
+resolves to. Takes the common `--server` flag.
+
+| Sub-action | Description |
+| --- | --- |
+| `create <name>` | Create a project. `<name>` is a slug (no `/`). Flags: `--display <name>`, `--description <text>`, `--region <name>` (default region for the project's compute/replicas). |
+| `ls` | List all projects. |
+| `show <name>` | Print one project's full record. |
+| `rm <name>` | Delete a project (refused while it still owns resources, or for the reserved `default`). |
+
+## `boatramp apply`
+
+Reconcile a whole project — its member sites (each a content dir + optional
+build + routing + config), top-level functions, and compute workloads — from one
+declarative RON manifest, in a single pass. Sites reuse the content-addressed
+`sync` flow (upload only the missing blobs, then activate); functions and compute
+are create-or-replace. `apply` is **pure upsert and never prunes**, so declarative
+and imperative (CLI/API) management coexist. See
+[Declare a project with `apply`](../how-to/apply.md).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-f`, `--file <path>` | `apply.cfg` | The project manifest (RON). |
+| `--server <url>` | — | Server base URL (overrides `[publish].server`; env `BOATRAMP_SERVER`). |
+| `--dry-run` | — | Print the plan (what would be built/deployed/activated) and mutate nothing. |
+| `--build` | — | Run each site's configured build command before publishing it. |
+
+The target project is the manifest's `project:` field, else the global
+`--project` / `default`.
+
+## `boatramp migrate`
+
+Migrate a pre-0.2.0 control-plane store to the project-scoped layout (mutable
+per-name records re-key under `project/<proj>/…`; no content-addressed body moves).
+The migration is online, idempotent, and resumable. `serve` refuses an unmigrated
+store unless started with [`--auto-migrate`](#boatramp-serve). See
+[Upgrade a store to project scoping](../how-to/migrate-to-projects.md).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--data-dir <path>` | `BOATRAMP_DATA_DIR` | Blob + KV root (the store to migrate). |
+| `--kv <slatedb\|memory\|cloudflare>` | `slatedb` | KV backend. |
+| `--dry-run` | — | Scan and print the rewrites; write nothing. |
+| `--stage` | — | Copy-only pass: write the new keys but leave the old ones for a soak/rollback window (the `2-dual` state). |
+| `--finalize` | — | Delete the old-layout keys left by an earlier `--stage`, completing the migration. |
+
+A plain `boatramp migrate` (no `--stage`) copies and finalizes in one shot.
 
 ## `boatramp sync`
 
@@ -262,7 +318,7 @@ Manage control-plane API tokens. See
 
 | Flag | Description |
 | --- | --- |
-| `--role <role>` | Role, repeatable: `<role>` (global) or `<role>:<site>` (scoped). Required. |
+| `--role <role>` | Role, repeatable: `<role>` (global), `<role>:<project>/<site>` (site-scoped), or `<role>:<project>` (project-scoped). A legacy `<role>:<site>` is read as `default/<site>`. Required. See the [RBAC reference](./rbac.md). |
 | `--ttl-secs <n>` | Time-to-live in seconds (omit for no expiry). |
 | `--holder-pub <alg:hex>` | Make the token delegatable: embed this holder public key as the `cnf`. |
 | `--pop` | Make the token PoP-bound: generate a holder keypair, mint against its public half, and print `BOATRAMP_TOKEN` + `BOATRAMP_TOKEN_HOLDER_KEY` exports. Conflicts with `--holder-pub`. See [PoP-bind a token](../how-to/pop-tokens.md). |

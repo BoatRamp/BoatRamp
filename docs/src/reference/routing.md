@@ -202,6 +202,7 @@ Matched after redirects, before static lookup. See
 | `imports` | list\<string\> | `[]` | Requested capabilities — see [imports](#imports). |
 | `limits` | HandlerLimits | — | Optional resource caps, intersected with the site caps at activation. |
 | `env` | map\<string, string\> | `{}` | Static environment variables. **Never secrets** — a credential-shaped value is rejected at validate; use `[handlers].secrets` in `boatramp.cfg` for those. |
+| `invoke_targets` | list\<string\> | `[]` | Function names this handler may call via the `invoke` import — see [invoke_targets](#invoke_targets). |
 
 ### `imports`
 
@@ -210,6 +211,7 @@ rejected at validate.
 
 | Import | Grants |
 | --- | --- |
+| `invoke` | Call sibling functions by name, gated by [`invoke_targets`](#invoke_targets). |
 | `wasi:http` | Outbound HTTP. |
 | `wasi:keyvalue` | Per-site KV store. |
 | `wasi:blobstore` | Per-site blob store. |
@@ -219,6 +221,18 @@ rejected at validate.
 
 The site's [`allow_imports`](./siteconfig.md#handlers) is the allowlist; a
 handler requesting an import the site does not permit is denied at activation.
+
+### `invoke_targets`
+
+The deny-by-default allowlist of sibling function names this handler may call
+through the `invoke` import. Each entry may use `*` wildcards (`*` = any function,
+`img-*` = a family, `resize` = one literal). It is only consulted when `imports`
+contains `invoke` (which the site's `allow_imports` must also permit); an empty
+list means the handler cannot invoke anything even with the import.
+
+```ron
+handlers: [ (route: "/api", component: "api.wasm", imports: ["invoke"], invoke_targets: ["resize", "img-*"]) ],
+```
 
 ### `limits` (HandlerLimits)
 

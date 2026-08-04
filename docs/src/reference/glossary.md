@@ -8,6 +8,15 @@ concept has a fuller treatment, the definition links to it.
 **Site** — a named project boatramp serves. The unit that owns domains, config,
 and deployments.
 
+**Project** — the Workspace (Uchron term) that owns many sites, functions, and
+compute, and is the tenant boundary for a managed handler's row-level scope. Every
+resource belongs to exactly one project; a site name is unique only within its
+project. See [Organize sites into a project](../how-to/projects.md).
+
+**default project** — the reserved project holding all pre-0.2.0 resources and
+anything deployed without an explicit `--project`; byte-identical to
+single-project behaviour, and cannot be deleted.
+
 **Deployment** — an immutable published version of a site's content, identified by
 a content hash. A deployment is created, then [activated](#activation); it never
 changes in place.

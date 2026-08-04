@@ -58,3 +58,24 @@ error: project.cfg: handler /api env var "TOKEN" looks like a secret; move it to
 ```
 
 See the [routing schema](./routing.md) for the fields these checks cover.
+
+## Store migration
+
+`boatramp serve` refuses to start on a control-plane store still on the pre-0.2.0
+layout, rather than silently reading it under the project-scoped keys. Migrate the
+store explicitly with `boatramp migrate` (or start `serve --auto-migrate`):
+
+```text
+error: the control-plane store is not migrated to the project-scoped (0.2.0)
+  layout; run `boatramp migrate` first, or start `serve --auto-migrate`
+```
+
+See [Migrate to projects](../how-to/migrate-to-projects.md).
+
+## Resource-name validation
+
+A project, site, function, compute, or workflow name is rejected at the write
+boundary (CLI or API) if it contains a path separator (`/` or `\`), a `*`,
+whitespace, or an ASCII control character, or if it is `.` or `..`. This keeps a
+name from escaping its key prefix or aliasing an authz wildcard, so the create or
+update fails before anything is written.

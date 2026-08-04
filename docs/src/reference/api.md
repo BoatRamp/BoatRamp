@@ -20,7 +20,27 @@ the [CLI reference](./cli.md) maps each command onto them.
 - **Errors.** A non-2xx status carries a JSON `{ "error": "..." }`. `401` is a
   missing or invalid token; `403` is a valid token without the required right.
 
+## Projects
+
+A [project](../how-to/projects.md) owns sites, functions, and compute, and is the
+tenant boundary. Since 0.2.0 every site/function/compute/workflow endpoint has a
+project-scoped counterpart under `/api/projects/:project/…`; the legacy top-level
+paths (`/api/sites/…`, `/api/functions/…`, `/api/compute/…`, `/api/workflows/…`)
+target the reserved `default` project and stay byte-identical to pre-0.2.0.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/projects` | List projects. |
+| `POST` | `/api/projects` | Create a project. |
+| `GET` | `/api/projects/:project` | Get one project's record. |
+| `DELETE` | `/api/projects/:project` | Delete an empty project (refused while it owns resources or is `default`). |
+| any | `/api/projects/:project/sites/…` | Per-project site endpoints — the same shapes as [Sites & deployments](#sites--deployments), scoped to the project. |
+| any | `/api/projects/:project/{functions,compute,workflows}/…` | Per-project function / compute / workflow endpoints, scoped to the project. |
+
 ## Sites & deployments
+
+The paths below target the `default` project; the `/api/projects/:project/sites/…`
+counterparts are identical but scoped to `:project`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -100,7 +120,29 @@ See [Migrate the root key](../how-to/migrate-root-key.md).
 | `GET` | `/api/metrics` | Prometheus exposition (always available). |
 | `GET`/`PUT` | `/api/authz/policy` | Read / replace the [RBAC policy](./rbac.md#the-policy-document). |
 
+## Functions & workflows
+
+Top-level (`default`-project) function and workflow endpoints; the
+`/api/projects/:project/…` counterparts scope to another project.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/functions` | List functions. |
+| `GET`/`PUT`/`DELETE` | `/api/functions/:name` | Manage one function (its current version). |
+| `POST` | `/api/functions/:name/versions` | Deploy a new function version. |
+| `POST` | `/api/functions/:name/rollback` | Roll back to a prior version. |
+| `PUT`/`DELETE` | `/api/functions/:name/aliases/:label` | Manage a version alias. |
+| `POST` | `/api/functions/:name/invoke` | Invoke synchronously / async / scheduled. |
+| `GET` | `/api/functions/:name/invocations/:id` | Get an async invocation record. |
+| `GET`/`POST`/`DELETE` | `/api/functions/:name/triggers[/:id]` | Manage event triggers (webhook/queue/cron/blob). |
+| `GET` | `/api/functions/:name/usage` | Metering / quota counters. |
+| `GET`/`PUT`/`DELETE` | `/api/workflows/:name` | Manage a declarative workflow. |
+| `GET` | `/api/workflows/:name/runs[/:id]` | List / get workflow runs. |
+
 ## Compute
+
+Top-level paths target the `default` project; `/api/projects/:project/compute/…`
+scopes to another project.
 
 | Method | Path | Purpose |
 | --- | --- | --- |

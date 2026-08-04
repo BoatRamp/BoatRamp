@@ -7,8 +7,16 @@ its own, and reused across sites. For the concept, see
 [Functions: the compute primitive](../explanation/functions.md); to run one behind
 a route instead, see [Deploy a handler](./deploy-handler.md).
 
+A function is owned by a **project**, just like a site. Every `boatramp function …`
+command respects the global `--project` flag (env `BOATRAMP_PROJECT`, falling back
+to `[publish].project`, then the reserved `default` project), and a function name is
+unique only *within* its project — so `acme/resize` and `beta/resize` are distinct
+functions.
+
 All of the commands below take `--server <url>` (or read it from `project.cfg`) and
-require a token with `system·admin` for writes / invoke, `system·read` for reads.
+require a token with `system·admin` for writes / invoke, `system·read` for reads —
+or a project role scoped to the function's project (`project_admin:<proj>` for
+writes / invoke, `project_viewer:<proj>` for reads).
 
 ## Scaffold a new function
 

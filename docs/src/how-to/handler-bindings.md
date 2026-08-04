@@ -43,6 +43,30 @@ site does not permit is refused at activation.
   the publishing handler and the consuming component, and match the topic name on
   each side. See [Run consumers, crons, and streams](./background-work.md).
 
+## Invoke a sibling function
+
+A handler can call a sibling [top-level function](./functions.md) **in-process**,
+exactly as a function invokes another. Grant `invoke` in the handler's `imports`,
+then list the functions it may reach in an `invoke_targets` allowlist — deny by
+default (an empty list invokes nothing, even with `invoke` granted), with `*`
+wildcards (`*`, `img-*`, or a literal name):
+
+```ron
+routing: (
+    handlers: [
+        ( route: "/api/**", component: "api.wasm",
+          methods: ["GET", "POST"],
+          imports: ["invoke"],
+          invoke_targets: ["resize", "thumb-*"] ),
+    ],
+),
+```
+
+Like every binding, `invoke` is capped by the site's allowed-imports policy: a
+site that does not permit it refuses the handler at activation. The callee is
+quota-admitted and depth-capped, and the caller's `Authorization` header is
+forwarded to it unchanged.
+
 ## Configure the `sql` backend
 
 The `sql` binding is the one data binding with a server-side backend choice, set

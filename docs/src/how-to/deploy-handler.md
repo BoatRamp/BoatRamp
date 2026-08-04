@@ -26,8 +26,8 @@ run the same kind of component *invoked by name* instead of behind a route, see
 
 Add the handler to the `routing.handlers` list. Each entry names a route pattern,
 the allowed methods, the component file, and the host imports it may use (`sql`,
-`wasi:keyvalue`, `wasi:blobstore`, `wasi:messaging`, plus `wasi:http` / `wasi:io`,
-which every handler gets):
+`wasi:keyvalue`, `wasi:blobstore`, `wasi:messaging`, `invoke`, plus `wasi:http` /
+`wasi:io`, which every handler gets):
 
 ```ron
 routing: (
@@ -42,6 +42,12 @@ routing: (
 A component receives only the imports it declares here, and only those the site
 also grants. Unlisted interfaces (for example `wasi:filesystem`) are refused even
 when named.
+
+A handler can also call a sibling top-level function in-process: grant it
+`invoke` and add an `invoke_targets` allowlist naming the functions it may reach
+(deny by default, `*` wildcards allowed). See
+[Deploy & invoke a function](./functions.md) and
+[Use handler bindings](./handler-bindings.md).
 
 ## 2. Validate the manifest
 

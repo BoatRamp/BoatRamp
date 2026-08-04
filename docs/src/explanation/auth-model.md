@@ -26,13 +26,30 @@ a signature-scale cost.
 Once a token verifies, the request is authorized with
 [Cedar](https://www.cedarpolicy.com/). Cedar decides whether the token's granted
 roles carry a **right** — an action (`read`, `write`, `deploy`, `admin`) on a
-**resource** (`site`, `blobs`, `tokens`, `certs`, `cache`, `system`), optionally
-scoped to one site — that satisfies what the endpoint requires. The policy is
-data: a default role-to-rights mapping ships built in, and an operator can
-replace it (validated server-side, so a bad policy cannot brick the control
+**resource** (`site`, `project`, `blobs`, `tokens`, `certs`, `cache`, `system`),
+optionally scoped to a target — that satisfies what the endpoint requires. The
+policy is data: a default role-to-rights mapping ships built in, and an operator
+can replace it (validated server-side, so a bad policy cannot brick the control
 plane). Unmapped paths fall through to `system` · `admin`, so a narrow token
 never reaches an ungated action by accident. The full vocabulary is in the
 [RBAC reference](../reference/rbac.md).
+
+## The project is the tenant boundary
+
+Two resources are target-scoped. A `site` right binds to a `<project>/<site>`
+target; a `project` right binds to a `<project>` and governs everything that
+project owns — its functions, compute, and workflows, and the project entity
+itself. This is what makes a project a hard tenant boundary: a token granted
+`project_admin:acme` has full control of `acme` and every site under it, but Cedar
+denies it any access to a sibling project `shop`. The built-in
+`project_admin` / `project_publisher` / `project_viewer` roles express the common
+tiers; a legacy site-only target (`publisher:blog`) is read as the `default`
+project (`publisher:default/blog`), so pre-0.2.0 tokens keep working.
+
+The same project identity is what a **managed handler's row-level scope resolves
+to**. The tenant is asserted by the platform from the verified token and the
+routed host — never supplied by guest code — so a handler cannot read across into
+another project's data. See [Organize sites into a project](../how-to/projects.md).
 
 ## The signing key can live outside the process
 

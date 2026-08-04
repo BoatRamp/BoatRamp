@@ -120,11 +120,16 @@ metadata:
   name: marketing
 spec:
   cluster: prod            # omit ⇒ the sole cluster in the namespace
+  project: acme            # omit ⇒ the reserved `default` project
   domains:
     - example.com          # → primary
     - www.example.com      # → alias
     - "*.preview.example.com"  # → wildcard
 ```
+
+The optional `project` field names the owning project (tenant boundary), so you
+can drive multi-project deployments from Git; empty is the reserved `default`
+project, byte-identical to the legacy per-site routing.
 
 The operator resolves the target `BoatRampCluster` and `PUT`s the site config over
 the same **pinned RPK-TLS channel** to the cluster's pod-0 that the membership
