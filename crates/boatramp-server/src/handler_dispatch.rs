@@ -15,6 +15,7 @@ pub(super) async fn dispatch_handler(
     runtime: &HandlerRuntime,
     deploy: &DeployStore,
     manifest: &Manifest,
+    project: &str,
     site: &str,
     request_path: &str,
     site_config: Option<&SiteConfig>,
@@ -64,6 +65,7 @@ pub(super) async fn dispatch_handler(
 
     let bindings = build_bindings(
         inner,
+        boatramp_core::project::ProjectRef::new(project),
         site,
         &scope,
         preview,
@@ -266,6 +268,7 @@ pub(super) async fn read_blob_fully(deploy: &DeployStore, hash: &str) -> Result<
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_bindings(
     inner: &HandlerRuntimeInner,
+    project: boatramp_core::project::ProjectRef<'_>,
     site: &str,
     scope: &str,
     preview: Option<&str>,
@@ -320,7 +323,9 @@ pub(super) async fn build_bindings(
     // bearer forwarding reaches it unchanged.
     if granted("invoke") && !invoke_targets.is_empty() {
         if let Some(invoker) = inner.invoker.get() {
-            bindings = bindings.with_invoke(invoker.clone(), invoke_targets.to_vec(), depth);
+            // A site handler invokes siblings within its own tenant project.
+            bindings =
+                bindings.with_invoke(invoker.scoped(project), invoke_targets.to_vec(), depth);
         }
     }
     // Capture stdout/stderr for *every* invocation — not a

@@ -134,28 +134,39 @@ async fn reconcile_blob_watchers(
         }
         return;
     }
-    let functions = match deploy.list_stored_functions(ProjectRef::DEFAULT).await {
-        Ok(f) => f,
-        Err(_) => return,
-    };
+    // Reconcile every project's blob triggers; a same-named function in two
+    // projects gets two independent watchers (the watch id is project-qualified).
+    let projects = deploy.discover_projects().await.unwrap_or_default();
     let mut desired = std::collections::HashSet::new();
-    for function in functions {
-        let triggers = deploy
-            .list_triggers(ProjectRef::DEFAULT, &function.name)
-            .await
-            .unwrap_or_default();
-        for trigger in triggers {
-            let TriggerKind::Blob { prefix } = &trigger.kind else {
-                continue;
-            };
-            let watch_id = format!("{}|{}", function.name, trigger.id);
-            desired.insert(watch_id.clone());
-            if let std::collections::hash_map::Entry::Vacant(slot) = watchers.entry(watch_id) {
-                if let Some(handle) =
-                    spawn_blob_watcher(inner.clone(), deploy.clone(), function.clone(), prefix)
-                        .await
-                {
-                    slot.insert(handle);
+    for project_name in projects {
+        let project = ProjectRef::new(&project_name);
+        let functions = match deploy.list_stored_functions(project).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for function in functions {
+            let triggers = deploy
+                .list_triggers(project, &function.name)
+                .await
+                .unwrap_or_default();
+            for trigger in triggers {
+                let TriggerKind::Blob { prefix } = &trigger.kind else {
+                    continue;
+                };
+                let watch_id = format!("{project_name}|{}|{}", function.name, trigger.id);
+                desired.insert(watch_id.clone());
+                if let std::collections::hash_map::Entry::Vacant(slot) = watchers.entry(watch_id) {
+                    if let Some(handle) = spawn_blob_watcher(
+                        inner.clone(),
+                        deploy.clone(),
+                        project_name.clone(),
+                        function.clone(),
+                        prefix,
+                    )
+                    .await
+                    {
+                        slot.insert(handle);
+                    }
                 }
             }
         }
@@ -178,6 +189,7 @@ async fn reconcile_blob_watchers(
 pub(super) async fn spawn_blob_watcher(
     inner: Arc<HandlerRuntimeInner>,
     deploy: DeployStore,
+    project: String,
     function: boatramp_core::function::Function,
     prefix: &str,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -196,7 +208,14 @@ pub(super) async fn spawn_blob_watcher(
     Some(tokio::spawn(async move {
         use futures::StreamExt;
         while let Some(change) = stream.next().await {
-            enqueue_blob_invocation(&deploy, &function, &change, &namespace).await;
+            enqueue_blob_invocation(
+                &deploy,
+                ProjectRef::new(&project),
+                &function,
+                &change,
+                &namespace,
+            )
+            .await;
         }
     }))
 }
@@ -207,6 +226,7 @@ pub(super) async fn spawn_blob_watcher(
 #[cfg(feature = "handlers")]
 async fn enqueue_blob_invocation(
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     change: &boatramp_core::BlobChange,
     namespace: &str,
@@ -235,7 +255,7 @@ async fn enqueue_blob_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
+    if let Err(err) = deploy.put_invocation(project, &inv).await {
         tracing::warn!(function = %function.name, %err, "enqueuing blob invocation failed");
     }
 }
@@ -255,134 +275,145 @@ pub(super) async fn run_scheduler_tick(
     use std::sync::atomic::Ordering;
     let mut acked = 0;
     let mut cron_handles = Vec::new();
-    for site in deploy.list_sites(ProjectRef::DEFAULT).await? {
-        let Some(site_config) = deploy.get_site_config(ProjectRef::DEFAULT, &site).await? else {
-            continue;
-        };
-        let Some(site_handlers) = site_config.handlers.as_ref().filter(|h| h.enabled) else {
-            continue;
-        };
-        // Active deployments: the current one (production, namespace `{site}`)
-        // plus each background alias (namespace `{site}/{alias}`). Never previews.
-        let mut active: Vec<(String, String)> = Vec::new();
-        if let Some(id) = deploy.current_id(ProjectRef::DEFAULT, &site).await? {
-            active.push((id, site.clone()));
-        }
-        for alias in &site_handlers.background_aliases {
-            if let Some(id) = deploy.get_alias(ProjectRef::DEFAULT, &site, alias).await? {
-                active.push((id, format!("{site}/{alias}")));
-            }
-        }
-        for (deploy_id, scope) in active {
-            let Some(manifest) = deploy.get_manifest(&deploy_id).await? else {
+    // Fan out over every project: a same-named site/function/workflow in two
+    // projects is scheduled independently (its background jobs run under its own
+    // tenant, never `default`). For a single default-only store this is one pass.
+    let projects = deploy.discover_projects().await?;
+    for project_name in &projects {
+        let project = ProjectRef::new(project_name);
+        for site in deploy.list_sites(project).await? {
+            let Some(site_config) = deploy.get_site_config(project, &site).await? else {
                 continue;
             };
-            // --- consumers (only with a messaging backend) ---
-            if let Some(messaging) = inner.messaging.clone() {
-                for consumer in &manifest.config.consumers {
-                    let Some(entry) = manifest.files.get(&consumer.component) else {
-                        tracing::warn!(site, component = %consumer.component, "consumer component missing");
-                        continue;
-                    };
-                    // Cache the (content-addressed) component bytes by hash.
-                    if !wasm_cache.contains_key(&entry.hash) {
-                        match read_blob_bytes(deploy, &entry.hash).await {
-                            Ok(bytes) => {
-                                wasm_cache.insert(entry.hash.clone(), bytes);
-                            }
-                            Err(err) => {
-                                tracing::warn!(site, %err, "reading consumer component failed");
-                                continue;
-                            }
-                        }
-                    }
-                    let wasm = &wasm_cache[&entry.hash];
-                    let bindings = build_bindings(
-                        inner,
-                        &site,
-                        &scope,
-                        None,
-                        &consumer.imports,
-                        site_handlers,
-                        // Consumers have no deploy `env`; site secrets still apply.
-                        &std::collections::BTreeMap::new(),
-                        // Consumers do not get the invoke capability (no allowlist field).
-                        &[],
-                        0,
-                    )
-                    .await;
-                    acked += dispatch_consumer_batch(
-                        &inner.engine,
-                        messaging.as_ref(),
-                        &inner.metrics,
-                        &site,
-                        &format!("{scope}/{}", consumer.topic),
-                        &format!("{scope}/"),
-                        &entry.hash,
-                        wasm,
-                        &bindings,
-                        site_limits(site_handlers),
-                        CONSUMER_LEASE,
-                        CONSUMER_MAX_ATTEMPTS,
-                        CONSUMER_BATCH,
-                    )
-                    .await;
+            let Some(site_handlers) = site_config.handlers.as_ref().filter(|h| h.enabled) else {
+                continue;
+            };
+            // Active deployments: the current one (production, namespace `{site}`)
+            // plus each background alias (namespace `{site}/{alias}`). Never previews.
+            let mut active: Vec<(String, String)> = Vec::new();
+            if let Some(id) = deploy.current_id(project, &site).await? {
+                active.push((id, site.clone()));
+            }
+            for alias in &site_handlers.background_aliases {
+                if let Some(id) = deploy.get_alias(project, &site, alias).await? {
+                    active.push((id, format!("{site}/{alias}")));
                 }
             }
-            // --- crons (leader-only in cluster mode) ---
-            // The gate fires crons on exactly one node; consumers above run on
-            // every node (leased dispatch distributes them). `None` = single
-            // node, always fires.
-            let cron_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
-            for (idx, cron) in manifest.config.crons.iter().enumerate() {
-                if !cron_enabled {
-                    break;
-                }
-                let Ok(schedule) = boatramp_core::cron::CronSchedule::parse(&cron.schedule) else {
+            for (deploy_id, scope) in active {
+                let Some(manifest) = deploy.get_manifest(&deploy_id).await? else {
                     continue;
                 };
-                if !schedule.fires_at(now.minute, now.hour, now.dom, now.month, now.dow) {
-                    continue;
+                // --- consumers (only with a messaging backend) ---
+                if let Some(messaging) = inner.messaging.clone() {
+                    for consumer in &manifest.config.consumers {
+                        let Some(entry) = manifest.files.get(&consumer.component) else {
+                            tracing::warn!(site, component = %consumer.component, "consumer component missing");
+                            continue;
+                        };
+                        // Cache the (content-addressed) component bytes by hash.
+                        if !wasm_cache.contains_key(&entry.hash) {
+                            match read_blob_bytes(deploy, &entry.hash).await {
+                                Ok(bytes) => {
+                                    wasm_cache.insert(entry.hash.clone(), bytes);
+                                }
+                                Err(err) => {
+                                    tracing::warn!(site, %err, "reading consumer component failed");
+                                    continue;
+                                }
+                            }
+                        }
+                        let wasm = &wasm_cache[&entry.hash];
+                        let bindings = build_bindings(
+                            inner,
+                            project,
+                            &site,
+                            &scope,
+                            None,
+                            &consumer.imports,
+                            site_handlers,
+                            // Consumers have no deploy `env`; site secrets still apply.
+                            &std::collections::BTreeMap::new(),
+                            // Consumers do not get the invoke capability (no allowlist field).
+                            &[],
+                            0,
+                        )
+                        .await;
+                        acked += dispatch_consumer_batch(
+                            &inner.engine,
+                            messaging.as_ref(),
+                            &inner.metrics,
+                            &site,
+                            &format!("{scope}/{}", consumer.topic),
+                            &format!("{scope}/"),
+                            &entry.hash,
+                            wasm,
+                            &bindings,
+                            site_limits(site_handlers),
+                            CONSUMER_LEASE,
+                            CONSUMER_MAX_ATTEMPTS,
+                            CONSUMER_BATCH,
+                        )
+                        .await;
+                    }
                 }
-                let key = format!("{scope}|cron|{idx}");
-                let entry = cron_state.entry(key).or_insert_with(|| CronEntry {
-                    last_minute: -1,
-                    running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                });
-                if entry.last_minute == now.minute_stamp {
-                    continue; // already fired this minute
+                // --- crons (leader-only in cluster mode) ---
+                // The gate fires crons on exactly one node; consumers above run on
+                // every node (leased dispatch distributes them). `None` = single
+                // node, always fires.
+                let cron_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
+                for (idx, cron) in manifest.config.crons.iter().enumerate() {
+                    if !cron_enabled {
+                        break;
+                    }
+                    let Ok(schedule) = boatramp_core::cron::CronSchedule::parse(&cron.schedule)
+                    else {
+                        continue;
+                    };
+                    if !schedule.fires_at(now.minute, now.hour, now.dom, now.month, now.dow) {
+                        continue;
+                    }
+                    let key = format!("{project_name}|{scope}|cron|{idx}");
+                    let entry = cron_state.entry(key).or_insert_with(|| CronEntry {
+                        last_minute: -1,
+                        running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    });
+                    if entry.last_minute == now.minute_stamp {
+                        continue; // already fired this minute
+                    }
+                    if matches!(cron.overlap, boatramp_core::config::Overlap::Skip)
+                        && entry.running.load(Ordering::Acquire)
+                    {
+                        tracing::info!(site, route = %cron.route, "cron skipped (previous run still in flight)");
+                        continue;
+                    }
+                    entry.last_minute = now.minute_stamp;
+                    let running = entry.running.clone();
+                    running.store(true, Ordering::Release);
+                    let (inner, deploy, manifest, project_owned, site, scope, site_handlers, cron) = (
+                        inner.clone(),
+                        deploy.clone(),
+                        manifest.clone(),
+                        project_name.clone(),
+                        site.clone(),
+                        scope.clone(),
+                        site_handlers.clone(),
+                        cron.clone(),
+                    );
+                    cron_handles.push(tokio::spawn(async move {
+                        fire_cron(
+                            &inner,
+                            &deploy,
+                            ProjectRef::new(&project_owned),
+                            &manifest,
+                            &site,
+                            &scope,
+                            &site_handlers,
+                            &cron,
+                        )
+                        .await;
+                        running.store(false, Ordering::Release);
+                    }));
                 }
-                if matches!(cron.overlap, boatramp_core::config::Overlap::Skip)
-                    && entry.running.load(Ordering::Acquire)
-                {
-                    tracing::info!(site, route = %cron.route, "cron skipped (previous run still in flight)");
-                    continue;
-                }
-                entry.last_minute = now.minute_stamp;
-                let running = entry.running.clone();
-                running.store(true, Ordering::Release);
-                let (inner, deploy, manifest, site, scope, site_handlers, cron) = (
-                    inner.clone(),
-                    deploy.clone(),
-                    manifest.clone(),
-                    site.clone(),
-                    scope.clone(),
-                    site_handlers.clone(),
-                    cron.clone(),
-                );
-                cron_handles.push(tokio::spawn(async move {
-                    fire_cron(
-                        &inner,
-                        &deploy,
-                        &manifest,
-                        &site,
-                        &scope,
-                        &site_handlers,
-                        &cron,
-                    )
-                    .await;
-                    running.store(false, Ordering::Release);
-                }));
             }
         }
     }
@@ -392,15 +423,21 @@ pub(super) async fn run_scheduler_tick(
     // cluster-wide; the drain runs inline so the outcome is settled this tick.
     let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
     if invoke_enabled {
-        for function in deploy.list_stored_functions(ProjectRef::DEFAULT).await? {
-            // Fire due triggers first (a cron enqueues an invocation this tick),
-            // then drain the queue so a just-enqueued call runs without waiting.
-            dispatch_function_triggers(inner, deploy, &function, &now).await;
-            drain_function_invocations(inner, deploy, &function).await;
-        }
-        // --- workflow runs (FA-6), same leader gate ---
-        for workflow in deploy.list_workflows(ProjectRef::DEFAULT).await? {
-            drain_workflow_runs(inner, deploy, &workflow).await;
+        // Same per-project fan-out as the site loop: each project's functions +
+        // workflows drain under their own tenant.
+        for project_name in &projects {
+            let project = ProjectRef::new(project_name);
+            for function in deploy.list_stored_functions(project).await? {
+                // Fire due triggers first (a cron enqueues an invocation this
+                // tick), then drain the queue so a just-enqueued call runs without
+                // waiting.
+                dispatch_function_triggers(inner, deploy, project, &function, &now).await;
+                drain_function_invocations(inner, deploy, project, &function).await;
+            }
+            // --- workflow runs (FA-6), same leader gate ---
+            for workflow in deploy.list_workflows(project).await? {
+                drain_workflow_runs(inner, deploy, project, &workflow).await;
+            }
         }
     }
     Ok((acked, cron_handles))
@@ -410,9 +447,11 @@ pub(super) async fn run_scheduler_tick(
 /// never a network hop) with a synthetic `GET`, scoped to the deployment's
 /// namespace. The response is drained and discarded — a cron has no caller.
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
 async fn fire_cron(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     manifest: &Manifest,
     site: &str,
     scope: &str,
@@ -435,6 +474,7 @@ async fn fire_cron(
     };
     let bindings = build_bindings(
         inner,
+        project,
         site,
         scope,
         None,

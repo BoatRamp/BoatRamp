@@ -536,7 +536,7 @@ async fn reconcile_domain_verifications(
     let now = now_unix();
     let mut attached = 0usize;
     let mut probes = 0usize;
-    for (_project, site, v) in deploy.list_all_domain_verifications().await? {
+    for (project, site, v) in deploy.list_all_domain_verifications().await? {
         if v.verified || v.is_expired(now) {
             continue;
         }
@@ -548,12 +548,13 @@ async fn reconcile_domain_verifications(
             break;
         }
         probes += 1;
+        let project = ProjectRef::new(&project);
         // Not satisfied yet, or the probe/method failed (network / a DNS method on
         // a build without the resolver) ⇒ leave it pending and retry next tick.
         if let Ok(true) = check_ownership(probe, &v).await {
             if let Err(err) = deploy
                 .mark_domain_verified(
-                    ProjectRef::DEFAULT,
+                    project,
                     &boatramp_core::site::SiteName::new(site.as_str()),
                     &v.host,
                 )
@@ -564,7 +565,7 @@ async fn reconcile_domain_verifications(
             }
             match deploy
                 .attach_verified_domain(
-                    ProjectRef::DEFAULT,
+                    project,
                     &boatramp_core::site::SiteName::new(site.as_str()),
                     &v.host,
                 )

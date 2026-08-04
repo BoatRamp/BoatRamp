@@ -42,9 +42,11 @@ pub(super) async fn serve_sites(
         limiter: limiter.as_ref(),
     };
     // The explicit `/_sites/<name>/` admin/testing route is not host-routed, so
-    // transport/canonical redirects don't apply.
+    // transport/canonical redirects don't apply. It addresses sites by bare name,
+    // a default-project admin convenience.
     serve_request(
         &deploy,
+        ProjectRef::DEFAULT.as_str(),
         &site,
         &request_path,
         request,
@@ -186,6 +188,7 @@ pub(super) async fn serve_by_host(
             // Host-routed: transport/canonical redirects + HSTS apply.
             serve_request(
                 &deploy,
+                &owner.project,
                 &owner.site,
                 &request_path,
                 request,
@@ -226,8 +229,10 @@ pub(super) async fn serve_by_host(
                         peer: peer.ip(),
                         limiter: limiter.as_ref(),
                     };
+                    // Implicit first-label routing is a default-project convenience.
                     return serve_request(
                         &deploy,
+                        ProjectRef::DEFAULT.as_str(),
                         label,
                         &request_path,
                         request,
@@ -244,8 +249,10 @@ pub(super) async fn serve_by_host(
                         peer: peer.ip(),
                         limiter: limiter.as_ref(),
                     };
+                    // The operator's catch-all `default_site` is a default-project site.
                     serve_request(
                         &deploy,
+                        ProjectRef::DEFAULT.as_str(),
                         site,
                         &request_path,
                         request,
@@ -283,16 +290,20 @@ async fn serve_host_preview(
         Ok(None) => return not_found(),
         Err(err) => return deploy_error_response(err),
     };
-    let site = match deploy.resolve_site_by_host(site_host).await {
-        Ok(owner) => owner.map(|o| o.site),
+    let owner = match deploy.resolve_site_by_host(site_host).await {
+        Ok(owner) => owner,
         Err(err) => return deploy_error_response(err),
     };
-    let site_config = match &site {
-        Some(site) => match deploy.get_site_config(ProjectRef::DEFAULT, site).await {
-            Ok(config) => config,
-            Err(err) => return deploy_error_response(err),
-        },
-        None => None,
+    let project = owner.as_ref().map(|o| o.project.clone());
+    let site = owner.map(|o| o.site);
+    let site_config = match (&project, &site) {
+        (Some(project), Some(site)) => {
+            match deploy.get_site_config(ProjectRef::new(project), site).await {
+                Ok(config) => config,
+                Err(err) => return deploy_error_response(err),
+            }
+        }
+        _ => None,
     };
     match deploy.get_manifest(&id).await {
         Ok(Some(manifest)) => {
@@ -302,6 +313,7 @@ async fn serve_host_preview(
                 request_path,
                 request,
                 peer,
+                project.as_deref(),
                 site.as_deref(),
                 site_config.as_ref(),
                 handlers,
@@ -318,8 +330,10 @@ async fn serve_host_preview(
 /// deploy config (redirects, rewrites/SPA, clean URLs, custom 404, headers,
 /// cache) via [`route::resolve`], then HTTP correctness (conditional `304`,
 /// `Range`/`206`, `ETag`).
+#[allow(clippy::too_many_arguments)]
 async fn serve_request(
     deploy: &DeployStore,
+    project: &str,
     site: &str,
     request_path: &str,
     request: Request,
@@ -327,8 +341,9 @@ async fn serve_request(
     handlers: &HandlerRuntime,
     host_routed: bool,
 ) -> Response {
+    let project_ref = ProjectRef::new(project);
     // Load the site config once (for access policy + client-IP resolution).
-    let site_config = match deploy.get_site_config(ProjectRef::DEFAULT, site).await {
+    let site_config = match deploy.get_site_config(project_ref, site).await {
         Ok(config) => config,
         Err(err) => return deploy_error_response(err),
     };
@@ -441,7 +456,7 @@ async fn serve_request(
         }
     }
 
-    let manifest = match deploy.current_manifest(ProjectRef::DEFAULT, site).await {
+    let manifest = match deploy.current_manifest(project_ref, site).await {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return not_found(),
         Err(err) => return deploy_error_response(err),
@@ -452,6 +467,7 @@ async fn serve_request(
         request_path,
         request,
         client_ip,
+        Some(project),
         Some(site),
         site_config.as_ref(),
         handlers,
@@ -704,19 +720,23 @@ pub(super) async fn serve_preview(
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .map(strip_port);
-    let site = match site {
+    let owner = match site {
         Some(host) => match deploy.resolve_site_by_host(host).await {
-            Ok(owner) => owner.map(|o| o.site),
+            Ok(owner) => owner,
             Err(err) => return deploy_error_response(err),
         },
         None => None,
     };
-    let site_config = match &site {
-        Some(site) => match deploy.get_site_config(ProjectRef::DEFAULT, site).await {
-            Ok(config) => config,
-            Err(err) => return deploy_error_response(err),
-        },
-        None => None,
+    let project = owner.as_ref().map(|o| o.project.clone());
+    let site = owner.map(|o| o.site);
+    let site_config = match (&project, &site) {
+        (Some(project), Some(site)) => {
+            match deploy.get_site_config(ProjectRef::new(project), site).await {
+                Ok(config) => config,
+                Err(err) => return deploy_error_response(err),
+            }
+        }
+        _ => None,
     };
     match deploy.get_manifest(&id).await {
         Ok(Some(manifest)) => {
@@ -726,6 +746,7 @@ pub(super) async fn serve_preview(
                 &request_path,
                 request,
                 peer.ip(),
+                project.as_deref(),
                 site.as_deref(),
                 site_config.as_ref(),
                 &handlers,
@@ -889,6 +910,9 @@ async fn serve_resolved(
     request_path: &str,
     request: Request,
     client_ip: IpAddr,
+    // The tenant project the resolved site belongs to; `None` mirrors `site:
+    // None` (a preview reached via a non-resolving host, handlers off).
+    project: Option<&str>,
     site: Option<&str>,
     site_config: Option<&SiteConfig>,
     handlers: &HandlerRuntime,
@@ -925,6 +949,10 @@ async fn serve_resolved(
                         handlers,
                         deploy,
                         manifest,
+                        // Handler dispatch only runs when `site` is Some, and the
+                        // project is threaded alongside it; default-project fallback
+                        // keeps a by-id preview reached via a non-resolving host safe.
+                        project.unwrap_or(ProjectRef::DEFAULT.as_str()),
                         site,
                         request_path,
                         site_config,

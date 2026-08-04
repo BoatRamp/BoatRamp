@@ -150,7 +150,7 @@ async fn execute_sync(
     idem_key: Option<String>,
 ) -> Response {
     let (response, duration_ms) =
-        execute_function(inner, deploy, function, component, request, 0).await;
+        execute_function(inner, deploy, project, function, component, request, 0).await;
     let Some(key) = idem_key else {
         // No capture on the plain streaming path: meter counts + duration + a
         // head-status success signal (byte totals are metered on the buffered
@@ -308,6 +308,7 @@ fn replay_invocation(inv: &boatramp_core::function::Invocation) -> Response {
 pub(super) async fn execute_function(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     component: &str,
     request: Request,
@@ -332,7 +333,7 @@ pub(super) async fn execute_function(
         Err(response) => return (response, 0),
     };
     let scope = format!("fn/{}", function.name);
-    let bindings = build_function_bindings(inner, &scope, &function.config, depth).await;
+    let bindings = build_function_bindings(inner, project, &scope, &function.config, depth).await;
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
@@ -369,6 +370,7 @@ pub(super) async fn execute_function(
 #[cfg(feature = "handlers")]
 async fn build_function_bindings(
     inner: &HandlerRuntimeInner,
+    project: ProjectRef<'_>,
     scope: &str,
     config: &boatramp_core::function::FunctionConfig,
     depth: u32,
@@ -401,7 +403,11 @@ async fn build_function_bindings(
     // chain; the host caps the next hop.
     if granted("invoke") && !config.invoke_targets.is_empty() {
         if let Some(invoker) = inner.invoker.get() {
-            bindings = bindings.with_invoke(invoker.clone(), config.invoke_targets.clone(), depth);
+            bindings = bindings.with_invoke(
+                invoker.scoped(project),
+                config.invoke_targets.clone(),
+                depth,
+            );
         }
     }
     inner.logs.configure(scope, None);
@@ -470,12 +476,32 @@ fn prepare_invoke_request(mut request: Request) -> Request {
 pub(crate) struct FunctionInvoker {
     deploy: DeployStore,
     runtime: std::sync::Weak<HandlerRuntimeInner>,
+    /// The tenant project the caller runs in. Function-to-function invoke is
+    /// **in-project**: a target is resolved, admitted, and metered within this
+    /// project, never across the tenant boundary. The startup template carries
+    /// `default`; [`scoped`](Self::scoped) rebinds it per caller.
+    project: String,
 }
 
 #[cfg(feature = "handlers")]
 impl FunctionInvoker {
     pub(crate) fn new(deploy: DeployStore, runtime: std::sync::Weak<HandlerRuntimeInner>) -> Self {
-        Self { deploy, runtime }
+        Self {
+            deploy,
+            runtime,
+            project: ProjectRef::DEFAULT.as_str().to_string(),
+        }
+    }
+
+    /// Derive a project-scoped invoker: the same store + runtime, but resolving
+    /// the caller's siblings within `project`. Built per binding (a site handler
+    /// or a top-level function) so the `invoke` capability never crosses tenants.
+    pub(crate) fn scoped(&self, project: ProjectRef<'_>) -> Arc<dyn boatramp_handlers::Invoker> {
+        Arc::new(Self {
+            deploy: self.deploy.clone(),
+            runtime: self.runtime.clone(),
+            project: project.as_str().to_string(),
+        })
     }
 }
 
@@ -494,8 +520,11 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
                 "handler runtime is shutting down".into(),
             ));
         };
+        // In-project invoke: resolve, admit, and meter the callee within the
+        // caller's own tenant project (never `default`, never a sibling tenant).
+        let project = ProjectRef::new(&self.project);
         // Resolve the target by name to its active version's component.
-        let function = match self.deploy.get_function(ProjectRef::DEFAULT, target).await {
+        let function = match self.deploy.get_function(project, target).await {
             Ok(Some(f)) => f,
             Ok(None) => return Err(InvokeError::NotFound),
             Err(err) => return Err(InvokeError::Failed(err.to_string())),
@@ -510,14 +539,13 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
         };
         // Rate-limit the callee against its own quota, as an external call would.
         // A rejection is the callee's response (429), surfaced to the caller.
-        if let Err(response) =
-            admit_by_quota(&inner, &self.deploy, ProjectRef::DEFAULT, &function).await
-        {
+        if let Err(response) = admit_by_quota(&inner, &self.deploy, project, &function).await {
             return Ok(buffer_invoke_response(response).await);
         }
         let (response, duration_ms) = execute_function(
             &inner,
             &self.deploy,
+            project,
             &function,
             &component,
             axum_request,
@@ -531,14 +559,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             bytes_in,
             bytes_out: invoke_response.body.len() as u64,
         };
-        record_metering(
-            &inner,
-            &self.deploy,
-            ProjectRef::DEFAULT,
-            &function.name,
-            &sample,
-        )
-        .await;
+        record_metering(&inner, &self.deploy, project, &function.name, &sample).await;
         Ok(invoke_response)
     }
 }
@@ -648,12 +669,10 @@ pub(super) fn b64_decode(s: &str) -> Vec<u8> {
 pub(super) async fn drain_function_invocations(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
 ) {
-    let queued = match deploy
-        .list_invocations(ProjectRef::DEFAULT, &function.name)
-        .await
-    {
+    let queued = match deploy.list_invocations(project, &function.name).await {
         Ok(list) => list,
         Err(err) => {
             tracing::warn!(function = %function.name, %err, "listing invocations failed");
@@ -667,7 +686,7 @@ pub(super) async fn drain_function_invocations(
         ) {
             continue;
         }
-        run_queued_invocation(inner, deploy, function, inv).await;
+        run_queued_invocation(inner, deploy, project, function, inv).await;
     }
 }
 
@@ -677,6 +696,7 @@ pub(super) async fn drain_function_invocations(
 async fn run_queued_invocation(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     mut inv: boatramp_core::function::Invocation,
 ) {
@@ -686,13 +706,13 @@ async fn run_queued_invocation(
         // The pinned version is gone (rolled off / pruned) — unrunnable, so fail.
         inv.status = InvocationStatus::Failed;
         inv.updated = now_unix();
-        let _ = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await;
+        let _ = deploy.put_invocation(project, &inv).await;
         return;
     };
     inv.status = InvocationStatus::Running;
     inv.attempts = inv.attempts.saturating_add(1);
     inv.updated = now_unix();
-    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
+    if let Err(err) = deploy.put_invocation(project, &inv).await {
         tracing::warn!(function = %function.name, %err, "marking invocation running failed");
         return;
     }
@@ -703,7 +723,7 @@ async fn run_queued_invocation(
         .unwrap_or(0);
     let request = build_stored_request(&inv);
     let (response, duration_ms) =
-        execute_function(inner, deploy, function, &component, request, 0).await;
+        execute_function(inner, deploy, project, function, &component, request, 0).await;
     let (status, content_type, body) = capture_response(response).await;
     // A function that returns a 5xx from the engine wrapper (timeout/trap/etc.)
     // is a delivery failure worth retrying; any response the guest itself
@@ -724,7 +744,7 @@ async fn run_queued_invocation(
         inv.status = InvocationStatus::Queued;
     }
     inv.updated = now_unix();
-    let _ = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await;
+    let _ = deploy.put_invocation(project, &inv).await;
     // Meter a settled attempt (a requeue-for-retry is not yet a completed
     // invocation, so only the terminal transition is metered).
     if matches!(
@@ -737,7 +757,7 @@ async fn run_queued_invocation(
             bytes_in,
             bytes_out: body.len() as u64,
         };
-        record_metering(inner, deploy, ProjectRef::DEFAULT, &function.name, &sample).await;
+        record_metering(inner, deploy, project, &function.name, &sample).await;
     }
 }
 
@@ -1038,14 +1058,12 @@ pub(super) fn blob_storage_prefix(function: &str, trigger_prefix: &str) -> Strin
 pub(super) async fn dispatch_function_triggers(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     now: &CronNow,
 ) {
     use boatramp_core::function::TriggerKind;
-    let triggers = match deploy
-        .list_triggers(ProjectRef::DEFAULT, &function.name)
-        .await
-    {
+    let triggers = match deploy.list_triggers(project, &function.name).await {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!(function = %function.name, %err, "listing triggers failed");
@@ -1064,14 +1082,12 @@ pub(super) async fn dispatch_function_triggers(
                 if trigger.last_fired_minute == Some(now.minute_stamp) {
                     continue; // already fired this minute
                 }
-                enqueue_scheduled_invocation(deploy, function).await;
+                enqueue_scheduled_invocation(deploy, project, function).await;
                 trigger.last_fired_minute = Some(now.minute_stamp);
-                let _ = deploy
-                    .put_trigger(ProjectRef::DEFAULT, &function.name, &trigger)
-                    .await;
+                let _ = deploy.put_trigger(project, &function.name, &trigger).await;
             }
             TriggerKind::Queue { topic } => {
-                dispatch_function_queue(inner, deploy, function, topic).await;
+                dispatch_function_queue(inner, deploy, project, function, topic).await;
             }
             // Route / Invoke / Webhook are request-driven; Blob / Stream are not
             // dispatched from the scheduler in this pass.
@@ -1085,6 +1101,7 @@ pub(super) async fn dispatch_function_triggers(
 #[cfg(feature = "handlers")]
 async fn enqueue_scheduled_invocation(
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
 ) {
     let now = now_unix();
@@ -1102,7 +1119,7 @@ async fn enqueue_scheduled_invocation(
         created: now,
         updated: now,
     };
-    if let Err(err) = deploy.put_invocation(ProjectRef::DEFAULT, &inv).await {
+    if let Err(err) = deploy.put_invocation(project, &inv).await {
         tracing::warn!(function = %function.name, %err, "enqueuing scheduled invocation failed");
     }
 }
@@ -1116,6 +1133,7 @@ async fn enqueue_scheduled_invocation(
 async fn dispatch_function_queue(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     topic: &str,
 ) {
@@ -1148,7 +1166,7 @@ async fn dispatch_function_queue(
         let bytes_in = msg.payload.len() as u64;
         let request = build_webhook_request(None, msg.payload.clone());
         let (response, duration_ms) =
-            execute_function(inner, deploy, function, &component, request, 0).await;
+            execute_function(inner, deploy, project, function, &component, request, 0).await;
         let (status, _content_type, body) = capture_response(response).await;
         let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
             && status != StatusCode::GATEWAY_TIMEOUT
@@ -1159,7 +1177,7 @@ async fn dispatch_function_queue(
             bytes_in,
             bytes_out: body.len() as u64,
         };
-        record_metering(inner, deploy, ProjectRef::DEFAULT, &function.name, &sample).await;
+        record_metering(inner, deploy, project, &function.name, &sample).await;
         if delivered {
             let _ = messaging.ack(&msg).await;
         } else {
@@ -1246,8 +1264,16 @@ pub(super) async fn webhook_ingress(
     };
     let bytes_in = body.len() as u64;
     let request = build_webhook_request(content_type, body.to_vec());
-    let (response, duration_ms) =
-        execute_function(inner, &deploy, &function, &component, request, 0).await;
+    let (response, duration_ms) = execute_function(
+        inner,
+        &deploy,
+        project.as_ref(),
+        &function,
+        &component,
+        request,
+        0,
+    )
+    .await;
     let sample = boatramp_core::function::MeteringSample {
         success: response.status().as_u16() < 500,
         duration_ms,

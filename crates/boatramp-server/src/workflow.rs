@@ -145,12 +145,10 @@ pub(super) async fn get_workflow_run_handler(
 pub(super) async fn drain_workflow_runs(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     workflow: &boatramp_core::workflow::Workflow,
 ) {
-    let runs = match deploy
-        .list_workflow_runs(ProjectRef::DEFAULT, &workflow.name)
-        .await
-    {
+    let runs = match deploy.list_workflow_runs(project, &workflow.name).await {
         Ok(runs) => runs,
         Err(err) => {
             tracing::warn!(workflow = %workflow.name, %err, "listing workflow runs failed");
@@ -161,7 +159,7 @@ pub(super) async fn drain_workflow_runs(
         if run.is_terminal() {
             continue;
         }
-        advance_workflow_run(inner, deploy, workflow, run).await;
+        advance_workflow_run(inner, deploy, project, workflow, run).await;
     }
 }
 
@@ -173,6 +171,7 @@ pub(super) async fn drain_workflow_runs(
 async fn advance_workflow_run(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     workflow: &boatramp_core::workflow::Workflow,
     mut run: boatramp_core::workflow::WorkflowRun,
 ) {
@@ -183,7 +182,7 @@ async fn advance_workflow_run(
             continue;
         };
         let input = build_step_input(&run, &step);
-        let outcome = run_workflow_step(inner, deploy, &step, input).await;
+        let outcome = run_workflow_step(inner, deploy, project, &step, input).await;
         let Some(sr) = run.steps.get_mut(&step_id) else {
             continue;
         };
@@ -202,13 +201,13 @@ async fn advance_workflow_run(
     // Settle the run.
     let any_failed = run.steps.values().any(|r| r.status == StepStatus::Failed);
     if any_failed {
-        compensate_run(inner, deploy, workflow, &mut run).await;
+        compensate_run(inner, deploy, project, workflow, &mut run).await;
         run.status = boatramp_core::workflow::WorkflowStatus::Failed;
     } else if run.all_succeeded() {
         run.status = boatramp_core::workflow::WorkflowStatus::Succeeded;
     }
     run.updated = now_unix();
-    let _ = deploy.put_workflow_run(ProjectRef::DEFAULT, &run).await;
+    let _ = deploy.put_workflow_run(project, &run).await;
 }
 
 /// Run a single step's function (active version) with `input` as its request body.
@@ -218,20 +217,18 @@ async fn advance_workflow_run(
 async fn run_workflow_step(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     step: &boatramp_core::workflow::Step,
     input: Vec<u8>,
 ) -> Option<Vec<u8>> {
-    let function = match deploy
-        .get_function(ProjectRef::DEFAULT, &step.function)
-        .await
-    {
+    let function = match deploy.get_function(project, &step.function).await {
         Ok(Some(f)) => f,
         _ => return None,
     };
     let component = function.resolve(&function.active).map(str::to_owned)?;
     let request = build_step_request(input);
     let (response, _duration) =
-        execute_function(inner, deploy, &function, &component, request, 0).await;
+        execute_function(inner, deploy, project, &function, &component, request, 0).await;
     let (status, _content_type, body) = capture_response(response).await;
     // A guest response (any status the guest itself set, incl. 4xx) is delivered;
     // an engine wrapper 5xx (timeout/trap/overload/missing blob) is a failure.
@@ -247,6 +244,7 @@ async fn run_workflow_step(
 async fn compensate_run(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
+    project: ProjectRef<'_>,
     workflow: &boatramp_core::workflow::Workflow,
     run: &mut boatramp_core::workflow::WorkflowRun,
 ) {
@@ -256,15 +254,13 @@ async fn compensate_run(
             continue;
         };
         if let Some(compensate_fn) = &step.compensate {
-            if let Ok(Some(function)) = deploy
-                .get_function(ProjectRef::DEFAULT, compensate_fn)
-                .await
-            {
+            if let Ok(Some(function)) = deploy.get_function(project, compensate_fn).await {
                 if let Some(component) = function.resolve(&function.active).map(str::to_owned) {
                     let request = build_step_request(Vec::new());
                     // Best-effort rollback; its outcome does not change the verdict.
                     let _ =
-                        execute_function(inner, deploy, &function, &component, request, 0).await;
+                        execute_function(inner, deploy, project, &function, &component, request, 0)
+                            .await;
                 }
             }
         }

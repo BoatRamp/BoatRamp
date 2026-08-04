@@ -250,8 +250,11 @@ struct HandlerRuntimeInner {
     /// The function-to-function invoke resolver (FI): backs the `invoke`
     /// capability. Set once at startup with the deploy store (a self-referential
     /// `Weak` back to this runtime), so a granted function can call a sibling
-    /// in-process. Unset ⇒ the `invoke` capability is not offered.
-    invoker: std::sync::OnceLock<Arc<dyn boatramp_handlers::Invoker>>,
+    /// in-process. Unset ⇒ the `invoke` capability is not offered. Held as the
+    /// concrete type so a binding can derive a **project-scoped** invoker
+    /// ([`FunctionInvoker::scoped`]) resolving the caller's siblings within its
+    /// own tenant project, not `default`.
+    invoker: std::sync::OnceLock<Arc<function_runtime::FunctionInvoker>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -309,9 +312,10 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub fn set_invoker(&self, deploy: DeployStore) {
         if let Some(inner) = self.inner.as_ref() {
-            let invoker: Arc<dyn boatramp_handlers::Invoker> = Arc::new(
-                function_runtime::FunctionInvoker::new(deploy, Arc::downgrade(inner)),
-            );
+            let invoker = Arc::new(function_runtime::FunctionInvoker::new(
+                deploy,
+                Arc::downgrade(inner),
+            ));
             let _ = inner.invoker.set(invoker);
         }
     }
@@ -2225,7 +2229,7 @@ mod tests {
     async fn function_invoker_runs_target_buffers_and_meters() {
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::function::{Function, FunctionVersion, Lifecycle, Owner};
-        use boatramp_handlers::{HandlerEngine, InvokeError, InvokeRequest, Limits};
+        use boatramp_handlers::{HandlerEngine, InvokeError, InvokeRequest, Invoker, Limits};
         use futures::StreamExt;
 
         // The committed `http-200` fixture is the invoke *target* (a wasi:http
@@ -2286,6 +2290,108 @@ mod tests {
         // An unknown target is NotFound (never reaches the engine).
         let err = invoker.invoke("ghost", request(), 1).await.unwrap_err();
         assert!(matches!(err, InvokeError::NotFound));
+    }
+
+    /// Tenant isolation (Step 7a): the background scheduler fans out over every
+    /// project, so a **non-default** project's queued async invocation is drained
+    /// and metered **within that project** — never leaking into `default`. Before
+    /// the fan-out the tick only ever scanned `default`, so an `acme` function's
+    /// queue would never drain at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_drains_a_non_default_projects_invocation_in_its_own_tenant() {
+        use crate::scheduler::{run_scheduler_tick, CronNow};
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::function::{
+            Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
+        };
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use futures::StreamExt;
+
+        const HTTP_200: &[u8] =
+            include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        let hash = boatramp_core::deploy::sha256_hex(HTTP_200);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+
+        // A function + a queued async invocation, both under project `acme`.
+        let acme = ProjectRef::new("acme");
+        let function = Function {
+            name: "worker".into(),
+            owner: Owner::Project("acme".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: Default::default(),
+        };
+        deploy.put_function(acme, &function).await.unwrap();
+        let inv = Invocation {
+            id: "inv1".into(),
+            function: "worker".into(),
+            version: "v1".into(),
+            mode: InvokeMode::Async,
+            status: InvocationStatus::Queued,
+            idempotency_key: None,
+            attempts: 0,
+            request_b64: None,
+            request_content_type: None,
+            result: None,
+            created: 0,
+            updated: 0,
+        };
+        deploy.put_invocation(acme, &inv).await.unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage.clone(), None, None);
+        let inner = rt.inner.as_ref().unwrap();
+
+        // One tick: `discover_projects()` yields `["acme"]`, so the drain runs
+        // under `acme`. A fixed `CronNow` (no cron to match) keeps it deterministic.
+        let mut wasm_cache = std::collections::HashMap::new();
+        let mut cron_state = std::collections::HashMap::new();
+        let now = CronNow {
+            minute: 0,
+            hour: 0,
+            dom: 1,
+            month: 1,
+            dow: 0,
+            minute_stamp: 0,
+        };
+        run_scheduler_tick(inner, &deploy, &mut wasm_cache, &mut cron_state, now)
+            .await
+            .unwrap();
+
+        // The invocation settled Succeeded **in `acme`** …
+        let settled = deploy
+            .get_invocation(acme, "worker", "inv1")
+            .await
+            .unwrap()
+            .expect("invocation still present in acme");
+        assert_eq!(settled.status, InvocationStatus::Succeeded);
+        // … metered in `acme` …
+        let metering = deploy.get_metering(acme, "worker").await.unwrap().unwrap();
+        assert_eq!(metering.invocations, 1);
+        // … and nothing leaked into `default` (no record, no metering there).
+        assert!(deploy
+            .get_invocation(ProjectRef::DEFAULT, "worker", "inv1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(deploy
+            .get_metering(ProjectRef::DEFAULT, "worker")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// The cron driver: a due cron fires its route (loopback), once per
@@ -2401,8 +2507,10 @@ mod tests {
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
 
         // overlap=Skip: a previous fire still running → the next minute is skipped.
+        // The cron dedup key is project-qualified (`default|blog|cron|0`) so a
+        // same-named site in another project can't dedup this one.
         crons
-            .get("blog|cron|0")
+            .get("default|blog|cron|0")
             .unwrap()
             .running
             .store(true, Ordering::Release);
