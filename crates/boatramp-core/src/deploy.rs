@@ -2089,12 +2089,57 @@ impl DeployStore {
         Ok(hash)
     }
 
+    /// The canonical record for the reserved `default` project — the single source
+    /// of its shape, shared by [`Self::ensure_default_project`], the migration's
+    /// `EnsureDefaultProject` step, and the reader-side backstop in
+    /// [`Self::get_project`] / [`Self::list_projects`].
+    pub fn default_project_record() -> crate::project::Project {
+        crate::project::Project {
+            version: crate::SCHEMA_VERSION,
+            name: crate::project::DEFAULT_PROJECT.to_string(),
+            created_at: now_unix(),
+            meta: crate::project::ProjectMeta::default(),
+            config: crate::project::ProjectConfig::default(),
+            secrets_ref: None,
+        }
+    }
+
+    /// Idempotently materialize the reserved `default` project's entity record, so
+    /// `project ls` / `project show default` reflect it on a fresh install just as
+    /// they do on a migrated store. Presence-checked and content-addressed, so it is
+    /// safe to call on every boot; in cluster mode the write forwards to the leader
+    /// and concurrent callers converge (identical body). Returns whether it created
+    /// the record. The reserved name is defined to *always* exist — this makes that
+    /// true in the store, not only in the reader backstop below.
+    pub async fn ensure_default_project(&self) -> Result<bool, DeployError> {
+        let pointer = crate::project::pointer_key(crate::project::DEFAULT_PROJECT);
+        if self.kv.get(&pointer).await?.is_some() {
+            return Ok(false);
+        }
+        let default = Self::default_project_record();
+        let hash = default.id();
+        let body = serde_json::to_vec(&default).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .write_batch(vec![
+                WriteOp::Put(crate::project::spec_key(&hash), body),
+                WriteOp::Put(pointer, hash.into_bytes()),
+            ])
+            .await?;
+        Ok(true)
+    }
+
     /// Load a project's active version, if it exists.
     pub async fn get_project(
         &self,
         name: &str,
     ) -> Result<Option<crate::project::Project>, DeployError> {
         let Some(hash) = self.kv.get(&crate::project::pointer_key(name)).await? else {
+            // Reader-side backstop: the reserved `default` project always exists
+            // conceptually, even before the boot-time ensure has run (or on a
+            // read-only replica), so `project show default` never 404s.
+            if name == crate::project::DEFAULT_PROJECT {
+                return Ok(Some(Self::default_project_record()));
+            }
             return Ok(None);
         };
         let hash = String::from_utf8_lossy(&hash).into_owned();
@@ -2102,7 +2147,12 @@ impl DeployStore {
             Some(bytes) => Ok(Some(
                 serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
             )),
-            None => Ok(None), // dangling pointer (body GC'd) reads as absent
+            // dangling pointer (body GC'd) reads as absent — except `default`, which
+            // always resolves (same backstop as the missing-pointer case above).
+            None if name == crate::project::DEFAULT_PROJECT => {
+                Ok(Some(Self::default_project_record()))
+            }
+            None => Ok(None),
         }
     }
 
@@ -2120,6 +2170,14 @@ impl DeployStore {
                     out.push(p);
                 }
             }
+        }
+        // Reader-side backstop: the reserved `default` project always exists, even
+        // before the boot-time ensure has run, so `project ls` never omits it.
+        if !out
+            .iter()
+            .any(|p| p.name == crate::project::DEFAULT_PROJECT)
+        {
+            out.push(Self::default_project_record());
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
@@ -4108,6 +4166,45 @@ mod tests {
     fn store() -> DeployStore {
         use crate::kv::MemoryKv;
         DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()))
+    }
+
+    #[tokio::test]
+    async fn default_project_is_visible_on_a_fresh_store_and_ensure_is_idempotent() {
+        let s = store();
+        let default = crate::project::DEFAULT_PROJECT;
+
+        // Reader backstop: even before any write, `default` resolves and lists.
+        assert!(
+            s.get_project(default).await.unwrap().is_some(),
+            "`project show default` must never 404, even on a fresh store"
+        );
+        let listed = s.list_projects().await.unwrap();
+        assert_eq!(
+            listed.iter().filter(|p| p.name == default).count(),
+            1,
+            "`project ls` must show exactly one `default` on a fresh store"
+        );
+        // A non-existent project is still absent (the backstop is default-only).
+        assert!(s.get_project("nope").await.unwrap().is_none());
+
+        // Boot ensure materializes the record once, then is a no-op.
+        assert!(
+            s.ensure_default_project().await.unwrap(),
+            "first ensure creates"
+        );
+        assert!(
+            !s.ensure_default_project().await.unwrap(),
+            "second ensure is idempotent (presence-checked)"
+        );
+
+        // After materialization the record is real (not the backstop) and still unique.
+        let listed = s.list_projects().await.unwrap();
+        assert_eq!(
+            listed.iter().filter(|p| p.name == default).count(),
+            1,
+            "materializing `default` must not duplicate it in the listing"
+        );
+        assert_eq!(s.get_project(default).await.unwrap().unwrap().name, default);
     }
 
     #[tokio::test]

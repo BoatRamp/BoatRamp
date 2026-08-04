@@ -1031,6 +1031,18 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     }
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv);
+    // Materialize the reserved `default` project so `project ls` / `project show
+    // default` reflect it on a fresh install, not only after a migration. Best
+    // effort: the reader backstop keeps listings correct even if this write can't
+    // land, so a transient failure must never block serving.
+    match deploy.ensure_default_project().await {
+        Ok(true) => tracing::info!("materialized the reserved `default` project record"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not materialize the `default` project record; readers use the synthesized default"
+        ),
+    }
     // Wire the function-to-function invoke resolver now the deploy store exists,
     // so a function granted `invoke` can call a sibling in-process (FI).
     #[cfg(feature = "handlers")]
@@ -1916,6 +1928,17 @@ async fn run_cluster(
 
     let compute_storage = storage.clone();
     let deploy = DeployStore::new(storage, kv);
+    // Materialize the reserved `default` project (as in the single-node path). In
+    // cluster mode the write forwards through `RaftKv` to the leader; a follower's
+    // presence-check finds it already there and writes nothing. Best effort.
+    match deploy.ensure_default_project().await {
+        Ok(true) => tracing::info!("materialized the reserved `default` project record"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not materialize the `default` project record; readers use the synthesized default"
+        ),
+    }
     // Wire the function-to-function invoke resolver (FI), as in the single-node path.
     #[cfg(feature = "handlers")]
     handlers.set_invoker(deploy.clone());

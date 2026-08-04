@@ -57,9 +57,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::kv::{KvStore, WriteOp};
-use crate::project::{
-    self, owner_kind, DomainOwner, Project, ProjectConfig, ProjectMeta, DEFAULT_PROJECT,
-};
+use crate::project::{self, owner_kind, DomainOwner, DEFAULT_PROJECT};
 use crate::time::now_unix;
 
 /// The global marker key recording the store's schema version + migration progress.
@@ -745,14 +743,9 @@ impl Step for EnsureDefaultProject {
         if dry_run {
             return Ok(());
         }
-        let default = Project {
-            version: crate::SCHEMA_VERSION,
-            name: DEFAULT_PROJECT.to_string(),
-            created_at: now_unix(),
-            meta: ProjectMeta::default(),
-            config: ProjectConfig::default(),
-            secrets_ref: None,
-        };
+        // Single-source the record shape with the boot-time ensure (fresh installs
+        // materialize `default` the same way a migration does).
+        let default = crate::deploy::DeployStore::default_project_record();
         let hash = default.id();
         let body = serde_json::to_vec(&default).map_err(|e| MigrateError::Serde(e.to_string()))?;
         kv.write_batch(vec![
