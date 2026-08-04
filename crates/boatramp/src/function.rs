@@ -346,6 +346,10 @@ struct UsageView {
 
 /// Run the `function` subcommand.
 pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
+    // Honor `--project`: every function URL is scoped to the collection segment
+    // (`functions` for default, else `projects/<proj>/functions`), so `--project` is
+    // no longer silently dropped on the deploy/config path.
+    let seg = client::project_seg(&client::resolve_project(config), "functions");
     match args.command {
         FunctionCommand::Ls { site, server } => {
             let funcs = fetch(server, site, config).await?;
@@ -410,7 +414,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 "lifecycle": "independent",
             });
             let f: StoredFunction = http
-                .put(format!("{server}/api/functions/{name}"))
+                .put(format!("{server}/api/{seg}/{name}"))
                 .json(&body)
                 .send()
                 .await?
@@ -427,7 +431,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
         FunctionCommand::Rollback { name, to, server } => {
             let (server, http) = client::connect(server, config)?;
             let f: StoredFunction = http
-                .post(format!("{server}/api/functions/{name}/rollback"))
+                .post(format!("{server}/api/{seg}/{name}/rollback"))
                 .json(&serde_json::json!({ "to": to }))
                 .send()
                 .await?
@@ -443,7 +447,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             server,
         } => {
             let (server, http) = client::connect(server, config)?;
-            http.put(format!("{server}/api/functions/{name}/aliases/{label}"))
+            http.put(format!("{server}/api/{seg}/{name}/aliases/{label}"))
                 .json(&serde_json::json!({ "version": version }))
                 .send()
                 .await?
@@ -452,7 +456,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
         }
         FunctionCommand::Rm { name, server } => {
             let (server, http) = client::connect(server, config)?;
-            http.delete(format!("{server}/api/functions/{name}"))
+            http.delete(format!("{server}/api/{seg}/{name}"))
                 .send()
                 .await?
                 .error_for_status()?;
@@ -478,9 +482,9 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 qs.push(format!("version={v}"));
             }
             let url = if qs.is_empty() {
-                format!("{server}/api/functions/{name}/invoke")
+                format!("{server}/api/{seg}/{name}/invoke")
             } else {
-                format!("{server}/api/functions/{name}/invoke?{}", qs.join("&"))
+                format!("{server}/api/{seg}/{name}/invoke?{}", qs.join("&"))
             };
             let mut req = http.post(url).body(body);
             if let Some(ct) = &content_type {
@@ -511,7 +515,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
         FunctionCommand::Invocation { name, id, server } => {
             let (server, http) = client::connect(server, config)?;
             let inv: InvocationRecord = http
-                .get(format!("{server}/api/functions/{name}/invocations/{id}"))
+                .get(format!("{server}/api/{seg}/{name}/invocations/{id}"))
                 .send()
                 .await?
                 .error_for_status()?
@@ -525,7 +529,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
         FunctionCommand::Usage { name, server } => {
             let (server, http) = client::connect(server, config)?;
             let usage: UsageView = http
-                .get(format!("{server}/api/functions/{name}/usage"))
+                .get(format!("{server}/api/{seg}/{name}/usage"))
                 .send()
                 .await?
                 .error_for_status()?
@@ -574,6 +578,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
 
 /// Run the `function trigger` subcommand.
 async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
+    let seg = client::project_seg(&client::resolve_project(config), "functions");
     match args.command {
         TriggerCommand::Add {
             name,
@@ -596,7 +601,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
                 }
                 _ => return Err(FunctionError::BadTrigger),
             };
-            http.put(format!("{server}/api/functions/{name}/triggers/{id}"))
+            http.put(format!("{server}/api/{seg}/{name}/triggers/{id}"))
                 .json(&kind)
                 .send()
                 .await?
@@ -606,7 +611,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
         TriggerCommand::Ls { name, server } => {
             let (server, http) = client::connect(server, config)?;
             let list: Vec<TriggerView> = http
-                .get(format!("{server}/api/functions/{name}/triggers"))
+                .get(format!("{server}/api/{seg}/{name}/triggers"))
                 .send()
                 .await?
                 .error_for_status()?
@@ -623,7 +628,7 @@ async fn run_trigger(args: TriggerArgs, config: &ProjectConfig) -> Result<()> {
         }
         TriggerCommand::Rm { name, id, server } => {
             let (server, http) = client::connect(server, config)?;
-            http.delete(format!("{server}/api/functions/{name}/triggers/{id}"))
+            http.delete(format!("{server}/api/{seg}/{name}/triggers/{id}"))
                 .send()
                 .await?
                 .error_for_status()?;
@@ -817,9 +822,10 @@ async fn fetch(
 ) -> Result<Vec<FunctionSummary>> {
     let server = client::resolve_server(server, config)?;
     let http = client::http_client(client::token(config).as_deref());
+    let seg = client::project_seg(&client::resolve_project(config), "functions");
     let url = match &site {
-        Some(s) => format!("{server}/api/functions?site={s}"),
-        None => format!("{server}/api/functions"),
+        Some(s) => format!("{server}/api/{seg}?site={s}"),
+        None => format!("{server}/api/{seg}"),
     };
     Ok(http
         .get(url)

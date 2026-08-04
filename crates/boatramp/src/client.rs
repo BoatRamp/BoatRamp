@@ -251,6 +251,19 @@ pub fn resolve_project(config: &ProjectConfig) -> String {
         .unwrap_or_else(|| boatramp_core::project::DEFAULT_PROJECT.to_string())
 }
 
+/// The URL path segment for a resource collection under a project: the bare
+/// `collection` for the reserved `default` project (byte-identical legacy
+/// `/api/<collection>/…`), else `projects/<proj>/<collection>`. The single source of
+/// the project-scoping rule, shared by [`ControlPlane`] and the imperative commands
+/// (`sync` / `compute` / `function`) so `--project` routes the same everywhere.
+pub fn project_seg(project: &str, collection: &str) -> String {
+    if project == boatramp_core::project::DEFAULT_PROJECT {
+        collection.to_string()
+    } else {
+        format!("projects/{project}/{collection}")
+    }
+}
+
 /// Resolve the server base URL from a flag, falling back to config.
 pub fn resolve_server(server: Option<String>, config: &ProjectConfig) -> Result<String> {
     let server = server
@@ -373,31 +386,19 @@ impl ControlPlane {
     /// The site-collection URL segment: `sites` for the default project (byte-identical
     /// legacy `/api/sites/...`), else `projects/<proj>/sites` for a named project.
     fn sites_seg(&self) -> String {
-        if self.project == boatramp_core::project::DEFAULT_PROJECT {
-            "sites".to_string()
-        } else {
-            format!("projects/{}/sites", self.project)
-        }
+        project_seg(&self.project, "sites")
     }
 
     /// The function-collection URL segment: `functions` for the default project
     /// (byte-identical legacy `/api/functions/...`), else `projects/<proj>/functions`.
     fn functions_seg(&self) -> String {
-        if self.project == boatramp_core::project::DEFAULT_PROJECT {
-            "functions".to_string()
-        } else {
-            format!("projects/{}/functions", self.project)
-        }
+        project_seg(&self.project, "functions")
     }
 
     /// The compute-collection URL segment: `compute` for the default project
     /// (byte-identical legacy `/api/compute/...`), else `projects/<proj>/compute`.
     fn compute_seg(&self) -> String {
-        if self.project == boatramp_core::project::DEFAULT_PROJECT {
-            "compute".to_string()
-        } else {
-            format!("projects/{}/compute", self.project)
-        }
+        project_seg(&self.project, "compute")
     }
 
     /// Fetch the manifest for a specific deployment id.

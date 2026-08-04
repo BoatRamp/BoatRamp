@@ -18,11 +18,12 @@
 //! sees `/api/projects/<proj>/…` and enforces the project-scoped right — and the DPoP
 //! proof still binds the path the client actually signed.
 
-use axum::extract::Request;
-use axum::http::Uri;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, Uri};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
+use boatramp_core::deploy::DeployStore;
 use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
 
 /// The resource families a `/api/projects/<proj>/<family>/…` URL may address — the
@@ -114,8 +115,40 @@ fn scope_of(path: &str) -> Scope {
 /// [`ProjectContext`] tenant from the path and, for a whitelisted project-scoped
 /// resource path, rewrite the URI to its global form (stashing the original path in
 /// [`OriginalPath`] for the auth layer). A no-op for every non-project path.
-pub async fn project_scope(mut request: Request, next: Next) -> Response {
+pub async fn project_scope(
+    State(deploy): State<DeployStore>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let scope = scope_of(request.uri().path());
+    // Reject a project-scoped resource operation on a project that was never created,
+    // so a typo'd or hand-crafted `/api/projects/<proj>/…` request cannot manufacture a
+    // ghost tenant (live keys under `project/<proj>/…` that `project ls` never shows).
+    // `default` always exists and is skipped; only a rewritten (whitelisted-family)
+    // path reaches a global handler, so only those need the guard — a non-family
+    // sub-path already fails closed with no rewrite.
+    if scope.rewrite.is_some() && scope.project != DEFAULT_PROJECT {
+        match deploy.project_exists(&scope.project).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "no project `{}`; create it first (`boatramp project create {}`)\n",
+                        scope.project, scope.project
+                    ),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("project lookup failed: {err}\n"),
+                )
+                    .into_response();
+            }
+        }
+    }
     request
         .extensions_mut()
         .insert(ProjectContext(scope.project));

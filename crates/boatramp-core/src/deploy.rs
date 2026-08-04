@@ -2128,6 +2128,21 @@ impl DeployStore {
         Ok(true)
     }
 
+    /// Cheap existence check for a project entity — whether its `projectmeta/<name>`
+    /// pointer is present. Used by the project-scope middleware to reject an
+    /// operation on a project that was never created (rather than silently
+    /// manufacturing a ghost). The reserved `default` always exists.
+    pub async fn project_exists(&self, name: &str) -> Result<bool, DeployError> {
+        if name == crate::project::DEFAULT_PROJECT {
+            return Ok(true);
+        }
+        Ok(self
+            .kv
+            .get(&crate::project::pointer_key(name))
+            .await?
+            .is_some())
+    }
+
     /// Load a project's active version, if it exists.
     pub async fn get_project(
         &self,
@@ -4186,6 +4201,11 @@ mod tests {
         );
         // A non-existent project is still absent (the backstop is default-only).
         assert!(s.get_project("nope").await.unwrap().is_none());
+
+        // project_exists (the middleware's ghost guard): default always exists;
+        // an uncreated project does not, so a write to it is rejected upstream.
+        assert!(s.project_exists(default).await.unwrap());
+        assert!(!s.project_exists("nope").await.unwrap());
 
         // Boot ensure materializes the record once, then is a no-op.
         assert!(

@@ -234,11 +234,15 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
         http.clone(),
         client::resolve_project(config),
     );
+    // Honor `--project`: every workload URL is scoped to the collection segment
+    // (`compute` for default, else `projects/<proj>/compute`), so `--project` is no
+    // longer silently dropped on the write path.
+    let seg = client::project_seg(&client::resolve_project(config), "compute");
 
     match args.command {
         ComputeCommand::Ls => {
             let workloads: serde_json::Value = http
-                .get(format!("{server}/api/compute"))
+                .get(format!("{server}/api/{seg}"))
                 .send()
                 .await?
                 .error_for_status()?
@@ -259,7 +263,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
         }
         ComputeCommand::Get { name } => {
             let workload: serde_json::Value = http
-                .get(format!("{server}/api/compute/{name}"))
+                .get(format!("{server}/api/{seg}/{name}"))
                 .send()
                 .await?
                 .error_for_status()?
@@ -319,7 +323,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 scale_to_zero,
                 isolation,
             )?;
-            let hash = put_workload(&http, &server, &name, spec, replicas, regions).await?;
+            let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             println!("workload {name} set (spec {hash})");
         }
         ComputeCommand::Build {
@@ -384,11 +388,11 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 scale_to_zero,
                 isolation,
             )?;
-            let hash = put_workload(&http, &server, &name, spec, replicas, regions).await?;
+            let hash = put_workload(&http, &server, &seg, &name, spec, replicas, regions).await?;
             println!("workload {name} built + set (spec {hash})");
         }
         ComputeCommand::Rm { name } => {
-            http.delete(format!("{server}/api/compute/{name}"))
+            http.delete(format!("{server}/api/{seg}/{name}"))
                 .send()
                 .await?
                 .error_for_status()?;
@@ -441,6 +445,7 @@ fn build_spec(
 async fn put_workload(
     http: &crate::client::ApiClient,
     server: &str,
+    seg: &str,
     name: &str,
     spec: ComputeSpec,
     replicas: u32,
@@ -455,7 +460,7 @@ async fn put_workload(
         },
     };
     let resp: serde_json::Value = http
-        .put(format!("{server}/api/compute/{name}"))
+        .put(format!("{server}/api/{seg}/{name}"))
         .json(&request)
         .send()
         .await?

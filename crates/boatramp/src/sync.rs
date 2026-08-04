@@ -132,6 +132,18 @@ pub struct SyncArgs {
 pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     let (server, site) =
         crate::client::resolve_target(args.server.clone(), args.site.clone(), config)?;
+    // Honor `--project` (via `[publish].project` / `BOATRAMP_PROJECT`): the site
+    // lives under its project's collection segment. Default ⇒ bare `sites`, so a
+    // single-project user's requests are byte-identical to before.
+    let project = crate::client::resolve_project(config);
+    let seg = crate::client::project_seg(&project, "sites");
+    // A label that names the project only when it is not the (invisible) default,
+    // so single-site output is unchanged but a targeted deploy shows its tenant.
+    let target = if project == boatramp_core::project::DEFAULT_PROJECT {
+        site.clone()
+    } else {
+        format!("{project}/{site}")
+    };
 
     // Build first if asked, or if a build is configured (unless suppressed).
     let should_build = !args.no_build && (args.build || config.build.is_some());
@@ -195,7 +207,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     // Negotiate the deployment: server stores the manifest and tells us which
     // blobs it still needs.
     let created: crate::client::CreateDeploymentResponse = client
-        .post(format!("{server}/api/sites/{site}/deployments"))
+        .post(format!("{server}/api/{seg}/{site}/deployments"))
         .query(&query)
         .json(&manifest)
         .send()
@@ -220,7 +232,7 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
     if args.no_activate {
         println!(
             "uploaded but not activated; preview at {server}/_deploy/{}/\n  \
-             activate with: curl -X POST {server}/api/sites/{site}/deployments/{}/activate",
+             activate with: curl -X POST {server}/api/{seg}/{site}/deployments/{}/activate",
             created.id, created.id
         );
         return Ok(());
@@ -228,15 +240,19 @@ pub async fn run(args: SyncArgs, config: &ProjectConfig) -> Result<()> {
 
     client
         .post(format!(
-            "{server}/api/sites/{site}/deployments/{}/activate",
+            "{server}/api/{seg}/{site}/deployments/{}/activate",
             created.id
         ))
         .send()
         .await?
         .error_for_status()?;
 
-    println!("activated {site} -> {}", created.id);
-    println!("now serving {server}/_sites/{site}/");
+    println!("activated {target} -> {}", created.id);
+    // `/_sites/<name>` resolves a site by bare name, so it is only unambiguous for
+    // the default project; a named project reaches its site by its domain.
+    if project == boatramp_core::project::DEFAULT_PROJECT {
+        println!("now serving {server}/_sites/{site}/");
+    }
     println!("immutable preview: {server}/_deploy/{}/", created.id);
     Ok(())
 }

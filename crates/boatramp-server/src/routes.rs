@@ -298,6 +298,9 @@ pub fn router_with(
     // feature.
     #[cfg(feature = "handlers")]
     let app = app.route("/_webhooks/{name}", post(webhook_ingress));
+    // Clone the store for the outermost `project_scope` layer (below), which checks
+    // project existence before routing; `with_state` moves `deploy`.
+    let scope_deploy = deploy.clone();
     let app = app
         .fallback(serve_by_host)
         .with_state(deploy)
@@ -389,6 +392,9 @@ pub fn router_with(
     // path the client sent); `project_scope` is a no-op for every non-project path.
     Router::new()
         .fallback_service(app)
-        .layer(axum::middleware::from_fn(project_scope))
+        .layer(axum::middleware::from_fn_with_state(
+            scope_deploy,
+            project_scope,
+        ))
         .layer(axum::middleware::from_fn(access_log))
 }
