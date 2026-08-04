@@ -27,6 +27,9 @@ pub(super) async fn define_workflow(
     Path(name): Path<String>,
     Json(body): Json<WorkflowBody>,
 ) -> Response {
+    if let Some(resp) = reject_invalid_name("workflow", &name) {
+        return resp;
+    }
     let workflow = boatramp_core::workflow::Workflow {
         name: name.clone(),
         steps: body.steps,

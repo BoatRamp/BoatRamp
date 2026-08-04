@@ -1180,6 +1180,16 @@ fn deploy_error_response(err: DeployError) -> Response {
     (status, format!("{err}\n")).into_response()
 }
 
+/// Reject a resource name (site/function/compute/workflow) that is unsafe at the
+/// store-key boundary, returning `Some(422)` to short-circuit the handler. The
+/// name arrives here already percent-decoded by axum's `Path` extractor, so a
+/// smuggled `%2F` is caught as a literal `/`. `None` = the name is fine.
+fn reject_invalid_name(kind: &'static str, value: &str) -> Option<Response> {
+    boatramp_core::project::validate_resource_name(kind, value)
+        .err()
+        .map(|err| (StatusCode::UNPROCESSABLE_ENTITY, format!("{err}\n")).into_response())
+}
+
 #[cfg(test)]
 mod drain_tests {
     use super::*;

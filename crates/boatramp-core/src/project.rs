@@ -39,6 +39,56 @@ impl std::fmt::Display for ProjectRef<'_> {
     }
 }
 
+/// A resource name (project / site / function / compute / workload / workflow)
+/// rejected by [`validate_resource_name`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid {kind} name {value:?}: {reason}")]
+pub struct InvalidResourceName {
+    /// What kind of name failed (for the error message), e.g. `"site"`.
+    pub kind: &'static str,
+    /// The offending value.
+    pub value: String,
+    /// Why it was rejected.
+    pub reason: &'static str,
+}
+
+/// Validate a project/site/function/compute/workflow name at the create/write
+/// boundary, so a name can never escape its `project/<proj>/…` key prefix, collide
+/// with the store's fixed sub-key grammar, smuggle a (possibly percent-decoded)
+/// path separator, or break Cedar entity/target construction.
+///
+/// Rejects: the empty string, `.` / `..`, and any name containing a path separator
+/// (`/` or `\`), a `*` (the authz wildcard sentinel — a resource named `*` would
+/// alias a project/site wildcard), whitespace, or an ASCII control character. This
+/// is a *targeted* denylist of the characters that carry a security or integrity
+/// consequence, not a full slug allowlist, so it does not reject pre-existing
+/// otherwise-ordinary names.
+pub fn validate_resource_name(kind: &'static str, value: &str) -> Result<(), InvalidResourceName> {
+    let reject = |reason| {
+        Err(InvalidResourceName {
+            kind,
+            value: value.to_string(),
+            reason,
+        })
+    };
+    if value.is_empty() {
+        return reject("must not be empty");
+    }
+    if value == "." || value == ".." {
+        return reject("must not be '.' or '..'");
+    }
+    for c in value.chars() {
+        match c {
+            '/' | '\\' => return reject("must not contain a path separator ('/' or '\\')"),
+            '*' => return reject("must not contain '*'"),
+            c if c.is_whitespace() => return reject("must not contain whitespace"),
+            c if c.is_control() => return reject("must not contain control characters"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +98,36 @@ mod tests {
         assert_eq!(ProjectRef::DEFAULT.as_str(), "default");
         assert_eq!(ProjectRef::new("acme").as_str(), "acme");
         assert_eq!(ProjectRef::from("shop").to_string(), "shop");
+    }
+
+    #[test]
+    fn resource_name_validation_rejects_the_dangerous_shapes() {
+        for ok in ["blog", "my-site", "resize_v2", "a.b", "Blog9"] {
+            assert!(
+                validate_resource_name("site", ok).is_ok(),
+                "{ok} should pass"
+            );
+        }
+        // Validation runs on the already-percent-decoded value the handler
+        // receives, so the `%2F` → `/` path-param case arrives here as a literal
+        // `/` and is caught by the separator rule.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "blog/../evil",
+            "*",
+            "proj*",
+            "a b",
+            "tab\tname",
+            "ctl\u{0}name",
+        ] {
+            assert!(
+                validate_resource_name("site", bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }

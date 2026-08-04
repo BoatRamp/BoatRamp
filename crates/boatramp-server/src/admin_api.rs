@@ -125,6 +125,9 @@ pub(super) async fn activate_deployment(
     Extension(project): axum::extract::Extension<ProjectContext>,
     Path((site, id)): Path<(String, String)>,
 ) -> Response {
+    if let Some(resp) = reject_invalid_name("site", &site) {
+        return resp;
+    }
     // Activation compile-gate: a deploy whose handlers the
     // site can't satisfy, or whose components don't compile, must not flip.
     match deploy.get_manifest(&id).await {
@@ -243,6 +246,9 @@ pub(super) async fn put_site_config(
     Path(site): Path<String>,
     Json(config): Json<SiteConfig>,
 ) -> Response {
+    if let Some(resp) = reject_invalid_name("site", &site) {
+        return resp;
+    }
     let current = match deploy.get_site_config(project.as_ref(), &site).await {
         Ok(c) => c.unwrap_or_default(),
         Err(err) => return deploy_error_response(err),
@@ -440,6 +446,9 @@ pub(super) async fn put_compute(
     Path(name): Path<String>,
     Json(mut request): Json<PutComputeRequest>,
 ) -> Response {
+    if let Some(resp) = reject_invalid_name("compute", &name) {
+        return resp;
+    }
     // A kernel applies only to the micro-VM source (`RootSource::Rootfs` boots
     // `vmlinux` + a rootfs image). For an OCI image (docker/cloudflare) or a tar
     // rootfs (native container) the kernel is ignored, so we neither require nor

@@ -102,6 +102,9 @@ pub(super) async fn deploy_function(
     Json(body): Json<FunctionUpsert>,
 ) -> Response {
     use boatramp_core::function::{Function, Owner};
+    if let Some(resp) = reject_invalid_name("function", &name) {
+        return resp;
+    }
     match deploy.has_blob(&body.component).await {
         Ok(true) => {}
         Ok(false) => {

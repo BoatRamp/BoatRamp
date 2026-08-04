@@ -367,13 +367,19 @@ pub fn project_of(target: &str) -> &str {
 }
 
 /// Whether a granted target covers a required target:
-/// - `None`/`*` — global wildcard, covers everything;
+/// - `None` — the global wildcard (an untargeted grant), covers everything;
 /// - `"<project>/*"` — a project wildcard, covers any `"<project>/<site>"` (the
 ///   required target's project segment must equal `<project>`);
 /// - anything else — an exact string match.
+///
+/// A grant target of the literal string `"*"` is **not** a global wildcard: the
+/// wildcard is the *absence* of a target (`None`), so a `"*"` target matches only
+/// a resource literally named `*`. This keeps the pure oracle faithful to the
+/// Cedar authorizer, which likewise matches `"*"` as a literal set member — and a
+/// resource named `*` cannot be created (`validate_resource_name` rejects it).
 fn target_matches(granted: Option<&str>, required: Option<&str>) -> bool {
     match granted {
-        None | Some("*") => true,
+        None => true,
         Some(g) => match g.strip_suffix("/*") {
             Some(project) => required.is_some_and(|r| project_of(r) == project),
             None => required == Some(g),

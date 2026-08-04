@@ -318,6 +318,11 @@ mod tests {
             Some("acme/blog".to_string()),
             Some("acme/shop".to_string()),
             Some("other/blog".to_string()),
+            // A literal `*` target: the wildcard is the *absence* of a target
+            // (`None`), so a grant/required of the string `*` must be treated
+            // literally by both engines (a resource named `*` can't be created).
+            Some("*".to_string()),
+            Some("acme/*".to_string()),
         ];
         for roles in rolesets {
             let expected_set: RightSet = policy.rights_for(roles);
@@ -391,6 +396,11 @@ mod tests {
                 GrantedRole::scoped("project_admin", "acme"),
                 GrantedRole::scoped("project_viewer", "other"),
             ],
+            // A grant target of the literal string `*` is NOT a global wildcard:
+            // both engines must treat it as matching only a resource named `*`
+            // (the pure oracle previously over-granted here — the gate now covers it).
+            vec![GrantedRole::scoped("publisher", "*")],
+            vec![GrantedRole::scoped("project_admin", "*")],
         ]
     }
 

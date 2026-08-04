@@ -41,10 +41,15 @@ pub(super) async fn create_project(
     Json(req): Json<CreateProjectRequest>,
 ) -> Response {
     let name = req.name.trim();
-    if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
+    if let Err(err) = boatramp_core::project::validate_resource_name("project", name) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("{err}\n")).into_response();
+    }
+    // `default` is reserved (the home of pre-project resources); it always exists
+    // and can never be (re-)created or deleted.
+    if name == boatramp_core::project::DEFAULT_PROJECT {
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid project name: must be a non-empty slug with no `/` or whitespace\n",
+            StatusCode::CONFLICT,
+            format!("project {name:?} is reserved\n"),
         )
             .into_response();
     }
