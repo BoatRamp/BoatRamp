@@ -102,9 +102,9 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
 /// A one-line description of a store's layout status.
 fn describe(status: Status) -> &'static str {
     match status {
-        Status::Ready => "ready (empty or already migrated)",
-        Status::NeedsMigration => "layout 1 (pre-0.2.0) — needs migration",
-        Status::Dual => "2-dual (migrated; old keys awaiting `--finalize`)",
+        Status::Ready => "ready (empty or already at the current schema version)",
+        Status::NeedsMigration => "below the current schema version — needs migration",
+        Status::Dual => "dual soak (migrated; old keys awaiting `--finalize`)",
     }
 }
 
