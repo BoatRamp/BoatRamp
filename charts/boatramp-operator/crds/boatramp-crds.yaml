@@ -139,6 +139,9 @@ spec:
     - jsonPath: .spec.cluster
       name: Cluster
       type: string
+    - jsonPath: .spec.project
+      name: Project
+      type: string
     - jsonPath: .status.phase
       name: Ready
       type: string
@@ -152,6 +155,10 @@ spec:
             properties:
               cluster:
                 description: The [`BoatRampCluster`] serving this site; empty ⇒ the sole cluster in the namespace.
+                nullable: true
+                type: string
+              project:
+                description: The owning **project** (tenant boundary); empty ⇒ the reserved `default` project (byte-identical to the legacy per-site routing). Reconciled to the project-scoped control-plane API.
                 nullable: true
                 type: string
               domains:
@@ -197,6 +204,9 @@ spec:
     - jsonPath: .spec.cluster
       name: Cluster
       type: string
+    - jsonPath: .spec.project
+      name: Project
+      type: string
     - jsonPath: .status.phase
       name: Ready
       type: string
@@ -210,6 +220,10 @@ spec:
             properties:
               cluster:
                 description: The [`BoatRampCluster`] hosting this function; empty ⇒ the sole cluster.
+                nullable: true
+                type: string
+              project:
+                description: The owning **project** (tenant boundary); empty ⇒ the reserved `default` project. Reconciled to the project-scoped functions API once the operator's apply path lands.
                 nullable: true
                 type: string
               component:

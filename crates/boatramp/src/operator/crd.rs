@@ -121,6 +121,7 @@ pub struct MemberStatus {
     namespaced,
     status = "SiteStatus",
     printcolumn = r#"{"name":"Cluster","type":"string","jsonPath":".spec.cluster"}"#,
+    printcolumn = r#"{"name":"Project","type":"string","jsonPath":".spec.project"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.phase"}"#
 )]
 pub struct SiteSpec {
@@ -128,6 +129,11 @@ pub struct SiteSpec {
     /// namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
+    /// The owning **project** (tenant boundary); empty ⇒ the reserved `default`
+    /// project (byte-identical to the legacy per-site routing). Reconciled to the
+    /// project-scoped control-plane API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// Hostnames routed to this site.
     #[serde(default)]
     pub domains: Vec<String>,
@@ -152,12 +158,18 @@ pub struct SiteStatus {
     namespaced,
     status = "FunctionStatus",
     printcolumn = r#"{"name":"Cluster","type":"string","jsonPath":".spec.cluster"}"#,
+    printcolumn = r#"{"name":"Project","type":"string","jsonPath":".spec.project"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.phase"}"#
 )]
 pub struct FunctionSpec {
     /// The [`BoatRampCluster`] hosting this function; empty ⇒ the sole cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
+    /// The owning **project** (tenant boundary); empty ⇒ the reserved `default`
+    /// project. Reconciled to the project-scoped functions API once the operator's
+    /// apply path lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// The wasm component: a blob content-address or an OCI reference.
     pub component: String,
     /// An optional route this function answers (`/api/...` or a host path).

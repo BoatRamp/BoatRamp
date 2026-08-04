@@ -88,7 +88,8 @@ async fn apply(client: &Client, ns: &str, site: &Site) -> Result<Action> {
     match executor::pinned_admin_pod0(client, ns, &brc).await? {
         Some((http, base, token)) => {
             let cfg = site_config_from_domains(&site.spec.domains);
-            http.put(format!("{base}/api/sites/{name}/config"))
+            let seg = site_seg(site.spec.project.as_deref(), &name);
+            http.put(format!("{base}/api/{seg}/config"))
                 .bearer_auth(&token)
                 .json(&cfg)
                 .send()
@@ -115,8 +116,9 @@ async fn cleanup(client: &Client, ns: &str, site: &Site) -> Result<Action> {
     let name = site.name_any();
     if let Ok(brc) = resolve_cluster(client, ns, site.spec.cluster.as_deref()).await {
         if let Ok(Some((http, base, token))) = executor::pinned_admin_pod0(client, ns, &brc).await {
+            let seg = site_seg(site.spec.project.as_deref(), &name);
             let _ = http
-                .delete(format!("{base}/api/sites/{name}"))
+                .delete(format!("{base}/api/{seg}"))
                 .bearer_auth(&token)
                 .send()
                 .await
@@ -124,6 +126,18 @@ async fn cleanup(client: &Client, ns: &str, site: &Site) -> Result<Action> {
         }
     }
     Ok(Action::await_change())
+}
+
+/// The site path segment for the control-plane API: `sites/<name>` for the
+/// reserved `default` project (byte-identical to the legacy route), else
+/// `projects/<project>/sites/<name>`. Mirrors the CLI client's `sites_seg`.
+fn site_seg(project: Option<&str>, name: &str) -> String {
+    match project {
+        Some(p) if p != boatramp_core::project::DEFAULT_PROJECT => {
+            format!("projects/{p}/sites/{name}")
+        }
+        _ => format!("sites/{name}"),
+    }
 }
 
 /// Patch the `Site` status phase (best-effort).
@@ -162,5 +176,14 @@ mod tests {
         assert!(cfg.domains.primary.is_none());
         assert!(cfg.domains.aliases.is_empty());
         assert!(cfg.domains.wildcards.is_empty());
+    }
+
+    #[test]
+    fn site_seg_is_legacy_for_default_and_absent_project() {
+        // Absent or `default` ⇒ the byte-identical legacy path.
+        assert_eq!(site_seg(None, "blog"), "sites/blog");
+        assert_eq!(site_seg(Some("default"), "blog"), "sites/blog");
+        // A named project is project-scoped.
+        assert_eq!(site_seg(Some("acme"), "blog"), "projects/acme/sites/blog");
     }
 }
