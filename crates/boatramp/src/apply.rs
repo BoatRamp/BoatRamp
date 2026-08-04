@@ -268,7 +268,8 @@ async fn ensure_project(cp: &client::ControlPlane, project: &str, dry_run: bool)
 }
 
 /// Reconcile one site: (optionally build), hash the content dir, negotiate the
-/// deployment, upload the missing blobs, activate, then PUT its site config.
+/// deployment, upload the missing blobs, PUT its site config, then activate (config
+/// before activate — the activation precheck gates handlers on the stored config).
 async fn apply_site(
     cp: &client::ControlPlane,
     site: &ApplySite,
@@ -325,14 +326,17 @@ async fn apply_site(
         cp.upload_blob_source(hash, source).await?;
     }
 
-    cp.activate(&site.name, &created.id).await?;
-    println!("  site `{}`: activated {}", site.name, created.id);
-
-    // Site-scoped config (domains/access/…) is PUT after the deploy is live.
+    // Apply the site config BEFORE activating: activation prechecks a deployment's
+    // handlers against the site's stored config (allow_imports / handler enablement),
+    // so a handler-shipping deployment is refused (422) if its config has not landed
+    // yet. Configure the site, then flip it live.
     if let Some(site_config) = &site.config {
         cp.put_site_config(&site.name, site_config).await?;
         println!("  site `{}`: config applied", site.name);
     }
+
+    cp.activate(&site.name, &created.id).await?;
+    println!("  site `{}`: activated {}", site.name, created.id);
 
     Ok(())
 }
