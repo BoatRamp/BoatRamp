@@ -4787,7 +4787,15 @@ mod tests {
         assert_eq!(hash, acme.id());
         assert_eq!(store.get_project("acme").await.unwrap(), Some(acme.clone()));
         assert!(store.get_project("ghost").await.unwrap().is_none());
-        assert_eq!(store.list_projects().await.unwrap(), vec![acme.clone()]);
+        // `default` is always present (the always-exists backstop), alongside acme.
+        let names: Vec<String> = store
+            .list_projects()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["acme".to_string(), "default".to_string()]);
 
         // Delete refuses while the project owns a resource…
         store

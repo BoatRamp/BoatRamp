@@ -249,6 +249,13 @@ pub fn router_with(
     #[cfg(feature = "mcp")]
     let mcp_origin = options.pop_origin.clone();
     let api = api
+        // Added BEFORE require_auth so it is the INNER layer (require_auth runs first):
+        // only an already-authorized request reaches the project-existence guard, so a
+        // 404 "no project" is never an existence oracle for an unauthorized caller.
+        .route_layer(axum::middleware::from_fn_with_state(
+            deploy.clone(),
+            crate::project_scope::require_project_exists,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
             auth::require_auth,
@@ -298,9 +305,6 @@ pub fn router_with(
     // feature.
     #[cfg(feature = "handlers")]
     let app = app.route("/_webhooks/{name}", post(webhook_ingress));
-    // Clone the store for the outermost `project_scope` layer (below), which checks
-    // project existence before routing; `with_state` moves `deploy`.
-    let scope_deploy = deploy.clone();
     let app = app
         .fallback(serve_by_host)
         .with_state(deploy)
@@ -392,9 +396,6 @@ pub fn router_with(
     // path the client sent); `project_scope` is a no-op for every non-project path.
     Router::new()
         .fallback_service(app)
-        .layer(axum::middleware::from_fn_with_state(
-            scope_deploy,
-            project_scope,
-        ))
+        .layer(axum::middleware::from_fn(project_scope))
         .layer(axum::middleware::from_fn(access_log))
 }

@@ -115,28 +115,46 @@ fn scope_of(path: &str) -> Scope {
 /// [`ProjectContext`] tenant from the path and, for a whitelisted project-scoped
 /// resource path, rewrite the URI to its global form (stashing the original path in
 /// [`OriginalPath`] for the auth layer). A no-op for every non-project path.
-pub async fn project_scope(
+pub async fn project_scope(mut request: Request, next: Next) -> Response {
+    let scope = scope_of(request.uri().path());
+    request
+        .extensions_mut()
+        .insert(ProjectContext(scope.project));
+    if let Some(new_path) = scope.rewrite {
+        let original = request.uri().path().to_string();
+        rewrite_path(request.uri_mut(), &new_path);
+        request.extensions_mut().insert(OriginalPath(original));
+    }
+    next.run(request).await
+}
+
+/// Reject a project-scoped resource operation on a project that was never created,
+/// so a typo'd or hand-crafted `/api/projects/<proj>/…` request cannot manufacture a
+/// ghost tenant (live keys under `project/<proj>/…` that `project ls` never shows).
+///
+/// This runs **after** [`super::auth::require_auth`] (it is layered inside it), so an
+/// unauthorized caller is already refused (401/403) and never learns whether the
+/// project exists — the guard is not a project-existence oracle. It fires only for a
+/// rewritten project-scoped path (an [`OriginalPath`] was stashed) under a non-default
+/// project; `default` always exists and every legacy `/api/…` path is untouched.
+pub async fn require_project_exists(
     State(deploy): State<DeployStore>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
-    let scope = scope_of(request.uri().path());
-    // Reject a project-scoped resource operation on a project that was never created,
-    // so a typo'd or hand-crafted `/api/projects/<proj>/…` request cannot manufacture a
-    // ghost tenant (live keys under `project/<proj>/…` that `project ls` never shows).
-    // `default` always exists and is skipped; only a rewritten (whitelisted-family)
-    // path reaches a global handler, so only those need the guard — a non-family
-    // sub-path already fails closed with no rewrite.
-    if scope.rewrite.is_some() && scope.project != DEFAULT_PROJECT {
-        match deploy.project_exists(&scope.project).await {
+    let rewritten = request.extensions().get::<OriginalPath>().is_some();
+    let project = request
+        .extensions()
+        .get::<ProjectContext>()
+        .map(|p| p.0.clone())
+        .unwrap_or_else(|| DEFAULT_PROJECT.to_string());
+    if rewritten && project != DEFAULT_PROJECT {
+        match deploy.project_exists(&project).await {
             Ok(true) => {}
             Ok(false) => {
                 return (
                     StatusCode::NOT_FOUND,
-                    format!(
-                        "no project `{}`; create it first (`boatramp project create {}`)\n",
-                        scope.project, scope.project
-                    ),
+                    format!("no project `{project}`; create it first (`boatramp project create {project}`)\n"),
                 )
                     .into_response();
             }
@@ -148,14 +166,6 @@ pub async fn project_scope(
                     .into_response();
             }
         }
-    }
-    request
-        .extensions_mut()
-        .insert(ProjectContext(scope.project));
-    if let Some(new_path) = scope.rewrite {
-        let original = request.uri().path().to_string();
-        rewrite_path(request.uri_mut(), &new_path);
-        request.extensions_mut().insert(OriginalPath(original));
     }
     next.run(request).await
 }

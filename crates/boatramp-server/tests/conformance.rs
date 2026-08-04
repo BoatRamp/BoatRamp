@@ -6041,11 +6041,30 @@ async fn project_route_scopes_resources_and_isolates_the_default_project() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// Build a bare project entity for a test (so a project-scoped write clears the
+/// existence guard). Pre-seeds directly rather than via the create API, which needs a
+/// system-admin token.
+fn test_project(name: &str) -> boatramp_core::project::Project {
+    boatramp_core::project::Project {
+        version: boatramp_core::SCHEMA_VERSION,
+        name: name.to_string(),
+        created_at: 0,
+        meta: Default::default(),
+        config: Default::default(),
+        secrets_ref: None,
+    }
+}
+
 /// A `project_admin:acme` token authorizes writes to project `acme` but is refused
 /// (403) on project `shop` — the authz runs on the original project-qualified path.
+/// `shop` is deliberately absent: the write is refused by **authz** (403) before the
+/// existence guard, so the guard never becomes a project-existence oracle.
 #[tokio::test]
 async fn project_admin_token_cannot_cross_projects() {
     let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+    // `acme` must exist for the authorized write to reach the handler (the missing-
+    // project guard runs after authz).
+    deploy.put_project(&test_project("acme")).await.unwrap();
     let (auth, token) = token_auth(&[GrantedRole::scoped("project_admin", "acme")]).await;
     let cfg = serde_json::to_value(SiteConfig::default()).unwrap();
 
@@ -6060,7 +6079,8 @@ async fn project_admin_token_cannot_cross_projects() {
         "project_admin:acme must write acme; got {status}"
     );
 
-    // Another project: forbidden.
+    // Another project: forbidden by authz (403), NOT 404 — an unauthorized caller must
+    // not learn whether `shop` exists.
     let req = with_bearer(
         json_request("PUT", "/api/projects/shop/sites/blog/config", &cfg),
         &token,
@@ -6071,4 +6091,31 @@ async fn project_admin_token_cannot_cross_projects() {
         StatusCode::FORBIDDEN,
         "project_admin:acme must NOT write shop"
     );
+}
+
+/// An **authorized** write to a project that was never created is rejected with 404
+/// (not silently written as a ghost tenant invisible to `project ls`). The guard runs
+/// after authz, so a caller authorized for the target still gets the honest 404.
+#[tokio::test]
+async fn writing_to_a_nonexistent_project_is_rejected_not_ghosted() {
+    let deploy = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+    // `project_admin:ghost` is authorized for `ghost`, but `ghost` is never created.
+    let (auth, token) = token_auth(&[GrantedRole::scoped("project_admin", "ghost")]).await;
+    let cfg = serde_json::to_value(SiteConfig::default()).unwrap();
+    let req = with_bearer(
+        json_request("PUT", "/api/projects/ghost/sites/blog/config", &cfg),
+        &token,
+    );
+    let (status, _, _) = send_as(&deploy, auth, req, [127, 0, 0, 1]).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a write to an uncreated project must 404, not manufacture a ghost"
+    );
+    // And nothing was written under the ghost project.
+    assert!(deploy
+        .get_site_config(ProjectRef::new("ghost"), "blog")
+        .await
+        .unwrap()
+        .is_none());
 }
