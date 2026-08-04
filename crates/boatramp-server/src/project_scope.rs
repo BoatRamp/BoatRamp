@@ -71,39 +71,42 @@ struct Scope {
 /// Classify a request `path`: extract the tenant project and, for a whitelisted
 /// project-scoped resource path, the rewritten unscoped path.
 fn scope_of(path: &str) -> Scope {
-    let Some(rest) = path.strip_prefix("/api/projects/") else {
-        // Not project-scoped (a legacy `/api/…` route, or a non-api path): default.
+    // Parse the tenant through the same `project_api_path` the authz layer uses, so
+    // the middleware and `Right::required` can never disagree on the project.
+    let Some((proj, sub)) = boatramp_core::authz::project_api_path(path) else {
+        // Not project-scoped (a legacy `/api/…` route, `/api/projects` itself, or a
+        // non-api path): the default tenant, no rewrite.
         return Scope {
             project: DEFAULT_PROJECT.to_string(),
             rewrite: None,
         };
     };
-    match rest.split_once('/') {
-        // `/api/projects/<proj>/<family>/…`: rewrite to `/api/<family>/…` **iff** the
-        // family is project-ownable; otherwise leave it (→ 404, never a global handler).
-        Some((proj, sub)) if !proj.is_empty() && !sub.is_empty() => {
-            let family = sub.split('/').next().unwrap_or("");
-            let rewrite = PROJECT_SCOPED_FAMILIES
-                .contains(&family)
-                .then(|| format!("/api/{sub}"));
-            Scope {
-                project: proj.to_string(),
-                rewrite,
-            }
-        }
-        // `/api/projects/<proj>` (bare) or `/api/projects/`: the project entity itself,
-        // handled by its own route — carry the tenant, do not rewrite.
-        _ => {
-            let proj = rest.trim_end_matches('/');
-            Scope {
-                project: if proj.is_empty() {
-                    DEFAULT_PROJECT.to_string()
-                } else {
-                    proj.to_string()
-                },
-                rewrite: None,
-            }
-        }
+    // A malformed empty project segment (`/api/projects//…` or `/api/projects/`) has
+    // no tenant to carry, so it falls back to the default project and never rewrites
+    // (fail-closed → 404 at routing).
+    if proj.is_empty() {
+        return Scope {
+            project: DEFAULT_PROJECT.to_string(),
+            rewrite: None,
+        };
+    }
+    // Bare `/api/projects/<proj>` (the project entity route): carry the tenant, do
+    // not rewrite (its own route handles it).
+    if sub.is_empty() {
+        return Scope {
+            project: proj.to_string(),
+            rewrite: None,
+        };
+    }
+    // `/api/projects/<proj>/<family>/…`: rewrite to `/api/<family>/…` **iff** the
+    // family is project-ownable; otherwise leave it (→ 404, never a global handler).
+    let family = sub.split('/').next().unwrap_or("");
+    let rewrite = PROJECT_SCOPED_FAMILIES
+        .contains(&family)
+        .then(|| format!("/api/{sub}"));
+    Scope {
+        project: proj.to_string(),
+        rewrite,
     }
 }
 
@@ -194,5 +197,41 @@ mod tests {
         let s = scope_of("/api/projects");
         assert_eq!(s.project, "default");
         assert!(s.rewrite.is_none());
+    }
+
+    #[test]
+    fn a_malformed_empty_project_segment_is_default_and_never_rewrites() {
+        // `/api/projects//sites/blog` (empty project) must not carry a bogus tenant
+        // or rewrite — it falls back to the default project and fails closed (404).
+        let s = scope_of("/api/projects//sites/blog/config");
+        assert_eq!(s.project, "default");
+        assert!(s.rewrite.is_none());
+        let s = scope_of("/api/projects/");
+        assert_eq!(s.project, "default");
+        assert!(s.rewrite.is_none());
+    }
+
+    #[test]
+    fn scope_of_and_authz_resolve_the_same_project_segment() {
+        // The middleware and `Right::required` MUST agree on which project a path
+        // targets (a confused-deputy hazard). Both now parse via the shared
+        // `project_api_path`; assert the middleware's tenant matches it (with the
+        // middleware's empty → default fail-closed policy) across edge cases.
+        use boatramp_core::authz::project_api_path;
+        for path in [
+            "/api/projects/acme/sites/blog/config",
+            "/api/projects/acme",
+            "/api/projects/acme/tokens",
+            "/api/projects//sites/blog", // malformed empty project
+            "/api/projects/",
+            "/api/sites/blog", // legacy, not project-scoped
+            "/healthz",
+        ] {
+            let mw = scope_of(path).project;
+            match project_api_path(path) {
+                Some((proj, _)) if !proj.is_empty() => assert_eq!(mw, proj, "{path}"),
+                _ => assert_eq!(mw, "default", "{path}"),
+            }
+        }
     }
 }

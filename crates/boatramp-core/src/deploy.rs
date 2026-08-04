@@ -2050,8 +2050,9 @@ impl DeployStore {
     // A project is content-addressed + atomically activated exactly like a site: an
     // immutable `projectver/<hash>` spec body, a mutable `projectmeta/<name>` pointer,
     // and a bounded history ring. Membership is positional — the `project/<name>/`
-    // prefix is the authoritative member set — with `owner/<kind>/<name>` a derived
-    // reverse index.
+    // prefix is the authoritative member set (this is what `delete_project` scans).
+    // `owner/<kind>/<name>` is a migration-built derived hint, not maintained here and
+    // not consulted for any decision (see the `boatramp_types::project` module docs).
 
     /// Create or update a project: store its content-addressed spec body (idempotent)
     /// and flip the `projectmeta/<name>` pointer to it, recording the prior pointer in

@@ -193,15 +193,15 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
-        // Project-scoped endpoints: `/api/projects/<proj>/<rest...>` (0.2.0).
-        if let Some(rest) = path.strip_prefix("/api/projects/") {
-            let mut segs = rest.split('/');
-            let proj = segs.next().unwrap_or("");
+        // Project-scoped endpoints: `/api/projects/<proj>/<rest...>` (0.2.0). Parsed
+        // through the shared `project_api_path` so this and the request-scoping
+        // middleware agree on the tenant segment.
+        if let Some((proj, sub)) = project_api_path(path) {
             if proj.is_empty() {
-                // `/api/projects/` (trailing slash) — listing.
+                // `/api/projects/` (trailing slash) or a malformed `//…` — listing.
                 return Some(Self::new(Resource::System, None, Action::Read));
             }
-            let sub: Vec<&str> = segs.filter(|s| !s.is_empty()).collect();
+            let sub: Vec<&str> = sub.split('/').filter(|s| !s.is_empty()).collect();
             return Some(match sub.split_first() {
                 // The project entity itself: read, or manage (admin).
                 None => Self::new(
@@ -364,6 +364,24 @@ fn site_subpath_action(method: &str, get: bool, sub: &[&str]) -> Option<Action> 
 /// `/`), or the whole string when it carries no `/` (a bare project target).
 pub fn project_of(target: &str) -> &str {
     target.split_once('/').map_or(target, |(p, _)| p)
+}
+
+/// Split an `/api/projects/<proj>/<sub…>` request path into its tenant project
+/// segment and the remaining sub-path, or `None` when the path is not
+/// project-scoped. `proj` is the first path segment after the prefix (possibly
+/// empty for a malformed `//…` or a trailing-slash `/api/projects/`); `sub` is
+/// everything after the first `/` (empty for the bare `/api/projects/<proj>` entity
+/// path).
+///
+/// Both the request-scoping middleware (`project_scope::scope_of`) and
+/// [`Right::required`] resolve the tenant through this one function, so the two can
+/// never disagree on which project a request targets — a confused-deputy hazard if
+/// they parsed it differently (each still applies its own policy to an empty
+/// segment: the middleware carries the default tenant, `Right::required` treats it
+/// as the listing/System right; both fail closed).
+pub fn project_api_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/api/projects/")?;
+    Some(rest.split_once('/').unwrap_or((rest, "")))
 }
 
 /// Whether a granted target covers a required target:

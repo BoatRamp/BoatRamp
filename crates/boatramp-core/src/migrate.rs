@@ -38,8 +38,15 @@
 //!
 //! The migration runs through the same [`KvStore`] a node serves from; in a Raft
 //! cluster that is the replicated store, so a single leader-run migration replicates
-//! for free. A follower must **not** race its own copy — it blocks on the marker (see
-//! the serve-startup guard) until the leader's migration has replicated.
+//! for free. Prefer running `boatramp migrate` **once** (against the leader) before a
+//! rolling upgrade. The startup guard does not elect a leader or block followers, so
+//! if several nodes start with `--auto-migrate` against a still-legacy store they may
+//! run the copy concurrently — which is **safe, only redundant**: every step is
+//! idempotent and re-verifying ([`copy_family`] is put-then-verify, [`delete_old_family`]
+//! re-reads and compares before each delete, [`rewrite_domain_values`] round-trips,
+//! [`ensure_default_project`] is create-if-absent), so racers converge rather than
+//! corrupt. The `schema/version` cursor is a last-writer-wins `put` (no CAS), so a race
+//! can at worst redo a family, never skip a delete-guard.
 
 use serde::{Deserialize, Serialize};
 

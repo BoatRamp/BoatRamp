@@ -6,9 +6,16 @@
 //! one wire shape.
 //!
 //! Every site/function/compute resource lives under the `project/<name>/…` key prefix
-//! (see [`resource_prefix`]) — that prefix *is* the authoritative membership statement.
-//! A global reverse index `owner/<kind>/<name>` → project (see [`owner_key`]) is a
-//! derived accelerator + the single-membership guard.
+//! (see [`resource_prefix`]) — that prefix *is* the authoritative membership statement,
+//! and it is what every guard consults (e.g. `delete_project` refuses a non-empty
+//! project by scanning the prefix).
+//!
+//! A global reverse index `owner/<kind>/<name>` → project (see [`owner_key`]) is
+//! **built once by the migration** as a derived lookup hint. It is **not** currently
+//! maintained on create/delete, and no code consults it for an authorization or
+//! uniqueness decision — so it can drift and must **not** be treated as an enforced
+//! single-membership guard. Make it a maintained derived index (written/deleted in the
+//! same batch as each resource) before relying on it.
 
 use std::collections::BTreeMap;
 
@@ -127,6 +134,11 @@ impl Project {
 /// `wildcard/<suffix>`, `httpchallenge/<host>/<token>`). Serializes as `{project,
 /// site}`; a **bare string** deserializes as `(DEFAULT_PROJECT, <string>)` so a
 /// not-yet-migrated (layout-1) index still reads correctly while the migration runs.
+///
+/// Note the two host-normalization schemes that key into this shared value type:
+/// `domain/`/`wildcard/` keys canonicalize the host via `Host::routing_key`, while
+/// `httpchallenge/`/`domainverify/` keys use `Host::verification`. They must not be
+/// crossed — a lookup keyed under one normalization must be read under the same one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DomainOwner {
     /// The owning project.
