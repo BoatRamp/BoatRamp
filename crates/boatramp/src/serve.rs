@@ -1061,6 +1061,16 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         options.daemon_runtime.clone(),
     )
     .await;
+    // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener + build
+    // the resolver when a sql provider and `compute.sql_shim_url` are both present.
+    #[cfg(feature = "handlers")]
+    let sql_resolver = boatramp_server::sql_shim::spawn_sql_shim(
+        handlers.sql_backends(),
+        config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
+    )
+    .await;
+    #[cfg(not(feature = "handlers"))]
+    let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
     let _reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -1074,12 +1084,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         Arc::new(|| true),
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
-        // Compute-bindings resolver (PLAN-compute-bindings Phase 0): the mechanism
-        // (declaration + hrana sql-shim + SqlShimResolver + reconcile injection) is in
-        // place and unit-tested; activation here — construct a SqlShimResolver from the
-        // sql provider + a per-node secret, spawn the shim listener on the compute
-        // bridge gateway, and pass Some(resolver) — is the live-integration seam.
-        None,
+        sql_resolver,
     );
 
     // Domain-verify auto-complete: periodically re-check every site's pending
@@ -1963,6 +1968,15 @@ async fn run_cluster(
             options.daemon_runtime.clone(),
         )
         .await;
+        // Activate the compute sql-shim (as in the single-node path).
+        #[cfg(feature = "handlers")]
+        let sql_resolver = boatramp_server::sql_shim::spawn_sql_shim(
+            handlers.sql_backends(),
+            config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
+        )
+        .await;
+        #[cfg(not(feature = "handlers"))]
+        let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
         let _reconcile = boatramp_server::spawn_compute_reconcile(
             deploy.clone(),
             compute_backends,
@@ -1975,9 +1989,7 @@ async fn run_cluster(
             Arc::new(move || boatramp_cluster::raft::is_leader(&raft, leader_node_id)),
             COMPUTE_RECONCILE_TICK,
             COMPUTE_IDLE_TIMEOUT,
-            // Compute-bindings resolver: see the single-node path — activation is the
-            // live-integration seam.
-            None,
+            sql_resolver,
         );
     }
 

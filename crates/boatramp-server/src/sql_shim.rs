@@ -177,6 +177,49 @@ impl ComputeBindingResolver for SqlShimResolver {
     }
 }
 
+/// Activate the compute sql-shim: bind its listener and build the resolver to hand
+/// the compute reconcile. `shim_url` is the guest-reachable base URL (e.g.
+/// `http://10.0.0.1:8081`, or the docker bridge gateway); the shim binds
+/// `0.0.0.0:<port-from-url>`. Returns `None` — the feature stays off — when there is
+/// no sql provider, no `shim_url`, or the bind fails.
+pub async fn spawn_sql_shim(
+    sql: Option<Arc<dyn SqlBackends>>,
+    shim_url: Option<String>,
+) -> Option<Arc<dyn ComputeBindingResolver>> {
+    let sql = sql?;
+    let base_url = shim_url?;
+    let Some(port) = base_url
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+    else {
+        tracing::warn!(%base_url, "compute.sql_shim_url has no :port; sql bindings disabled");
+        return None;
+    };
+    let mut secret = [0u8; 32];
+    if getrandom::getrandom(&mut secret).is_err() {
+        tracing::error!("getrandom failed; sql bindings disabled");
+        return None;
+    }
+    let shim = SqlShim::new();
+    let router = shim.router();
+    let bind = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => {
+            tokio::spawn(async move {
+                if let Err(err) = axum::serve(listener, router).await {
+                    tracing::error!(error = %err, "compute sql-shim listener exited");
+                }
+            });
+            tracing::info!(%bind, %base_url, "compute sql-shim listening");
+        }
+        Err(err) => {
+            tracing::warn!(%bind, error = %err, "compute sql-shim bind failed; sql bindings disabled");
+            return None;
+        }
+    }
+    Some(Arc::new(SqlShimResolver::new(sql, shim, base_url, secret)))
+}
+
 /// Extract the `Authorization: Bearer <token>` value.
 fn bearer(headers: &HeaderMap) -> Option<String> {
     headers

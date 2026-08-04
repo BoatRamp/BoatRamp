@@ -321,6 +321,14 @@ impl HandlerRuntime {
         }
     }
 
+    /// The per-site SQL provider, if the `sql` capability is offered. Backs the
+    /// compute sql-shim (PLAN-compute-bindings) so an opaque workload reaches the
+    /// same tenant-scoped database a handler does.
+    #[cfg(feature = "handlers")]
+    pub fn sql_backends(&self) -> Option<Arc<dyn boatramp_core::sql::SqlBackends>> {
+        self.inner.as_ref().and_then(|inner| inner.sql.clone())
+    }
+
     /// Wire the cloud blob-change notification provisioner (FA-5b2). Set once at
     /// startup when the storage backend is a cloud object store; a no-op runtime,
     /// or a self-watching backend (fs), leaves it unset.

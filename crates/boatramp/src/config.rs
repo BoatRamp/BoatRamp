@@ -204,6 +204,12 @@ pub struct ComputeConfig {
     /// macOS, where the bridge IP is not host-routable); `bridge` routes to the
     /// container bridge IP directly (only when `serve` shares the daemon's network).
     pub docker_endpoint: boatramp_docker::DockerEndpoint,
+    /// Guest-reachable base URL of the compute **sql-shim** (PLAN-compute-bindings) —
+    /// e.g. `http://10.0.0.1:8081` (the compute bridge gateway) or the docker bridge
+    /// gateway. Set ⇒ a workload's `--bind sql` reaches the managed database through a
+    /// listener bound on `0.0.0.0:<port>`. `None` (default) ⇒ compute sql bindings off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_shim_url: Option<String>,
 }
 
 /// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
@@ -233,6 +239,7 @@ impl Default for ComputeConfig {
             ],
             region: None,
             docker_endpoint: boatramp_docker::DockerEndpoint::default(),
+            sql_shim_url: None,
         }
     }
 }
