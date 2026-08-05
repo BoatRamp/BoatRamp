@@ -19,8 +19,10 @@ use boatramp_core::config::DeployConfig;
 use serde::Deserialize;
 
 /// RON parse options shared by both loaders: `implicit_some` lets optional fields
-/// be written as bare values (`server: "..."`, not `Some("...")`).
-pub(crate) fn ron_options() -> ron::Options {
+/// be written as bare values (`server: "..."`, not `Some("...")`). `pub` so the
+/// binary (which re-exports this module) can parse a manifest with the same
+/// options after the module moved into this crate.
+pub fn ron_options() -> ron::Options {
     ron::Options::default().with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
 }
 

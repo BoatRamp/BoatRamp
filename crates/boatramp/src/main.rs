@@ -40,7 +40,9 @@ mod cluster;
 mod cluster_tls;
 mod completions;
 mod compute;
-mod config;
+// The config model moved to `boatramp-node` (library); re-export it under the
+// binary's `crate::config` so existing call sites are unchanged.
+pub use boatramp_node::config;
 mod config_cmd;
 mod dlq;
 #[cfg(feature = "acme-dns")]

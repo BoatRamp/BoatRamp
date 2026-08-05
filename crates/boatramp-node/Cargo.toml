@@ -1,0 +1,33 @@
+[package]
+name = "boatramp-node"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Node assembly for boatramp: the parsed config model (and, incrementally, the config-to-running-node assembly) that the serve binary and library embedders share."
+
+[dependencies]
+boatramp-core.workspace = true
+boatramp-server.workspace = true
+boatramp-docker.workspace = true
+ron.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+[features]
+# Cfg markers matching the binary's feature set: `config` parses every section in
+# every build (so config files stay portable), but a handful of fields/impls are
+# cfg-gated to the feature that consumes them. The binary forwards each of its
+# features to the matching one here so the gating stays consistent.
+acme-dns = []
+cluster = []
+console = ["boatramp-server/console"]
+handlers = []
+tls = []

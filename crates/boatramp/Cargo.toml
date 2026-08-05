@@ -73,7 +73,13 @@ sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 # object_store backend.
 slatedb = ["boatramp-storage/slatedb"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
-tls = ["dep:axum-server", "dep:rustls-acme", "dep:rustls", "dep:rustls-pemfile"]
+tls = [
+  "dep:axum-server",
+  "dep:rustls-acme",
+  "dep:rustls",
+  "dep:rustls-pemfile",
+  "boatramp-node/tls",
+]
 # DNS-TXT domain-ownership verification (`domain add --method dns`): resolve the
 # `_boatramp-verify.<host>` TXT over public DNS. Needed to verify a host that
 # points at this same instance (e.g. a self-hosted domain behind fly/Cloudflare,
@@ -92,7 +98,7 @@ signer-aws = ["boatramp-server/signer-aws"]
 signer-pkcs11 = ["boatramp-server/signer-pkcs11"]
 # Embedded web management console: bakes the `boatramp-console` Wasm SPA into the
 # binary and serves it at an operator-configured host+path (`[serve.console]`).
-console = ["boatramp-server/console"]
+console = ["boatramp-server/console", "boatramp-node/console"]
 # On-the-fly response compression, runtime-opt-in per site.
 compression = ["boatramp-server/compression"]
 # HTTP/3 (QUIC) serving: a UDP listener alongside the TLS
@@ -104,6 +110,7 @@ http3 = ["tls", "boatramp-server/http3"]
 # clients; off by default.
 acme-dns = [
   "tls",
+  "boatramp-node/acme-dns",
   "dep:boatramp-acme",
   "boatramp-acme/acme",
   "boatramp-acme/cloudflare",
@@ -126,6 +133,7 @@ bundler = ["dep:rolldown", "dep:lightningcss"]
 # default; the engine (wasmtime) lands behind this flag later. `dummy-module`
 # is pulled so tests can synthesize fixture components without a guest toolchain.
 handlers = [
+  "boatramp-node/handlers",
   "dep:wit-component",
   "dep:wit-parser",
   "dep:boatramp-handlers",
@@ -151,6 +159,7 @@ handlers = [
 # node-local Raft store).
 cluster = [
   "handlers",
+  "boatramp-node/cluster",
   "slatedb",
   # The dynamic join pins a seed's **control plane** over RPK-TLS (`--tls rpk`) —
   # it TOFU-captures the seed's presented TLS key and verifies its root-signed
@@ -193,6 +202,10 @@ mcp = ["dep:boatramp-mcp", "boatramp-server/mcp"]
 boatramp-core = { workspace = true, features = ["authz"] }
 boatramp-storage.workspace = true
 boatramp-server.workspace = true
+# The node config model (moved out of the binary so it is a library value the
+# serve path and embedders share). Feature flags below forward to its matching
+# cfg markers so config parsing stays consistent per feature.
+boatramp-node.workspace = true
 # The MCP server (behind the `mcp` feature): the `boatramp mcp` subcommand.
 boatramp-mcp = { workspace = true, optional = true }
 # RFC 7250 RPK primitives: the `--tls rpk` bootstrap listener (server, `tls`
