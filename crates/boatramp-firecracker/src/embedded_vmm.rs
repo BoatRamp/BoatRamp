@@ -1369,6 +1369,121 @@ mod tests {
         );
     }
 
+    /// Prove the launch-time env channel end-to-end: the **production** encoder
+    /// (`config::env_cmdline_fragment`) writes `boatramp.env=<hex>` onto the
+    /// kernel cmdline, the guest `vminit` decodes it and places those vars first
+    /// in the workload's `envp` (so runtime overrides baked), and a baked
+    /// `envdump` workload prints its received environment to the console.
+    /// Asserts a runtime-only var arrives, a runtime var overrides its baked twin
+    /// (and precedes it), and a baked-only var survives. Needs the vminit+envdump
+    /// rootfs at `BOATRAMP_TEST_ROOTFS`, built by
+    /// `tests/fixtures/build-env-rootfs.sh` (argv=`/envdump`; baked env
+    /// `BR_TEST=baked_loses`, `BR_BAKED=baked_ok`). Dispatch-only (`compute-live`).
+    #[test]
+    #[ignore = "boots the vminit+envdump rootfs to check runtime env delivery; needs /dev/kvm + BOATRAMP_TEST_KERNEL + BOATRAMP_TEST_ROOTFS(vminit+envdump)"]
+    fn delivers_runtime_env_to_the_guest_via_cmdline() {
+        if std::env::var("BOATRAMP_TEST_KERNEL").is_err()
+            || std::env::var("BOATRAMP_TEST_ROOTFS").is_err()
+            || !std::path::Path::new("/dev/kvm").exists()
+        {
+            eprintln!("SKIP: need /dev/kvm + BOATRAMP_TEST_KERNEL=vmlinux + BOATRAMP_TEST_ROOTFS=vminit+envdump.ext4");
+            return;
+        }
+
+        let serial = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink_buf = serial.clone();
+        std::thread::spawn(move || {
+            use crate::embedded::mmio_cmdline_arg;
+            use crate::virtio_block::{VirtioBlock, SECTOR_SIZE};
+            let kernel = std::env::var("BOATRAMP_TEST_KERNEL").unwrap();
+            let rootfs = std::env::var("BOATRAMP_TEST_ROOTFS").unwrap();
+
+            let mut vmm = EmbeddedVmm::with_irqchip(512 * 1024 * 1024, 1).expect("create vm");
+            let entry = vmm.load_kernel(Path::new(&kernel)).expect("load kernel");
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&rootfs)
+                .expect("open rootfs");
+            let sectors = file.metadata().unwrap().len() / SECTOR_SIZE;
+            let block = VirtioBlock::new(file, sectors, false);
+            let mut devices = DeviceManager::new(vec![Box::new(block)]).expect("device manager");
+
+            let mmio: String = devices
+                .windows()
+                .iter()
+                .map(mmio_cmdline_arg)
+                .collect::<Vec<_>>()
+                .join(" ");
+            // The runtime env, encoded by the *production* fragment builder — the
+            // exact bytes `FcMachine::from_spec` appends at launch.
+            let env = std::collections::BTreeMap::from([
+                ("BR_RUNTIME".to_string(), "live_ok".to_string()),
+                ("BR_TEST".to_string(), "runtime_wins".to_string()),
+            ]);
+            let frag = crate::config::env_cmdline_fragment(&env);
+            let cmdline =
+                format!("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw {mmio}{frag}");
+            vmm.write_boot_params(&cmdline).expect("boot params");
+            vmm.setup_registers(entry.raw_value()).expect("registers");
+
+            struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for SharedSink {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut sink = SharedSink(sink_buf);
+            let _ = vmm.run_primary_vcpu(&mut devices, &mut sink);
+        });
+
+        let mut console = String::new();
+        for _ in 0..120 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            console = String::from_utf8_lossy(&serial.lock().unwrap()).into_owned();
+            if console.contains("BR_ENVDUMP_END") || console.contains("Kernel panic") {
+                break;
+            }
+        }
+        eprintln!("=== guest serial ({} bytes) ===\n{console}", console.len());
+        assert!(
+            console.contains("Linux version"),
+            "kernel did not reach serial console"
+        );
+        assert!(
+            console.contains("BR_ENVDUMP_BEGIN"),
+            "envdump workload did not run (vminit never execve'd it)"
+        );
+        // Runtime-only var delivered over the cmdline channel.
+        assert!(
+            console.contains("BR_RUNTIME=live_ok"),
+            "runtime env var not delivered to the guest"
+        );
+        // Runtime overrides its baked twin, and comes first in envp.
+        let rt = console.find("BR_TEST=runtime_wins");
+        let baked = console.find("BR_TEST=baked_loses");
+        assert!(
+            rt.is_some(),
+            "override runtime var missing from the guest env"
+        );
+        if let (Some(rt), Some(baked)) = (rt, baked) {
+            assert!(
+                rt < baked,
+                "runtime env must precede baked env so it wins (override order)"
+            );
+        }
+        // A baked-only var still reaches the workload.
+        assert!(
+            console.contains("BR_BAKED=baked_ok"),
+            "baked image env var was lost"
+        );
+    }
+
     /// Boot a real Linux kernel **SMP with 2 vCPUs** and assert the guest brings
     /// the second processor online — proving the multi-vCPU run loop (one thread
     /// per vCPU, the AP woken by the BSP's INIT-SIPI via the in-kernel LAPIC, the

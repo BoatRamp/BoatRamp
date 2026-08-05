@@ -234,6 +234,11 @@ impl Default for ComputeConfig {
             // content hash is allow-listed so it clears the strict-posture kernel
             // bar out of the box when an operator selects it as the fleet
             // `compute.default_kernel`. Bump this on each new signed release.
+            // NOTE: this `cf1e590…` hash predates enabling
+            // `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` in the flake `#vmlinux` (needed
+            // for the in-process embedded VMM to discover its virtio-block root over
+            // the cmdline transport). The next signed release regenerates the kernel
+            // + hash; replace this then.
             kernel_allowed_hashes: vec![
                 "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
             ],

@@ -310,16 +310,30 @@
                   url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.10.1/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config";
                   hash = "sha256-OR2NSY+J5Ws5G+XqSnUB68RObQlDMeyqve/tHaayipY=";
                 };
-                # `linuxManualConfig` uses the Firecracker config as the kernel's
-                # `.config` verbatim; no modules/debug_info ⇒ a small vmlinux.
-                # nixpkgs only keeps `vmlinux` (in a `dev` output) for MODULAR
-                # kernels; this one has CONFIG_MODULES off, so copy the uncompressed
-                # ELF into $out ourselves (fixupPhase then strips it — still
-                # Elf::load-able). `$buildRoot` is the exported out-of-tree build dir.
+                # The **embedded rust-vmm VMM** advertises its virtio-MMIO devices
+                # via the `virtio_mmio.device=<size>@<addr>:<irq>` **kernel cmdline**
+                # (the legacy Firecracker discovery path). The stock Firecracker
+                # config ships `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` OFF — the
+                # Firecracker *binary* backend discovers devices over ACPI instead —
+                # so on the embedded path the guest never sees `/dev/vda` and root
+                # mount fails (`Cannot open root device "vda" … error -6`). Enable it:
+                # purely additive (the ACPI discovery the firecracker-binary backend
+                # uses is unaffected), and required for the in-process VMM to boot a
+                # rootfs at all.
+                config = pkgs.runCommand "boatramp-vmlinux.config" { } ''
+                  sed 's/# CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not set/CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y/' \
+                    ${fcConfig} > "$out"
+                '';
+                # `linuxManualConfig` uses the (patched) Firecracker config as the
+                # kernel's `.config` verbatim; no modules/debug_info ⇒ a small
+                # vmlinux. nixpkgs only keeps `vmlinux` (in a `dev` output) for
+                # MODULAR kernels; this one has CONFIG_MODULES off, so copy the
+                # uncompressed ELF into $out ourselves (fixupPhase then strips it —
+                # still Elf::load-able). `$buildRoot` is the exported build dir.
                 micro =
                   (pkgs.linuxManualConfig {
                     inherit (pkgs.linux_6_1) version src;
-                    configfile = fcConfig;
+                    configfile = config;
                     allowImportFromDerivation = true;
                   }).overrideAttrs
                     (old: {
