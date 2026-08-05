@@ -70,20 +70,24 @@ jobs:
       # end-to-end (production `env_cmdline_fragment` → `boatramp.env=<hex>` →
       # guest `vminit` decode → workload env, runtime overriding baked). Both need
       # only /dev/kvm + a rootfs (no tap/bridge/net), so — unlike the serve path
-      # below — they gate here. Serial (`--test-threads=1`): the two VMs share the
-      # one rootfs image file.
+      # below — they gate here. Run one filter per invocation (cargo test takes a
+      # single positional TESTNAME before `--`); they share the one rootfs image so
+      # running them in separate serial invocations also avoids a concurrent-writer.
       - name: Boot a rootfs + deliver runtime env (embedded-VMM gate)
         run: |
           set -o pipefail
           bash crates/boatramp-firecracker/tests/fixtures/build-env-rootfs.sh /tmp/br-env-root.ext4
-          timeout -k 30 360 sudo -E env "PATH=$PATH" \
-            "BOATRAMP_TEST_KERNEL=$BOATRAMP_TEST_KERNEL" \
-            "BOATRAMP_TEST_ROOTFS=/tmp/br-env-root.ext4" \
-            cargo test -p boatramp-firecracker --lib --features build,backend,embedded \
-            boots_a_real_kernel_with_rootfs delivers_runtime_env_to_the_guest_via_cmdline \
-            -- --ignored --nocapture --test-threads=1 2>&1 | tee rootfs-env.log
-          grep -qE 'test result: ok. 2 passed' rootfs-env.log \
-            || { echo "::error::embedded-VMM rootfs/env gate did not pass 2 tests" >&2; exit 1; }
+          gate() {
+            timeout -k 30 360 sudo -E env "PATH=$PATH" \
+              "BOATRAMP_TEST_KERNEL=$BOATRAMP_TEST_KERNEL" \
+              "BOATRAMP_TEST_ROOTFS=/tmp/br-env-root.ext4" \
+              cargo test -p boatramp-firecracker --lib --features build,backend,embedded \
+              "$1" -- --ignored --nocapture 2>&1 | tee "$1.log"
+            grep -qE 'test result: ok. 1 passed' "$1.log" \
+              || { echo "::error::embedded-VMM gate: $1 did not pass" >&2; exit 1; }
+          }
+          gate boots_a_real_kernel_with_rootfs
+          gate delivers_runtime_env_to_the_guest_via_cmdline
 
       # Secondary (informational + timeout-bounded): the full build→boot→init→exec→
       # serve path. It exercises virtio-net + guest init, which do NOT work in the
