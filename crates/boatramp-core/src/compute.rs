@@ -289,6 +289,20 @@ impl BackendPolicy {
             None => true,
         }
     }
+
+    /// The placement policy implied by a security posture's shared-kernel stance.
+    /// When shared-kernel compute is disallowed (a strict posture), only
+    /// **strong-isolation** (VM/platform) backends are eligible — so a workload
+    /// that only declares `Trusted` still cannot land on a native-namespace /
+    /// Docker backend. `allow_shared_kernel = true` yields the default permissive
+    /// policy. The single source of truth for the mapping the serve + cluster
+    /// paths apply (previously inlined + duplicated in the binary).
+    pub fn from_shared_kernel_allowed(allow_shared_kernel: bool) -> Self {
+        Self {
+            require_strong_isolation: !allow_shared_kernel,
+            ..Default::default()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1098,16 @@ mod tests {
         };
         assert!(force.permits("vmm"), "force overrides forbid");
         assert!(!force.permits("container"));
+    }
+
+    #[test]
+    fn policy_from_shared_kernel_allowed_maps_posture_to_strong_isolation() {
+        // Strict posture (shared-kernel disallowed) ⇒ require strong isolation.
+        assert!(BackendPolicy::from_shared_kernel_allowed(false).require_strong_isolation);
+        // Permissive posture ⇒ the default (no strong-isolation requirement).
+        let permissive = BackendPolicy::from_shared_kernel_allowed(true);
+        assert!(!permissive.require_strong_isolation);
+        assert_eq!(permissive, BackendPolicy::default());
     }
 
     #[test]

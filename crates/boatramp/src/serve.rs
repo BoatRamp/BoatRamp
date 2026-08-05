@@ -1075,12 +1075,9 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         deploy.clone(),
         compute_backends,
         vec![compute_node],
-        boatramp_core::compute::BackendPolicy {
-            // Strict posture: untrusted-grade (VM/platform) isolation only —
-            // shared-kernel backends are ineligible.
-            require_strong_isolation: !posture.allow_shared_kernel_compute,
-            ..Default::default()
-        },
+        boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(
+            posture.allow_shared_kernel_compute,
+        ),
         Arc::new(|| true),
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
@@ -1981,11 +1978,9 @@ async fn run_cluster(
             deploy.clone(),
             compute_backends,
             vec![compute_node],
-            boatramp_core::compute::BackendPolicy {
-                // Strict posture: VM/platform isolation only.
-                require_strong_isolation: !options.posture.allow_shared_kernel_compute,
-                ..Default::default()
-            },
+            boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(
+                options.posture.allow_shared_kernel_compute,
+            ),
             Arc::new(move || boatramp_cluster::raft::is_leader(&raft, leader_node_id)),
             COMPUTE_RECONCILE_TICK,
             COMPUTE_IDLE_TIMEOUT,
