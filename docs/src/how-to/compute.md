@@ -51,16 +51,20 @@ it up once by uploading the released `vmlinux` as a blob and pointing the defaul
 kernel at that content hash:
 
 ```sh
-# 1. fetch the signed release + upload the kernel as a content-addressed blob
-curl -fsSLO https://github.com/BoatRamp/boatramp-vmlinux/releases/latest/download/boatramp-vmlinux-x86_64
+# 1. fetch the signed release (kernel + its .sha256 + .sig) and upload the kernel as a blob
+base=https://github.com/BoatRamp/boatramp-vmlinux/releases/latest/download
+curl -fsSLO "$base/boatramp-vmlinux-x86_64"
+curl -fsSLO "$base/boatramp-vmlinux-x86_64.sha256"
+curl -fsSLO "$base/boatramp-vmlinux-x86_64.sig"
 boatramp blob put boatramp-vmlinux-x86_64        # prints the blob hash == its sha256
 
-# 2. point the fleet default at it (source = the blob hash; sha256 + sig from the release)
-boatramp config set compute.default_kernel '{
-  "source": "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974",
-  "sha256": "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974",
-  "sig":    "94c868398299ce156a9522c8caac839e8489cf6e3ac05b9ec7a496ef964fa1e3e66aa151ab4334379406f338616bd867a3350f567a57f12787517ff0554f9a14"
-}'
+# 2. point the fleet default at it (source = the blob hash; sha256 + sig from the release
+#    artifacts, so this stays correct across releases)
+boatramp config set compute.default_kernel "{
+  \"source\": \"$(cat boatramp-vmlinux-x86_64.sha256)\",
+  \"sha256\": \"$(cat boatramp-vmlinux-x86_64.sha256)\",
+  \"sig\":    \"$(cat boatramp-vmlinux-x86_64.sig)\"
+}"
 ```
 
 `source` is the **blob hash** the backend stages (not the release URL). A workload

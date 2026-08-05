@@ -229,18 +229,22 @@ impl Default for ComputeConfig {
             vcpus: 0,
             mem_mib: 0,
             kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
-            // The first-party signed `boatramp-vmlinux` release (v0.2.0 — a minimal
-            // Firecracker microVM config, ~39 MB, serial-boot-validated in CI). Its
-            // content hash is allow-listed so it clears the strict-posture kernel
-            // bar out of the box when an operator selects it as the fleet
-            // `compute.default_kernel`. Bump this on each new signed release.
-            // NOTE: this `cf1e590…` hash predates enabling
-            // `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` in the flake `#vmlinux` (needed
-            // for the in-process embedded VMM to discover its virtio-block root over
-            // the cmdline transport). The next signed release regenerates the kernel
-            // + hash; replace this then.
+            // Signed `boatramp-vmlinux` release kernels trusted under the strict
+            // posture (content sha256), so a selected `compute.default_kernel`
+            // clears the bar out of the box. Bump on each new signed release.
             kernel_allowed_hashes: vec![
+                // v0.2.0 minimal Firecracker 6.1-config kernel: boots under the
+                // firecracker-*binary* backend (ACPI device discovery) but NOT the
+                // in-process embedded VMM. Kept trusted so operators on the currently
+                // published release don't fail strict verification.
                 "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
+                // Same kernel + CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y (flake `#vmlinux`),
+                // so the embedded VMM binds its virtio-block root over the cmdline
+                // transport. Reproducible build output (deterministic nix build,
+                // verified on KVM); the next signed boatramp-vmlinux release — which
+                // reuses this flake — publishes + signs it, gated by
+                // `vmlinux-release-boot.yml`.
+                "d0dc2098ab2a2a3c1bc72ab61dc85d9e464d798d7e55b6b80525db5ca2f00c5a".to_string(),
             ],
             region: None,
             docker_endpoint: boatramp_docker::DockerEndpoint::default(),
