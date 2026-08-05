@@ -17,3 +17,6 @@
 
 pub mod compute;
 pub mod config;
+pub mod error;
+pub use error::Error;
+pub mod handlers;

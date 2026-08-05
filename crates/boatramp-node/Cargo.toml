@@ -26,6 +26,10 @@ boatramp-firecracker = { workspace = true, features = [
   "backend",
   "embedded",
 ] }
+# Handler-runtime assembly (`handlers::build_handler_runtime`/`build_sql_backends`);
+# optional, pulled only by the `handlers` feature (the lean node has no wasm engine).
+boatramp-handlers = { workspace = true, optional = true }
+boatramp-storage = { workspace = true, optional = true }
 ron.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
@@ -39,5 +43,15 @@ tracing.workspace = true
 acme-dns = []
 cluster = []
 console = ["boatramp-server/console"]
-handlers = []
+# The wasm handler runtime assembly: the engine + the libsql `sql` binding backend.
+handlers = [
+  "dep:boatramp-handlers",
+  "dep:boatramp-storage",
+  "boatramp-handlers/engine",
+  "boatramp-server/handlers",
+  "boatramp-storage/sql",
+]
+# External bring-your-own SQL for the handler `sql` binding (each implies handlers).
+sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
+sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 tls = []

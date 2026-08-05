@@ -181,53 +181,11 @@ pub enum Error {
     #[cfg(feature = "azure")]
     #[error("Azure backend: {0}")]
     AzureConnect(String),
-    /// A handler `sql` binding named an env var that is not set.
-    #[cfg(feature = "handlers")]
-    #[error("handlers SQL binding: env var {0} is not set")]
-    SqlEnvUnset(String),
-    /// A cluster sqld `url` was set without the required `admin_url`.
-    #[cfg(feature = "handlers")]
-    #[error("handlers SQL binding: `url` (cluster sqld) requires `admin_url`")]
-    SqlAdminUrlRequired,
-    /// An unrecognised `[handlers.bindings.sql].preview_mode`.
-    #[cfg(feature = "handlers")]
-    #[error("handlers SQL binding: unknown preview_mode {0:?} (expected empty | branch | shared)")]
-    UnknownPreviewMode(String),
-    /// Reading the `preview_init` SQL script failed.
-    #[cfg(feature = "handlers")]
-    #[error("handlers SQL binding: reading preview_init {path:?}: {source}")]
-    PreviewInitRead {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// An external `[handlers.bindings.sql.databases.<name>]` named an
-    /// unrecognised engine `kind`.
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    #[error("handlers SQL binding: external database {name:?} has unknown kind {kind:?} (expected postgres | mysql)")]
-    SqlExternalKind { name: String, kind: String },
-    /// An external database entry omitted the required `url_env`.
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    #[error("handlers SQL binding: external database {0:?} is missing `url_env`")]
-    SqlExternalUrlEnvMissing(String),
-    /// Building an external database backend (pool/URL parse) failed.
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    #[error("handlers SQL binding: external database {name:?}: {source}")]
-    SqlExternalConnect {
-        name: String,
-        #[source]
-        source: boatramp_core::sql::SqlError,
-    },
-    /// External databases were configured but this build has no external SQL
-    /// engine compiled in.
-    #[cfg(all(
-        feature = "handlers",
-        not(any(feature = "sql-postgres", feature = "sql-mysql"))
-    ))]
-    #[error("handlers SQL binding: external database {0:?} needs an external SQL engine — rebuild with --features sql-postgres and/or sql-mysql")]
-    SqlExternalUnavailable(String),
 
     // ---- propagated library errors (`#[from]`) ------------------------------
+    /// Node-library assembly (handler runtime / SQL binding) failed.
+    #[error(transparent)]
+    Assembly(#[from] boatramp_node::Error),
     /// Resolving the `[security]` posture (e.g. an unknown profile name) failed.
     #[error(transparent)]
     Security(#[from] boatramp_core::security::SecurityError),
@@ -818,7 +776,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
     // `[handlers.bindings.sql]` (default: per-site libsql files under <data-dir>).
-    let handlers = build_handler_runtime(
+    let handlers = boatramp_node::handlers::build_handler_runtime(
         kv.clone(),
         storage.clone(),
         &data_dir,
@@ -1716,7 +1674,7 @@ async fn run_cluster(
         node: node.clone(),
         issuer: options.issuer.clone(),
     }));
-    let handlers = build_handler_runtime(
+    let handlers = boatramp_node::handlers::build_handler_runtime(
         kv.clone(),
         storage.clone(),
         &data_dir,
@@ -2225,175 +2183,6 @@ async fn serve_acme_dns(
     _options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     Err(Error::NoAcmeDnsSupport)
-}
-
-/// Build the WebAssembly handler runtime. With the `handlers` feature it wraps a
-/// wasmtime engine serving the kv/blob bindings from the server's own backends;
-/// otherwise it is an empty placeholder (handler routes fall through to static).
-#[cfg(feature = "handlers")]
-fn build_handler_runtime(
-    kv: Arc<dyn KvStore>,
-    storage: Arc<dyn boatramp_core::Storage>,
-    data_dir: &Path,
-    handlers_cfg: Option<&crate::config::HandlersConfig>,
-    messaging_override: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
-    max_blob_bytes: u64,
-    max_component_bytes: u64,
-) -> Result<boatramp_server::HandlerRuntime> {
-    // Opt-in pooling allocator: faster instantiation, large
-    // up-front virtual reservation — benchmark before enabling.
-    let limits = boatramp_handlers::Limits::default();
-    let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
-        boatramp_handlers::HandlerEngine::with_pooling(limits, 64)?
-    } else {
-        boatramp_handlers::HandlerEngine::new(limits, 64)?
-    };
-    let sql = build_sql_backends(handlers_cfg.and_then(|h| h.bindings.sql.as_ref()), data_dir)?;
-    // The `wasi:messaging` substrate: single-node `LogMessaging` over the same
-    // blob/KV backends by default, or the cluster coordinator when one is given.
-    let messaging: Arc<dyn boatramp_core::messaging::Messaging> = messaging_override
-        .unwrap_or_else(|| {
-            Arc::new(boatramp_core::messaging::LogMessaging::new(
-                storage.clone(),
-                kv.clone(),
-            ))
-        });
-    let runtime =
-        boatramp_server::HandlerRuntime::new(engine, kv, storage, Some(sql), Some(messaging));
-    // Apply the posture's host-side blob cap + component-size cap.
-    runtime.set_max_blob_bytes(max_blob_bytes);
-    runtime.set_max_component_bytes(max_component_bytes);
-    Ok(runtime)
-}
-
-/// Resolve the `[handlers.bindings.sql]` config to the libsql SQL backend.
-/// Single-node by default (an embedded file per site under `<data-dir>`); set
-/// `url` to bind a shared sqld cluster (a namespace per site). Either way sites
-/// get a real database boundary — see `boatramp_core::sql`.
-#[cfg(feature = "handlers")]
-fn build_sql_backends(
-    cfg: Option<&crate::config::SqlBindingConfig>,
-    data_dir: &Path,
-) -> Result<Arc<dyn boatramp_core::sql::SqlBackends>> {
-    let resolve_env = |var: &Option<String>| -> Result<Option<String>> {
-        match var {
-            Some(var) => Ok(Some(
-                std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?,
-            )),
-            None => Ok(None),
-        }
-    };
-
-    let backend = match cfg.and_then(|c| c.url.as_ref()) {
-        // Cluster: a sqld namespace per site. Auth tokens come from the
-        // environment, never the config file.
-        Some(url) => {
-            let cfg = cfg.expect("url implies cfg");
-            let admin_url = cfg.admin_url.as_ref().ok_or(Error::SqlAdminUrlRequired)?;
-            let token = resolve_env(&cfg.token_env)?.unwrap_or_default();
-            let admin_token = resolve_env(&cfg.admin_token_env)?;
-            let backends = boatramp_storage::LibsqlSqlBackends::remote(
-                url.clone(),
-                admin_url.clone(),
-                token,
-                admin_token,
-            );
-            // Optional read-replica routing: reads → replica, writes → primary.
-            match &cfg.replica_url {
-                Some(replica_url) => backends.with_read_replica(replica_url.clone()),
-                None => backends,
-            }
-        }
-        // Single-node: an embedded file per site.
-        None => {
-            let dir = cfg
-                .and_then(|c| c.dir.clone())
-                .unwrap_or_else(|| data_dir.join("handlers-sql"));
-            boatramp_storage::LibsqlSqlBackends::local(dir)
-        }
-    };
-    // Preview SQL policy (how preview deployments relate to live data).
-    let preview_mode = match cfg.and_then(|c| c.preview_mode.as_deref()) {
-        None | Some("empty") => boatramp_core::sql::PreviewSqlMode::Empty,
-        Some("branch") => boatramp_core::sql::PreviewSqlMode::Branch,
-        Some("shared") => boatramp_core::sql::PreviewSqlMode::Shared,
-        Some(other) => return Err(Error::UnknownPreviewMode(other.to_string())),
-    };
-    let preview_init = match cfg.and_then(|c| c.preview_init.as_ref()) {
-        Some(path) => {
-            Some(
-                std::fs::read_to_string(path).map_err(|err| Error::PreviewInitRead {
-                    path: path.clone(),
-                    source: err,
-                })?,
-            )
-        }
-        None => None,
-    };
-    let default: Arc<dyn boatramp_core::sql::SqlBackends> =
-        Arc::new(backend.with_preview_policy(preview_mode, preview_init));
-
-    // Overlay any external (bring-your-own) databases on the managed default.
-    // With none configured the default is returned unchanged (and a build
-    // without an external SQL engine never has to link the sqlx path).
-    let databases = cfg.map(|c| &c.databases);
-    if databases.is_none_or(std::collections::BTreeMap::is_empty) {
-        return Ok(default);
-    }
-    let databases = databases.expect("checked non-empty above");
-
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    {
-        use boatramp_storage::sql_sqlx::{
-            connect, CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions,
-        };
-        let mut composite = CompositeSqlBackends::new(default);
-        for (name, db) in databases {
-            let kind = ExternalSqlKind::parse(&db.kind).ok_or_else(|| Error::SqlExternalKind {
-                name: name.clone(),
-                kind: db.kind.clone(),
-            })?;
-            if db.url_env.trim().is_empty() {
-                return Err(Error::SqlExternalUrlEnvMissing(name.clone()));
-            }
-            // The connection URL(s) are secrets, resolved from the environment.
-            let url =
-                std::env::var(&db.url_env).map_err(|_| Error::SqlEnvUnset(db.url_env.clone()))?;
-            let read_url = match &db.read_url_env {
-                Some(var) => Some(std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?),
-                None => None,
-            };
-            let opts = ExternalSqlOptions::new(url)
-                .with_read_url(read_url)
-                .with_max_connections(db.pool_max)
-                .read_only(db.read_only)
-                .with_connect_timeout(db.connect_timeout_secs.map(std::time::Duration::from_secs));
-            let external = connect(kind, &opts).map_err(|source| Error::SqlExternalConnect {
-                name: name.clone(),
-                source,
-            })?;
-            composite = composite.with_external(name.clone(), external, db.allow_preview);
-        }
-        Ok(Arc::new(composite))
-    }
-    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
-    {
-        let name = databases.keys().next().cloned().unwrap_or_default();
-        Err(Error::SqlExternalUnavailable(name))
-    }
-}
-
-#[cfg(not(feature = "handlers"))]
-fn build_handler_runtime(
-    _kv: Arc<dyn KvStore>,
-    _storage: Arc<dyn boatramp_core::Storage>,
-    _data_dir: &Path,
-    _handlers_cfg: Option<&crate::config::HandlersConfig>,
-    _messaging_override: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
-    _max_blob_bytes: u64,
-    _max_component_bytes: u64,
-) -> Result<boatramp_server::HandlerRuntime> {
-    Ok(boatramp_server::HandlerRuntime::disabled())
 }
 
 /// Build the control-plane [`Auth`](boatramp_server::Auth) from the resolved

@@ -67,8 +67,16 @@ cloudflare-kv = ["boatramp-storage/cloudflare-kv"]
 # `[handlers.bindings.sql.databases]`). Each implies `handlers` (the binding
 # lives in the handler engine). Isolation is the operator's; libsql stays the
 # managed per-site default.
-sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
-sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
+sql-postgres = [
+  "handlers",
+  "boatramp-storage/sql-postgres",
+  "boatramp-node/sql-postgres",
+]
+sql-mysql = [
+  "handlers",
+  "boatramp-storage/sql-mysql",
+  "boatramp-node/sql-mysql",
+]
 # Durable embedded KV (the default `--kv slatedb`): transactional LSM over an
 # object_store backend.
 slatedb = ["boatramp-storage/slatedb"]
