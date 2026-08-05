@@ -5,6 +5,46 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.1]
+
+### Added
+- **Compute bindings: the managed `sql` for opaque compute workloads.** A docker or
+  native-container workload can now declare a managed dependency with
+  `compute set <name> --bind sql` and reach the **same per-tenant-scoped `SqlBackend`
+  a WASI handler gets** — over libsql's hrana-over-HTTP `/v2/pipeline` wire protocol
+  served by a per-node, token-multiplexed sql-shim — instead of hand-gluing a
+  connection string. The reconcile mints an instance-lifetime bearer token and injects
+  `BOATRAMP_SQL_URL` + `_AUTH_TOKEN`; no long-lived DB secret ever enters the guest, and
+  the wire has no "open database" verb, so a workload is structurally scoped to its
+  project's namespace. Opt-in via `[compute].sql_shim_url`.
+- **`[compute].docker_endpoint`.** Publish a docker/podman workload's port to the host
+  (`127.0.0.1:<ephemeral>`) by default, so the sql-shim and health checks reach it under
+  rootless podman and remote daemons where the container-bridge IP is not host-routable.
+- **Declarative functions in `apply.cfg`.** A function may now declare its `imports`,
+  `env`, `invoke_targets`, and resource `limits` in the project manifest.
+
+### Fixed
+- **Firecracker: a workload's runtime `env` reaches the guest (the "env drop").** Env set
+  at launch was silently dropped (only `compute build`-time env reached the guest). It is
+  now delivered over a launch-time kernel-cmdline channel (`boatramp.env=<hex>`) the guest
+  init decodes, placing runtime entries first so they override the baked image env.
+- **Firecracker/embedded VMM: the microVM now boots its virtio-block root.** The signed
+  `boatramp-vmlinux` is built with `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`, so the in-process
+  embedded VMM's virtio-MMIO cmdline device transport is discovered; previously the guest
+  never saw `/dev/vda` and root mount failed. (Additive; the firecracker-binary ACPI path
+  is unaffected.)
+- **Projects: imperative writes honor `--project`.** `sync`, `compute set`, and function
+  deploy now route to the selected project instead of a project-unaware path; a write to a
+  missing project is rejected (the existence check runs after authz, so it is not an
+  existence oracle); the reserved `default` project is materialized so it is always
+  visible; a site's config is applied before activation, not after.
+
+### Changed
+- **Kernel trust: the CMDLINE_DEVICES kernel is allow-listed.** `kernel_allowed_hashes`
+  adds the new signed `boatramp-vmlinux` hash alongside the prior release (the previous
+  kernel stays trusted so current operators are not broken), and the kernel how-to reads
+  the hash and signature from the downloaded release artifacts rather than hardcoding them.
+
 ## [0.2.0]
 
 ### Security
