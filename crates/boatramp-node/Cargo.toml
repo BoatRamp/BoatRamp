@@ -30,6 +30,9 @@ boatramp-firecracker = { workspace = true, features = [
 # optional, pulled only by the `handlers` feature (the lean node has no wasm engine).
 boatramp-handlers = { workspace = true, optional = true }
 boatramp-storage = { workspace = true, optional = true }
+# Optional: derives `clap::ValueEnum` on the backend-selection enums so the CLI
+# binary uses them directly in its args. A non-CLI embedder never pulls clap.
+clap = { workspace = true, optional = true }
 ron.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
@@ -41,6 +44,8 @@ tracing.workspace = true
 # cfg-gated to the feature that consumes them. The binary forwards each of its
 # features to the matching one here so the gating stays consistent.
 acme-dns = []
+# Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
+clap = ["dep:clap"]
 cluster = []
 console = ["boatramp-server/console"]
 # The wasm handler runtime assembly: the engine + the libsql `sql` binding backend.

@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use boatramp_core::migrate::{self, MigrateOptions, MigrationReport, Status};
 
 use crate::config::ServerConfig;
-use crate::serve::{build_control_plane_kv, KvBackend};
+use crate::serve::build_control_plane_kv;
+use boatramp_node::backends::KvBackend;
 
 /// Errors from the `migrate` command.
 #[derive(Debug, thiserror::Error)]

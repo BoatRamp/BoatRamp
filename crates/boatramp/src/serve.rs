@@ -8,6 +8,7 @@ use boatramp_core::cache_coherence::Changelog;
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::kv::{CachedKv, KvStore};
 use boatramp_core::migrate;
+use boatramp_node::backends::{BlobBackend, KvBackend};
 use clap::ValueEnum;
 
 use crate::config::ServerConfig;
@@ -279,31 +280,6 @@ const DOMAIN_VERIFY_RECONCILE_TICK: std::time::Duration = std::time::Duration::f
 /// How long a scale-to-zero workload must go without a request before it is
 /// snapshotted + parked. A requested workload is woken on demand.
 const COMPUTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Blob (file-content) backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum BlobBackend {
-    /// Local filesystem (`<data-dir>/blobs`).
-    Fs,
-    /// S3-compatible object store (requires `--features s3`).
-    S3,
-    /// Google Cloud Storage (requires `--features gcs`).
-    Gcs,
-    /// Azure Blob Storage (requires `--features azure`).
-    Azure,
-}
-
-/// Metadata (manifest + pointer) backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum KvBackend {
-    /// Transactional LSM over object storage; durable local default
-    /// (`<data-dir>/kv-slate`). Requires `--features slatedb` (on by default).
-    Slatedb,
-    /// In-memory (ephemeral; lost on restart).
-    Memory,
-    /// Cloudflare KV over REST (requires `--features cloudflare-kv`).
-    Cloudflare,
-}
 
 /// TLS mode for the public listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

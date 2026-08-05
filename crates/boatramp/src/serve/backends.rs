@@ -11,7 +11,9 @@ use boatramp_core::kv::{KvStore, MemoryKv};
 use boatramp_core::Storage;
 use boatramp_storage::FsStorage;
 
-use super::{BlobBackend, Error, KvBackend, Result, ServeArgs};
+use boatramp_node::backends::{BlobBackend, KvBackend};
+
+use super::{Error, Result, ServeArgs};
 
 /// The blob backend plus, on a cloud object store with notification provisioning
 /// configured, its blob-change [`WatchProvider`](boatramp_core::blob_provision::WatchProvider)

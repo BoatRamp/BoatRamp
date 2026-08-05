@@ -213,7 +213,7 @@ boatramp-server.workspace = true
 # The node config model (moved out of the binary so it is a library value the
 # serve path and embedders share). Feature flags below forward to its matching
 # cfg markers so config parsing stays consistent per feature.
-boatramp-node.workspace = true
+boatramp-node = { workspace = true, features = ["clap"] }
 # The MCP server (behind the `mcp` feature): the `boatramp mcp` subcommand.
 boatramp-mcp = { workspace = true, optional = true }
 # RFC 7250 RPK primitives: the `--tls rpk` bootstrap listener (server, `tls`

@@ -15,6 +15,7 @@
 //! `boatramp-server` deliberately does not, keeping `boatramp-server` a
 //! backend-agnostic library while this crate is the batteries-included assembler.
 
+pub mod backends;
 pub mod compute;
 pub mod config;
 pub mod error;

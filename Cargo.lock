@@ -1676,6 +1676,7 @@ dependencies = [
  "boatramp-handlers",
  "boatramp-server",
  "boatramp-storage",
+ "clap",
  "ron",
  "serde",
  "thiserror 2.0.18",
