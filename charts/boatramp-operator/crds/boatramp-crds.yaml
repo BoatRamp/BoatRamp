@@ -157,16 +157,16 @@ spec:
                 description: The [`BoatRampCluster`] serving this site; empty ⇒ the sole cluster in the namespace.
                 nullable: true
                 type: string
-              project:
-                description: The owning **project** (tenant boundary); empty ⇒ the reserved `default` project (byte-identical to the legacy per-site routing). Reconciled to the project-scoped control-plane API.
-                nullable: true
-                type: string
               domains:
                 default: []
                 description: Hostnames routed to this site.
                 items:
                   type: string
                 type: array
+              project:
+                description: The owning **project** (tenant boundary); empty ⇒ the reserved `default` project (byte-identical to the legacy per-site routing). Reconciled to the project-scoped control-plane API.
+                nullable: true
+                type: string
             type: object
           status:
             description: Observed state of a [`Site`].
@@ -222,12 +222,12 @@ spec:
                 description: The [`BoatRampCluster`] hosting this function; empty ⇒ the sole cluster.
                 nullable: true
                 type: string
+              component:
+                description: 'The wasm component: a blob content-address or an OCI reference.'
+                type: string
               project:
                 description: The owning **project** (tenant boundary); empty ⇒ the reserved `default` project. Reconciled to the project-scoped functions API once the operator's apply path lands.
                 nullable: true
-                type: string
-              component:
-                description: 'The wasm component: a blob content-address or an OCI reference.'
                 type: string
               route:
                 description: An optional route this function answers (`/api/...` or a host path).

@@ -209,6 +209,7 @@ pub struct ComputeConfig {
     /// gateway. Set ⇒ a workload's `--bind sql` reaches the managed database through a
     /// listener bound on `0.0.0.0:<port>`. `None` (default) ⇒ compute sql bindings off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub sql_shim_url: Option<String>,
 }
 
