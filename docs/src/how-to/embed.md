@@ -28,6 +28,25 @@ control plane — rather than as a separate daemon.
 > The published library crates are pre-1.0 (0.2.x); the API may change between
 > minor versions.
 
+## Not a substitute for testing the binary
+
+Embedding runs boatramp's **library** request handling — not the `boatramp serve`
+binary operators actually run. `router()` deliberately skips the binary's
+`serve.rs` wiring (how config is parsed into a store + compute backends +
+reconcile loops before the router is assembled), the real compute backends
+(docker/microVM), and CLI/config parsing. That is exactly where integration bugs
+live: a site's config applied at the wrong point in activation, posture gating of
+shared-kernel compute, a backend's published-endpoint resolution against a real
+daemon, an untagged-image request returning the wrong status. An embedded harness
+sails past all of them and goes green while the shipped artifact is broken.
+
+So do **not** use the embed surface as a smoke/integration harness for boatramp
+itself. To validate boatramp as an operator runs it, drive the **real artifact** —
+spawn `boatramp serve` (or the container image), exercise it over HTTP and the CLI
+against real backends — which is what the crate's live/e2e tests and the release
+boot gate do. Embedding is for putting boatramp's serving *inside your own
+application*, not for testing boatramp.
+
 ## 1. Add the dependencies
 
 ```toml
