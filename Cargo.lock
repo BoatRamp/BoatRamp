@@ -1669,12 +1669,15 @@ dependencies = [
 name = "boatramp-node"
 version = "0.2.1"
 dependencies = [
+ "boatramp-container",
  "boatramp-core",
  "boatramp-docker",
+ "boatramp-firecracker",
  "boatramp-server",
  "ron",
  "serde",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

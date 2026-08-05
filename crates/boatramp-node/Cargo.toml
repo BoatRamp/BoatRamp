@@ -17,9 +17,19 @@ description = "Node assembly for boatramp: the parsed config model (and, increme
 boatramp-core.workspace = true
 boatramp-server.workspace = true
 boatramp-docker.workspace = true
+# Concrete compute backends assembled by `compute::build_compute` (the deps
+# boatramp-server deliberately avoids). Linux/KVM deps are `target_os`-gated in
+# these crates, so enabling them cross-platform is a no-op off Linux.
+boatramp-container.workspace = true
+boatramp-firecracker = { workspace = true, features = [
+  "build",
+  "backend",
+  "embedded",
+] }
 ron.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+tracing.workspace = true
 
 [features]
 # Cfg markers matching the binary's feature set: `config` parses every section in
