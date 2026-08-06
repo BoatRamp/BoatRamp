@@ -100,7 +100,16 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/flakehub-cache-action@main
+      # Pull the compiled dependency closure from the project's own Cachix (kept warm
+      # by `cache.yml` on every push to main), and push newly-built check derivations
+      # back so later runs reuse them. Replaces `flakehub-cache-action`, which began
+      # failing FlakeHub auth and fell back to the GitHub-throttled Magic Nix Cache
+      # (HTTP 418) — with no cache hits the flake check rebuilt the whole Rust closure
+      # from source and the nix daemon OOM-crashed mid-build.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       # `--max-jobs 1` serializes the heavy derivations (the workspace clippy check
       # and the NixOS-VM package build are each a full compile) so two never run at
       # once; `--cores 2` caps cargo's `-j` inside each build so a burst of parallel
