@@ -188,9 +188,14 @@ pub async fn build_compute(
     let free_mem_mib = if cfg.mem_mib > 0 { cfg.mem_mib } else { 1024 };
     let advertised: Vec<BackendKind> = backends
         .iter()
-        .map(|(id, b)| BackendKind {
-            id: id.clone(),
-            isolation: b.capabilities().isolation,
+        .map(|(id, b)| {
+            let caps = b.capabilities();
+            BackendKind {
+                id: id.clone(),
+                isolation: caps.isolation,
+                persistent_volumes: caps.persistent_volumes,
+                scale_to_zero: caps.scale_to_zero,
+            }
         })
         .collect();
     tracing::info!(backends = ?advertised, free_vcpus, free_mem_mib, "compute node inventory");

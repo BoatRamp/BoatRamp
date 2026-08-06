@@ -309,13 +309,24 @@ impl BackendPolicy {
 // Scheduler (backend-aware placement)
 // ---------------------------------------------------------------------------
 
-/// A backend a node offers, with the isolation class it provides there.
+/// A backend a node offers, with the capabilities the scheduler gates placement
+/// on: the isolation class it provides, plus whether it can back persistent
+/// volumes and scale a workload to zero. Populated from the backend's
+/// [`Capabilities`] at node advertisement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKind {
     /// Backend id (`"vmm"`, …).
     pub id: String,
     /// Isolation class this backend provides on this node.
     pub isolation: IsolationClass,
+    /// Whether this backend can attach the spec's persistent volumes. A spec with
+    /// `volumes` placed on a `false` backend would run storage-less (silent data
+    /// loss), so the scheduler treats it as ineligible.
+    pub persistent_volumes: bool,
+    /// Whether this backend can scale a workload to zero. A `scale_to_zero` spec on
+    /// a `false` backend would run always-on (a silently missed cost optimization),
+    /// so the scheduler treats it as ineligible rather than surprise the operator.
+    pub scale_to_zero: bool,
 }
 
 /// A node's advertised capacity, attributes, and the backends it offers
@@ -347,6 +358,12 @@ impl Node {
                 // Strict posture: only strong isolation, regardless of the spec's
                 // (possibly misclassified) requirement.
                 && (!policy.require_strong_isolation || b.isolation.is_strong())
+                // A volume spec needs a volume-capable backend — else it would run
+                // storage-less (silent data loss). No capable backend ⇒ no placement.
+                && (spec.volumes.is_empty() || b.persistent_volumes)
+                // A scale-to-zero spec needs a scale-to-zero-capable backend — else it
+                // silently runs always-on. Fail loud (no placement) instead.
+                && (!spec.scale_to_zero || b.scale_to_zero)
         };
         if let Some(pref) = &spec.prefer_backend {
             if let Some(b) = self.backends.iter().find(|b| &b.id == pref && eligible(b)) {
@@ -1032,6 +1049,12 @@ mod tests {
                 .map(|(id, iso)| BackendKind {
                     id: (*id).to_string(),
                     isolation: *iso,
+                    // Fully-capable fixture: the volume / scale-to-zero gates only
+                    // *refuse* on absent capability, so a capable fixture leaves every
+                    // existing placement test unaffected; negative cases build their
+                    // own incapable `BackendKind`.
+                    persistent_volumes: true,
+                    scale_to_zero: true,
                 })
                 .collect(),
         }
@@ -1163,6 +1186,109 @@ mod tests {
         );
         assert_eq!(placed.len(), 2);
         assert!(placed.iter().all(|p| p.backend == "vmm"));
+    }
+
+    /// A node offering one backend with the given capabilities — for the negative
+    /// gate cases (the shared fixtures are deliberately fully-capable).
+    fn node_with_caps(id: &str, iso: IsolationClass, volumes: bool, s2z: bool) -> Node {
+        Node {
+            id: 1,
+            region: Some("eu".into()),
+            labels: BTreeMap::new(),
+            free_vcpus: 8,
+            free_mem_mib: 8192,
+            backends: vec![BackendKind {
+                id: id.into(),
+                isolation: iso,
+                persistent_volumes: volumes,
+                scale_to_zero: s2z,
+            }],
+        }
+    }
+
+    #[test]
+    fn volume_spec_needs_a_volume_capable_backend() {
+        let mut s = spec(1, 128);
+        s.volumes = vec![VolumeRef {
+            mount: "/data".into(),
+            name: "db".into(),
+            size_mib: 64,
+        }];
+        // A backend that can't back volumes ⇒ no placement (fail loud, not
+        // silently storage-less).
+        let no_vol = vec![node_with_caps(
+            "container",
+            IsolationClass::Namespace,
+            false,
+            false,
+        )];
+        assert!(
+            place_replicas(
+                1,
+                &PlacementConstraints::default(),
+                &s,
+                &no_vol,
+                &BackendPolicy::default()
+            )
+            .is_empty(),
+            "a volume spec must not place on a volume-incapable backend"
+        );
+        // A volume-capable backend places it.
+        let vol_ok = vec![node_with_caps("vmm", IsolationClass::VmKvm, true, false)];
+        assert_eq!(
+            place_replicas(
+                1,
+                &PlacementConstraints::default(),
+                &s,
+                &vol_ok,
+                &BackendPolicy::default()
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scale_to_zero_spec_needs_a_capable_backend() {
+        let mut s = spec(1, 128);
+        s.scale_to_zero = true;
+        // A backend that can't scale to zero ⇒ no placement, rather than silently
+        // running always-on.
+        let no_s2z = vec![node_with_caps(
+            "docker",
+            IsolationClass::Container,
+            false,
+            false,
+        )];
+        assert!(
+            place_replicas(
+                1,
+                &PlacementConstraints::default(),
+                &s,
+                &no_s2z,
+                &BackendPolicy::default()
+            )
+            .is_empty(),
+            "a scale-to-zero spec must not place on a scale-to-zero-incapable backend"
+        );
+        // A scale-to-zero-capable backend places it.
+        let s2z_ok = vec![node_with_caps(
+            "container",
+            IsolationClass::Namespace,
+            false,
+            true,
+        )];
+        assert_eq!(
+            place_replicas(
+                1,
+                &PlacementConstraints::default(),
+                &s,
+                &s2z_ok,
+                &BackendPolicy::default()
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
@@ -1657,6 +1783,10 @@ mod tests {
             backends: vec![BackendKind {
                 id: "fake".into(),
                 isolation: IsolationClass::Namespace,
+                // Fully-capable so the scale-to-zero reconcile tests (which reuse this
+                // fixture) still place; negative gate tests build their own node.
+                persistent_volumes: true,
+                scale_to_zero: true,
             }],
         }
     }
