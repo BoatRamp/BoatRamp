@@ -47,9 +47,13 @@ pub enum Error {
         #[source]
         source: boatramp_core::ConfigError,
     },
-    /// A control-plane request failed.
+    /// A control-plane request failed (the `connect`/resolve path).
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
+    /// A control-plane request from the reconcile core failed, carrying the
+    /// 404/409 classification the core acts on (see [`CpError`]).
+    #[error(transparent)]
+    Cp(#[from] CpError),
     /// Loading/parsing the project config (`project.cfg`) failed.
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
@@ -69,6 +73,140 @@ pub enum Error {
 
 /// `apply` module result; `Err` is [`Error`].
 type Result<T> = std::result::Result<T, Error>;
+
+/// The control-plane operations the `apply` reconcile core performs — a seam over
+/// the concrete HTTP [`client::ControlPlane`] so the reconcile logic (create-or-
+/// update, config-before-activate, create-on-404 / ignore-on-409) is
+/// unit-testable against a mock without a live server. Static-dispatched: the
+/// reconcile fns are generic over `C: ControlPlane`, so no `async-trait` / boxing.
+#[allow(async_fn_in_trait)] // crate-internal trait; never used as `dyn`
+trait ControlPlane {
+    /// Read a project; a missing one is [`CpError::NotFound`].
+    async fn get_project(&self, name: &str) -> CpResult<serde_json::Value>;
+    /// Create a project; a concurrent create is [`CpError::Conflict`].
+    async fn create_project(&self, body: &serde_json::Value) -> CpResult<serde_json::Value>;
+    /// Negotiate a deployment; the reply lists the blob hashes still missing.
+    async fn create_deployment(
+        &self,
+        site: &str,
+        manifest: &boatramp_core::deploy::Manifest,
+    ) -> CpResult<crate::client::CreateDeploymentResponse>;
+    /// Upload one missing blob by content-address.
+    async fn upload_blob_source(
+        &self,
+        hash: &str,
+        source: &crate::sync::BlobSource,
+    ) -> CpResult<()>;
+    /// PUT a site's mutable config (applied before activation).
+    async fn put_site_config(&self, site: &str, config: &SiteConfig) -> CpResult<()>;
+    /// Flip a site live to a deployment id.
+    async fn activate(&self, site: &str, id: &str) -> CpResult<()>;
+    /// Stage a local file as a content-addressed blob, returning its hash.
+    async fn put_file_blob(&self, path: &Path) -> CpResult<String>;
+    /// Create/replace a top-level function record.
+    async fn deploy_function(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> CpResult<serde_json::Value>;
+    /// Create/replace a compute workload spec.
+    async fn put_compute(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> CpResult<serde_json::Value>;
+}
+
+/// A control-plane call outcome classified for the reconcile core: `NotFound`
+/// (HTTP 404) and `Conflict` (409) are surfaced explicitly so `ensure_project`'s
+/// create-on-404 / ignore-conflict-on-409 works against a mock; every other
+/// failure carries the original [`client::ClientError`] verbatim.
+#[derive(Debug, thiserror::Error)]
+pub enum CpError {
+    /// The resource is absent (HTTP 404).
+    #[error("control-plane resource not found (HTTP 404)")]
+    NotFound,
+    /// The resource already exists (HTTP 409).
+    #[error("control-plane resource already exists (HTTP 409)")]
+    Conflict,
+    /// Any other control-plane failure, preserved verbatim.
+    #[error(transparent)]
+    Client(#[from] crate::client::ClientError),
+}
+
+/// Reconcile-core control-plane result; `Err` is [`CpError`].
+type CpResult<T> = std::result::Result<T, CpError>;
+
+/// The real seam: the concrete HTTP client. Each method forwards to the same-named
+/// inherent method (inherent methods take precedence over trait methods, so `self.`
+/// resolves to the HTTP call, not this trait). Only `get_project`/`create_project`
+/// classify their error (the sole errors the reconcile core inspects); every other
+/// method preserves the original `ClientError` unchanged, so no error text shifts.
+impl ControlPlane for client::ControlPlane {
+    async fn get_project(&self, name: &str) -> CpResult<serde_json::Value> {
+        self.get_project(name).await.map_err(|e| {
+            if is_not_found(&e) {
+                CpError::NotFound
+            } else {
+                CpError::Client(e)
+            }
+        })
+    }
+    async fn create_project(&self, body: &serde_json::Value) -> CpResult<serde_json::Value> {
+        self.create_project(body).await.map_err(|e| {
+            if is_conflict(&e) {
+                CpError::Conflict
+            } else {
+                CpError::Client(e)
+            }
+        })
+    }
+    async fn create_deployment(
+        &self,
+        site: &str,
+        manifest: &boatramp_core::deploy::Manifest,
+    ) -> CpResult<crate::client::CreateDeploymentResponse> {
+        self.create_deployment(site, manifest, &[])
+            .await
+            .map_err(CpError::Client)
+    }
+    async fn upload_blob_source(
+        &self,
+        hash: &str,
+        source: &crate::sync::BlobSource,
+    ) -> CpResult<()> {
+        self.upload_blob_source(hash, source)
+            .await
+            .map_err(CpError::Client)
+    }
+    async fn put_site_config(&self, site: &str, config: &SiteConfig) -> CpResult<()> {
+        self.put_site_config(site, config)
+            .await
+            .map_err(CpError::Client)
+    }
+    async fn activate(&self, site: &str, id: &str) -> CpResult<()> {
+        self.activate(site, id).await.map_err(CpError::Client)
+    }
+    async fn put_file_blob(&self, path: &Path) -> CpResult<String> {
+        self.put_file_blob(path).await.map_err(CpError::Client)
+    }
+    async fn deploy_function(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> CpResult<serde_json::Value> {
+        self.deploy_function(name, body)
+            .await
+            .map_err(CpError::Client)
+    }
+    async fn put_compute(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> CpResult<serde_json::Value> {
+        self.put_compute(name, body).await.map_err(CpError::Client)
+    }
+}
 
 /// A whole-project desired state: the sites, functions, and compute workloads to
 /// reconcile under one project.
@@ -242,7 +380,7 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
 /// Ensure the target project exists: `GET` it, and on a 404 `create` it. A
 /// concurrent create (409/conflict) is ignored. The reserved `default` project
 /// always exists, so it is skipped.
-async fn ensure_project(cp: &client::ControlPlane, project: &str, dry_run: bool) -> Result<()> {
+async fn ensure_project<C: ControlPlane>(cp: &C, project: &str, dry_run: bool) -> Result<()> {
     if project == boatramp_core::project::DEFAULT_PROJECT {
         return Ok(());
     }
@@ -252,17 +390,15 @@ async fn ensure_project(cp: &client::ControlPlane, project: &str, dry_run: bool)
     }
     match cp.get_project(project).await {
         Ok(_) => Ok(()),
-        Err(err) if is_not_found(&err) => {
-            match cp.create_project(&json!({ "name": project })).await {
-                Ok(_) => {
-                    println!("  created project `{project}`");
-                    Ok(())
-                }
-                // A concurrent create is fine — the project ends up existing either way.
-                Err(err) if is_conflict(&err) => Ok(()),
-                Err(err) => Err(err.into()),
+        Err(CpError::NotFound) => match cp.create_project(&json!({ "name": project })).await {
+            Ok(_) => {
+                println!("  created project `{project}`");
+                Ok(())
             }
-        }
+            // A concurrent create is fine — the project ends up existing either way.
+            Err(CpError::Conflict) => Ok(()),
+            Err(err) => Err(err.into()),
+        },
         Err(err) => Err(err.into()),
     }
 }
@@ -270,8 +406,8 @@ async fn ensure_project(cp: &client::ControlPlane, project: &str, dry_run: bool)
 /// Reconcile one site: (optionally build), hash the content dir, negotiate the
 /// deployment, upload the missing blobs, PUT its site config, then activate (config
 /// before activate — the activation precheck gates handlers on the stored config).
-async fn apply_site(
-    cp: &client::ControlPlane,
+async fn apply_site<C: ControlPlane>(
+    cp: &C,
     site: &ApplySite,
     config: &ProjectConfig,
     build_flag: bool,
@@ -311,7 +447,7 @@ async fn apply_site(
         manifest.config = routing.clone();
     }
 
-    let created = cp.create_deployment(&site.name, &manifest, &[]).await?;
+    let created = cp.create_deployment(&site.name, &manifest).await?;
     println!(
         "  site `{}`: deployment {} — uploading {} new blob(s)",
         site.name,
@@ -343,8 +479,8 @@ async fn apply_site(
 
 /// Reconcile one top-level function: stage its component blob, then PUT the
 /// function record (`{ component, config, lifecycle }`).
-async fn apply_function(
-    cp: &client::ControlPlane,
+async fn apply_function<C: ControlPlane>(
+    cp: &C,
     function: &ApplyFunction,
     dry_run: bool,
 ) -> Result<()> {
@@ -388,8 +524,8 @@ async fn apply_function(
 }
 
 /// Reconcile one compute workload: PUT its spec straight to the server.
-async fn apply_compute(
-    cp: &client::ControlPlane,
+async fn apply_compute<C: ControlPlane>(
+    cp: &C,
     compute: &ApplyCompute,
     dry_run: bool,
 ) -> Result<()> {
@@ -440,6 +576,213 @@ fn yes_no(b: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A recording [`ControlPlane`] double: every call appends a line to `calls`,
+    /// so a reconcile test asserts *which* control-plane operations ran and *in
+    /// what order* — without a live server. `project_exists` toggles `get_project`
+    /// between `Ok` and [`CpError::NotFound`].
+    #[derive(Default)]
+    struct MockCp {
+        calls: Mutex<Vec<String>>,
+        project_exists: bool,
+    }
+
+    impl MockCp {
+        fn rec(&self, line: impl Into<String>) {
+            self.calls.lock().unwrap().push(line.into());
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ControlPlane for MockCp {
+        async fn get_project(&self, name: &str) -> CpResult<serde_json::Value> {
+            self.rec(format!("get_project {name}"));
+            if self.project_exists {
+                Ok(json!({ "name": name }))
+            } else {
+                Err(CpError::NotFound)
+            }
+        }
+        async fn create_project(&self, body: &serde_json::Value) -> CpResult<serde_json::Value> {
+            self.rec(format!(
+                "create_project {}",
+                body["name"].as_str().unwrap_or_default()
+            ));
+            Ok(body.clone())
+        }
+        async fn create_deployment(
+            &self,
+            site: &str,
+            _manifest: &boatramp_core::deploy::Manifest,
+        ) -> CpResult<crate::client::CreateDeploymentResponse> {
+            self.rec(format!("create_deployment {site}"));
+            // No missing blobs ⇒ the upload loop is skipped, isolating the
+            // config-before-activate ordering under test.
+            Ok(crate::client::CreateDeploymentResponse {
+                id: "dep-1".into(),
+                missing: vec![],
+            })
+        }
+        async fn upload_blob_source(
+            &self,
+            hash: &str,
+            _source: &crate::sync::BlobSource,
+        ) -> CpResult<()> {
+            self.rec(format!("upload_blob_source {hash}"));
+            Ok(())
+        }
+        async fn put_site_config(&self, site: &str, _config: &SiteConfig) -> CpResult<()> {
+            self.rec(format!("put_site_config {site}"));
+            Ok(())
+        }
+        async fn activate(&self, site: &str, id: &str) -> CpResult<()> {
+            self.rec(format!("activate {site} {id}"));
+            Ok(())
+        }
+        async fn put_file_blob(&self, path: &Path) -> CpResult<String> {
+            self.rec(format!("put_file_blob {}", path.display()));
+            Ok("deadbeef".into())
+        }
+        async fn deploy_function(
+            &self,
+            name: &str,
+            _body: &serde_json::Value,
+        ) -> CpResult<serde_json::Value> {
+            self.rec(format!("deploy_function {name}"));
+            Ok(json!({}))
+        }
+        async fn put_compute(
+            &self,
+            name: &str,
+            _body: &serde_json::Value,
+        ) -> CpResult<serde_json::Value> {
+            self.rec(format!("put_compute {name}"));
+            Ok(json!({}))
+        }
+    }
+
+    fn a_function() -> ApplyFunction {
+        ApplyFunction {
+            name: "resize".into(),
+            component: "resize.wasm".into(),
+            runtime: None,
+            webhook_secret_env: None,
+            imports: vec![],
+            env: Default::default(),
+            invoke_targets: vec![],
+            limits: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_project_creates_on_404() {
+        let mock = MockCp::default(); // project_exists: false
+        ensure_project(&mock, "acme", false).await.unwrap();
+        assert_eq!(mock.calls(), ["get_project acme", "create_project acme"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_project_existing_does_not_create() {
+        let mock = MockCp {
+            project_exists: true,
+            ..Default::default()
+        };
+        ensure_project(&mock, "acme", false).await.unwrap();
+        assert_eq!(mock.calls(), ["get_project acme"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_project_skips_the_reserved_default() {
+        let mock = MockCp::default();
+        ensure_project(&mock, boatramp_core::project::DEFAULT_PROJECT, false)
+            .await
+            .unwrap();
+        assert!(mock.calls().is_empty(), "default is never created");
+    }
+
+    #[tokio::test]
+    async fn ensure_project_dry_run_mutates_nothing() {
+        let mock = MockCp::default();
+        ensure_project(&mock, "acme", true).await.unwrap();
+        assert!(mock.calls().is_empty(), "dry-run issues no requests");
+    }
+
+    #[tokio::test]
+    async fn apply_function_stages_blob_then_deploys() {
+        let mock = MockCp::default();
+        apply_function(&mock, &a_function(), false).await.unwrap();
+        assert_eq!(
+            mock.calls(),
+            ["put_file_blob resize.wasm", "deploy_function resize"]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_function_dry_run_mutates_nothing() {
+        let mock = MockCp::default();
+        apply_function(&mock, &a_function(), true).await.unwrap();
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_compute_puts_the_spec() {
+        let mock = MockCp::default();
+        let compute = ApplyCompute {
+            name: "api".into(),
+            spec: json!({ "replicas": 2 }),
+        };
+        apply_compute(&mock, &compute, false).await.unwrap();
+        assert_eq!(mock.calls(), ["put_compute api"]);
+    }
+
+    #[tokio::test]
+    async fn apply_compute_dry_run_mutates_nothing() {
+        let mock = MockCp::default();
+        let compute = ApplyCompute {
+            name: "api".into(),
+            spec: json!({}),
+        };
+        apply_compute(&mock, &compute, true).await.unwrap();
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_site_applies_config_before_activate() {
+        // `build_manifest` hashes a real tree, so stage a one-file content dir.
+        let dir = std::env::temp_dir().join(format!(
+            "boatramp-apply-site-{}-{}",
+            std::process::id(),
+            "www"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"<h1>hi</h1>").unwrap();
+
+        let mock = MockCp::default();
+        let site = ApplySite {
+            name: "www".into(),
+            path: Some(dir.display().to_string()),
+            build: None,
+            routing: None,
+            config: Some(SiteConfig::default()),
+        };
+        let result = apply_site(&mock, &site, &ProjectConfig::default(), false, false).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
+
+        // The invariant this module exists to guarantee (see `apply_site`'s doc):
+        // the site config lands BEFORE the deployment is activated.
+        assert_eq!(
+            mock.calls(),
+            [
+                "create_deployment www",
+                "put_site_config www",
+                "activate www dep-1"
+            ]
+        );
+    }
 
     #[test]
     fn manifest_round_trips_sites_functions_and_compute() {
