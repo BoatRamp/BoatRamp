@@ -4288,6 +4288,7 @@ mod tests {
             restart: RestartPolicy::Always,
             scale_to_zero: false,
             volumes: vec![],
+            writable_root: false,
             isolation: Default::default(),
             prefer_backend: None,
             bindings: vec![],

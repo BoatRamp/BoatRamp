@@ -163,6 +163,14 @@ pub struct ComputeSpec {
     /// Persistent volumes (opt-in).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeRef>,
+    /// Allow a writable root filesystem instead of the hardened read-only-root
+    /// default. Opt-in and honored **only under the single-tenant isolation
+    /// posture** (a backend forces read-only root under the multi-tenant guard).
+    /// The idiomatic path for app writes remains a [`VolumeRef`]; this is for images
+    /// that write outside a declared volume. Default off; omitted from the wire + the
+    /// content hash when false (back-compat).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writable_root: bool,
     /// Isolation the workload requires; selects which backends are eligible.
     /// Default `Trusted`; omitted from the serialized
     /// spec when default, so existing specs keep their content hash.
@@ -314,6 +322,7 @@ mod tests {
             restart: RestartPolicy::Always,
             scale_to_zero: true,
             volumes: vec![],
+            writable_root: false,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],

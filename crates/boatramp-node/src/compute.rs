@@ -102,7 +102,11 @@ pub async fn build_compute(
     // Remote docker: register only if a daemon actually answers.
     match boatramp_docker::DockerBackend::connect() {
         Ok(docker) => {
-            let docker = docker.with_endpoint(cfg.docker_endpoint);
+            // `writable_root` is honored only under the single-tenant posture
+            // (`!strict`); the multi-tenant guard keeps the hardened read-only root.
+            let docker = docker
+                .with_endpoint(cfg.docker_endpoint)
+                .with_writable_root_allowed(!strict);
             if docker.reachable().await {
                 backends.insert("docker".to_string(), std::sync::Arc::new(docker));
             } else {

@@ -56,6 +56,10 @@ pub enum DockerEndpoint {
 pub struct DockerBackend {
     docker: Docker,
     endpoint: DockerEndpoint,
+    /// Whether a spec's `writable_root` is honored here. Set from the isolation
+    /// posture (single-tenant only); off under the multi-tenant guard, so a
+    /// writable-root spec is forced back to the hardened read-only root.
+    writable_root_allowed: bool,
 }
 
 impl DockerBackend {
@@ -67,6 +71,7 @@ impl DockerBackend {
         Ok(Self {
             docker,
             endpoint: DockerEndpoint::default(),
+            writable_root_allowed: false,
         })
     }
 
@@ -75,12 +80,20 @@ impl DockerBackend {
         Self {
             docker,
             endpoint: DockerEndpoint::default(),
+            writable_root_allowed: false,
         }
     }
 
     /// Select how a launched workload's endpoint is reported (see [`DockerEndpoint`]).
     pub fn with_endpoint(mut self, endpoint: DockerEndpoint) -> Self {
         self.endpoint = endpoint;
+        self
+    }
+
+    /// Allow a spec's `writable_root` to relax the read-only root here (single-tenant
+    /// posture). Off by default, so the multi-tenant guard keeps the hardened root.
+    pub fn with_writable_root_allowed(mut self, allowed: bool) -> Self {
+        self.writable_root_allowed = allowed;
         self
     }
 
@@ -134,7 +147,16 @@ const MAX_PIDS: i64 = 512;
 /// still work), and a **PID cap**. Running as a non-root *user* is left to the
 /// image — forcing a UID breaks images that expect their own user, and
 /// `no-new-privileges` already blocks setuid escalation.
-fn hardened_host_config(mem_mib: u32, vcpus: u32, restart: RestartPolicy) -> HostConfig {
+///
+/// `writable_root` relaxes only the read-only-root default (caller-gated to the
+/// single-tenant posture); every other hardening stays on. The idiomatic path for
+/// app writes is a persistent volume, not a writable root.
+fn hardened_host_config(
+    mem_mib: u32,
+    vcpus: u32,
+    restart: RestartPolicy,
+    writable_root: bool,
+) -> HostConfig {
     let tmpfs = std::collections::HashMap::from([
         ("/tmp".to_string(), "rw,noexec,nosuid,size=64m".to_string()),
         ("/run".to_string(), "rw,noexec,nosuid,size=16m".to_string()),
@@ -146,7 +168,7 @@ fn hardened_host_config(mem_mib: u32, vcpus: u32, restart: RestartPolicy) -> Hos
         // Hardening:
         security_opt: Some(vec!["no-new-privileges:true".to_string()]),
         cap_drop: Some(vec!["ALL".to_string()]),
-        readonly_rootfs: Some(true),
+        readonly_rootfs: Some(!writable_root),
         tmpfs: Some(tmpfs),
         pids_limit: Some(MAX_PIDS),
         ..Default::default()
@@ -209,8 +231,15 @@ impl ComputeBackend for DockerBackend {
             .collect();
         let port = req.spec.port;
         let port_key = format!("{port}/tcp");
-        let mut host_config =
-            hardened_host_config(req.spec.mem_mib, req.spec.vcpus, req.spec.restart);
+        // Honor `writable_root` only where the posture allows it (single-tenant);
+        // otherwise the hardened read-only root stands.
+        let writable_root = req.spec.writable_root && self.writable_root_allowed;
+        let mut host_config = hardened_host_config(
+            req.spec.mem_mib,
+            req.spec.vcpus,
+            req.spec.restart,
+            writable_root,
+        );
         let mut config = Config {
             image: Some(reference),
             cmd: Some(req.spec.entrypoint.clone()),
@@ -402,7 +431,7 @@ mod tests {
 
     #[test]
     fn host_config_is_hardened_by_default() {
-        let hc = hardened_host_config(256, 2, RestartPolicy::Never);
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false);
         // Resource limits still applied.
         assert_eq!(hc.memory, Some(256 * 1024 * 1024));
         assert_eq!(hc.nano_cpus, Some(2_000_000_000));
@@ -420,8 +449,36 @@ mod tests {
         assert!(tmpfs.contains_key("/run"));
         // At least one vCPU even when the spec asks for zero.
         assert_eq!(
-            hardened_host_config(64, 0, RestartPolicy::Never).nano_cpus,
+            hardened_host_config(64, 0, RestartPolicy::Never, false).nano_cpus,
             Some(1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn writable_root_relaxes_only_the_read_only_root() {
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, true);
+        // The one relaxation.
+        assert_eq!(hc.readonly_rootfs, Some(false));
+        // Every other hardening still applies.
+        assert_eq!(
+            hc.security_opt.as_deref(),
+            Some(["no-new-privileges:true".to_string()].as_slice())
+        );
+        assert_eq!(hc.cap_drop.as_deref(), Some(["ALL".to_string()].as_slice()));
+        assert_eq!(hc.pids_limit, Some(MAX_PIDS));
+    }
+
+    #[test]
+    fn writable_root_is_off_by_default_on_the_backend() {
+        // A backend built without the posture opt-in refuses to honor writable_root.
+        let docker = Docker::connect_with_defaults().unwrap();
+        let backend = DockerBackend::with_client(docker);
+        assert!(!backend.writable_root_allowed);
+        assert!(
+            backend
+                .with_writable_root_allowed(true)
+                .writable_root_allowed,
+            "the single-tenant posture opts in"
         );
     }
 

@@ -123,6 +123,11 @@ enum ComputeCommand {
         /// Snapshot + stop when idle; restore on the next request.
         #[arg(long)]
         scale_to_zero: bool,
+        /// Allow a writable root filesystem (honored only under the single-tenant
+        /// posture; the hardened read-only root is the default). Prefer a persistent
+        /// volume for app writes.
+        #[arg(long)]
+        writable_root: bool,
         /// Isolation the workload requires (`trusted` allows containers;
         /// `untrusted` forces a microVM / managed platform).
         #[arg(long, value_enum, default_value_t = Isolation::Trusted)]
@@ -175,6 +180,10 @@ enum ComputeCommand {
         /// Snapshot + stop when idle.
         #[arg(long)]
         scale_to_zero: bool,
+        /// Allow a writable root filesystem (single-tenant posture only; the
+        /// hardened read-only root is the default). Prefer a persistent volume.
+        #[arg(long)]
+        writable_root: bool,
         /// Isolation the workload requires (`trusted` allows containers;
         /// `untrusted` forces a microVM / managed platform).
         #[arg(long, value_enum, default_value_t = Isolation::Trusted)]
@@ -294,6 +303,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             env,
             restart,
             scale_to_zero,
+            writable_root,
             isolation,
             regions,
             bind,
@@ -331,6 +341,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 env,
                 restart,
                 scale_to_zero,
+                writable_root,
                 isolation,
                 parse_bindings(&bind)?,
             )?;
@@ -350,6 +361,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             env,
             restart,
             scale_to_zero,
+            writable_root,
             isolation,
             regions,
             bind,
@@ -398,6 +410,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 env,
                 restart,
                 scale_to_zero,
+                writable_root,
                 isolation,
                 parse_bindings(&bind)?,
             )?;
@@ -427,6 +440,7 @@ fn build_spec(
     env: Vec<String>,
     restart: Restart,
     scale_to_zero: bool,
+    writable_root: bool,
     isolation: Isolation,
     bindings: Vec<ComputeBinding>,
 ) -> Result<ComputeSpec> {
@@ -450,6 +464,7 @@ fn build_spec(
         restart: restart.into(),
         scale_to_zero,
         volumes: vec![],
+        writable_root,
         isolation: isolation.into(),
         prefer_backend: None,
         bindings,
