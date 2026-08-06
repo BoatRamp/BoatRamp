@@ -208,14 +208,6 @@ impl From<boatramp_cluster::node::BootstrapError> for Error {
 #[cfg(feature = "cluster")]
 const _: () = assert!(std::mem::size_of::<Error>() <= 128);
 
-// The reconcile-timing policy now lives in `boatramp_node::node` (the assembly
-// crate). `run` reaches it via `assemble`; only the cluster path (`run_cluster`,
-// which still inlines its reconcile spawns until N4) names these directly.
-#[cfg(feature = "cluster")]
-use boatramp_node::node::{
-    COMPUTE_IDLE_TIMEOUT, COMPUTE_RECONCILE_TICK, DOMAIN_VERIFY_RECONCILE_TICK,
-};
-
 /// TLS mode for the public listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TlsMode {
@@ -718,6 +710,10 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         options,
         watch_provider: built_blobs.watch_provider.clone(),
         provision_tier: built_blobs.provision_tier,
+        // Single-node: default messaging, an always-true leader gate (one node), id 0.
+        messaging: None,
+        is_leader: Arc::new(|| true),
+        node_id: 0,
     })
     .await?;
 
@@ -1543,94 +1539,35 @@ async fn run_cluster(
         node: node.clone(),
         issuer: options.issuer.clone(),
     }));
-    let handlers = boatramp_node::handlers::build_handler_runtime(
-        kv.clone(),
-        storage.clone(),
-        &data_dir,
-        config.handlers.as_ref(),
-        Some(node.messaging.clone()),
-        options.posture.max_handler_blob_bytes,
-        options.posture.max_component_bytes,
-    )?;
-    // Cron single-firing: only the Raft leader fires.
-    let raft = node.raft.clone();
-    let node_id = node.node_id;
-    handlers.set_cron_leader_gate(Arc::new(move || {
-        boatramp_cluster::raft::is_leader(&raft, node_id)
-    }));
-    // FA-5b2: wire the blob-change notification provisioner (leader-gated dispatch
-    // already ensures a single node reconciles the watchers).
-    #[cfg(feature = "handlers")]
-    if let Some(provider) = built_blobs.watch_provider.clone() {
-        handlers.set_watch_provider(provider);
-        handlers.set_provision_tier(built_blobs.provision_tier);
-    }
-
-    let compute_storage = storage.clone();
-    let deploy = DeployStore::new(storage, kv);
-    // Materialize the reserved `default` project (as in the single-node path). In
-    // cluster mode the write forwards through `RaftKv` to the leader; a follower's
-    // presence-check finds it already there and writes nothing. Best effort.
-    match deploy.ensure_default_project().await {
-        Ok(true) => tracing::info!("materialized the reserved `default` project record"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not materialize the `default` project record; readers use the synthesized default"
-        ),
-    }
-    // Wire the function-to-function invoke resolver (FI), as in the single-node path.
-    #[cfg(feature = "handlers")]
-    handlers.set_invoker(deploy.clone());
-
-    // Compute reconcile loop — leader-gated like cron.
-    {
-        let raft = node.raft.clone();
-        let leader_node_id = node.node_id;
-        let (compute_backends, compute_node) = boatramp_node::compute::build_compute(
-            config.compute.as_ref(),
-            compute_storage,
-            &data_dir,
-            node_id,
-            !options.posture.allow_shared_kernel_compute,
-            options.daemon_runtime.clone(),
-        )
-        .await;
-        // Activate the compute sql-shim (as in the single-node path).
-        #[cfg(feature = "handlers")]
-        let sql_resolver = boatramp_server::sql_shim::spawn_sql_shim(
-            handlers.sql_backends(),
-            config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
-        )
-        .await;
-        #[cfg(not(feature = "handlers"))]
-        let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
-        let _reconcile = boatramp_server::spawn_compute_reconcile(
-            deploy.clone(),
-            compute_backends,
-            vec![compute_node],
-            boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(
-                options.posture.allow_shared_kernel_compute,
-            ),
-            Arc::new(move || boatramp_cluster::raft::is_leader(&raft, leader_node_id)),
-            COMPUTE_RECONCILE_TICK,
-            COMPUTE_IDLE_TIMEOUT,
-            sql_resolver,
-        );
-    }
-
-    // Domain-verify auto-complete reconcile — leader-gated like the compute loop,
-    // so a single node drives the sweep in the cluster.
-    {
-        let raft = node.raft.clone();
-        let dv_node_id = node.node_id;
-        let _dv_reconcile = boatramp_server::spawn_domain_verify_reconcile(
-            deploy.clone(),
-            options.posture.domain_verify_allow_private,
-            Arc::new(move || boatramp_cluster::raft::is_leader(&raft, dv_node_id)),
-            DOMAIN_VERIFY_RECONCILE_TICK,
-        );
-    }
+    // Node-graph assembly, shared with the single-node path (`boatramp_node::assemble`):
+    // handler runtime, deploy store (+ reserved `default` project), compute + domain-
+    // verify reconcile loops. The cluster differences are threaded as `NodeInput`
+    // fields: the Raft messaging substrate, a Raft `is_leader` gate (cron firing +
+    // both reconcile loops run only on the leader), and this node's compute id.
+    let leader_raft = node.raft.clone();
+    let leader_node_id = node.node_id;
+    let is_leader: boatramp_server::CronLeaderGate =
+        Arc::new(move || boatramp_cluster::raft::is_leader(&leader_raft, leader_node_id));
+    let boatramp_node::RunningNode {
+        deploy,
+        handlers,
+        auth,
+        options,
+        reconcile: _reconcile,
+    } = boatramp_node::assemble(boatramp_node::NodeInput {
+        config,
+        data_dir: data_dir.as_path(),
+        storage,
+        kv,
+        auth,
+        options,
+        watch_provider: built_blobs.watch_provider.clone(),
+        provision_tier: built_blobs.provision_tier,
+        messaging: Some(node.messaging.clone()),
+        is_leader,
+        node_id: node.node_id,
+    })
+    .await?;
 
     tracing::info!(tls = ?args.tls, "cluster: serving public traffic");
     #[cfg(feature = "tls")]

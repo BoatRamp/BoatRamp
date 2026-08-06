@@ -49,6 +49,17 @@ pub struct NodeInput<'a> {
     pub watch_provider: Option<Arc<dyn boatramp_core::blob_provision::WatchProvider>>,
     /// The provisioning tier for the watch provider.
     pub provision_tier: boatramp_core::blob_notify::ProvisionTier,
+    /// The `wasi:messaging` substrate override for the handler runtime. `None` uses
+    /// the single-node default (`LogMessaging` over the same backends); the cluster
+    /// path passes its Raft-backed coordinator.
+    pub messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
+    /// The single leader gate for cron firing + the compute / domain-verify reconcile
+    /// loops. Single-node passes an always-true gate (there is one node); the cluster
+    /// passes its Raft `is_leader` check so a single node drives each sweep.
+    pub is_leader: boatramp_server::CronLeaderGate,
+    /// This node's compute scheduler id (`0` single-node; the cluster node id in a
+    /// fleet, so replicas are tagged to the right node).
+    pub node_id: u64,
 }
 
 /// A fully wired node: the deploy store, handler runtime, auth, and options a
@@ -86,6 +97,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         options,
         watch_provider,
         provision_tier,
+        messaging,
+        is_leader,
+        node_id,
     } = input;
     // Copy out the posture scalars up front so `options` can be moved into the
     // returned `RunningNode` without a lingering borrow.
@@ -102,10 +116,16 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         storage.clone(),
         data_dir,
         config.handlers.as_ref(),
-        None,
+        messaging,
         max_handler_blob_bytes,
         max_component_bytes,
     )?;
+    // Leader-gate cron firing (cluster: only the Raft leader fires; single-node: an
+    // always-true gate, equivalent to the unset default). The same gate drives the
+    // reconcile loops below, so all three converge on one leader per fleet. Only the
+    // handler runtime has a scheduler, so this is a no-op without the `handlers` feature.
+    #[cfg(feature = "handlers")]
+    handlers.set_cron_leader_gate(is_leader.clone());
     // FA-5b2: on a cloud backend, wire the blob-change notification provisioner +
     // its tier so adding a `blob` trigger provisions (and removing it retracts).
     #[cfg(feature = "handlers")]
@@ -142,7 +162,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         config.compute.as_ref(),
         compute_storage,
         data_dir,
-        0,
+        node_id,
         !allow_shared_kernel,
         options.daemon_runtime.clone(),
     )
@@ -162,7 +182,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         compute_backends,
         vec![compute_node],
         boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(allow_shared_kernel),
-        Arc::new(|| true),
+        is_leader.clone(),
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
         sql_resolver,
@@ -174,7 +194,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let dv_reconcile = boatramp_server::spawn_domain_verify_reconcile(
         deploy.clone(),
         domain_verify_allow_private,
-        Arc::new(|| true),
+        is_leader,
         DOMAIN_VERIFY_RECONCILE_TICK,
     );
 
@@ -224,6 +244,9 @@ mod tests {
             options,
             watch_provider: None,
             provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+            messaging: None,
+            is_leader: Arc::new(|| true),
+            node_id: 0,
         })
         .await
         .expect("assemble a node over a temp store");
