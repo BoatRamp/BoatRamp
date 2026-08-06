@@ -1669,6 +1669,7 @@ dependencies = [
 name = "boatramp-node"
 version = "0.2.1"
 dependencies = [
+ "axum",
  "boatramp-container",
  "boatramp-core",
  "boatramp-docker",
@@ -1679,8 +1680,10 @@ dependencies = [
  "clap",
  "ron",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower 0.5.3",
  "tracing",
 ]
 

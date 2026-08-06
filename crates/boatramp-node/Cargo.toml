@@ -68,3 +68,11 @@ sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []
+
+[dev-dependencies]
+# The in-process fidelity test (`node::tests`) drives the assembled router with a
+# synthetic request over a temp `FsStorage` + `MemoryKv` (gated on `fs`).
+axum = "0.8"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }

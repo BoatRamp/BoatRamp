@@ -186,3 +186,71 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         reconcile: vec![compute_reconcile, dv_reconcile],
     })
 }
+
+#[cfg(all(test, feature = "fs"))]
+mod tests {
+    use super::*;
+    use boatramp_core::kv::MemoryKv;
+    use boatramp_core::security::SecurityProfile;
+
+    /// The headline in-process fidelity check (PLAN-node-library N2b.3): `assemble`
+    /// over a temp `FsStorage` + `MemoryKv` produces a `RunningNode` whose deploy
+    /// store is live (the reserved `default` project was materialized during
+    /// assembly) and whose router — the exact one `boatramp serve` builds — answers
+    /// `/healthz`. No listener is bound: the request is driven through the router
+    /// via `tower::oneshot`, so the whole assembly runs in-process.
+    #[tokio::test]
+    async fn assemble_produces_a_serving_node_over_a_temp_store() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(tmp.path()));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let config = ServerConfig::default();
+        let options = boatramp_server::ServerOptions {
+            // The strict `multi-tenant` posture, as an unconfigured `serve` resolves.
+            posture: SecurityProfile::MultiTenant.preset(),
+            ..Default::default()
+        };
+
+        let node = assemble(NodeInput {
+            config: &config,
+            data_dir: tmp.path(),
+            storage,
+            kv,
+            auth: boatramp_server::Auth::disabled(),
+            options,
+            watch_provider: None,
+            provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
+        })
+        .await
+        .expect("assemble a node over a temp store");
+
+        // The deploy store is live: `assemble` already materialized the reserved
+        // `default` project, so a second ensure reports "already present" (`false`).
+        assert!(
+            !node
+                .deploy
+                .ensure_default_project()
+                .await
+                .expect("read the default project"),
+            "assemble should have materialized the default project"
+        );
+
+        // The assembled router (the same wiring `serve` binds) answers /healthz.
+        let router =
+            boatramp_server::router_with(node.deploy, node.auth, node.handlers, node.options);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("route /healthz");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
