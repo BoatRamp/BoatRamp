@@ -51,6 +51,19 @@ pub enum Error {
     #[error("handlers SQL binding: external database {0:?} needs an external SQL engine — rebuild with --features sql-postgres and/or sql-mysql")]
     SqlExternalUnavailable(String),
 
+    /// `--kv slatedb` selected but this build lacks SlateDB support.
+    #[cfg(not(feature = "slatedb"))]
+    #[error("this build has no slatedb support; rebuild with `--features slatedb`")]
+    NoSlatedbSupport,
+    /// `--kv cloudflare` selected but this build lacks Cloudflare KV support.
+    #[cfg(not(feature = "cloudflare-kv"))]
+    #[error("this build has no Cloudflare KV support; rebuild with `--features cloudflare-kv`")]
+    NoCloudflareKvSupport,
+    /// Opening the KV store (SlateDB / Cloudflare) failed.
+    #[cfg(any(feature = "slatedb", feature = "cloudflare-kv"))]
+    #[error(transparent)]
+    Kv(#[from] boatramp_core::kv::KvError),
+
     /// Building the wasm handler engine failed.
     #[cfg(feature = "handlers")]
     #[error(transparent)]

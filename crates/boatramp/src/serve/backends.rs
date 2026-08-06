@@ -7,11 +7,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use boatramp_core::kv::{KvStore, MemoryKv};
 use boatramp_core::Storage;
 use boatramp_storage::FsStorage;
 
-use boatramp_node::backends::{BlobBackend, KvBackend};
+use boatramp_node::backends::BlobBackend;
 
 use super::{Error, Result, ServeArgs};
 
@@ -190,38 +189,4 @@ async fn build_s3(
     _notify_account: Option<String>,
 ) -> Result<BuiltBlobs> {
     Err(Error::NoS3Support)
-}
-
-pub(crate) async fn build_kv(kv: KvBackend, data_dir: &Path) -> Result<Arc<dyn KvStore>> {
-    match kv {
-        KvBackend::Slatedb => build_slatedb_kv(data_dir).await,
-        KvBackend::Memory => Ok(Arc::new(MemoryKv::new())),
-        KvBackend::Cloudflare => build_cloudflare_kv(),
-    }
-}
-
-#[cfg(feature = "slatedb")]
-async fn build_slatedb_kv(data_dir: &Path) -> Result<Arc<dyn KvStore>> {
-    Ok(Arc::new(
-        boatramp_storage::SlateKv::open_local_with_flush(
-            data_dir.join("kv-slate"),
-            super::CONTROL_PLANE_FLUSH,
-        )
-        .await?,
-    ))
-}
-
-#[cfg(not(feature = "slatedb"))]
-async fn build_slatedb_kv(_data_dir: &Path) -> Result<Arc<dyn KvStore>> {
-    Err(Error::NoSlatedbSupport)
-}
-
-#[cfg(feature = "cloudflare-kv")]
-fn build_cloudflare_kv() -> Result<Arc<dyn KvStore>> {
-    Ok(Arc::new(boatramp_storage::CloudflareKv::from_env()?))
-}
-
-#[cfg(not(feature = "cloudflare-kv"))]
-fn build_cloudflare_kv() -> Result<Arc<dyn KvStore>> {
-    Err(Error::NoCloudflareKvSupport)
 }

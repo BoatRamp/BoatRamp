@@ -46,6 +46,7 @@ tracing.workspace = true
 acme-dns = []
 # Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
 clap = ["dep:clap"]
+cloudflare-kv = ["dep:boatramp-storage", "boatramp-storage/cloudflare-kv"]
 cluster = []
 console = ["boatramp-server/console"]
 # The wasm handler runtime assembly: the engine + the libsql `sql` binding backend.
@@ -59,4 +60,5 @@ handlers = [
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).
 sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
 sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
+slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []

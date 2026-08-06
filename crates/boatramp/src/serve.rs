@@ -15,17 +15,9 @@ use crate::config::ServerConfig;
 
 mod backends;
 
+use backends::build_blobs;
 /// The control-plane KV builder, reused by the standalone `boatramp migrate` command.
-pub(crate) use backends::build_kv as build_control_plane_kv;
-use backends::{build_blobs, build_kv};
-
-/// Control-plane flush interval for SlateDB. Deploys are serialized and a human
-/// is waiting, so we favour per-write latency over the throughput-oriented
-/// ~100 ms default (which the request-driven handler `wasi:keyvalue` store keeps).
-/// Shared by the control-plane KV builder ([`backends::build_kv`]) and the
-/// per-site store opened directly below.
-#[cfg(feature = "slatedb")]
-pub(super) const CONTROL_PLANE_FLUSH: std::time::Duration = std::time::Duration::from_millis(5);
+pub(crate) use boatramp_node::backends::build_kv as build_control_plane_kv;
 
 /// A failure running `boatramp serve`: selecting/initialising a backend, wiring
 /// auth / OIDC / TLS, or the HTTP server itself exiting with an error. Most of
@@ -74,14 +66,6 @@ pub enum Error {
     #[cfg(not(feature = "azure"))]
     #[error("this build has no Azure support; rebuild with `--features azure`")]
     NoAzureSupport,
-    /// `--kv slatedb` selected but the binary lacks SlateDB support.
-    #[cfg(not(feature = "slatedb"))]
-    #[error("this build has no slatedb support; rebuild with `--features slatedb`")]
-    NoSlatedbSupport,
-    /// `--kv cloudflare` selected but the binary lacks Cloudflare KV support.
-    #[cfg(not(feature = "cloudflare-kv"))]
-    #[error("this build has no Cloudflare KV support; rebuild with `--features cloudflare-kv`")]
-    NoCloudflareKvSupport,
 
     // ---- configuration / argument validation -------------------------------
     /// A token root **private** key (hex) failed to parse.
@@ -670,7 +654,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         return Err(Error::NoClusterSupport);
     }
 
-    let kv_backend = build_kv(args.kv, &data_dir).await?;
+    let kv_backend = boatramp_node::backends::build_kv(args.kv, &data_dir).await?;
     // Shared-mode coherence: when several processes share
     // one KV, publish each write to a changelog over the *uncached* backend and
     // poll it to invalidate peer-changed keys.
@@ -1306,7 +1290,11 @@ async fn run_cluster(
     // the dir is created just by opening the KV, before a first join completes.
     let store_dir_existed = store_dir.exists();
     let durable_kv: Arc<dyn KvStore> = Arc::new(
-        boatramp_storage::SlateKv::open_local_with_flush(store_dir, CONTROL_PLANE_FLUSH).await?,
+        boatramp_storage::SlateKv::open_local_with_flush(
+            store_dir,
+            boatramp_node::backends::CONTROL_PLANE_FLUSH,
+        )
+        .await?,
     );
     // The real resume-vs-found/join signal (F5): whether the store holds COMMITTED
     // cluster state (persisted mesh trust). A store dir that exists but has no

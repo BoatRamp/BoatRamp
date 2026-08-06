@@ -68,7 +68,7 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
 
     let kv = build_control_plane_kv(args.kv, &data_dir)
         .await
-        .map_err(Box::new)?;
+        .map_err(|e| Box::new(crate::serve::Error::from(e)))?;
 
     println!(
         "control-plane store ({:?} at {}): {}",
