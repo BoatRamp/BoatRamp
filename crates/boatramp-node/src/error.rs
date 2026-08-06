@@ -6,6 +6,24 @@
 /// produces them, matching the crate's forwarded features.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A token root **private** key (hex) failed to parse, or an external signer
+    /// (KMS/HSM/Vault) failed to build / resolve its public key.
+    #[error("invalid auth root private key: {0}")]
+    AuthPrivKey(String),
+    /// A token root **public** key (hex) failed to parse.
+    #[error("invalid auth root public key: {0}")]
+    AuthPubKey(String),
+    /// Refusing to bind a non-loopback address with control-plane auth disabled.
+    /// Set auth keys, bind a loopback address, or — for local dev —
+    /// relax `allow_unauthenticated_public_bind` in `[security]` (the `dev` profile).
+    #[error(
+        "refusing to bind {addr} with control-plane auth disabled: an \
+         unauthenticated control plane must not be exposed to a non-loopback \
+         address. Configure auth keys, bind a loopback address, or set the `dev` \
+         security profile / `allow_unauthenticated_public_bind` for local dev"
+    )]
+    UnauthenticatedPublicBind { addr: std::net::SocketAddr },
+
     /// A handler `sql` binding named an env var that is not set.
     #[cfg(feature = "handlers")]
     #[error("handlers SQL binding: env var {0} is not set")]

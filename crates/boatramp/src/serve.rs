@@ -34,16 +34,6 @@ pub enum Error {
          rebuild with `--features cluster`"
     )]
     NoClusterSupport,
-    /// Refusing to bind a non-loopback address with control-plane auth disabled.
-    /// Set auth keys, bind a loopback address, or — for local dev —
-    /// relax `allow_unauthenticated_public_bind` in `[security]` (the `dev` profile).
-    #[error(
-        "refusing to bind {addr} with control-plane auth disabled: an \
-         unauthenticated control plane must not be exposed to a non-loopback \
-         address. Configure auth keys, bind a loopback address, or set the `dev` \
-         security profile / `allow_unauthenticated_public_bind` for local dev"
-    )]
-    UnauthenticatedPublicBind { addr: std::net::SocketAddr },
     /// A `--tls custom`/`acme` mode selected but the binary lacks TLS support.
     #[cfg(not(feature = "tls"))]
     #[error("this build has no TLS support; rebuild with `--features tls`")]
@@ -54,12 +44,12 @@ pub enum Error {
     NoAcmeDnsSupport,
 
     // ---- configuration / argument validation -------------------------------
-    /// A token root **private** key (hex) failed to parse.
+    /// A token root **private** key (hex) failed to parse (cluster write-capability
+    /// minting). The single-node auth path's key errors now live in
+    /// [`boatramp_node::Error`].
+    #[cfg(feature = "cluster")]
     #[error("invalid auth root private key: {0}")]
     AuthPrivKey(String),
-    /// A token root **public** key (hex) failed to parse.
-    #[error("invalid auth root public key: {0}")]
-    AuthPubKey(String),
     /// A raw-public-key TLS error — building the peer-mesh identity/config
     /// (`cluster`) or the `--tls rpk` bootstrap identity/config (`tls`). Both use
     /// the same RPK stack (`boatramp_rpktls`), so `mesh::MeshError` is an alias of
@@ -698,7 +688,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     if let Some(changelog) = changelog {
         spawn_cache_poller(changelog, kv.clone(), Some(daemon_runtime.clone()));
     }
-    let auth = configure_auth(
+    let auth = boatramp_node::auth::configure_auth(
         serve_cfg.signer.as_ref(),
         args.auth_root_private_key
             .clone()
@@ -712,7 +702,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     .await?;
     configure_oidc(&args, &mut options).await?;
     // Fail-closed: don't expose an unauthenticated control plane on a public bind.
-    enforce_auth_bind(addr, &auth, &options.posture)?;
+    boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
     // `[handlers.bindings.sql]` (default: per-site libsql files under <data-dir>).
@@ -1594,7 +1584,7 @@ async fn run_cluster(
     // handles replicated `daemon/*` writes; this is the manual override).
     spawn_sighup_reload(kv.clone(), options.daemon_runtime.clone());
     let cluster_serve_cfg = config.serve.clone().unwrap_or_default();
-    let auth = configure_auth(
+    let auth = boatramp_node::auth::configure_auth(
         cluster_serve_cfg.signer.as_ref(),
         args.auth_root_private_key
             .clone()
@@ -1608,7 +1598,7 @@ async fn run_cluster(
     .await?;
     configure_oidc(&args, &mut options).await?;
     // Fail-closed: don't expose an unauthenticated control plane on a public bind.
-    enforce_auth_bind(addr, &auth, &options.posture)?;
+    boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
 
     // The mesh control hook: `POST /api/cluster/join` + `/rotate-key` reach the
     // cluster runtime through it. Constructed after `configure_auth` so it carries
@@ -2129,63 +2119,6 @@ async fn serve_acme_dns(
     Err(Error::NoAcmeDnsSupport)
 }
 
-/// Build the control-plane [`Auth`](boatramp_server::Auth) from the resolved
-/// root-key settings (flag/env > `serve` config). For an issuing node (a
-/// private key) it also sets `options.issuer` so the token-create and
-/// OIDC-exchange routes can mint. No key ⇒ auth disabled (dev).
-/// Fail-closed bind guard: refuse to expose an unauthenticated
-/// control plane on a non-loopback listener unless the posture explicitly allows
-/// it, and warn loudly for any auth-disabled listener.
-fn enforce_auth_bind(
-    addr: SocketAddr,
-    auth: &boatramp_server::Auth,
-    posture: &boatramp_core::security::SecurityPosture,
-) -> Result<()> {
-    if auth.is_disabled() {
-        if !addr.ip().is_loopback() && !posture.allow_unauthenticated_public_bind {
-            return Err(Error::UnauthenticatedPublicBind { addr });
-        }
-        tracing::warn!(
-            %addr,
-            "control-plane auth is DISABLED — do not expose this listener to an untrusted network"
-        );
-    }
-    Ok(())
-}
-
-async fn configure_auth(
-    signer: Option<&crate::config::AuthSignerConfig>,
-    private_key: Option<String>,
-    public_key: Option<String>,
-    options: &mut boatramp_server::ServerOptions,
-    kv: Arc<dyn KvStore>,
-) -> Result<boatramp_server::Auth> {
-    use boatramp_core::cose::{LocalSigner, Signer, TokenPublicKey};
-    // An external signer (KMS/HSM/Vault) issues *and* provides the trust anchor:
-    // it resolves its own public key at connect.
-    if let Some(cfg) = signer {
-        let issuer = boatramp_server::signer::build_signer(&cfg.to_signer_config())
-            .await
-            .map_err(|e| Error::AuthPrivKey(e.to_string()))?;
-        let public = issuer.public_key();
-        options.issuer = Some(issuer);
-        return Ok(boatramp_server::Auth::with_key(public, kv));
-    }
-    if let Some(hex) = private_key {
-        let signer =
-            LocalSigner::from_private_hex(&hex).map_err(|e| Error::AuthPrivKey(e.to_string()))?;
-        let public = signer.public_key();
-        options.issuer = Some(Arc::new(signer) as Arc<dyn Signer>);
-        return Ok(boatramp_server::Auth::with_key(public, kv));
-    }
-    if let Some(hex) = public_key {
-        let public =
-            TokenPublicKey::from_hex(&hex).map_err(|e| Error::AuthPubKey(e.to_string()))?;
-        return Ok(boatramp_server::Auth::with_key(public, kv));
-    }
-    Ok(boatramp_server::Auth::disabled())
-}
-
 /// Construct the OIDC verifier for `/api/auth/exchange` when `--oidc-issuer` is
 /// set (fetching the issuer's JWKS now — the live network step) and
 /// stash it in `options`. No-op without the `oidc` feature or the flag.
@@ -2517,8 +2450,10 @@ async fn serve_rpk(
 
 #[cfg(test)]
 mod tests {
+    // Every test remaining in this module is `cluster`-gated; the import is unused
+    // in a lean build (the single-node auth tests moved to `boatramp_node::auth`).
+    #[cfg(feature = "cluster")]
     use super::*;
-    use boatramp_core::security::SecurityProfile;
 
     /// The mesh write authorizer accepts only a token from the control-plane
     /// root granting `cluster-write` — no token, a wrong-role token, garbage, or a
@@ -2589,26 +2524,5 @@ mod tests {
         assert_eq!(parse_rotation_interval("5w"), None);
         assert_eq!(parse_rotation_interval("0d"), None);
         assert_eq!(parse_rotation_interval(""), None);
-    }
-
-    /// An auth-disabled non-loopback bind is refused under the strict
-    /// posture, allowed on loopback, and allowed when the posture opts in.
-    #[test]
-    fn fail_closed_refuses_unauthenticated_public_bind() {
-        let disabled = boatramp_server::Auth::disabled();
-        let strict = SecurityProfile::MultiTenant.preset();
-        let dev = SecurityProfile::Dev.preset();
-        let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-
-        // Auth disabled + public + strict → refused.
-        assert!(matches!(
-            enforce_auth_bind(public, &disabled, &strict),
-            Err(Error::UnauthenticatedPublicBind { .. })
-        ));
-        // Loopback is always permitted (local-dev convenience).
-        assert!(enforce_auth_bind(loopback, &disabled, &strict).is_ok());
-        // The `dev` posture opts into an unauthenticated public bind.
-        assert!(enforce_auth_bind(public, &disabled, &dev).is_ok());
     }
 }
