@@ -208,18 +208,13 @@ impl From<boatramp_cluster::node::BootstrapError> for Error {
 #[cfg(feature = "cluster")]
 const _: () = assert!(std::mem::size_of::<Error>() <= 128);
 
-/// How often the compute reconcile loop converges desired vs. running
-/// replicas.
-const COMPUTE_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How often the domain-verify reconcile loop re-checks pending challenges and
-/// auto-attaches any that now pass (so a published-but-unverified host self-heals
-/// without a manual `domain verify`).
-const DOMAIN_VERIFY_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long a scale-to-zero workload must go without a request before it is
-/// snapshotted + parked. A requested workload is woken on demand.
-const COMPUTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// The reconcile-timing policy now lives in `boatramp_node::node` (the assembly
+// crate). `run` reaches it via `assemble`; only the cluster path (`run_cluster`,
+// which still inlines its reconcile spawns until N4) names these directly.
+#[cfg(feature = "cluster")]
+use boatramp_node::node::{
+    COMPUTE_IDLE_TIMEOUT, COMPUTE_RECONCILE_TICK, DOMAIN_VERIFY_RECONCILE_TICK,
+};
 
 /// TLS mode for the public listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -703,88 +698,28 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     configure_oidc(&args, &mut options).await?;
     // Fail-closed: don't expose an unauthenticated control plane on a public bind.
     boatramp_node::auth::enforce_auth_bind(addr, &auth, &options.posture)?;
-    // The handler runtime reuses the same blob/KV backends (per-site prefixed)
-    // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
-    // `[handlers.bindings.sql]` (default: per-site libsql files under <data-dir>).
-    let handlers = boatramp_node::handlers::build_handler_runtime(
-        kv.clone(),
-        storage.clone(),
-        &data_dir,
-        config.handlers.as_ref(),
-        None,
-        posture.max_handler_blob_bytes,
-        posture.max_component_bytes,
-    )?;
-    // FA-5b2: on a cloud backend, wire the blob-change notification provisioner +
-    // its tier so adding a `blob` trigger provisions (and removing it retracts).
-    #[cfg(feature = "handlers")]
-    if let Some(provider) = built_blobs.watch_provider.clone() {
-        handlers.set_watch_provider(provider);
-        handlers.set_provision_tier(built_blobs.provision_tier);
-    }
-    let compute_storage = storage.clone();
-    let deploy = DeployStore::new(storage, kv);
-    // Materialize the reserved `default` project so `project ls` / `project show
-    // default` reflect it on a fresh install, not only after a migration. Best
-    // effort: the reader backstop keeps listings correct even if this write can't
-    // land, so a transient failure must never block serving.
-    match deploy.ensure_default_project().await {
-        Ok(true) => tracing::info!("materialized the reserved `default` project record"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not materialize the `default` project record; readers use the synthesized default"
-        ),
-    }
-    // Wire the function-to-function invoke resolver now the deploy store exists,
-    // so a function granted `invoke` can call a sibling in-process (FI).
-    #[cfg(feature = "handlers")]
-    handlers.set_invoker(deploy.clone());
-
-    // Compute reconcile loop. Single-node is always
-    // the "leader". Backends are built from the `[compute]` config + capability
-    // detection; a no-op when none are registered. Detached for the server's life.
-    let (compute_backends, compute_node) = boatramp_node::compute::build_compute(
-        config.compute.as_ref(),
-        compute_storage,
-        &data_dir,
-        0,
-        !posture.allow_shared_kernel_compute,
-        options.daemon_runtime.clone(),
-    )
-    .await;
-    // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener + build
-    // the resolver when a sql provider and `compute.sql_shim_url` are both present.
-    #[cfg(feature = "handlers")]
-    let sql_resolver = boatramp_server::sql_shim::spawn_sql_shim(
-        handlers.sql_backends(),
-        config.compute.as_ref().and_then(|c| c.sql_shim_url.clone()),
-    )
-    .await;
-    #[cfg(not(feature = "handlers"))]
-    let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
-    let _reconcile = boatramp_server::spawn_compute_reconcile(
-        deploy.clone(),
-        compute_backends,
-        vec![compute_node],
-        boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(
-            posture.allow_shared_kernel_compute,
-        ),
-        Arc::new(|| true),
-        COMPUTE_RECONCILE_TICK,
-        COMPUTE_IDLE_TIMEOUT,
-        sql_resolver,
-    );
-
-    // Domain-verify auto-complete: periodically re-check every site's pending
-    // ownership challenges and attach any that now pass — a published token (e.g.
-    // via `domain add --provider`) converges without a manual `domain verify`.
-    let _dv_reconcile = boatramp_server::spawn_domain_verify_reconcile(
-        deploy.clone(),
-        posture.domain_verify_allow_private,
-        Arc::new(|| true),
-        DOMAIN_VERIFY_RECONCILE_TICK,
-    );
+    // Wire the built store + configured auth/options into a running node graph:
+    // handler runtime, deploy store, compute + domain-verify reconcile loops. This
+    // is the same assembly `boatramp serve` exercises, now a library call so an
+    // embedder / in-process test builds the identical graph (PLAN-node-library N2b.3).
+    // `_reconcile` holds the detached reconcile loops for the server's serving life.
+    let boatramp_node::RunningNode {
+        deploy,
+        handlers,
+        auth,
+        options,
+        reconcile: _reconcile,
+    } = boatramp_node::assemble(boatramp_node::NodeInput {
+        config,
+        data_dir: data_dir.as_path(),
+        storage,
+        kv,
+        auth,
+        options,
+        watch_provider: built_blobs.watch_provider.clone(),
+        provision_tier: built_blobs.provision_tier,
+    })
+    .await?;
 
     tracing::info!(
         blobs = ?args.blobs, kv = ?args.kv, tls = ?args.tls,

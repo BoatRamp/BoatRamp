@@ -23,3 +23,5 @@ pub mod config;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
+pub mod node;
+pub use node::{assemble, NodeInput, RunningNode};

@@ -36,6 +36,8 @@ clap = { workspace = true, optional = true }
 ron.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+# Naming the detached reconcile `JoinHandle`s that `assemble` returns.
+tokio.workspace = true
 tracing.workspace = true
 
 [features]
