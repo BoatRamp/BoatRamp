@@ -15,19 +15,21 @@
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource, Scheme,
+    InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource, Scheme, VolumeRef,
 };
 use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    HostConfig, PortBinding, RestartPolicy as DockerRestartPolicy, RestartPolicyNameEnum,
+    HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy,
+    RestartPolicyNameEnum,
 };
 use bollard::Docker;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// How the remote-Docker backend reports a launched workload's reachable endpoint.
 ///
@@ -52,10 +54,93 @@ pub enum DockerEndpoint {
     Bridge,
 }
 
+/// How the remote-Docker backend backs a workload's persistent [`VolumeRef`]s.
+///
+/// `Named` (the default) attaches a daemon-managed `docker volume` by name — it
+/// works with a **remote** daemon and Docker Desktop / macOS (where a client host
+/// path isn't the daemon's filesystem). `Bind` bind-mounts a host directory under
+/// `<data_dir>/compute/volumes/<name>` (matching the native-container convention),
+/// so it is **local-daemon only** but keeps the data on the node's own filesystem.
+/// Either way the volume is node-local and outside the blob-snapshot durability
+/// story (consistent with the docker backend's `scale_to_zero: false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerVolumeMode {
+    /// A daemon-managed named volume (`docker volume`), portable across daemons.
+    #[default]
+    Named,
+    /// A host bind mount under `<data_dir>/compute/volumes/<name>` (local daemon only).
+    Bind,
+}
+
+/// The docker named-volume for boatramp volume `name` — prefixed so it never
+/// clobbers an unrelated volume on a shared daemon.
+fn docker_volume_name(name: &str) -> String {
+    format!("boatramp-{name}")
+}
+
+/// The host backing directory for a `Bind`-mode volume `name`
+/// (`<data_dir>/compute/volumes/<name>`), matching the native-container layout.
+fn volume_dir(data_dir: &Path, name: &str) -> PathBuf {
+    data_dir.join("compute").join("volumes").join(name)
+}
+
+/// Reject a volume whose `name` or `mount` could escape its sandboxed location
+/// (mirrors the native-container guard): `name` backs a docker volume / a
+/// `<data_dir>/compute/volumes/<name>` bind, so it must be a single normal path
+/// component; `mount` is the in-container target, so it must be absolute with no
+/// `..`/`.`.
+fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
+    use std::path::Component;
+    let name_ok = matches!(
+        Path::new(name).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    );
+    if !name_ok {
+        return Err(BackendError::Launch(format!(
+            "invalid volume name {name:?}: must be a single path component"
+        )));
+    }
+    let m = Path::new(mount);
+    let mount_ok = m.is_absolute()
+        && m.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !mount_ok {
+        return Err(BackendError::Launch(format!(
+            "invalid volume mount {mount:?}: must be an absolute path with no `..`"
+        )));
+    }
+    Ok(())
+}
+
+/// Build the bollard [`Mount`] for one volume in the selected mode (a writable
+/// mount). Pure: `Bind` mode's host directory is created separately by
+/// [`DockerBackend::stage_volumes`] before the container is created.
+fn volume_mount(vol: &VolumeRef, mode: DockerVolumeMode, data_dir: &Path) -> Mount {
+    let (typ, source) = match mode {
+        DockerVolumeMode::Named => (MountTypeEnum::VOLUME, docker_volume_name(&vol.name)),
+        DockerVolumeMode::Bind => (
+            MountTypeEnum::BIND,
+            volume_dir(data_dir, &vol.name).display().to_string(),
+        ),
+    };
+    Mount {
+        target: Some(vol.mount.clone()),
+        source: Some(source),
+        typ: Some(typ),
+        read_only: Some(false),
+        ..Default::default()
+    }
+}
+
 /// The remote-Docker compute backend: a connected Engine API client.
 pub struct DockerBackend {
     docker: Docker,
     endpoint: DockerEndpoint,
+    /// How persistent volumes are backed (named daemon volume vs host bind).
+    volume_mode: DockerVolumeMode,
+    /// Node data directory, for `Bind`-mode volume host paths.
+    data_dir: PathBuf,
     /// Whether a spec's `writable_root` is honored here. Set from the isolation
     /// posture (single-tenant only); off under the multi-tenant guard, so a
     /// writable-root spec is forced back to the hardened read-only root.
@@ -71,6 +156,8 @@ impl DockerBackend {
         Ok(Self {
             docker,
             endpoint: DockerEndpoint::default(),
+            volume_mode: DockerVolumeMode::default(),
+            data_dir: PathBuf::from("."),
             writable_root_allowed: false,
         })
     }
@@ -80,6 +167,8 @@ impl DockerBackend {
         Self {
             docker,
             endpoint: DockerEndpoint::default(),
+            volume_mode: DockerVolumeMode::default(),
+            data_dir: PathBuf::from("."),
             writable_root_allowed: false,
         }
     }
@@ -97,10 +186,42 @@ impl DockerBackend {
         self
     }
 
+    /// Select how persistent volumes are backed (see [`DockerVolumeMode`]).
+    pub fn with_volume_mode(mut self, mode: DockerVolumeMode) -> Self {
+        self.volume_mode = mode;
+        self
+    }
+
+    /// Set the node data directory used for `Bind`-mode volume host paths.
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = data_dir.into();
+        self
+    }
+
     /// Whether the daemon answers a `ping` — used to decide whether to register
     /// this backend (a connected client doesn't imply a reachable daemon).
     pub async fn reachable(&self) -> bool {
         self.docker.ping().await.is_ok()
+    }
+
+    /// Validate + stage the spec's persistent volumes into bollard [`Mount`]s: each
+    /// name/mount is checked for traversal, and a `Bind`-mode volume's host
+    /// directory is created (idempotent) so the daemon can bind it. A named volume
+    /// is auto-created by the daemon on container create. Returns the mounts to
+    /// attach (empty ⇒ no volumes).
+    async fn stage_volumes(&self, spec: &ComputeSpec) -> Result<Vec<Mount>, BackendError> {
+        let mut mounts = Vec::with_capacity(spec.volumes.len());
+        for vol in &spec.volumes {
+            validate_volume(&vol.name, &vol.mount)?;
+            if self.volume_mode == DockerVolumeMode::Bind {
+                let dir = volume_dir(&self.data_dir, &vol.name);
+                tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                    BackendError::Launch(format!("create volume {} dir: {e}", vol.name))
+                })?;
+            }
+            mounts.push(volume_mount(vol, self.volume_mode, &self.data_dir));
+        }
+        Ok(mounts)
     }
 }
 
@@ -185,7 +306,7 @@ impl ComputeBackend for DockerBackend {
         Capabilities {
             isolation: IsolationClass::Container,
             scale_to_zero: false,
-            persistent_volumes: false,
+            persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
         }
@@ -240,6 +361,11 @@ impl ComputeBackend for DockerBackend {
             req.spec.restart,
             writable_root,
         );
+        // Attach the spec's persistent volumes (validated; bind dirs created).
+        let mounts = self.stage_volumes(&req.spec).await?;
+        if !mounts.is_empty() {
+            host_config.mounts = Some(mounts);
+        }
         let mut config = Config {
             image: Some(reference),
             cmd: Some(req.spec.entrypoint.clone()),
@@ -479,6 +605,60 @@ mod tests {
                 .with_writable_root_allowed(true)
                 .writable_root_allowed,
             "the single-tenant posture opts in"
+        );
+    }
+
+    #[test]
+    fn named_volume_mode_builds_a_prefixed_daemon_volume_mount() {
+        let vol = VolumeRef {
+            name: "db".into(),
+            mount: "/data".into(),
+            size_mib: 64,
+        };
+        let m = volume_mount(&vol, DockerVolumeMode::Named, Path::new("/srv/data"));
+        assert_eq!(m.typ, Some(MountTypeEnum::VOLUME));
+        // Prefixed so it never clobbers an unrelated volume on a shared daemon.
+        assert_eq!(m.source.as_deref(), Some("boatramp-db"));
+        assert_eq!(m.target.as_deref(), Some("/data"));
+        assert_eq!(m.read_only, Some(false), "a persistent volume is writable");
+    }
+
+    #[test]
+    fn bind_volume_mode_builds_a_host_path_mount() {
+        let vol = VolumeRef {
+            name: "db".into(),
+            mount: "/data".into(),
+            size_mib: 64,
+        };
+        let m = volume_mount(&vol, DockerVolumeMode::Bind, Path::new("/srv/data"));
+        assert_eq!(m.typ, Some(MountTypeEnum::BIND));
+        assert_eq!(m.source.as_deref(), Some("/srv/data/compute/volumes/db"));
+        assert_eq!(m.target.as_deref(), Some("/data"));
+        assert_eq!(m.read_only, Some(false));
+    }
+
+    #[test]
+    fn validate_volume_rejects_traversal_in_name_and_mount() {
+        assert!(validate_volume("db", "/data").is_ok());
+        assert!(validate_volume("cache-1", "/var/lib/app").is_ok());
+        // A name must be a single path component.
+        assert!(validate_volume("../etc", "/data").is_err());
+        assert!(validate_volume("a/b", "/data").is_err());
+        // A mount must be absolute with no `..`.
+        assert!(validate_volume("db", "relative").is_err());
+        assert!(validate_volume("db", "/data/../etc").is_err());
+    }
+
+    #[test]
+    fn volume_mode_defaults_to_named_and_parses_lowercase() {
+        assert_eq!(DockerVolumeMode::default(), DockerVolumeMode::Named);
+        assert_eq!(
+            serde_json::from_str::<DockerVolumeMode>("\"named\"").unwrap(),
+            DockerVolumeMode::Named
+        );
+        assert_eq!(
+            serde_json::from_str::<DockerVolumeMode>("\"bind\"").unwrap(),
+            DockerVolumeMode::Bind
         );
     }
 

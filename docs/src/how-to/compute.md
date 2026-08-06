@@ -162,6 +162,33 @@ Inspect a workload's desired state:
 boatramp compute get api
 ```
 
+## Docker workloads: read-only root, writable root, and volumes
+
+A docker (or native-container) workload runs **hardened** by default: a read-only
+root filesystem, all Linux capabilities dropped, no privilege escalation, and a PID
+cap. The idiomatic path for app writes is a **persistent volume**, not a writable
+root — attach one (in-guest mount → named backing) via the API or a `project.cfg`
+manifest, and the data persists across restarts.
+
+For an image that insists on writing outside a declared volume, `--writable-root`
+relaxes *only* the read-only-root default (every other hardening stays on):
+
+```sh
+boatramp compute set legacy-app --image acme/legacy:1 --port 8080 --writable-root
+```
+
+`--writable-root` is honored **only under the single-tenant security posture** — the
+strict `multi-tenant` guard forces the hardened read-only root back on (and, being
+shared-kernel, won't place the workload on docker at all). See
+[Choose a security posture](./security-posture.md).
+
+How the docker backend stores a volume is set by `[compute].docker_volume_mode`:
+`named` (default) uses a daemon-managed `docker volume` (portable across daemons and
+Docker Desktop / macOS); `bind` uses a host directory under
+`<data_dir>/compute/volumes/<name>` (local daemon only). Either way the volume is
+**node-local** — it is not part of the blob-snapshot durability story the microVM
+backend's volumes get, and does not follow a workload across nodes.
+
 ## Next steps
 
 - [Scale compute to zero](./scale-to-zero.md) when a workload is idle.

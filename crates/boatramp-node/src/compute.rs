@@ -106,6 +106,8 @@ pub async fn build_compute(
             // (`!strict`); the multi-tenant guard keeps the hardened read-only root.
             let docker = docker
                 .with_endpoint(cfg.docker_endpoint)
+                .with_volume_mode(cfg.docker_volume_mode)
+                .with_data_dir(data_dir)
                 .with_writable_root_allowed(!strict);
             if docker.reachable().await {
                 backends.insert("docker".to_string(), std::sync::Arc::new(docker));
