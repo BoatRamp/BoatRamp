@@ -57,10 +57,10 @@ default = [
   "operator",
   "mcp",
 ]
-fs = ["boatramp-storage/fs"]
-s3 = ["boatramp-storage/s3"]
-gcs = ["boatramp-storage/gcs"]
-azure = ["boatramp-storage/azure"]
+fs = ["boatramp-storage/fs", "boatramp-node/fs"]
+s3 = ["boatramp-storage/s3", "boatramp-node/s3"]
+gcs = ["boatramp-storage/gcs", "boatramp-node/gcs"]
+azure = ["boatramp-storage/azure", "boatramp-node/azure"]
 cloudflare-kv = [
   "boatramp-storage/cloudflare-kv",
   "boatramp-node/cloudflare-kv",

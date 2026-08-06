@@ -16,6 +16,7 @@
 //! backend-agnostic library while this crate is the batteries-included assembler.
 
 pub mod backends;
+pub mod blobs;
 pub mod compute;
 pub mod config;
 pub mod error;

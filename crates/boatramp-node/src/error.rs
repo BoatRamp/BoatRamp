@@ -64,6 +64,43 @@ pub enum Error {
     #[error(transparent)]
     Kv(#[from] boatramp_core::kv::KvError),
 
+    /// `--blobs fs` selected but this build lacks filesystem blob support.
+    #[cfg(not(feature = "fs"))]
+    #[error("this build has no filesystem blob support; rebuild with `--features fs`")]
+    NoFsSupport,
+    /// `--blobs s3` selected but this build lacks S3 support.
+    #[cfg(not(feature = "s3"))]
+    #[error("this build has no S3 support; rebuild with `--features s3`")]
+    NoS3Support,
+    /// `--blobs gcs` selected but this build lacks GCS support.
+    #[cfg(not(feature = "gcs"))]
+    #[error("this build has no GCS support; rebuild with `--features gcs`")]
+    NoGcsSupport,
+    /// `--blobs azure` selected but this build lacks Azure support.
+    #[cfg(not(feature = "azure"))]
+    #[error("this build has no Azure support; rebuild with `--features azure`")]
+    NoAzureSupport,
+    /// `--blobs s3` without `--s3-bucket`.
+    #[cfg(feature = "s3")]
+    #[error("--s3-bucket is required for --blobs s3")]
+    S3BucketRequired,
+    /// `--blobs gcs` was selected without a bucket.
+    #[cfg(feature = "gcs")]
+    #[error("--gcs-bucket is required for --blobs gcs")]
+    GcsBucketRequired,
+    /// Connecting the GCS backend failed (usually credential resolution).
+    #[cfg(feature = "gcs")]
+    #[error("GCS backend: {0}")]
+    GcsConnect(String),
+    /// `--blobs azure` was selected without an account/container.
+    #[cfg(feature = "azure")]
+    #[error("--azure-account and --azure-container are required for --blobs azure")]
+    AzureConfigRequired,
+    /// Connecting the Azure backend failed.
+    #[cfg(feature = "azure")]
+    #[error("Azure backend: {0}")]
+    AzureConnect(String),
+
     /// Building the wasm handler engine failed.
     #[cfg(feature = "handlers")]
     #[error(transparent)]

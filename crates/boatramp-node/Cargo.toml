@@ -44,11 +44,14 @@ tracing.workspace = true
 # cfg-gated to the feature that consumes them. The binary forwards each of its
 # features to the matching one here so the gating stays consistent.
 acme-dns = []
+azure = ["dep:boatramp-storage", "boatramp-storage/azure"]
 # Derive `clap::ValueEnum` on the backend enums (enabled by the CLI binary).
 clap = ["dep:clap"]
 cloudflare-kv = ["dep:boatramp-storage", "boatramp-storage/cloudflare-kv"]
 cluster = []
 console = ["boatramp-server/console"]
+fs = ["dep:boatramp-storage", "boatramp-storage/fs"]
+gcs = ["dep:boatramp-storage", "boatramp-storage/gcs"]
 # The wasm handler runtime assembly: the engine + the libsql `sql` binding backend.
 handlers = [
   "dep:boatramp-handlers",
@@ -60,5 +63,6 @@ handlers = [
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).
 sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
 sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
+s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []

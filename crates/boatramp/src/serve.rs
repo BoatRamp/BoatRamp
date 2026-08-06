@@ -13,11 +13,9 @@ use clap::ValueEnum;
 
 use crate::config::ServerConfig;
 
-mod backends;
-
-use backends::build_blobs;
 /// The control-plane KV builder, reused by the standalone `boatramp migrate` command.
 pub(crate) use boatramp_node::backends::build_kv as build_control_plane_kv;
+use boatramp_node::blobs::{build_blobs, BlobArgs};
 
 /// A failure running `boatramp serve`: selecting/initialising a backend, wiring
 /// auth / OIDC / TLS, or the HTTP server itself exiting with an error. Most of
@@ -54,18 +52,6 @@ pub enum Error {
     #[cfg(not(feature = "acme-dns"))]
     #[error("this build has no ACME DNS-01 support; rebuild with `--features acme-dns`")]
     NoAcmeDnsSupport,
-    /// `--blobs s3` selected but the binary lacks S3 support.
-    #[cfg(not(feature = "s3"))]
-    #[error("this build has no S3 support; rebuild with `--features s3`")]
-    NoS3Support,
-    /// `--blobs gcs` selected but the binary lacks GCS support.
-    #[cfg(not(feature = "gcs"))]
-    #[error("this build has no GCS support; rebuild with `--features gcs`")]
-    NoGcsSupport,
-    /// `--blobs azure` selected but the binary lacks Azure support.
-    #[cfg(not(feature = "azure"))]
-    #[error("this build has no Azure support; rebuild with `--features azure`")]
-    NoAzureSupport,
 
     // ---- configuration / argument validation -------------------------------
     /// A token root **private** key (hex) failed to parse.
@@ -146,26 +132,6 @@ pub enum Error {
         "no certificates available yet — awaiting the cluster leader to issue (retry shortly)"
     )]
     NoCertsYet,
-    /// `--blobs s3` without `--s3-bucket`.
-    #[cfg(feature = "s3")]
-    #[error("--s3-bucket is required for --blobs s3")]
-    S3BucketRequired,
-    /// `--blobs gcs` was selected without a bucket.
-    #[cfg(feature = "gcs")]
-    #[error("--gcs-bucket is required for --blobs gcs")]
-    GcsBucketRequired,
-    /// Connecting the GCS backend failed (usually credential resolution).
-    #[cfg(feature = "gcs")]
-    #[error("GCS backend: {0}")]
-    GcsConnect(String),
-    /// `--blobs azure` was selected without an account/container.
-    #[cfg(feature = "azure")]
-    #[error("--azure-account and --azure-container are required for --blobs azure")]
-    AzureConfigRequired,
-    /// Connecting the Azure backend failed.
-    #[cfg(feature = "azure")]
-    #[error("Azure backend: {0}")]
-    AzureConnect(String),
 
     // ---- propagated library errors (`#[from]`) ------------------------------
     /// Node-library assembly (handler runtime / SQL binding) failed.
@@ -617,7 +583,21 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
     // the notify-enabled S3 backend + its provider share one AWS config.
     let notify_tier = serve_cfg.blob_notify_tier;
     let notify_account = serve_cfg.blob_notify_account_id.clone();
-    let built_blobs = build_blobs(&args, &data_dir, notify_tier, notify_account).await?;
+    let blob_args = BlobArgs {
+        blobs: args.blobs,
+        s3_bucket: args.s3_bucket.clone(),
+        s3_endpoint: args.s3_endpoint.clone(),
+        s3_region: args.s3_region.clone(),
+        s3_path_style: args.s3_path_style,
+        gcs_bucket: args.gcs_bucket.clone(),
+        gcs_endpoint: args.gcs_endpoint.clone(),
+        gcs_anonymous: args.gcs_anonymous,
+        azure_account: args.azure_account.clone(),
+        azure_container: args.azure_container.clone(),
+        azure_access_key: args.azure_access_key.clone(),
+        azure_emulator: args.azure_emulator,
+    };
+    let built_blobs = build_blobs(&blob_args, &data_dir, notify_tier, notify_account).await?;
     let storage = built_blobs.storage.clone();
 
     // Cluster mode: triggered by a `[cluster]` config section OR the founding/
@@ -1270,7 +1250,7 @@ async fn run_cluster(
     mut cluster_cfg: crate::config::ClusterConfig,
     addr: SocketAddr,
     data_dir: PathBuf,
-    built_blobs: backends::BuiltBlobs,
+    built_blobs: boatramp_node::blobs::BuiltBlobs,
     mut options: boatramp_server::ServerOptions,
 ) -> Result<()> {
     use boatramp_cluster::node::{build_node, ClusterParams};
