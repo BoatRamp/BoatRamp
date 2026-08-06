@@ -12,40 +12,54 @@ control plane — rather than as a separate daemon.
 
 ## What is (and isn't) a library
 
-- **`boatramp-server`** is the library. Its own crate doc puts it plainly: *"The
-  server is backend-agnostic: it is handed a [`DeployStore`] (blobs in any
-  `Storage`, metadata in any `KvStore`)."* The storage backends live in
+- **`boatramp-server`** is the request-plane library. Its own crate doc puts it
+  plainly: *"The server is backend-agnostic: it is handed a [`DeployStore`] (blobs
+  in any `Storage`, metadata in any `KvStore`)."* The storage backends live in
   **`boatramp-storage`**, the domain types in **`boatramp-core`** — all published
   on crates.io.
-- **The `boatramp` binary is not a library.** All the high-level orchestration —
-  parsing `project.cfg` / `boatramp.cfg`, assembling the store + compute backends
-  + reconcile loops + cluster + TLS + the web console — lives in the binary, not a
-  crate. So embedding gives you the *server*, and you assemble the pieces you want
-  (storage, auth, optional handler engine) yourself. A basic embedded server is a
-  few lines; reproducing the full batteries-included node means wiring those pieces
-  as the binary's `serve` path does.
+- **`boatramp-node`** is the *assembly* library. It holds the batteries-included
+  node wiring the `boatramp serve` binary used to inline: building the store
+  (`build_blobs` / `build_kv`), the compute backends (`build_compute`), the handler
+  runtime (`build_handler_runtime`), control-plane auth (`configure_auth`), and the
+  node graph that ties them together —
+  [`assemble(NodeInput) -> RunningNode`](#3c-assemble-the-full-node-boatramp-node).
+  It depends on the concrete backend crates `boatramp-server` deliberately avoids,
+  so it is the batteries-included assembler you can embed *or* test in-process.
+- **The `boatramp` binary is a thin shell.** What is left in the binary is the
+  *environment*, not the assembly: parsing `project.cfg` / `boatramp.cfg`, the
+  store-migration guard, SIGHUP/signal handling, transport + TLS/ACME dispatch,
+  cluster bring-up, and the web console. So embedding gives you the server *and* the
+  assembly; you supply the environment you want. A basic embedded server is a few
+  lines; a faithful batteries-included node is a `boatramp_node::assemble` call.
 
 > The published library crates are pre-1.0 (0.2.x); the API may change between
 > minor versions.
 
-## Not a substitute for testing the binary
+## Fidelity: what embedding does and doesn't cover
 
-Embedding runs boatramp's **library** request handling — not the `boatramp serve`
-binary operators actually run. `router()` deliberately skips the binary's
-`serve.rs` wiring (how config is parsed into a store + compute backends +
-reconcile loops before the router is assembled), the real compute backends
-(docker/microVM), and CLI/config parsing. That is exactly where integration bugs
-live: a site's config applied at the wrong point in activation, posture gating of
-shared-kernel compute, a backend's published-endpoint resolution against a real
-daemon, an untagged-image request returning the wrong status. An embedded harness
-sails past all of them and goes green while the shipped artifact is broken.
+Which surface you embed decides how much of the real node you exercise:
 
-So do **not** use the embed surface as a smoke/integration harness for boatramp
-itself. To validate boatramp as an operator runs it, drive the **real artifact** —
-spawn `boatramp serve` (or the container image), exercise it over HTTP and the CLI
-against real backends — which is what the crate's live/e2e tests and the release
-boot gate do. Embedding is for putting boatramp's serving *inside your own
-application*, not for testing boatramp.
+- **`router()` alone** runs boatramp's library request handling but skips the
+  *assembly* — how config becomes a store + compute backends + reconcile loops
+  before the router exists. That assembly is exactly where integration bugs live: a
+  site's config applied at the wrong point in activation, posture gating of
+  shared-kernel compute, the default-project materialization. A `router()`-only
+  harness sails past all of them.
+- **`boatramp_node::assemble`** closes most of that gap: it *is* the serve binary's
+  node-graph wiring (store → handler runtime → deploy store → compute + reconcile
+  loops → a router-ready node), so an in-process test drives the same assembly the
+  operator runs. `boatramp-node` ships exactly such a fidelity test. This is the
+  surface to embed — and to test against — when you want the real node.
+
+What **neither** exercises, and what therefore still needs the **real artifact**:
+the CLI / `project.cfg` / `boatramp.cfg` parsing, the store-migration guard,
+transport + TLS/ACME, cluster bring-up, and — the big one — the **real compute
+backends** (docker / microVM), which need a live daemon (`dockerd`, `/dev/kvm`) and
+process re-exec that no in-process harness provides. So `assemble` is a
+high-fidelity harness for the assembly + serving plane, but validating the compute
+backends, the CLI, and packaging still means driving `boatramp serve` (or the
+container image) over HTTP and the CLI against real backends — which is what the
+crate's live/e2e tests and the release boot gate do.
 
 ## 1. Add the dependencies
 
@@ -144,6 +158,52 @@ axum::serve(listener, app.into_make_service_with_connect_info::<std::net::Socket
 > The connect-info make-service is what lets handlers see the peer address (IP
 > rules, rate limiting, access logs).
 
+## 3c. Assemble the full node (`boatramp-node`)
+
+Steps 3a/3b give you the request plane over a bare `DeployStore`. To embed the
+**batteries-included node** — the store plus the handler runtime, the compute
+backends, and the background reconcile loops, wired exactly as `boatramp serve`
+does — call `boatramp_node::assemble`. It is the same assembly the binary runs,
+reachable as a library:
+
+```toml
+# The assembly crate. `fs` for filesystem blobs; `handlers` for the wasm engine.
+boatramp-node = { version = "0.2", features = ["fs", "handlers"] }
+```
+
+```rust
+use std::sync::Arc;
+use boatramp_node::{assemble, NodeInput, RunningNode};
+
+let storage = Arc::new(boatramp_storage::FsStorage::new("./blobs"));
+let kv = Arc::new(boatramp_core::kv::MemoryKv::new());
+let config = boatramp_node::config::ServerConfig::default(); // or parsed from boatramp.cfg
+let options = boatramp_server::ServerOptions::default();      // posture, limits, PoP …
+
+let RunningNode { deploy, handlers, auth, options, reconcile } = assemble(NodeInput {
+    config: &config,
+    data_dir: std::path::Path::new("./data"),
+    storage,
+    kv,
+    auth: boatramp_server::Auth::disabled(), // dev only — see step 4
+    options,
+    watch_provider: None,          // cloud blob-change notifications, if any
+    provision_tier: Default::default(),
+})
+.await?;
+
+// Hand the wired node to a transport — or `router_with(deploy, auth, handlers, options)`
+// to mount it into your own app (step 3b).
+boatramp_server::serve_with("127.0.0.1:8080".parse()?, deploy, auth, handlers, options).await?;
+// `reconcile` holds the compute + domain-verify loops — keep it in scope while serving.
+```
+
+`assemble` materializes the reserved `default` project, builds the handler runtime
+and any configured compute backends, and spawns the reconcile loops; you still
+provide the *environment* the binary would otherwise resolve for you (parsing the
+config, the migration guard, signals, the transport). This is also the surface an
+in-process fidelity test should target — see the fidelity note above.
+
 ## 4. Authentication
 
 `Auth::disabled()` leaves the control plane open — only acceptable for a private
@@ -188,6 +248,7 @@ backends you pass here back every tenant safely.
 - **Publish into it** the same way the CLI does — over the HTTP publishing API
   (`boatramp sync` against your embedded server) — so you reuse the negotiated,
   content-addressed, atomic-activate flow.
-- The binary's `serve` path (`crates/boatramp/src/serve.rs`) is the reference for
-  wiring the fuller feature set (cluster, TLS, ACME, the web console, compute
-  backends) if you need it embedded too.
+- **`boatramp_node::assemble`** (step 3c) is the reference wiring for the full node
+  (store + handlers + compute + reconcile). For the *environment* around it —
+  cluster, TLS/ACME, the web console — the binary's `serve` path
+  (`crates/boatramp/src/serve.rs`) remains the reference.
