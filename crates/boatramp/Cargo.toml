@@ -170,6 +170,12 @@ handlers = [
 # node-local Raft store).
 cluster = [
   "handlers",
+  # A cluster node serves blobs and falls back to the zero-config filesystem backend
+  # (the default `--blobs fs`), so it needs `fs` compiled in. The slim cluster image
+  # (`--no-default-features --features operator,cluster,tls`) does not list `fs`
+  # itself; without this a cluster pod crashes with "no filesystem blob support" once
+  # `build_blobs` moved to `boatramp-node` (whose `fs` arm is feature-gated).
+  "fs",
   "boatramp-node/cluster",
   "slatedb",
   # The dynamic join pins a seed's **control plane** over RPK-TLS (`--tls rpk`) —
