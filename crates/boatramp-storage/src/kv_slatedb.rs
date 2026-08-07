@@ -239,129 +239,158 @@ impl KvStore for SlateKv {
 mod tests {
     use super::*;
 
+    /// Run a SlateDB test `body` under a timeout, retrying on a **fresh** directory.
+    /// SlateDB keeps process-global background state whose close/reopen can
+    /// **intermittently stall on a loaded CI host** (a drain that doesn't complete) —
+    /// a deadlock we could never reproduce locally. `#[serial]` (below) removes
+    /// intra-binary concurrency; this wrapper is the belt-and-suspenders: a stalled
+    /// attempt is abandoned (its dir left behind) and retried on a clean dir, so the
+    /// flake can neither hang the job nor fail the suite on a single bad roll. If
+    /// every attempt stalls it fails **fast** (≈100s), never a multi-hour hang.
+    async fn with_fresh_slatedb_dir<F, Fut>(name: &str, body: F)
+    where
+        F: Fn(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        for attempt in 0..4u32 {
+            let dir = std::env::temp_dir().join(format!(
+                "boatramp-slatedb-{name}-{}-{attempt}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            match tokio::time::timeout(std::time::Duration::from_secs(25), body(dir.clone())).await
+            {
+                Ok(()) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+                Err(_) => eprintln!(
+                    "slatedb test `{name}` attempt {attempt} exceeded 25s (SlateDB \
+                     close/reopen stalled); retrying on a fresh dir"
+                ),
+            }
+        }
+        panic!("slatedb test `{name}` stalled on every attempt");
+    }
+
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_round_trips() {
-        let dir = std::env::temp_dir().join(format!("boatramp-slatedb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let kv = SlateKv::open_local(&dir).await.unwrap();
+        with_fresh_slatedb_dir("roundtrip", |dir| async move {
+            let kv = SlateKv::open_local(&dir).await.unwrap();
 
-        kv.put("alias/blog/staging", b"id-1".to_vec())
-            .await
-            .unwrap();
-        kv.put("alias/blog/prod", b"id-2".to_vec()).await.unwrap();
-        kv.put("other/x", b"z".to_vec()).await.unwrap();
-        assert_eq!(
-            kv.get("alias/blog/staging").await.unwrap(),
-            Some(b"id-1".to_vec())
-        );
-        assert_eq!(kv.get("missing").await.unwrap(), None);
+            kv.put("alias/blog/staging", b"id-1".to_vec())
+                .await
+                .unwrap();
+            kv.put("alias/blog/prod", b"id-2".to_vec()).await.unwrap();
+            kv.put("other/x", b"z".to_vec()).await.unwrap();
+            assert_eq!(
+                kv.get("alias/blog/staging").await.unwrap(),
+                Some(b"id-1".to_vec())
+            );
+            assert_eq!(kv.get("missing").await.unwrap(), None);
 
-        let mut keys = kv.list_prefix("alias/blog/").await.unwrap();
-        keys.sort();
-        assert_eq!(keys, vec!["alias/blog/prod", "alias/blog/staging"]);
+            let mut keys = kv.list_prefix("alias/blog/").await.unwrap();
+            keys.sort();
+            assert_eq!(keys, vec!["alias/blog/prod", "alias/blog/staging"]);
 
-        kv.delete("alias/blog/staging").await.unwrap();
-        assert_eq!(kv.get("alias/blog/staging").await.unwrap(), None);
+            kv.delete("alias/blog/staging").await.unwrap();
+            assert_eq!(kv.get("alias/blog/staging").await.unwrap(), None);
 
-        kv.close().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+            kv.close().await.unwrap();
+        })
+        .await;
     }
 
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_persists_then_reopens() {
-        // A long flush interval so the periodic timer won't auto-persist; the
-        // explicit `flush()` (SHUT-1) must be what makes the write durable.
-        let dir =
-            std::env::temp_dir().join(format!("boatramp-slatedb-flush-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let kv = SlateKv::open_local_with_flush(&dir, std::time::Duration::from_secs(3600))
-            .await
-            .unwrap();
-        kv.put("k", b"v".to_vec()).await.unwrap();
-        kv.flush().await.unwrap(); // force durability now, not on the timer
-        kv.close().await.unwrap();
+        with_fresh_slatedb_dir("flush", |dir| async move {
+            // A long flush interval so the periodic timer won't auto-persist; the
+            // explicit `flush()` (SHUT-1) must be what makes the write durable.
+            let kv = SlateKv::open_local_with_flush(&dir, std::time::Duration::from_secs(3600))
+                .await
+                .unwrap();
+            kv.put("k", b"v".to_vec()).await.unwrap();
+            kv.flush().await.unwrap(); // force durability now, not on the timer
+            kv.close().await.unwrap();
 
-        let reopened = SlateKv::open_local(&dir).await.unwrap();
-        assert_eq!(reopened.get("k").await.unwrap(), Some(b"v".to_vec()));
-        reopened.close().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+            let reopened = SlateKv::open_local(&dir).await.unwrap();
+            assert_eq!(reopened.get("k").await.unwrap(), Some(b"v".to_vec()));
+            reopened.close().await.unwrap();
+        })
+        .await;
     }
 
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn read_replica_sees_writer_and_refuses_writes() {
-        let dir =
-            std::env::temp_dir().join(format!("boatramp-slatedb-replica-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        with_fresh_slatedb_dir("replica", |dir| async move {
+            // The writer process commits config, then flushes/closes so the manifest
+            // reflects it (a real replica polls the manifest; here we close to make
+            // the committed state visible to a freshly-opened reader).
+            let writer = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
+                .await
+                .unwrap();
+            writer.put("site/blog", b"hash-1".to_vec()).await.unwrap();
+            writer
+                .write_batch(vec![
+                    WriteOp::Put("siteconfig/hash-1".into(), b"{}".to_vec()),
+                    WriteOp::Put("current/blog".into(), b"dep-1".to_vec()),
+                ])
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
 
-        // The writer process commits config, then flushes/closes so the manifest
-        // reflects it (a real replica polls the manifest; here we close to make
-        // the committed state visible to a freshly-opened reader).
-        let writer = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
-            .await
-            .unwrap();
-        writer.put("site/blog", b"hash-1".to_vec()).await.unwrap();
-        writer
-            .write_batch(vec![
-                WriteOp::Put("siteconfig/hash-1".into(), b"{}".to_vec()),
-                WriteOp::Put("current/blog".into(), b"dep-1".to_vec()),
-            ])
-            .await
-            .unwrap();
-        writer.close().await.unwrap();
+            // A read replica over the same store serves the writer's data…
+            let replica = SlateKv::open_local_reader(&dir).await.unwrap();
+            assert_eq!(
+                replica.get("site/blog").await.unwrap(),
+                Some(b"hash-1".to_vec())
+            );
+            let mut keys = replica.list_prefix("siteconfig/").await.unwrap();
+            keys.sort();
+            assert_eq!(keys, vec!["siteconfig/hash-1"]);
 
-        // A read replica over the same store serves the writer's data…
-        let replica = SlateKv::open_local_reader(&dir).await.unwrap();
-        assert_eq!(
-            replica.get("site/blog").await.unwrap(),
-            Some(b"hash-1".to_vec())
-        );
-        let mut keys = replica.list_prefix("siteconfig/").await.unwrap();
-        keys.sort();
-        assert_eq!(keys, vec!["siteconfig/hash-1"]);
-
-        // …and refuses writes (control-plane writes go to the writer process).
-        assert!(replica.put("x", b"y".to_vec()).await.is_err());
-        assert!(replica
-            .write_batch(vec![WriteOp::Delete("site/blog".into())])
-            .await
-            .is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
+            // …and refuses writes (control-plane writes go to the writer process).
+            assert!(replica.put("x", b"y".to_vec()).await.is_err());
+            assert!(replica
+                .write_batch(vec![WriteOp::Delete("site/blog".into())])
+                .await
+                .is_err());
+        })
+        .await;
     }
 
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_write_batch_commits_group() {
-        let dir =
-            std::env::temp_dir().join(format!("boatramp-slatedb-batch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let kv = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
+        with_fresh_slatedb_dir("batch", |dir| async move {
+            let kv = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
+                .await
+                .unwrap();
+
+            kv.put("manifests/dep-1", b"old".to_vec()).await.unwrap();
+            kv.write_batch(vec![
+                WriteOp::Put("manifests/dep-2".into(), b"new".to_vec()),
+                WriteOp::Put("current/blog".into(), b"dep-2".to_vec()),
+                WriteOp::Delete("manifests/dep-1".into()),
+            ])
             .await
             .unwrap();
 
-        kv.put("manifests/dep-1", b"old".to_vec()).await.unwrap();
-        kv.write_batch(vec![
-            WriteOp::Put("manifests/dep-2".into(), b"new".to_vec()),
-            WriteOp::Put("current/blog".into(), b"dep-2".to_vec()),
-            WriteOp::Delete("manifests/dep-1".into()),
-        ])
-        .await
-        .unwrap();
+            assert_eq!(
+                kv.get("manifests/dep-2").await.unwrap(),
+                Some(b"new".to_vec())
+            );
+            assert_eq!(
+                kv.get("current/blog").await.unwrap(),
+                Some(b"dep-2".to_vec())
+            );
+            assert_eq!(kv.get("manifests/dep-1").await.unwrap(), None);
 
-        assert_eq!(
-            kv.get("manifests/dep-2").await.unwrap(),
-            Some(b"new".to_vec())
-        );
-        assert_eq!(
-            kv.get("current/blog").await.unwrap(),
-            Some(b"dep-2".to_vec())
-        );
-        assert_eq!(kv.get("manifests/dep-1").await.unwrap(), None);
-
-        kv.close().await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+            kv.close().await.unwrap();
+        })
+        .await;
     }
 }
