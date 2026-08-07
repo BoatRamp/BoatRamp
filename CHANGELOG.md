@@ -5,6 +5,42 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.2]
+
+### Added
+- **Docker / native-container workloads: writable root + external persistent volumes.**
+  A docker workload now honors a spec's `volumes` (previously ignored, silently
+  running storage-less). Back the volume with the new `[compute].docker_volume_mode`
+  knob: `named` (default) attaches a daemon-managed `docker volume` by name (portable
+  across daemons and Docker Desktop / macOS), `bind` bind-mounts a host directory
+  under `<data_dir>/compute/volumes/<name>` (local daemon only). Volumes are
+  node-local — outside the blob-snapshot durability the microVM backend's volumes get.
+- **`compute set` / `compute build --writable-root`.** Opt into a writable root
+  filesystem for a container workload instead of the hardened read-only-root default.
+  Honored **only under the single-tenant security posture** (the multi-tenant guard
+  forces the read-only root back on); every other hardening — dropped capabilities,
+  `no-new-privileges`, the PID cap — stays. A persistent volume remains the idiomatic
+  path for app writes.
+- **`boatramp_node::assemble` — the serve-node assembly as a library.** The wiring
+  `boatramp serve` runs (store → handler runtime → deploy store → compute +
+  domain-verify reconcile loops → a router-ready node) is now a published library
+  call, so an embedder — or an in-process fidelity test — builds the exact same graph
+  the binary runs. Both the single-node and cluster serve paths share it. See the
+  updated *Embed boatramp as a library* guide.
+
+### Fixed
+- **Scheduler: a workload requiring persistent volumes or scale-to-zero is no longer
+  placed on a backend that can't provide it.** Such a spec could previously be
+  scheduled onto an incapable backend and run storage-less (silent data loss) or
+  always-on (a silently missed cost optimization). Placement now treats the missing
+  capability as ineligible and returns "insufficient capacity" instead of running
+  wrong.
+- **Cluster image: the filesystem blob backend is compiled in.** After `build_blobs`
+  moved into `boatramp-node` (whose `fs` arm is feature-gated), the slim cluster build
+  (`--no-default-features --features operator,cluster,tls`) no longer pulled `fs`, so a
+  cluster pod serving the zero-config default `--blobs fs` crashed with "no filesystem
+  blob support". The `cluster` feature now requires `fs`.
+
 ## [0.2.1]
 
 ### Added

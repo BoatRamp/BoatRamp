@@ -239,6 +239,7 @@ impl KvStore for SlateKv {
 mod tests {
     use super::*;
 
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_round_trips() {
         let dir = std::env::temp_dir().join(format!("boatramp-slatedb-{}", std::process::id()));
@@ -267,6 +268,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_persists_then_reopens() {
         // A long flush interval so the periodic timer won't auto-persist; the
@@ -287,6 +289,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn read_replica_sees_writer_and_refuses_writes() {
         let dir =
@@ -329,6 +332,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_write_batch_commits_group() {
         let dir =

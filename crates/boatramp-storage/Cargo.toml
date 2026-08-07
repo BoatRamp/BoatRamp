@@ -94,6 +94,11 @@ lru = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
+# SlateDB keeps process-global background state, so several `kv_slatedb` tests
+# opening their own instances concurrently intermittently deadlock on close/reopen.
+# `#[serial]` runs them one at a time (they use distinct temp dirs, so this only
+# gates concurrency, not correctness).
+serial_test = "3"
 
 [lints]
 workspace = true
