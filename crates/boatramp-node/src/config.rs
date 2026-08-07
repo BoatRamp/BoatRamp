@@ -397,9 +397,14 @@ pub struct SqlBindingConfig {
     pub databases: BTreeMap<String, ExternalDatabaseConfig>,
 }
 
-/// One external (bring-your-own) SQL database for the handler `sql` binding. The
-/// connection URL is a secret and is named indirectly (`url_env`), never written
-/// in the config file.
+/// One external SQL database for the handler `sql` binding. Its **source** is one
+/// of two mutually-exclusive forms:
+///  - `url_env` — a **bring-your-own** database: the connection URL is a secret,
+///    named indirectly by an env var (never written in the config file).
+///  - `compute` — a database **boatramp runs** as a compute workload: boatramp
+///    derives the connection from the workload's live endpoint (host\:port) plus
+///    the `database`/`user`/`password_env` here, so there is no URL to hand-map and
+///    it follows the workload across restarts (PLAN-managed-compute-sql).
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -408,11 +413,24 @@ pub struct ExternalDatabaseConfig {
     /// `mariadb`).
     pub kind: String,
     /// Name of the env var holding the connection URL (e.g.
-    /// `postgres://user:pw@host/db`). Required.
+    /// `postgres://user:pw@host/db`). Required unless `compute` is set.
     pub url_env: String,
     /// Optional env var holding a **read-replica** connection URL. When set,
     /// `open-read-only` transactions route there; writes stay on `url_env`.
     pub read_url_env: Option<String>,
+    /// The name of a **compute workload** (a Postgres/MySQL server boatramp runs)
+    /// to source this database from, instead of `url_env`. boatramp resolves the
+    /// workload's live endpoint and builds the connection. Mutually exclusive with
+    /// `url_env`.
+    pub compute: Option<String>,
+    /// The database name inside the compute-backed server (non-secret).
+    pub database: Option<String>,
+    /// The connecting user for the compute-backed server (non-secret).
+    pub user: Option<String>,
+    /// Env var holding the password for `user` on the compute-backed server. Omit
+    /// to let boatramp generate + manage the credential (a later phase); for now a
+    /// compute-backed database requires it.
+    pub password_env: Option<String>,
     /// Maximum pooled connections (default 8).
     pub pool_max: Option<u32>,
     /// Open every transaction `READ ONLY` (the engine rejects writes) — for a
@@ -423,6 +441,42 @@ pub struct ExternalDatabaseConfig {
     pub allow_preview: bool,
     /// Connection/acquire timeout in seconds (default 10).
     pub connect_timeout_secs: Option<u64>,
+}
+
+impl ExternalDatabaseConfig {
+    /// Validate the source is well-formed: **exactly one** of `url_env` /
+    /// `compute`, and a `compute`-backed database has the connection details
+    /// boatramp can't infer (`database`, `user`, and — for now — `password_env`).
+    /// `name` is the binding name, for the error message.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let has_url = !self.url_env.is_empty();
+        let has_compute = self.compute.as_deref().is_some_and(|c| !c.is_empty());
+        match (has_url, has_compute) {
+            (true, true) => Err(format!(
+                "sql database {name:?}: set exactly one of `url_env` or `compute`, not both"
+            )),
+            (false, false) => Err(format!(
+                "sql database {name:?}: needs a source — set `url_env` (bring-your-own) or \
+                 `compute` (a database boatramp runs)"
+            )),
+            (false, true) => {
+                for (field, val) in [
+                    ("database", &self.database),
+                    ("user", &self.user),
+                    ("password_env", &self.password_env),
+                ] {
+                    if val.as_deref().is_none_or(str::is_empty) {
+                        return Err(format!(
+                            "sql database {name:?}: a `compute`-backed database requires `{field}`"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            (true, false) => Ok(()),
+        }
+    }
 }
 
 /// The signing algorithm for a signer that can choose one (`Local`, `Vault`,
@@ -970,6 +1024,71 @@ mod tests {
         );
         assert!(events.allow_preview);
         assert!(!events.read_only);
+    }
+
+    #[test]
+    fn sql_binding_compute_backed_database() {
+        let cfg = server(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "analytics": (
+                            kind: "postgres",
+                            compute: "pg",
+                            database: "analytics",
+                            user: "app",
+                            password_env: "PG_APP_PW",
+                        ),
+                    },
+                ) ) ),
+            )"#,
+        );
+        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases["analytics"];
+        assert_eq!(db.kind, "postgres");
+        assert_eq!(db.compute.as_deref(), Some("pg"));
+        assert_eq!(db.database.as_deref(), Some("analytics"));
+        assert_eq!(db.user.as_deref(), Some("app"));
+        assert_eq!(db.password_env.as_deref(), Some("PG_APP_PW"));
+        assert!(db.url_env.is_empty(), "compute-backed has no url_env");
+        assert!(db.validate("analytics").is_ok());
+    }
+
+    #[test]
+    fn sql_binding_source_is_exactly_one_of_url_or_compute() {
+        // Neither source → error.
+        assert!(ExternalDatabaseConfig::default().validate("db").is_err());
+        // Both sources → error.
+        let both = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            url_env: "PG_URL".into(),
+            compute: Some("pg".into()),
+            ..Default::default()
+        };
+        assert!(both.validate("db").is_err());
+        // `url_env` only → ok.
+        let url = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            url_env: "PG_URL".into(),
+            ..Default::default()
+        };
+        assert!(url.validate("db").is_ok());
+        // `compute` without the connection details boatramp can't infer → error.
+        let bare = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            ..Default::default()
+        };
+        assert!(bare.validate("db").is_err());
+        // `compute` with database/user/password_env → ok.
+        let full = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("analytics".into()),
+            user: Some("app".into()),
+            password_env: Some("PG_APP_PW".into()),
+            ..Default::default()
+        };
+        assert!(full.validate("db").is_ok());
     }
 
     /// Path to a file at the repo root (two levels up from this crate).
