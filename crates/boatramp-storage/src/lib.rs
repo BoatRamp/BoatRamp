@@ -48,6 +48,8 @@ pub mod sql_libsql;
 mod sql_placeholders;
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod sql_compute;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod sql_sqlx;
 
 #[cfg(feature = "cache")]
