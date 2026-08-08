@@ -205,8 +205,16 @@ See [Deploy a self-hosted cluster](../how-to/deploy-cluster.md) and
 ## `compute`
 
 Container / microVM execution backends. Present ⇒ this node advertises compute
-capacity to the scheduler; backends are capability-detected (container on Linux,
-microVM where `/dev/kvm` exists).
+capacity to the scheduler; backends are capability-detected: the native
+`container` backend on Linux; the KVM microVM (`vmm-embedded`) where `/dev/kvm`
+exists; the **macOS-native microVM (`vmm-vz`)** on Apple silicon + macOS 15+,
+which boots each replica as a Linux VM via Virtualization.framework (strong
+per-VM isolation, the same user surface as the KVM backend — no config change);
+and remote `docker` wherever a Docker daemon is reachable. macOS 26 is
+recommended for the `vmm-vz` backend: macOS 15's vmnet cannot do
+container-to-container networking, so multi-replica cross-VM comms needs 26
+(single-node serve works on 15). Nothing in the spec, CLI, or the fields below
+differs by backend — the environment difference lives behind the backend.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |

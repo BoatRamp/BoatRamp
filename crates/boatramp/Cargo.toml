@@ -243,6 +243,11 @@ boatramp-firecracker = { workspace = true, features = [
 boatramp-container.workspace = true
 # The remote-docker compute backend (cross-platform Engine API client).
 boatramp-docker.workspace = true
+# The macOS-native VMM backend: the `__vz-run` re-exec worker (macOS) boots a
+# microVM via Virtualization.framework; the pure layer compiles everywhere, and
+# the objc2/Virtualization deps are `target_os = "macos"`-gated, so it's a no-op
+# off macOS.
+boatramp-vz = { workspace = true, features = ["backend"] }
 boatramp-handlers = { workspace = true, optional = true }
 # The local single-function harness (`function dev`/`test`, FA-7) drives the
 # engine directly, so it builds requests + collects responses over `http`.

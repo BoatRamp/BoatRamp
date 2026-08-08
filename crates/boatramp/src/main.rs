@@ -222,6 +222,14 @@ fn run() -> Result<(), CliError> {
     {
         return run_vmm_worker(std::env::args().nth(2));
     }
+    // A re-exec'd `boatramp __vz-run <json>` is the macOS-native VMM backend's
+    // per-VM worker: it builds + runs one Linux microVM via Virtualization.framework
+    // in this process, owning the VZVirtualMachine on a dedicated DispatchQueue. No
+    // Tokio runtime needed. macOS-only (the backend is registered only there).
+    #[cfg(target_os = "macos")]
+    if std::env::args().nth(1).as_deref() == Some(boatramp_vz::VZ_RUN_SUBCOMMAND) {
+        return run_vz_worker(std::env::args().nth(2));
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -280,6 +288,20 @@ fn run_vmm_worker(json: Option<String>) -> Result<(), CliError> {
     let json = json.ok_or(CliError::VmmMissingConfig)?;
     let cfg: WorkerConfig = serde_json::from_str(&json).map_err(CliError::VmmConfigParse)?;
     run_jailed_worker(cfg).map_err(CliError::VmmWorker)?;
+    Ok(())
+}
+
+/// The macOS-native VMM backend's per-VM worker (`boatramp __vz-run <json>`):
+/// build + run one Linux microVM via Virtualization.framework in this process
+/// (owning the `VZVirtualMachine` on a dedicated `DispatchQueue`). Runs until the
+/// guest stops or the parent closes stdin (the control channel). `json` is the
+/// [`boatramp_vz::WorkerConfig`]. macOS-only (Virtualization.framework).
+#[cfg(target_os = "macos")]
+fn run_vz_worker(json: Option<String>) -> Result<(), CliError> {
+    let json = json.ok_or(CliError::VzMissingConfig)?;
+    let cfg: boatramp_vz::WorkerConfig =
+        serde_json::from_str(&json).map_err(CliError::VzConfigParse)?;
+    boatramp_vz::vm::run_worker(cfg).map_err(CliError::VzWorker)?;
     Ok(())
 }
 

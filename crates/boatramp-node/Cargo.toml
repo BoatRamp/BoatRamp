@@ -26,6 +26,11 @@ boatramp-firecracker = { workspace = true, features = [
   "backend",
   "embedded",
 ] }
+# The macOS-native VMM backend (Virtualization.framework). Its objc2/Virtualization
+# deps are `target_os = "macos"`-gated, so enabling `backend` cross-platform is a
+# no-op off macOS (the crate compiles to a shell whose `launch` is unreachable
+# because `build_compute` cfg-gates registration to macOS).
+boatramp-vz = { workspace = true, features = ["backend"] }
 # Handler-runtime assembly (`handlers::build_handler_runtime`/`build_sql_backends`);
 # optional, pulled only by the `handlers` feature (the lean node has no wasm engine).
 boatramp-handlers = { workspace = true, optional = true }

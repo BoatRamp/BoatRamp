@@ -12,6 +12,7 @@ members = [
   "crates/boatramp-firecracker",
   "crates/boatramp-container",
   "crates/boatramp-docker",
+  "crates/boatramp-vz",
   "crates/boatramp-cloudflare",
   "crates/boatramp-mcp",
   "crates/boatramp-node",
@@ -75,6 +76,7 @@ boatramp-acme = { path = "crates/boatramp-acme", version = "0.2.2" }
 boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.2.2" }
 boatramp-container = { path = "crates/boatramp-container", version = "0.2.2" }
 boatramp-docker = { path = "crates/boatramp-docker", version = "0.2.2" }
+boatramp-vz = { path = "crates/boatramp-vz", version = "0.2.2" }
 boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.2.2" }
 boatramp-node = { path = "crates/boatramp-node", version = "0.2.2" }
 

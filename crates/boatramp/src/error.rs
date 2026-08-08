@@ -158,6 +158,21 @@ pub enum CliError {
     #[cfg(target_os = "linux")]
     #[error("vmm worker: {0}")]
     VmmWorker(String),
+    /// `__vz-run`: the config JSON argument was missing.
+    #[cfg(target_os = "macos")]
+    #[error("__vz-run: missing config argument")]
+    VzMissingConfig,
+    /// `__vz-run`: the config argument did not parse as a `WorkerConfig`.
+    #[cfg(target_os = "macos")]
+    #[error("__vz-run: invalid config: {0}")]
+    VzConfigParse(#[source] serde_json::Error),
+    /// `__vz-run`: building/booting the macOS microVM failed. The
+    /// Virtualization.framework worker reports failures as a `String` at this
+    /// process boundary; carried verbatim (the one foreign API whose error type is
+    /// `String`, like the KVM `VmmWorker`).
+    #[cfg(target_os = "macos")]
+    #[error("vz worker: {0}")]
+    VzWorker(String),
 }
 
 // `CliError`'s largest variant is `Serve(serve::Error)`, kept small by boxing

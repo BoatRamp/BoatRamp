@@ -1,0 +1,109 @@
+[package]
+name = "boatramp-vz"
+version.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "macOS-native (Virtualization.framework) microVM compute backend for boatramp: run a Linux workload as a lightweight per-replica VM on Apple silicon"
+
+[features]
+# The `VzBackend` `ComputeBackend` impl: wraps the macOS VM host behind
+# `boatramp_core::compute::ComputeBackend`, staging blobs from `Storage` and
+# driving the VM via a re-exec'd `__vz-run` worker. Pulls boatramp-core + an async
+# runtime; off by default so the pure config/IPAM layer stays dependency-light
+# (mirrors the boatramp-firecracker `backend` feature).
+backend = ["dep:boatramp-core", "dep:async-trait", "dep:tokio", "dep:futures"]
+
+[dependencies]
+boatramp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ipnet.workspace = true
+
+# `backend` feature (the `ComputeBackend` impl).
+boatramp-core = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+# `+ time` for the health-probe connect timeout (workspace tokio omits it); `+ net`
+# for the probe itself; `+ io-util`/`+ process` for the worker control channel.
+tokio = { workspace = true, optional = true, features = [
+  "time",
+  "net",
+  "io-util",
+  "process",
+] }
+futures = { workspace = true, optional = true }
+
+# Virtualization.framework bindings — macOS only. The VM host (`vm` module) is
+# `target_os = "macos"`-gated; everything else (config/IPAM/orchestration) is
+# cross-platform, so the crate compiles to a no-op-runtime shell off macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+# Feature-gated class set: the exact configuration surface a Linux microVM needs
+# (boot loader + virtio block/net + serial console + socket/vsock). Rosetta +
+# save/restore classes are added by the Phase-5 scale-to-zero work.
+objc2-virtualization = { version = "0.3", features = [
+  "VZVirtualMachine",
+  "VZVirtualMachineConfiguration",
+  "VZBootLoader",
+  "VZLinuxBootLoader",
+  "VZStorageDeviceConfiguration",
+  "VZStorageDeviceAttachment",
+  "VZDiskImageStorageDeviceAttachment",
+  "VZVirtioBlockDeviceConfiguration",
+  "VZNetworkDeviceAttachment",
+  "VZNATNetworkDeviceAttachment",
+  "VZNetworkDeviceConfiguration",
+  "VZVirtioNetworkDeviceConfiguration",
+  "VZMACAddress",
+  "VZSerialPortConfiguration",
+  "VZVirtioConsoleDeviceSerialPortConfiguration",
+  "VZSerialPortAttachment",
+  "VZFileHandleSerialPortAttachment",
+  "VZSocketDeviceConfiguration",
+  "VZVirtioSocketDeviceConfiguration",
+  # `block2` = the completion-handler block support VZVirtualMachine.start needs;
+  # `dispatch2` = the DispatchQueue integration for initWithConfiguration:queue:.
+  "block2",
+  "dispatch2",
+] }
+# Completion-handler blocks for VZVirtualMachine.start/stop.
+block2 = "0.6"
+# The main DispatchQueue used to signal the run loop from the stdin watcher.
+dispatch2 = "0.3"
+# The CFRunLoop that pumps the VM's main-queue events on the worker thread.
+objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
+
+# Standalone re-exec target for the crate's own integration test (`vz_live`).
+# Production re-execs the `boatramp` binary's `__vz-run` subcommand; this lets the
+# crate's integration test be self-contained (mirrors firecracker's `vmm-worker`).
+[[bin]]
+name = "vz-worker"
+required-features = ["backend"]
+
+[dev-dependencies]
+# The `vz_live` integration test (ignored; Apple-silicon + macOS 26 only) drives the
+# `ComputeBackend` trait directly, so it needs the async runtime + trait macro.
+async-trait.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "net",
+  "io-util",
+  "process",
+] }
+boatramp-core.workspace = true
+boatramp-types.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
