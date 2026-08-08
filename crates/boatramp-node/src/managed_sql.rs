@@ -9,6 +9,36 @@ use std::sync::Arc;
 
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
+use boatramp_storage::ExternalSqlKind;
+
+/// The env vars a managed DB server image reads to **initialize on first boot** with
+/// boatramp's managed credential — so the handler can then connect as `user`/`password`
+/// to `database`. (Postgres: `POSTGRES_*`; MySQL: `MYSQL_*`, incl. a root password —
+/// unused by handlers but required by the image to init.) Injected into the DB
+/// workload's env at launch (P2-b); the values come from [`ManagedSqlCredentials`].
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub fn managed_db_server_env(
+    kind: ExternalSqlKind,
+    database: &str,
+    user: &str,
+    password: &str,
+) -> Vec<(String, String)> {
+    match kind {
+        ExternalSqlKind::Postgres => vec![
+            ("POSTGRES_USER".into(), user.into()),
+            ("POSTGRES_PASSWORD".into(), password.into()),
+            ("POSTGRES_DB".into(), database.into()),
+        ],
+        ExternalSqlKind::Mysql => vec![
+            ("MYSQL_USER".into(), user.into()),
+            ("MYSQL_PASSWORD".into(), password.into()),
+            ("MYSQL_DATABASE".into(), database.into()),
+            // The image requires a root password to initialize; reuse the managed
+            // secret (root is not exposed to handlers, which connect as `user`).
+            ("MYSQL_ROOT_PASSWORD".into(), password.into()),
+        ],
+    }
+}
 
 /// Generates + seals + persists a stable password per managed-DB workload.
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
@@ -117,5 +147,23 @@ mod tests {
 
         // A different workload gets a different password.
         assert_ne!(creds.password("default", "other").await.unwrap(), pw);
+    }
+
+    #[test]
+    fn server_env_recipe_per_engine() {
+        let pg = managed_db_server_env(ExternalSqlKind::Postgres, "analytics", "app", "pw");
+        assert_eq!(
+            pg,
+            vec![
+                ("POSTGRES_USER".into(), "app".into()),
+                ("POSTGRES_PASSWORD".into(), "pw".into()),
+                ("POSTGRES_DB".into(), "analytics".into()),
+            ]
+        );
+        let my = managed_db_server_env(ExternalSqlKind::Mysql, "shop", "app", "pw");
+        // MySQL needs a root password to initialize, plus the app user/db.
+        assert!(my.contains(&("MYSQL_USER".into(), "app".into())));
+        assert!(my.contains(&("MYSQL_DATABASE".into(), "shop".into())));
+        assert!(my.contains(&("MYSQL_ROOT_PASSWORD".into(), "pw".into())));
     }
 }
