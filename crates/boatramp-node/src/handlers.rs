@@ -253,3 +253,118 @@ pub async fn build_handler_runtime(
 ) -> Result<boatramp_server::HandlerRuntime> {
     Ok(boatramp_server::HandlerRuntime::disabled())
 }
+
+#[cfg(all(test, any(feature = "sql-postgres", feature = "sql-mysql")))]
+mod tests {
+    use super::*;
+    // `super::*` brings the crate's 1-arg `Result` alias into scope; the trait impls
+    // below need the std 2-arg `Result`, so shadow it back (explicit beats glob).
+    use std::result::Result;
+
+    use async_trait::async_trait;
+    use boatramp_core::envelope::EnvelopeError;
+    use boatramp_core::kv::MemoryKv;
+    use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+
+    /// A reversible test envelope (NOT encryption) — proves sealing round-trips.
+    struct TestEnvelope;
+    #[async_trait]
+    impl KeyEnvelope for TestEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.iter().rev().copied().collect())
+        }
+        async fn unwrap(&self, w: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(w.iter().rev().copied().collect())
+        }
+    }
+
+    /// A no-op object store, so a `DeployStore` can be built (the endpoint resolver
+    /// only reads KV replica state, which is empty here — the backend is lazy).
+    struct NullStorage;
+    #[async_trait]
+    impl Storage for NullStorage {
+        async fn get(&self, _: &str) -> Result<GetObject, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::unsupported("null"))
+        }
+        async fn head(&self, _: &str) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A `sql` binding with one managed (compute-backed, no `password_env`) database.
+    fn managed_sql_cfg() -> crate::config::SqlBindingConfig {
+        let mut databases = std::collections::BTreeMap::new();
+        databases.insert(
+            "analytics".to_string(),
+            crate::config::ExternalDatabaseConfig {
+                kind: "postgres".into(),
+                compute: Some("pg".into()),
+                database: Some("analytics".into()),
+                user: Some("app".into()),
+                ..Default::default()
+            },
+        );
+        crate::config::SqlBindingConfig {
+            databases,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_sql_fails_closed_without_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let cfg = managed_sql_cfg();
+        // `Arc<dyn SqlBackends>` isn't `Debug`, so match rather than `unwrap_err`.
+        match build_sql_backends(Some(&cfg), tmp.path(), &deploy, &kv, None).await {
+            Err(Error::SqlManagedNeedsSecrets(name)) => assert_eq!(name, "analytics"),
+            Ok(_) => panic!("a managed DB without [secrets] must fail closed, got Ok"),
+            Err(other) => panic!("expected SqlManagedNeedsSecrets, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_sql_builds_lazily_and_seals_the_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(TestEnvelope);
+        let cfg = managed_sql_cfg();
+        // No DB is running: the backend resolves the endpoint on first use, so
+        // assembly succeeds without a connection and the credential is sealed now.
+        let backends = build_sql_backends(Some(&cfg), tmp.path(), &deploy, &kv, Some(&envelope))
+            .await
+            .expect("managed sql builds without a live DB (lazy connect)");
+        let sealed = kv
+            .get("managed-sql-cred/default/pg")
+            .await
+            .unwrap()
+            .expect("managed credential sealed at build under the default project");
+        assert_ne!(sealed.len(), 0);
+        // Sanity: the composite is usable as a provider (no connection yet).
+        let _: Arc<dyn boatramp_core::sql::SqlBackends> = backends;
+    }
+}
