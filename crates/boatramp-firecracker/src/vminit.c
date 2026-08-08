@@ -2,28 +2,33 @@
  *
  * A tiny **freestanding** PID-1: mount the kernel pseudo-filesystems, read the
  * baked exec spec (/etc/boatramp/{argv,env,cwd}), and `execve` the workload. No
- * libc (raw x86_64 syscalls + a custom `_start`), so the single static binary
+ * libc (raw Linux syscalls + a custom `_start`), so the single static binary
  * runs as /sbin/init in *any* rootfs — busybox/alpine/debian *and* shell-less
  * scratch/distroless images. Built with:
  *   cc -static -nostdlib -ffreestanding -no-pie -Os
+ *
+ * Portable across the two guest arches boatramp boots: **x86_64** (the Linux/KVM
+ * embedded VMM) and **aarch64** (the macOS Virtualization.framework backend). The
+ * only arch-specific parts are the syscall numbers + the `sys()` trap stub; the
+ * rest is plain C. aarch64 dropped the legacy `open`/`mkdir` syscalls, so both
+ * arches go through `openat`/`mkdirat` (which x86_64 also has).
  *
  * `boatramp_firecracker::oci::build_rootfs` writes this to /sbin/init, creates
  * the mount-point dirs (the root is mounted read-only, so they must pre-exist),
  * and writes the NUL-separated argv/env + cwd files this reads.
  */
 
-/* x86_64 syscall numbers. */
+#if defined(__x86_64__)
+/* x86_64 syscall numbers (arch/x86/entry/syscalls). */
 #define SYS_read 0
 #define SYS_write 1
-#define SYS_open 2
 #define SYS_close 3
+#define SYS_openat 257
+#define SYS_mkdirat 258
 #define SYS_execve 59
 #define SYS_exit 60
 #define SYS_chdir 80
-#define SYS_mkdir 83
 #define SYS_mount 165
-
-#define O_RDONLY 0
 
 static long sys(long n, long a, long b, long c, long d, long e) {
     long r;
@@ -35,6 +40,39 @@ static long sys(long n, long a, long b, long c, long d, long e) {
                      : "rcx", "r11", "memory");
     return r;
 }
+#elif defined(__aarch64__)
+/* aarch64 syscall numbers (the asm-generic ABI; no legacy open/mkdir). */
+#define SYS_read 63
+#define SYS_write 64
+#define SYS_close 57
+#define SYS_openat 56
+#define SYS_mkdirat 34
+#define SYS_execve 221
+#define SYS_exit 93
+#define SYS_chdir 49
+#define SYS_mount 40
+
+static long sys(long n, long a, long b, long c, long d, long e) {
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x4 __asm__("x4") = e;
+    __asm__ volatile("svc #0"
+                     : "=r"(x0)
+                     : "r"(x8), "0"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(x4)
+                     : "memory", "cc");
+    return x0;
+}
+#else
+#error "vminit: unsupported target architecture (need x86_64 or aarch64)"
+#endif
+
+#define O_RDONLY 0
+/* openat/mkdirat resolve a relative path against the cwd when dirfd is AT_FDCWD;
+ * we always pass absolute paths, so it is just the "no dir fd" sentinel. */
+#define AT_FDCWD -100
 
 static int slen(const char *s) {
     int n = 0;
@@ -51,7 +89,7 @@ static void die(const char *msg) {
 
 /* Read up to `cap` bytes of `path` into `buf`; returns the byte count (or -1). */
 static int read_file(const char *path, char *buf, int cap) {
-    long fd = sys(SYS_open, (long)path, O_RDONLY, 0, 0, 0);
+    long fd = sys(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0);
     if (fd < 0) return -1;
     int total = 0;
     while (total < cap) {
@@ -106,7 +144,7 @@ static int hexdec(char *p, char *end, char *out, int cap) {
 }
 
 static void mount_fs(const char *src, const char *target, const char *fstype) {
-    sys(SYS_mkdir, (long)target, 0755, 0, 0, 0);            /* no-op if it exists */
+    sys(SYS_mkdirat, AT_FDCWD, (long)target, 0755, 0, 0);        /* no-op if it exists */
     sys(SYS_mount, (long)src, (long)target, (long)fstype, 0, 0); /* best-effort */
 }
 

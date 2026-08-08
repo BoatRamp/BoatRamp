@@ -143,8 +143,13 @@
           );
 
           # The default build (server + CLI, filesystem backend) needs no native
-          # libraries. These are kept around for the optional `s3` backend.
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          # libraries. `pkg-config` is kept around for the optional `s3` backend;
+          # on macOS `zig` cross-compiles the aarch64 guest `vminit` in the
+          # boatramp-firecracker `build.rs` (Linux uses native `cc`).
+          nativeBuildInputs = [
+            pkgs.pkg-config
+          ]
+          ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.zig ];
           buildInputs = [ pkgs.openssl ];
 
           # Whole-workspace **clippy** as a flake check, built with crane so it
@@ -446,7 +451,16 @@
             # iproute2 (the CI s3 step's default-gateway probe) is Linux-only, so
             # it must not be in the cross-platform set or `nix develop` breaks on
             # macOS.
-            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iproute2 ];
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iproute2 ]
+            # macOS `compute build` for the `vmm-vz` backend: `zig` cross-compiles
+            # the aarch64 guest `vminit` (boatramp-firecracker `build.rs`), and
+            # `e2fsprogs` provides the `mke2fs -d` the OCI→ext4 rootfs build shells
+            # out to. (Linux builds the init with native `cc` and ships its own
+            # `mke2fs`, so neither is needed there.)
+            ++ lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.zig
+              pkgs.e2fsprogs
+            ];
 
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
             # libclang for bindgen (aws-lc-rs) when building `--features s3`.

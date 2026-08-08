@@ -328,8 +328,21 @@ pub struct ImageConfig {
     pub workdir: String,
 }
 
-/// Resolve `image` to a concrete `linux/amd64` manifest, performing the anonymous
-/// Bearer-token dance. A multi-arch index is followed to its amd64 entry.
+/// The OCI image architecture to pull — the **guest** arch, which mirrors the
+/// build host's (an x86_64 host boots `amd64` guests via the KVM VMM; an
+/// Apple-silicon host boots `arm64` guests via Virtualization.framework). This
+/// matches the arch of the `vminit` baked by `build.rs` and the guest kernel, so
+/// the rootfs, init, and kernel agree.
+fn oci_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "amd64",
+    }
+}
+
+/// Resolve `image` to a concrete `linux/<guest-arch>` manifest, performing the
+/// anonymous Bearer-token dance. A multi-arch index is followed to its entry for
+/// [`oci_arch`] (the host/guest arch).
 async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
     let (registry, repo, reference) = parse_reference(image);
     let client = reqwest::Client::builder()
@@ -353,17 +366,18 @@ async fn resolve_manifest(image: &str) -> Result<ResolvedManifest, OciError> {
         .map_err(|e| OciError::Registry(e.to_string()))?;
 
     let manifest = if manifest.get("manifests").is_some() {
-        // An index/list — pick linux/amd64.
+        // An index/list — pick linux/<guest-arch>.
+        let arch = oci_arch();
         let digest = manifest["manifests"]
             .as_array()
             .and_then(|entries| {
                 entries.iter().find(|m| {
                     let p = &m["platform"];
-                    p["os"].as_str() == Some("linux") && p["architecture"].as_str() == Some("amd64")
+                    p["os"].as_str() == Some("linux") && p["architecture"].as_str() == Some(arch)
                 })
             })
             .and_then(|m| m["digest"].as_str())
-            .ok_or_else(|| OciError::Registry("no linux/amd64 in image index".into()))?
+            .ok_or_else(|| OciError::Registry(format!("no linux/{arch} in image index")))?
             .to_string();
         let url = format!("{base}/manifests/{digest}");
         let resp = get_authed(&client, &url, MANIFEST_ACCEPT, &mut token).await?;
@@ -431,8 +445,8 @@ async fn fetch_layers(r: &mut ResolvedManifest) -> Result<Vec<Vec<u8>>, OciError
 
 /// Pull an image's layer blobs (gzip'd tar, lowest first) over the registry HTTP
 /// API — anonymous pull with the Bearer-token dance. A multi-arch index resolves
-/// to `linux/amd64`. Each blob is verified against its `sha256:` digest. Network
-/// seam (not unit-tested). Assumes gzip layers (the common case).
+/// to `linux/<guest-arch>` (see [`oci_arch`]). Each blob is verified against its
+/// `sha256:` digest. Network seam (not unit-tested). Assumes gzip layers.
 pub async fn pull_layers(image: &str) -> Result<Vec<Vec<u8>>, OciError> {
     let mut r = resolve_manifest(image).await?;
     fetch_layers(&mut r).await
