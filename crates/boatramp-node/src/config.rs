@@ -229,6 +229,50 @@ pub struct ComputeConfig {
 pub const BOATRAMP_KERNEL_SIGNING_PUBKEY: &str =
     "es256:02c4e4af2e9cba6ba6745c513f193622e6674a8b2d0187ebea5612f5b46a7eade4";
 
+/// The first-party signed-kernel content hashes trusted under the **strict**
+/// posture, for this build's **guest arch**. The guest arch mirrors the host: an
+/// x86_64 host boots x86_64 KVM guests (the embedded VMM); an Apple-silicon host
+/// boots aarch64 guests (the Virtualization.framework `vmm-vz` backend). An x86_64
+/// kernel can't boot an aarch64 VM (and vice versa), so each arch trusts only its
+/// own signed `boatramp-vmlinux-<arch>` releases. Bump on each new signed release.
+///
+/// The **relaxed** (single-tenant) posture ignores this list — it verifies only the
+/// content-hash pin — so an operator-supplied kernel boots there regardless of arch.
+fn default_allowed_kernel_hashes() -> Vec<String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        vec![
+            // v0.2.0 minimal Firecracker 6.1-config kernel: boots under the
+            // firecracker-*binary* backend (ACPI device discovery) but NOT the
+            // in-process embedded VMM. Kept trusted so operators on the currently
+            // published release don't fail strict verification.
+            "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
+            // Same kernel + CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y (flake `#vmlinux`),
+            // so the embedded VMM binds its virtio-block root over the cmdline
+            // transport. Reproducible build output (deterministic nix build,
+            // verified on KVM); the next signed boatramp-vmlinux release — which
+            // reuses this flake — publishes + signs it, gated by
+            // `vmlinux-release-boot.yml`.
+            "d0dc2098ab2a2a3c1bc72ab61dc85d9e464d798d7e55b6b80525db5ca2f00c5a".to_string(),
+        ]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // `boatramp-vmlinux-aarch64` (the Virtualization.framework guest kernel,
+        // flake `#vmlinux-aarch64`, a raw arm64 `Image`): the hash is baked here
+        // once the first signed arm64 release ships. Until then the strict posture
+        // requires an operator-configured signed kernel (`[compute]
+        // kernel_allowed_hashes` + a `compute.default_kernel` carrying its `.sig`);
+        // the single-tenant posture needs only the content-hash pin, so `vmm-vz`
+        // runs with any operator-supplied arm64 kernel there today.
+        Vec::new()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        Vec::new()
+    }
+}
+
 impl Default for ComputeConfig {
     fn default() -> Self {
         Self {
@@ -237,23 +281,7 @@ impl Default for ComputeConfig {
             vcpus: 0,
             mem_mib: 0,
             kernel_signing_pubkeys: vec![BOATRAMP_KERNEL_SIGNING_PUBKEY.to_string()],
-            // Signed `boatramp-vmlinux` release kernels trusted under the strict
-            // posture (content sha256), so a selected `compute.default_kernel`
-            // clears the bar out of the box. Bump on each new signed release.
-            kernel_allowed_hashes: vec![
-                // v0.2.0 minimal Firecracker 6.1-config kernel: boots under the
-                // firecracker-*binary* backend (ACPI device discovery) but NOT the
-                // in-process embedded VMM. Kept trusted so operators on the currently
-                // published release don't fail strict verification.
-                "cf1e590a9e642be3667131ca35fbf390378a457d8908169d2a169608e299d974".to_string(),
-                // Same kernel + CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y (flake `#vmlinux`),
-                // so the embedded VMM binds its virtio-block root over the cmdline
-                // transport. Reproducible build output (deterministic nix build,
-                // verified on KVM); the next signed boatramp-vmlinux release — which
-                // reuses this flake — publishes + signs it, gated by
-                // `vmlinux-release-boot.yml`.
-                "d0dc2098ab2a2a3c1bc72ab61dc85d9e464d798d7e55b6b80525db5ca2f00c5a".to_string(),
-            ],
+            kernel_allowed_hashes: default_allowed_kernel_hashes(),
             region: None,
             docker_endpoint: boatramp_docker::DockerEndpoint::default(),
             docker_volume_mode: boatramp_docker::DockerVolumeMode::default(),

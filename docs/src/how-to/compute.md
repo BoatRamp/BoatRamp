@@ -86,6 +86,21 @@ boatramp ships a first-party signing public key built in, so the signed default
 kernel it distributes verifies out of the box. `boatramp security explain` shows
 the resolved kernel-trust bar.
 
+### Kernels are per guest-arch (macOS `vmm-vz`)
+
+The guest kernel matches the backend's guest architecture: the Linux/KVM embedded
+VMM boots an **x86_64** `vmlinux`, while the macOS Virtualization.framework backend
+(`vmm-vz`, Apple silicon) boots a raw **arm64** `Image`. An x86_64 kernel can't boot
+an arm64 VM, so `[compute].kernel_allowed_hashes` is arch-scoped — an Apple-silicon
+node trusts only `boatramp-vmlinux-aarch64` releases, an x86_64 node only the
+`x86_64` ones — and `--kernel` / `compute.default_kernel` on macOS must point at an
+arm64 kernel (the release's `boatramp-vmlinux-aarch64` asset, or any uncompressed
+arm64 `Image`). Everything else — `--kernel`, the fleet default, verify-before-boot
+— is identical. Under `single-tenant` / `dev` the content-hash pin alone suffices,
+so `vmm-vz` runs with any operator-supplied arm64 kernel; the strict posture on
+Apple silicon needs the signed `boatramp-vmlinux-aarch64` release (its hash is baked
+into the arch-scoped allow-list on release).
+
 ## Deploy a container image
 
 `compute build` takes an OCI image reference, builds an ext4 root filesystem from
