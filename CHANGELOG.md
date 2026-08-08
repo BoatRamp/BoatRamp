@@ -18,13 +18,17 @@ versions.
   worker (mirroring the KVM `__vmm-run`), driven in-process through
   `objc2-virtualization`. Capability-detected and registered only on a capable
   host; off macOS the crate compiles to its pure orchestration layer (the objc2
-  deps are `target_os="macos"`-gated), so Linux builds are unaffected. The boot
-  path is live-validated on Apple silicon (boot loader → arm64 kernel → virtio-blk
-  root → serial console → kernel cmdline, under the free self-signable
-  `com.apple.security.virtualization` entitlement). macOS 26 is recommended
-  (macOS 15's vmnet lacks container-to-container networking). Deferred to follow-ups:
-  scale-to-zero via `saveMachineState`/`restoreMachineState` (advertises
-  `scale_to_zero: false` for now) and the CI release-signing step. See
+  deps are `target_os="macos"`-gated), so Linux builds are unaffected. **Validated
+  end-to-end on Apple silicon** under the free self-signable
+  `com.apple.security.virtualization` entitlement: a real Linux userspace boots
+  from an `ext4` rootfs, gets a static vmnet IP, and **runs PostgreSQL 16 with its
+  data directory on a persistent virtio-block volume** — the port is reachable from
+  the macOS host over vmnet, and the data survives a full VM restart. macOS 26 is
+  recommended (macOS 15's vmnet lacks container-to-container networking). Deferred
+  to follow-ups: an `aarch64` guest `vminit` + arm64 kernel selection so the
+  `compute build` (OCI→ext4) path produces macOS-ready images directly; scale-to-zero
+  via `saveMachineState`/`restoreMachineState` (advertises `scale_to_zero: false` for
+  now); and the CI release-signing step. See
   [`compute`](docs/src/reference/boatramp-cfg.md#compute).
 - **Managed SQL on a database boatramp runs.** A handler `sql` database can now be
   sourced from a Postgres/MySQL **compute workload boatramp runs** instead of a
