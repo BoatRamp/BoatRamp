@@ -23,5 +23,7 @@ pub mod config;
 pub mod error;
 pub use error::Error;
 pub mod handlers;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod managed_sql;
 pub mod node;
 pub use node::{assemble, NodeInput, RunningNode};

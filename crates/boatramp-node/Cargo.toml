@@ -39,6 +39,9 @@ thiserror.workspace = true
 # Naming the detached reconcile `JoinHandle`s that `assemble` returns.
 tokio.workspace = true
 tracing.workspace = true
+# Generating the managed SQL credential (PLAN-managed-compute-sql; only used under
+# the sql features, but a tiny dep so it stays unconditional).
+getrandom.workspace = true
 
 [features]
 # Cfg markers matching the binary's feature set: `config` parses every section in
@@ -76,3 +79,5 @@ axum = "0.8"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
+# A mock `KeyEnvelope` for the managed-sql credential-store test.
+async-trait.workspace = true
