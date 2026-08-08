@@ -427,9 +427,12 @@ pub struct ExternalDatabaseConfig {
     pub database: Option<String>,
     /// The connecting user for the compute-backed server (non-secret).
     pub user: Option<String>,
-    /// Env var holding the password for `user` on the compute-backed server. Omit
-    /// to let boatramp generate + manage the credential (a later phase); for now a
-    /// compute-backed database requires it.
+    /// Env var holding the password for `user` on the compute-backed server.
+    /// **Omit to let boatramp fully manage the credential** (PLAN-managed-compute-sql
+    /// Phase 2): it generates a strong password once, seals it with the `[secrets]`
+    /// envelope, injects it into the DB workload's server-init env at launch, and
+    /// connects the handler with it — the operator sets no DB secret at all. Set it
+    /// only to bring your own password for the compute-backed server.
     pub password_env: Option<String>,
     /// Maximum pooled connections (default 8).
     pub pool_max: Option<u32>,
@@ -446,8 +449,9 @@ pub struct ExternalDatabaseConfig {
 impl ExternalDatabaseConfig {
     /// Validate the source is well-formed: **exactly one** of `url_env` /
     /// `compute`, and a `compute`-backed database has the connection details
-    /// boatramp can't infer (`database`, `user`, and — for now — `password_env`).
-    /// `name` is the binding name, for the error message.
+    /// boatramp can't infer (`database` + `user`). `password_env` is **optional** —
+    /// omit it to let boatramp manage the credential (Phase 2). `name` is the
+    /// binding name, for the error message.
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub fn validate(&self, name: &str) -> Result<(), String> {
         let has_url = !self.url_env.is_empty();
@@ -461,11 +465,9 @@ impl ExternalDatabaseConfig {
                  `compute` (a database boatramp runs)"
             )),
             (false, true) => {
-                for (field, val) in [
-                    ("database", &self.database),
-                    ("user", &self.user),
-                    ("password_env", &self.password_env),
-                ] {
+                // `database` + `user` are non-secret and can't be inferred; a missing
+                // `password_env` is *not* an error — it selects the managed credential.
+                for (field, val) in [("database", &self.database), ("user", &self.user)] {
                     if val.as_deref().is_none_or(str::is_empty) {
                         return Err(format!(
                             "sql database {name:?}: a `compute`-backed database requires `{field}`"
@@ -476,6 +478,14 @@ impl ExternalDatabaseConfig {
             }
             (true, false) => Ok(()),
         }
+    }
+
+    /// Whether this compute-backed database uses a **boatramp-managed** credential
+    /// (Phase 2): `compute` is set and no `password_env` was supplied.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn is_managed_credential(&self) -> bool {
+        self.compute.as_deref().is_some_and(|c| !c.is_empty())
+            && self.password_env.as_deref().is_none_or(str::is_empty)
     }
 }
 
@@ -1079,8 +1089,9 @@ mod tests {
             ..Default::default()
         };
         assert!(bare.validate("db").is_err());
-        // `compute` with database/user/password_env → ok.
-        let full = ExternalDatabaseConfig {
+        // `compute` with database/user + a bring-your-own `password_env` → ok, and
+        // is *not* a managed credential.
+        let byo = ExternalDatabaseConfig {
             kind: "postgres".into(),
             compute: Some("pg".into()),
             database: Some("analytics".into()),
@@ -1088,7 +1099,19 @@ mod tests {
             password_env: Some("PG_APP_PW".into()),
             ..Default::default()
         };
-        assert!(full.validate("db").is_ok());
+        assert!(byo.validate("db").is_ok());
+        assert!(!byo.is_managed_credential());
+        // `compute` with database/user but NO `password_env` → ok, and boatramp
+        // manages the credential (Phase 2).
+        let managed = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: Some("pg".into()),
+            database: Some("analytics".into()),
+            user: Some("app".into()),
+            ..Default::default()
+        };
+        assert!(managed.validate("db").is_ok());
+        assert!(managed.is_managed_credential());
     }
 
     /// Path to a file at the repo root (two levels up from this crate).
