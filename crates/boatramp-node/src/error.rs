@@ -60,6 +60,20 @@ pub enum Error {
         #[source]
         source: boatramp_core::sql::SqlError,
     },
+    /// A managed compute-backed database (no `password_env`) was configured but no
+    /// `[secrets]` envelope is set — boatramp refuses to manage a credential it
+    /// cannot seal (it would otherwise store the DB password in cleartext).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[error(
+        "handlers SQL binding: managed database {0:?} needs a `[secrets]` envelope to seal its \
+         generated credential — set `[secrets]` (envelope = \"local\" or \"vault\"), or supply \
+         `password_env` to bring your own"
+    )]
+    SqlManagedNeedsSecrets(String),
+    /// Generating/sealing/reading a managed compute-backed database credential failed.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[error("handlers SQL binding: managed database {name:?}: {reason}")]
+    SqlManagedCredential { name: String, reason: String },
     /// External databases were configured but this build has no external SQL
     /// engine compiled in.
     #[cfg(all(
@@ -123,6 +137,10 @@ pub enum Error {
     #[cfg(feature = "handlers")]
     #[error(transparent)]
     Handler(#[from] boatramp_handlers::HandlerError),
+
+    /// Building the `[secrets]` envelope (local KEK / Vault) failed.
+    #[error("secrets envelope: {0}")]
+    Envelope(String),
 }
 
 /// Node-assembly result alias.

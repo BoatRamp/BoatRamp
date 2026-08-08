@@ -19,7 +19,7 @@ use boatramp_core::kv::KvStore;
 use boatramp_core::Storage;
 
 use crate::config::ServerConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// How often the compute reconcile loop converges desired vs actual workloads.
 pub const COMPUTE_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
@@ -108,18 +108,30 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let allow_shared_kernel = options.posture.allow_shared_kernel_compute;
     let domain_verify_allow_private = options.posture.domain_verify_allow_private;
 
+    // The deploy store the router serves from — built up front so the handler
+    // runtime's managed compute-backed `sql` binding can resolve DB endpoints from
+    // the same store the reconcile writes.
+    let compute_storage = storage.clone();
+    let deploy = DeployStore::new(storage, kv.clone());
+    // The `[secrets]` envelope (local KEK / Vault) that seals a managed SQL
+    // credential at rest. `None` ⇒ no wrapping (a managed DB then fails closed).
+    let secrets_envelope = build_secrets_envelope(config.secrets.as_ref(), data_dir)?;
+
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
     // `[handlers.bindings.sql]` (default: per-site libsql files under <data-dir>).
     let handlers = crate::handlers::build_handler_runtime(
         kv.clone(),
-        storage.clone(),
+        compute_storage.clone(),
         data_dir,
         config.handlers.as_ref(),
         messaging,
         max_handler_blob_bytes,
         max_component_bytes,
-    )?;
+        &deploy,
+        secrets_envelope.clone(),
+    )
+    .await?;
     // Leader-gate cron firing (cluster: only the Raft leader fires; single-node: an
     // always-true gate, equivalent to the unset default). The same gate drives the
     // reconcile loops below, so all three converge on one leader per fleet. Only the
@@ -136,8 +148,6 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(feature = "handlers"))]
     let _ = (watch_provider, provision_tier);
 
-    let compute_storage = storage.clone();
-    let deploy = DeployStore::new(storage, kv);
     // Materialize the reserved `default` project so `project ls` / `project show
     // default` reflect it on a fresh install, not only after a migration. Best
     // effort: the reader backstop keeps listings correct even if this write can't
@@ -177,6 +187,30 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     .await;
     #[cfg(not(feature = "handlers"))]
     let sql_resolver: Option<Arc<dyn boatramp_core::compute::ComputeBindingResolver>> = None;
+
+    // Managed compute-backed SQL (PLAN-managed-compute-sql P2-b): if the handler
+    // `sql` config declares any managed database, inject its `POSTGRES_*`/`MYSQL_*`
+    // server-init env into the DB workload at launch from the sealed credential.
+    // Reaching here with a managed DB implies an envelope (build_handler_runtime
+    // fails closed otherwise), so the credential store always has one to seal with.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
+        config
+            .handlers
+            .as_ref()
+            .and_then(|h| h.bindings.sql.as_ref()),
+        secrets_envelope,
+    ) {
+        (Some(sql), Some(envelope)) if !sql.databases.is_empty() => {
+            let creds = crate::managed_sql::ManagedSqlCredentials::new(kv.clone(), envelope);
+            let env = crate::managed_sql::ManagedDbEnv::from_config(&sql.databases, creds);
+            (!env.is_empty()).then(|| Arc::new(env) as Arc<_>)
+        }
+        _ => None,
+    };
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = None;
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -186,9 +220,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
         sql_resolver,
-        // Managed-DB server-env injection is wired in below once the deploy store +
-        // secrets envelope exist (PLAN-managed-compute-sql P2-b).
-        None,
+        managed_db_resolver,
     );
 
     // Domain-verify auto-complete: periodically re-check every site's pending
@@ -208,6 +240,51 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         options,
         reconcile: vec![compute_reconcile, dv_reconcile],
     })
+}
+
+/// Build the `[secrets]` envelope (secrets-at-rest wrapping) from `boatramp.cfg`'s
+/// `[secrets]` section: `local` (a machine-local AES-256-GCM KEK) or `vault` (Vault
+/// Transit). `None`/empty ⇒ no wrapping. The Vault token is read from the
+/// environment (`token_env`), never a file. This seals a managed SQL credential at
+/// rest; a managed database fails closed without it.
+fn build_secrets_envelope(
+    secrets: Option<&crate::config::SecretsConfig>,
+    data_dir: &Path,
+) -> Result<Option<Arc<dyn boatramp_core::envelope::KeyEnvelope>>> {
+    use boatramp_server::envelope::{build_envelope, EnvelopeSpec};
+    let Some(cfg) = secrets else {
+        return Ok(None);
+    };
+    let spec = match cfg.envelope.as_str() {
+        "" => EnvelopeSpec::None,
+        "local" => EnvelopeSpec::Local {
+            kek_file: cfg
+                .kek_file
+                .clone()
+                .unwrap_or_else(|| data_dir.join("secrets/kek")),
+        },
+        "vault" => {
+            let v = cfg.vault.as_ref().ok_or_else(|| {
+                Error::Envelope(
+                    "secrets.envelope = \"vault\" needs a [secrets.vault] section".into(),
+                )
+            })?;
+            let token = std::env::var(&v.token_env).map_err(|_| {
+                Error::Envelope(format!("Vault token env `{}` is not set", v.token_env))
+            })?;
+            EnvelopeSpec::Vault {
+                addr: v.addr.clone(),
+                key: v.key.clone(),
+                token,
+            }
+        }
+        other => {
+            return Err(Error::Envelope(format!(
+                "unknown secrets.envelope {other:?} (want \"local\" or \"vault\")"
+            )))
+        }
+    };
+    build_envelope(spec).map_err(|e| Error::Envelope(e.to_string()))
 }
 
 #[cfg(all(test, feature = "fs"))]

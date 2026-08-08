@@ -9,6 +9,8 @@
 #[cfg(feature = "handlers")]
 use crate::error::Error;
 use crate::error::Result;
+use boatramp_core::deploy::DeployStore;
+use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +19,8 @@ use std::sync::Arc;
 /// wasmtime engine serving the kv/blob bindings from the server's own backends;
 /// otherwise it is an empty placeholder (handler routes fall through to static).
 #[cfg(feature = "handlers")]
-pub fn build_handler_runtime(
+#[allow(clippy::too_many_arguments)]
+pub async fn build_handler_runtime(
     kv: Arc<dyn KvStore>,
     storage: Arc<dyn boatramp_core::Storage>,
     data_dir: &Path,
@@ -25,6 +28,10 @@ pub fn build_handler_runtime(
     messaging_override: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
     max_blob_bytes: u64,
     max_component_bytes: u64,
+    // The deploy store (for a managed compute-backed `sql` database's endpoint
+    // resolution) and the `[secrets]` envelope (to seal a managed credential).
+    deploy: &DeployStore,
+    secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {
     // Opt-in pooling allocator: faster instantiation, large
     // up-front virtual reservation — benchmark before enabling.
@@ -34,7 +41,14 @@ pub fn build_handler_runtime(
     } else {
         boatramp_handlers::HandlerEngine::new(limits, 64)?
     };
-    let sql = build_sql_backends(handlers_cfg.and_then(|h| h.bindings.sql.as_ref()), data_dir)?;
+    let sql = build_sql_backends(
+        handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
+        data_dir,
+        deploy,
+        &kv,
+        secrets_envelope.as_ref(),
+    )
+    .await?;
     // The `wasi:messaging` substrate: single-node `LogMessaging` over the same
     // blob/KV backends by default, or the cluster coordinator when one is given.
     let messaging: Arc<dyn boatramp_core::messaging::Messaging> = messaging_override
@@ -57,9 +71,12 @@ pub fn build_handler_runtime(
 /// `url` to bind a shared sqld cluster (a namespace per site). Either way sites
 /// get a real database boundary — see `boatramp_core::sql`.
 #[cfg(feature = "handlers")]
-fn build_sql_backends(
+async fn build_sql_backends(
     cfg: Option<&crate::config::SqlBindingConfig>,
     data_dir: &Path,
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    secrets_envelope: Option<&Arc<dyn KeyEnvelope>>,
 ) -> Result<Arc<dyn boatramp_core::sql::SqlBackends>> {
     let resolve_env = |var: &Option<String>| -> Result<Option<String>> {
         match var {
@@ -130,8 +147,14 @@ fn build_sql_backends(
 
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     {
+        use boatramp_core::project::DEFAULT_PROJECT;
+        use boatramp_core::sql::SqlBackend;
+        use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
         use boatramp_storage::sql_sqlx::{
             connect, CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions,
+        };
+        let timeout = |db: &crate::config::ExternalDatabaseConfig| {
+            db.connect_timeout_secs.map(std::time::Duration::from_secs)
         };
         let mut composite = CompositeSqlBackends::new(default);
         for (name, db) in databases {
@@ -139,38 +162,85 @@ fn build_sql_backends(
                 name: name.clone(),
                 kind: db.kind.clone(),
             })?;
-            if db.url_env.trim().is_empty() {
-                return Err(Error::SqlExternalUrlEnvMissing(name.clone()));
-            }
-            // The connection URL(s) are secrets, resolved from the environment.
-            let url =
-                std::env::var(&db.url_env).map_err(|_| Error::SqlEnvUnset(db.url_env.clone()))?;
-            let read_url = match &db.read_url_env {
-                Some(var) => Some(std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?),
-                None => None,
+            let external: Arc<dyn SqlBackend> = if let Some(workload) =
+                db.compute.as_deref().filter(|c| !c.is_empty())
+            {
+                // Compute-backed: resolve the workload's live endpoint on demand and
+                // build the connection. The credential is either brought
+                // (`password_env`) or **boatramp-managed** (generated + sealed).
+                let password = match db.password_env.as_deref().filter(|v| !v.is_empty()) {
+                    Some(var) => std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.into()))?,
+                    None => {
+                        // Managed credential: fail closed without a secrets envelope
+                        // (we will not persist a DB password in cleartext).
+                        let envelope = secrets_envelope
+                            .cloned()
+                            .ok_or_else(|| Error::SqlManagedNeedsSecrets(name.clone()))?;
+                        crate::managed_sql::ManagedSqlCredentials::new(kv.clone(), envelope)
+                            .password(DEFAULT_PROJECT, workload)
+                            .await
+                            .map_err(|reason| Error::SqlManagedCredential {
+                                name: name.clone(),
+                                reason,
+                            })?
+                    }
+                };
+                let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new(
+                    deploy.clone(),
+                    DEFAULT_PROJECT,
+                ));
+                Arc::new(ComputeResolvedSqlBackend::new(
+                    resolver,
+                    workload,
+                    kind,
+                    db.database.clone().unwrap_or_default(),
+                    db.user.clone().unwrap_or_default(),
+                    password,
+                    db.pool_max,
+                    db.read_only,
+                    timeout(db),
+                ))
+            } else {
+                // Bring-your-own URL: the connection URL(s) are secrets, resolved
+                // from the environment.
+                if db.url_env.trim().is_empty() {
+                    return Err(Error::SqlExternalUrlEnvMissing(name.clone()));
+                }
+                let url = std::env::var(&db.url_env)
+                    .map_err(|_| Error::SqlEnvUnset(db.url_env.clone()))?;
+                let read_url = match &db.read_url_env {
+                    Some(var) => {
+                        Some(std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.clone()))?)
+                    }
+                    None => None,
+                };
+                let opts = ExternalSqlOptions::new(url)
+                    .with_read_url(read_url)
+                    .with_max_connections(db.pool_max)
+                    .read_only(db.read_only)
+                    .with_connect_timeout(timeout(db));
+                connect(kind, &opts).map_err(|source| Error::SqlExternalConnect {
+                    name: name.clone(),
+                    source,
+                })?
             };
-            let opts = ExternalSqlOptions::new(url)
-                .with_read_url(read_url)
-                .with_max_connections(db.pool_max)
-                .read_only(db.read_only)
-                .with_connect_timeout(db.connect_timeout_secs.map(std::time::Duration::from_secs));
-            let external = connect(kind, &opts).map_err(|source| Error::SqlExternalConnect {
-                name: name.clone(),
-                source,
-            })?;
             composite = composite.with_external(name.clone(), external, db.allow_preview);
         }
         Ok(Arc::new(composite))
     }
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     {
+        // The compute-backed arm (the only consumer of these) is compiled out
+        // without a SQL engine; a `databases` entry then can't be served at all.
+        let _ = (deploy, kv, secrets_envelope);
         let name = databases.keys().next().cloned().unwrap_or_default();
         Err(Error::SqlExternalUnavailable(name))
     }
 }
 
 #[cfg(not(feature = "handlers"))]
-pub fn build_handler_runtime(
+#[allow(clippy::too_many_arguments)]
+pub async fn build_handler_runtime(
     _kv: Arc<dyn KvStore>,
     _storage: Arc<dyn boatramp_core::Storage>,
     _data_dir: &Path,
@@ -178,6 +248,8 @@ pub fn build_handler_runtime(
     _messaging_override: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
     _max_blob_bytes: u64,
     _max_component_bytes: u64,
+    _deploy: &DeployStore,
+    _secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {
     Ok(boatramp_server::HandlerRuntime::disabled())
 }
