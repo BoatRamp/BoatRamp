@@ -355,6 +355,7 @@ pub fn spawn_compute_reconcile(
     tick: std::time::Duration,
     idle_timeout: std::time::Duration,
     resolver: Option<std::sync::Arc<dyn boatramp_core::compute::ComputeBindingResolver>>,
+    managed_db: Option<std::sync::Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // drive scale-to-zero from the gateway's per-workload activity —
@@ -378,6 +379,7 @@ pub fn spawn_compute_reconcile(
                 &policy,
                 &activity,
                 resolver.as_deref(),
+                managed_db.as_deref(),
             )
             .await
             {

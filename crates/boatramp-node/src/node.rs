@@ -186,6 +186,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         COMPUTE_RECONCILE_TICK,
         COMPUTE_IDLE_TIMEOUT,
         sql_resolver,
+        // Managed-DB server-env injection is wired in below once the deploy store +
+        // secrets envelope exist (PLAN-managed-compute-sql P2-b).
+        None,
     );
 
     // Domain-verify auto-complete: periodically re-check every site's pending

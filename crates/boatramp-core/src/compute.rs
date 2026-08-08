@@ -717,6 +717,23 @@ pub trait ComputeBindingResolver: Send + Sync {
     );
 }
 
+/// Injects **server-initialization env** (`POSTGRES_*` / `MYSQL_*`) into a compute
+/// workload that a handler `sql` binding manages (PLAN-managed-compute-sql, Phase
+/// 2). The reverse of [`ComputeBindingResolver`]: that wires a *guest* to reach
+/// boatramp's shims; this wires boatramp's managed **credential** into a *database
+/// server* the guest then connects to. Given `(project, workload)` it returns the
+/// env the DB image reads on first boot to create boatramp's user/password/database
+/// — empty when `workload` is not a managed database. **Idempotent**: the credential
+/// is generated once + sealed, then stable, so it is safe to call on every launch
+/// (the DB, initialized with it, keeps accepting the same password across restarts).
+/// The concrete impl lives in `boatramp-node`, where the handler sql config + the
+/// sealed-credential store are; the reconcile only calls this trait.
+#[async_trait]
+pub trait ManagedDbEnvResolver: Send + Sync {
+    /// Server-init env for `workload` if it is a managed database, else empty.
+    async fn managed_db_env(&self, project: &str, workload: &str) -> Vec<(String, String)>;
+}
+
 /// One reconcile pass: for every workload, refresh replica health, compute the
 /// plan ([`reconcile_plan`]), and execute it against the chosen backends —
 /// launching/stopping replicas and persisting their observed state (which the
@@ -733,6 +750,7 @@ pub async fn reconcile_once(
     policy: &BackendPolicy,
     activity: &dyn ActivitySource,
     resolver: Option<&dyn ComputeBindingResolver>,
+    managed_db: Option<&dyn ManagedDbEnvResolver>,
 ) -> Result<ReconcileReport, crate::error::DeployError> {
     let mut report = ReconcileReport::default();
     // Per-backend capabilities (the planner gates scale-to-zero on them).
@@ -811,12 +829,19 @@ pub async fn reconcile_once(
                     let node_region = region_of_node(nodes, node);
                     // Resolve declared bindings → env injected into the guest (registers
                     // the shim token for this replica).
-                    let binding_env = match resolver {
+                    let mut launch_env = match resolver {
                         Some(r) if !spec.bindings.is_empty() => {
                             r.resolve(&project_name, &wl, replica, &spec.bindings).await
                         }
                         _ => Vec::new(),
                     };
+                    // If this workload is a managed database, inject its server-init
+                    // env (POSTGRES_*/MYSQL_*) from the sealed managed credential, so it
+                    // initializes on first boot with the user/password the handler will
+                    // connect as. Empty for a non-managed workload (idempotent).
+                    if let Some(m) = managed_db {
+                        launch_env.extend(m.managed_db_env(&project_name, &wl).await);
+                    }
                     match launch_one(
                         b.as_ref(),
                         &wl,
@@ -824,7 +849,7 @@ pub async fn reconcile_once(
                         node,
                         node_region,
                         &spec,
-                        &binding_env,
+                        &launch_env,
                     )
                     .await
                     {
@@ -1904,6 +1929,7 @@ mod tests {
             &policy,
             &FixedActivity(WorkloadActivity::Active),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1916,6 +1942,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Idle),
+            None,
             None,
         )
         .await
@@ -1938,6 +1965,7 @@ mod tests {
             &policy,
             &FixedActivity(WorkloadActivity::Idle),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1950,6 +1978,7 @@ mod tests {
             &nodes,
             &policy,
             &FixedActivity(WorkloadActivity::Active),
+            None,
             None,
         )
         .await
@@ -1989,9 +2018,17 @@ mod tests {
         let policy = BackendPolicy::default();
 
         // Pass 1: launches both replicas + persists their state.
-        let r = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive, None)
-            .await
-            .unwrap();
+        let r = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!((r.launched, r.stopped), (2, 0), "{:?}", r.errors);
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         let states = deploy
@@ -2006,9 +2043,17 @@ mod tests {
         );
 
         // Pass 2: already converged (FakeBackend reports Healthy) → no-op.
-        let r2 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive, None)
-            .await
-            .unwrap();
+        let r2 = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!((r2.launched, r2.stopped), (0, 0));
 
         // Scale to zero → both stopped + state cleared.
@@ -2025,9 +2070,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let r3 = reconcile_once(&deploy, &backends, &nodes, &policy, &AlwaysActive, None)
-            .await
-            .unwrap();
+        let r3 = reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &AlwaysActive,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(r3.stopped, 2);
         assert!(deploy
             .list_replica_states(crate::project::ProjectRef::DEFAULT, "w")
