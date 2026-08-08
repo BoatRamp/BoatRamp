@@ -135,19 +135,39 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 
 ### External SQL databases
 
-`bindings.sql.databases` is a map of `name → external database`, each an
-operator-run Postgres/MySQL a guest opens by that name (`sql.open("<name>")`)
-instead of a per-site libsql one. Needs the `sql-postgres` / `sql-mysql` build
-feature. Isolation is the operator's — an external database is shared across
-every guest granted the `sql` binding — so it bypasses the per-site libsql
-boundary; libsql stays the managed default. A name here shadows the same name on
-the libsql default.
+`bindings.sql.databases` is a map of `name → external database`, each a
+Postgres/MySQL a guest opens by that name (`sql.open("<name>")`) instead of a
+per-site libsql one. Needs the `sql-postgres` / `sql-mysql` build feature.
+Isolation is the operator's — such a database is shared across every guest
+granted the `sql` binding — so it bypasses the per-site libsql boundary; libsql
+stays the managed default. A name here shadows the same name on the libsql
+default.
+
+Each database has **one of two sources**, mutually exclusive:
+
+- **Bring-your-own (`url_env`)** — you run the database anywhere; boatramp reads
+  its connection URL from an env var.
+- **Compute-backed (`compute`)** — the database is a compute workload *boatramp
+  runs* (see [`compute`](#compute)). boatramp resolves the workload's live
+  endpoint on demand and builds the connection, so there is no URL to hand-map
+  and it follows the workload across restarts. With `password_env` set you bring
+  the credential; **omit it and boatramp fully manages the credential** — it
+  generates a strong password once, seals it with the [`secrets`](#secrets)
+  envelope, injects it into the DB workload's server-init env at launch, and
+  connects the handler with it, so you set no DB secret at all. A managed
+  database therefore **requires a `[secrets]` envelope** (it refuses to store a
+  credential it cannot seal) and a **persistent volume** on the DB workload (so
+  the password the server was initialized with survives a restart).
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `kind` | string | — | Engine: `postgres` (aliases `postgresql`/`pg`) or `mysql` (alias `mariadb`). Required. |
-| `url_env` | string | — | Env var holding the connection URL, e.g. `postgres://user:pw@host/db`. A secret — never the URL in-file. Required. |
+| `url_env` | string | — | **Bring-your-own source.** Env var holding the connection URL, e.g. `postgres://user:pw@host/db`. A secret — never the URL in-file. Required unless `compute` is set. |
 | `read_url_env` | string | — | Env var holding a read-replica URL. When set, `open-read-only` routes there; writes stay on `url_env`. |
+| `compute` | string | — | **Compute-backed source.** Name of a `compute` workload (a Postgres/MySQL boatramp runs) to source this database from. Mutually exclusive with `url_env`. |
+| `database` | string | — | Compute-backed: the database name inside the server (non-secret). Required with `compute`. |
+| `user` | string | — | Compute-backed: the connecting user (non-secret). Required with `compute`. |
+| `password_env` | string | — | Compute-backed: env var holding the password for `user`. **Omit to let boatramp generate + manage the credential** (needs `[secrets]`); set it to bring your own. |
 | `pool_max` | int | `8` | Maximum pooled connections. |
 | `read_only` | bool | `false` | Open every transaction `READ ONLY` (the engine rejects writes). |
 | `allow_preview` | bool | `false` | Permit preview deployments to reach it. Default refuses them, so a preview can't touch live external data. |

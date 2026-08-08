@@ -163,6 +163,55 @@ a database boatramp doesn't manage:
   you to cast it (`SELECT col::text`). MySQL has no native boolean, so a
   `TINYINT` (its bool) reads back as the integer `0`/`1`.
 
+## Managed SQL on a database boatramp runs
+
+If the Postgres/MySQL is itself a **compute workload boatramp runs** (see
+[Run a container or microVM](./compute.md)), you don't have to hand-map a
+connection URL at all. Point the database at the workload with `compute` instead
+of `url_env`, and boatramp wires the rest:
+
+```ron
+handlers: (
+    bindings: (
+        sql: (
+            databases: {
+                // Opened by the guest as `sql.open("app")`; backed by the
+                // compute workload named "pg" that boatramp runs.
+                "app": (
+                    kind: "postgres",
+                    compute: "pg",         // a compute workload, not a URL
+                    database: "app",       // db name inside the server
+                    user: "app",           // connecting user
+                    // no password_env → boatramp manages the credential
+                ),
+            },
+        ),
+    ),
+),
+// Required: a secrets envelope to seal the managed credential at rest.
+secrets: ( envelope: "local" ),
+```
+
+With `password_env` omitted, boatramp **fully manages the credential**: on first
+launch it generates a strong password, seals it with the [`secrets`](../reference/boatramp-cfg.md#secrets)
+envelope, injects it into the `pg` workload's server-init env (`POSTGRES_*` /
+`MYSQL_*`) so the database initializes with it, and connects the handler with the
+same sealed password — you set no DB secret anywhere. It then resolves the
+workload's live endpoint per use, so the binding **follows the database across
+restarts** with no config change.
+
+Two requirements make this safe and durable:
+
+- **A `[secrets]` envelope is mandatory.** boatramp refuses to manage a
+  credential it cannot seal, rather than store a DB password in cleartext — a
+  managed database with no `[secrets]` fails to start with a clear error. (Set
+  `password_env` instead to bring your own credential for a compute-backed
+  database.)
+- **Give the DB workload a persistent volume.** The password is baked into the
+  database on first init, so the data directory must survive restarts for it to
+  keep accepting the same credential. See
+  [persistent volumes](./compute.md).
+
 See the [boatramp.cfg schema](../reference/boatramp-cfg.md#external-sql-databases)
 for the full field list and [Cargo features](../reference/features.md) for the
 build features.

@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Added
+- **Managed SQL on a database boatramp runs.** A handler `sql` database can now be
+  sourced from a Postgres/MySQL **compute workload boatramp runs** instead of a
+  hand-mapped connection URL: set `compute: "<workload>"` (with `database`/`user`)
+  on the entry instead of `url_env`. boatramp resolves the workload's live endpoint
+  on demand and builds the connection, so the binding **follows the database across
+  restarts** with no config change. Omit `password_env` and boatramp **fully manages
+  the credential** — it generates a strong password once, seals it with the
+  `[secrets]` envelope, injects it into the DB workload's server-init env
+  (`POSTGRES_*` / `MYSQL_*`) at launch, and connects the handler with the same sealed
+  password, so the operator sets no DB secret at all. A managed database **requires a
+  `[secrets]` envelope** (it fails closed rather than store a credential it cannot
+  seal) and a **persistent volume** on the DB workload (so the initialized password
+  survives a restart — pairs with the 0.2.2 docker volumes). Needs the `sql-postgres`
+  / `sql-mysql` build feature. See *Managed SQL on a database boatramp runs* in
+  [Use handler bindings](docs/src/how-to/handler-bindings.md).
+
 ## [0.2.2]
 
 ### Added
