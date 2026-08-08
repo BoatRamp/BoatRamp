@@ -5,10 +5,17 @@
 //! cleartext**. The same password configures the DB workload's server env at launch
 //! and connects the handler `sql` binding, so an operator sets no DB secret at all.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use boatramp_core::compute::{ManagedDbEnvResolver, ReplicaPhase};
+use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
+use boatramp_core::project::ProjectRef;
+use boatramp_core::sql::SqlError;
+use boatramp_storage::sql_compute::ComputeEndpointResolver;
 use boatramp_storage::ExternalSqlKind;
 
 /// The env vars a managed DB server image reads to **initialize on first boot** with
@@ -94,6 +101,129 @@ impl ManagedSqlCredentials {
     }
 }
 
+/// One managed database's non-secret connection parts, keyed in [`ManagedDbEnv`]
+/// by the compute **workload** that backs it.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+struct ManagedDbSpec {
+    kind: ExternalSqlKind,
+    database: String,
+    user: String,
+}
+
+/// The node's [`ManagedDbEnvResolver`]: the set of managed databases (from the
+/// handler `sql` config) keyed by backing workload, plus the sealed-credential
+/// store. At launch the reconcile asks this for a workload's server-init env; a
+/// non-managed workload gets nothing. Both sides (this injector and the handler's
+/// [`ComputeResolvedSqlBackend`]) read the **same** sealed credential, so the DB is
+/// initialized with exactly the password the handler later connects with.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub struct ManagedDbEnv {
+    dbs: HashMap<String, ManagedDbSpec>,
+    creds: ManagedSqlCredentials,
+}
+
+impl ManagedDbEnv {
+    /// Build from the handler `sql` `databases` config + the credential store,
+    /// selecting only the **managed** ones (compute-backed, no `password_env`).
+    /// A database with an unparsable engine or missing parts is skipped (config
+    /// validation already rejects those before serve).
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn from_config(
+        databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+        creds: ManagedSqlCredentials,
+    ) -> Self {
+        let mut dbs = HashMap::new();
+        for db in databases.values() {
+            if !db.is_managed_credential() {
+                continue;
+            }
+            let (Some(workload), Some(kind), Some(database), Some(user)) = (
+                db.compute.clone(),
+                ExternalSqlKind::parse(&db.kind),
+                db.database.clone(),
+                db.user.clone(),
+            ) else {
+                continue;
+            };
+            dbs.insert(
+                workload,
+                ManagedDbSpec {
+                    kind,
+                    database,
+                    user,
+                },
+            );
+        }
+        Self { dbs, creds }
+    }
+
+    /// No managed databases configured — the caller can skip wiring this resolver.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.dbs.is_empty()
+    }
+}
+
+#[async_trait]
+impl ManagedDbEnvResolver for ManagedDbEnv {
+    async fn managed_db_env(&self, project: &str, workload: &str) -> Vec<(String, String)> {
+        let Some(db) = self.dbs.get(workload) else {
+            return Vec::new();
+        };
+        match self.creds.password(project, workload).await {
+            Ok(password) => managed_db_server_env(db.kind, &db.database, &db.user, &password),
+            Err(e) => {
+                // Fail closed on the env: without the sealed credential we must not
+                // launch the DB with a blank/default password. An empty env means
+                // the image refuses to initialize, which surfaces the misconfig.
+                tracing::error!(
+                    %workload,
+                    error = %e,
+                    "managed sql: could not resolve the sealed credential; DB launched without managed env"
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// A [`ComputeEndpointResolver`] backed by the control-plane replica state: it
+/// lists a workload's **healthy, running** replicas (primary-first by replica
+/// index) as `(host, port)`, scoped to a fixed project. Backs the handler's
+/// [`ComputeResolvedSqlBackend`](boatramp_storage::sql_compute::ComputeResolvedSqlBackend)
+/// so a managed `sql` binding follows its DB workload across restarts.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+pub struct DeployEndpointResolver {
+    deploy: DeployStore,
+    project: String,
+}
+
+impl DeployEndpointResolver {
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub fn new(deploy: DeployStore, project: impl Into<String>) -> Self {
+        Self {
+            deploy,
+            project: project.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl ComputeEndpointResolver for DeployEndpointResolver {
+    async fn endpoints(&self, workload: &str) -> Result<Vec<(String, u16)>, SqlError> {
+        let states = self
+            .deploy
+            .list_replica_states(ProjectRef::new(&self.project), workload)
+            .await
+            .map_err(SqlError::other)?;
+        Ok(states
+            .into_iter()
+            .filter(|s| s.phase == ReplicaPhase::Running && s.healthy)
+            .map(|s| (s.endpoint.host, s.endpoint.port))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +295,179 @@ mod tests {
         assert!(my.contains(&("MYSQL_USER".into(), "app".into())));
         assert!(my.contains(&("MYSQL_DATABASE".into(), "shop".into())));
         assert!(my.contains(&("MYSQL_ROOT_PASSWORD".into(), "pw".into())));
+    }
+
+    use crate::config::ExternalDatabaseConfig;
+    use std::collections::BTreeMap;
+
+    fn db(
+        kind: &str,
+        compute: Option<&str>,
+        url_env: &str,
+        pw_env: Option<&str>,
+    ) -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            kind: kind.into(),
+            url_env: url_env.into(),
+            compute: compute.map(Into::into),
+            database: compute.map(|_| "analytics".into()),
+            user: compute.map(|_| "app".into()),
+            password_env: pw_env.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_db_env_only_covers_managed_workloads() {
+        let mut dbs = BTreeMap::new();
+        // Managed: compute-backed, no password_env.
+        dbs.insert(
+            "analytics".to_string(),
+            db("postgres", Some("pg"), "", None),
+        );
+        // Bring-your-own credential: compute-backed WITH password_env → not managed.
+        dbs.insert(
+            "byo".to_string(),
+            db("postgres", Some("pg2"), "", Some("PG2_PW")),
+        );
+        // Bring-your-own URL: not compute-backed → not managed.
+        dbs.insert("ext".to_string(), db("mysql", None, "MYSQL_URL", None));
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
+        let env = ManagedDbEnv::from_config(&dbs, creds);
+        assert!(!env.is_empty());
+
+        // The managed workload gets its server-init env, sealed-password-derived.
+        let pg = env.managed_db_env("default", "pg").await;
+        assert!(pg.contains(&("POSTGRES_USER".into(), "app".into())));
+        assert!(pg.contains(&("POSTGRES_DB".into(), "analytics".into())));
+        let password = pg
+            .iter()
+            .find(|(k, _)| k == "POSTGRES_PASSWORD")
+            .map(|(_, v)| v.clone())
+            .expect("password present");
+        assert_eq!(password.len(), 64, "managed 32-byte hex password");
+        // Idempotent: the same sealed credential each call.
+        let pg2 = env.managed_db_env("default", "pg").await;
+        assert_eq!(pg, pg2);
+
+        // The BYO-credential + BYO-URL workloads are NOT managed here.
+        assert!(env.managed_db_env("default", "pg2").await.is_empty());
+        assert!(env.managed_db_env("default", "nope").await.is_empty());
+    }
+
+    // A no-op object store so a `DeployStore` can be built for the KV-only replica
+    // state the endpoint resolver reads.
+    use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+    struct NullStorage;
+    #[async_trait]
+    impl Storage for NullStorage {
+        async fn get(&self, _: &str) -> Result<GetObject, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::unsupported("null"))
+        }
+        async fn head(&self, _: &str) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn replica(
+        workload: &str,
+        replica: u32,
+        host: &str,
+        port: u16,
+        healthy: bool,
+        phase: ReplicaPhase,
+    ) -> boatramp_core::compute::ObservedInstance {
+        use boatramp_core::compute::{Endpoint, InstanceHandle, Scheme};
+        boatramp_core::compute::ObservedInstance {
+            handle: InstanceHandle {
+                workload: workload.into(),
+                replica,
+                backend_ref: String::new(),
+            },
+            node: 0,
+            backend: "fake".into(),
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: host.into(),
+                port,
+            },
+            region: None,
+            healthy,
+            phase,
+            snapshot: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_resolver_returns_only_healthy_running_replicas() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let p = ProjectRef::DEFAULT;
+        // Two healthy running replicas, one unhealthy, one parked (Zero).
+        deploy
+            .set_replica_state(
+                p,
+                &replica("pg", 0, "10.0.0.1", 5432, true, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(
+                p,
+                &replica("pg", 1, "10.0.0.2", 5432, true, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(
+                p,
+                &replica("pg", 2, "10.0.0.3", 5432, false, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(
+                p,
+                &replica("pg", 3, "10.0.0.4", 5432, false, ReplicaPhase::Zero),
+            )
+            .await
+            .unwrap();
+
+        let resolver = DeployEndpointResolver::new(deploy, "default");
+        let mut eps = resolver.endpoints("pg").await.unwrap();
+        eps.sort();
+        assert_eq!(
+            eps,
+            vec![
+                ("10.0.0.1".to_string(), 5432),
+                ("10.0.0.2".to_string(), 5432)
+            ],
+            "only the healthy running replicas, unhealthy + Zero filtered out"
+        );
+        // A workload with no replicas resolves to nothing (a clear no-endpoint state).
+        assert!(resolver.endpoints("absent").await.unwrap().is_empty());
     }
 }
