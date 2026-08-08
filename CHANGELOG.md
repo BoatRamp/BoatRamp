@@ -8,6 +8,24 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **macOS-native microVM compute backend (`vmm-vz`).** On Apple silicon + macOS 15+,
+  boatramp runs each compute replica as a lightweight Linux VM via Apple's
+  Virtualization.framework — the macOS analog of the Linux/KVM `vmm-embedded`
+  backend, with **strong per-VM isolation** (`IsolationClass::VmKvm`) and an
+  **identical user surface** (same `ComputeSpec`, `boatramp compute` CLI, and
+  `/api/compute` — the environment difference lives entirely behind the backend
+  seam). It stays a **single binary**: each VM runs in a re-exec'd `__vz-run`
+  worker (mirroring the KVM `__vmm-run`), driven in-process through
+  `objc2-virtualization`. Capability-detected and registered only on a capable
+  host; off macOS the crate compiles to its pure orchestration layer (the objc2
+  deps are `target_os="macos"`-gated), so Linux builds are unaffected. The boot
+  path is live-validated on Apple silicon (boot loader → arm64 kernel → virtio-blk
+  root → serial console → kernel cmdline, under the free self-signable
+  `com.apple.security.virtualization` entitlement). macOS 26 is recommended
+  (macOS 15's vmnet lacks container-to-container networking). Deferred to follow-ups:
+  scale-to-zero via `saveMachineState`/`restoreMachineState` (advertises
+  `scale_to_zero: false` for now) and the CI release-signing step. See
+  [`compute`](docs/src/reference/boatramp-cfg.md#compute).
 - **Managed SQL on a database boatramp runs.** A handler `sql` database can now be
   sourced from a Postgres/MySQL **compute workload boatramp runs** instead of a
   hand-mapped connection URL: set `compute: "<workload>"` (with `database`/`user`)
