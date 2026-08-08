@@ -24,12 +24,20 @@ versions.
   from an `ext4` rootfs, gets a static vmnet IP, and **runs PostgreSQL 16 with its
   data directory on a persistent virtio-block volume** — the port is reachable from
   the macOS host over vmnet, and the data survives a full VM restart. macOS 26 is
-  recommended (macOS 15's vmnet lacks container-to-container networking). Deferred
-  to follow-ups: an `aarch64` guest `vminit` + arm64 kernel selection so the
-  `compute build` (OCI→ext4) path produces macOS-ready images directly; scale-to-zero
-  via `saveMachineState`/`restoreMachineState` (advertises `scale_to_zero: false` for
-  now); and the CI release-signing step. See
-  [`compute`](docs/src/reference/boatramp-cfg.md#compute).
+  recommended (macOS 15's vmnet lacks container-to-container networking).
+  **`compute build` produces arm64 images on macOS**: the guest `vminit` is now
+  arch-portable (x86_64 + aarch64), the `boatramp-firecracker` build cross-compiles
+  the aarch64 init via `zig` on macOS, and the OCI pull + kernel trust are
+  arch-scoped to the guest arch — validated end-to-end (a Docker Hub image built to
+  an arm64 rootfs on macOS boots under `vmm-vz` and serves). Deferred to follow-ups:
+  the **signed** `boatramp-vmlinux-aarch64` kernel release (its reproducible build +
+  release matrix are wired; the signed artifact + baking its hash into the arch-scoped
+  allow-list is the remaining CI/secret step — the `single-tenant` posture already
+  runs `vmm-vz` with any arm64 kernel today); scale-to-zero via
+  `saveMachineState`/`restoreMachineState` (advertises `scale_to_zero: false` for
+  now); and the CI binary-signing step. See
+  [`compute`](docs/src/reference/boatramp-cfg.md#compute) and
+  [The kernel and its trust](docs/src/how-to/compute.md).
 - **Managed SQL on a database boatramp runs.** A handler `sql` database can now be
   sourced from a Postgres/MySQL **compute workload boatramp runs** instead of a
   hand-mapped connection URL: set `compute: "<workload>"` (with `database`/`user`)
