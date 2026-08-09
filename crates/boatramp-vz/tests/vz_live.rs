@@ -47,7 +47,6 @@ fn vz_live_build_configuration_validates() {
         mem_mib: 512,
         vcpus: 1,
         volumes: vec![],
-        restore_path: None,
     };
     boatramp_vz::vm::build_configuration(&cfg)
         .expect("a well-formed config with real kernel+rootfs must validate");
@@ -76,7 +75,6 @@ fn vz_live_boot_and_stop() {
         mem_mib: 512,
         vcpus: 1,
         volumes: vec![],
-        restore_path: None,
     };
     // Run the worker in a thread; close its "stdin" analog by dropping after a
     // delay is not directly possible here (run_worker reads the process stdin), so
