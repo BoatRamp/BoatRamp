@@ -30,17 +30,31 @@ versions.
   the aarch64 init via `zig` on macOS, and the OCI pull + kernel trust are
   arch-scoped to the guest arch — validated end-to-end (a Docker Hub image built to
   an arm64 rootfs on macOS boots under `vmm-vz` and serves). A **signed first-party
-  arm64 kernel is shipped**: `boatramp-vmlinux` v0.2.2 publishes a reproducible,
-  ES256-signed `boatramp-vmlinux-aarch64` (a raw arm64 `Image`) whose hash is on the
-  arch-scoped allow-list, so strict-posture `vmm-vz` on Apple silicon verifies it out
-  of the box (as the x86_64 kernel does on Linux). The **released macOS binaries are
-  code-signed** with the `com.apple.security.virtualization` entitlement (ad-hoc, the
-  last build step, with a survive-assert per podman #21843) so the shipped binary can
-  boot VMs. **Scale-to-zero is not supported on `vmm-vz`** (`scale_to_zero: false`):
-  Virtualization.framework cannot restore a Linux-guest saved state
-  (`restoreMachineStateFromURL:` fails "invalid argument"; the save path works, but a
-  save you can't restore is useless), so it's blocked on Apple — unlike the KVM
-  embedded VMM, which does support it. See
+  arm64 kernel is shipped**: `boatramp-vmlinux` v0.2.3 publishes an ES256-signed
+  `boatramp-vmlinux-aarch64` (a raw arm64 `Image`) whose hash is on the arch-scoped
+  allow-list, so strict-posture `vmm-vz` on Apple silicon verifies it out of the box
+  (as the x86_64 kernel does on Linux) — the allow-list pins the published signed
+  asset (the aarch64 build is not currently bit-reproducible across build hosts, so
+  verify against the release `.sha256`/`.sig`, not a local rebuild). This kernel
+  **enables the generic
+  PCIe host + virtio-pci**: Virtualization.framework presents its virtio disk/net/
+  console over a PCIe host bridge (not the cmdline virtio-mmio the Firecracker config
+  targets), so the earlier `CONFIG_PCI`-off build never booted under VZ; the PCI build
+  boots, mounts its root over virtio-blk, and gets its static IP via kernel `ip=`
+  autoconfig over virtio-net. The **released macOS binaries are code-signed** with the
+  `com.apple.security.virtualization` entitlement (ad-hoc, the last build step, with a
+  survive-assert per podman #21843) so the shipped binary can boot VMs.
+- **Scale-to-zero on `vmm-vz`** (`scale_to_zero: true`). An idle `vmm-vz` replica is
+  now parked to disk and later woken, the macOS analog of the KVM embedded VMM's
+  scale-to-zero: `snapshot` pauses the VM, writes its state with
+  `saveMachineStateToURL:`, and stops it; `restore` recreates the VM and
+  `restoreMachineStateFromURL:` + resumes it. The key is a **stable
+  `VZGenericMachineIdentifier`** threaded from launch through park to wake (via a
+  `VZGenericPlatformConfiguration`): Virtualization.framework rejects a restore whose
+  identifier differs from the saved VM's, so the backend mints one per replica and
+  persists it with the snapshot. **Validated end-to-end on Apple silicon** — a parked
+  guest wakes with its exact in-RAM state intact (init does not re-run), gated by
+  `tests/vz_live.rs::vz_live_snapshot_restore_roundtrip`. See
   [`compute`](docs/src/reference/boatramp-cfg.md#compute) and
   [The kernel and its trust](docs/src/how-to/compute.md).
 - **Managed SQL on a database boatramp runs.** A handler `sql` database can now be

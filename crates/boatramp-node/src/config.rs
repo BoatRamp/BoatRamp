@@ -259,12 +259,19 @@ fn default_allowed_kernel_hashes() -> Vec<String> {
     #[cfg(target_arch = "aarch64")]
     {
         vec![
-            // `boatramp-vmlinux-aarch64` v0.2.2 (the Virtualization.framework guest
-            // kernel, flake `#vmlinux` on aarch64-linux — a raw arm64 `Image`).
-            // Reproducible build; signed by BOATRAMP_KERNEL_SIGNING_PUBKEY in the
-            // boatramp-vmlinux release, so a selected `compute.default_kernel`
-            // clears the strict bar out of the box. Bump on each new signed release.
-            "be95fb0dd2c3c5595624efef4f0a9903cd944313870c0011cc876e28032ca5a5".to_string(),
+            // `boatramp-vmlinux-aarch64` v0.2.3 (the Virtualization.framework guest
+            // kernel, flake `#vmlinux` on aarch64-linux — a raw arm64 `Image`). This
+            // release enables the generic PCIe host + virtio-pci so the guest actually
+            // discovers VZ's virtio disk/net/console (the earlier v0.2.2 `be95fb0d…`
+            // built with `CONFIG_PCI` off never booted under VZ and is dropped). This
+            // is the hash of the **published, ES256-signed** release asset (signed by
+            // BOATRAMP_KERNEL_SIGNING_PUBKEY), so a selected `compute.default_kernel`
+            // clears the strict bar out of the box; the boot + scale-to-zero round-trip
+            // was validated against this exact published kernel. NOTE: unlike x86_64,
+            // the aarch64 build is not currently bit-reproducible across build hosts
+            // (same config + size, different build metadata), so pin/verify against the
+            // published `.sha256`/`.sig`, not a local rebuild. Bump on each new release.
+            "d785a48d754e65a4630443301f1fb84cb69cf882336d3cf37055e437b3d8e21f".to_string(),
         ]
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

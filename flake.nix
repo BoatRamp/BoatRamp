@@ -338,7 +338,23 @@
                 # are already =y); the config is used verbatim.
                 config =
                   if isArm then
-                    fcConfig
+                    # aarch64/VZ: Virtualization.framework presents its virtio devices
+                    # to the guest over a generic **PCIe host bridge (ECAM)**, not the
+                    # cmdline virtio-mmio the Firecracker config targets — so the stock
+                    # config (CONFIG_PCI off) finds no devices and never boots. Enable
+                    # the generic PCIe host + virtio-pci so VZ's disk/net/console are
+                    # discovered. (virtio-mmio stays on too, harmlessly.)
+                    pkgs.runCommand "boatramp-vmlinux.config" { } ''
+                      grep -vE '^(# )?CONFIG_(PCI|PCI_HOST_GENERIC|PCI_HOST_COMMON|PCI_ECAM|VIRTIO_PCI)( is not set|=)' \
+                        ${fcConfig} > "$out"
+                      {
+                        echo CONFIG_PCI=y
+                        echo CONFIG_PCI_HOST_COMMON=y
+                        echo CONFIG_PCI_HOST_GENERIC=y
+                        echo CONFIG_PCI_ECAM=y
+                        echo CONFIG_VIRTIO_PCI=y
+                      } >> "$out"
+                    ''
                   else
                     pkgs.runCommand "boatramp-vmlinux.config" { } ''
                       sed 's/# CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not set/CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y/' \
@@ -356,8 +372,21 @@
                     inherit (pkgs.linux_6_1) version src;
                     configfile = config;
                     allowImportFromDerivation = true;
+                    # `linuxManualConfig`'s configurePhase runs `make oldconfig`,
+                    # which non-interactively expands a partial config: the aarch64
+                    # PCI options appended above pull in their `select`ed sub-options
+                    # with defaults, so no strict "verbatim" check applies here
+                    # (that lives in the higher-level `buildLinux`, not this path).
                   }).overrideAttrs
                     (old: {
+                      # nixpkgs marks kernels `requiredSystemFeatures = ["big-parallel"]`,
+                      # but the stock nix-darwin `linux-builder` (the only aarch64-linux
+                      # builder on a Mac dev host) advertises no features, so the build
+                      # can't be scheduled there. This minimal microVM kernel builds fine
+                      # without the hint (it's a scheduling gate, not a correctness one,
+                      # and doesn't affect the output bytes), so drop it — CI's native
+                      # aarch64 runner is unaffected.
+                      requiredSystemFeatures = [ ];
                       postInstall = (old.postInstall or "") + ''
                         cp "$buildRoot/${kernelRel}" "$out/${kernelName}"
                       '';

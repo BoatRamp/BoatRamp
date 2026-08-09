@@ -45,6 +45,19 @@ pub struct WorkerConfig {
     /// (`/dev/vdb`, `/dev/vdc`, …) after the rootfs, in order.
     #[serde(default)]
     pub volumes: Vec<WorkerVolume>,
+    /// **Restore** (scale-to-zero wake): host path to a `saveMachineStateToURL:`
+    /// state file. When set, the worker recreates the VM from this `WorkerConfig`
+    /// (which must match the one that saved it), `restoreMachineStateFromURL:` +
+    /// `resume`s it instead of a fresh boot. `None` ⇒ a normal cold boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_path: Option<String>,
+    /// Hex of a `VZGenericMachineIdentifier.dataRepresentation` — the VM's stable
+    /// platform identity. VZ requires the identifier on **restore** to match the one
+    /// the state was **saved** with, so the backend generates it once at launch and
+    /// threads it through launch → snapshot → restore. `None` ⇒ the worker mints a
+    /// fresh one (a VM that is never restored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// One persistent volume as the worker needs it: the (already-created) host image
@@ -172,6 +185,8 @@ mod tests {
             mem_mib: 256,
             vcpus: 1,
             volumes: vec![],
+            restore_path: None,
+            machine_id: None,
         };
         let full = full_cmdline(&cfg);
         assert!(full.starts_with("console=hvc0"), "{full}");
@@ -191,6 +206,8 @@ mod tests {
             mem_mib: 256,
             vcpus: 1,
             volumes: vec![],
+            restore_path: None,
+            machine_id: None,
         };
         assert_eq!(full_cmdline(&cfg), "custom root=/dev/vda ro");
     }
@@ -211,6 +228,8 @@ mod tests {
                 image_path: "/data/compute/volumes/db.img".into(),
                 mount: "/data".into(),
             }],
+            restore_path: None,
+            machine_id: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: WorkerConfig = serde_json::from_str(&json).unwrap();

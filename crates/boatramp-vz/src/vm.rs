@@ -18,15 +18,17 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AllocAnyThread;
 use objc2_core_foundation::CFRunLoop;
-use objc2_foundation::{NSError, NSFileHandle, NSString, NSURL};
+use objc2_foundation::{NSData, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment, VZLinuxBootLoader,
-    VZMACAddress, VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
+    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
+    VZGenericMachineIdentifier, VZGenericPlatformConfiguration, VZLinuxBootLoader, VZMACAddress,
+    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
     VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioNetworkDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
@@ -51,6 +53,23 @@ pub fn build_configuration(
         let configuration = VZVirtualMachineConfiguration::new();
         configuration.setCPUCount(cfg.vcpus.max(1) as usize);
         configuration.setMemorySize(u64::from(cfg.mem_mib.max(1)) * 1024 * 1024);
+
+        // Platform: a generic Linux platform carrying a **machine identifier**. For
+        // save/restore (scale-to-zero), VZ requires the restore's identifier to match
+        // the saved VM's, so it comes from `cfg.machine_id` (persisted across the
+        // park); a fresh one is minted for a VM that is never restored.
+        let platform = VZGenericPlatformConfiguration::new();
+        let machine_id = cfg
+            .machine_id
+            .as_deref()
+            .and_then(machine_id_from_hex)
+            .unwrap_or_else(|| {
+                VZGenericMachineIdentifier::init(VZGenericMachineIdentifier::alloc())
+            });
+        platform.setMachineIdentifier(&machine_id);
+        let platform_up: Retained<objc2_virtualization::VZPlatformConfiguration> =
+            Retained::into_super(platform);
+        configuration.setPlatform(&platform_up);
 
         // Boot loader: kernel + the assembled cmdline (base + env fragment).
         let kernel_url = file_url(&cfg.kernel_path);
@@ -84,8 +103,8 @@ pub fn build_configuration(
             Retained::into_super(net);
         configuration.setNetworkDevices(&objc2_foundation::NSArray::from_slice(&[net_up.as_ref()]));
 
-        // Serial console → this process's stderr (boot logs; gated by
-        // BOATRAMP_VMM_SERIAL at the caller, but always wired so a crash is visible).
+        // Serial console → this process's stderr (boot logs; always wired so a crash
+        // is visible).
         let console = VZVirtioConsoleDeviceSerialPortConfiguration::new();
         let stderr = NSFileHandle::fileHandleWithStandardError();
         let attachment =
@@ -104,6 +123,15 @@ pub fn build_configuration(
         configuration
             .validateWithError()
             .map_err(|e| format!("invalid VM configuration: {}", ns_error(&e)))?;
+        // Whether this device model can be paused + saved + restored (scale-to-zero).
+        // Not fatal (save/restore is optional) but log the specific reason if not, so
+        // an operator can see why a workload won't park.
+        if let Err(e) = configuration.validateSaveRestoreSupportWithError() {
+            eprintln!(
+                "vz: save/restore unsupported for this config: {}",
+                ns_error(&e)
+            );
+        }
         Ok(configuration)
     }
 }
@@ -134,25 +162,109 @@ fn file_url(path: &str) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(path))
 }
 
-/// Render an [`NSError`] as a `String` for our error type.
+/// A fresh VM platform identity, hex-encoded (its `dataRepresentation`). The backend
+/// generates one per replica at launch and threads it through launch → snapshot →
+/// restore, because VZ rejects a restore whose machine identifier differs from the
+/// saved VM's. Cheap plain object creation — safe to call off any queue.
+pub fn new_machine_id_hex() -> String {
+    // SAFETY: plain Obj-C object creation; no threading constraints.
+    let id = unsafe { VZGenericMachineIdentifier::init(VZGenericMachineIdentifier::alloc()) };
+    let data = unsafe { id.dataRepresentation() };
+    hex_encode(&data.to_vec())
+}
+
+/// Recreate a machine identifier from the hex of its `dataRepresentation`; `None`
+/// if the hex is malformed or VZ rejects the bytes.
+fn machine_id_from_hex(hex: &str) -> Option<Retained<VZGenericMachineIdentifier>> {
+    let bytes = hex_decode(hex)?;
+    let data = NSData::with_bytes(&bytes);
+    // SAFETY: plain object creation; returns nil (→ None) if the data is invalid.
+    unsafe {
+        VZGenericMachineIdentifier::initWithDataRepresentation(
+            VZGenericMachineIdentifier::alloc(),
+            &data,
+        )
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+        s.push(char::from_digit(u32::from(b & 0xf), 16).unwrap());
+    }
+    s
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Render an [`NSError`] as a `String` for our error type, appending the failure
+/// reason when present (it names the specific incompatible device on a save/restore
+/// or configuration error).
 fn ns_error(err: &NSError) -> String {
-    err.localizedDescription().to_string()
+    let desc = err.localizedDescription().to_string();
+    match err.localizedFailureReason() {
+        Some(reason) => format!("{desc} ({reason})"),
+        None => desc,
+    }
+}
+
+/// Invoke an async `VZVirtualMachine` op (`start`/`restore`/`resume`/`pause`/`save`,
+/// each a `…CompletionHandler:` taking `void (^)(NSError *)`) and block **this**
+/// thread until its completion fires, by pumping the run loop (the framework
+/// delivers the completion there). Must be called on the VM's thread. `Err` carries
+/// the op's `NSError`.
+fn block_on_vm<F>(invoke: F) -> Result<(), String>
+where
+    F: FnOnce(&RcBlock<dyn Fn(*mut NSError)>),
+{
+    let result: Rc<RefCell<Option<Result<(), String>>>> = Rc::new(RefCell::new(None));
+    let sink = result.clone();
+    let handler = RcBlock::new(move |err: *mut NSError| {
+        // SAFETY: a non-null error is owned by the framework for the callback.
+        let r = if err.is_null() {
+            Ok(())
+        } else {
+            Err(ns_error(unsafe { &*err }))
+        };
+        *sink.borrow_mut() = Some(r);
+        // Return control to the pumping `CFRunLoop::run()` below.
+        if let Some(rl) = CFRunLoop::current() {
+            rl.stop();
+            rl.wake_up();
+        }
+    });
+    invoke(&handler);
+    // The completion handler stops the loop; the guard tolerates a spurious return.
+    while result.borrow().is_none() {
+        CFRunLoop::run();
+    }
+    let outcome = result.borrow_mut().take().unwrap_or(Ok(()));
+    outcome
 }
 
 /// Run one VM to completion in **this** process. Called from the `__vz-run`
 /// re-exec child.
 ///
-/// The whole VM lifecycle stays on **this one thread** — `VZVirtualMachine` and
-/// its owned objects are `!Send`, so they never cross a thread boundary. We use
-/// the *main-queue* VM (`initWithConfiguration:`, which drives the VM off the
-/// thread's run loop), start it with a completion block, then pump this thread's
-/// [`CFRunLoop`] so the framework can deliver the guest's I/O + lifecycle events.
-/// A tiny **watcher thread** reads the control channel (stdin) and, on EOF (the
-/// parent's `stop` drops it), stops the run loop — after which we request a clean
-/// guest halt. Mirrors the KVM worker's "run until the parent tears it down"
-/// contract, cooperatively.
+/// The whole VM lifecycle stays on **this one thread** — `VZVirtualMachine` and its
+/// owned objects are `!Send`, so they never cross a thread boundary. We use the
+/// *main-queue* VM (`initWithConfiguration:`, driven off the thread's run loop),
+/// bring it to Running (a fresh `start`, or `restore` from a saved state file +
+/// `resume` for a scale-to-zero wake), then pump the [`CFRunLoop`] so the framework
+/// delivers the guest's I/O + lifecycle. A tiny **control watcher** reads one command
+/// off stdin — `snapshot <path>` (pause + `saveMachineStateToURL:`, then exit) or EOF
+/// (clean stop) — and stops the run loop so we act on it. Mirrors the KVM worker's
+/// cooperative "run until the parent tears it down" contract, plus scale-to-zero.
 ///
-/// Returns `Ok(())` on a clean run-loop exit; `Err` on a config/start failure.
+/// Returns `Ok(())` on a clean run/stop/snapshot; `Err` on a start/restore/save failure.
 pub fn run_worker(cfg: WorkerConfig) -> Result<(), String> {
     let configuration = build_configuration(&cfg)?;
 
@@ -162,54 +274,69 @@ pub fn run_worker(cfg: WorkerConfig) -> Result<(), String> {
         VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &configuration)
     };
 
-    // Start; the completion block (run on this thread's run loop) records success.
-    let start_result: Rc<RefCell<Option<Result<(), String>>>> = Rc::new(RefCell::new(None));
-    {
-        let start_result = start_result.clone();
-        let handler = RcBlock::new(move |err: *mut NSError| {
-            let r = if err.is_null() {
-                Ok(())
-            } else {
-                // SAFETY: a non-null error is owned by the framework for the callback.
-                Err(format!("start failed: {}", ns_error(unsafe { &*err })))
-            };
-            *start_result.borrow_mut() = Some(r);
-        });
-        // SAFETY: on the VM's thread; the block outlives the async call via RcBlock.
-        unsafe { vm.startWithCompletionHandler(&handler) };
+    // Bring the VM to Running: restore-from-file + resume (scale-to-zero wake), or a
+    // fresh cold boot. Each op is pumped to completion on this thread.
+    match &cfg.restore_path {
+        Some(path) => {
+            let url = file_url(path);
+            // SAFETY: on the VM's thread; the block outlives the async call via RcBlock.
+            block_on_vm(|h| unsafe { vm.restoreMachineStateFromURL_completionHandler(&url, h) })
+                .map_err(|e| format!("restore from {path}: {e}"))?;
+            // Restore leaves the VM paused; resume it into the running state.
+            block_on_vm(|h| unsafe { vm.resumeWithCompletionHandler(h) })
+                .map_err(|e| format!("resume: {e}"))?;
+        }
+        None => {
+            block_on_vm(|h| unsafe { vm.startWithCompletionHandler(h) })
+                .map_err(|e| format!("start: {e}"))?;
+        }
     }
 
-    // Watch the control channel on a helper thread; stop the run loop on EOF.
-    // `CFRunLoopStop`/`CFRunLoopWakeUp` are documented thread-safe, so we hand the
-    // watcher a raw pointer (in a `Send` wrapper) — it never touches the (!Send)
-    // VM, only signals the loop. We leak one strong ref to the run loop so the
-    // pointer stays valid across `run()` (the loop lives for the process anyway).
+    // Watch the control channel on a helper thread; it reads one command + stops the
+    // run loop. `CFRunLoopStop`/`WakeUp` are documented thread-safe, so we hand it a
+    // raw pointer (in a `Send` wrapper) — it never touches the (!Send) VM. We leak one
+    // strong ref to the run loop so the pointer stays valid (the loop lives anyway).
+    let action: Arc<Mutex<Option<WorkerAction>>> = Arc::new(Mutex::new(None));
     if let Some(run_loop) = CFRunLoop::current() {
         let ptr = objc2_core_foundation::CFRetained::as_ptr(&run_loop);
-        spawn_stdin_watcher(RunLoopHandle(ptr.as_ptr()));
+        spawn_control_watcher(RunLoopHandle(ptr.as_ptr()), action.clone());
         std::mem::forget(run_loop);
     }
 
-    // Pump this thread's run loop until the watcher stops it (parent closed stdin)
-    // or the VM stops itself. The framework delivers guest I/O + lifecycle here.
+    // Serve until the parent asks to stop or snapshot. The framework delivers guest
+    // I/O + lifecycle here.
     CFRunLoop::run();
 
-    // Surface a start failure if the completion handler recorded one.
-    if let Some(Err(e)) = start_result.borrow().clone() {
-        return Err(e);
-    }
-
-    // Best-effort clean guest stop on the way out (we're back on the VM's thread).
-    // SAFETY: on the VM's thread; `canStop`/`requestStopWithError` are valid here.
-    unsafe {
-        if vm.canStop() {
-            let _ = vm.requestStopWithError();
+    // Carry out the request back on the VM's thread.
+    match action.lock().expect("action mutex").take() {
+        Some(WorkerAction::Snapshot(path)) => {
+            // Scale-to-zero park: pause, write the state file, then **stop** the VM.
+            // The stop is required — the saved state file is only finalized into a
+            // restorable form on a clean stop; exiting while merely paused leaves a
+            // file that `restoreMachineStateFromURL:` rejects with "invalid argument".
+            // (Same order Lima uses.) The state restores via `restore_path` on wake.
+            block_on_vm(|h| unsafe { vm.pauseWithCompletionHandler(h) })
+                .map_err(|e| format!("pause: {e}"))?;
+            let url = file_url(&path);
+            block_on_vm(|h| unsafe { vm.saveMachineStateToURL_completionHandler(&url, h) })
+                .map_err(|e| format!("save to {path}: {e}"))?;
+            block_on_vm(|h| unsafe { vm.stopWithCompletionHandler(h) })
+                .map_err(|e| format!("stop after save: {e}"))?;
+        }
+        _ => {
+            // Best-effort clean guest stop on the way out (back on the VM's thread).
+            // SAFETY: on the VM's thread; `canStop`/`requestStopWithError` are valid here.
+            unsafe {
+                if vm.canStop() {
+                    let _ = vm.requestStopWithError();
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// A `Send` wrapper over a raw `CFRunLoop` pointer, so the stdin watcher can
+/// A `Send` wrapper over a raw `CFRunLoop` pointer, so the control watcher can
 /// signal the loop from another thread. Safe because `CFRunLoopStop`/`WakeUp` are
 /// documented thread-safe and [`run_worker`] leaks a strong ref keeping the loop
 /// alive for the pointer's lifetime.
@@ -218,25 +345,34 @@ struct RunLoopHandle(*mut CFRunLoop);
 // documented as thread-safe by Core Foundation.
 unsafe impl Send for RunLoopHandle {}
 
-/// Spawn a helper thread that blocks reading the control channel (stdin) and, on
-/// EOF — the parent's `stop` drops the child's stdin — stops the run loop so
-/// [`run_worker`]'s `CFRunLoop::run()` returns. Never touches the VM.
-fn spawn_stdin_watcher(handle: RunLoopHandle) {
+/// What the parent asked the worker to do, read off the control channel (stdin).
+enum WorkerAction {
+    /// EOF / unrecognized input: request a clean guest halt, then exit.
+    Stop,
+    /// `snapshot <path>`: pause + `saveMachineStateToURL:(<path>)`, then exit — the
+    /// scale-to-zero park. The state restores via [`WorkerConfig::restore_path`].
+    Snapshot(String),
+}
+
+/// Spawn a helper thread that reads **one** control command from stdin — `snapshot
+/// <path>` (scale-to-zero) or EOF (stop) — records it in `action`, and stops the run
+/// loop so [`run_worker`]'s serve `CFRunLoop::run()` returns to act on it. Never
+/// touches the (!Send) VM; only signals the loop via the thread-safe handle.
+fn spawn_control_watcher(handle: RunLoopHandle, action: Arc<Mutex<Option<WorkerAction>>>) {
     std::thread::Builder::new()
-        .name("vz-stdin-watcher".into())
+        .name("vz-control".into())
         .spawn(move || {
-            use std::io::Read;
+            use std::io::BufRead;
             let handle = handle; // move the whole Send wrapper in
-            let mut buf = [0u8; 64];
-            let stdin = std::io::stdin();
-            let mut locked = stdin.lock();
-            loop {
-                match locked.read(&mut buf) {
-                    Ok(0) => break,    // EOF: parent closed the control channel
-                    Ok(_) => continue, // ignore any control bytes for now (v1)
-                    Err(_) => break,
-                }
-            }
+            let mut line = String::new();
+            let act = match std::io::stdin().lock().read_line(&mut line) {
+                Ok(0) | Err(_) => WorkerAction::Stop, // EOF or read error
+                Ok(_) => match line.trim().strip_prefix("snapshot ") {
+                    Some(path) if !path.is_empty() => WorkerAction::Snapshot(path.to_string()),
+                    _ => WorkerAction::Stop,
+                },
+            };
+            *action.lock().expect("action mutex") = Some(act);
             // SAFETY: the pointer is kept alive by the leaked strong ref in
             // `run_worker`; `stop`/`wake_up` are thread-safe CF operations.
             unsafe {

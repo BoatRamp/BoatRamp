@@ -14,12 +14,12 @@
 //! orchestration — staging, IPAM, ref encode/decode, spawn-arg construction — is
 //! cross-platform and unit-tested everywhere.
 //!
-//! `persistent_volumes: true`; **`scale_to_zero: false`** — and not a near-term
-//! follow-up: the `saveMachineStateToURL:` save path works, but
-//! Virtualization.framework rejects a **Linux-guest** `restoreMachineStateFromURL:`
-//! with "invalid argument" (verified live: same-process + cross-process, minimal
-//! config, every device/disk-mode variant), so a parked workload could never be
-//! woken. Scale-to-zero is blocked on Apple until VZ restore works for Linux guests.
+//! `persistent_volumes: true`, `scale_to_zero: true`. Scale-to-zero is live: the
+//! reconcile parks an idle replica via `snapshot` (pause, `saveMachineStateToURL:`,
+//! stop) and wakes it via `restore` (recreate the VM with the SAME machine identity,
+//! `restoreMachineStateFromURL:`, resume). The round-trip preserves the guest's exact
+//! in-RAM state and is validated end-to-end (the `vz_live_snapshot_restore_roundtrip`
+//! test in `tests/vz_live.rs`). See [`VzBackend::restore`].
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -29,7 +29,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, VolumeRef,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot, VolumeRef,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -128,8 +128,11 @@ fn ensure_volume_images(
 struct RunningVm {
     /// The `<self_exe> __vz-run` child running the VM. Killed / stdin-closed on stop.
     child: tokio::process::Child,
-    /// Allocated guest IP (released on stop).
+    /// Allocated guest IP (released on stop; held across a scale-to-zero snapshot).
     ip: std::net::Ipv4Addr,
+    /// The config the VM was launched with — persisted on snapshot so a later
+    /// [`restore`](VzBackend::restore) recreates the same VM to load the saved state.
+    cfg: WorkerConfig,
 }
 
 /// The macOS-native VMM compute backend. Each replica runs as a re-exec'd
@@ -240,6 +243,13 @@ impl VzBackend {
         ip: std::net::Ipv4Addr,
         volumes: Vec<WorkerVolume>,
     ) -> WorkerConfig {
+        // A stable platform identity, minted once here (the VM's whole life), so a
+        // later scale-to-zero restore recreates the SAME identity VZ demands. macOS
+        // only (VZ); off macOS `launch` is never registered, so `None` is fine.
+        #[cfg(target_os = "macos")]
+        let machine_id = Some(crate::vm::new_machine_id_hex());
+        #[cfg(not(target_os = "macos"))]
+        let machine_id: Option<String> = None;
         WorkerConfig {
             rootfs_path,
             kernel_path,
@@ -251,8 +261,26 @@ impl VzBackend {
             mem_mib: req.spec.mem_mib,
             vcpus: req.spec.vcpus as u8,
             volumes,
+            restore_path: None,
+            machine_id,
         }
     }
+}
+
+/// Encode a snapshot's recovery info into its `data_ref` (`<stem>|<ip>|<port>`).
+/// `<stem>` is the path prefix of the two snapshot files (`<stem>.vzstate` = the
+/// saved VM state, `<stem>.cfg` = the JSON `WorkerConfig` to recreate the VM).
+fn encode_snap(stem: &str, ip: &str, port: u16) -> String {
+    format!("{stem}|{ip}|{port}")
+}
+
+/// Decode `<stem>|<ip>|<port>` from a snapshot `data_ref`.
+fn decode_snap(s: &str) -> Option<(String, String, u16)> {
+    let mut it = s.rsplitn(3, '|');
+    let port = it.next()?.parse().ok()?;
+    let ip = it.next()?.to_string();
+    let stem = it.next()?.to_string();
+    Some((stem, ip, port))
 }
 
 #[async_trait]
@@ -266,11 +294,14 @@ impl ComputeBackend for VzBackend {
             // A per-container hypervisor VM — the same strong isolation as the KVM
             // backend (satisfies untrusted / multi-tenant workloads).
             isolation: IsolationClass::VmKvm,
-            // No scale-to-zero: VZ `saveMachineStateToURL:` works but
-            // `restoreMachineStateFromURL:` fails "invalid argument" for Linux guests
-            // (verified live), so a parked workload could never be woken. Blocked on
-            // Apple; see the module docs.
-            scale_to_zero: false,
+            // Scale-to-zero: park an idle replica (pause + `saveMachineStateToURL:` +
+            // stop) and later wake it (recreate the VM with the SAME stable machine
+            // identity + `restoreMachineStateFromURL:` + resume). The resumed guest
+            // keeps its exact in-RAM state — validated end-to-end (see
+            // `snapshot`/`restore` and `tests/vz_live.rs`). The stable
+            // `VZGenericMachineIdentifier` is the key: VZ rejects a restore whose
+            // identifier differs from the saved VM's.
+            scale_to_zero: true,
             // Persistent volumes as writable virtio-block images.
             persistent_volumes: true,
             max_vcpus: None,
@@ -356,7 +387,7 @@ impl ComputeBackend for VzBackend {
         self.running
             .lock()
             .expect("running mutex")
-            .insert(id, RunningVm { child, ip });
+            .insert(id, RunningVm { child, ip, cfg });
 
         Ok(Instance {
             handle: InstanceHandle {
@@ -399,6 +430,138 @@ impl ComputeBackend for VzBackend {
             Ok(Err(_)) => Ok(Health::Unhealthy),
             Err(_) => Ok(Health::Unknown), // timed out — indeterminate
         }
+    }
+
+    /// **Snapshot** (scale-to-zero park): ask the worker to pause + write its VM
+    /// state (`saveMachineStateToURL:`) to `<stem>.vzstate`, persist the
+    /// `WorkerConfig` to `<stem>.cfg` (a [`restore`](Self::restore) recreates the
+    /// same VM to load it), and wait for the worker to exit. The guest IP stays
+    /// reserved so the restore reuses it (the guest keeps that IP in its saved
+    /// state). `Ok(None)` if the replica isn't running.
+    async fn snapshot(&self, handle: &InstanceHandle) -> Result<Option<Snapshot>, BackendError> {
+        let (_ip, port) = decode_ref(&handle.backend_ref).ok_or_else(|| {
+            BackendError::Other(format!("bad handle ref {:?}", handle.backend_ref))
+        })?;
+        let id = vm_id(&handle.workload, handle.replica);
+        let running = self.running.lock().expect("running mutex").remove(&id);
+        let Some(mut running) = running else {
+            return Ok(None); // not running — nothing to snapshot
+        };
+        let ip = running.ip;
+
+        let dir = self.data_dir.join("compute").join("snapshots");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| BackendError::Other(format!("create snapshots dir: {e}")))?;
+        let stem = dir.join(&id).display().to_string();
+        let state_path = format!("{stem}.vzstate");
+        let cfg_path = format!("{stem}.cfg");
+        // Persist the config so a restore can recreate the same VM (its attachments
+        // must match the saved state). `saveMachineStateToURL:` requires the target
+        // not already exist, so clear any stale state file from a prior park.
+        let cfg_json =
+            serde_json::to_vec(&running.cfg).map_err(|e| BackendError::Other(e.to_string()))?;
+        tokio::fs::write(&cfg_path, cfg_json)
+            .await
+            .map_err(|e| BackendError::Other(format!("write {cfg_path}: {e}")))?;
+        let _ = tokio::fs::remove_file(&state_path).await;
+
+        // Request the save over the control channel, then wait for the worker to
+        // pause + write the state file + exit.
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = running
+                .child
+                .stdin
+                .take()
+                .ok_or_else(|| BackendError::Other("no control channel".into()))?;
+            stdin
+                .write_all(format!("snapshot {state_path}\n").as_bytes())
+                .await
+                .map_err(|e| BackendError::Other(format!("send snapshot command: {e}")))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|e| BackendError::Other(format!("flush snapshot command: {e}")))?;
+        }
+        let status = running
+            .child
+            .wait()
+            .await
+            .map_err(|e| BackendError::Other(format!("wait worker: {e}")))?;
+        if !status.success() {
+            // Save failed; the VM is gone, so reclaim the IP and report the error
+            // (the reconcile then relaunches rather than parking).
+            self.ipam.lock().expect("ipam mutex").release(ip);
+            return Err(BackendError::Other(format!(
+                "worker exited {status} during snapshot"
+            )));
+        }
+        Ok(Some(Snapshot {
+            workload: handle.workload.clone(),
+            replica: handle.replica,
+            data_ref: encode_snap(&stem, &ip.to_string(), port),
+        }))
+    }
+
+    /// **Restore** (scale-to-zero wake): read the persisted config, re-reserve the
+    /// guest IP, and spawn a worker in restore mode — it recreates the VM and
+    /// `restoreMachineStateFromURL:` + resumes from `<stem>.vzstate`. Returns the
+    /// resumed replica at its original endpoint.
+    ///
+    /// The persisted `WorkerConfig` carries the VM's stable machine identity, which
+    /// the worker feeds back into `VZGenericPlatformConfiguration` on restore — VZ
+    /// requires it to match the saved VM's, and that match is what makes a Linux-guest
+    /// `restoreMachineStateFromURL:` succeed rather than fail with "invalid argument".
+    async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
+        let (stem, ip, port) = decode_snap(&snapshot.data_ref).ok_or_else(|| {
+            BackendError::Other(format!("bad snapshot ref {:?}", snapshot.data_ref))
+        })?;
+        let addr: std::net::Ipv4Addr = ip
+            .parse()
+            .map_err(|e| BackendError::Other(format!("bad snapshot ip {ip}: {e}")))?;
+        let id = vm_id(&snapshot.workload, snapshot.replica);
+        let state_path = format!("{stem}.vzstate");
+        let cfg_path = format!("{stem}.cfg");
+
+        let cfg_bytes = tokio::fs::read(&cfg_path)
+            .await
+            .map_err(|e| BackendError::Other(format!("read {cfg_path}: {e}")))?;
+        let mut cfg: WorkerConfig =
+            serde_json::from_slice(&cfg_bytes).map_err(|e| BackendError::Other(e.to_string()))?;
+        cfg.restore_path = Some(state_path);
+
+        // Re-reserve the guest IP so the pool won't reissue it while restoring.
+        self.ipam.lock().expect("ipam mutex").reserve(addr);
+
+        let child = match spawn_worker(&self.self_exe, &cfg) {
+            Ok(child) => child,
+            Err(err) => {
+                self.ipam.lock().expect("ipam mutex").release(addr);
+                return Err(BackendError::Launch(err));
+            }
+        };
+        self.running.lock().expect("running mutex").insert(
+            id,
+            RunningVm {
+                child,
+                ip: addr,
+                cfg,
+            },
+        );
+
+        Ok(Instance {
+            handle: InstanceHandle {
+                workload: snapshot.workload.clone(),
+                replica: snapshot.replica,
+                backend_ref: encode_ref(&ip, port),
+            },
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: ip,
+                port,
+            },
+        })
     }
 }
 
@@ -451,18 +614,35 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_strong_vm_no_s2z_with_volumes() {
-        // A backend fixture (no IO): reach capabilities without booting.
+    fn capabilities_are_strong_vm_with_s2z_and_volumes() {
+        // Strong per-VM isolation + persistent volumes + scale-to-zero (the VZ
+        // save/restore round-trip is validated live — see `capabilities` and
+        // `tests/vz_live.rs`).
         let caps = Capabilities {
             isolation: IsolationClass::VmKvm,
-            scale_to_zero: false,
+            scale_to_zero: true,
             persistent_volumes: true,
             max_vcpus: None,
             max_mem_mib: None,
         };
         assert!(caps.isolation.is_strong());
-        assert!(!caps.scale_to_zero);
+        assert!(caps.scale_to_zero);
         assert!(caps.persistent_volumes);
+    }
+
+    #[test]
+    fn snapshot_ref_round_trips() {
+        let r = encode_snap("/d/compute/snapshots/web-0", "192.168.64.5", 8080);
+        assert_eq!(r, "/d/compute/snapshots/web-0|192.168.64.5|8080");
+        assert_eq!(
+            decode_snap(&r),
+            Some((
+                "/d/compute/snapshots/web-0".to_string(),
+                "192.168.64.5".to_string(),
+                8080
+            ))
+        );
+        assert_eq!(decode_snap("garbage"), None);
     }
 
     /// The spawn-arg construction: the worker config carries the right cmdline
@@ -482,6 +662,8 @@ mod tests {
             mem_mib: 256,
             vcpus: 2,
             volumes: vec![],
+            restore_path: None,
+            machine_id: None,
         };
         // The env fragment is present and gateway/vcpu/mem are threaded through.
         assert!(cfg.env_cmdline.starts_with(" boatramp.env="));

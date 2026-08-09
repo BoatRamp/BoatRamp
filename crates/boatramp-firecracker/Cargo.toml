@@ -52,6 +52,11 @@ embedded = [
 name = "vmm-worker"
 required-features = ["embedded", "backend"]
 
+# Fixture builder for the boatramp-vz scale-to-zero live test; needs `oci::build_rootfs`.
+[[example]]
+name = "vzfix"
+required-features = ["build"]
+
 [dependencies]
 boatramp-types.workspace = true
 serde.workspace = true

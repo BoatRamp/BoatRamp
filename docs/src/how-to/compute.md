@@ -99,7 +99,11 @@ arm64 `Image`). Everything else — `--kernel`, the fleet default, verify-before
 — is identical. Under `single-tenant` / `dev` the content-hash pin alone suffices,
 so `vmm-vz` runs with any operator-supplied arm64 kernel; the strict posture on
 Apple silicon needs the signed `boatramp-vmlinux-aarch64` release (its hash is baked
-into the arch-scoped allow-list on release).
+into the arch-scoped allow-list on release). An operator-supplied arm64 kernel must
+enable the **generic PCIe host + virtio-pci** (`CONFIG_PCI`, `CONFIG_PCI_HOST_GENERIC`,
+`CONFIG_VIRTIO_PCI`): Virtualization.framework presents its virtio disk/net/console
+over a PCIe host bridge, so a `CONFIG_PCI`-off kernel finds no devices and never boots.
+The `boatramp-vmlinux-aarch64` release is built this way.
 
 ## Deploy a container image
 
