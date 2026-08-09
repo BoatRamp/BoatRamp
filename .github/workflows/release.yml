@@ -109,6 +109,29 @@ jobs:
           cargo build -p boatramp --release --locked \
             --target ${{ matrix.target }} --features "$features"
 
+      # The shipped macOS binary embeds the (non-optional) `boatramp-vz` compute
+      # backend, which boots VMs via Apple's Virtualization.framework. VZVirtualMachine
+      # init/start fails on an unsigned binary, so ad-hoc code-sign it with the free,
+      # self-signable `com.apple.security.virtualization` entitlement (no Apple approval;
+      # no `--options runtime` — hardened runtime is for Developer-ID notarization).
+      # This MUST be the last mutation of the binary and be asserted: a later re-sign or
+      # notarization silently strips the entitlement (podman #21843), so we sign here —
+      # before packaging — and fail the job if the entitlement did not survive.
+      - name: Code-sign macOS binary with virtualization entitlement
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/boatramp"
+          codesign --force --sign - \
+            --entitlements packaging/macos/boatramp.entitlements "$bin"
+          # Assert the entitlement is actually present in the signature (guards against
+          # a stripped/re-signed binary shipping without VM-boot capability).
+          if ! codesign -d --entitlements - "$bin" 2>&1 | grep -q 'com.apple.security.virtualization'; then
+            echo "::error::com.apple.security.virtualization entitlement missing from $bin after signing — the binary cannot boot VMs (see podman #21843: a re-sign can strip entitlements)"
+            exit 1
+          fi
+
       - name: Assemble archive (binary + completions + man + docs)
         shell: bash
         run: |
