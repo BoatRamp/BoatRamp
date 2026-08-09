@@ -29,12 +29,12 @@ versions.
   arch-portable (x86_64 + aarch64), the `boatramp-firecracker` build cross-compiles
   the aarch64 init via `zig` on macOS, and the OCI pull + kernel trust are
   arch-scoped to the guest arch — validated end-to-end (a Docker Hub image built to
-  an arm64 rootfs on macOS boots under `vmm-vz` and serves). Deferred to follow-ups:
-  the **signed** `boatramp-vmlinux-aarch64` kernel release (its reproducible build +
-  release matrix are wired; the signed artifact + baking its hash into the arch-scoped
-  allow-list is the remaining CI/secret step — the `single-tenant` posture already
-  runs `vmm-vz` with any arm64 kernel today); scale-to-zero via
-  `saveMachineState`/`restoreMachineState` (advertises `scale_to_zero: false` for
+  an arm64 rootfs on macOS boots under `vmm-vz` and serves). A **signed first-party
+  arm64 kernel is shipped**: `boatramp-vmlinux` v0.2.2 publishes a reproducible,
+  ES256-signed `boatramp-vmlinux-aarch64` (a raw arm64 `Image`) whose hash is on the
+  arch-scoped allow-list, so strict-posture `vmm-vz` on Apple silicon verifies it out
+  of the box (as the x86_64 kernel does on Linux). Deferred to follow-ups: scale-to-zero
+  via `saveMachineState`/`restoreMachineState` (advertises `scale_to_zero: false` for
   now); and the CI binary-signing step. See
   [`compute`](docs/src/reference/boatramp-cfg.md#compute) and
   [The kernel and its trust](docs/src/how-to/compute.md).

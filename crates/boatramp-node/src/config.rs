@@ -258,14 +258,14 @@ fn default_allowed_kernel_hashes() -> Vec<String> {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // `boatramp-vmlinux-aarch64` (the Virtualization.framework guest kernel,
-        // flake `#vmlinux-aarch64`, a raw arm64 `Image`): the hash is baked here
-        // once the first signed arm64 release ships. Until then the strict posture
-        // requires an operator-configured signed kernel (`[compute]
-        // kernel_allowed_hashes` + a `compute.default_kernel` carrying its `.sig`);
-        // the single-tenant posture needs only the content-hash pin, so `vmm-vz`
-        // runs with any operator-supplied arm64 kernel there today.
-        Vec::new()
+        vec![
+            // `boatramp-vmlinux-aarch64` v0.2.2 (the Virtualization.framework guest
+            // kernel, flake `#vmlinux` on aarch64-linux — a raw arm64 `Image`).
+            // Reproducible build; signed by BOATRAMP_KERNEL_SIGNING_PUBKEY in the
+            // boatramp-vmlinux release, so a selected `compute.default_kernel`
+            // clears the strict bar out of the box. Bump on each new signed release.
+            "be95fb0dd2c3c5595624efef4f0a9903cd944313870c0011cc876e28032ca5a5".to_string(),
+        ]
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
