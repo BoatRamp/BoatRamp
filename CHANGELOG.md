@@ -33,9 +33,14 @@ versions.
   arm64 kernel is shipped**: `boatramp-vmlinux` v0.2.2 publishes a reproducible,
   ES256-signed `boatramp-vmlinux-aarch64` (a raw arm64 `Image`) whose hash is on the
   arch-scoped allow-list, so strict-posture `vmm-vz` on Apple silicon verifies it out
-  of the box (as the x86_64 kernel does on Linux). Deferred to follow-ups: scale-to-zero
-  via `saveMachineState`/`restoreMachineState` (advertises `scale_to_zero: false` for
-  now); and the CI binary-signing step. See
+  of the box (as the x86_64 kernel does on Linux). The **released macOS binaries are
+  code-signed** with the `com.apple.security.virtualization` entitlement (ad-hoc, the
+  last build step, with a survive-assert per podman #21843) so the shipped binary can
+  boot VMs. Deferred: **scale-to-zero** — the save/restore machinery is wired and the
+  `saveMachineStateToURL:` save path is validated live, but Virtualization.framework
+  rejects a Linux-guest `restoreMachineStateFromURL:` with "invalid argument", so
+  `scale_to_zero` stays `false` (never park a workload we can't wake) until VZ restore
+  works. See
   [`compute`](docs/src/reference/boatramp-cfg.md#compute) and
   [The kernel and its trust](docs/src/how-to/compute.md).
 - **Managed SQL on a database boatramp runs.** A handler `sql` database can now be
