@@ -14,8 +14,12 @@
 //! orchestration — staging, IPAM, ref encode/decode, spawn-arg construction — is
 //! cross-platform and unit-tested everywhere.
 //!
-//! v1: `scale_to_zero: false` (Virtualization.framework's `saveMachineState`/
-//! `restoreMachineState` lands in a follow-up); `persistent_volumes: true`.
+//! `persistent_volumes: true`; **`scale_to_zero: false`** — and not a near-term
+//! follow-up: the `saveMachineStateToURL:` save path works, but
+//! Virtualization.framework rejects a **Linux-guest** `restoreMachineStateFromURL:`
+//! with "invalid argument" (verified live: same-process + cross-process, minimal
+//! config, every device/disk-mode variant), so a parked workload could never be
+//! woken. Scale-to-zero is blocked on Apple until VZ restore works for Linux guests.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -262,7 +266,10 @@ impl ComputeBackend for VzBackend {
             // A per-container hypervisor VM — the same strong isolation as the KVM
             // backend (satisfies untrusted / multi-tenant workloads).
             isolation: IsolationClass::VmKvm,
-            // saveMachineState/restoreMachineState lands in the Phase-5 follow-up.
+            // No scale-to-zero: VZ `saveMachineStateToURL:` works but
+            // `restoreMachineStateFromURL:` fails "invalid argument" for Linux guests
+            // (verified live), so a parked workload could never be woken. Blocked on
+            // Apple; see the module docs.
             scale_to_zero: false,
             // Persistent volumes as writable virtio-block images.
             persistent_volumes: true,

@@ -36,11 +36,11 @@ versions.
   of the box (as the x86_64 kernel does on Linux). The **released macOS binaries are
   code-signed** with the `com.apple.security.virtualization` entitlement (ad-hoc, the
   last build step, with a survive-assert per podman #21843) so the shipped binary can
-  boot VMs. Deferred: **scale-to-zero** — the save/restore machinery is wired and the
-  `saveMachineStateToURL:` save path is validated live, but Virtualization.framework
-  rejects a Linux-guest `restoreMachineStateFromURL:` with "invalid argument", so
-  `scale_to_zero` stays `false` (never park a workload we can't wake) until VZ restore
-  works. See
+  boot VMs. **Scale-to-zero is not supported on `vmm-vz`** (`scale_to_zero: false`):
+  Virtualization.framework cannot restore a Linux-guest saved state
+  (`restoreMachineStateFromURL:` fails "invalid argument"; the save path works, but a
+  save you can't restore is useless), so it's blocked on Apple — unlike the KVM
+  embedded VMM, which does support it. See
   [`compute`](docs/src/reference/boatramp-cfg.md#compute) and
   [The kernel and its trust](docs/src/how-to/compute.md).
 - **Managed SQL on a database boatramp runs.** A handler `sql` database can now be
