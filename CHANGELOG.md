@@ -7,6 +7,20 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+- **Untagged docker image references default to `:latest`.** `compute set/build --image
+  <name>` with no tag (e.g. `--image alpine`) no longer pulls *every* tag of the repo
+  (slow, and a hard failure on any repo that still carries an ancient v1-manifest tag) —
+  the docker backend now splits the reference into `fromImage` + `tag`, defaulting an
+  untagged one to `latest` (a registry `host:port` is not mistaken for a tag; a digest
+  pin is passed through), and records the fully-qualified reference it pulled.
+
+### Changed
+- **The compute reconcile tick is configurable** via `BOATRAMP_COMPUTE_RECONCILE_TICK_MS`
+  (milliseconds; default 30s). Compute-backed tests can set it low so a workload's
+  launch/scale reconcile converges in a fraction of a second instead of waiting a full
+  30s tick.
+
 ## [0.2.3]
 
 ### Added

@@ -243,6 +243,25 @@ fn decode_ref(s: &str) -> Option<(String, String, u16)> {
     Some((name.to_string(), ip.to_string(), port.parse().ok()?))
 }
 
+/// Split an image reference into the `fromImage` name + `tag` the daemon's
+/// `create_image` wants, defaulting an untagged reference to `latest`. A tag is a
+/// `:` in the **last path component** (so a registry `host:port/repo` port isn't
+/// mistaken for one); a digest-pinned reference (`name@sha256:…`) is returned whole
+/// with an empty tag.
+fn image_pull_target(reference: &str) -> (String, String) {
+    if reference.contains('@') {
+        return (reference.to_string(), String::new()); // digest-pinned
+    }
+    let last = reference.rsplit('/').next().unwrap_or(reference);
+    if last.contains(':') {
+        // Tagged: the tag is after the final `:`.
+        let (name, tag) = reference.rsplit_once(':').expect("last has ':'");
+        (name.to_string(), tag.to_string())
+    } else {
+        (reference.to_string(), "latest".to_string())
+    }
+}
+
 /// Map a boatramp [`RestartPolicy`] to a Docker `HostConfig.restart_policy`.
 fn restart_policy(policy: RestartPolicy) -> DockerRestartPolicy {
     let name = match policy {
@@ -323,14 +342,28 @@ impl ComputeBackend for DockerBackend {
                 ))
             }
         };
+        // Split the reference into `from_image` + `tag`, defaulting an untagged
+        // reference to `:latest`. Without a tag the daemon's `fromImage=<name>` (no
+        // `tag`) pulls **every** tag of the repo -- which is slow and 501s on any
+        // repo that still has an ancient v1-manifest tag. A digest-pinned reference
+        // is passed whole (no tag).
+        let (from_image, tag) = image_pull_target(&reference);
         let options = CreateImageOptions {
-            from_image: reference.clone(),
+            from_image: from_image.clone(),
+            tag: tag.clone(),
             ..Default::default()
         };
         let mut pull = self.docker.create_image(Some(options), None, None);
         while let Some(step) = pull.next().await {
             step.map_err(|e| BackendError::Materialize(format!("pull {reference}: {e}")))?;
         }
+        // Record the fully-qualified reference actually pulled, so `launch` runs the
+        // exact tag (not the bare, all-tags-ambiguous name).
+        let reference = if tag.is_empty() {
+            reference
+        } else {
+            format!("{from_image}:{tag}")
+        };
         Ok(Artifact::Image { reference })
     }
 
@@ -527,6 +560,36 @@ impl DockerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_pull_target_defaults_untagged_to_latest() {
+        // Bare name -> latest (the papercut fix: no more all-tags pull).
+        assert_eq!(
+            image_pull_target("alpine"),
+            ("alpine".into(), "latest".into())
+        );
+        assert_eq!(
+            image_pull_target("ghcr.io/owner/app"),
+            ("ghcr.io/owner/app".into(), "latest".into())
+        );
+        // Explicit tag is preserved.
+        assert_eq!(
+            image_pull_target("nginx:1.27"),
+            ("nginx".into(), "1.27".into())
+        );
+        // A registry host:port is NOT mistaken for a tag.
+        assert_eq!(
+            image_pull_target("localhost:5000/app"),
+            ("localhost:5000/app".into(), "latest".into())
+        );
+        assert_eq!(
+            image_pull_target("localhost:5000/app:v2"),
+            ("localhost:5000/app".into(), "v2".into())
+        );
+        // A digest-pinned reference is passed whole, no tag.
+        let d = "alpine@sha256:abc123";
+        assert_eq!(image_pull_target(d), (d.into(), String::new()));
+    }
 
     #[test]
     fn docker_endpoint_defaults_to_published_and_parses_lowercase() {

@@ -22,7 +22,17 @@ use crate::config::ServerConfig;
 use crate::error::{Error, Result};
 
 /// How often the compute reconcile loop converges desired vs actual workloads.
-pub const COMPUTE_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+/// Defaults to 30s; override with `BOATRAMP_COMPUTE_RECONCILE_TICK_MS` (milliseconds)
+/// so compute-backed tests can converge in a fraction of a second instead of
+/// waiting a full tick for the launch/scale reconcile.
+pub fn compute_reconcile_tick() -> std::time::Duration {
+    std::env::var("BOATRAMP_COMPUTE_RECONCILE_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(30))
+}
 /// How often the domain-verify reconcile loop re-checks pending challenges.
 pub const DOMAIN_VERIFY_RECONCILE_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a compute workload may be idle before scale-to-zero sleeps it.
@@ -217,7 +227,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         vec![compute_node],
         boatramp_core::compute::BackendPolicy::from_shared_kernel_allowed(allow_shared_kernel),
         is_leader.clone(),
-        COMPUTE_RECONCILE_TICK,
+        compute_reconcile_tick(),
         COMPUTE_IDLE_TIMEOUT,
         sql_resolver,
         managed_db_resolver,
