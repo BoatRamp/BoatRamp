@@ -35,6 +35,10 @@
 /// worker, wires veth + netns, stages the rootfs.
 #[cfg(target_os = "linux")]
 pub mod backend;
+/// CRIU checkpoint/restore for scale-to-zero (Linux). Pure arg-builders + the
+/// `criu` dump/restore drivers.
+#[cfg(target_os = "linux")]
+pub mod criu;
 /// The guest-log sink: drain the worker's (guest's) stdout/stderr to `tracing`
 /// + a per-container log file. Cross-platform + unit-tested.
 pub mod logsink;

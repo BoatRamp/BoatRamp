@@ -207,3 +207,101 @@ async fn container_live_launch_and_hold() {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
+
+/// Poll the container's `/nonce` endpoint over HTTP, returning the body or empty.
+fn probe_nonce(host: &str, port: u16) -> String {
+    let url = format!("http://{host}:{port}/nonce");
+    for _ in 0..40 {
+        if let Ok(out) = std::process::Command::new("curl")
+            .args(["-s", "--max-time", "2", &url])
+            .output()
+        {
+            if out.status.success() && !out.stdout.is_empty() {
+                return String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    String::new()
+}
+
+/// The **scale-to-zero round-trip through the backend**: launch a container serving a
+/// per-process nonce, `snapshot()` it (CRIU dump → the container is parked + gone),
+/// `restore()` it (CRIU restore + the `__criu-net-setup` action-script re-attaches
+/// the veth), and assert the restored container serves the SAME nonce over HTTP —
+/// i.e. its in-RAM state AND its networking came back. The container analog of the
+/// VZ / KVM scale-to-zero round-trips.
+///
+/// Needs Linux + root + a bridge + a rootfs tar (as the launch test) **and** a
+/// working `criu` (on PATH or `$BOATRAMP_CRIU`); skips (passes) if any is absent or
+/// the backend reports no scale-to-zero (CRIU not usable here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Linux + root + a bridge + a rootfs tar + criu (privileged live seam)"]
+async fn container_criu_roundtrip() {
+    let (Some(bin), Some(rootfs_path)) = (
+        std::env::var_os("BOATRAMP_BIN"),
+        std::env::var_os("BOATRAMP_CONTAINER_ROOTFS"),
+    ) else {
+        eprintln!("container_criu: set BOATRAMP_BIN + BOATRAMP_CONTAINER_ROOTFS to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+
+    let rootfs = std::fs::read(&rootfs_path).expect("read rootfs tar");
+    let data_dir = std::env::temp_dir().join(format!("boatramp-ccriu-{}", std::process::id()));
+    let backend = ContainerBackend::new(
+        Arc::new(FileBlob(rootfs)),
+        data_dir.clone(),
+        bridge,
+        &subnet,
+        PathBuf::from(bin),
+    )
+    .expect("backend");
+
+    if !backend.capabilities().scale_to_zero {
+        eprintln!("container_criu: backend reports no scale-to-zero (criu unusable); skipping");
+        return;
+    }
+
+    let hash = "d".repeat(64);
+    let spec = spec_for(&hash);
+    let artifact = backend.materialize(&spec).await.expect("materialize");
+    let req = LaunchRequest {
+        workload: "ccriu".into(),
+        replica: 0,
+        spec,
+        artifact,
+    };
+    let inst = backend.launch(&req).await.expect("launch");
+    let nonce1 = probe_nonce(&inst.endpoint.host, inst.endpoint.port);
+    assert!(
+        !nonce1.is_empty(),
+        "container should serve a nonce before park"
+    );
+
+    // Park: CRIU dump. `Some(snapshot)` and the container is gone.
+    let snap = backend
+        .snapshot(&inst.handle)
+        .await
+        .expect("snapshot ok")
+        .expect("snapshot produced (container was running)");
+    // The parked container's port should no longer answer.
+    assert!(
+        probe_nonce(&inst.endpoint.host, inst.endpoint.port).is_empty(),
+        "parked container should not serve"
+    );
+
+    // Wake: CRIU restore + veth re-attach. The restored container serves again.
+    let inst2 = backend.restore(&snap).await.expect("restore ok");
+    let nonce2 = probe_nonce(&inst2.endpoint.host, inst2.endpoint.port);
+
+    let _ = backend.stop(&inst2.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    assert_eq!(
+        nonce1, nonce2,
+        "restored container must serve the SAME nonce (in-RAM state + networking preserved)"
+    );
+    eprintln!("container scale-to-zero round-trip OK: nonce {nonce1} preserved across park/wake");
+}

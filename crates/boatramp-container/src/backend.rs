@@ -19,7 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
+    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -47,6 +47,28 @@ fn blob_key(hash: &str) -> String {
 /// cgroup + hostname stem.
 fn container_id(workload: &str, replica: u32) -> String {
     format!("{workload}-{replica}")
+}
+
+/// Decode a running instance's `backend_ref` (`<ip>:<port>`).
+fn decode_ref(s: &str) -> Option<(String, u16)> {
+    let (ip, port) = s.rsplit_once(':')?;
+    Some((ip.to_string(), port.parse().ok()?))
+}
+
+/// Encode the persistent part of a snapshot ref: `<image-dir>|<rootfs>`. The
+/// running IP/port are appended by `snapshot` (`|<ip>|<port>`).
+fn encode_snap(image_dir: &str, rootfs: &str) -> String {
+    format!("{image_dir}|{rootfs}")
+}
+
+/// Decode a snapshot `data_ref` (`<image-dir>|<rootfs>|<ip>|<port>`).
+fn decode_snap(s: &str) -> Option<(String, String, String, u16)> {
+    let mut it = s.rsplitn(4, '|');
+    let port = it.next()?.parse().ok()?;
+    let ip = it.next()?.to_string();
+    let rootfs = it.next()?.to_string();
+    let image_dir = it.next()?.to_string();
+    Some((image_dir, rootfs, ip, port))
 }
 
 /// Reject a volume whose `name` or `mount` could escape its sandboxed location
@@ -88,10 +110,15 @@ pub struct ContainerBackend {
     /// Guest subnet (e.g. `10.0.0.0/24`) — gateway + prefix for in-netns config.
     prefix: u8,
     gateway: Ipv4Addr,
-    /// Path to this `boatramp` binary, re-execed as `__sandbox`.
+    /// Path to this `boatramp` binary, re-execed as `__sandbox` (and, for a
+    /// scale-to-zero wake, as `__criu-net-setup`).
     self_exe: PathBuf,
     /// Per-node guest-IP pool.
     ipam: Mutex<IpPool>,
+    /// A usable `criu` (present + `criu check` passed) enables scale-to-zero;
+    /// `None` leaves the backend without it (the scheduler routes such workloads
+    /// elsewhere). Detected once at construction.
+    criu: Option<crate::criu::Criu>,
 }
 
 impl ContainerBackend {
@@ -117,6 +144,7 @@ impl ContainerBackend {
             gateway: ipam.gateway(),
             self_exe,
             ipam: Mutex::new(ipam),
+            criu: crate::criu::Criu::detect(),
         })
     }
 
@@ -216,7 +244,11 @@ impl ComputeBackend for ContainerBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             isolation: IsolationClass::Namespace,
-            scale_to_zero: false,
+            // CRIU checkpoint/restore parks an idle container to disk + wakes it
+            // with in-RAM state intact — advertised only when a working `criu` was
+            // detected (see `Criu::detect`), so we never promise a park we can't
+            // wake.
+            scale_to_zero: self.criu.is_some(),
             // Volumes are host directories bind-mounted into the jail before
             // `pivot_root`; they persist across launches (keyed by volume name).
             persistent_volumes: true,
@@ -300,6 +332,125 @@ impl ComputeBackend for ContainerBackend {
             Ok(Err(_)) => Ok(Health::Unhealthy),
             Err(_) => Ok(Health::Unknown),
         }
+    }
+
+    /// **Snapshot** (scale-to-zero park): CRIU-dump the container's process tree to
+    /// an image directory, freeing its resources. Finds the container's pid1 (the
+    /// pidns init) in its cgroup, dumps it (which kills the tree), tears down the
+    /// veth, and keeps the guest IP reserved so [`restore`](Self::restore) reuses it.
+    /// `Ok(None)` if scale-to-zero is unavailable or the container isn't running.
+    async fn snapshot(&self, handle: &InstanceHandle) -> Result<Option<Snapshot>, BackendError> {
+        let Some(criu) = self.criu.clone() else {
+            return Ok(None); // no CRIU → not a parkable backend
+        };
+        let (ip, port) = decode_ref(&handle.backend_ref).ok_or_else(|| {
+            BackendError::Other(format!("bad handle ref {:?}", handle.backend_ref))
+        })?;
+        let id = container_id(&handle.workload, handle.replica);
+        let cgroup = format!("/sys/fs/cgroup/boatramp/{id}");
+        let data_dir = self.data_dir.clone();
+        let bridge = self.bridge.clone();
+        let id_for_dump = id.clone();
+
+        // The CRIU work is blocking; run it off the async runtime.
+        let dumped = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+            let Some(pid1) = crate::criu::find_pid1(Path::new(&format!("{cgroup}/cgroup.procs")))
+            else {
+                return Ok(None); // not running
+            };
+            let rootfs = crate::criu::rootfs_of(pid1)
+                .ok_or_else(|| format!("no rootfs mount for pid {pid1}"))?;
+            let image_dir = data_dir.join("compute").join("criu").join(&id_for_dump);
+            let _ = std::fs::remove_dir_all(&image_dir);
+            criu.dump(pid1, &rootfs, &image_dir)?;
+            Ok(Some(encode_snap(&image_dir.display().to_string(), &rootfs)))
+        })
+        .await
+        .map_err(|e| BackendError::Other(format!("join: {e}")))?
+        .map_err(BackendError::Other)?;
+
+        let Some(stem) = dumped else {
+            return Ok(None);
+        };
+        // Container is gone; tear down the veth but hold the IP for the wake.
+        let _ = VethNetwork::for_vm(&id, &bridge).teardown().await;
+        Ok(Some(Snapshot {
+            workload: handle.workload.clone(),
+            replica: handle.replica,
+            data_ref: format!("{stem}|{ip}|{port}"),
+        }))
+    }
+
+    /// **Restore** (scale-to-zero wake): recreate the veth, then CRIU-restore the
+    /// container from its image. The restore runs an action-script
+    /// (`boatramp __criu-net-setup`) at CRIU's namespace-setup hook to move the veth
+    /// peer into the fresh netns + re-add `eth0` (reusing the launch-time wiring).
+    /// Returns the resumed replica at its original endpoint.
+    async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
+        let criu = self.criu.clone().ok_or(BackendError::Unsupported)?;
+        let (image_dir, rootfs, ip, port) = decode_snap(&snapshot.data_ref).ok_or_else(|| {
+            BackendError::Other(format!("bad snapshot ref {:?}", snapshot.data_ref))
+        })?;
+        let addr: Ipv4Addr = ip
+            .parse()
+            .map_err(|e| BackendError::Other(format!("bad snapshot ip {ip}: {e}")))?;
+        let id = container_id(&snapshot.workload, snapshot.replica);
+
+        // Re-reserve the IP and recreate the host veth (the peer lands in the
+        // restored netns via the action-script below).
+        self.ipam.lock().expect("ipam mutex").reserve(addr);
+        let veth = VethNetwork::for_vm(&id, &self.bridge);
+        if let Err(e) = veth.host_setup().await {
+            self.ipam.lock().expect("ipam mutex").release(addr);
+            return Err(BackendError::Launch(format!("veth host setup: {e}")));
+        }
+
+        // Restore into an empty net namespace (the container's httpd socket is
+        // bound to INADDR_ANY, so it needs no eth0 to resume).
+        let restored =
+            tokio::task::spawn_blocking(move || criu.restore(Path::new(&image_dir), &rootfs))
+                .await
+                .map_err(|e| BackendError::Other(format!("join: {e}")))?;
+        let pid = match restored {
+            Ok(pid) => pid,
+            Err(e) => {
+                let _ = veth.teardown().await;
+                self.ipam.lock().expect("ipam mutex").release(addr);
+                return Err(BackendError::Other(format!("criu restore: {e}")));
+            }
+        };
+
+        // Re-attach networking from the host (CRIU left the netns empty): move the
+        // veth peer into the restored container's netns + rename it to eth0 with the
+        // original IP — the same wiring the launch path does with the worker pid.
+        let restore_net = async {
+            veth.move_peer_into_netns(pid)
+                .await
+                .map_err(|e| format!("move veth peer: {e}"))?;
+            configure_in_netns(pid, &veth.peer_veth, addr, self.prefix, self.gateway)
+        };
+        if let Err(e) = restore_net.await {
+            // Best-effort: kill the restored container + release the IP so a retry
+            // starts clean.
+            let cgroup = format!("/sys/fs/cgroup/boatramp/{id}");
+            let _ = std::fs::write(format!("{cgroup}/cgroup.kill"), b"1");
+            let _ = veth.teardown().await;
+            self.ipam.lock().expect("ipam mutex").release(addr);
+            return Err(BackendError::Launch(format!("restore netns setup: {e}")));
+        }
+
+        Ok(Instance {
+            handle: InstanceHandle {
+                workload: snapshot.workload.clone(),
+                replica: snapshot.replica,
+                backend_ref: format!("{ip}:{port}"),
+            },
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: ip,
+                port,
+            },
+        })
     }
 }
 
