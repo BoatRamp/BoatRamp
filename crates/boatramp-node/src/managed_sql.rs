@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use boatramp_core::compute::{ManagedDbEnvResolver, ReplicaPhase};
+use boatramp_core::compute::{ManagedDbEnvResolver, PrivilegeDirective, ReplicaPhase};
+
+use crate::config::ManagedDbPrivilege;
 use boatramp_core::deploy::DeployStore;
 use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
@@ -120,6 +122,27 @@ struct ManagedDbSpec {
 pub struct ManagedDbEnv {
     dbs: HashMap<String, ManagedDbSpec>,
     creds: ManagedSqlCredentials,
+    /// How a managed DB's stock image runs on a shared-kernel backend so it can init
+    /// (`[compute].managed_db_privilege`).
+    privilege: ManagedDbPrivilege,
+}
+
+/// The uid:gid a stock DB image runs its server process as — both the official
+/// `postgres` and `mysql` images use `999:999`. Used for the rootless strategy so the
+/// entrypoint owns its pre-chowned volume without needing any capability.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+fn managed_db_default_ids(_kind: ExternalSqlKind) -> (u32, u32) {
+    (999, 999)
+}
+
+/// The minimal capabilities a stock DB entrypoint needs when it runs as root: `chown`
+/// its data dir + socket dir, then `gosu`/`su-exec` drop to the DB user.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+fn managed_db_caps() -> Vec<String> {
+    ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 impl ManagedDbEnv {
@@ -131,6 +154,7 @@ impl ManagedDbEnv {
     pub fn from_config(
         databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
         creds: ManagedSqlCredentials,
+        privilege: ManagedDbPrivilege,
     ) -> Self {
         let mut dbs = HashMap::new();
         for db in databases.values() {
@@ -154,7 +178,11 @@ impl ManagedDbEnv {
                 },
             );
         }
-        Self { dbs, creds }
+        Self {
+            dbs,
+            creds,
+            privilege,
+        }
     }
 
     /// No managed databases configured — the caller can skip wiring this resolver.
@@ -184,6 +212,17 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
                 Vec::new()
             }
         }
+    }
+
+    fn managed_db_privilege(&self, _project: &str, workload: &str) -> Option<PrivilegeDirective> {
+        let db = self.dbs.get(workload)?;
+        Some(match self.privilege {
+            ManagedDbPrivilege::Rootless => {
+                let (uid, gid) = managed_db_default_ids(db.kind);
+                PrivilegeDirective::Rootless { uid, gid }
+            }
+            ManagedDbPrivilege::Caps => PrivilegeDirective::Caps(managed_db_caps()),
+        })
     }
 }
 
@@ -335,8 +374,16 @@ mod tests {
 
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
-        let env = ManagedDbEnv::from_config(&dbs, creds);
+        let env = ManagedDbEnv::from_config(&dbs, creds, ManagedDbPrivilege::default());
         assert!(!env.is_empty());
+
+        // The managed workload gets a rootless privilege directive by default; the
+        // non-managed ones get none.
+        assert_eq!(
+            env.managed_db_privilege("default", "pg"),
+            Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 })
+        );
+        assert_eq!(env.managed_db_privilege("default", "nope"), None);
 
         // The managed workload gets its server-init env, sealed-password-derived.
         let pg = env.managed_db_env("default", "pg").await;

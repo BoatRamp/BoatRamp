@@ -224,7 +224,13 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     ) {
         (Some(sql), Some(envelope)) if !sql.databases.is_empty() => {
             let creds = crate::managed_sql::ManagedSqlCredentials::new(kv.clone(), envelope);
-            let env = crate::managed_sql::ManagedDbEnv::from_config(&sql.databases, creds);
+            let privilege = config
+                .compute
+                .as_ref()
+                .map(|c| c.managed_db_privilege)
+                .unwrap_or_default();
+            let env =
+                crate::managed_sql::ManagedDbEnv::from_config(&sql.databases, creds, privilege);
             (!env.is_empty()).then(|| Arc::new(env) as Arc<_>)
         }
         _ => None,

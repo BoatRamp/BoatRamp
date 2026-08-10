@@ -169,6 +169,22 @@ impl ServerConfig {
     }
 }
 
+/// How a **managed database** (PLAN-managed-compute-sql) runs its stock image on a
+/// shared-kernel backend, whose entrypoint would otherwise fail under the dropped-`ALL`
+/// hardening. `rootless` (the default) needs no capabilities and works under any
+/// posture; `caps` is the fallback for an image that won't run rootless.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedDbPrivilege {
+    /// Run the DB as its image's user (`999:999` for the official postgres/mysql
+    /// images) against a pre-owned volume — no added capabilities, any posture.
+    #[default]
+    Rootless,
+    /// Add the minimal capability set the entrypoint needs (`CHOWN`, `DAC_OVERRIDE`,
+    /// `FOWNER`, `SETUID`, `SETGID`). Honored only under the single-tenant posture.
+    Caps,
+}
+
 /// `compute` section — opt-in compute backends. Present
 /// ⇒ `serve` registers the backends this node can offer and advertises them to
 /// the scheduler; backends are capability-detected (container on Linux, remote
@@ -218,6 +234,11 @@ pub struct ComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub sql_shim_url: Option<String>,
+    /// Privilege strategy for a managed database's stock image on a shared-kernel
+    /// backend (see [`ManagedDbPrivilege`]). `rootless` by default.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub managed_db_privilege: ManagedDbPrivilege,
 }
 
 /// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
@@ -293,6 +314,7 @@ impl Default for ComputeConfig {
             docker_endpoint: boatramp_docker::DockerEndpoint::default(),
             docker_volume_mode: boatramp_docker::DockerVolumeMode::default(),
             sql_shim_url: None,
+            managed_db_privilege: ManagedDbPrivilege::default(),
         }
     }
 }

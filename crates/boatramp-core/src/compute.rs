@@ -732,6 +732,44 @@ pub trait ComputeBindingResolver: Send + Sync {
 pub trait ManagedDbEnvResolver: Send + Sync {
     /// Server-init env for `workload` if it is a managed database, else empty.
     async fn managed_db_env(&self, project: &str, workload: &str) -> Vec<(String, String)>;
+
+    /// The privilege strategy that lets `workload`'s stock DB image initialize on a
+    /// shared-kernel backend, or `None` if `workload` is not a managed database.
+    /// Sync + defaulted so a non-DB resolver needs no change. The reconcile applies it
+    /// to the **launch** spec only (never the stored one), and only when the operator
+    /// has not already set `user`/`cap_add`.
+    fn managed_db_privilege(&self, _project: &str, _workload: &str) -> Option<PrivilegeDirective> {
+        None
+    }
+}
+
+/// How a managed database is made able to initialize its stock image on a shared-kernel
+/// backend despite the dropped-`ALL` default. Applied to the launch spec by the
+/// reconcile (see [`ManagedDbEnvResolver::managed_db_privilege`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivilegeDirective {
+    /// Run rootless as `uid:gid` (the image's DB user) against its pre-owned volume —
+    /// needs no capabilities and works under any posture. The preferred default.
+    Rootless { uid: u32, gid: u32 },
+    /// Grant these capabilities back (short names, no `CAP_` prefix). Single-tenant
+    /// only — the backend's posture gate drops them under the multi-tenant guard.
+    Caps(Vec<String>),
+}
+
+impl PrivilegeDirective {
+    /// Apply this directive to a **launch** `spec`, without overriding a value the
+    /// operator set explicitly (an operator `user`/`cap_add` always wins).
+    pub fn apply(&self, spec: &mut ComputeSpec) {
+        match self {
+            Self::Rootless { uid, gid } if spec.user.is_none() => {
+                spec.user = Some(format!("{uid}:{gid}"));
+            }
+            Self::Caps(caps) if spec.cap_add.is_empty() => {
+                spec.cap_add = caps.clone();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One reconcile pass: for every workload, refresh replica health, compute the
@@ -842,6 +880,12 @@ pub async fn reconcile_once(
                     if let Some(m) = managed_db {
                         launch_env.extend(m.managed_db_env(&project_name, &wl).await);
                     }
+                    // A managed DB also gets a privilege strategy (rootless user or a
+                    // cap allowlist) so its stock image can init on a shared-kernel
+                    // backend; applied to the launch spec only, and only where the
+                    // operator has not set `user`/`cap_add` already.
+                    let privilege =
+                        managed_db.and_then(|m| m.managed_db_privilege(&project_name, &wl));
                     match launch_one(
                         b.as_ref(),
                         &wl,
@@ -850,6 +894,7 @@ pub async fn reconcile_once(
                         node_region,
                         &spec,
                         &launch_env,
+                        privilege.as_ref(),
                     )
                     .await
                     {
@@ -986,6 +1031,7 @@ fn region_of_node(nodes: &[Node], id: u64) -> Option<String> {
 }
 
 /// Materialize + launch one replica, returning its observed state.
+#[allow(clippy::too_many_arguments)]
 async fn launch_one(
     backend: &dyn ComputeBackend,
     workload: &str,
@@ -994,6 +1040,7 @@ async fn launch_one(
     node_region: Option<String>,
     spec: &ComputeSpec,
     extra_env: &[(String, String)],
+    privilege: Option<&PrivilegeDirective>,
 ) -> Result<ObservedInstance, BackendError> {
     let artifact = backend.materialize(spec).await?;
     // Fold the resolved binding env into the launched spec. The workload's own env
@@ -1001,6 +1048,11 @@ async fn launch_one(
     let mut spec = spec.clone();
     for (k, v) in extra_env {
         spec.env.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    // A managed-DB privilege strategy (rootless user / cap allowlist) — launch spec
+    // only; never overrides an operator-set `user`/`cap_add`.
+    if let Some(p) = privilege {
+        p.apply(&mut spec);
     }
     let instance = backend
         .launch(&LaunchRequest {
@@ -1025,6 +1077,32 @@ async fn launch_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privilege_directive_applies_without_overriding_operator_values() {
+        // Rootless sets `user` when unset.
+        let mut s = spec(1, 64);
+        PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut s);
+        assert_eq!(s.user.as_deref(), Some("999:999"));
+        assert!(s.cap_add.is_empty());
+
+        // An operator-set `user` is never overridden.
+        let mut s = spec(1, 64);
+        s.user = Some("1000".into());
+        PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut s);
+        assert_eq!(s.user.as_deref(), Some("1000"));
+
+        // Caps fills `cap_add` when empty…
+        let mut s = spec(1, 64);
+        PrivilegeDirective::Caps(vec!["CHOWN".into(), "SETUID".into()]).apply(&mut s);
+        assert_eq!(s.cap_add, vec!["CHOWN".to_string(), "SETUID".to_string()]);
+
+        // …but not over an operator-set allowlist.
+        let mut s = spec(1, 64);
+        s.cap_add = vec!["NET_BIND_SERVICE".into()];
+        PrivilegeDirective::Caps(vec!["CHOWN".into()]).apply(&mut s);
+        assert_eq!(s.cap_add, vec!["NET_BIND_SERVICE".to_string()]);
+    }
 
     fn spec(vcpus: u32, mem_mib: u32) -> ComputeSpec {
         ComputeSpec {
