@@ -8,6 +8,26 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **Scale-to-zero for the native `container` backend (CRIU).** An idle container
+  workload is now parked to disk and later woken with its **in-RAM state intact** —
+  the container analog of the microVM backends' snapshot/restore, using CRIU
+  (Checkpoint/Restore In Userspace, the same mechanism runc/Podman `checkpoint`
+  use). `snapshot` dumps the container's process tree (freeing all its resources,
+  holding its IP); `restore` checkpoints it back and re-attaches its veth/`eth0`, so
+  a woken container resumes exactly where it left off (validated end-to-end: a
+  per-process nonce served over HTTP survives the park/wake round-trip). It is
+  **capability-detected** — advertised only when a usable `criu` is present on the
+  node (`criu check` passes), so a `scale_to_zero` workload is never placed on a node
+  that couldn't wake it (the scheduler routes it to a capable backend otherwise).
+  This brings scale-to-zero to the shared-kernel/trusted-tier path (dense, fast,
+  no VM) alongside the strong-isolation microVM backends (`vmm-embedded`, `vmm`,
+  `vmm-vz`). **Also fixes four latent bugs on the container launch path** (which had
+  never been exercised live): the userns id-maps are now written by the privileged
+  launcher (a just-`unshare`d worker can't self-write a range map); `/proc`/`/sys`
+  are mounted before the old root is detached (userns `mount_too_revealing`); the
+  seccomp allow-list adds `fork`/`vfork` (musl-static workloads use the raw syscall);
+  and the container init `setsid`s to lead its own session. Needs `criu` on the node
+  (Linux; `CONFIG_CHECKPOINT_RESTORE` + `CAP_CHECKPOINT_RESTORE`/`CAP_SYS_ADMIN`).
 - **macOS-native microVM compute backend (`vmm-vz`).** On Apple silicon + macOS 15+,
   boatramp runs each compute replica as a lightweight Linux VM via Apple's
   Virtualization.framework — the macOS analog of the Linux/KVM `vmm-embedded`
