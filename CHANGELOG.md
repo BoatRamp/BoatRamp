@@ -8,6 +8,22 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **Tunable privileges for shared-kernel workloads, so a stock DB image can init.** The
+  docker + native-container backends drop every Linux capability by default, which stops
+  a stock `postgres`/`mysql` entrypoint (it `chown`s its data dir and `gosu`-drops to its
+  user). Three composable ways to fix it, cleanest first: `ComputeSpec.user`
+  (`compute set --user uid[:gid]`) runs the image **rootless** against a volume boatramp
+  pre-`chown`s for that uid — no capabilities, honored under any posture; `cap_add`
+  (`--cap-add CHOWN …`) grants specific capabilities back on top of the dropped-`ALL`
+  default, **single-tenant only** (the multi-tenant guard strips it, like
+  `writable_root`; on the native-container backend the caps are user-namespace-bounded);
+  and `[compute].managed_db_privilege` (`rootless` default | `caps`) makes a **managed
+  database** (a handler `sql` binding sourced from a DB boatramp runs) apply the right
+  strategy automatically, so it initializes with zero extra operator config. The stored,
+  content-addressed `ComputeSpec` is never mutated — the managed-DB strategy is applied
+  to the launch spec only, and never overrides an operator-set `user`/`cap_add`.
+  `no-new-privileges` stays on in every path. See
+  [Run a container or microVM](docs/src/how-to/compute.md).
 - **Embed the compute backends in-process: `NodeInput::worker_exe`.** The
   container + microVM backends re-exec a per-workload worker (`__sandbox` /
   `__vmm-run` / `__vz-run`); they now re-exec `NodeInput.worker_exe` (default:

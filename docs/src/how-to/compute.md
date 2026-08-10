@@ -208,6 +208,44 @@ Docker Desktop / macOS); `bind` uses a host directory under
 **node-local** — it is not part of the blob-snapshot durability story the microVM
 backend's volumes get, and does not follow a workload across nodes.
 
+## Running a stock image that needs privileges (e.g. a database)
+
+Because every capability is dropped, a stock image whose entrypoint runs as root and
+then **`chown`s a data dir and drops to its own user** (the classic `postgres` /
+`mysql` init) can't initialize on the shared-kernel backends out of the box — the
+`chown` needs `CAP_CHOWN`/`CAP_FOWNER` and the privilege-drop needs
+`CAP_SETUID`/`CAP_SETGID`. Two ways to make it work, cleanest first:
+
+**Run it rootless (preferred).** Point the entrypoint at the image's own DB user with
+`--user`, backed by a persistent volume boatramp pre-owns for that uid — the entrypoint
+then skips both the `chown` and the privilege-drop, so it needs **no capabilities** and
+works under **any** posture:
+
+```sh
+boatramp compute set pg --image postgres:16 --port 5432 \
+    --user 999:999 --volume pgdata:/var/lib/postgresql/data
+```
+
+**Add back the capabilities (fallback).** For an image that won't run rootless,
+`--cap-add` grants specific capabilities on top of the dropped-`ALL` default. It is
+honored **only under the single-tenant posture** (the multi-tenant guard strips it,
+same as `--writable-root`); on the native-container backend the caps are bounded by the
+workload's user namespace:
+
+```sh
+boatramp compute set pg --image postgres:16 --port 5432 \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+    --cap-add SETUID --cap-add SETGID \
+    --volume pgdata:/var/lib/postgresql/data
+```
+
+**Managed databases do this for you.** When a handler `sql` binding is sourced from a
+database boatramp runs (see [Managed SQL](./handler-bindings.md)), boatramp applies a
+privilege strategy automatically — no `--user`/`--cap-add` needed. The strategy is
+`[compute].managed_db_privilege`: `rootless` (the default — run as the image's DB user
+against its pre-owned volume, no capabilities, any posture) or `caps` (add the minimal
+set; single-tenant only).
+
 ## Next steps
 
 - [Scale compute to zero](./scale-to-zero.md) when a workload is idle.
