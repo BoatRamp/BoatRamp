@@ -36,6 +36,15 @@ use std::path::Path;
 pub enum WorkerError {
     /// A syscall failed (with the step that failed).
     Syscall(&'static str, nix::errno::Errno),
+    /// A `mount(2)` failed, with the specific source/target/fstype (the generic
+    /// [`Syscall`](Self::Syscall) label hides which mount tripped — critical when a
+    /// userns can mount some fs types but not others).
+    Mount {
+        source: String,
+        target: String,
+        fstype: String,
+        errno: nix::errno::Errno,
+    },
     /// A filesystem op failed (cgroup write, dir create, …).
     Io(&'static str, std::io::Error),
     /// The plan was malformed (e.g. an empty argv, or a non-UTF8 path/arg).
@@ -48,6 +57,15 @@ impl fmt::Display for WorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WorkerError::Syscall(step, e) => write!(f, "sandbox syscall {step} failed: {e}"),
+            WorkerError::Mount {
+                source,
+                target,
+                fstype,
+                errno,
+            } => write!(
+                f,
+                "sandbox mount {fstype} {source} -> {target} failed: {errno}"
+            ),
             WorkerError::Io(step, e) => write!(f, "sandbox {step} failed: {e}"),
             WorkerError::Plan(m) => write!(f, "invalid sandbox plan: {m}"),
             WorkerError::Seccomp(e) => write!(f, "sandbox seccomp: {e}"),
@@ -71,11 +89,13 @@ pub fn prepare(plan: &SandboxPlan) -> Result<(), WorkerError> {
     // already constrained (limits inherited through the cgroup hierarchy).
     setup_cgroup(plan)?;
     unshare(clone_flags(&plan.namespaces)).map_err(|e| WorkerError::Syscall("unshare", e))?;
-    // A user namespace is inert until its uid/gid maps are written; do it right
-    // after unshare, before any mount/`pivot_root`/id-drop.
-    if plan.namespaces.user {
-        setup_userns_maps()?;
-    }
+    // A user namespace is inert until its uid/gid maps are written — but we do NOT
+    // write them here. A process that has just unshared `CLONE_NEWUSER` no longer
+    // holds `CAP_SETUID`/`CAP_SETGID` in the *parent* namespace, so a self-write of a
+    // multi-id range map fails with `EPERM`. The privileged launcher (still root in
+    // the parent ns) writes `/proc/<pid>/{uid,gid}_map` after we signal ready — the
+    // same pid-based handshake it uses to move the veth peer into our netns. See
+    // [`userns_map_line`] + the `__sandbox` subcommand's launcher.
     Ok(())
 }
 
@@ -86,21 +106,13 @@ const USERNS_HOST_BASE: u32 = 100_000;
 /// The number of ids mapped from the container into the host range.
 const USERNS_COUNT: u32 = 65_536;
 
-/// The `/proc/self/{uid,gid}_map` line mapping container id `0` onto the
-/// unprivileged host base for [`USERNS_COUNT`] ids.
-fn userns_map_line() -> String {
+/// The `/proc/<pid>/{uid,gid}_map` line mapping container id `0` onto the
+/// unprivileged host base for [`USERNS_COUNT`] ids. Written by the **launcher**
+/// (which holds `CAP_SETUID`/`CAP_SETGID` in the parent namespace, so it can write
+/// an arbitrary range and needs no `setgroups=deny` dance) against the worker's pid
+/// after it unshares.
+pub fn userns_map_line() -> String {
     format!("0 {USERNS_HOST_BASE} {USERNS_COUNT}\n")
-}
-
-/// Write the user-namespace uid/gid maps. The worker runs as **real root**
-/// (`CAP_SETUID`/`CAP_SETGID` in the parent namespace), so it writes the maps
-/// directly — no `setgroups=deny` dance, which also keeps `drop_privileges`'
-/// `setgroups()` working (deny would forbid it).
-fn setup_userns_maps() -> Result<(), WorkerError> {
-    let line = userns_map_line();
-    fs::write("/proc/self/uid_map", &line).map_err(|e| WorkerError::Io("write uid_map", e))?;
-    fs::write("/proc/self/gid_map", &line).map_err(|e| WorkerError::Io("write gid_map", e))?;
-    Ok(())
 }
 
 /// Fork the container init and run the jail. In the parent, returns the init's
@@ -190,8 +202,20 @@ fn clone_flags(ns: &crate::sandbox::Namespaces) -> CloneFlags {
 
 /// In the forked child: build the jail and `execve`. Never returns on success.
 fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
+    // Become a session + process-group leader in the new pid namespace, detaching
+    // from the launcher's session (which lives in the host pidns). Standard
+    // container-init behavior — and required for checkpoint: CRIU refuses to dump a
+    // task whose session leader is outside its pid namespace.
+    nix::unistd::setsid().map_err(|e| WorkerError::Syscall("setsid", e))?;
     pivot_into_root(&plan.root, &plan.volumes)?;
+    // Mount `/proc`, `/sys`, … *before* detaching the old root. In a user
+    // namespace the kernel's `mount_too_revealing` guard permits a fresh procfs/
+    // sysfs mount only when a fully-visible reference of that fstype already exists
+    // in the mount namespace; the still-attached old root (at `/.put_old`) provides
+    // it (its `/.put_old/proc` etc.). Detaching it first (the old order) left no
+    // reference → `mount proc -> /proc` failed with EPERM.
     apply_mounts(&plan.mounts)?;
+    detach_old_root()?;
 
     sethostname(&plan.hostname).map_err(|e| WorkerError::Syscall("sethostname", e))?;
 
@@ -241,6 +265,18 @@ fn pivot_into_root(root: &str, volumes: &[VolumeMount]) -> Result<(), WorkerErro
     fs::create_dir_all(&put_old).map_err(|e| WorkerError::Io("create put_old", e))?;
     pivot_root(root, &put_old).map_err(|e| WorkerError::Syscall("pivot_root", e))?;
     chdir("/").map_err(|e| WorkerError::Syscall("chdir", e))?;
+    // NOTE: the old root stays mounted at `/.put_old` until [`detach_old_root`], so
+    // it can serve as the `mount_too_revealing` reference for the `/proc`/`/sys`
+    // mounts in [`apply_mounts`]. It is detached immediately after.
+    Ok(())
+}
+
+/// Detach + remove the old root parked at `/.put_old` by [`pivot_into_root`]. Called
+/// **after** [`apply_mounts`] so the container's fresh `/proc`/`/sys` mounts had a
+/// fully-visible reference of their fstype while being set up (the userns
+/// `mount_too_revealing` guard). After this the container can no longer see the host
+/// root.
+fn detach_old_root() -> Result<(), WorkerError> {
     nix::mount::umount2("/.put_old", MntFlags::MNT_DETACH)
         .map_err(|e| WorkerError::Syscall("umount put_old", e))?;
     fs::remove_dir("/.put_old").map_err(|e| WorkerError::Io("remove put_old", e))?;
@@ -292,7 +328,12 @@ fn apply_mounts(mounts: &[Mount]) -> Result<(), WorkerError> {
             flags,
             data.as_deref(),
         )
-        .map_err(|e| WorkerError::Syscall("mount", e))?;
+        .map_err(|e| WorkerError::Mount {
+            source: m.source.clone(),
+            target: m.target.clone(),
+            fstype: m.fstype.clone(),
+            errno: e,
+        })?;
     }
     Ok(())
 }

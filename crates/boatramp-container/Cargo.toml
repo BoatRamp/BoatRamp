@@ -59,6 +59,19 @@ ipnet.workspace = true
 serde_json.workspace = true
 # Build an in-memory rootfs blob stream for the `materialize` staging test.
 bytes.workspace = true
+# The privileged `container_live` seam drives a real launch (+ later CRIU
+# checkpoint/restore) on a multi-thread runtime so the log-pump tasks drain the
+# worker's pipes while the probe loop blocks. Linux-only, `#[ignore]`d by default.
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "process",
+  "net",
+  "fs",
+  "io-util",
+  "time",
+  "sync",
+] }
 
 [lints]
 workspace = true

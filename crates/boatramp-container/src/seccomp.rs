@@ -81,6 +81,12 @@ const ALLOWED: &[&str] = &[
     // process / threads / scheduling
     "clone",
     "clone3",
+    // musl's `fork()`/`vfork()` on x86_64 issue the raw `fork`/`vfork` syscalls
+    // (not `clone`), so a static-musl workload (e.g. busybox) can't spawn a child
+    // without these. They add no escape surface beyond `clone`, which is already
+    // allowed.
+    "fork",
+    "vfork",
     "execve",
     "execveat",
     "exit",

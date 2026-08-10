@@ -426,9 +426,28 @@ impl ContainerBackend {
             .await
             .map_err(|e| BackendError::Launch(format!("await ready: {e}")))?;
         if ready.trim() != "ready" {
+            // The worker died in `prepare` (cgroup/unshare/userns) before signaling
+            // ready; surface its stderr so the failure reason isn't swallowed.
+            let mut why = String::new();
+            let mut lines = cstderr.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                why.push_str(&line);
+                why.push('\n');
+            }
             return Err(BackendError::Launch(format!(
-                "worker did not signal ready (got {ready:?})"
+                "worker did not signal ready (got {ready:?}); worker stderr:\n{}",
+                why.trim_end()
             )));
+        }
+
+        // Write the user-namespace id maps from here (the privileged launcher). The
+        // worker cannot self-write a range map after `unshare(CLONE_NEWUSER)` (it
+        // lacks CAP_SETUID in the parent ns → EPERM); we hold it, so we write its
+        // `/proc/<pid>/{uid,gid}_map` directly. Same pid-based handshake as the netns
+        // setup below.
+        if plan.namespaces.user {
+            write_userns_maps(pid)
+                .map_err(|e| BackendError::Launch(format!("write userns maps: {e}")))?;
         }
 
         // Move the veth peer into the worker's netns + configure eth0/lo there.
@@ -642,6 +661,18 @@ fn unpack_tar_gz(tar_path: &Path, dir: &Path, caps: ArchiveCaps) -> Result<(), A
             return Err(ArchiveError::PathEscape(p));
         }
     }
+    Ok(())
+}
+
+/// Write the worker's user-namespace uid/gid maps from the launcher. The worker
+/// unshared `CLONE_NEWUSER` but can't self-write a range map (no CAP_SETUID in the
+/// parent ns after the unshare); the launcher still holds CAP_SETUID/SETGID in the
+/// parent, so it writes `/proc/<pid>/{uid,gid}_map` for it (uid first). No
+/// `setgroups=deny` is needed — a privileged writer may set gid_map directly.
+fn write_userns_maps(pid: u32) -> Result<(), String> {
+    let line = crate::worker::userns_map_line();
+    std::fs::write(format!("/proc/{pid}/uid_map"), &line).map_err(|e| format!("uid_map: {e}"))?;
+    std::fs::write(format!("/proc/{pid}/gid_map"), &line).map_err(|e| format!("gid_map: {e}"))?;
     Ok(())
 }
 
