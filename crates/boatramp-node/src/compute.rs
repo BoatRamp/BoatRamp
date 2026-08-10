@@ -161,6 +161,11 @@ pub async fn build_compute(
     node_id: u64,
     strict: bool,
     daemon: Option<Arc<boatramp_server::DaemonRuntime>>,
+    // The binary the re-exec'd container/microVM workers run as; `None` ⇒ this
+    // process's own executable (`current_exe`). An embedding harness points it at a
+    // built `boatramp` binary so the workers find the `__sandbox`/`__vmm-run`/
+    // `__vz-run` subcommands. See [`crate::node::NodeInput::worker_exe`].
+    worker_exe: Option<&std::path::Path>,
 ) -> (
     boatramp_core::compute::BackendRegistry,
     boatramp_core::compute::Node,
@@ -200,7 +205,7 @@ pub async fn build_compute(
 
     // Native container backend (Linux only).
     #[cfg(target_os = "linux")]
-    match std::env::current_exe() {
+    match worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())) {
         Ok(self_exe) => match boatramp_container::ContainerBackend::new(
             storage.clone(),
             data_dir.to_path_buf(),
@@ -223,7 +228,7 @@ pub async fn build_compute(
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if std::path::Path::new("/dev/kvm").exists() {
         match (
-            std::env::current_exe(),
+            worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())),
             boatramp_core::ipam::IpPool::new(&cfg.subnet),
         ) {
             (Ok(self_exe), Ok(pool)) => {
@@ -266,7 +271,7 @@ pub async fn build_compute(
     #[cfg(target_os = "macos")]
     if macos_supports_vz() {
         match (
-            std::env::current_exe(),
+            worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())),
             boatramp_core::ipam::IpPool::new(&cfg.subnet),
         ) {
             (Ok(self_exe), Ok(_pool)) => {

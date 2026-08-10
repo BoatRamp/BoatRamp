@@ -53,13 +53,35 @@ Which surface you embed decides how much of the real node you exercise:
 
 What **neither** exercises, and what therefore still needs the **real artifact**:
 the CLI / `project.cfg` / `boatramp.cfg` parsing, the store-migration guard,
-transport + TLS/ACME, cluster bring-up, and — the big one — the **real compute
-backends** (docker / microVM), which need a live daemon (`dockerd`, `/dev/kvm`) and
-process re-exec that no in-process harness provides. So `assemble` is a
-high-fidelity harness for the assembly + serving plane, but validating the compute
-backends, the CLI, and packaging still means driving `boatramp serve` (or the
-container image) over HTTP and the CLI against real backends — which is what the
-crate's live/e2e tests and the release boot gate do.
+transport + TLS/ACME, cluster bring-up, and packaging. Validating those still means
+driving `boatramp serve` (or the container image) over HTTP and the CLI against real
+backends — which is what the crate's live/e2e tests and the release boot gate do.
+
+The **compute backends are more embeddable than they look**, and it's worth being
+precise about what each needs:
+
+- The **docker** backend does **no process re-exec** — it talks to a `dockerd` over
+  the Engine API. `assemble` registers it whenever a daemon answers, so an in-process
+  harness can drive real docker-backed compute (e.g. **Postgres-as-OCI** for a handler
+  `sql` binding) by embedding the serving plane and pointing `DOCKER_HOST` at a daemon.
+  No `boatramp serve` subprocess.
+- The **container** + **microVM** backends *do* re-exec a per-workload worker
+  (`__sandbox` / `__vmm-run` / `__vz-run`) — and they re-exec **`NodeInput::worker_exe`**
+  (default: this process's own executable). An embedding harness whose binary doesn't
+  implement those subcommands sets `worker_exe` to a **built `boatramp` binary**, and
+  then those backends work in-process too: the serving plane stays embedded, and only
+  each workload's worker re-execs the real `boatramp` (exactly what `boatramp serve`
+  does). They still need their substrate — root + cgroup v2 for `container`, `/dev/kvm`
+  for the KVM VMM, macOS + Virtualization.framework for `vmm-vz`.
+
+The one thing that is **irreducible**: a compute workload *is* a separate process — a
+container or a VM — so a real Postgres never runs *inside* the test process itself.
+What `assemble` (+ `worker_exe`) lets you collapse is the **serve / control / tenancy
+plane** into your test binary (no `boatramp serve` subprocess); the workload then runs
+in its backend (a `dockerd` container, or a re-exec'd worker), not as a spawned
+`boatramp serve`. So `assemble` is a high-fidelity harness for the assembly + serving
+plane *and* a viable driver for the compute backends — with the workload process being
+the only part that stays out-of-process by nature.
 
 ## 1. Add the dependencies
 

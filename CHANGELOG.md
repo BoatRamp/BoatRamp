@@ -7,6 +7,18 @@ versions.
 
 ## [Unreleased]
 
+### Added
+- **Embed the compute backends in-process: `NodeInput::worker_exe`.** The
+  container + microVM backends re-exec a per-workload worker (`__sandbox` /
+  `__vmm-run` / `__vz-run`); they now re-exec `NodeInput.worker_exe` (default:
+  `current_exe()`, which is what `boatramp serve` wants). An **embedding harness**
+  whose own binary doesn't implement those subcommands can point `worker_exe` at a
+  built `boatramp` binary and drive the real container/microVM backends in-process —
+  the serving/tenancy plane stays embedded via `assemble`, only each workload's worker
+  is a re-exec. (The docker backend needs no re-exec at all — it talks to a daemon — so
+  docker-backed compute, e.g. Postgres-as-OCI, embeds through `assemble` today.) See
+  [Embed the node](docs/src/how-to/embed.md).
+
 ### Fixed
 - **Untagged docker image references default to `:latest`.** `compute set/build --image
   <name>` with no tag (e.g. `--image alpine`) no longer pulls *every* tag of the repo

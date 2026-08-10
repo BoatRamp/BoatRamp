@@ -70,6 +70,15 @@ pub struct NodeInput<'a> {
     /// This node's compute scheduler id (`0` single-node; the cluster node id in a
     /// fleet, so replicas are tagged to the right node).
     pub node_id: u64,
+    /// The binary the re-exec'd compute workers run as — the container backend's
+    /// `__sandbox` jailer and the microVM backends' `__vmm-run`/`__vz-run` VM hosts.
+    /// `None` uses this process's own executable (`current_exe`), which is what
+    /// `boatramp serve` wants (the child *is* boatramp). An **embedding harness**
+    /// whose own binary doesn't implement those subcommands should point this at a
+    /// built `boatramp` binary, so it can drive the real container/microVM backends
+    /// in-process (only the per-workload worker re-execs; the serving plane stays
+    /// embedded). The docker backend needs neither — it talks to a daemon.
+    pub worker_exe: Option<std::path::PathBuf>,
 }
 
 /// A fully wired node: the deploy store, handler runtime, auth, and options a
@@ -110,6 +119,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         messaging,
         is_leader,
         node_id,
+        worker_exe,
     } = input;
     // Copy out the posture scalars up front so `options` can be moved into the
     // returned `RunningNode` without a lingering borrow.
@@ -185,6 +195,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         node_id,
         !allow_shared_kernel,
         options.daemon_runtime.clone(),
+        worker_exe.as_deref(),
     )
     .await;
     // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener +
@@ -337,6 +348,7 @@ mod tests {
             messaging: None,
             is_leader: Arc::new(|| true),
             node_id: 0,
+            worker_exe: None,
         })
         .await
         .expect("assemble a node over a temp store");

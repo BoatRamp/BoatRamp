@@ -714,6 +714,8 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         messaging: None,
         is_leader: Arc::new(|| true),
         node_id: 0,
+        // `boatramp serve` re-execs itself for compute workers (the child is boatramp).
+        worker_exe: None,
     })
     .await?;
 
@@ -1566,6 +1568,7 @@ async fn run_cluster(
         messaging: Some(node.messaging.clone()),
         is_leader,
         node_id: node.node_id,
+        worker_exe: None,
     })
     .await?;
 
