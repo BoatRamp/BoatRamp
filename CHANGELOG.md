@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.3]
+
 ### Added
 - **Scale-to-zero for the native `container` backend (CRIU).** An idle container
   workload is now parked to disk and later woken with its **in-RAM state intact** —
