@@ -85,6 +85,32 @@ fn volume_dir(data_dir: &Path, name: &str) -> PathBuf {
     data_dir.join("compute").join("volumes").join(name)
 }
 
+/// Parse a `ComputeSpec.user` (`"uid"` or `"uid:gid"`, numeric) into `(uid, gid)`,
+/// defaulting `gid` to `uid`. Returns `None` for a non-numeric value (the caller then
+/// leaves ownership untouched — the endpoint still passes the raw string to Docker,
+/// which resolves an image username itself).
+fn parse_uid_gid(user: &str) -> Option<(u32, u32)> {
+    match user.split_once(':') {
+        Some((u, g)) => Some((u.parse().ok()?, g.parse().ok()?)),
+        None => {
+            let uid = user.parse().ok()?;
+            Some((uid, uid))
+        }
+    }
+}
+
+/// `chown` a bind-volume host directory so a rootless image can own its data
+/// (e.g. Postgres' `PGDATA`). Non-recursive: only the mount root, so an already
+/// initialized volume's nested ownership is left alone. A no-op off unix.
+#[cfg(unix)]
+fn chown_dir(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    std::os::unix::fs::chown(path, Some(uid), Some(gid))
+}
+#[cfg(not(unix))]
+fn chown_dir(_path: &Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Reject a volume whose `name` or `mount` could escape its sandboxed location
 /// (mirrors the native-container guard): `name` backs a docker volume / a
 /// `<data_dir>/compute/volumes/<name>` bind, so it must be a single normal path
@@ -224,6 +250,10 @@ impl DockerBackend {
     /// is auto-created by the daemon on container create. Returns the mounts to
     /// attach (empty ⇒ no volumes).
     async fn stage_volumes(&self, spec: &ComputeSpec) -> Result<Vec<Mount>, BackendError> {
+        // A rootless `user` (`uid[:gid]`) means the entrypoint runs unprivileged, so a
+        // bind volume it must write (a database's data dir) needs to be owned by that
+        // uid — the host owns the dir, so pre-chown it. Only meaningful for `Bind` mode.
+        let chown = spec.user.as_deref().and_then(parse_uid_gid);
         let mut mounts = Vec::with_capacity(spec.volumes.len());
         for vol in &spec.volumes {
             validate_volume(&vol.name, &vol.mount)?;
@@ -232,6 +262,14 @@ impl DockerBackend {
                 tokio::fs::create_dir_all(&dir).await.map_err(|e| {
                     BackendError::Launch(format!("create volume {} dir: {e}", vol.name))
                 })?;
+                if let Some((uid, gid)) = chown {
+                    chown_dir(&dir, uid, gid).map_err(|e| {
+                        BackendError::Launch(format!(
+                            "chown volume {} to {uid}:{gid}: {e}",
+                            vol.name
+                        ))
+                    })?;
+                }
             }
             mounts.push(volume_mount(vol, self.volume_mode, &self.data_dir));
         }
@@ -434,6 +472,10 @@ impl ComputeBackend for DockerBackend {
             image: Some(reference),
             cmd: Some(req.spec.entrypoint.clone()),
             env: Some(env),
+            // Run the entrypoint as this user (`uid[:gid]`) so a stock image runs
+            // rootless against its pre-chowned volume — no capabilities needed. Passed
+            // to Docker verbatim; `None` keeps the image's own user.
+            user: req.spec.user.clone(),
             ..Default::default()
         };
         // In the default `Published` mode, publish the container port on the host
@@ -718,6 +760,15 @@ mod tests {
                 .writable_root_allowed,
             "the single-tenant posture opts in"
         );
+    }
+
+    #[test]
+    fn parse_uid_gid_handles_uid_and_uid_gid() {
+        assert_eq!(parse_uid_gid("999"), Some((999, 999)));
+        assert_eq!(parse_uid_gid("1000:1001"), Some((1000, 1001)));
+        // A non-numeric user (an image username) is left to Docker to resolve.
+        assert_eq!(parse_uid_gid("postgres"), None);
+        assert_eq!(parse_uid_gid("999:abc"), None);
     }
 
     #[test]

@@ -22,8 +22,8 @@ use nix::mount::{MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
-    chdir, execve, fork, pivot_root, setgroups, sethostname, setresgid, setresuid, ForkResult, Gid,
-    Uid,
+    chdir, chown, execve, fork, pivot_root, setgroups, sethostname, setresgid, setresuid,
+    ForkResult, Gid, Uid,
 };
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -218,6 +218,19 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
     detach_old_root()?;
 
     sethostname(&plan.hostname).map_err(|e| WorkerError::Syscall("sethostname", e))?;
+
+    // If the entrypoint runs as a non-root user, hand it ownership of its persistent
+    // volumes (the mount root only) so it can write — done here as namespace-root,
+    // before dropping privileges. Bind mounts share inodes with the host backing dir,
+    // so this persists across restarts; namespace uid 0 already owns everything.
+    if plan.uid != 0 {
+        let owner = Uid::from_raw(plan.uid);
+        let group = Gid::from_raw(plan.gid);
+        for v in &plan.volumes {
+            chown(v.mount.as_str(), Some(owner), Some(group))
+                .map_err(|e| WorkerError::Syscall("chown volume", e))?;
+        }
+    }
 
     // Drop privileges first (sets `no_new_privs`), then install seccomp — so the
     // filter can be applied without CAP_SYS_ADMIN and only the entrypoint (and

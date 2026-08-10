@@ -32,10 +32,26 @@ use crate::sandbox::{SandboxPlan, VolumeMount};
 
 /// The entrypoint runs as root **inside** the container's user view (caps are
 /// dropped + seccomp installed by the worker, so it holds no host privilege).
-/// Matches the default most OCI images expect; an image `User` override is a
-/// later refinement.
+/// Matches the default most OCI images expect; a spec `user` overrides it.
 const GUEST_UID: u32 = 0;
 const GUEST_GID: u32 = 0;
+
+/// Parse a `ComputeSpec.user` (`"uid"` or `"uid:gid"`, numeric) into the namespace
+/// `(uid, gid)` the entrypoint runs as, `gid` defaulting to `uid`. Absent or
+/// non-numeric ⇒ the container default (namespace-root), so the entrypoint keeps the
+/// prior behaviour.
+fn spec_uid_gid(spec: &ComputeSpec) -> (u32, u32) {
+    let Some(user) = spec.user.as_deref() else {
+        return (GUEST_UID, GUEST_GID);
+    };
+    match user.split_once(':') {
+        Some((u, g)) => match (u.parse(), g.parse()) {
+            (Ok(u), Ok(g)) => (u, g),
+            _ => (GUEST_UID, GUEST_GID),
+        },
+        None => user.parse().map_or((GUEST_UID, GUEST_GID), |u| (u, u)),
+    }
+}
 
 /// Content-addressed Storage key for a blob hash (`<2hex>/<hash>`).
 fn blob_key(hash: &str) -> String {
@@ -543,7 +559,8 @@ impl ContainerBackend {
         rootfs: &str,
         ip: Ipv4Addr,
     ) -> Result<Instance, BackendError> {
-        let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, GUEST_UID, GUEST_GID);
+        let (uid, gid) = spec_uid_gid(&req.spec);
+        let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, uid, gid);
         plan.volumes = self.stage_volumes(&req.spec).await?;
         // Honor `cap_add` only where the posture allows it (single-tenant); otherwise
         // the dropped-`ALL` default stands. Bounded by the worker's user namespace.
@@ -1043,6 +1060,20 @@ mod tests {
             prefer_backend: None,
             bindings: vec![],
         }
+    }
+
+    #[test]
+    fn spec_uid_gid_parses_user_or_defaults_to_namespace_root() {
+        let mut spec = spec_for(&"a".repeat(64));
+        // Absent ⇒ namespace-root default.
+        assert_eq!(spec_uid_gid(&spec), (GUEST_UID, GUEST_GID));
+        spec.user = Some("999".into());
+        assert_eq!(spec_uid_gid(&spec), (999, 999));
+        spec.user = Some("1000:1001".into());
+        assert_eq!(spec_uid_gid(&spec), (1000, 1001));
+        // A non-numeric user falls back to the default (never a parse panic).
+        spec.user = Some("postgres".into());
+        assert_eq!(spec_uid_gid(&spec), (GUEST_UID, GUEST_GID));
     }
 
     #[tokio::test]
