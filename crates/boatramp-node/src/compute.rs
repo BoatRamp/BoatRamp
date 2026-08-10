@@ -187,13 +187,15 @@ pub async fn build_compute(
     // Remote docker: register only if a daemon actually answers.
     match boatramp_docker::DockerBackend::connect() {
         Ok(docker) => {
-            // `writable_root` is honored only under the single-tenant posture
-            // (`!strict`); the multi-tenant guard keeps the hardened read-only root.
+            // `writable_root` and `cap_add` are honored only under the single-tenant
+            // posture (`!strict`); the multi-tenant guard keeps the hardened read-only
+            // root and every capability dropped.
             let docker = docker
                 .with_endpoint(cfg.docker_endpoint)
                 .with_volume_mode(cfg.docker_volume_mode)
                 .with_data_dir(data_dir)
-                .with_writable_root_allowed(!strict);
+                .with_writable_root_allowed(!strict)
+                .with_cap_add_allowed(!strict);
             if docker.reachable().await {
                 backends.insert("docker".to_string(), std::sync::Arc::new(docker));
             } else {
@@ -214,6 +216,9 @@ pub async fn build_compute(
             self_exe,
         ) {
             Ok(c) => {
+                // Single-tenant posture (`!strict`) may honor `cap_add`; multi-tenant
+                // keeps every capability dropped.
+                let c = c.with_cap_add_allowed(!strict);
                 backends.insert("container".to_string(), std::sync::Arc::new(c));
             }
             Err(e) => tracing::warn!(%e, "container backend unavailable"),

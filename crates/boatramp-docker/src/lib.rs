@@ -145,6 +145,10 @@ pub struct DockerBackend {
     /// posture (single-tenant only); off under the multi-tenant guard, so a
     /// writable-root spec is forced back to the hardened read-only root.
     writable_root_allowed: bool,
+    /// Whether a spec's `cap_add` is honored here. Set from the isolation posture
+    /// (single-tenant only); off under the multi-tenant guard, so a cap-add spec is
+    /// forced back to the dropped-`ALL` default.
+    cap_add_allowed: bool,
 }
 
 impl DockerBackend {
@@ -159,6 +163,7 @@ impl DockerBackend {
             volume_mode: DockerVolumeMode::default(),
             data_dir: PathBuf::from("."),
             writable_root_allowed: false,
+            cap_add_allowed: false,
         })
     }
 
@@ -170,6 +175,7 @@ impl DockerBackend {
             volume_mode: DockerVolumeMode::default(),
             data_dir: PathBuf::from("."),
             writable_root_allowed: false,
+            cap_add_allowed: false,
         }
     }
 
@@ -183,6 +189,14 @@ impl DockerBackend {
     /// posture). Off by default, so the multi-tenant guard keeps the hardened root.
     pub fn with_writable_root_allowed(mut self, allowed: bool) -> Self {
         self.writable_root_allowed = allowed;
+        self
+    }
+
+    /// Allow a spec's `cap_add` to add capabilities back on top of the dropped-`ALL`
+    /// default here (single-tenant posture). Off by default, so the multi-tenant guard
+    /// keeps every capability dropped.
+    pub fn with_cap_add_allowed(mut self, allowed: bool) -> Self {
+        self.cap_add_allowed = allowed;
         self
     }
 
@@ -291,11 +305,18 @@ const MAX_PIDS: i64 = 512;
 /// `writable_root` relaxes only the read-only-root default (caller-gated to the
 /// single-tenant posture); every other hardening stays on. The idiomatic path for
 /// app writes is a persistent volume, not a writable root.
+///
+/// `cap_add` names capabilities (short form, no `CAP_` prefix) to grant back on top of
+/// the dropped-`ALL` default — also caller-gated to single-tenant — for an image whose
+/// entrypoint genuinely needs one (a stock database that `chown`s its data dir and
+/// drops privileges). `cap_drop: ALL` still applies, so it is an explicit allowlist,
+/// and `no-new-privileges` stays on. Empty ⇒ the strict dropped-`ALL` default.
 fn hardened_host_config(
     mem_mib: u32,
     vcpus: u32,
     restart: RestartPolicy,
     writable_root: bool,
+    cap_add: &[String],
 ) -> HostConfig {
     let tmpfs = std::collections::HashMap::from([
         ("/tmp".to_string(), "rw,noexec,nosuid,size=64m".to_string()),
@@ -308,6 +329,8 @@ fn hardened_host_config(
         // Hardening:
         security_opt: Some(vec!["no-new-privileges:true".to_string()]),
         cap_drop: Some(vec!["ALL".to_string()]),
+        // Add back only the explicitly-allowlisted capabilities (empty by default).
+        cap_add: (!cap_add.is_empty()).then(|| cap_add.to_vec()),
         readonly_rootfs: Some(!writable_root),
         tmpfs: Some(tmpfs),
         pids_limit: Some(MAX_PIDS),
@@ -388,11 +411,19 @@ impl ComputeBackend for DockerBackend {
         // Honor `writable_root` only where the posture allows it (single-tenant);
         // otherwise the hardened read-only root stands.
         let writable_root = req.spec.writable_root && self.writable_root_allowed;
+        // Same posture gate for `cap_add`: single-tenant may add capabilities back,
+        // the multi-tenant guard keeps the dropped-`ALL` default.
+        let cap_add: &[String] = if self.cap_add_allowed {
+            &req.spec.cap_add
+        } else {
+            &[]
+        };
         let mut host_config = hardened_host_config(
             req.spec.mem_mib,
             req.spec.vcpus,
             req.spec.restart,
             writable_root,
+            cap_add,
         );
         // Attach the spec's persistent volumes (validated; bind dirs created).
         let mounts = self.stage_volumes(&req.spec).await?;
@@ -620,7 +651,7 @@ mod tests {
 
     #[test]
     fn host_config_is_hardened_by_default() {
-        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false);
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &[]);
         // Resource limits still applied.
         assert_eq!(hc.memory, Some(256 * 1024 * 1024));
         assert_eq!(hc.nano_cpus, Some(2_000_000_000));
@@ -631,6 +662,8 @@ mod tests {
             Some(["no-new-privileges:true".to_string()].as_slice())
         );
         assert_eq!(hc.cap_drop.as_deref(), Some(["ALL".to_string()].as_slice()));
+        // No capabilities added back by default.
+        assert_eq!(hc.cap_add, None);
         assert_eq!(hc.readonly_rootfs, Some(true));
         // A read-only rootfs stays usable via small noexec/nosuid scratch mounts.
         let tmpfs = hc.tmpfs.expect("tmpfs mounts for a read-only rootfs");
@@ -638,14 +671,14 @@ mod tests {
         assert!(tmpfs.contains_key("/run"));
         // At least one vCPU even when the spec asks for zero.
         assert_eq!(
-            hardened_host_config(64, 0, RestartPolicy::Never, false).nano_cpus,
+            hardened_host_config(64, 0, RestartPolicy::Never, false, &[]).nano_cpus,
             Some(1_000_000_000)
         );
     }
 
     #[test]
     fn writable_root_relaxes_only_the_read_only_root() {
-        let hc = hardened_host_config(256, 2, RestartPolicy::Never, true);
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, true, &[]);
         // The one relaxation.
         assert_eq!(hc.readonly_rootfs, Some(false));
         // Every other hardening still applies.
@@ -654,7 +687,23 @@ mod tests {
             Some(["no-new-privileges:true".to_string()].as_slice())
         );
         assert_eq!(hc.cap_drop.as_deref(), Some(["ALL".to_string()].as_slice()));
+        assert_eq!(hc.cap_add, None);
         assert_eq!(hc.pids_limit, Some(MAX_PIDS));
+    }
+
+    #[test]
+    fn cap_add_adds_back_only_the_allowlist() {
+        let caps = ["CHOWN".to_string(), "SETUID".to_string()];
+        let hc = hardened_host_config(256, 2, RestartPolicy::Never, false, &caps);
+        // The allowlist is added back on top of the retained drop-ALL.
+        assert_eq!(hc.cap_drop.as_deref(), Some(["ALL".to_string()].as_slice()));
+        assert_eq!(hc.cap_add.as_deref(), Some(caps.as_slice()));
+        // Adding caps does not relax any other hardening.
+        assert_eq!(
+            hc.security_opt.as_deref(),
+            Some(["no-new-privileges:true".to_string()].as_slice())
+        );
+        assert_eq!(hc.readonly_rootfs, Some(true));
     }
 
     #[test]
@@ -667,6 +716,18 @@ mod tests {
             backend
                 .with_writable_root_allowed(true)
                 .writable_root_allowed,
+            "the single-tenant posture opts in"
+        );
+    }
+
+    #[test]
+    fn cap_add_is_off_by_default_on_the_backend() {
+        // Without the posture opt-in the backend keeps every capability dropped.
+        let docker = Docker::connect_with_defaults().unwrap();
+        let backend = DockerBackend::with_client(docker);
+        assert!(!backend.cap_add_allowed);
+        assert!(
+            backend.with_cap_add_allowed(true).cap_add_allowed,
             "the single-tenant posture opts in"
         );
     }

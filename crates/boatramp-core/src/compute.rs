@@ -1041,6 +1041,8 @@ mod tests {
             scale_to_zero: false,
             volumes: vec![],
             writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],

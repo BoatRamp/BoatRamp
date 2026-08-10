@@ -116,6 +116,13 @@ pub struct SandboxPlan {
     pub volumes: Vec<VolumeMount>,
     /// cgroup v2 limits.
     pub cgroup: CgroupLimits,
+    /// Linux capabilities to retain on top of the dropped-`ALL` default (short names,
+    /// no `CAP_` prefix, e.g. `"CHOWN"`). Populated by the backend after the
+    /// single-tenant posture gate; empty ⇒ drop every capability (the default). Because
+    /// the worker runs in a user namespace, a retained capability is bounded by that
+    /// namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
     /// The allowed-syscall seccomp profile (default-deny: everything not listed
     /// is denied). [`for_spec`](SandboxPlan::for_spec) populates it from
     /// [`seccomp::default_allowlist`](crate::seccomp::default_allowlist); the
@@ -177,6 +184,7 @@ impl SandboxPlan {
             mounts,
             volumes: Vec::new(),
             cgroup,
+            cap_add: Vec::new(),
             seccomp_allow: Some(crate::seccomp::default_allowlist()),
             namespaces: Namespaces::default(),
         }
@@ -204,6 +212,8 @@ mod tests {
             scale_to_zero: false,
             volumes: vec![],
             writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],
@@ -218,6 +228,19 @@ mod tests {
         assert_eq!(plan.root, "/run/c/web-0/rootfs");
         assert_eq!(plan.hostname, "web-0");
         assert_eq!((plan.uid, plan.gid), (1000, 1000));
+    }
+
+    #[test]
+    fn cap_add_defaults_empty_and_the_backend_fills_it() {
+        // `for_spec` never grants capabilities itself — the backend sets `cap_add`
+        // after the single-tenant posture gate.
+        let mut plan = SandboxPlan::for_spec(&spec(1, 128), "/r", "h", 0, 0);
+        assert!(plan.cap_add.is_empty());
+        plan.cap_add = vec!["CHOWN".into(), "SETUID".into()];
+        assert_eq!(
+            plan.cap_add,
+            vec!["CHOWN".to_string(), "SETUID".to_string()]
+        );
     }
 
     #[test]

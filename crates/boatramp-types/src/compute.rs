@@ -171,6 +171,24 @@ pub struct ComputeSpec {
     /// content hash when false (back-compat).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub writable_root: bool,
+    /// Linux capabilities to add back on top of the dropped-`ALL` default of the
+    /// shared-kernel backends (docker / native container), so an image whose
+    /// entrypoint needs a specific capability (e.g. a stock database that `chown`s its
+    /// data dir and `gosu`-drops to its user) can init. Names are the short form
+    /// without the `CAP_` prefix (`"CHOWN"`, `"SETUID"`, …). Honored **only under the
+    /// single-tenant isolation posture** — the multi-tenant guard strips it, exactly
+    /// like [`writable_root`](Self::writable_root). Empty ⇒ omitted from the wire + the
+    /// content hash (back-compat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// Run the entrypoint as this user instead of the backend default. `"uid"` or
+    /// `"uid:gid"` (numeric). On the shared-kernel backends this lets a stock image
+    /// run rootless against a pre-owned volume — the entrypoint skips the `chown` +
+    /// privilege-drop that would otherwise need capabilities, so it needs none. A
+    /// hardening (not a relaxation), so it is honored under any posture. `None` ⇒ the
+    /// backend default; omitted from the wire + the content hash (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// Isolation the workload requires; selects which backends are eligible.
     /// Default `Trusted`; omitted from the serialized
     /// spec when default, so existing specs keep their content hash.
@@ -323,6 +341,8 @@ mod tests {
             scale_to_zero: true,
             volumes: vec![],
             writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],

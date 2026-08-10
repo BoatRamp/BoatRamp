@@ -128,6 +128,18 @@ enum ComputeCommand {
         /// volume for app writes.
         #[arg(long)]
         writable_root: bool,
+        /// Add back a Linux capability on the shared-kernel backends (docker / native
+        /// container), without the `CAP_` prefix, e.g. `CHOWN` (repeatable). Honored
+        /// only under the single-tenant posture. For an image whose entrypoint needs a
+        /// capability (a stock database that `chown`s its data dir and drops
+        /// privileges). Prefer `--user` + a persistent volume where the image allows.
+        #[arg(long = "cap-add")]
+        cap_add: Vec<String>,
+        /// Run the entrypoint as this user (`uid` or `uid:gid`, numeric) instead of the
+        /// backend default, so a stock image can run rootless against a pre-owned
+        /// volume — no added capabilities. Honored under any posture.
+        #[arg(long)]
+        user: Option<String>,
         /// Isolation the workload requires (`trusted` allows containers;
         /// `untrusted` forces a microVM / managed platform).
         #[arg(long, value_enum, default_value_t = Isolation::Trusted)]
@@ -184,6 +196,14 @@ enum ComputeCommand {
         /// hardened read-only root is the default). Prefer a persistent volume.
         #[arg(long)]
         writable_root: bool,
+        /// Add back a Linux capability on the shared-kernel backends, without the
+        /// `CAP_` prefix, e.g. `CHOWN` (repeatable). Single-tenant posture only.
+        #[arg(long = "cap-add")]
+        cap_add: Vec<String>,
+        /// Run the entrypoint as this user (`uid` or `uid:gid`, numeric) instead of the
+        /// backend default. Lets a stock image run rootless against a pre-owned volume.
+        #[arg(long)]
+        user: Option<String>,
         /// Isolation the workload requires (`trusted` allows containers;
         /// `untrusted` forces a microVM / managed platform).
         #[arg(long, value_enum, default_value_t = Isolation::Trusted)]
@@ -304,6 +324,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             restart,
             scale_to_zero,
             writable_root,
+            cap_add,
+            user,
             isolation,
             regions,
             bind,
@@ -342,6 +364,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 restart,
                 scale_to_zero,
                 writable_root,
+                cap_add,
+                user,
                 isolation,
                 parse_bindings(&bind)?,
             )?;
@@ -362,6 +386,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             restart,
             scale_to_zero,
             writable_root,
+            cap_add,
+            user,
             isolation,
             regions,
             bind,
@@ -411,6 +437,8 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 restart,
                 scale_to_zero,
                 writable_root,
+                cap_add,
+                user,
                 isolation,
                 parse_bindings(&bind)?,
             )?;
@@ -441,6 +469,8 @@ fn build_spec(
     restart: Restart,
     scale_to_zero: bool,
     writable_root: bool,
+    cap_add: Vec<String>,
+    user: Option<String>,
     isolation: Isolation,
     bindings: Vec<ComputeBinding>,
 ) -> Result<ComputeSpec> {
@@ -465,6 +495,8 @@ fn build_spec(
         scale_to_zero,
         volumes: vec![],
         writable_root,
+        cap_add,
+        user,
         isolation: isolation.into(),
         prefer_backend: None,
         bindings,

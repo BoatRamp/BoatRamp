@@ -235,6 +235,8 @@ mod tests {
             scale_to_zero: false,
             volumes: vec![],
             writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
             isolation: boatramp_types::compute::IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],

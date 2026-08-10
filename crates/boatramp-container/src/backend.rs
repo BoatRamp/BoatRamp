@@ -119,6 +119,10 @@ pub struct ContainerBackend {
     /// `None` leaves the backend without it (the scheduler routes such workloads
     /// elsewhere). Detected once at construction.
     criu: Option<crate::criu::Criu>,
+    /// Whether a spec's `cap_add` is honored here. Set from the isolation posture
+    /// (single-tenant only); off under the multi-tenant guard, so a cap-add spec is
+    /// forced back to the dropped-`ALL` default.
+    cap_add_allowed: bool,
 }
 
 impl ContainerBackend {
@@ -145,7 +149,16 @@ impl ContainerBackend {
             self_exe,
             ipam: Mutex::new(ipam),
             criu: crate::criu::Criu::detect(),
+            cap_add_allowed: false,
         })
+    }
+
+    /// Allow a spec's `cap_add` to retain capabilities on top of the dropped-`ALL`
+    /// default here (single-tenant posture). Off by default, so the multi-tenant guard
+    /// keeps every capability dropped.
+    pub fn with_cap_add_allowed(mut self, allowed: bool) -> Self {
+        self.cap_add_allowed = allowed;
+        self
     }
 
     /// Stage the rootfs **tar** blob `hash` and unpack it to
@@ -532,6 +545,11 @@ impl ContainerBackend {
     ) -> Result<Instance, BackendError> {
         let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, GUEST_UID, GUEST_GID);
         plan.volumes = self.stage_volumes(&req.spec).await?;
+        // Honor `cap_add` only where the posture allows it (single-tenant); otherwise
+        // the dropped-`ALL` default stands. Bounded by the worker's user namespace.
+        if self.cap_add_allowed {
+            plan.cap_add = req.spec.cap_add.clone();
+        }
         let veth = VethNetwork::for_vm(id, &self.bridge);
         veth.host_setup()
             .await
@@ -1019,6 +1037,8 @@ mod tests {
             scale_to_zero: false,
             volumes: vec![],
             writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
             isolation: IsolationRequirement::Trusted,
             prefer_backend: None,
             bindings: vec![],

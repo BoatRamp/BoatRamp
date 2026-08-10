@@ -221,8 +221,9 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
 
     // Drop privileges first (sets `no_new_privs`), then install seccomp — so the
     // filter can be applied without CAP_SYS_ADMIN and only the entrypoint (and
-    // the `execve` to reach it) runs under it.
-    drop_privileges(plan.uid, plan.gid)?;
+    // the `execve` to reach it) runs under it. `cap_add` (single-tenant, posture-gated
+    // by the backend) retains the listed capabilities; empty ⇒ drop them all.
+    apply_privileges(plan.uid, plan.gid, &plan.cap_add)?;
     if let Some(allow) = &plan.seccomp_allow {
         crate::seccomp::install(allow).map_err(WorkerError::Seccomp)?;
     }
@@ -361,31 +362,82 @@ fn mount_flags(flags: &[String]) -> (MsFlags, Option<String>) {
     (ms, data)
 }
 
-/// Drop all capabilities and switch to the unprivileged `uid`/`gid`. gids first
-/// (a uid-first switch would lose the privilege needed to set gids), supplementary
-/// groups cleared, and `no_new_privs` set so a later `execve` of a setuid binary
-/// can't regain privilege.
-fn drop_privileges(uid: u32, gid: u32) -> Result<(), WorkerError> {
+/// Reduce the entrypoint's Linux capabilities and switch to the unprivileged
+/// `uid`/`gid`. gids first (a uid-first switch would lose the privilege needed to set
+/// gids), supplementary groups cleared, and `no_new_privs` set so a later `execve` of a
+/// setuid binary can't regain privilege.
+///
+/// `cap_add` (short names, no `CAP_` prefix) are capabilities to **retain** on top of
+/// the drop-everything default — for an image whose entrypoint needs one (a stock
+/// database that `chown`s its data dir then drops privileges). Because the worker runs
+/// in a user namespace, a retained capability is bounded by that namespace. Empty ⇒
+/// every capability is dropped, exactly as before. Retaining is only meaningful while
+/// the entrypoint stays namespace-root (`uid == 0`); the rootless path uses `user`
+/// instead and keeps `cap_add` empty.
+fn apply_privileges(uid: u32, gid: u32, cap_add: &[String]) -> Result<(), WorkerError> {
     nix::sys::prctl::set_no_new_privs().map_err(|e| WorkerError::Syscall("no_new_privs", e))?;
-    // Clear every capability set so the entrypoint starts with none.
-    for set in [
-        caps::CapSet::Ambient,
-        caps::CapSet::Bounding,
-        caps::CapSet::Inheritable,
-    ] {
-        caps::clear(None, set).map_err(|e| WorkerError::Io("clear caps", to_io(e)))?;
+
+    if cap_add.is_empty() {
+        // Clear every capability set so the entrypoint starts with none.
+        for set in [
+            caps::CapSet::Ambient,
+            caps::CapSet::Bounding,
+            caps::CapSet::Inheritable,
+        ] {
+            caps::clear(None, set).map_err(|e| WorkerError::Io("clear caps", to_io(e)))?;
+        }
+        setgroups(&[]).map_err(|e| WorkerError::Syscall("setgroups", e))?;
+        let gid = Gid::from_raw(gid);
+        setresgid(gid, gid, gid).map_err(|e| WorkerError::Syscall("setresgid", e))?;
+        let uid = Uid::from_raw(uid);
+        setresuid(uid, uid, uid).map_err(|e| WorkerError::Syscall("setresuid", e))?;
+        // Effective/Permitted are emptied as a side effect of the uid switch with an
+        // empty permitted set; clear explicitly to be unambiguous.
+        caps::clear(None, caps::CapSet::Effective)
+            .map_err(|e| WorkerError::Io("clear caps", to_io(e)))?;
+        caps::clear(None, caps::CapSet::Permitted)
+            .map_err(|e| WorkerError::Io("clear caps", to_io(e)))?;
+        return Ok(());
     }
+
+    // Retain exactly the allowlisted capabilities. Parse the short names into the
+    // `CAP_`-prefixed form the `caps` crate expects (accepting either `CHOWN` or
+    // `CAP_CHOWN`); an unknown name is a hard error, never a silent drop.
+    let keep: caps::CapsHashSet = cap_add
+        .iter()
+        .map(|name| {
+            let up = name.trim().to_uppercase();
+            let bare = up.strip_prefix("CAP_").unwrap_or(&up);
+            format!("CAP_{bare}")
+                .parse::<caps::Capability>()
+                .map_err(|_| {
+                    WorkerError::Io(
+                        "unknown capability",
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, name.clone()),
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Narrow the bounding set first so nothing outside the allowlist can be regained.
+    caps::set(None, caps::CapSet::Bounding, &keep)
+        .map_err(|e| WorkerError::Io("set bounding caps", to_io(e)))?;
     setgroups(&[]).map_err(|e| WorkerError::Syscall("setgroups", e))?;
     let gid = Gid::from_raw(gid);
     setresgid(gid, gid, gid).map_err(|e| WorkerError::Syscall("setresgid", e))?;
     let uid = Uid::from_raw(uid);
     setresuid(uid, uid, uid).map_err(|e| WorkerError::Syscall("setresuid", e))?;
-    // Effective/Permitted are emptied as a side effect of the uid switch with an
-    // empty permitted set; clear explicitly to be unambiguous.
-    caps::clear(None, caps::CapSet::Effective)
-        .map_err(|e| WorkerError::Io("clear caps", to_io(e)))?;
-    caps::clear(None, caps::CapSet::Permitted)
-        .map_err(|e| WorkerError::Io("clear caps", to_io(e)))?;
+    // Reduce the remaining sets to the allowlist. Permitted + Inheritable before
+    // Ambient (whose raise requires a cap be in both); Effective so the caps are live
+    // for the entrypoint without an explicit `capset`.
+    for set in [
+        caps::CapSet::Permitted,
+        caps::CapSet::Inheritable,
+        caps::CapSet::Effective,
+        caps::CapSet::Ambient,
+    ] {
+        caps::set(None, set, &keep).map_err(|e| WorkerError::Io("set caps", to_io(e)))?;
+    }
     Ok(())
 }
 
