@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.4]
+
 ### Added
 - **Tunable privileges for shared-kernel workloads, so a stock DB image can init.** The
   docker + native-container backends drop every Linux capability by default, which stops
