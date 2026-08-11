@@ -325,6 +325,54 @@ pub(super) async fn put_site_config(
     }
 }
 
+/// `PUT /api/projects/{proj}/graphql/subgraphs/{name}` — publish a subgraph's SDL (the
+/// request body). Recomposes + validates the whole supergraph; a composition failure is a
+/// `400` and the subgraph is **not** stored. On success, returns the composed supergraph
+/// summary.
+#[cfg(feature = "handlers")]
+pub(super) async fn put_graphql_subgraph(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path(name): Path<String>,
+    sdl: String,
+) -> Response {
+    if let Some(resp) = reject_invalid_name("subgraph", &name) {
+        return resp;
+    }
+    let kv = deploy.kv().as_ref();
+    match crate::graphql_registry::publish(kv, &project.0, &name, &sdl).await {
+        Ok(sg) => {
+            let names = crate::graphql_registry::subgraph_names(kv, &project.0).await;
+            axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
+        }
+        Err(crate::graphql_registry::PublishError::Composition(e)) => {
+            (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response()
+        }
+        Err(crate::graphql_registry::PublishError::Store(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("registry store error: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/projects/{proj}/graphql/supergraph` — the composed supergraph summary
+/// (subgraphs, entities, root fields) for the project.
+#[cfg(feature = "handlers")]
+pub(super) async fn get_graphql_supergraph(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    let kv = deploy.kv().as_ref();
+    match crate::graphql_registry::supergraph(kv, &project.0).await {
+        Ok(sg) => {
+            let names = crate::graphql_registry::subgraph_names(kv, &project.0).await;
+            axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    }
+}
+
 /// GET the active dynamic daemon config + its generation hash.
 pub(super) async fn get_daemon_config(
     State(deploy): State<DeployStore>,

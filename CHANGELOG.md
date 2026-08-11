@@ -60,6 +60,15 @@ versions.
   never registers a new one, turning persisted queries into a query allowlist (a security
   control). Backed by the site's KV store, keyed per project-qualified scope so tenants
   never collide. Off by default; composes with the query-guard.
+- **GraphQL subgraph schema registry.** A project publishes a subgraph's SDL to
+  `PUT /api/projects/{proj}/graphql/subgraphs/{name}` (body = SDL); the control plane
+  composes all the project's subgraphs into a supergraph, validates it (rejecting a
+  co-owned field without `@shareable`, or an SDL that doesn't parse), and persists the
+  subgraph **only if composition succeeds** — a bad publish never corrupts the registry.
+  `GET /api/projects/{proj}/graphql/supergraph` returns the composed model (subgraphs,
+  `@key` entities + their resolving subgraphs, root fields). Core federation
+  (`@key`/`@external`/`@shareable`), per-project isolated — the foundation for the
+  federation gateway.
 
 ## [0.2.4]
 

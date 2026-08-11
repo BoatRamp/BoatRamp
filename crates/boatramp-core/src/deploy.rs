@@ -276,6 +276,12 @@ impl DeployStore {
         }
     }
 
+    /// The underlying metadata store, for control-plane features that keep their own
+    /// key namespace (e.g. the GraphQL subgraph registry) rather than a deploy record.
+    pub fn kv(&self) -> &Arc<dyn KvStore> {
+        &self.kv
+    }
+
     /// Readiness probe: confirm the metadata backend is reachable with a cheap
     /// read (a missing key is fine — it still proves the backend answered). The
     /// blob backend is exercised per-request rather than probed here.

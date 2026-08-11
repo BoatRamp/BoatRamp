@@ -6,10 +6,8 @@
 //! Scope is **core federation**: `@key` entities, field ownership, `@external` references,
 //! and `@shareable` fields. Pure and deterministic — SDL in, model out; no I/O.
 //!
-//! This is the foundation of the federation gateway; it is consumed by the schema registry
-//! (publish/validate) and the query planner in the following landings, so its items are
-//! not yet called from non-test code.
-#![allow(dead_code)]
+//! This is the foundation of the federation gateway: the schema registry composes on
+//! publish, and the query planner (a later landing) plans against this model.
 
 use graphql_parser::schema::{Definition, Directive, Field, TypeDefinition, TypeExtension, Value};
 use std::collections::{BTreeMap, BTreeSet};

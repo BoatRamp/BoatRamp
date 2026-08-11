@@ -46,6 +46,8 @@ pub(crate) use admin_api::{
     put_compute, put_daemon_config, put_site_config, remove_alias, rollback_daemon_config,
     scrub_blobs, set_alias,
 };
+#[cfg(feature = "handlers")]
+pub(crate) use admin_api::{get_graphql_supergraph, put_graphql_subgraph};
 mod auth;
 #[cfg(feature = "console")]
 pub mod console;
@@ -73,6 +75,8 @@ mod graphql_apq;
 mod graphql_federation;
 #[cfg(feature = "handlers")]
 mod graphql_guard;
+#[cfg(feature = "handlers")]
+mod graphql_registry;
 #[cfg(feature = "handlers")]
 mod handler_cache;
 #[cfg(feature = "handlers")]
