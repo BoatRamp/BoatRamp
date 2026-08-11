@@ -19,6 +19,15 @@ versions.
   `Vary`, and expire by TTL (clamped to `max_ttl_secs`, lazily evicted on read). Backed
   by the site's KV store; disabled by default. Foundation for GraphQL persisted-query
   caching (HS-4).
+- **`wss`/`https` WebSocket upstreams for the gateway (HS-2).** The gateway's WebSocket /
+  HTTP-upgrade tunnelling now completes a TLS handshake to `https`/`wss` upstreams —
+  previously only `http`/`ws`/`unix:` were wired. So a private service reached over TLS
+  (e.g. a compute-workload GraphQL server that speaks `graphql-ws`) can be proxied through
+  the edge. Server-auth uses the platform's webpki roots against the resolved upstream
+  host, pinned to the posture-validated address (the same SSRF guard as the plaintext
+  path); the `ring` crypto provider is pinned explicitly.
+
+## [0.2.4]
 
 ### Added
 - **Tunable privileges for shared-kernel workloads, so a stock DB image can init.** The

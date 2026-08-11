@@ -45,7 +45,7 @@ compression = ["dep:async-compression", "dep:tokio-util"]
 # HTTP/3 (QUIC) serving: a third listener transport feeding
 # the same router. Pulls quinn + h3; off by default. The QUIC handshake is
 # exercised only in live testing (no in-process round-trip).
-http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:tower"]
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:tower"]
 
 # External token signer backends: the control-plane root key
 # lives outside the process (KMS/HSM/Vault). The REST backends (Vault/GCP/Azure)
@@ -130,7 +130,17 @@ tokio-util = { version = "0.7", features = ["io"], optional = true }
 quinn = { version = "0.11", optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
-rustls = { version = "0.23", optional = true }
+# rustls is a base dep (the gateway's `wss` upstream upgrade needs a TLS client, HS-2);
+# it is already compiled in the base build via reqwest, so this adds negligible weight.
+# The `http3` feature reuses it for the QUIC crypto config.
+rustls = { version = "0.23", features = ["ring"] }
+# TLS client for the gateway's `wss`/`https` WebSocket-upgrade upstreams (HS-2).
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "ring",
+  "logging",
+  "tls12",
+] }
+webpki-roots = "1.0"
 # Calling the router as a `tower::Service` (oneshot) for each HTTP/3 request.
 tower = { version = "0.5", features = ["util"], optional = true }
 # Error enums (the OIDC verifier's error type).

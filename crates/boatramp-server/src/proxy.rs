@@ -736,10 +736,20 @@ pub(super) fn is_upgrade_request(headers: &HeaderMap) -> bool {
     connection_upgrade && headers.contains_key(header::UPGRADE)
 }
 
+/// Map a TCP upstream URL scheme to the upgrade transport: `Some(false)` = plaintext
+/// (`http`/`ws`), `Some(true)` = TLS (`https`/`wss`, HS-2), `None` = unsupported.
+fn upgrade_transport(scheme: &str) -> Option<bool> {
+    match scheme {
+        "http" | "ws" => Some(false),
+        "https" | "wss" => Some(true),
+        _ => None,
+    }
+}
+
 /// Proxy an HTTP **upgrade** (WebSocket) to a gateway upstream: forward the
 /// handshake over a hyper client connection and, on `101`, bridge the two
-/// upgraded byte streams in both directions. Supports `http`
-/// (ws) and `unix:` upstreams; `https` (wss) upgrade isn't wired yet.
+/// upgraded byte streams in both directions. Supports `http`/`ws` (plaintext),
+/// `https`/`wss` (TLS, HS-2), and `unix:` upstreams.
 async fn proxy_upgrade(
     mut request: Request,
     upstream: &boatramp_core::gateway::Upstream,
@@ -812,13 +822,17 @@ async fn proxy_upgrade(
         Ok(u) => u,
         Err(_) => return (StatusCode::BAD_GATEWAY, "bad gateway upstream\n").into_response(),
     };
-    if parsed.scheme() != "http" {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "gateway upgrade supports http (ws) or unix upstreams\n",
-        )
-            .into_response();
-    }
+    // http/ws → plaintext; https/wss → TLS (HS-2). Anything else is unsupported.
+    let tls = match upgrade_transport(parsed.scheme()) {
+        Some(tls) => tls,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "gateway upgrade supports http/ws, https/wss, or unix upstreams\n",
+            )
+                .into_response()
+        }
+    };
     let Some(host) = parsed.host_str().map(str::to_string) else {
         return (StatusCode::BAD_GATEWAY, "gateway upstream missing host\n").into_response();
     };
@@ -856,7 +870,39 @@ async fn proxy_upgrade(
             return (StatusCode::BAD_GATEWAY, "gateway upstream unreachable\n").into_response()
         }
     };
-    let host_hdr = upstream.host_header.clone().unwrap_or(host);
+    let host_hdr = upstream.host_header.clone().unwrap_or_else(|| host.clone());
+    // `wss`/`https`: complete the TLS handshake to the upstream first, then run the
+    // WebSocket upgrade over the encrypted stream. SNI + cert verification use the
+    // resolved upstream host against the platform's webpki roots.
+    if tls {
+        let server_name = match rustls::pki_types::ServerName::try_from(host) {
+            Ok(name) => name,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "gateway upstream host invalid for TLS\n",
+                )
+                    .into_response()
+            }
+        };
+        let tls_stream = match tls_connector().connect(server_name, stream).await {
+            Ok(s) => s,
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY, "gateway TLS handshake failed\n").into_response()
+            }
+        };
+        return upgrade_over(
+            hyper_util::rt::TokioIo::new(tls_stream),
+            method,
+            uri,
+            req_headers,
+            host_hdr,
+            upstream,
+            client_ip,
+            client_on_upgrade,
+        )
+        .await;
+    }
     upgrade_over(
         hyper_util::rt::TokioIo::new(stream),
         method,
@@ -868,6 +914,30 @@ async fn proxy_upgrade(
         client_on_upgrade,
     )
     .await
+}
+
+/// A process-wide TLS client connector for `wss`/`https` gateway upstreams, built once
+/// from the platform's webpki roots (server auth only; the gateway never presents a
+/// client cert). Cheap to clone (an `Arc` inside).
+fn tls_connector() -> tokio_rustls::TlsConnector {
+    use std::sync::OnceLock;
+    static CONFIG: OnceLock<std::sync::Arc<rustls::ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Pin the `ring` provider explicitly (the tree standardizes on ring via reqwest);
+        // `aws-lc-rs` is also present transitively, so the default provider is ambiguous.
+        std::sync::Arc::new(
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring provider supports the default TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        )
+    });
+    tokio_rustls::TlsConnector::from(config.clone())
 }
 
 /// Drive a hyper HTTP/1 client connection (with upgrades) over `io`, forward the
@@ -958,4 +1028,23 @@ where
         headers.insert(name.clone(), value.clone());
     }
     (status, headers, Body::new(upstream_resp.into_body())).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upgrade_transport;
+
+    #[test]
+    fn upgrade_transport_maps_scheme_to_tls() {
+        // Plaintext schemes.
+        assert_eq!(upgrade_transport("http"), Some(false));
+        assert_eq!(upgrade_transport("ws"), Some(false));
+        // TLS schemes (HS-2: wss/https now wired).
+        assert_eq!(upgrade_transport("https"), Some(true));
+        assert_eq!(upgrade_transport("wss"), Some(true));
+        // Anything else is unsupported for an upgrade.
+        assert_eq!(upgrade_transport("ftp"), None);
+        assert_eq!(upgrade_transport("unix"), None);
+        assert_eq!(upgrade_transport(""), None);
+    }
 }
