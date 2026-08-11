@@ -36,6 +36,18 @@ versions.
   [Embed the node](docs/src/how-to/embed.md).
 
 ### Fixed
+- **A non-root docker workload can create its own runtime dir (`/run/...`), so a managed
+  DB inits with zero operator config.** The hardened docker `HostConfig` mounts a small
+  tmpfs at `/run`; Docker special-cases a bare `/run` tmpfs to `0755 root:root`, which a
+  workload running as a non-root user cannot write. A stock `postgres` entrypoint does
+  `mkdir -p /var/run/postgresql` (its unix-socket dir) as its own uid and, when that
+  silently fails, never starts its init server — so `CREATE DATABASE` never runs and the
+  managed DB comes up missing its database. The `/tmp` + `/run` tmpfs mounts are now
+  `mode=1777` (world-writable + sticky, matching a real `/tmp`/`/run`), so the entrypoint
+  creates and owns its runtime dir exactly as it expects. General, not image-specific
+  (MySQL's `/run/mysqld`, nginx's `/run/nginx`, … all rely on the same); `noexec`/`nosuid`
+  keep the mount hardened. Reproduced and fixed live against `postgres:16` under the exact
+  hardened flags.
 - **Untagged docker image references default to `:latest`.** `compute set/build --image
   <name>` with no tag (e.g. `--image alpine`) no longer pulls *every* tag of the repo
   (slow, and a hard failure on any repo that still carries an ancient v1-manifest tag) —

@@ -340,6 +340,15 @@ const MAX_PIDS: i64 = 512;
 /// image — forcing a UID breaks images that expect their own user, and
 /// `no-new-privileges` already blocks setuid escalation.
 ///
+/// The tmpfs mounts are `mode=1777` (world-writable + sticky, like a real `/tmp`
+/// and `/run`). Docker special-cases a bare `/run` tmpfs to `0755 root:root`,
+/// which a **non-root** image cannot write — so an entrypoint that creates its own
+/// runtime dir there (a stock Postgres `mkdir -p /var/run/postgresql` for its unix
+/// socket, MySQL's `/run/mysqld`, nginx's `/run/nginx`, …) silently fails and the
+/// service never comes up. `1777` restores exactly the pre-owned, writable runtime
+/// dir the image expects, generally and without special-casing any image, while
+/// `noexec`/`nosuid`/`size` keep the mount hardened.
+///
 /// `writable_root` relaxes only the read-only-root default (caller-gated to the
 /// single-tenant posture); every other hardening stays on. The idiomatic path for
 /// app writes is a persistent volume, not a writable root.
@@ -357,8 +366,14 @@ fn hardened_host_config(
     cap_add: &[String],
 ) -> HostConfig {
     let tmpfs = std::collections::HashMap::from([
-        ("/tmp".to_string(), "rw,noexec,nosuid,size=64m".to_string()),
-        ("/run".to_string(), "rw,noexec,nosuid,size=16m".to_string()),
+        (
+            "/tmp".to_string(),
+            "rw,noexec,nosuid,size=64m,mode=1777".to_string(),
+        ),
+        (
+            "/run".to_string(),
+            "rw,noexec,nosuid,size=16m,mode=1777".to_string(),
+        ),
     ]);
     HostConfig {
         memory: Some(i64::from(mem_mib) * 1024 * 1024),
@@ -710,7 +725,11 @@ mod tests {
         // A read-only rootfs stays usable via small noexec/nosuid scratch mounts.
         let tmpfs = hc.tmpfs.expect("tmpfs mounts for a read-only rootfs");
         assert!(tmpfs.get("/tmp").is_some_and(|o| o.contains("noexec")));
-        assert!(tmpfs.contains_key("/run"));
+        // /run must be world-writable + sticky (mode=1777): Docker defaults a bare
+        // /run tmpfs to 0755 root:root, which a non-root image (e.g. a stock Postgres
+        // creating /var/run/postgresql for its socket) cannot write. Regression guard.
+        assert!(tmpfs.get("/run").is_some_and(|o| o.contains("mode=1777")));
+        assert!(tmpfs.get("/tmp").is_some_and(|o| o.contains("mode=1777")));
         // At least one vCPU even when the spec asks for zero.
         assert_eq!(
             hardened_host_config(64, 0, RestartPolicy::Never, false, &[]).nano_cpus,
