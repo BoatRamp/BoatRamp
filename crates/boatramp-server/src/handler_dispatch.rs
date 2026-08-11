@@ -356,8 +356,15 @@ async fn federation_gateway(inner: &HandlerRuntimeInner, project: &str, query: &
         )
             .into_response();
     };
-    let runner = crate::graphql_gateway::InvokeRunner::new(
+    // Route each fetch to its subgraph's backend: a SQL-backed subgraph resolves via the
+    // data connector, a function subgraph via the invoke path. This is where a GraphQL→SQL
+    // subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
+    let sql_subgraphs = crate::graphql_registry::sql_subgraphs(inner.kv.as_ref(), project).await;
+    let runner = crate::graphql_gateway::BackendRouter::new(
         invoker.scoped(boatramp_core::project::ProjectRef::new(project)),
+        project.to_string(),
+        inner.sql.clone(),
+        sql_subgraphs,
     );
     axum::Json(crate::graphql_gateway::execute(&plan, &runner).await).into_response()
 }

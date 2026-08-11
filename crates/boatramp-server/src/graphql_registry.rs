@@ -6,7 +6,9 @@
 //! supergraph model is what the query planner (a later landing) plans against.
 
 use crate::graphql_federation::{compose, CompositionError, Supergraph};
+use boatramp_core::config::HandlerGraphqlDataConfig;
 use boatramp_core::kv::KvStore;
+use std::collections::BTreeMap;
 
 /// The kv prefix under which a project's subgraph SDLs live.
 fn subgraph_prefix(project: &str) -> String {
@@ -15,6 +17,49 @@ fn subgraph_prefix(project: &str) -> String {
 
 fn subgraph_key(project: &str, name: &str) -> String {
     format!("{}{name}", subgraph_prefix(project))
+}
+
+/// The kv prefix under which a project's per-subgraph **backend kinds** live (which runner
+/// resolves a subgraph's fetches). Absent ⇒ a wasm function, so pre-existing subgraphs are
+/// unaffected.
+fn backend_prefix(project: &str) -> String {
+    format!("graphql/{project}/subgraph-backend/")
+}
+
+/// How a registered subgraph's fetches are resolved: a wasm **function** (the default), or
+/// the **SQL** data connector reading a managed database. Persisted as JSON under
+/// `graphql/{project}/subgraph-backend/{name}` (a raw write today; a registration endpoint
+/// is a follow-up).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum SubgraphBackendSpec {
+    /// Dispatch fetches to the wasm function of the same name.
+    Function,
+    /// Resolve fetches by compiling to SQL against `site`'s managed database.
+    Sql {
+        site: String,
+        config: HandlerGraphqlDataConfig,
+    },
+}
+
+/// The SQL-backed subgraphs of `project`: `name → (site, data config)`. Function subgraphs
+/// (the default) are not included — the gateway routes those to the invoker.
+pub(crate) async fn sql_subgraphs(
+    kv: &dyn KvStore,
+    project: &str,
+) -> BTreeMap<String, (String, HandlerGraphqlDataConfig)> {
+    let prefix = backend_prefix(project);
+    let mut out = BTreeMap::new();
+    for key in kv.list_prefix(&prefix).await.unwrap_or_default() {
+        let Ok(Some(bytes)) = kv.get(&key).await else {
+            continue;
+        };
+        if let Ok(SubgraphBackendSpec::Sql { site, config }) = serde_json::from_slice(&bytes) {
+            let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+            out.insert(name, (site, config));
+        }
+    }
+    out
 }
 
 /// Why a subgraph publish failed.

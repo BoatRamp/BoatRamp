@@ -4,8 +4,10 @@
 //! each — a root fetch, or a dependent `_entities` fetch whose representations are built
 //! from an earlier fetch's data — and merges every fetch's result into one response,
 //! joining entities by their `@key`. Dispatching a fetch to its subgraph is abstracted
-//! behind [`SubgraphRunner`], so the stitching logic is tested with a mock and reused
-//! over the real (streaming-invoke) runner in the serving path.
+//! behind [`SubgraphRunner`], so the stitching logic is tested with a mock and reused over
+//! the real [`BackendRouter`] in the serving path — which routes each fetch to its
+//! subgraph's backend (a wasm function, or the SQL data connector), letting a GraphQL→SQL
+//! subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
 //!
 //! Scope is **core federation**: object- and list-valued join points; entities are
 //! stitched by representation order (which `_entities` preserves). Nested jumps work via
@@ -59,49 +61,126 @@ fn fetch_data(resp: &Value) -> &Value {
     resp.get("data").unwrap_or(resp)
 }
 
-/// A [`SubgraphRunner`] that dispatches each fetch to a subgraph **function** over the
-/// in-process invoke path (no network hop, no SSRF surface) — the subgraph name is the
-/// function name. Buffered (a federation fetch is bounded); the gateway is the root of the
-/// call chain, so it invokes at depth 0.
-pub(crate) struct InvokeRunner {
-    invoker: std::sync::Arc<dyn boatramp_handlers::Invoker>,
+/// Dispatch one fetch to a subgraph **function** over the in-process invoke path (no network
+/// hop, no SSRF surface) — the subgraph name is the function name — mapping the result (or a
+/// precise error) to a GraphQL response. The gateway is the root of the call chain, so it
+/// invokes at depth 0. Used by the [`BackendRouter`]'s function branch.
+async fn invoke_subgraph(
+    invoker: &dyn boatramp_handlers::Invoker,
+    subgraph: &str,
+    query: &str,
+    variables: Value,
+) -> Value {
+    let body = json!({ "query": query, "variables": variables })
+        .to_string()
+        .into_bytes();
+    let request = boatramp_handlers::InvokeRequest {
+        method: "POST".to_string(),
+        path: "/".to_string(),
+        headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+        body,
+    };
+    match invoker.invoke(subgraph, request, 0).await {
+        Ok(resp) => serde_json::from_slice(&resp.body).unwrap_or_else(|_| {
+            json!({ "errors": [{ "message": format!("subgraph `{subgraph}` returned invalid JSON") }] })
+        }),
+        // A registered subgraph with no deployed function of the same name — the registry
+        // SDL and the actual subgraph function are decoupled, so surface this precisely
+        // rather than as a generic outage (a silently-wrong result would be worse).
+        Err(boatramp_handlers::InvokeError::NotFound) => json!({ "errors": [{
+            "message": format!(
+                "subgraph `{subgraph}` is registered but no function named `{subgraph}` is deployed"
+            )
+        }] }),
+        Err(boatramp_handlers::InvokeError::Failed(msg)) => json!({ "errors": [{
+            "message": format!("subgraph `{subgraph}` failed: {msg}")
+        }] }),
+    }
 }
 
-impl InvokeRunner {
-    pub(crate) fn new(invoker: std::sync::Arc<dyn boatramp_handlers::Invoker>) -> Self {
-        Self { invoker }
+/// A [`SubgraphRunner`] that dispatches each fetch to the **right backend**: a SQL-backed
+/// subgraph (compiled to SQL against a managed database) or, by default, a wasm function.
+/// This is where a GraphQL→SQL subgraph and a GraphQL→Wasi subgraph compose in one
+/// supergraph — the gateway plans uniformly and this routes each fetch by its subgraph's
+/// registered kind.
+pub(crate) struct BackendRouter {
+    invoker: std::sync::Arc<dyn boatramp_handlers::Invoker>,
+    project: String,
+    sql_provider: Option<std::sync::Arc<dyn boatramp_core::sql::SqlBackends>>,
+    /// SQL-backed subgraphs: `name → (site, data config)`. A subgraph not here is a function.
+    sql_subgraphs: std::collections::BTreeMap<
+        String,
+        (String, boatramp_core::config::HandlerGraphqlDataConfig),
+    >,
+}
+
+impl BackendRouter {
+    pub(crate) fn new(
+        invoker: std::sync::Arc<dyn boatramp_handlers::Invoker>,
+        project: String,
+        sql_provider: Option<std::sync::Arc<dyn boatramp_core::sql::SqlBackends>>,
+        sql_subgraphs: std::collections::BTreeMap<
+            String,
+            (String, boatramp_core::config::HandlerGraphqlDataConfig),
+        >,
+    ) -> Self {
+        Self {
+            invoker,
+            project,
+            sql_provider,
+            sql_subgraphs,
+        }
+    }
+
+    /// Resolve a fetch for a SQL-backed subgraph: open the site's database, introspect, and
+    /// compile + run the fetch (the connector's own path), returning its GraphQL response.
+    async fn run_sql(
+        &self,
+        subgraph: &str,
+        site: &str,
+        config: &boatramp_core::config::HandlerGraphqlDataConfig,
+        query: &str,
+        variables: Value,
+    ) -> Value {
+        let Some(provider) = &self.sql_provider else {
+            return json!({ "errors": [{ "message": "the federation gateway has no SQL backend configured" }] });
+        };
+        let backend = match provider.database(&self.project, site, &config.source).await {
+            Ok(backend) => backend,
+            Err(err) => {
+                return json!({ "errors": [{ "message": format!("subgraph `{subgraph}` database unavailable: {err}") }] })
+            }
+        };
+        let schema = match crate::graphql_data::introspect::introspect_sqlite(backend.as_ref())
+            .await
+        {
+            Ok(schema) => schema,
+            Err(err) => {
+                return json!({ "errors": [{ "message": format!("subgraph `{subgraph}` introspection failed: {err}") }] })
+            }
+        };
+        let policy = crate::graphql_data::policy_from_config(config);
+        let claims = crate::graphql_data::request_claims(&self.project);
+        crate::graphql_data::runner::execute(
+            backend.as_ref(),
+            &crate::graphql_data::dialect::Sqlite,
+            &schema,
+            &policy,
+            &claims,
+            query,
+            &variables,
+        )
+        .await
     }
 }
 
 #[async_trait::async_trait]
-impl SubgraphRunner for InvokeRunner {
+impl SubgraphRunner for BackendRouter {
     async fn run(&self, subgraph: &str, query: &str, variables: Value) -> Value {
-        let body = json!({ "query": query, "variables": variables })
-            .to_string()
-            .into_bytes();
-        let request = boatramp_handlers::InvokeRequest {
-            method: "POST".to_string(),
-            path: "/".to_string(),
-            headers: vec![("content-type".to_string(), b"application/json".to_vec())],
-            body,
-        };
-        match self.invoker.invoke(subgraph, request, 0).await {
-            Ok(resp) => serde_json::from_slice(&resp.body).unwrap_or_else(|_| {
-                json!({ "errors": [{ "message": format!("subgraph `{subgraph}` returned invalid JSON") }] })
-            }),
-            // A registered subgraph with no deployed function of the same name — the
-            // registry SDL and the actual subgraph function are decoupled, so surface
-            // this precisely rather than as a generic outage (a silently-wrong result
-            // would be worse than an explicit error).
-            Err(boatramp_handlers::InvokeError::NotFound) => json!({ "errors": [{
-                "message": format!(
-                    "subgraph `{subgraph}` is registered but no function named `{subgraph}` is deployed"
-                )
-            }] }),
-            Err(boatramp_handlers::InvokeError::Failed(msg)) => json!({ "errors": [{
-                "message": format!("subgraph `{subgraph}` failed: {msg}")
-            }] }),
+        if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
+            return self.run_sql(subgraph, site, config, query, variables).await;
         }
+        invoke_subgraph(self.invoker.as_ref(), subgraph, query, variables).await
     }
 }
 
@@ -343,9 +422,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_runner_reports_a_registered_but_undeployed_subgraph() {
-        let runner = InvokeRunner::new(std::sync::Arc::new(MissingInvoker));
-        let resp = runner.run("accounts", "{ me { id } }", json!({})).await;
+    async fn a_function_subgraph_that_is_not_deployed_is_reported_precisely() {
+        // A router with no SQL subgraphs routes every fetch to the invoke path.
+        let router = BackendRouter::new(
+            std::sync::Arc::new(MissingInvoker),
+            "default".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+        );
+        let resp = router.run("accounts", "{ me { id } }", json!({})).await;
         let msg = resp["errors"][0]["message"].as_str().unwrap_or_default();
         assert!(
             msg.contains("no function named `accounts` is deployed"),

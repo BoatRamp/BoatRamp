@@ -39,6 +39,36 @@ pub(crate) fn generate_sdl(schema: &DbSchema) -> String {
     out
 }
 
+/// Generate the **federation** SDL for `schema` (already policy-projected): each entity
+/// table becomes a `@key`-typed object plus argless root fields, so the composition model
+/// (`graphql_federation`) treats it as a subgraph. Kept minimal — the federation planner
+/// sends argless root and `_entities` fetches, so the filter inputs are unneeded here.
+pub(crate) fn generate_federation_sdl(schema: &DbSchema) -> String {
+    let mut out = String::new();
+    for table in &schema.tables {
+        if table.primary_key.is_empty() {
+            push_object_type(&mut out, table);
+        } else {
+            let key = table.primary_key.join(" ");
+            let _ = writeln!(out, "type {} @key(fields: \"{key}\") {{", table.name);
+            for col in &table.columns {
+                let bang = if col.nullable { "" } else { "!" };
+                let _ = writeln!(out, "  {}: {}{bang}", col.name, col.ty.graphql_name());
+            }
+            out.push_str("}\n");
+        }
+    }
+    out.push_str("type Query {\n");
+    for table in &schema.tables {
+        let _ = writeln!(out, "  {t}: [{t}!]!", t = table.name);
+        if !table.primary_key.is_empty() {
+            let _ = writeln!(out, "  {t}_by_pk({}): {t}", pk_args(table), t = table.name);
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
 /// `type <t> { <col>: <Scalar>[!] … }`
 fn push_object_type(out: &mut String, table: &Table) {
     let _ = writeln!(out, "type {} {{", table.name);
@@ -199,6 +229,16 @@ mod tests {
         let sdl = generate_sdl(&schema);
         assert!(sdl.contains("events(where:"));
         assert!(!sdl.contains("events_by_pk"));
+    }
+
+    #[test]
+    fn federation_sdl_gives_entities_a_key_directive() {
+        let sdl = generate_federation_sdl(&users_and_posts());
+        assert!(sdl.contains(r#"type users @key(fields: "id") {"#));
+        assert!(sdl.contains(r#"type posts @key(fields: "id") {"#));
+        // Argless root fields (the planner sends argless root + `_entities` fetches).
+        assert!(sdl.contains("users: [users!]!"));
+        assert!(sdl.contains("users_by_pk(id: ID!): users"));
     }
 
     #[test]
