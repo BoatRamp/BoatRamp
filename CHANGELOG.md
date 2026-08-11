@@ -35,6 +35,14 @@ versions.
   for the runtime to supply. Composition runs in-process, so it needs no external
   toolchain and never runs on the serving node — it is a build step that emits one
   component (`compose --edge a.wasm --plugin b.wasm -o fused.wasm`).
+- **Streaming function-to-function invoke.** A handler can now call a sibling function
+  and consume its response as a **stream** — status and headers up front, the body pulled
+  incrementally through a new `incoming-response` resource — so a large or
+  incrementally-produced result is never buffered whole in host memory. The buffered
+  `invoke` stays the simple default; the streaming variant is the opt-in for big or
+  incremental (`@defer`-style) responses. It keeps the same in-process path (no network
+  hop), target allowlist, and call-depth cap; streamed responses are metered at hand-off
+  (bytes-out from a declared `Content-Length` when present).
 
 ## [0.2.4]
 

@@ -194,10 +194,30 @@ interface invoke-types {
 /// targets are an operator-configured allowlist (each entry may use `*`
 /// wildcards); the host caps call depth so functions cannot invoke in a loop.
 interface invoke {
-  use invoke-types.{invoke-request, invoke-response, error};
+  use invoke-types.{header, invoke-request, invoke-response, error};
+
+  /// A streamed response from a sibling function: `status` and `headers` are
+  /// available immediately, and the body is pulled incrementally via `read`, so a
+  /// large or incrementally-produced response is never buffered whole in host
+  /// memory. Returned by `invoke-streaming`.
+  resource incoming-response {
+    /// The callee's HTTP status.
+    status: func() -> u16;
+    /// The callee's response headers.
+    headers: func() -> list<header>;
+    /// Read up to `max` more bytes of the body, blocking until at least one byte
+    /// is available or the stream ends. An empty list marks end of stream.
+    read: func(max: u64) -> result<list<u8>, error>;
+  }
 
   /// Invoke the function named `target` with `request`, returning its response.
   invoke: func(target: string, request: invoke-request) -> result<invoke-response, error>;
+
+  /// Like `invoke`, but the response body **streams**: the returned resource
+  /// yields status + headers up front and the body incrementally via `read`, so
+  /// the caller never buffers the whole body. The request body is still passed
+  /// whole (request streaming is a separate future step).
+  invoke-streaming: func(target: string, request: invoke-request) -> result<incoming-response, error>;
 }
 
 /// The invoke capability world (imported into request handlers / functions).

@@ -14,7 +14,9 @@ mod engine;
 pub mod logging;
 
 #[cfg(feature = "invoke")]
-pub use bindings::invoke::{InvokeError, InvokeRequest, InvokeResponse, Invoker, MAX_INVOKE_DEPTH};
+pub use bindings::invoke::{
+    InvokeError, InvokeRequest, InvokeResponse, InvokeStreamResponse, Invoker, MAX_INVOKE_DEPTH,
+};
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
 #[cfg(feature = "engine")]

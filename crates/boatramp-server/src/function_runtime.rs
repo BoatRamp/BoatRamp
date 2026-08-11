@@ -583,6 +583,67 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
         record_metering(&inner, &self.deploy, project, &function.name, &sample).await;
         Ok(invoke_response)
     }
+
+    async fn invoke_streaming(
+        &self,
+        target: &str,
+        request: boatramp_handlers::InvokeRequest,
+        depth: u32,
+    ) -> Result<boatramp_handlers::InvokeStreamResponse, boatramp_handlers::InvokeError> {
+        use boatramp_handlers::InvokeError;
+        let Some(inner) = self.runtime.upgrade() else {
+            return Err(InvokeError::Failed(
+                "handler runtime is shutting down".into(),
+            ));
+        };
+        let project = ProjectRef::new(&self.project);
+        let function = match self.deploy.get_function(project, target).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return Err(InvokeError::NotFound),
+            Err(err) => return Err(InvokeError::Failed(err.to_string())),
+        };
+        let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+            return Err(InvokeError::NotFound);
+        };
+        let bytes_in = request.body.len() as u64;
+        let axum_request = match build_internal_request(request) {
+            Ok(req) => req,
+            Err(err) => return Err(InvokeError::Failed(err)),
+        };
+        // A quota rejection is the callee's (429) response, streamed like any other.
+        if let Err(response) = admit_by_quota(&inner, &self.deploy, project, &function).await {
+            return Ok(stream_invoke_response(response));
+        }
+        let (response, duration_ms) = execute_function(
+            &inner,
+            &self.deploy,
+            project,
+            &function,
+            &component,
+            axum_request,
+            depth,
+        )
+        .await;
+        let stream_response = stream_invoke_response(response);
+        // Streamed responses are metered at hand-off: `bytes_out` is taken from a
+        // declared `Content-Length` when present (the common case), else 0 — the body is
+        // not buffered to count it. `success`/`duration`/`bytes_in` are exact.
+        let bytes_out = stream_response
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let sample = boatramp_core::function::MeteringSample {
+            success: stream_response.status < 500,
+            duration_ms,
+            bytes_in,
+            bytes_out,
+        };
+        record_metering(&inner, &self.deploy, project, &function.name, &sample).await;
+        Ok(stream_response)
+    }
 }
 
 /// Turn an internal [`InvokeRequest`](boatramp_handlers::InvokeRequest) into the
@@ -629,6 +690,30 @@ async fn buffer_invoke_response(response: Response) -> boatramp_handlers::Invoke
         .map(|b| b.to_vec())
         .unwrap_or_default();
     boatramp_handlers::InvokeResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// Adapt a [`Response`] into a streaming [`InvokeStreamResponse`](boatramp_handlers::InvokeStreamResponse):
+/// status + headers eagerly, the body as a chunk stream the caller pulls on demand
+/// (never buffered whole in host memory). A body-stream error surfaces as a chunk error.
+#[cfg(feature = "handlers")]
+fn stream_invoke_response(response: Response) -> boatramp_handlers::InvokeStreamResponse {
+    use futures::StreamExt as _;
+    let status = response.status().as_u16();
+    let headers: Vec<(String, Vec<u8>)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect();
+    let body = response
+        .into_body()
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|e| e.to_string()))
+        .boxed();
+    boatramp_handlers::InvokeStreamResponse {
         status,
         headers,
         body,
