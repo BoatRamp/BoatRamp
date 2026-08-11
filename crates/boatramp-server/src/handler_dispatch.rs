@@ -131,6 +131,12 @@ pub(super) async fn dispatch_handler(
                     {
                         return graphql_guard::error_response(&reason);
                     }
+                    // Federation gateway: plan the query against the project's registered
+                    // subgraphs and execute it by dispatching fetches to the subgraph
+                    // functions, instead of running a single handler component.
+                    if gql.federated {
+                        return federation_gateway(inner, project, query).await;
+                    }
                 }
                 // Put the (possibly query-injected) body back on the request.
                 request = Request::from_parts(parts, axum::body::Body::from(body_bytes));
@@ -263,6 +269,42 @@ pub(super) async fn dispatch_handler(
             handler_error_response(&err)
         }
     }
+}
+
+/// The federation gateway: load the project's composed supergraph, plan `query` against
+/// it, execute the plan by dispatching each fetch to its subgraph function over the
+/// in-process invoke path, and return the stitched `{ "data": … }` response.
+#[cfg(feature = "handlers")]
+async fn federation_gateway(inner: &HandlerRuntimeInner, project: &str, query: &str) -> Response {
+    let supergraph = match crate::graphql_registry::supergraph(inner.kv.as_ref(), project).await {
+        Ok(sg) => sg,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("supergraph composition failed: {err}\n"),
+            )
+                .into_response()
+        }
+    };
+    let plan = match crate::graphql_plan::plan(query, &supergraph) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return graphql_guard::error_response(
+                "the query cannot be planned against the supergraph",
+            )
+        }
+    };
+    let Some(invoker) = inner.invoker.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "federation gateway: no invoker configured\n",
+        )
+            .into_response();
+    };
+    let runner = crate::graphql_gateway::InvokeRunner::new(
+        invoker.scoped(boatramp_core::project::ProjectRef::new(project)),
+    );
+    axum::Json(crate::graphql_gateway::execute(&plan, &runner).await).into_response()
 }
 
 /// Add the standard reverse-proxy fields to the request the guest sees. The

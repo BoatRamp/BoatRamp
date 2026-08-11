@@ -673,6 +673,12 @@ pub struct HandlerGraphqlConfig {
     /// never registers a new query. Implies (and is stronger than) `persisted_queries`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub safelist: bool,
+    /// Federation gateway: this site is a supergraph gateway. A GraphQL query is planned
+    /// against the project's registered subgraphs and executed by dispatching fetches to
+    /// the subgraph functions (a subgraph's name is its function name), stitching the
+    /// results — instead of running a single handler component.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub federated: bool,
 }
 
 /// Per-site edge response-cache tuning (see [`HandlersSiteConfig::cache`]).

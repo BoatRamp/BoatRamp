@@ -69,6 +69,15 @@ versions.
   `@key` entities + their resolving subgraphs, root fields). Core federation
   (`@key`/`@external`/`@shareable`), per-project isolated — the foundation for the
   federation gateway.
+- **GraphQL federation gateway (`[handlers.graphql] federated`).** A site can be a
+  supergraph gateway: an incoming query is **planned** against the project's registered
+  subgraphs (root fields grouped by owning subgraph; a field owned by another subgraph
+  becomes a dependent `_entities` fetch joined on the entity `@key`) and **executed** by
+  dispatching each fetch to its subgraph function over the in-process invoke path (no
+  network hop, no SSRF surface), stitching the results by key — instead of running a
+  single handler component. Core federation (`@key` entities, root + entity fetches);
+  the planner and executor are unit-tested end-to-end on a two-subgraph `User` supergraph
+  (a cross-subgraph `reviews` field resolved and stitched into the `me` result).
 
 ## [0.2.4]
 

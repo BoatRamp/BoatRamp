@@ -32,6 +32,10 @@ pub(crate) struct Supergraph {
     pub root_query: BTreeMap<String, String>,
     /// Root `Mutation` field → owning subgraph.
     pub root_mutation: BTreeMap<String, String>,
+    /// `(type, field)` → the field's base return type name (list/non-null unwrapped),
+    /// recorded for every field including roots and `@external` ones, so the query
+    /// planner can walk a selection and know each field's child type.
+    pub field_types: BTreeMap<(String, String), String>,
 }
 
 /// A composition failure.
@@ -140,6 +144,10 @@ fn ingest_object(
     }
 
     for field in fields {
+        // Record every field's return type (roots + @external included) for the planner.
+        sg.field_types
+            .entry((type_name.to_string(), field.name.clone()))
+            .or_insert_with(|| base_type_name(&field.field_type));
         // An `@external` field is a reference to a field owned elsewhere; it does not make
         // this subgraph a resolver of it.
         if has_directive(&field.directives, "external") {
@@ -172,6 +180,15 @@ fn ingest_object(
 
 fn has_directive(dirs: &[Directive<'_, String>], name: &str) -> bool {
     dirs.iter().any(|d| d.name == name)
+}
+
+/// The base named type of a field type, unwrapping `[T]` and `T!` wrappers.
+fn base_type_name(ty: &graphql_parser::schema::Type<'_, String>) -> String {
+    use graphql_parser::schema::Type;
+    match ty {
+        Type::NamedType(name) => name.clone(),
+        Type::ListType(inner) | Type::NonNullType(inner) => base_type_name(inner),
+    }
 }
 
 /// The field names of the first `@key(fields: "…")` directive on a type, if any.
