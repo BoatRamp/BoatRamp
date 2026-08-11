@@ -32,6 +32,9 @@ pub enum CliError {
     /// The `bundle` command.
     #[error(transparent)]
     Bundle(#[from] crate::bundle::Error),
+    /// The `compose` command.
+    #[error(transparent)]
+    Compose(#[from] crate::compose::Error),
     /// The deployment-management commands (`deployments`, `rollback`, `status`,
     /// `prune`, `scrub`, `cert-status`).
     #[error(transparent)]

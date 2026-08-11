@@ -26,6 +26,15 @@ versions.
   the edge. Server-auth uses the platform's webpki roots against the resolved upstream
   host, pinned to the posture-validated address (the same SSRF guard as the plaintext
   path); the `ring` crypto provider is pinned explicitly.
+- **`boatramp compose`: fuse WebAssembly components into one handler.** Author resolvers
+  or middleware as separate, WIT-typed components and link them into a single component
+  **in-process** — no network hop, checked at compile time — then deploy the one fused
+  `.wasm` through the normal content-addressed path. The fused component's exports are
+  unchanged (still e.g. `wasi:http/incoming-handler`); only the imports a plugin provides
+  are satisfied internally, while host imports (`wasi:http`, `sql`, `kv`, …) stay imported
+  for the runtime to supply. Composition runs in-process, so it needs no external
+  toolchain and never runs on the serving node — it is a build step that emits one
+  component (`compose --edge a.wasm --plugin b.wasm -o fused.wasm`).
 
 ## [0.2.4]
 

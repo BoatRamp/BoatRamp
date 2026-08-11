@@ -39,6 +39,7 @@ mod cluster;
 #[cfg(all(feature = "cluster", feature = "acme-dns"))]
 mod cluster_tls;
 mod completions;
+mod compose;
 mod compute;
 // The config model moved to `boatramp-node` (library); re-export it under the
 // binary's `crate::config` so existing call sites are unchanged.
@@ -106,6 +107,9 @@ enum Command {
     Build(build::BuildArgs),
     /// Bundle JS/TS (Rolldown) + CSS (lightningcss) in-process (`bundler` feature).
     Bundle(bundle::BundleArgs),
+    /// Fuse an edge handler component with plugin components into one linked
+    /// component (`--edge a.wasm --plugin b.wasm -o fused.wasm`).
+    Compose(compose::ComposeArgs),
     /// Parse and check a `project.cfg` (its `routing` section).
     Validate(build::ValidateArgs),
     /// List a site's deployment history.
@@ -419,6 +423,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Apply(args) => apply::run(args, &config).await?,
         Command::Build(args) => build::run(args, &config).await?,
         Command::Bundle(args) => bundle::run(args, &config).await?,
+        Command::Compose(args) => compose::run(args)?,
         Command::Validate(args) => build::validate(args)?,
         Command::Deployments(args) => manage::list(args, &config).await?,
         Command::Function(args) => function::run(args, &config).await?,

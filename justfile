@@ -149,6 +149,14 @@ build-fixtures:
       cp "examples/handlers/$name/target/wasm32-wasip2/release/${out}.wasm" "$dest/$name.wasm"
       echo "   -> $dest/$name.wasm"
     done
+    # The compose edge/plugin components the `boatramp compose` test loads.
+    cdest="crates/boatramp/tests/fixtures"
+    for name in edge plugin; do
+      echo "== building compose-$name =="
+      ( cd "examples/compose/$name" && cargo build --release --target wasm32-wasip2 )
+      cp "examples/compose/$name/target/wasm32-wasip2/release/boatramp_compose_${name}.wasm" "$cdest/compose-$name.wasm"
+      echo "   -> $cdest/compose-$name.wasm"
+    done
     echo "fixtures rebuilt"
 
 # Run the ACME DNS-01 wildcard-cert end-to-end test against a local Pebble CA.

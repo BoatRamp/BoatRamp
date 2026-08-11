@@ -1,0 +1,19 @@
+package boatramp:composedemo;
+
+/// A trivial interface used to exercise component composition: the edge component
+/// imports it, a plugin component exports it, and `boatramp compose` fuses them so
+/// the edge's import is satisfied internally.
+interface adder {
+    add: func(a: u32, b: u32) -> u32;
+}
+
+/// A plugin (leaf) component: provides `adder`.
+world plugin {
+    export adder;
+}
+
+/// The edge (root) component: needs `adder` and exports a `run` entry point.
+world edge {
+    import adder;
+    export run: func() -> u32;
+}

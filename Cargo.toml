@@ -29,6 +29,8 @@ exclude = [
   "examples/handlers/sql-counter",
   "examples/handlers/event-consumer",
   "examples/handlers/invoke-caller",
+  "examples/compose/edge",
+  "examples/compose/plugin",
   "crates/boatramp-console",
 ]
 

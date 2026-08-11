@@ -243,6 +243,12 @@ boatramp-firecracker = { workspace = true, features = [
 boatramp-container.workspace = true
 # The remote-docker compute backend (cross-platform Engine API client).
 boatramp-docker.workspace = true
+# In-process WebAssembly component composition for `boatramp compose`: fuse an
+# edge handler component with plugin components into one linked component.
+# `wac-graph` is the library behind the `wac` tool; `wasmparser` inspects the
+# fused component to confirm the plugged interfaces were satisfied.
+wac-graph = "0.10"
+wasmparser = "0.252"
 # The macOS-native VMM backend: the `__vz-run` re-exec worker (macOS) boots a
 # microVM via Virtualization.framework; the pure layer compiles everywhere, and
 # the objc2/Virtualization deps are `target_os = "macos"`-gated, so it's a no-op
