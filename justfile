@@ -140,7 +140,7 @@ build-fixtures:
     #!/usr/bin/env bash
     set -euo pipefail
     dest="crates/boatramp-handlers/tests/fixtures"
-    for name in http-200 kv-counter sql-counter event-consumer invoke-caller; do
+    for name in http-200 kv-counter sql-counter event-consumer invoke-caller graphql-accounts graphql-reviews; do
       echo "== building $name =="
       ( cd "examples/handlers/$name" && cargo build --release --target wasm32-wasip2 )
       # The crate emits boatramp_example_<name-with-underscores>.wasm; the fixture

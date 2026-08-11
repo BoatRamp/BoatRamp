@@ -5945,6 +5945,160 @@ async fn site_handler_invoke_withheld_by_site() {
     assert!(body.contains("capability not granted"), "body: {body}");
 }
 
+// ---- GraphQL federation gateway end-to-end (real subgraph functions) --------
+
+/// A federated GraphQL query is planned against the registered subgraphs and executed by
+/// dispatching each fetch to a **real subgraph function** over the in-process invoke path,
+/// then stitched — exercised end-to-end through the real `router()`, engine, and
+/// `FunctionInvoker`, not the mock runner the gateway unit tests use. The `accounts`
+/// subgraph returns two keyed users; the gateway builds `_entities` representations from
+/// their keys and dispatches a dependent fetch to the `reviews` subgraph, which resolves
+/// each user's reviews from those representations; the gateway joins each user to its own.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federation_gateway_stitches_real_subgraph_functions() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::kv::KvStore;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const ACCOUNTS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-accounts.wasm");
+    const REVIEWS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-reviews.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    // The two subgraphs are ordinary functions; the gateway invokes each by name.
+    deploy_test_function(&deploy, "accounts", ACCOUNTS, Vec::new()).await;
+    deploy_test_function(&deploy, "reviews", REVIEWS, Vec::new()).await;
+
+    // Seed the subgraph registry the way a successful publish would (the publish path has
+    // its own unit tests). These two compose into a `User` supergraph: `accounts` owns the
+    // entity + `users`; `reviews` contributes `User.reviews` via an `@external` key.
+    kv.put(
+        "graphql/default/subgraph/accounts",
+        b"type Query { users: [User] } type User @key(fields: \"id\") { id: ID! name: String }"
+            .to_vec(),
+    )
+    .await
+    .unwrap();
+    kv.put(
+        "graphql/default/subgraph/reviews",
+        b"type Query { topReviews: [Review] } type Review { id: ID! body: String } extend type User @key(fields: \"id\") { id: ID! @external reviews: [Review] }"
+            .to_vec(),
+    )
+    .await
+    .unwrap();
+
+    // The gateway site: a handler route a federated query reaches. Its component is never
+    // run for a federated query (the gateway returns before loading it), but the manifest
+    // needs a valid entry, so point it at http-200.
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        federated: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    // The gateway dispatches subgraph fetches through the runtime invoker (the same one
+    // the top-level function + site-handler invoke paths use).
+    runtime.set_invoker(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/_sites/gw/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"query":"{ users { name reviews { body } } }"}"#,
+        ))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Each user is stitched to its OWN reviews, resolved by key through the real invoke
+    // path: Alice(id 1) → "review for 1", Bob(id 2) → "review for 2". A swapped or dropped
+    // join would fail here, unlike the unit test's canned mock runner.
+    let users = out["data"]["users"].as_array().expect("users array");
+    assert_eq!(users.len(), 2, "out: {out}");
+    assert_eq!(out["data"]["users"][0]["name"], serde_json::json!("Alice"));
+    assert_eq!(
+        out["data"]["users"][0]["reviews"][0]["body"],
+        serde_json::json!("review for 1")
+    );
+    assert_eq!(out["data"]["users"][1]["name"], serde_json::json!("Bob"));
+    assert_eq!(
+        out["data"]["users"][1]["reviews"][0]["body"],
+        serde_json::json!("review for 2")
+    );
+}
+
 // ---- 0.2.0 project-scoped API ---------------------------------------------
 
 /// A `/api/projects/<proj>/…` request operates on that project's data, and the

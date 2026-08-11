@@ -79,12 +79,14 @@ versions.
   becomes a dependent `_entities` fetch joined on the entity `@key`) and **executed** by
   dispatching each fetch to its subgraph function over the in-process invoke path (no
   network hop, no SSRF surface), stitching the results by key — instead of running a
-  single handler component. Core federation (`@key` entities, root + entity fetches); the
-  planner and executor are unit-tested end-to-end on a two-subgraph `User` supergraph,
-  including a **list-valued** cross-subgraph join through a runner that honors the real
-  `_entities` contract (each element resolved by its own key, so per-element identity is
-  preserved). The registry SDL and the deployed subgraph function are decoupled: a query
-  routed to a registered-but-undeployed subgraph fails with an explicit
+  single handler component. Core federation (`@key` entities, root + entity fetches). It is
+  validated **live end-to-end** through the real serving path — two `wasi:http` wasm
+  subgraph functions (`accounts` + `reviews`), a `{ users { name reviews { body } } }` query
+  planned, dispatched over the in-process invoke path, and stitched so each user is joined to
+  its own reviews by key — as well as at the unit level (including a list-valued cross-subgraph
+  join through a runner that honors the real `_entities` contract). The registry SDL and the
+  deployed subgraph function are decoupled: a query routed to a registered-but-undeployed
+  subgraph fails with an explicit
   `subgraph … is registered but no function … is deployed` error rather than a
   silently-wrong result.
 - **GraphQL subscriptions over graphql-sse.** A subscription operation sent to a
