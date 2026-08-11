@@ -1,4 +1,4 @@
-//! Edge response cache: policy, keying, and entry codec (HS-4 / PLAN-persisted-queries).
+//! Edge response cache: policy, keying, and entry codec.
 //!
 //! Pure and deterministic — **no I/O**. This module decides *whether* a handler
 //! response may be cached, *under what key*, and *for how long*, and (de)serializes a

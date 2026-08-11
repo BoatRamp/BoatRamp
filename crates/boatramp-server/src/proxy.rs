@@ -737,7 +737,7 @@ pub(super) fn is_upgrade_request(headers: &HeaderMap) -> bool {
 }
 
 /// Map a TCP upstream URL scheme to the upgrade transport: `Some(false)` = plaintext
-/// (`http`/`ws`), `Some(true)` = TLS (`https`/`wss`, HS-2), `None` = unsupported.
+/// (`http`/`ws`), `Some(true)` = TLS (`https`/`wss`), `None` = unsupported.
 fn upgrade_transport(scheme: &str) -> Option<bool> {
     match scheme {
         "http" | "ws" => Some(false),
@@ -749,7 +749,7 @@ fn upgrade_transport(scheme: &str) -> Option<bool> {
 /// Proxy an HTTP **upgrade** (WebSocket) to a gateway upstream: forward the
 /// handshake over a hyper client connection and, on `101`, bridge the two
 /// upgraded byte streams in both directions. Supports `http`/`ws` (plaintext),
-/// `https`/`wss` (TLS, HS-2), and `unix:` upstreams.
+/// `https`/`wss` (TLS), and `unix:` upstreams.
 async fn proxy_upgrade(
     mut request: Request,
     upstream: &boatramp_core::gateway::Upstream,
@@ -822,7 +822,7 @@ async fn proxy_upgrade(
         Ok(u) => u,
         Err(_) => return (StatusCode::BAD_GATEWAY, "bad gateway upstream\n").into_response(),
     };
-    // http/ws → plaintext; https/wss → TLS (HS-2). Anything else is unsupported.
+    // http/ws → plaintext; https/wss → TLS. Anything else is unsupported.
     let tls = match upgrade_transport(parsed.scheme()) {
         Some(tls) => tls,
         None => {
@@ -1039,7 +1039,7 @@ mod tests {
         // Plaintext schemes.
         assert_eq!(upgrade_transport("http"), Some(false));
         assert_eq!(upgrade_transport("ws"), Some(false));
-        // TLS schemes (HS-2: wss/https now wired).
+        // TLS schemes (wss/https).
         assert_eq!(upgrade_transport("https"), Some(true));
         assert_eq!(upgrade_transport("wss"), Some(true));
         // Anything else is unsupported for an upgrade.

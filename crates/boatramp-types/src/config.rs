@@ -630,7 +630,7 @@ pub struct HandlersSiteConfig {
     /// dropped (counted). `None` = the server default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_log_rate: Option<u32>,
-    /// Edge response cache (HS-4). Off unless present + `enabled`. When on, a
+    /// Edge response cache. Off unless present + `enabled`. When on, a
     /// cacheable `GET`/`HEAD` response the handler opts in via
     /// `Cache-Control: max-age=…` is stored and served for later identical
     /// requests **without re-instantiating the handler**. Never caches a private

@@ -62,7 +62,7 @@ pub(super) async fn dispatch_handler(
         return not_found();
     };
 
-    // Edge response cache (HS-4): on a cacheable request a fresh hit short-circuits the
+    // Edge response cache: on a cacheable request a fresh hit short-circuits the
     // whole handler path — no blob read, no bindings, no instantiation. The write
     // context is captured here because `serve_with_limits` below consumes `request`.
     let cache_cfg = handler_cache::config_for(site_handlers);
@@ -163,8 +163,8 @@ pub(super) async fn dispatch_handler(
         Ok(response) => {
             let (parts, body) = response.into_parts();
             let response = axum::http::Response::from_parts(parts, axum::body::Body::new(body));
-            // Cache the response if the site opted in and the response is cacheable
-            // (HS-4). On a non-cacheable request/response this returns it untouched, so
+            // Cache the response if the site opted in and the response is cacheable.
+            // On a non-cacheable request/response this returns it untouched, so
             // streaming is preserved.
             match &cache_write {
                 Some((cfg, key, method, req_headers)) => {
