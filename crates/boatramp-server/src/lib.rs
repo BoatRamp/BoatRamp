@@ -70,6 +70,8 @@ pub mod envelope;
 #[cfg(feature = "handlers")]
 mod graphql_apq;
 #[cfg(feature = "handlers")]
+mod graphql_federation;
+#[cfg(feature = "handlers")]
 mod graphql_guard;
 #[cfg(feature = "handlers")]
 mod handler_cache;
