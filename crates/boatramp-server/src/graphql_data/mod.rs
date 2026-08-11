@@ -20,6 +20,8 @@
 
 pub(crate) mod compile;
 pub(crate) mod dialect;
+pub(crate) mod introspect;
 pub(crate) mod policy;
+pub(crate) mod runner;
 pub(crate) mod schema;
 pub(crate) mod sdl;
