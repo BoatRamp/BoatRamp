@@ -418,23 +418,43 @@ async fn data_connector_serve(
     // so an unexposed table/column is rejected even though it's structurally present.
     let policy = crate::graphql_data::policy_from_config(cfg);
     let claims = crate::graphql_data::request_claims(project);
-    // A delegated field is resolved by a sibling function over the invoke path (scoped to
-    // this project); the connector is the root of that call chain (depth 0).
-    let invoker = inner
-        .invoker
-        .get()
-        .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project)));
-    let response = crate::graphql_data::runner::execute(
-        backend.as_ref(),
-        &crate::graphql_data::dialect::Sqlite,
-        &schema,
-        &policy,
-        &claims,
-        query,
-        variables,
-        invoker.as_deref(),
-    )
-    .await;
+    let dialect = crate::graphql_data::dialect::Sqlite;
+    let response = if crate::graphql_data::compile::is_mutation(query) {
+        // A write: gated on the site opting into mutations (deny-by-default), run on a write
+        // transaction. Mutations don't delegate, so no invoker is needed.
+        if !cfg.mutations {
+            serde_json::json!({ "errors": [ { "message": "mutations are not enabled for this endpoint" } ] })
+        } else {
+            crate::graphql_data::runner::execute_mutation(
+                backend.as_ref(),
+                &dialect,
+                &schema,
+                &policy,
+                &claims,
+                query,
+                variables,
+            )
+            .await
+        }
+    } else {
+        // A delegated field is resolved by a sibling function over the invoke path (scoped to
+        // this project); the connector is the root of that call chain (depth 0).
+        let invoker = inner
+            .invoker
+            .get()
+            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project)));
+        crate::graphql_data::runner::execute(
+            backend.as_ref(),
+            &dialect,
+            &schema,
+            &policy,
+            &claims,
+            query,
+            variables,
+            invoker.as_deref(),
+        )
+        .await
+    };
     axum::Json(response).into_response()
 }
 

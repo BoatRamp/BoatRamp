@@ -6348,6 +6348,21 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
     // Bob has no posts — a to-many with no matches is an empty array, not null.
     assert_eq!(out["data"]["users"][1]["posts"], serde_json::json!([]));
 
+    // Mutations are off by default: a write is refused (deny-by-default), not executed.
+    let response = app
+        .clone()
+        .oneshot(post(
+            r#"{"query":"mutation { insert_users(object: {id: \"9\"}) { affected_rows } }"}"#,
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(out["errors"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not enabled"));
+
     // An unexposed column is rejected (deny-by-default), never returned.
     let response = app
         .oneshot(post(r#"{"query":"{ users { tenant } }"}"#))
@@ -6517,6 +6532,179 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
         out["data"]["users"][1]["reviews"][0]["body"],
         serde_json::json!("review for 2")
     );
+
+    let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
+/// Mutations through the data connector (opt-in): insert, update, and delete compile to
+/// parameterized writes in a transaction, and the row filter is enforced on every write — an
+/// inserted row is forced to belong to the tenant, and update/delete only touch the tenant's
+/// rows. Drives the real router, connector, and libsql end to end.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn graphql_data_connector_mutations_write_with_row_isolation() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlerGraphqlDataConfig,
+        HandlerGraphqlRowTerm, HandlerGraphqlTableConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::sql::SqlBackends;
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::collections::BTreeMap;
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let sql_dir = std::env::temp_dir().join(format!("boatramp-conf-gqlmut-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sql_dir);
+    let sql: Arc<dyn SqlBackends> = Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+    {
+        let backend = sql.database("default", "store", "").await.unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT, tenant TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "store", &id)
+        .await
+        .unwrap();
+    let data_cfg = HandlerGraphqlDataConfig {
+        enabled: true,
+        mutations: true,
+        tables: BTreeMap::from([(
+            "items".to_string(),
+            HandlerGraphqlTableConfig {
+                columns: vec!["id".into(), "name".into()],
+                row_filter: vec![HandlerGraphqlRowTerm {
+                    column: "tenant".into(),
+                    claim: "project".into(),
+                }],
+                resolvers: Default::default(),
+            },
+        )]),
+        ..Default::default()
+    };
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "store",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        data: Some(data_cfg),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let call = |app: axum::Router, body: &'static str| async move {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/_sites/store/graphql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        let response = app.oneshot(req).await.unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+
+    // Insert — the row filter forces `tenant` to the project claim, so the row is ours.
+    let out = call(
+        app.clone(),
+        r#"{"query":"mutation { insert_items(object: {id: \"1\", name: \"Widget\"}) { affected_rows } }"}"#,
+    )
+    .await;
+    assert_eq!(
+        out["data"]["insert_items"]["affected_rows"],
+        serde_json::json!(1),
+        "{out}"
+    );
+
+    // The inserted row is visible (its forced tenant matches the row filter).
+    let out = call(app.clone(), r#"{"query":"{ items { id name } }"}"#).await;
+    assert_eq!(out["data"]["items"][0]["name"], serde_json::json!("Widget"));
+
+    // Update, then observe.
+    let out = call(
+        app.clone(),
+        r#"{"query":"mutation { update_items(where: {id: {_eq: \"1\"}}, _set: {name: \"Gadget\"}) { affected_rows } }"}"#,
+    )
+    .await;
+    assert_eq!(
+        out["data"]["update_items"]["affected_rows"],
+        serde_json::json!(1),
+        "{out}"
+    );
+    let out = call(app.clone(), r#"{"query":"{ items { name } }"}"#).await;
+    assert_eq!(out["data"]["items"][0]["name"], serde_json::json!("Gadget"));
+
+    // Delete, then observe the empty set.
+    let out = call(
+        app.clone(),
+        r#"{"query":"mutation { delete_items(where: {id: {_eq: \"1\"}}) { affected_rows } }"}"#,
+    )
+    .await;
+    assert_eq!(
+        out["data"]["delete_items"]["affected_rows"],
+        serde_json::json!(1),
+        "{out}"
+    );
+    let out = call(app, r#"{"query":"{ items { id } }"}"#).await;
+    assert_eq!(out["data"]["items"], serde_json::json!([]));
 
     let _ = std::fs::remove_dir_all(&sql_dir);
 }

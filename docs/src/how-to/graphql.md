@@ -75,10 +75,38 @@ Two guarantees make this safe to point at real data:
   is denied — a missing claim never widens access.
 
 Every value is a bound parameter (injection-safe), and every identifier comes only from the
-introspected, exposed schema. The connector composes *beneath* the guard, persisted queries,
-and cache above, and *beside* the wasm-resolver model — a schema can mix tables served from
-the database with types served by a wasm subgraph (see [Federation](#federation)). It's
-off by default. Managed libsql is supported today; relationships and mutations follow.
+introspected, exposed schema. It's off by default; managed libsql is supported today.
+
+**Relationships.** Foreign keys become relationship fields — a to-one field for each outgoing
+FK and a to-many field for the rows that reference this one. A nested query resolves in **one
+SQL statement** (relationships compile to correlated JSON subqueries), so there is no N+1, and
+the row filter applies **inside** each relationship too — a nested row a tenant shouldn't see
+stays hidden.
+
+**Mutations** are opt-in:
+
+```ron
+graphql: ( enabled: true, data: ( enabled: true, mutations: true, tables: { … } ) )
+```
+
+You get `insert_<table>`, `update_<table>`, and `delete_<table>`, each returning
+`{ affected_rows }`. Writes run in a transaction, use only exposed columns, and the row
+filter is enforced on every write: an inserted row is forced to belong to the tenant, and an
+update/delete only touches the tenant's rows. An unbounded update/delete (no `where`) is
+refused.
+
+**A wasm-resolved field.** A field can be served by a wasm function instead of a column,
+listed per table:
+
+```ron
+"users": ( columns: ["id", "name"], resolvers: { "recommendations": "recommender" } )
+```
+
+The connector resolves the row's columns from SQL, then fills the delegated field with a
+single batched invoke to the function (a local `_entities` fetch, joined by key — no N+1).
+The map is also the allowlist: only these fields delegate, only to these functions. This is
+GraphQL→SQL and GraphQL→Wasi blended at field grain; the coarser form is a SQL source acting
+as a **federation subgraph** composed with wasm subgraphs (see [Federation](#federation)).
 
 ## The query-guard
 

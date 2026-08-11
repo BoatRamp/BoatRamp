@@ -64,6 +64,48 @@ pub(crate) async fn execute(
     json!({ "data": data })
 }
 
+/// Execute a **mutation**: compile it to writes and run them in one transaction (commit on
+/// success, roll back on any failure). Each write returns `{ affected_rows }` under its
+/// response key. `{"errors": …}` on a compile or SQL failure — never a partial write.
+pub(crate) async fn execute_mutation(
+    backend: &dyn SqlBackend,
+    dialect: &dyn Dialect,
+    schema: &DbSchema,
+    policy: &DataPolicy,
+    claims: &Claims,
+    query: &str,
+    variables: &Value,
+) -> Value {
+    use super::compile::compile_mutation;
+    let plan = match compile_mutation(query, variables, schema, policy, claims, dialect) {
+        Ok(plan) => plan,
+        Err(err) => return errors(&err.to_string()),
+    };
+    let mut tx = match backend.begin().await {
+        Ok(tx) => tx,
+        Err(err) => return errors(&format!("database unavailable: {err}")),
+    };
+    let mut data = Map::new();
+    for statement in &plan.statements {
+        match tx.execute(&statement.sql, &statement.params).await {
+            Ok(affected) => {
+                data.insert(
+                    statement.response_key.clone(),
+                    json!({ "affected_rows": affected }),
+                );
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return errors(&format!("mutation failed: {err}"));
+            }
+        }
+    }
+    if let Err(err) = tx.commit().await {
+        return errors(&format!("commit failed: {err}"));
+    }
+    json!({ "data": data })
+}
+
 /// Shape each returned row into its base GraphQL object (columns, relationships,
 /// `__typename`); delegated fields are filled afterward.
 fn shape_objects(root: &RootQuery, rows: &SqlRows) -> Vec<Value> {

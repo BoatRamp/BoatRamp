@@ -84,6 +84,38 @@ pub(crate) struct PlannedSql {
 /// delegated fields.
 type CompiledSelection = (Vec<String>, Vec<OutField>, Vec<Delegation>);
 
+/// One write (`INSERT`/`UPDATE`/`DELETE`) a mutation lowers to.
+#[derive(Debug, PartialEq)]
+pub(crate) struct WriteStatement {
+    /// The response key the write's result (`{ affected_rows }`) is returned under.
+    pub response_key: String,
+    /// The parameterized write SQL.
+    pub sql: String,
+    /// The bound parameters, in placeholder order.
+    pub params: Vec<SqlValue>,
+}
+
+/// A mutation operation lowered to a sequence of writes (run in one transaction).
+#[derive(Debug, PartialEq)]
+pub(crate) struct MutationPlan {
+    pub statements: Vec<WriteStatement>,
+}
+
+/// Whether `query`'s operation is a mutation (so the caller runs it on a write transaction
+/// and only if the site opted into mutations).
+pub(crate) fn is_mutation(query: &str) -> bool {
+    graphql_parser::query::parse_query::<String>(query)
+        .ok()
+        .and_then(|doc| {
+            doc.definitions.into_iter().find_map(|d| match d {
+                Definition::Operation(OperationDefinition::Mutation(_)) => Some(true),
+                Definition::Operation(_) => Some(false),
+                _ => None,
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Why compilation failed. Every variant is a hard rejection — the connector never runs a
 /// partial or guessed query.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -141,6 +173,232 @@ pub(crate) fn compile(
         )?);
     }
     Ok(PlannedSql { roots })
+}
+
+/// Compile a **mutation** operation into a sequence of writes. Each root field is
+/// `insert_<t>` / `update_<t>` / `delete_<t>` on an exposed table. Writable columns are the
+/// exposed columns; the row filter is forced onto inserts (so a new row belongs to the
+/// tenant) and combined into every update/delete `WHERE` (so a tenant can only change its own
+/// rows). An unbounded update/delete is refused. Values are always bound parameters.
+pub(crate) fn compile_mutation(
+    query: &str,
+    variables: &serde_json::Value,
+    schema: &DbSchema,
+    policy: &DataPolicy,
+    claims: &Claims,
+    dialect: &dyn Dialect,
+) -> Result<MutationPlan, CompileError> {
+    let doc = graphql_parser::query::parse_query::<String>(query)
+        .map_err(|e| CompileError::Parse(e.to_string()))?;
+    let op = doc
+        .definitions
+        .iter()
+        .find_map(|d| match d {
+            Definition::Operation(op) => Some(op),
+            _ => None,
+        })
+        .ok_or(CompileError::NoOperation)?;
+    let OperationDefinition::Mutation(mutation) = op else {
+        return Err(CompileError::Unsupported("expected a mutation".into()));
+    };
+    let mut statements = Vec::new();
+    for sel in &mutation.selection_set.items {
+        let Selection::Field(field) = sel else {
+            return Err(CompileError::Unsupported("fragments in a mutation".into()));
+        };
+        statements.push(compile_write(
+            field, variables, schema, policy, claims, dialect,
+        )?);
+    }
+    Ok(MutationPlan { statements })
+}
+
+/// The three write shapes.
+enum WriteKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+fn compile_write(
+    field: &Field<'_, String>,
+    variables: &serde_json::Value,
+    schema: &DbSchema,
+    policy: &DataPolicy,
+    claims: &Claims,
+    dialect: &dyn Dialect,
+) -> Result<WriteStatement, CompileError> {
+    let response_key = field.alias.clone().unwrap_or_else(|| field.name.clone());
+    let (table_name, kind) = if let Some(t) = field.name.strip_prefix("insert_") {
+        (t, WriteKind::Insert)
+    } else if let Some(t) = field.name.strip_prefix("update_") {
+        (t, WriteKind::Update)
+    } else if let Some(t) = field.name.strip_prefix("delete_") {
+        (t, WriteKind::Delete)
+    } else {
+        return Err(CompileError::UnknownField(field.name.clone()));
+    };
+    if !policy.is_table_exposed(table_name) {
+        return Err(CompileError::UnknownField(field.name.clone()));
+    }
+    let table = schema
+        .table(table_name)
+        .ok_or_else(|| CompileError::UnknownField(field.name.clone()))?;
+
+    let mut cx = Cx {
+        dialect,
+        variables,
+        params: Vec::new(),
+        alias_seq: 1,
+    };
+    let sql = match kind {
+        WriteKind::Insert => compile_insert(field, table, policy, claims, &mut cx)?,
+        WriteKind::Update => compile_update(field, table, policy, claims, &mut cx)?,
+        WriteKind::Delete => compile_delete(field, table, policy, claims, &mut cx)?,
+    };
+    Ok(WriteStatement {
+        response_key,
+        sql,
+        params: cx.params,
+    })
+}
+
+/// `INSERT INTO <t> (…) VALUES (…)` from an `object` argument, with the row filter forced.
+fn compile_insert(
+    field: &Field<'_, String>,
+    table: &Table,
+    policy: &DataPolicy,
+    claims: &Claims,
+    cx: &mut Cx<'_>,
+) -> Result<String, CompileError> {
+    let Some((_, Value::Object(map))) = field.arguments.iter().find(|(n, _)| n == "object") else {
+        return Err(CompileError::Unsupported(
+            "insert requires an `object` argument".into(),
+        ));
+    };
+    let mut columns: Vec<String> = Vec::new();
+    let mut values: Vec<SqlValue> = Vec::new();
+    for (col, val) in map {
+        if table.column(col).is_none() || !policy.is_column_exposed(&table.name, col) {
+            return Err(CompileError::UnknownField(format!("{}.{col}", table.name)));
+        }
+        columns.push(col.clone());
+        values.push(resolve_value(val, cx.variables)?);
+    }
+    // A new row must belong to the tenant: force the row-filter columns to the claim values.
+    if let Some(filter) = policy.row_filter(&table.name, claims)? {
+        for term in filter.terms {
+            match columns.iter().position(|c| *c == term.column) {
+                Some(pos) => values[pos] = term.value,
+                None => {
+                    columns.push(term.column);
+                    values.push(term.value);
+                }
+            }
+        }
+    }
+    if columns.is_empty() {
+        return Err(CompileError::Unsupported("insert sets no columns".into()));
+    }
+    let col_list = columns
+        .iter()
+        .map(|c| cx.dialect.quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = values
+        .into_iter()
+        .map(|v| cx.bind(v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "INSERT INTO {} ({col_list}) VALUES ({placeholders})",
+        cx.dialect.quote_ident(&table.name)
+    ))
+}
+
+/// `UPDATE <t> SET … WHERE …` from `_set` + `where`; refuses an unbounded update.
+fn compile_update(
+    field: &Field<'_, String>,
+    table: &Table,
+    policy: &DataPolicy,
+    claims: &Claims,
+    cx: &mut Cx<'_>,
+) -> Result<String, CompileError> {
+    let Some((_, Value::Object(map))) = field.arguments.iter().find(|(n, _)| n == "_set") else {
+        return Err(CompileError::Unsupported(
+            "update requires a `_set` argument".into(),
+        ));
+    };
+    if map.is_empty() {
+        return Err(CompileError::Unsupported("`_set` sets no columns".into()));
+    }
+    let mut assignments = Vec::new();
+    for (col, val) in map {
+        if table.column(col).is_none() || !policy.is_column_exposed(&table.name, col) {
+            return Err(CompileError::UnknownField(format!("{}.{col}", table.name)));
+        }
+        let value = resolve_value(val, cx.variables)?;
+        let ph = cx.bind(value);
+        assignments.push(format!("{} = {ph}", cx.dialect.quote_ident(col)));
+    }
+    let Some(where_sql) = compile_write_where(field, table, policy, claims, cx)? else {
+        return Err(CompileError::Unsupported(
+            "update requires a `where` (or a row filter) — an unbounded update is refused".into(),
+        ));
+    };
+    Ok(format!(
+        "UPDATE {} SET {} WHERE {where_sql}",
+        cx.dialect.quote_ident(&table.name),
+        assignments.join(", ")
+    ))
+}
+
+/// `DELETE FROM <t> WHERE …`; refuses an unbounded delete.
+fn compile_delete(
+    field: &Field<'_, String>,
+    table: &Table,
+    policy: &DataPolicy,
+    claims: &Claims,
+    cx: &mut Cx<'_>,
+) -> Result<String, CompileError> {
+    let Some(where_sql) = compile_write_where(field, table, policy, claims, cx)? else {
+        return Err(CompileError::Unsupported(
+            "delete requires a `where` (or a row filter) — an unbounded delete is refused".into(),
+        ));
+    };
+    Ok(format!(
+        "DELETE FROM {} WHERE {where_sql}",
+        cx.dialect.quote_ident(&table.name)
+    ))
+}
+
+/// The write `WHERE`: the client `where` argument combined with the table's row filter
+/// (unqualified columns — a single-table statement). `None` when both are absent.
+fn compile_write_where(
+    field: &Field<'_, String>,
+    table: &Table,
+    policy: &DataPolicy,
+    claims: &Claims,
+    cx: &mut Cx<'_>,
+) -> Result<Option<String>, CompileError> {
+    let mut clauses = Vec::new();
+    if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n == "where") {
+        if let Some(expr) = compile_bool_exp(where_arg, table, "", policy, cx)? {
+            clauses.push(expr);
+        }
+    }
+    if let Some(filter) = policy.row_filter(&table.name, claims)? {
+        for term in filter.terms {
+            let col = cx.dialect.quote_ident(&term.column);
+            let ph = cx.bind(term.value);
+            clauses.push(format!("{col} = {ph}"));
+        }
+    }
+    Ok(if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses.join(" AND "))
+    })
 }
 
 /// Per-root compilation state: the parameter + subquery-alias accumulators and the request
@@ -582,6 +840,16 @@ fn compile_junction(
     Ok(format!("({})", parts.join(sep)))
 }
 
+/// A column reference: `qualifier."column"`, or bare `"column"` when `qualifier` is empty
+/// (mutations address a single table, so their `WHERE`/`SET` columns are unqualified).
+fn qualify(qualifier: &str, column: &str, dialect: &dyn Dialect) -> String {
+    if qualifier.is_empty() {
+        dialect.quote_ident(column)
+    } else {
+        format!("{qualifier}.{}", dialect.quote_ident(column))
+    }
+}
+
 /// Compile a `<Scalar>_comparison_exp` for `qualifier.column` (already exposure-checked).
 fn compile_comparison(
     qualifier: &str,
@@ -594,7 +862,7 @@ fn compile_comparison(
             "a comparison must be an object".into(),
         ));
     };
-    let col = format!("{qualifier}.{}", cx.dialect.quote_ident(column));
+    let col = qualify(qualifier, column, cx.dialect);
     let mut parts = Vec::new();
     for (op, operand) in ops {
         let clause = match op.as_str() {
@@ -1074,10 +1342,10 @@ mod tests {
     }
 
     #[test]
-    fn mutations_are_not_compiled_here() {
+    fn mutations_are_not_compiled_by_the_query_path() {
         let vars = serde_json::json!({});
         let err = compile(
-            "mutation { insert_users(name: \"x\") { id } }",
+            "mutation { insert_users(object: {}) { affected_rows } }",
             &vars,
             &schema(),
             &open_policy(),
@@ -1086,5 +1354,124 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CompileError::Unsupported(m) if m.contains("mutation")));
+    }
+
+    fn mutate(
+        query: &str,
+        policy: &DataPolicy,
+        claims: &Claims,
+    ) -> Result<WriteStatement, CompileError> {
+        let vars = serde_json::json!({});
+        let mut plan = compile_mutation(
+            query,
+            &vars,
+            &schema(),
+            policy,
+            claims,
+            &super::super::dialect::Sqlite,
+        )?;
+        Ok(plan.statements.remove(0))
+    }
+
+    #[test]
+    fn is_mutation_distinguishes_operations() {
+        assert!(is_mutation(
+            "mutation { insert_users(object: {}) { affected_rows } }"
+        ));
+        assert!(!is_mutation("{ users { id } }"));
+        assert!(!is_mutation("query Q { users { id } }"));
+    }
+
+    #[test]
+    fn insert_compiles_to_a_parameterized_insert() {
+        let stmt = mutate(
+            r#"mutation { insert_users(object: {id: "1", name: "Alice"}) { affected_rows } }"#,
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap();
+        // BTreeMap sorts the object keys: id before name.
+        assert_eq!(
+            stmt.sql,
+            r#"INSERT INTO "users" ("id", "name") VALUES (?1, ?2)"#
+        );
+        assert_eq!(
+            stmt.params,
+            vec![SqlValue::Text("1".into()), SqlValue::Text("Alice".into())]
+        );
+    }
+
+    #[test]
+    fn insert_forces_the_row_filter_column_to_the_claim() {
+        let policy = DataPolicy::new().with_table(
+            "users",
+            TablePolicy::columns(["id", "name"]).with_rows(RowPredicate {
+                terms: vec![RowTerm {
+                    column: "tenant_id".into(),
+                    op: RowOp::Eq,
+                    value: RowValue::Claim("tenant".into()),
+                }],
+            }),
+        );
+        let claims = BTreeMap::from([("tenant".to_string(), SqlValue::Text("acme".into()))]);
+        let stmt = mutate(
+            r#"mutation { insert_users(object: {id: "1", name: "Alice"}) { affected_rows } }"#,
+            &policy,
+            &Claims::new(claims),
+        )
+        .unwrap();
+        assert_eq!(
+            stmt.sql,
+            r#"INSERT INTO "users" ("id", "name", "tenant_id") VALUES (?1, ?2, ?3)"#
+        );
+        assert_eq!(stmt.params[2], SqlValue::Text("acme".into()));
+    }
+
+    #[test]
+    fn update_combines_set_where_and_row_filter() {
+        let policy = DataPolicy::new().with_table(
+            "users",
+            TablePolicy::columns(["id", "name"]).with_rows(RowPredicate {
+                terms: vec![RowTerm {
+                    column: "tenant_id".into(),
+                    op: RowOp::Eq,
+                    value: RowValue::Claim("tenant".into()),
+                }],
+            }),
+        );
+        let claims = BTreeMap::from([("tenant".to_string(), SqlValue::Text("acme".into()))]);
+        let stmt = mutate(
+            r#"mutation { update_users(where: {id: {_eq: "1"}}, _set: {name: "Bob"}) { affected_rows } }"#,
+            &policy,
+            &Claims::new(claims),
+        )
+        .unwrap();
+        // SET binds first, then the WHERE (client predicate, then the forced tenant filter).
+        assert_eq!(
+            stmt.sql,
+            r#"UPDATE "users" SET "name" = ?1 WHERE "id" = ?2 AND "tenant_id" = ?3"#
+        );
+    }
+
+    #[test]
+    fn an_unbounded_delete_is_refused() {
+        let err = mutate(
+            "mutation { delete_users { affected_rows } }",
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CompileError::Unsupported(m) if m.contains("where")));
+    }
+
+    #[test]
+    fn an_unexposed_insert_column_is_rejected() {
+        let err = mutate(
+            r#"mutation { insert_users(object: {tenant_id: "x"}) { affected_rows } }"#,
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CompileError::UnknownField(f) if f == "users.tenant_id"));
     }
 }

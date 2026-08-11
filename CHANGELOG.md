@@ -10,17 +10,25 @@ versions.
 ### Added
 - **GraphQL from your database (`[handlers.graphql.data]`).** A site can serve a GraphQL API
   generated from its managed database — **no resolver code**. boatramp introspects the schema,
-  generates the object types plus a read surface (`<table>`, `<table>_by_pk`, and
-  `where`/`order_by`/`limit`/`offset`), and answers each query by compiling it to **one
-  parameterized SQL statement**. It stays a *compiler*, not an execution engine: a query it
-  can't lower is rejected, never run partially; the database executes. Exposure is
-  **deny-by-default** and **fail-closed** — only the tables and columns the policy names are
-  visible, and a per-table row filter bound to the host-asserted `project` claim isolates
-  tenants (a missing claim denies rather than widens). Every value is a bound parameter
+  generates the object types plus a read surface (`<table>`, `<table>_by_pk`,
+  `where`/`order_by`/`limit`/`offset`, and foreign-key **relationship** fields), and answers
+  each query by compiling it to **one parameterized SQL statement** — relationships become
+  correlated JSON subqueries, so a nested query is one round-trip with no N+1. It stays a
+  *compiler*, not an execution engine: a query it can't lower is rejected, never run partially;
+  the database executes. Exposure is **deny-by-default** and **fail-closed** — only the tables
+  and columns the policy names are visible, and a per-table row filter bound to the
+  host-asserted `project` claim isolates tenants at **every depth** (including inside a
+  relationship), a missing claim denying rather than widening. Every value is a bound parameter
   (injection-safe) and every identifier comes only from the introspected, exposed schema.
-  Composes *beneath* the existing GraphQL edge (guard, persisted queries, cache) and beside
-  the wasm-resolver model. Off by default; libsql today, with relationships, federation, and
-  mutations to follow.
+  **Mutations** (`insert`/`update`/`delete`) are opt-in (`mutations: true`), run in a
+  transaction, force the row filter onto every write, and refuse an unbounded update/delete.
+  A field can also be **resolved by a wasm function** instead of a column (a per-field resolver
+  map), filled by one batched invoke — GraphQL→SQL and GraphQL→Wasi blended at field grain. And
+  a SQL source can be a **federation subgraph**, composing with wasm subgraphs in one supergraph
+  (the gateway routes each fetch to its backend). Composes *beneath* the existing GraphQL edge
+  (guard, persisted queries, cache) and beside the wasm-resolver model. Off by default; libsql
+  today. Validated end-to-end against real libsql (reads, nested relationships with
+  depth isolation, delegation, SQL+wasm federation, and mutations).
 - **Edge response cache for handlers (`[handlers.cache]`).** A site can opt into a
   host-level cache that serves a cacheable `GET`/`HEAD` response **without
   re-instantiating the handler** — the execution analogue of the existing compile cache.
