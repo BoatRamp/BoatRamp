@@ -34,6 +34,7 @@
 - [Enable the embedded web console](./how-to/web-console.md)
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
+- [Serve a GraphQL API](./how-to/graphql.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
 - [Deploy & invoke a function](./how-to/functions.md)
 - [Orchestrate functions with workflows](./how-to/workflows.md)
