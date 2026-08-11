@@ -78,6 +78,12 @@ versions.
   single handler component. Core federation (`@key` entities, root + entity fetches);
   the planner and executor are unit-tested end-to-end on a two-subgraph `User` supergraph
   (a cross-subgraph `reviews` field resolved and stitched into the `me` result).
+- **GraphQL subscriptions over SSE.** A subscription operation sent to a graphql-enabled
+  site is served as a **messaging-backed SSE stream**: the subscription's root field names
+  a topic, and the client receives each message a producer (a mutation, a function)
+  publishes to that topic as an SSE event — with `Last-Event-ID` resume, a heartbeat, and
+  the site's stream connection caps. The host fans out; the payload is whatever the
+  producer publishes.
 
 ## [0.2.4]
 

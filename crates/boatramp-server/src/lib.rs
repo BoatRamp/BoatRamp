@@ -82,6 +82,8 @@ mod graphql_plan;
 #[cfg(feature = "handlers")]
 mod graphql_registry;
 #[cfg(feature = "handlers")]
+mod graphql_subscription;
+#[cfg(feature = "handlers")]
 mod handler_cache;
 #[cfg(feature = "handlers")]
 mod handler_dispatch;

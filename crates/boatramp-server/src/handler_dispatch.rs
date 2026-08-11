@@ -131,6 +131,31 @@ pub(super) async fn dispatch_handler(
                     {
                         return graphql_guard::error_response(&reason);
                     }
+                    // GraphQL subscription: serve it over the messaging-backed SSE stream,
+                    // deriving the topic from the subscription's root field. A producer
+                    // (a mutation, a function) publishes results to that topic.
+                    if let Some(topic) = graphql_subscription::subscription_topic(query) {
+                        let stream_cfg = boatramp_core::config::StreamConfig {
+                            route: String::new(),
+                            topics: vec![topic],
+                            ..Default::default()
+                        };
+                        let after = parts
+                            .headers
+                            .get("last-event-id")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        return crate::stream::serve_stream(
+                            inner,
+                            site,
+                            site_handlers,
+                            &stream_cfg,
+                            after,
+                            client_ip,
+                            preview,
+                        )
+                        .await;
+                    }
                     // Federation gateway: plan the query against the project's registered
                     // subgraphs and execute it by dispatching fetches to the subgraph
                     // functions, instead of running a single handler component.

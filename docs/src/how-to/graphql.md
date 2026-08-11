@@ -57,6 +57,23 @@ query alongside the hash and the edge registers it (after verifying the hash).
 never registers a new one — persisted queries become a **query allowlist**, a
 real security control.
 
+## Subscriptions
+
+A GraphQL **subscription** operation sent to a graphql-enabled site is served as a
+messaging-backed SSE stream. The subscription's single root field names a **topic**;
+a producer — a mutation handler, a function, a consumer — publishes each event to
+that topic (via the `messaging` binding), and the connected client receives them as
+SSE events, with `Last-Event-ID` resume and a heartbeat, bounded by the site's stream
+connection caps.
+
+```graphql
+subscription { messageAdded { id body } }   # streams the "messageAdded" topic
+```
+
+The host only fans out — the payload delivered to the client is exactly what your
+producer publishes to the topic (typically the subscription's result JSON). No handler
+component runs per event.
+
 ## Federation
 
 For a multi-team schema, run several **subgraph** handlers and let boatramp
