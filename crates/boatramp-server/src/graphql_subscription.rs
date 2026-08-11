@@ -1,14 +1,15 @@
 //! GraphQL subscriptions.
 //!
-//! A subscription is served over boatramp's existing **messaging-backed SSE stream**: the
-//! subscription's root field names a topic; a mutation (or any producer) publishes a
-//! result to that topic, and the connected client receives each as an SSE event. This
-//! module only needs to *detect* a subscription operation and *derive its topic* — the
-//! transport (subscribe, `Last-Event-ID` resume, heartbeat, connection caps) is the
-//! `stream` module's existing SSE machinery.
+//! A subscription is served as a **graphql-sse** event stream (see
+//! [`crate::stream::serve_graphql_subscription`]): the subscription's root field names a
+//! messaging topic; a mutation (or any producer) publishes an execution result to that
+//! topic, and each is framed as a graphql-sse `next` event so a standard graphql-sse
+//! client consumes it directly. This module only needs to *detect* a subscription
+//! operation and *derive its topic* — the transport (subscribe, `Last-Event-ID` resume,
+//! heartbeat, connection caps, graphql-sse framing) is the `stream` module's job.
 //!
 //! boatramp stays GraphQL-*aware*, not an engine: the payload published to the topic is
-//! the subscription result your producer computes; the host just fans it out.
+//! the subscription result your producer computes; the host just fans it out (framed).
 
 use graphql_parser::query::{Definition, OperationDefinition, Selection};
 

@@ -209,6 +209,148 @@ pub(super) async fn serve_stream(
         .into_response()
 }
 
+/// Serve a GraphQL **subscription** as a [graphql-sse] event stream ("distinct
+/// connections" mode): subscribe to the subscription's topic and frame each published
+/// payload as an `event: next` carrying the execution-result JSON, so a standard
+/// graphql-sse client (Apollo Client, urql, `graphql-sse`) consumes it directly — unlike
+/// [`serve_stream`], which frames boatramp's own `event: <topic>` shape that no GraphQL
+/// client understands. Resume (`Last-Event-ID`), heartbeat, idle timeout, and the
+/// per-scope + per-IP connection caps are shared with `serve_stream`.
+///
+/// boatramp stays GraphQL-*aware*, not an engine: the host does not execute the
+/// subscription. Its single root field names a messaging **topic**; a producer (a
+/// mutation handler, a function, a consumer) publishes each event's **execution result**
+/// (`{"data": …}`) to that topic, and the host frames it as graphql-sse `next`. The
+/// payload delivered is exactly what the producer published.
+///
+/// [graphql-sse]: https://github.com/enisdenjo/graphql-sse/blob/master/PROTOCOL.md
+#[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn serve_graphql_subscription(
+    inner: &Arc<HandlerRuntimeInner>,
+    site: &str,
+    site_handlers: &boatramp_core::config::HandlersSiteConfig,
+    topic: &str,
+    after: Option<String>,
+    client_ip: IpAddr,
+    preview: Option<&str>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt;
+
+    let Some(messaging) = inner.messaging.clone() else {
+        // Subscriptions require a messaging backend; without one the route is dead.
+        return not_found();
+    };
+    // Binding identity, same rule as request handlers and `serve_stream`: live binds to
+    // the site, a preview to its own `{site}/_preview/{id}` namespace.
+    let scope = match preview {
+        Some(id) => format!("{site}/_preview/{id}"),
+        None => site.to_string(),
+    };
+    let site_permit = match acquire_stream_permit(inner, &scope, site_handlers) {
+        Ok(permit) => permit,
+        Err(()) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "site stream connection limit reached\n",
+            )
+                .into_response()
+        }
+    };
+    let ip_guard = match acquire_stream_ip_slot(inner, &scope, client_ip) {
+        Ok(guard) => guard,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client stream connection limit reached\n",
+            )
+                .into_response()
+        }
+    };
+
+    // One live subscription on the (scope-namespaced) topic, each payload framed as a
+    // graphql-sse `next` event carrying the producer's execution result.
+    let namespaced = format!("{scope}/{topic}");
+    let events = messaging
+        .subscribe(&namespaced, after.as_deref())
+        .map(|event| graphql_sse_next(&event.id, &event.payload))
+        .boxed();
+
+    let conn = StreamConn {
+        events,
+        _site_permit: site_permit,
+        _ip_guard: ip_guard,
+    };
+    let body = futures::stream::unfold(conn, |mut conn| async move {
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, conn.events.next()).await {
+            Ok(Some(event)) => Some((Ok::<Event, std::convert::Infallible>(event), conn)),
+            // Idle past the timeout, or the topic ended: close. The client's EventSource
+            // reconnects (with `Last-Event-ID`) on its own — we deliberately do not
+            // synthesize a graphql-sse `complete`, which would tell the client the
+            // subscription is finished and stop it resuming.
+            Ok(None) | Err(_) => None,
+        }
+    });
+
+    Sse::new(body)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(STREAM_HEARTBEAT)
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// Frame one messaging payload as a graphql-sse `next` event: `event: next` whose `data`
+/// is the producer's execution-result JSON. The durable message id rides as the SSE `id:`
+/// for `Last-Event-ID` resume.
+#[cfg(feature = "handlers")]
+fn graphql_sse_next(id: &str, payload: &[u8]) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .id(id)
+        .event("next")
+        .data(graphql_sse_data(payload))
+}
+
+/// The `data` for a graphql-sse `next` event: the payload verbatim when it is UTF-8 and
+/// CR-free (a valid execution-result JSON, which `Event::data` can frame), else a
+/// well-formed GraphQL error result — a non-UTF-8 or CR-bearing payload can't be valid
+/// execution-result JSON, and `Event::data` panics on a lone `\r`.
+#[cfg(feature = "handlers")]
+fn graphql_sse_data(payload: &[u8]) -> String {
+    match std::str::from_utf8(payload) {
+        Ok(text) if !text.contains('\r') => text.to_string(),
+        _ => r#"{"errors":[{"message":"subscription payload was not valid UTF-8 GraphQL JSON"}]}"#
+            .to_string(),
+    }
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod tests {
+    use super::graphql_sse_data;
+
+    #[test]
+    fn graphql_sse_frames_a_json_result_verbatim() {
+        let payload = br#"{"data":{"messageAdded":{"id":"1","body":"hi"}}}"#;
+        assert_eq!(
+            graphql_sse_data(payload),
+            r#"{"data":{"messageAdded":{"id":"1","body":"hi"}}}"#
+        );
+    }
+
+    #[test]
+    fn graphql_sse_replaces_an_unframable_payload_with_an_error_result() {
+        // A lone CR would panic `Event::data`; a non-UTF-8 byte can't be JSON. Both
+        // become a well-formed GraphQL error result the client can parse.
+        for bad in [b"{\"data\":1}\r".to_vec(), vec![0xff, 0xfe]] {
+            let data = graphql_sse_data(&bad);
+            assert!(data.contains("\"errors\""), "unexpected: {data}");
+            let _: serde_json::Value = serde_json::from_str(&data).expect("valid JSON");
+        }
+    }
+}
+
 /// Serve a configured stream as a **WebSocket**: the same scope-namespaced
 /// `topics` fan out to the client
 /// (server→client, as binary frames), and — bidirectionally — frames the client

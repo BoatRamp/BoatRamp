@@ -32,16 +32,32 @@ pub(crate) enum GuardVerdict {
 }
 
 /// Largest POST body the edge guard will buffer to inspect the query. A GraphQL
-/// request (query + variables) is small; a larger body is passed through unguarded
-/// rather than buffered, so this can't become a memory-exhaustion vector.
+/// request (query + variables) is small; a query-bearing body over this cap is
+/// **rejected** (not passed through), so an oversized or unknown-length body can't slip
+/// past the guard, and the buffer itself can never exhaust host memory.
 pub(crate) const MAX_QUERY_BYTES: usize = 1024 * 1024;
 
 /// A GraphQL-shaped `400` error (`{"errors":[{"message": …}]}`) for a rejected query.
 pub(crate) fn error_response(reason: &str) -> axum::response::Response {
+    json_error(axum::http::StatusCode::BAD_REQUEST, reason)
+}
+
+/// A GraphQL-shaped `413` for a request body over [`MAX_QUERY_BYTES`]. A GraphQL request
+/// is small; a query-bearing body past the edge cap is refused rather than buffered or
+/// passed through — passing it through would let it bypass the guard entirely.
+pub(crate) fn too_large_response() -> axum::response::Response {
+    json_error(
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        &format!("GraphQL request exceeds the {MAX_QUERY_BYTES}-byte edge limit"),
+    )
+}
+
+/// A GraphQL-shaped error body (`{"errors":[{"message": …}]}`) at `status`.
+fn json_error(status: axum::http::StatusCode, message: &str) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let body = serde_json::json!({ "errors": [ { "message": reason } ] }).to_string();
+    let body = serde_json::json!({ "errors": [ { "message": message } ] }).to_string();
     (
-        axum::http::StatusCode::BAD_REQUEST,
+        status,
         [(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),

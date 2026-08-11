@@ -52,6 +52,14 @@ This is defense-in-depth over the per-handler fuel cap against the deep/wide
 query denial-of-service class the fuel cap can't fully catch. A rejection is a
 GraphQL-shaped `400`.
 
+Every query-bearing POST is inspected — the body is buffered up to a 1 MiB edge
+cap **regardless of its declared length**, so a chunked or oversized request can't
+slip past the guard by omitting or misstating `Content-Length`. A GraphQL request
+is small; a query body over the cap is refused with a GraphQL-shaped `413` rather
+than passed through. Only an upload/form POST (`multipart/form-data`,
+`application/x-www-form-urlencoded`), which carries no query the edge parses, passes
+through untouched.
+
 ## Persisted queries + safelist
 
 ```ron
@@ -71,19 +79,26 @@ real security control.
 ## Subscriptions
 
 A GraphQL **subscription** operation sent to a graphql-enabled site is served as a
-messaging-backed SSE stream. The subscription's single root field names a **topic**;
-a producer — a mutation handler, a function, a consumer — publishes each event to
-that topic (via the `messaging` binding), and the connected client receives them as
-SSE events, with `Last-Event-ID` resume and a heartbeat, bounded by the site's stream
-connection caps.
+[graphql-sse] event stream (the "distinct connections" mode). The subscription's
+single root field names a messaging **topic**; a producer — a mutation handler, a
+function, a consumer — publishes each event to that topic (via the `messaging`
+binding), and each is delivered to the client as a graphql-sse `next` event, with
+`Last-Event-ID` resume and a heartbeat, bounded by the site's stream connection caps.
 
 ```graphql
 subscription { messageAdded { id body } }   # streams the "messageAdded" topic
 ```
 
-The host only fans out — the payload delivered to the client is exactly what your
-producer publishes to the topic (typically the subscription's result JSON). No handler
-component runs per event.
+Because the frames are standard graphql-sse, a normal GraphQL client (Apollo Client,
+urql, or the `graphql-sse` library) consumes the subscription directly.
+
+The host only fans out — it does **not** execute the subscription. The payload your
+producer publishes to the topic is delivered verbatim as the `next` event's data, so
+publish the **execution result** for each event — the JSON your resolver would return,
+e.g. `{"data": {"messageAdded": {"id": "1", "body": "hi"}}}`. No handler component
+runs per event.
+
+[graphql-sse]: https://github.com/enisdenjo/graphql-sse/blob/master/PROTOCOL.md
 
 ## Federation
 
@@ -120,6 +135,12 @@ subgraph on a `@key` entity becomes a dependent `_entities` fetch joined on the
 entity key — and **executed** by dispatching each fetch to its subgraph
 function over the in-process invoke path (no network hop), stitching the results
 by key. A subgraph named `accounts` is invoked as the function named `accounts`.
+
+The registry (the SDL) and the deployed subgraph function are separate: if you
+register a subgraph's SDL but never deploy a function of that name, a query that
+routes to it fails with an explicit `subgraph \`accounts\` is registered but no
+function named \`accounts\` is deployed` error rather than a silently-wrong result.
+Deploy each registered subgraph as a function of the same name.
 
 ### The subgraph contract
 

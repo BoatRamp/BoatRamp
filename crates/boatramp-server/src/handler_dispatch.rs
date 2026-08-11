@@ -64,10 +64,12 @@ pub(super) async fn dispatch_handler(
 
     // GraphQL edge processing: resolve a persisted-query hash to its text (registering
     // it on a verified first miss unless safelisted), then reject an over-limit (or,
-    // when disabled, introspection) query — all before the handler runs. Only a POST
-    // body of known, bounded size is inspected — a GraphQL request is small; a larger or
-    // unknown-length body passes through untouched, so buffering here can never exhaust
-    // host memory.
+    // when disabled, introspection) query — all before the handler runs. Every
+    // query-bearing POST is inspected: the body is buffered up to `MAX_QUERY_BYTES`
+    // regardless of its declared length, and a body over that cap is rejected outright
+    // (not passed through), so no chunked or oversized request can bypass the guard. Only
+    // an upload/form POST (`multipart/form-data`, `x-www-form-urlencoded`) — which carries
+    // no inspectable query — passes through untouched.
     if let Some(gql) = site_handlers.graphql.as_ref().filter(|g| g.enabled) {
         // GraphiQL explorer: a browser GET (Accept: text/html) gets the IDE, which posts
         // queries back to the same URL.
@@ -82,22 +84,30 @@ pub(super) async fn dispatch_handler(
             }
         }
         if request.method() == Method::POST {
-            let content_length = request
+            let content_type = request
                 .headers()
-                .get(header::CONTENT_LENGTH)
+                .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<usize>().ok());
-            if content_length.is_some_and(|n| n <= graphql_guard::MAX_QUERY_BYTES) {
-                let content_type = request
-                    .headers()
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+                .map(str::to_string);
+            // A GraphQL query travels as JSON or a raw `application/graphql` body. A
+            // `multipart/form-data` / `x-www-form-urlencoded` POST is an upload or form
+            // submission whose query (if any) the edge does not parse — pass it through
+            // rather than buffer it under the small query cap.
+            let is_upload = content_type.as_deref().is_some_and(|ct| {
+                ct.contains("multipart/form-data")
+                    || ct.contains("application/x-www-form-urlencoded")
+            });
+            if !is_upload {
                 let (parts, body) = request.into_parts();
-                let raw = axum::body::to_bytes(body, graphql_guard::MAX_QUERY_BYTES)
-                    .await
-                    .unwrap_or_default();
-                let mut body_bytes = raw.to_vec();
+                // Buffer up to the cap regardless of Content-Length; a body over the cap
+                // is refused (a GraphQL request is small, and an unbounded body must not
+                // slip past the guard). `to_bytes` also enforces the cap, so this can
+                // never exhaust host memory.
+                let mut body_bytes =
+                    match axum::body::to_bytes(body, graphql_guard::MAX_QUERY_BYTES).await {
+                        Ok(raw) => raw.to_vec(),
+                        Err(_) => return graphql_guard::too_large_response(),
+                    };
 
                 // The query to guard: from a JSON body's `query` (after APQ resolution)
                 // or a raw `application/graphql` body.
@@ -143,25 +153,21 @@ pub(super) async fn dispatch_handler(
                     {
                         return graphql_guard::error_response(&reason);
                     }
-                    // GraphQL subscription: serve it over the messaging-backed SSE stream,
-                    // deriving the topic from the subscription's root field. A producer
-                    // (a mutation, a function) publishes results to that topic.
+                    // GraphQL subscription: serve it as a graphql-sse event stream,
+                    // deriving the messaging topic from the subscription's root field. A
+                    // producer (a mutation, a function) publishes each execution result to
+                    // that topic; the host frames it as graphql-sse `next`.
                     if let Some(topic) = graphql_subscription::subscription_topic(query) {
-                        let stream_cfg = boatramp_core::config::StreamConfig {
-                            route: String::new(),
-                            topics: vec![topic],
-                            ..Default::default()
-                        };
                         let after = parts
                             .headers
                             .get("last-event-id")
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
-                        return crate::stream::serve_stream(
+                        return crate::stream::serve_graphql_subscription(
                             inner,
                             site,
                             site_handlers,
-                            &stream_cfg,
+                            &topic,
                             after,
                             client_ip,
                             preview,

@@ -48,10 +48,14 @@ versions.
   when they exceed a depth or complexity limit, or (unless allowed) are
   schema-introspection queries — defense-in-depth over the per-request fuel cap against
   the deep/wide-query denial-of-service class it can't fully catch. Fragments are expanded
-  so nesting can't hide behind them, and cyclic fragments terminate. Only a bounded POST
-  body is inspected (a larger or unknown-length body passes through unguarded, so the guard
-  can't exhaust memory); a rejection is a GraphQL-shaped `400`. Off by default. The first
-  step toward GraphQL-native serving.
+  so nesting can't hide behind them, and cyclic fragments terminate. Every query-bearing
+  POST is inspected: the body is buffered up to a 1 MiB cap **regardless of its declared
+  length** (so a chunked or oversized request can't bypass the guard by omitting or
+  misstating `Content-Length`), and a query body over the cap is refused with a
+  GraphQL-shaped `413` rather than passed through; an upload/form POST
+  (`multipart/form-data`, `x-www-form-urlencoded`) — which carries no query the edge
+  parses — passes through untouched. A rejection is a GraphQL-shaped `400`. Off by
+  default. The first step toward GraphQL-native serving.
 - **GraphQL persisted queries + safelist (`[handlers.graphql]`).** Clients may send a
   small query hash (`extensions.persistedQuery.sha256Hash`) instead of the full query; the
   edge resolves the hash to the stored query and hands the full query to the handler —
@@ -75,15 +79,24 @@ versions.
   becomes a dependent `_entities` fetch joined on the entity `@key`) and **executed** by
   dispatching each fetch to its subgraph function over the in-process invoke path (no
   network hop, no SSRF surface), stitching the results by key — instead of running a
-  single handler component. Core federation (`@key` entities, root + entity fetches);
-  the planner and executor are unit-tested end-to-end on a two-subgraph `User` supergraph
-  (a cross-subgraph `reviews` field resolved and stitched into the `me` result).
-- **GraphQL subscriptions over SSE.** A subscription operation sent to a graphql-enabled
-  site is served as a **messaging-backed SSE stream**: the subscription's root field names
-  a topic, and the client receives each message a producer (a mutation, a function)
-  publishes to that topic as an SSE event — with `Last-Event-ID` resume, a heartbeat, and
-  the site's stream connection caps. The host fans out; the payload is whatever the
-  producer publishes.
+  single handler component. Core federation (`@key` entities, root + entity fetches); the
+  planner and executor are unit-tested end-to-end on a two-subgraph `User` supergraph,
+  including a **list-valued** cross-subgraph join through a runner that honors the real
+  `_entities` contract (each element resolved by its own key, so per-element identity is
+  preserved). The registry SDL and the deployed subgraph function are decoupled: a query
+  routed to a registered-but-undeployed subgraph fails with an explicit
+  `subgraph … is registered but no function … is deployed` error rather than a
+  silently-wrong result.
+- **GraphQL subscriptions over graphql-sse.** A subscription operation sent to a
+  graphql-enabled site is served as a [graphql-sse] event stream ("distinct connections"
+  mode): the subscription's root field names a messaging topic, and each message a producer
+  (a mutation, a function) publishes to that topic is delivered as a graphql-sse `next`
+  event — so a standard GraphQL client (Apollo Client, urql, `graphql-sse`) consumes it
+  directly — with `Last-Event-ID` resume, a heartbeat, and the site's stream connection
+  caps. The host fans out but does not execute the subscription; publish the **execution
+  result** (`{"data": …}`) for each event.
+
+[graphql-sse]: https://github.com/enisdenjo/graphql-sse/blob/master/PROTOCOL.md
 - **Baked GraphiQL explorer (`[handlers.graphql] graphiql`).** A browser `GET` (an
   `Accept: text/html` request) to a graphiql-enabled GraphQL endpoint gets the GraphiQL
   IDE, which posts queries back to the same URL. A developer convenience — off by default;

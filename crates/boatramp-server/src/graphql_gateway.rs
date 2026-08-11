@@ -89,9 +89,18 @@ impl SubgraphRunner for InvokeRunner {
             Ok(resp) => serde_json::from_slice(&resp.body).unwrap_or_else(|_| {
                 json!({ "errors": [{ "message": format!("subgraph `{subgraph}` returned invalid JSON") }] })
             }),
-            Err(_) => {
-                json!({ "errors": [{ "message": format!("subgraph `{subgraph}` is unavailable") }] })
-            }
+            // A registered subgraph with no deployed function of the same name — the
+            // registry SDL and the actual subgraph function are decoupled, so surface
+            // this precisely rather than as a generic outage (a silently-wrong result
+            // would be worse than an explicit error).
+            Err(boatramp_handlers::InvokeError::NotFound) => json!({ "errors": [{
+                "message": format!(
+                    "subgraph `{subgraph}` is registered but no function named `{subgraph}` is deployed"
+                )
+            }] }),
+            Err(boatramp_handlers::InvokeError::Failed(msg)) => json!({ "errors": [{
+                "message": format!("subgraph `{subgraph}` failed: {msg}")
+            }] }),
         }
     }
 }
@@ -188,6 +197,10 @@ mod tests {
         type Query { me: User }
         type User @key(fields: "id") { id: ID! name: String }
     "#;
+    const ACCOUNTS_LIST: &str = r#"
+        type Query { users: [User] }
+        type User @key(fields: "id") { id: ID! name: String }
+    "#;
     const REVIEWS: &str = r#"
         type Query { topReviews: [Review] }
         type Review { id: ID! body: String }
@@ -201,6 +214,63 @@ mod tests {
     impl SubgraphRunner for Mock {
         async fn run(&self, subgraph: &str, _query: &str, _variables: Value) -> Value {
             self.0.get(subgraph).cloned().unwrap_or_else(|| json!({}))
+        }
+    }
+
+    /// A runner that honors the real federation contract instead of returning a canned
+    /// answer: a root fetch returns its data; an `_entities` fetch reads the
+    /// `representations` variable and resolves each representation **by its key, in
+    /// order** — exactly what an async-graphql federation subgraph's `_entities` resolver
+    /// does. Using it end-to-end exercises the whole representations→`_entities`→stitch
+    /// round-trip against a faithful subgraph, not a stub that echoes the expected result.
+    struct ContractRunner;
+
+    #[async_trait::async_trait]
+    impl SubgraphRunner for ContractRunner {
+        async fn run(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+            match subgraph {
+                "accounts" => json!({ "data": { "users": [
+                    { "__typename": "User", "id": "1", "name": "Alice" },
+                    { "__typename": "User", "id": "2", "name": "Bob" },
+                ] } }),
+                "reviews" => {
+                    assert!(
+                        query.contains("_entities"),
+                        "entity fetch must use _entities"
+                    );
+                    let reprs = variables
+                        .get("representations")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let entities: Vec<Value> = reprs
+                        .iter()
+                        .map(|r| {
+                            let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            json!({ "reviews": [ { "body": format!("review for {id}") } ] })
+                        })
+                        .collect();
+                    json!({ "data": { "_entities": entities } })
+                }
+                other => json!({ "errors": [{ "message": format!("unknown subgraph {other}") }] }),
+            }
+        }
+    }
+
+    /// An [`Invoker`](boatramp_handlers::Invoker) with no functions deployed — every
+    /// target resolves to `NotFound`, so [`InvokeRunner`] must report the
+    /// registered-but-undeployed subgraph precisely.
+    struct MissingInvoker;
+
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for MissingInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            Err(boatramp_handlers::InvokeError::NotFound)
         }
     }
 
@@ -246,6 +316,41 @@ mod tests {
         // The `me` object now carries both its accounts fields and the stitched reviews.
         assert_eq!(out["data"]["me"]["name"], json!("Alice"));
         assert_eq!(out["data"]["me"]["reviews"][0]["body"], json!("great"));
+    }
+
+    #[tokio::test]
+    async fn executes_a_list_entity_fetch_joining_each_element_by_its_key() {
+        let sg = compose(&[
+            ("accounts".into(), ACCOUNTS_LIST.into()),
+            ("reviews".into(), REVIEWS.into()),
+        ])
+        .unwrap();
+        let plan = plan("{ users { name reviews { body } } }", &sg).unwrap();
+        let out = execute(&plan, &ContractRunner).await;
+        // Each list element is joined to *its own* reviews by key — proving the
+        // representations→`_entities`→stitch round-trip preserves per-element identity
+        // (element 2 gets review-for-2, not review-for-1), which a canned mock can't show.
+        assert_eq!(out["data"]["users"][0]["name"], json!("Alice"));
+        assert_eq!(
+            out["data"]["users"][0]["reviews"][0]["body"],
+            json!("review for 1")
+        );
+        assert_eq!(out["data"]["users"][1]["name"], json!("Bob"));
+        assert_eq!(
+            out["data"]["users"][1]["reviews"][0]["body"],
+            json!("review for 2")
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_runner_reports_a_registered_but_undeployed_subgraph() {
+        let runner = InvokeRunner::new(std::sync::Arc::new(MissingInvoker));
+        let resp = runner.run("accounts", "{ me { id } }", json!({})).await;
+        let msg = resp["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("no function named `accounts` is deployed"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
