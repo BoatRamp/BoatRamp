@@ -37,6 +37,49 @@ request) serves the GraphiQL IDE, which posts queries back to the same URL. Pair
 `introspection: Some(true)` so the explorer can load your schema. It's a developer
 convenience — leave it (and introspection) off in production.
 
+## GraphQL from your database (no resolver code)
+
+boatramp already runs your site's database as a managed workload, so it can also expose
+it as a GraphQL API directly — **no handler, no resolvers**. Turn on the data connector
+and name what to expose:
+
+```ron
+graphql: (
+    enabled: true,
+    data: (
+        enabled: true,
+        tables: {
+            "users": (
+                columns: ["id", "name"],
+                // Row-level isolation: only rows whose `tenant` equals the request's
+                // host-asserted `project` claim are visible.
+                row_filter: [( column: "tenant", claim: "project" )],
+            ),
+        },
+    ),
+)
+```
+
+boatramp introspects the database, generates the schema (an object type per table plus
+`users`, `users_by_pk`, and `where`/`order_by`/`limit`/`offset` arguments), and answers
+each query by **compiling it to one parameterized SQL statement**. It is a *compiler*, not
+an execution engine: a query it can't lower is rejected, never run partially — the database
+does the executing.
+
+Two guarantees make this safe to point at real data:
+
+- **Deny-by-default.** Only the tables and columns you list are exposed; everything else is
+  invisible and unqueryable. Selecting an unexposed column is an error, not a leak.
+- **Fail-closed row isolation.** A table's `row_filter` is applied to *every* access, its
+  value bound from a host-asserted claim (e.g. `project`). If the claim is absent the request
+  is denied — a missing claim never widens access.
+
+Every value is a bound parameter (injection-safe), and every identifier comes only from the
+introspected, exposed schema. The connector composes *beneath* the guard, persisted queries,
+and cache above, and *beside* the wasm-resolver model — a schema can mix tables served from
+the database with types served by a wasm subgraph (see [Federation](#federation)). It's
+off by default. Managed libsql is supported today; relationships and mutations follow.
+
 ## The query-guard
 
 With the guard on, an incoming GraphQL operation is parsed **at the edge and

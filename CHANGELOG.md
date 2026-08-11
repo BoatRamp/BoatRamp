@@ -8,6 +8,19 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **GraphQL from your database (`[handlers.graphql.data]`).** A site can serve a GraphQL API
+  generated from its managed database — **no resolver code**. boatramp introspects the schema,
+  generates the object types plus a read surface (`<table>`, `<table>_by_pk`, and
+  `where`/`order_by`/`limit`/`offset`), and answers each query by compiling it to **one
+  parameterized SQL statement**. It stays a *compiler*, not an execution engine: a query it
+  can't lower is rejected, never run partially; the database executes. Exposure is
+  **deny-by-default** and **fail-closed** — only the tables and columns the policy names are
+  visible, and a per-table row filter bound to the host-asserted `project` claim isolates
+  tenants (a missing claim denies rather than widens). Every value is a bound parameter
+  (injection-safe) and every identifier comes only from the introspected, exposed schema.
+  Composes *beneath* the existing GraphQL edge (guard, persisted queries, cache) and beside
+  the wasm-resolver model. Off by default; libsql today, with relationships, federation, and
+  mutations to follow.
 - **Edge response cache for handlers (`[handlers.cache]`).** A site can opt into a
   host-level cache that serves a cacheable `GET`/`HEAD` response **without
   re-instantiating the handler** — the execution analogue of the existing compile cache.

@@ -590,7 +590,7 @@ mod tests {
             &Claims::default(),
         )
         .unwrap();
-        assert_eq!(root.sql, r#"SELECT "name" FROM "users" WHERE "id" = ?"#);
+        assert_eq!(root.sql, r#"SELECT "name" FROM "users" WHERE "id" = ?1"#);
         assert_eq!(root.params, vec![SqlValue::Text("7".into())]);
         assert!(root.single);
     }
@@ -606,7 +606,7 @@ mod tests {
         // Keys sort (BTreeMap): age before name.
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" WHERE "age" >= ? AND "name" LIKE ?"#
+            r#"SELECT "id" FROM "users" WHERE "age" >= ?1 AND "name" LIKE ?2"#
         );
         assert_eq!(
             root.params,
@@ -624,7 +624,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" WHERE ("id" IN (?, ?) OR "age" < ?)"#
+            r#"SELECT "id" FROM "users" WHERE ("id" IN (?1, ?2) OR "age" < ?3)"#
         );
         assert_eq!(root.params.len(), 3);
     }
@@ -639,7 +639,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" ORDER BY "age" DESC LIMIT ? OFFSET ?"#
+            r#"SELECT "id" FROM "users" ORDER BY "age" DESC LIMIT ?1 OFFSET ?2"#
         );
         assert_eq!(
             root.params,
@@ -671,7 +671,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" WHERE "tenant_id" = ? AND "name" = ?"#
+            r#"SELECT "id" FROM "users" WHERE "tenant_id" = ?1 AND "name" = ?2"#
         );
         assert_eq!(
             root.params,

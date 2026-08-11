@@ -684,6 +684,55 @@ pub struct HandlerGraphqlConfig {
     /// A developer convenience — off by default; pair with `introspection` for schema docs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub graphiql: bool,
+    /// Declarative data connector: serve the GraphQL API by generating it from a managed
+    /// database (queries compiled to SQL) instead of running a wasm handler. Absent unless
+    /// configured; exposure is deny-by-default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<HandlerGraphqlDataConfig>,
+}
+
+/// The declarative GraphQL data connector's configuration (see
+/// [`HandlerGraphqlConfig::data`]). A database-derived API is **deny-by-default**: only the
+/// tables (and their columns) named here are exposed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandlerGraphqlDataConfig {
+    /// Master switch. `false` (the default) ⇒ the connector is inert even if present.
+    pub enabled: bool,
+    /// The managed SQL database name to expose (the site's default database if unset).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// The exposed tables, keyed by table name. Deny-by-default: a table absent here is
+    /// neither in the generated schema nor queryable.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tables: std::collections::BTreeMap<String, HandlerGraphqlTableConfig>,
+    /// Allow mutations (insert/update/delete). Off by default — the connector is read-only
+    /// unless a site opts in.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mutations: bool,
+}
+
+/// One exposed table's policy (see [`HandlerGraphqlDataConfig::tables`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandlerGraphqlTableConfig {
+    /// The readable columns (an allow-list). Deny-by-default: a column absent here is
+    /// invisible.
+    pub columns: Vec<String>,
+    /// Row-level filter terms, all applied to every access — the tenant-isolation seam.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub row_filter: Vec<HandlerGraphqlRowTerm>,
+}
+
+/// One row-filter term: the `column` must equal the value of the request's `claim` (see
+/// [`HandlerGraphqlTableConfig::row_filter`]). Claims are host-asserted (e.g. `project`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandlerGraphqlRowTerm {
+    /// The constrained column.
+    pub column: String,
+    /// The request claim whose value the column must equal.
+    pub claim: String,
 }
 
 /// Per-site edge response-cache tuning (see [`HandlersSiteConfig::cache`]).

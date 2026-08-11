@@ -25,3 +25,41 @@ pub(crate) mod policy;
 pub(crate) mod runner;
 pub(crate) mod schema;
 pub(crate) mod sdl;
+
+use boatramp_core::config::HandlerGraphqlDataConfig;
+use boatramp_core::sql::SqlValue;
+use policy::{Claims, DataPolicy, RowOp, RowPredicate, RowTerm, RowValue, TablePolicy};
+use std::collections::BTreeMap;
+
+/// Build the connector's [`DataPolicy`] from a site's `[handlers.graphql.data]` config.
+/// Deny-by-default is inherent: only the configured tables/columns become exposed.
+pub(crate) fn policy_from_config(cfg: &HandlerGraphqlDataConfig) -> DataPolicy {
+    let mut policy = DataPolicy::new();
+    for (table, table_cfg) in &cfg.tables {
+        let mut table_policy = TablePolicy::columns(table_cfg.columns.iter().cloned());
+        if !table_cfg.row_filter.is_empty() {
+            table_policy = table_policy.with_rows(RowPredicate {
+                terms: table_cfg
+                    .row_filter
+                    .iter()
+                    .map(|term| RowTerm {
+                        column: term.column.clone(),
+                        op: RowOp::Eq,
+                        value: RowValue::Claim(term.claim.clone()),
+                    })
+                    .collect(),
+            });
+        }
+        policy = policy.with_table(table.clone(), table_policy);
+    }
+    policy
+}
+
+/// The host-asserted request claims a row predicate binds against. The tenant `project` is
+/// always available and host-asserted; verified token claims can extend this later.
+pub(crate) fn request_claims(project: &str) -> Claims {
+    Claims::new(BTreeMap::from([(
+        "project".to_string(),
+        SqlValue::Text(project.to_string()),
+    )]))
+}

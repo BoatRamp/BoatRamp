@@ -6099,6 +6099,204 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
     );
 }
 
+// ---- GraphQL declarative data connector end-to-end (real libsql) ------------
+
+/// A site configured with `[handlers.graphql.data]` serves a GraphQL API generated from its
+/// managed database — no resolver code. This drives the real router → dispatch → introspect
+/// → compile-to-SQL → libsql path end to end, and checks the two guarantees that make it a
+/// product rather than a footgun: deny-by-default column exposure, and a row-level filter
+/// bound to the host-asserted `project` claim (so one tenant's rows never leak to another).
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlerGraphqlDataConfig,
+        HandlerGraphqlRowTerm, HandlerGraphqlTableConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::sql::{SqlBackends, SqlValue};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::collections::BTreeMap;
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    // Per-site embedded libsql databases under a temp dir.
+    let sql_dir =
+        std::env::temp_dir().join(format!("boatramp-conf-gqldata-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sql_dir);
+    let sql: Arc<dyn SqlBackends> = Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+
+    // Seed the `shop` site's database: two tenants' rows in one `users` table. Only the
+    // `default`-tenant rows should ever be visible to a `default`-project request.
+    {
+        let backend = sql.database("default", "shop", "").await.unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tenant TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (id, name, tenant) in [
+            (1_i64, "Alice", "default"),
+            (2, "Bob", "default"),
+            (3, "Zed", "other"),
+        ] {
+            tx.execute(
+                "INSERT INTO users (id, name, tenant) VALUES (?1, ?2, ?3)",
+                &[
+                    SqlValue::Integer(id),
+                    SqlValue::Text(name.into()),
+                    SqlValue::Text(tenant.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    // The data-connector site: a placeholder component (never run — the connector answers
+    // before it would load), a route, and `[handlers.graphql.data]` exposing users(id,name)
+    // with a row filter `tenant = {claim:project}`.
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "shop", &id)
+        .await
+        .unwrap();
+    let data_cfg = HandlerGraphqlDataConfig {
+        enabled: true,
+        tables: BTreeMap::from([(
+            "users".to_string(),
+            HandlerGraphqlTableConfig {
+                columns: vec!["id".into(), "name".into()],
+                row_filter: vec![HandlerGraphqlRowTerm {
+                    column: "tenant".into(),
+                    claim: "project".into(),
+                }],
+            },
+        )]),
+        ..Default::default()
+    };
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "shop",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        data: Some(data_cfg),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let post = |body: &'static str| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/_sites/shop/graphql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        req
+    };
+
+    // A list query returns only this project's rows (Zed, tenant `other`, is filtered out),
+    // ordered, with exactly the exposed columns.
+    let response = app
+        .clone()
+        .oneshot(post(
+            r#"{"query":"{ users(order_by: {id: asc}) { id name } }"}"#,
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let users = out["data"]["users"].as_array().expect("users array");
+    assert_eq!(
+        users.len(),
+        2,
+        "row filter should hide the other tenant: {out}"
+    );
+    assert_eq!(out["data"]["users"][0]["name"], serde_json::json!("Alice"));
+    assert_eq!(out["data"]["users"][1]["name"], serde_json::json!("Bob"));
+
+    // A `_by_pk` on a hidden tenant's row returns null (the row filter still applies).
+    let response = app
+        .clone()
+        .oneshot(post(r#"{"query":"{ users_by_pk(id: 3) { name } }"}"#))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        out["data"]["users_by_pk"].is_null(),
+        "hidden row leaked: {out}"
+    );
+
+    // An unexposed column is rejected (deny-by-default), never returned.
+    let response = app
+        .oneshot(post(r#"{"query":"{ users { tenant } }"}"#))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(out["data"].is_null());
+    assert!(out["errors"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("tenant"));
+
+    let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
 // ---- 0.2.0 project-scoped API ---------------------------------------------
 
 /// A `/api/projects/<proj>/…` request operates on that project's data, and the

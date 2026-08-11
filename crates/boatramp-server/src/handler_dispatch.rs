@@ -112,7 +112,13 @@ pub(super) async fn dispatch_handler(
                 // The query to guard: from a JSON body's `query` (after APQ resolution)
                 // or a raw `application/graphql` body.
                 let mut effective_query: Option<String> = None;
+                // The request's GraphQL variables (for the data connector); a raw
+                // `application/graphql` body carries none.
+                let mut variables = serde_json::Value::Object(Default::default());
                 if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    if let Some(vars) = json.get("variables").filter(|v| v.is_object()) {
+                        variables = vars.clone();
+                    }
                     if gql.persisted_queries || gql.safelist {
                         match graphql_apq::resolve_stored(
                             inner.kv.as_ref(),
@@ -179,6 +185,12 @@ pub(super) async fn dispatch_handler(
                     // functions, instead of running a single handler component.
                     if gql.federated {
                         return federation_gateway(inner, project, query).await;
+                    }
+                    // Declarative data connector: serve the query from the site's managed
+                    // database (compiled to SQL), instead of running a handler component.
+                    if let Some(data) = gql.data.as_ref().filter(|d| d.enabled) {
+                        return data_connector_serve(inner, project, site, data, query, &variables)
+                            .await;
                     }
                 }
                 // Put the (possibly query-injected) body back on the request.
@@ -348,6 +360,67 @@ async fn federation_gateway(inner: &HandlerRuntimeInner, project: &str, query: &
         invoker.scoped(boatramp_core::project::ProjectRef::new(project)),
     );
     axum::Json(crate::graphql_gateway::execute(&plan, &runner).await).into_response()
+}
+
+/// The declarative data connector: serve a GraphQL query from the site's managed database.
+/// Resolve the site's SQL backend, introspect it into a schema, build the deny-by-default
+/// policy from `[handlers.graphql.data]`, and compile + run the query to SQL — returning the
+/// GraphQL response. The backend is opened with the same project/site scoping handlers use,
+/// so tenant isolation is inherited; the policy's row filter binds the host-asserted
+/// `project` claim.
+#[cfg(feature = "handlers")]
+async fn data_connector_serve(
+    inner: &HandlerRuntimeInner,
+    project: &str,
+    site: &str,
+    cfg: &boatramp_core::config::HandlerGraphqlDataConfig,
+    query: &str,
+    variables: &serde_json::Value,
+) -> Response {
+    let Some(provider) = &inner.sql else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "graphql data connector: this server has no SQL backend configured\n",
+        )
+            .into_response();
+    };
+    let backend = match provider.database(project, site, &cfg.source).await {
+        Ok(backend) => backend,
+        Err(err) => {
+            tracing::warn!(site, %err, "graphql data connector: opening the database failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "graphql data connector: database unavailable\n",
+            )
+                .into_response();
+        }
+    };
+    let schema = match crate::graphql_data::introspect::introspect_sqlite(backend.as_ref()).await {
+        Ok(schema) => schema,
+        Err(err) => {
+            tracing::warn!(site, %err, "graphql data connector: introspection failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "graphql data connector: schema introspection failed\n",
+            )
+                .into_response();
+        }
+    };
+    // Deny-by-default: only what the policy exposes reaches the compiler.
+    let policy = crate::graphql_data::policy_from_config(cfg);
+    let exposed = policy.project_schema(&schema);
+    let claims = crate::graphql_data::request_claims(project);
+    let response = crate::graphql_data::runner::execute(
+        backend.as_ref(),
+        &crate::graphql_data::dialect::Sqlite,
+        &exposed,
+        &policy,
+        &claims,
+        query,
+        variables,
+    )
+    .await;
+    axum::Json(response).into_response()
 }
 
 /// Add the standard reverse-proxy fields to the request the guest sees. The
