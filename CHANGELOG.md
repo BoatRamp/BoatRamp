@@ -7,7 +7,18 @@ versions.
 
 ## [Unreleased]
 
-## [0.2.4]
+### Added
+- **Edge response cache for handlers (`[handlers.cache]`).** A site can opt into a
+  host-level cache that serves a cacheable `GET`/`HEAD` response **without
+  re-instantiating the handler** — the execution analogue of the existing compile cache.
+  A response is stored only when it explicitly opts in via `Cache-Control: max-age`/
+  `s-maxage` and its size is known (`Content-Length`) and within `max_entry_bytes`;
+  it is **never** cached when private (`no-store`/`private`/`no-cache`, a `Set-Cookie`,
+  `Vary: *`, or an `Authorization` request without `public`/`s-maxage`). Entries are
+  keyed by the request's project-qualified scope (so two tenants never collide), honor
+  `Vary`, and expire by TTL (clamped to `max_ttl_secs`, lazily evicted on read). Backed
+  by the site's KV store; disabled by default. Foundation for GraphQL persisted-query
+  caching (HS-4).
 
 ### Added
 - **Tunable privileges for shared-kernel workloads, so a stock DB image can init.** The

@@ -62,6 +62,38 @@ pub(super) async fn dispatch_handler(
         return not_found();
     };
 
+    // Edge response cache (HS-4): on a cacheable request a fresh hit short-circuits the
+    // whole handler path — no blob read, no bindings, no instantiation. The write
+    // context is captured here because `serve_with_limits` below consumes `request`.
+    let cache_cfg = handler_cache::config_for(site_handlers);
+    let cache_key = cache_cfg.as_ref().and_then(|cfg| {
+        handler_cache::request_lookupable(cfg, request.method()).then(|| {
+            let path_and_query = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
+            handler_cache::cache_key(&scope, request.method(), path_and_query)
+        })
+    });
+    if let Some(key) = &cache_key {
+        if let Some(hit) = handler_cache::lookup_response(
+            inner.kv.as_ref(),
+            key,
+            request.headers(),
+            handler_cache::now_secs(),
+        )
+        .await
+        {
+            return hit;
+        }
+    }
+    let cache_write = match (&cache_cfg, &cache_key) {
+        (Some(cfg), Some(key)) => Some((
+            cfg.clone(),
+            key.clone(),
+            request.method().clone(),
+            request.headers().clone(),
+        )),
+        _ => None,
+    };
+
     // The component `.wasm` is a content-addressed blob in the deployment.
     let Some(entry) = manifest.files.get(&handler.component) else {
         tracing::warn!(site, component = %handler.component, "handler component missing from deployment");
@@ -130,7 +162,25 @@ pub(super) async fn dispatch_handler(
     match result {
         Ok(response) => {
             let (parts, body) = response.into_parts();
-            axum::http::Response::from_parts(parts, axum::body::Body::new(body))
+            let response = axum::http::Response::from_parts(parts, axum::body::Body::new(body));
+            // Cache the response if the site opted in and the response is cacheable
+            // (HS-4). On a non-cacheable request/response this returns it untouched, so
+            // streaming is preserved.
+            match &cache_write {
+                Some((cfg, key, method, req_headers)) => {
+                    handler_cache::maybe_store(
+                        inner.kv.clone(),
+                        cfg,
+                        key,
+                        method,
+                        req_headers,
+                        response,
+                        handler_cache::now_secs(),
+                    )
+                    .await
+                }
+                None => response,
+            }
         }
         Err(err) => {
             tracing::warn!(site, route = %handler.route, %err, "handler invocation failed");

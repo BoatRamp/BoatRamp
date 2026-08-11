@@ -630,6 +630,30 @@ pub struct HandlersSiteConfig {
     /// dropped (counted). `None` = the server default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_log_rate: Option<u32>,
+    /// Edge response cache (HS-4). Off unless present + `enabled`. When on, a
+    /// cacheable `GET`/`HEAD` response the handler opts in via
+    /// `Cache-Control: max-age=…` is stored and served for later identical
+    /// requests **without re-instantiating the handler**. Never caches a private
+    /// response (`no-store`/`private`, `Set-Cookie`, `Vary: *`, or an
+    /// `Authorization` request without `public`/`s-maxage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<HandlerCacheConfig>,
+}
+
+/// Per-site edge response-cache tuning (see [`HandlersSiteConfig::cache`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandlerCacheConfig {
+    /// Master switch. `false` (the default) ⇒ the cache is inert even if present.
+    pub enabled: bool,
+    /// Largest cacheable entry (encoded status+headers+body), in bytes; a bigger
+    /// response streams through uncached. `None` ⇒ the server default (256 KiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_entry_bytes: Option<u64>,
+    /// Upper bound (seconds) on a stored entry's TTL, clamping an over-long
+    /// `max-age`. `None` ⇒ the server default (3600s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ttl_secs: Option<u64>,
 }
 
 impl SiteConfig {
