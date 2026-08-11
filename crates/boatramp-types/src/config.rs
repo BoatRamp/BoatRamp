@@ -664,6 +664,15 @@ pub struct HandlerGraphqlConfig {
     /// (**off** under the multi-tenant posture, on for single-tenant).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub introspection: Option<bool>,
+    /// Automatic Persisted Queries: clients may send a query hash
+    /// (`extensions.persistedQuery.sha256Hash`) instead of the full query; the edge
+    /// resolves + caches `hash → query` (saving bandwidth + parse cost).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub persisted_queries: bool,
+    /// Safelist mode: only pre-registered query hashes run (a query allowlist); the edge
+    /// never registers a new query. Implies (and is stronger than) `persisted_queries`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub safelist: bool,
 }
 
 /// Per-site edge response-cache tuning (see [`HandlersSiteConfig::cache`]).

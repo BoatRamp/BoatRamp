@@ -62,11 +62,12 @@ pub(super) async fn dispatch_handler(
         return not_found();
     };
 
-    // GraphQL edge query-guard: reject an over-limit (or, when disabled, introspection)
-    // query before the handler runs. Only a POST body of known, bounded size is
-    // inspected — a GraphQL request is small; a larger or unknown-length body passes
-    // through unguarded (the handler + fuel cap still apply), so buffering here can
-    // never exhaust host memory.
+    // GraphQL edge processing: resolve a persisted-query hash to its text (registering
+    // it on a verified first miss unless safelisted), then reject an over-limit (or,
+    // when disabled, introspection) query — all before the handler runs. Only a POST
+    // body of known, bounded size is inspected — a GraphQL request is small; a larger or
+    // unknown-length body passes through untouched, so buffering here can never exhaust
+    // host memory.
     if let Some(gql) = site_handlers.graphql.as_ref().filter(|g| g.enabled) {
         if request.method() == Method::POST {
             let content_length = request
@@ -81,19 +82,58 @@ pub(super) async fn dispatch_handler(
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 let (parts, body) = request.into_parts();
-                let bytes = axum::body::to_bytes(body, graphql_guard::MAX_QUERY_BYTES)
+                let raw = axum::body::to_bytes(body, graphql_guard::MAX_QUERY_BYTES)
                     .await
                     .unwrap_or_default();
-                if let Some(query) = graphql_guard::query_from_body(content_type.as_deref(), &bytes)
-                {
+                let mut body_bytes = raw.to_vec();
+
+                // The query to guard: from a JSON body's `query` (after APQ resolution)
+                // or a raw `application/graphql` body.
+                let mut effective_query: Option<String> = None;
+                if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    if gql.persisted_queries || gql.safelist {
+                        match graphql_apq::resolve_stored(
+                            inner.kv.as_ref(),
+                            &scope,
+                            &json,
+                            gql.safelist,
+                        )
+                        .await
+                        {
+                            graphql_apq::Resolved::Error(msg) => {
+                                return graphql_apq::error_response(&msg)
+                            }
+                            graphql_apq::Resolved::Query(q) => {
+                                // Inject the resolved query so the handler executes it.
+                                json["query"] = serde_json::Value::String(q.clone());
+                                if let Ok(v) = serde_json::to_vec(&json) {
+                                    body_bytes = v;
+                                }
+                                effective_query = Some(q);
+                            }
+                            graphql_apq::Resolved::Passthrough => {}
+                        }
+                    }
+                    if effective_query.is_none() {
+                        effective_query = json
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                } else {
+                    effective_query =
+                        graphql_guard::query_from_body(content_type.as_deref(), &body_bytes);
+                }
+
+                if let Some(query) = &effective_query {
                     if let graphql_guard::GuardVerdict::Reject(reason) =
-                        graphql_guard::guard_query(&query, &graphql_guard::limits_from(gql))
+                        graphql_guard::guard_query(query, &graphql_guard::limits_from(gql))
                     {
                         return graphql_guard::error_response(&reason);
                     }
                 }
-                // Put the buffered body back on the request for the handler.
-                request = Request::from_parts(parts, axum::body::Body::from(bytes));
+                // Put the (possibly query-injected) body back on the request.
+                request = Request::from_parts(parts, axum::body::Body::from(body_bytes));
             }
         }
     }

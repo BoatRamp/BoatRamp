@@ -52,6 +52,14 @@ versions.
   body is inspected (a larger or unknown-length body passes through unguarded, so the guard
   can't exhaust memory); a rejection is a GraphQL-shaped `400`. Off by default. The first
   step toward GraphQL-native serving.
+- **GraphQL persisted queries + safelist (`[handlers.graphql]`).** Clients may send a
+  small query hash (`extensions.persistedQuery.sha256Hash`) instead of the full query; the
+  edge resolves the hash to the stored query and hands the full query to the handler —
+  registering it (hash-verified) on a first miss, or returning `PersistedQueryNotFound` so
+  the client re-sends it. In **safelist** mode only pre-registered hashes run and the edge
+  never registers a new one, turning persisted queries into a query allowlist (a security
+  control). Backed by the site's KV store, keyed per project-qualified scope so tenants
+  never collide. Off by default; composes with the query-guard.
 
 ## [0.2.4]
 

@@ -68,6 +68,8 @@ mod domain_verify;
 pub use domain_verify::{spawn_domain_verify_reconcile, verification_pending_page};
 pub mod envelope;
 #[cfg(feature = "handlers")]
+mod graphql_apq;
+#[cfg(feature = "handlers")]
 mod graphql_guard;
 #[cfg(feature = "handlers")]
 mod handler_cache;
