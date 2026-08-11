@@ -1584,6 +1584,7 @@ async fn handler_route_dispatches_through_engine() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -2852,6 +2853,7 @@ async fn activation_during_traffic_drops_no_requests() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -2987,6 +2989,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -3097,6 +3100,7 @@ async fn activation_refuses_broken_component() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -3200,6 +3204,7 @@ async fn activation_refuses_disallowed_import() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -3294,6 +3299,7 @@ async fn activation_refuses_oversized_component() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -3390,6 +3396,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },
@@ -3511,6 +3518,7 @@ async fn per_site_timeout_cap_applies() {
                     max_stream_connections: None,
                     max_log_rate: None,
                     cache: None,
+                    graphql: None,
                 }),
                 ..Default::default()
             },

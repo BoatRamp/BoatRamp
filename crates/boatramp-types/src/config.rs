@@ -638,6 +638,32 @@ pub struct HandlersSiteConfig {
     /// `Authorization` request without `public`/`s-maxage`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<HandlerCacheConfig>,
+    /// GraphQL edge query-guard. Off unless present + `enabled`. When on, an
+    /// incoming GraphQL operation is parsed at the edge and rejected **before the
+    /// handler runs** if it exceeds the depth or complexity limit, or (unless
+    /// allowed) is a schema-introspection query. Defense-in-depth over the fuel cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<HandlerGraphqlConfig>,
+}
+
+/// Per-site GraphQL edge query-guard tuning (see [`HandlersSiteConfig::graphql`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandlerGraphqlConfig {
+    /// Master switch. `false` (the default) ⇒ the guard is inert even if present.
+    pub enabled: bool,
+    /// Deepest allowed selection-set nesting (fragments expanded). `None` ⇒ the
+    /// server default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
+    /// Largest allowed total field count (a schema-free complexity proxy). `None` ⇒
+    /// the server default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_complexity: Option<u32>,
+    /// Whether a schema-introspection query is allowed. `None` ⇒ the posture default
+    /// (**off** under the multi-tenant posture, on for single-tenant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub introspection: Option<bool>,
 }
 
 /// Per-site edge response-cache tuning (see [`HandlersSiteConfig::cache`]).

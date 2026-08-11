@@ -62,6 +62,42 @@ pub(super) async fn dispatch_handler(
         return not_found();
     };
 
+    // GraphQL edge query-guard: reject an over-limit (or, when disabled, introspection)
+    // query before the handler runs. Only a POST body of known, bounded size is
+    // inspected — a GraphQL request is small; a larger or unknown-length body passes
+    // through unguarded (the handler + fuel cap still apply), so buffering here can
+    // never exhaust host memory.
+    if let Some(gql) = site_handlers.graphql.as_ref().filter(|g| g.enabled) {
+        if request.method() == Method::POST {
+            let content_length = request
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok());
+            if content_length.is_some_and(|n| n <= graphql_guard::MAX_QUERY_BYTES) {
+                let content_type = request
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, graphql_guard::MAX_QUERY_BYTES)
+                    .await
+                    .unwrap_or_default();
+                if let Some(query) = graphql_guard::query_from_body(content_type.as_deref(), &bytes)
+                {
+                    if let graphql_guard::GuardVerdict::Reject(reason) =
+                        graphql_guard::guard_query(&query, &graphql_guard::limits_from(gql))
+                    {
+                        return graphql_guard::error_response(&reason);
+                    }
+                }
+                // Put the buffered body back on the request for the handler.
+                request = Request::from_parts(parts, axum::body::Body::from(bytes));
+            }
+        }
+    }
+
     // Edge response cache: on a cacheable request a fresh hit short-circuits the
     // whole handler path — no blob read, no bindings, no instantiation. The write
     // context is captured here because `serve_with_limits` below consumes `request`.

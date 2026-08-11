@@ -43,6 +43,15 @@ versions.
   incremental (`@defer`-style) responses. It keeps the same in-process path (no network
   hop), target allowlist, and call-depth cap; streamed responses are metered at hand-off
   (bytes-out from a declared `Content-Length` when present).
+- **GraphQL edge query-guard (`[handlers.graphql]`).** A site can opt into parsing
+  incoming GraphQL operations at the edge and **rejecting them before the handler runs**
+  when they exceed a depth or complexity limit, or (unless allowed) are
+  schema-introspection queries — defense-in-depth over the per-request fuel cap against
+  the deep/wide-query denial-of-service class it can't fully catch. Fragments are expanded
+  so nesting can't hide behind them, and cyclic fragments terminate. Only a bounded POST
+  body is inspected (a larger or unknown-length body passes through unguarded, so the guard
+  can't exhaust memory); a rejection is a GraphQL-shaped `400`. Off by default. The first
+  step toward GraphQL-native serving.
 
 ## [0.2.4]
 

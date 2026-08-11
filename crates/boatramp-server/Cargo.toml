@@ -24,6 +24,7 @@ handlers = [
   "boatramp-handlers/messaging",
   "boatramp-handlers/invoke",
   "dep:chrono",
+  "dep:graphql-parser",
 ]
 
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
@@ -145,6 +146,10 @@ webpki-roots = "1.0"
 tower = { version = "0.5", features = ["util"], optional = true }
 # Error enums (the OIDC verifier's error type).
 thiserror.workspace = true
+# GraphQL query parsing for the edge query-guard (`handlers` feature): parse an
+# incoming operation to enforce depth/complexity limits + introspection policy
+# before the handler runs. A small standalone parser (no async-graphql runtime).
+graphql-parser = { version = "0.4", optional = true }
 
 # External signer backends (optional). AWS KMS reuses the workspace `aws-config`
 # (already in the tree for s3) + the KMS SDK; PKCS#11 uses `cryptoki` (a thin,
