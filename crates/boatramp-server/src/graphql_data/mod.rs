@@ -18,6 +18,8 @@
 //! compiler, introspection + serving, relationships, federation, and mutations.
 #![allow(dead_code)] // wired into serving by a later landing
 
+pub(crate) mod compile;
+pub(crate) mod dialect;
 pub(crate) mod policy;
 pub(crate) mod schema;
 pub(crate) mod sdl;
