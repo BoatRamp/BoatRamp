@@ -69,6 +69,18 @@ pub(super) async fn dispatch_handler(
     // unknown-length body passes through untouched, so buffering here can never exhaust
     // host memory.
     if let Some(gql) = site_handlers.graphql.as_ref().filter(|g| g.enabled) {
+        // GraphiQL explorer: a browser GET (Accept: text/html) gets the IDE, which posts
+        // queries back to the same URL.
+        if gql.graphiql && request.method() == Method::GET {
+            let wants_html = request
+                .headers()
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.contains("text/html"));
+            if wants_html {
+                return graphql_graphiql::page();
+            }
+        }
         if request.method() == Method::POST {
             let content_length = request
                 .headers()

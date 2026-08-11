@@ -76,6 +76,8 @@ mod graphql_federation;
 #[cfg(feature = "handlers")]
 mod graphql_gateway;
 #[cfg(feature = "handlers")]
+mod graphql_graphiql;
+#[cfg(feature = "handlers")]
 mod graphql_guard;
 #[cfg(feature = "handlers")]
 mod graphql_plan;

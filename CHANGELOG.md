@@ -84,6 +84,10 @@ versions.
   publishes to that topic as an SSE event — with `Last-Event-ID` resume, a heartbeat, and
   the site's stream connection caps. The host fans out; the payload is whatever the
   producer publishes.
+- **Baked GraphiQL explorer (`[handlers.graphql] graphiql`).** A browser `GET` (an
+  `Accept: text/html` request) to a graphiql-enabled GraphQL endpoint gets the GraphiQL
+  IDE, which posts queries back to the same URL. A developer convenience — off by default;
+  pair with `introspection` for schema docs.
 
 ## [0.2.4]
 

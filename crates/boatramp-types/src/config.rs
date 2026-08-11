@@ -679,6 +679,11 @@ pub struct HandlerGraphqlConfig {
     /// results — instead of running a single handler component.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub federated: bool,
+    /// Serve the GraphiQL in-browser explorer: a browser `GET` (an `Accept: text/html`
+    /// request) to the endpoint gets the IDE, which posts queries back to the same URL.
+    /// A developer convenience — off by default; pair with `introspection` for schema docs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub graphiql: bool,
 }
 
 /// Per-site edge response-cache tuning (see [`HandlersSiteConfig::cache`]).

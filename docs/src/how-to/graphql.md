@@ -26,6 +26,17 @@ handlers: (
 )
 ```
 
+## The GraphiQL explorer
+
+```ron
+graphql: ( enabled: true, graphiql: true, introspection: Some(true) )
+```
+
+With `graphiql` on, opening the endpoint in a **browser** (any `Accept: text/html`
+request) serves the GraphiQL IDE, which posts queries back to the same URL. Pair it with
+`introspection: Some(true)` so the explorer can load your schema. It's a developer
+convenience — leave it (and introspection) off in production.
+
 ## The query-guard
 
 With the guard on, an incoming GraphQL operation is parsed **at the edge and
