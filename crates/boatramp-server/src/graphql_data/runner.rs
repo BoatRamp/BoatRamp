@@ -59,6 +59,7 @@ fn shape_rows(root: &RootQuery, rows: &SqlRows) -> Value {
             for field in &root.projection {
                 let value = match &field.source {
                     OutSource::Column(idx) => row.get(*idx).map_or(Value::Null, sql_to_json),
+                    OutSource::Json(idx) => row.get(*idx).map_or(Value::Null, json_cell),
                     OutSource::Typename(name) => json!(name),
                 };
                 obj.insert(field.key.clone(), value);
@@ -85,6 +86,15 @@ fn sql_to_json(value: &SqlValue) -> Value {
             use base64::Engine;
             json!(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
+    }
+}
+
+/// Parse a relationship cell (JSON text from a subquery) into its nested value: an object
+/// for a to-one, an array for a to-many, or null when the to-one had no match.
+fn json_cell(value: &SqlValue) -> Value {
+    match value {
+        SqlValue::Text(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+        _ => Value::Null,
     }
 }
 

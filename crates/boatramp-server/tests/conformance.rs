@@ -6156,12 +6156,39 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
             .await
             .unwrap();
         }
+        // A related table so a nested relationship query resolves in one SQL statement.
+        // `posts.author_id` references `users.id`; posts also carry a tenant, so the
+        // depth-1 row filter must hide a post whose tenant differs even when its author is
+        // visible.
+        tx.execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, \
+             author_id INTEGER REFERENCES users(id), title TEXT, tenant TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (id, author, title, tenant) in [
+            (10_i64, 1_i64, "Hello", "default"),
+            (11, 1, "Hidden", "other"),
+        ] {
+            tx.execute(
+                "INSERT INTO posts (id, author_id, title, tenant) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Integer(id),
+                    SqlValue::Integer(author),
+                    SqlValue::Text(title.into()),
+                    SqlValue::Text(tenant.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
         tx.commit().await.unwrap();
     }
 
     // The data-connector site: a placeholder component (never run — the connector answers
     // before it would load), a route, and `[handlers.graphql.data]` exposing users(id,name)
-    // with a row filter `tenant = {claim:project}`.
+    // + posts(id,title), each with a row filter `tenant = {claim:project}`.
     let gw_hash = sha256_hex(HTTP_200);
     let gw_bytes = HTTP_200.to_vec();
     let gw_stream: ByteStream =
@@ -6198,18 +6225,30 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         .activate(ProjectRef::DEFAULT, "shop", &id)
         .await
         .unwrap();
+    let tenant_filter = || {
+        vec![HandlerGraphqlRowTerm {
+            column: "tenant".into(),
+            claim: "project".into(),
+        }]
+    };
     let data_cfg = HandlerGraphqlDataConfig {
         enabled: true,
-        tables: BTreeMap::from([(
-            "users".to_string(),
-            HandlerGraphqlTableConfig {
-                columns: vec!["id".into(), "name".into()],
-                row_filter: vec![HandlerGraphqlRowTerm {
-                    column: "tenant".into(),
-                    claim: "project".into(),
-                }],
-            },
-        )]),
+        tables: BTreeMap::from([
+            (
+                "users".to_string(),
+                HandlerGraphqlTableConfig {
+                    columns: vec!["id".into(), "name".into()],
+                    row_filter: tenant_filter(),
+                },
+            ),
+            (
+                "posts".to_string(),
+                HandlerGraphqlTableConfig {
+                    columns: vec!["id".into(), "title".into()],
+                    row_filter: tenant_filter(),
+                },
+            ),
+        ]),
         ..Default::default()
     };
     deploy
@@ -6280,6 +6319,32 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         out["data"]["users_by_pk"].is_null(),
         "hidden row leaked: {out}"
     );
+
+    // A nested relationship resolves in one SQL statement (no N+1). Alice's posts come back
+    // nested, and the depth-1 row filter hides her `other`-tenant post — proving isolation
+    // holds through the relationship, not just at the root.
+    let response = app
+        .clone()
+        .oneshot(post(
+            r#"{"query":"{ users(order_by: {id: asc}) { name posts { id title } } }"}"#,
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(out["data"]["users"][0]["name"], serde_json::json!("Alice"));
+    let alice_posts = out["data"]["users"][0]["posts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("posts should be a nested array: {out}"));
+    assert_eq!(
+        alice_posts.len(),
+        1,
+        "the other-tenant post must be hidden: {out}"
+    );
+    assert_eq!(alice_posts[0]["title"], serde_json::json!("Hello"));
+    assert_eq!(alice_posts[0]["id"], serde_json::json!(10));
+    // Bob has no posts — a to-many with no matches is an empty array, not null.
+    assert_eq!(out["data"]["users"][1]["posts"], serde_json::json!([]));
 
     // An unexposed column is rejected (deny-by-default), never returned.
     let response = app

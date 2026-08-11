@@ -4,14 +4,16 @@
 //! This is where the connector stays a *compiler*, not an engine. Each root field lowers to
 //! a single `SELECT` whose values are **always bound parameters** (injection-safe) and whose
 //! identifiers come **only** from the introspected + policy-exposed schema (never request
-//! text). Anything the compiler cannot lower — an unexposed table/column, an unknown
-//! operator, a relationship field (a later landing), a mutation/subscription — is a
-//! [`CompileError`], never a partial or guessed result. The policy's row filter is combined
-//! into every `WHERE`, so tenant isolation is enforced at compile time.
+//! text). A relationship field (from a foreign key) lowers to a correlated JSON subquery, so
+//! one statement still returns the whole tree — no N+1. Anything the compiler cannot lower —
+//! an unexposed table/column, an unknown operator, a relationship nested beyond one level, a
+//! mutation/subscription — is a [`CompileError`], never a partial or guessed result. The
+//! policy's row filter is combined into every access (the root and every relationship
+//! subquery), so tenant isolation is enforced at compile time, at every depth.
 
-use super::dialect::Dialect;
+use super::dialect::{sql_string_literal, Dialect};
 use super::policy::{Claims, DataPolicy, PolicyError, RowOp};
-use super::schema::{DbSchema, Table};
+use super::schema::{DbSchema, RelKind, Relationship, Table};
 use boatramp_core::sql::SqlValue;
 use graphql_parser::query::{Definition, Field, OperationDefinition, Selection, Value};
 
@@ -20,6 +22,9 @@ use graphql_parser::query::{Definition, Field, OperationDefinition, Selection, V
 pub(crate) enum OutSource {
     /// The value at this index of the `SELECT` column list (and the returned row).
     Column(usize),
+    /// A relationship: the value at this index is JSON text to parse into a nested
+    /// object/array.
+    Json(usize),
     /// A constant `__typename` (the object type name).
     Typename(String),
 }
@@ -69,8 +74,8 @@ pub(crate) enum CompileError {
     Policy(#[from] PolicyError),
 }
 
-/// Compile `query` (with its `variables`) against `schema` (already policy-projected is
-/// fine, but exposure is re-checked here) under `policy` + `claims`, targeting `dialect`.
+/// Compile `query` (with its `variables`) against `schema` under `policy` + `claims`,
+/// targeting `dialect`.
 pub(crate) fn compile(
     query: &str,
     variables: &serde_json::Value,
@@ -112,11 +117,13 @@ pub(crate) fn compile(
     Ok(PlannedSql { roots })
 }
 
-/// Per-root compilation state: the parameter accumulator and the request context.
+/// Per-root compilation state: the parameter + subquery-alias accumulators and the request
+/// context.
 struct Cx<'a> {
     dialect: &'a dyn Dialect,
     variables: &'a serde_json::Value,
     params: Vec<SqlValue>,
+    alias_seq: usize,
 }
 
 impl Cx<'_> {
@@ -124,6 +131,13 @@ impl Cx<'_> {
     fn bind(&mut self, value: SqlValue) -> String {
         self.params.push(value);
         self.dialect.placeholder(self.params.len())
+    }
+
+    /// A fresh subquery table alias (`t1`, `t2`, …); distinct from any root table name.
+    fn next_alias(&mut self) -> String {
+        let alias = format!("t{}", self.alias_seq);
+        self.alias_seq += 1;
+        alias
     }
 }
 
@@ -141,7 +155,6 @@ fn compile_root(
         None => (field.name.as_str(), false),
     };
 
-    // The table must exist and be exposed.
     if !policy.is_table_exposed(table_name) {
         return Err(CompileError::UnknownField(field.name.clone()));
     }
@@ -153,25 +166,36 @@ fn compile_root(
         dialect,
         variables,
         params: Vec::new(),
+        alias_seq: 1,
     };
+    // The root table is referenced by its (quoted) name; subqueries correlate to it.
+    let qualifier = dialect.quote_ident(table_name);
 
-    // Projection (the selected columns / __typename).
-    let (projection, select_columns) = build_projection(field, table, table_name, policy)?;
+    // Projection (columns, relationship subqueries, __typename). Built first, so its
+    // subquery parameters number before the WHERE's.
+    let (select_exprs, projection) = compile_selection(
+        &field.selection_set.items,
+        table,
+        &qualifier,
+        schema,
+        policy,
+        claims,
+        &mut cx,
+    )?;
 
-    // WHERE = the policy row filter, plus either the `_by_pk` key equality or the list
-    // `where` argument.
+    // WHERE = the policy row filter, plus the `_by_pk` key equality or the list `where` arg.
     let mut clauses: Vec<String> = Vec::new();
     if let Some(filter) = policy.row_filter(table_name, claims)? {
         for term in filter.terms {
             let op = match term.op {
                 RowOp::Eq => "=",
             };
+            let col = format!("{qualifier}.{}", dialect.quote_ident(&term.column));
             let ph = cx.bind(term.value);
-            clauses.push(format!("{} {op} {ph}", dialect.quote_ident(&term.column)));
+            clauses.push(format!("{col} {op} {ph}"));
         }
     }
     if single {
-        // A `_by_pk` field: each primary-key column is a required argument.
         if table.primary_key.is_empty() {
             return Err(CompileError::UnknownField(field.name.clone()));
         }
@@ -182,24 +206,20 @@ fn compile_root(
                 .find(|(name, _)| name == pk)
                 .ok_or_else(|| CompileError::UnknownField(format!("{table_name}_by_pk.{pk}")))?;
             let value = resolve_value(&arg.1, variables)?;
+            let col = format!("{qualifier}.{}", dialect.quote_ident(pk));
             let ph = cx.bind(value);
-            clauses.push(format!("{} = {ph}", dialect.quote_ident(pk)));
+            clauses.push(format!("{col} = {ph}"));
         }
     } else if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n == "where") {
-        if let Some(expr) = compile_bool_exp(where_arg, table, policy, &mut cx)? {
+        if let Some(expr) = compile_bool_exp(where_arg, table, &qualifier, policy, &mut cx)? {
             clauses.push(expr);
         }
     }
 
-    // Assemble the statement.
-    let select_list = if select_columns.is_empty() {
+    let select_list = if select_exprs.is_empty() {
         "1".to_string()
     } else {
-        select_columns
-            .iter()
-            .map(|c| dialect.quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ")
+        select_exprs.join(", ")
     };
     let mut sql = format!(
         "SELECT {select_list} FROM {}",
@@ -210,7 +230,7 @@ fn compile_root(
         sql.push_str(&clauses.join(" AND "));
     }
     if !single {
-        if let Some(order) = order_by_clause(field, table, policy, dialect)? {
+        if let Some(order) = order_by_clause(field, table, &qualifier, policy, dialect)? {
             sql.push_str(" ORDER BY ");
             sql.push_str(&order);
         }
@@ -233,16 +253,22 @@ fn compile_root(
     })
 }
 
-/// Build the output projection + the ordered list of DB columns to `SELECT`.
-fn build_projection(
-    field: &Field<'_, String>,
+/// Compile a selection set on `table` (referenced by `qualifier`) into the `SELECT`
+/// expression list and the output projection. A scalar field is a qualified column; a
+/// relationship field is a correlated JSON subquery; `__typename` is a constant.
+fn compile_selection(
+    items: &[Selection<'_, String>],
     table: &Table,
-    table_name: &str,
+    qualifier: &str,
+    schema: &DbSchema,
     policy: &DataPolicy,
-) -> Result<(Vec<OutField>, Vec<String>), CompileError> {
+    claims: &Claims,
+    cx: &mut Cx<'_>,
+) -> Result<(Vec<String>, Vec<OutField>), CompileError> {
+    let relationships = schema.relationships(&table.name);
+    let mut exprs = Vec::new();
     let mut projection = Vec::new();
-    let mut select_columns = Vec::new();
-    for sel in &field.selection_set.items {
+    for sel in items {
         let Selection::Field(f) = sel else {
             return Err(CompileError::Unsupported("fragments in a selection".into()));
         };
@@ -250,51 +276,147 @@ fn build_projection(
         if f.name == "__typename" {
             projection.push(OutField {
                 key,
-                source: OutSource::Typename(table_name.to_string()),
+                source: OutSource::Typename(table.name.clone()),
             });
             continue;
         }
-        if !f.selection_set.items.is_empty() {
-            // A nested selection is a relationship — a later landing.
-            return Err(CompileError::Unsupported(format!(
-                "relationship field `{}`",
-                f.name
-            )));
+        if let Some(rel) = relationships.iter().find(|r| r.field == f.name) {
+            if f.selection_set.items.is_empty() {
+                return Err(CompileError::UnknownField(format!(
+                    "{}.{}",
+                    table.name, f.name
+                )));
+            }
+            let subquery = relationship_subquery(rel, f, qualifier, schema, policy, claims, cx)?;
+            let idx = exprs.len();
+            exprs.push(subquery);
+            projection.push(OutField {
+                key,
+                source: OutSource::Json(idx),
+            });
+            continue;
         }
-        if table.column(&f.name).is_none() || !policy.is_column_exposed(table_name, &f.name) {
+        // A scalar column.
+        if !f.selection_set.items.is_empty()
+            || table.column(&f.name).is_none()
+            || !policy.is_column_exposed(&table.name, &f.name)
+        {
             return Err(CompileError::UnknownField(format!(
-                "{table_name}.{}",
-                f.name
+                "{}.{}",
+                table.name, f.name
             )));
         }
-        let idx = select_columns.len();
-        select_columns.push(f.name.clone());
+        let idx = exprs.len();
+        exprs.push(format!("{qualifier}.{}", cx.dialect.quote_ident(&f.name)));
         projection.push(OutField {
             key,
             source: OutSource::Column(idx),
         });
     }
-    Ok((projection, select_columns))
+    Ok((exprs, projection))
+}
+
+/// Lower a relationship field to a correlated JSON subquery selecting the target's scalar
+/// fields, joined to the outer row and filtered by the target's row policy. The target
+/// selection must be scalar-only — a relationship nested beyond one level is rejected.
+fn relationship_subquery(
+    rel: &Relationship,
+    field: &Field<'_, String>,
+    outer_qualifier: &str,
+    schema: &DbSchema,
+    policy: &DataPolicy,
+    claims: &Claims,
+    cx: &mut Cx<'_>,
+) -> Result<String, CompileError> {
+    if !policy.is_table_exposed(&rel.target_table) {
+        return Err(CompileError::UnknownField(rel.field.clone()));
+    }
+    let target = schema
+        .table(&rel.target_table)
+        .ok_or_else(|| CompileError::UnknownField(rel.field.clone()))?;
+    let alias = cx.next_alias();
+    let qalias = cx.dialect.quote_ident(&alias);
+
+    // The per-row JSON object: scalar fields + __typename only.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for sel in &field.selection_set.items {
+        let Selection::Field(sf) = sel else {
+            return Err(CompileError::Unsupported("fragments in a selection".into()));
+        };
+        let key = sf.alias.clone().unwrap_or_else(|| sf.name.clone());
+        if sf.name == "__typename" {
+            pairs.push((key, sql_string_literal(&rel.target_table)));
+            continue;
+        }
+        if !sf.selection_set.items.is_empty() {
+            return Err(CompileError::Unsupported(
+                "a relationship nested beyond one level".into(),
+            ));
+        }
+        if target.column(&sf.name).is_none()
+            || !policy.is_column_exposed(&rel.target_table, &sf.name)
+        {
+            return Err(CompileError::UnknownField(format!(
+                "{}.{}",
+                rel.target_table, sf.name
+            )));
+        }
+        pairs.push((
+            key,
+            format!("{qalias}.{}", cx.dialect.quote_ident(&sf.name)),
+        ));
+    }
+    let object = cx.dialect.json_object(&pairs);
+
+    // Join to the outer row, plus the target's own row filter (isolation at every depth).
+    let mut clauses = Vec::new();
+    for (local, remote) in rel.local_columns.iter().zip(&rel.target_columns) {
+        clauses.push(format!(
+            "{qalias}.{} = {outer_qualifier}.{}",
+            cx.dialect.quote_ident(remote),
+            cx.dialect.quote_ident(local)
+        ));
+    }
+    if let Some(filter) = policy.row_filter(&rel.target_table, claims)? {
+        for term in filter.terms {
+            let col = format!("{qalias}.{}", cx.dialect.quote_ident(&term.column));
+            let ph = cx.bind(term.value);
+            clauses.push(format!("{col} = {ph}"));
+        }
+    }
+    let where_sql = clauses.join(" AND ");
+    let from = cx.dialect.quote_ident(&rel.target_table);
+    let body = match rel.kind {
+        RelKind::ToOne => format!("SELECT {object} FROM {from} AS {qalias} WHERE {where_sql}"),
+        RelKind::ToMany => {
+            let agg = cx.dialect.json_array_agg(&object);
+            format!("SELECT {agg} FROM {from} AS {qalias} WHERE {where_sql}")
+        }
+    };
+    Ok(format!("({body})"))
 }
 
 /// Compile a `<table>_bool_exp` value into a SQL boolean expression (or `None` if empty).
 fn compile_bool_exp(
     value: &Value<'_, String>,
     table: &Table,
+    qualifier: &str,
     policy: &DataPolicy,
     cx: &mut Cx<'_>,
 ) -> Result<Option<String>, CompileError> {
     let Value::Object(obj) = value else {
-        // A variable holding the whole `where` is not supported; require an inline object.
         return Err(CompileError::Unsupported("non-object `where`".into()));
     };
     let mut clauses = Vec::new();
     for (key, val) in obj {
         match key.as_str() {
-            "_and" => clauses.push(compile_junction(val, table, policy, cx, " AND ")?),
-            "_or" => clauses.push(compile_junction(val, table, policy, cx, " OR ")?),
+            "_and" => clauses.push(compile_junction(
+                val, table, qualifier, policy, cx, " AND ",
+            )?),
+            "_or" => clauses.push(compile_junction(val, table, qualifier, policy, cx, " OR ")?),
             "_not" => {
-                let inner = compile_bool_exp(val, table, policy, cx)?.unwrap_or_default();
+                let inner =
+                    compile_bool_exp(val, table, qualifier, policy, cx)?.unwrap_or_default();
                 clauses.push(format!("NOT ({inner})"));
             }
             column => {
@@ -305,7 +427,7 @@ fn compile_bool_exp(
                         table.name
                     )));
                 }
-                clauses.push(compile_comparison(column, val, cx)?);
+                clauses.push(compile_comparison(qualifier, column, val, cx)?);
             }
         }
     }
@@ -320,6 +442,7 @@ fn compile_bool_exp(
 fn compile_junction(
     value: &Value<'_, String>,
     table: &Table,
+    qualifier: &str,
     policy: &DataPolicy,
     cx: &mut Cx<'_>,
     sep: &str,
@@ -329,13 +452,14 @@ fn compile_junction(
     };
     let parts: Vec<String> = items
         .iter()
-        .map(|v| compile_bool_exp(v, table, policy, cx).map(Option::unwrap_or_default))
+        .map(|v| compile_bool_exp(v, table, qualifier, policy, cx).map(Option::unwrap_or_default))
         .collect::<Result<_, _>>()?;
     Ok(format!("({})", parts.join(sep)))
 }
 
-/// Compile a `<Scalar>_comparison_exp` for `column` (already exposure-checked).
+/// Compile a `<Scalar>_comparison_exp` for `qualifier.column` (already exposure-checked).
 fn compile_comparison(
+    qualifier: &str,
     column: &str,
     value: &Value<'_, String>,
     cx: &mut Cx<'_>,
@@ -345,7 +469,7 @@ fn compile_comparison(
             "a comparison must be an object".into(),
         ));
     };
-    let col = cx.dialect.quote_ident(column);
+    let col = format!("{qualifier}.{}", cx.dialect.quote_ident(column));
     let mut parts = Vec::new();
     for (op, operand) in ops {
         let clause = match op.as_str() {
@@ -401,13 +525,13 @@ fn compile_comparison(
 fn order_by_clause(
     field: &Field<'_, String>,
     table: &Table,
+    qualifier: &str,
     policy: &DataPolicy,
     dialect: &dyn Dialect,
 ) -> Result<Option<String>, CompileError> {
     let Some((_, arg)) = field.arguments.iter().find(|(n, _)| n == "order_by") else {
         return Ok(None);
     };
-    // Accept a single object or a list of them.
     let entries: Vec<&Value<'_, String>> = match arg {
         Value::List(items) => items.iter().collect(),
         obj @ Value::Object(_) => vec![obj],
@@ -438,7 +562,10 @@ fn order_by_clause(
                 Value::String(s) if s == "desc" => "DESC",
                 _ => return Err(CompileError::Unsupported("order_by direction".into())),
             };
-            terms.push(format!("{} {direction}", dialect.quote_ident(column)));
+            terms.push(format!(
+                "{qualifier}.{} {direction}",
+                dialect.quote_ident(column)
+            ));
         }
     }
     Ok(if terms.is_empty() {
@@ -516,44 +643,69 @@ fn json_to_sql(value: &serde_json::Value) -> Result<SqlValue, CompileError> {
 #[cfg(test)]
 mod tests {
     use super::super::policy::{DataPolicy, RowPredicate, RowTerm, RowValue, TablePolicy};
-    use super::super::schema::{Column, DbSchema, ScalarType, Table};
+    use super::super::schema::{Column, DbSchema, ForeignKey, ScalarType, Table};
     use super::*;
     use std::collections::BTreeMap;
 
     fn schema() -> DbSchema {
         DbSchema {
-            tables: vec![Table {
-                name: "users".into(),
-                columns: vec![
-                    Column {
-                        name: "id".into(),
-                        ty: ScalarType::Id,
-                        nullable: false,
-                    },
-                    Column {
-                        name: "name".into(),
-                        ty: ScalarType::String,
-                        nullable: true,
-                    },
-                    Column {
-                        name: "age".into(),
-                        ty: ScalarType::Int,
-                        nullable: true,
-                    },
-                    Column {
-                        name: "tenant_id".into(),
-                        ty: ScalarType::String,
-                        nullable: false,
-                    },
-                ],
-                primary_key: vec!["id".into()],
-                foreign_keys: vec![],
-            }],
+            tables: vec![
+                Table {
+                    name: "users".into(),
+                    columns: vec![
+                        Column {
+                            name: "id".into(),
+                            ty: ScalarType::Id,
+                            nullable: false,
+                        },
+                        Column {
+                            name: "name".into(),
+                            ty: ScalarType::String,
+                            nullable: true,
+                        },
+                        Column {
+                            name: "age".into(),
+                            ty: ScalarType::Int,
+                            nullable: true,
+                        },
+                        Column {
+                            name: "tenant_id".into(),
+                            ty: ScalarType::String,
+                            nullable: false,
+                        },
+                    ],
+                    primary_key: vec!["id".into()],
+                    foreign_keys: vec![],
+                },
+                Table {
+                    name: "posts".into(),
+                    columns: vec![
+                        Column {
+                            name: "id".into(),
+                            ty: ScalarType::Id,
+                            nullable: false,
+                        },
+                        Column {
+                            name: "author_id".into(),
+                            ty: ScalarType::Id,
+                            nullable: false,
+                        },
+                    ],
+                    primary_key: vec!["id".into()],
+                    foreign_keys: vec![ForeignKey {
+                        columns: vec!["author_id".into()],
+                        ref_table: "users".into(),
+                        ref_columns: vec!["id".into()],
+                    }],
+                },
+            ],
         }
     }
 
     fn open_policy() -> DataPolicy {
-        DataPolicy::new().with_table("users", TablePolicy::columns(["id", "name", "age"]))
+        DataPolicy::new()
+            .with_table("users", TablePolicy::columns(["id", "name", "age"]))
+            .with_table("posts", TablePolicy::columns(["id", "author_id"]))
     }
 
     fn compile_one(
@@ -574,12 +726,14 @@ mod tests {
     }
 
     #[test]
-    fn a_list_selects_exposed_columns() {
+    fn a_list_selects_qualified_columns() {
         let root =
             compile_one("{ users { id name } }", &open_policy(), &Claims::default()).unwrap();
-        assert_eq!(root.sql, r#"SELECT "id", "name" FROM "users""#);
+        assert_eq!(
+            root.sql,
+            r#"SELECT "users"."id", "users"."name" FROM "users""#
+        );
         assert!(!root.single);
-        assert_eq!(root.projection.len(), 2);
     }
 
     #[test]
@@ -590,7 +744,10 @@ mod tests {
             &Claims::default(),
         )
         .unwrap();
-        assert_eq!(root.sql, r#"SELECT "name" FROM "users" WHERE "id" = ?1"#);
+        assert_eq!(
+            root.sql,
+            r#"SELECT "users"."name" FROM "users" WHERE "users"."id" = ?1"#
+        );
         assert_eq!(root.params, vec![SqlValue::Text("7".into())]);
         assert!(root.single);
     }
@@ -603,10 +760,9 @@ mod tests {
             &Claims::default(),
         )
         .unwrap();
-        // Keys sort (BTreeMap): age before name.
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" WHERE "age" >= ?1 AND "name" LIKE ?2"#
+            r#"SELECT "users"."id" FROM "users" WHERE "users"."age" >= ?1 AND "users"."name" LIKE ?2"#
         );
         assert_eq!(
             root.params,
@@ -624,7 +780,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" WHERE ("id" IN (?1, ?2) OR "age" < ?3)"#
+            r#"SELECT "users"."id" FROM "users" WHERE ("users"."id" IN (?1, ?2) OR "users"."age" < ?3)"#
         );
         assert_eq!(root.params.len(), 3);
     }
@@ -639,7 +795,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" ORDER BY "age" DESC LIMIT ?1 OFFSET ?2"#
+            r#"SELECT "users"."id" FROM "users" ORDER BY "users"."age" DESC LIMIT ?1 OFFSET ?2"#
         );
         assert_eq!(
             root.params,
@@ -671,7 +827,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root.sql,
-            r#"SELECT "id" FROM "users" WHERE "tenant_id" = ?1 AND "name" = ?2"#
+            r#"SELECT "users"."id" FROM "users" WHERE "users"."tenant_id" = ?1 AND "users"."name" = ?2"#
         );
         assert_eq!(
             root.params,
@@ -680,8 +836,60 @@ mod tests {
     }
 
     #[test]
+    fn a_to_many_relationship_becomes_a_correlated_json_subquery() {
+        // users → posts (posts.author_id references users.id).
+        let root = compile_one(
+            "{ users { name posts { id } } }",
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap();
+        assert!(
+            root.sql.contains(
+                r#"(SELECT json_group_array(json_object('id', "t1"."id")) FROM "posts" AS "t1" WHERE "t1"."author_id" = "users"."id")"#
+            ),
+            "sql: {}",
+            root.sql
+        );
+        // The `posts` field is a JSON-sourced projection.
+        assert!(root
+            .projection
+            .iter()
+            .any(|f| f.key == "posts" && matches!(f.source, OutSource::Json(_))));
+    }
+
+    #[test]
+    fn a_to_one_relationship_becomes_a_correlated_json_subquery() {
+        // posts → author (follow posts.author_id to users). The FK column `author_id`
+        // strips to the field name `author`.
+        let root = compile_one(
+            "{ posts { id author { name } } }",
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap();
+        assert!(
+            root.sql.contains(
+                r#"(SELECT json_object('name', "t1"."name") FROM "users" AS "t1" WHERE "t1"."id" = "posts"."author_id")"#
+            ),
+            "sql: {}",
+            root.sql
+        );
+    }
+
+    #[test]
+    fn a_relationship_nested_beyond_one_level_is_rejected() {
+        let err = compile_one(
+            "{ users { posts { author { name } } } }",
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CompileError::Unsupported(m) if m.contains("nested")));
+    }
+
+    #[test]
     fn an_unexposed_column_is_rejected() {
-        // `tenant_id` exists but is not exposed by open_policy.
         let err = compile_one(
             "{ users { tenant_id } }",
             &open_policy(),
@@ -696,18 +904,6 @@ mod tests {
         let err =
             compile_one("{ secrets { id } }", &open_policy(), &Claims::default()).unwrap_err();
         assert!(matches!(err, CompileError::UnknownField(_)));
-    }
-
-    #[test]
-    fn a_relationship_field_is_unsupported_for_now() {
-        // A nested selection (posts) is a relationship — not yet lowered.
-        let err = compile_one(
-            "{ users { id posts { id } } }",
-            &open_policy(),
-            &Claims::default(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, CompileError::Unsupported(m) if m.contains("relationship")));
     }
 
     #[test]

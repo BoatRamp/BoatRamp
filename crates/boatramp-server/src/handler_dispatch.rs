@@ -406,14 +406,15 @@ async fn data_connector_serve(
                 .into_response();
         }
     };
-    // Deny-by-default: only what the policy exposes reaches the compiler.
+    // The compiler sees the full introspected schema (for structure — columns, foreign-key
+    // relationships, join keys) and the policy enforces exposure per field: deny-by-default,
+    // so an unexposed table/column is rejected even though it's structurally present.
     let policy = crate::graphql_data::policy_from_config(cfg);
-    let exposed = policy.project_schema(&schema);
     let claims = crate::graphql_data::request_claims(project);
     let response = crate::graphql_data::runner::execute(
         backend.as_ref(),
         &crate::graphql_data::dialect::Sqlite,
-        &exposed,
+        &schema,
         &policy,
         &claims,
         query,

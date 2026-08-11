@@ -13,6 +13,18 @@ pub(crate) trait Dialect: Send + Sync {
     /// The bind placeholder for the 1-based parameter `index` (some dialects number them,
     /// some don't).
     fn placeholder(&self, index: usize) -> String;
+
+    /// A JSON object expression from `(key, value_expr)` pairs — the relationship subquery's
+    /// per-row shape. Keys are GraphQL field names (safe), emitted as SQL string literals.
+    fn json_object(&self, pairs: &[(String, String)]) -> String;
+
+    /// Aggregate a per-row object expression into a JSON array (the to-many shape).
+    fn json_array_agg(&self, element: &str) -> String;
+}
+
+/// A SQL single-quoted string literal (`'…'`), doubling any embedded quote.
+pub(crate) fn sql_string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// SQLite / libsql — the managed default. `"ident"` quoting, **numbered** `?N` placeholders
@@ -26,5 +38,20 @@ impl Dialect for Sqlite {
 
     fn placeholder(&self, index: usize) -> String {
         format!("?{index}")
+    }
+
+    fn json_object(&self, pairs: &[(String, String)]) -> String {
+        let args = pairs
+            .iter()
+            .map(|(key, value)| format!("{}, {value}", sql_string_literal(key)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("json_object({args})")
+    }
+
+    fn json_array_agg(&self, element: &str) -> String {
+        // SQLite marks json_object results with the JSON subtype, so json_group_array nests
+        // them as objects rather than quoting them.
+        format!("json_group_array({element})")
     }
 }
