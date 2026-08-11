@@ -418,6 +418,12 @@ async fn data_connector_serve(
     // so an unexposed table/column is rejected even though it's structurally present.
     let policy = crate::graphql_data::policy_from_config(cfg);
     let claims = crate::graphql_data::request_claims(project);
+    // A delegated field is resolved by a sibling function over the invoke path (scoped to
+    // this project); the connector is the root of that call chain (depth 0).
+    let invoker = inner
+        .invoker
+        .get()
+        .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project)));
     let response = crate::graphql_data::runner::execute(
         backend.as_ref(),
         &crate::graphql_data::dialect::Sqlite,
@@ -426,6 +432,7 @@ async fn data_connector_serve(
         &claims,
         query,
         variables,
+        invoker.as_deref(),
     )
     .await;
     axum::Json(response).into_response()

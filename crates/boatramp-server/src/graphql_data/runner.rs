@@ -6,15 +6,19 @@
 //! partial result. The connector remains a translator: the database executes, this maps
 //! rows to JSON.
 
-use super::compile::{compile, OutSource, RootQuery};
+use super::compile::{compile, Delegation, OutSource, RootQuery};
 use super::dialect::Dialect;
 use super::policy::{Claims, DataPolicy};
 use super::schema::DbSchema;
 use boatramp_core::sql::{SqlBackend, SqlRows, SqlValue};
+use boatramp_handlers::{InvokeRequest, Invoker};
 use serde_json::{json, Map, Value};
 
 /// Execute `query` (with its `variables`) against `backend`, returning a GraphQL response
-/// (`{"data": …}` on success, `{"errors": …}` on a compile or SQL failure).
+/// (`{"data": …}` on success, `{"errors": …}` on a compile or SQL failure). `invoker`
+/// resolves delegated fields (a wasm function per the policy); a query that delegates
+/// without one configured is an error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute(
     backend: &dyn SqlBackend,
     dialect: &dyn Dialect,
@@ -23,6 +27,7 @@ pub(crate) async fn execute(
     claims: &Claims,
     query: &str,
     variables: &Value,
+    invoker: Option<&dyn Invoker>,
 ) -> Value {
     let planned = match compile(query, variables, schema, policy, claims, dialect) {
         Ok(planned) => planned,
@@ -34,25 +39,35 @@ pub(crate) async fn execute(
     };
     let mut data = Map::new();
     for root in &planned.roots {
-        match tx.query(&root.sql, &root.params).await {
-            Ok(rows) => {
-                data.insert(root.response_key.clone(), shape_rows(root, &rows));
-            }
+        let rows = match tx.query(&root.sql, &root.params).await {
+            Ok(rows) => rows,
             Err(err) => {
                 let _ = tx.rollback().await;
                 return errors(&format!("query failed: {err}"));
             }
+        };
+        let mut objects = shape_objects(root, &rows);
+        for delegation in &root.delegations {
+            if let Err(message) = apply_delegation(&mut objects, &rows, delegation, invoker).await {
+                let _ = tx.rollback().await;
+                return errors(&message);
+            }
         }
+        let value = if root.single {
+            objects.into_iter().next().unwrap_or(Value::Null)
+        } else {
+            Value::Array(objects)
+        };
+        data.insert(root.response_key.clone(), value);
     }
     let _ = tx.rollback().await; // read-only: nothing to commit
     json!({ "data": data })
 }
 
-/// Shape a root field's returned rows into its GraphQL value: an array for a list field, the
-/// first object (or null) for a `_by_pk` field.
-fn shape_rows(root: &RootQuery, rows: &SqlRows) -> Value {
-    let objects: Vec<Value> = rows
-        .rows
+/// Shape each returned row into its base GraphQL object (columns, relationships,
+/// `__typename`); delegated fields are filled afterward.
+fn shape_objects(root: &RootQuery, rows: &SqlRows) -> Vec<Value> {
+    rows.rows
         .iter()
         .map(|row| {
             let mut obj = Map::new();
@@ -66,12 +81,78 @@ fn shape_rows(root: &RootQuery, rows: &SqlRows) -> Value {
             }
             Value::Object(obj)
         })
+        .collect()
+}
+
+/// Fill a delegated field on every row object by a **single** batched invoke to its function
+/// (a local `_entities` fetch): build one representation per row from its key, send them, and
+/// join the returned entities back by position. No N+1 — one invoke for the whole result set.
+async fn apply_delegation(
+    objects: &mut [Value],
+    rows: &SqlRows,
+    delegation: &Delegation,
+    invoker: Option<&dyn Invoker>,
+) -> Result<(), String> {
+    let Some(invoker) = invoker else {
+        return Err(format!(
+            "field `{}` needs a resolver function, but this server has no invoker configured",
+            delegation.response_key
+        ));
+    };
+    // One representation per row: `{ __typename, <key…> }`.
+    let representations: Vec<Value> = rows
+        .rows
+        .iter()
+        .map(|row| {
+            let mut repr = Map::new();
+            repr.insert("__typename".to_string(), json!(delegation.type_name));
+            for (name, idx) in &delegation.key {
+                repr.insert(name.clone(), row.get(*idx).map_or(Value::Null, sql_to_json));
+            }
+            Value::Object(repr)
+        })
         .collect();
-    if root.single {
-        objects.into_iter().next().unwrap_or(Value::Null)
-    } else {
-        Value::Array(objects)
+
+    let body = json!({
+        "query": delegation.entities_query,
+        "variables": { "representations": representations },
+    })
+    .to_string()
+    .into_bytes();
+    let request = InvokeRequest {
+        method: "POST".to_string(),
+        path: "/".to_string(),
+        headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+        body,
+    };
+    let response = invoker
+        .invoke(&delegation.function, request, 0)
+        .await
+        .map_err(|_| {
+            format!(
+                "resolver function `{}` for `{}` is unavailable",
+                delegation.function, delegation.response_key
+            )
+        })?;
+    let parsed: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+    let entities = parsed
+        .pointer("/data/_entities")
+        .or_else(|| parsed.pointer("/_entities"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Join by position (the `_entities` contract preserves representation order).
+    for (object, entity) in objects.iter_mut().zip(entities.iter()) {
+        let value = entity
+            .get(&delegation.field)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Value::Object(map) = object {
+            map.insert(delegation.response_key.clone(), value);
+        }
     }
+    Ok(())
 }
 
 /// Map a SQL cell to JSON. A blob becomes a base64 string (GraphQL has no bytes scalar).
@@ -184,6 +265,7 @@ mod tests {
             &Claims::default(),
             "{ users { id name } }",
             &json!({}),
+            None,
         )
         .await;
         assert_eq!(out["data"]["users"][0]["name"], json!("Alice"));
@@ -205,6 +287,7 @@ mod tests {
             &Claims::default(),
             r#"{ users_by_pk(id: "1") { name } }"#,
             &json!({}),
+            None,
         )
         .await;
         assert_eq!(out["data"]["users_by_pk"]["name"], json!("Alice"));
@@ -222,6 +305,7 @@ mod tests {
             &Claims::default(),
             "{ users { secret } }", // unexposed column
             &json!({}),
+            None,
         )
         .await;
         assert!(out["data"].is_null());

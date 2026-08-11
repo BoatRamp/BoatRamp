@@ -68,6 +68,9 @@ pub(crate) struct TablePolicy {
     pub columns: BTreeSet<String>,
     /// An optional row filter conjoined onto every access to this table.
     pub rows: Option<RowPredicate>,
+    /// Delegated fields: `field → wasm function`. Also the invoke allowlist — only these
+    /// fields delegate, only to these functions.
+    pub resolvers: BTreeMap<String, String>,
 }
 
 impl TablePolicy {
@@ -80,12 +83,23 @@ impl TablePolicy {
         Self {
             columns: columns.into_iter().map(Into::into).collect(),
             rows: None,
+            resolvers: BTreeMap::new(),
         }
     }
 
     /// Add a row predicate.
     pub(crate) fn with_rows(mut self, rows: RowPredicate) -> Self {
         self.rows = Some(rows);
+        self
+    }
+
+    /// Add a delegated field → function mapping.
+    pub(crate) fn with_resolver(
+        mut self,
+        field: impl Into<String>,
+        function: impl Into<String>,
+    ) -> Self {
+        self.resolvers.insert(field.into(), function.into());
         self
     }
 }
@@ -145,6 +159,14 @@ impl DataPolicy {
         self.tables
             .get(table)
             .is_some_and(|t| t.columns.contains(column))
+    }
+
+    /// The wasm function a delegated `field` of `table` resolves to, if any.
+    pub(crate) fn delegated(&self, table: &str, field: &str) -> Option<&str> {
+        self.tables
+            .get(table)
+            .and_then(|t| t.resolvers.get(field))
+            .map(String::as_str)
     }
 
     /// A schema projected to only what the policy exposes: exposed tables, exposed columns,

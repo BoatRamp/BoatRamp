@@ -6239,6 +6239,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
                 HandlerGraphqlTableConfig {
                     columns: vec!["id".into(), "name".into()],
                     row_filter: tenant_filter(),
+                    resolvers: Default::default(),
                 },
             ),
             (
@@ -6246,6 +6247,7 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
                 HandlerGraphqlTableConfig {
                     columns: vec!["id".into(), "title".into()],
                     row_filter: tenant_filter(),
+                    resolvers: Default::default(),
                 },
             ),
         ]),
@@ -6358,6 +6360,163 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         .as_str()
         .unwrap()
         .contains("tenant"));
+
+    let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
+/// The data connector resolves a field on a SQL-backed type with a **wasm function** — a
+/// mostly-SQL type with one custom field — via a single batched invoke (a local `_entities`
+/// fetch), joined by key. This is GraphQL→SQL and GraphQL→Wasi blended at field grain within
+/// one endpoint (no federation gateway). Drives the real router, connector, invoker, and
+/// libsql end to end.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlerGraphqlDataConfig,
+        HandlerGraphqlTableConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::sql::{SqlBackends, SqlValue};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use std::collections::BTreeMap;
+
+    const REVIEWS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-reviews.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let sql_dir =
+        std::env::temp_dir().join(format!("boatramp-conf-gqldeleg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sql_dir);
+    let sql: Arc<dyn SqlBackends> = Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+
+    // The SQL side: a `widgets`-site users table (id TEXT so the key round-trips as a string).
+    {
+        let backend = sql.database("default", "widgets", "").await.unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)", &[])
+            .await
+            .unwrap();
+        for (id, name) in [("1", "Alice"), ("2", "Bob")] {
+            tx.execute(
+                "INSERT INTO users (id, name) VALUES (?1, ?2)",
+                &[SqlValue::Text(id.into()), SqlValue::Text(name.into())],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    // The wasm side: the `reviews` function resolves the delegated field via `_entities`.
+    deploy_test_function(&deploy, "reviews", REVIEWS, Vec::new()).await;
+
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "widgets", &id)
+        .await
+        .unwrap();
+    let data_cfg = HandlerGraphqlDataConfig {
+        enabled: true,
+        tables: BTreeMap::from([(
+            "users".to_string(),
+            HandlerGraphqlTableConfig {
+                columns: vec!["id".into(), "name".into()],
+                row_filter: Vec::new(),
+                // `reviews` is not a column — resolve it with the `reviews` function.
+                resolvers: BTreeMap::from([("reviews".to_string(), "reviews".to_string())]),
+            },
+        )]),
+        ..Default::default()
+    };
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "widgets",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        data: Some(data_cfg),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    runtime.set_invoker(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/_sites/widgets/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"query":"{ users { name reviews { body } } }"}"#,
+        ))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let response = app.oneshot(req).await.unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // `name` from SQL, `reviews` from the wasm function, joined by key in one batched invoke.
+    let users = out["data"]["users"]
+        .as_array()
+        .unwrap_or_else(|| panic!("users array expected: {out}"));
+    assert_eq!(users.len(), 2, "{out}");
+    assert_eq!(out["data"]["users"][0]["name"], serde_json::json!("Alice"));
+    assert_eq!(
+        out["data"]["users"][0]["reviews"][0]["body"],
+        serde_json::json!("review for 1")
+    );
+    assert_eq!(out["data"]["users"][1]["name"], serde_json::json!("Bob"));
+    assert_eq!(
+        out["data"]["users"][1]["reviews"][0]["body"],
+        serde_json::json!("review for 2")
+    );
 
     let _ = std::fs::remove_dir_all(&sql_dir);
 }

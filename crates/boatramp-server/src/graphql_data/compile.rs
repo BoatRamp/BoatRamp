@@ -16,6 +16,7 @@ use super::policy::{Claims, DataPolicy, PolicyError, RowOp};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
 use boatramp_core::sql::SqlValue;
 use graphql_parser::query::{Definition, Field, OperationDefinition, Selection, Value};
+use std::collections::BTreeMap;
 
 /// How one output field of a row is produced.
 #[derive(Debug, PartialEq)]
@@ -37,6 +38,25 @@ pub(crate) struct OutField {
     pub source: OutSource,
 }
 
+/// A field of the root type resolved by a **wasm function** (a local `_entities` fetch),
+/// batched over the returned rows and joined by key.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Delegation {
+    /// The response key (alias) to fill on each row object.
+    pub response_key: String,
+    /// The entity field the function resolves (the key into its `_entities` result).
+    pub field: String,
+    /// The wasm function to invoke.
+    pub function: String,
+    /// The GraphQL type name (for the `... on Type` in the `_entities` query).
+    pub type_name: String,
+    /// The entity key: each key column's name + its index in the `SELECT`/row (so the
+    /// runner can build one representation per row).
+    pub key: Vec<(String, usize)>,
+    /// The `_entities` query text to send the function.
+    pub entities_query: String,
+}
+
 /// One root field lowered to SQL.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RootQuery {
@@ -50,6 +70,8 @@ pub(crate) struct RootQuery {
     pub single: bool,
     /// How to shape each returned row into the GraphQL object.
     pub projection: Vec<OutField>,
+    /// Fields resolved after the query by a wasm function (batched), if any.
+    pub delegations: Vec<Delegation>,
 }
 
 /// A whole operation lowered to one SQL statement per root field.
@@ -57,6 +79,10 @@ pub(crate) struct RootQuery {
 pub(crate) struct PlannedSql {
     pub roots: Vec<RootQuery>,
 }
+
+/// A compiled selection set: the `SELECT` expressions, the output projection, and any
+/// delegated fields.
+type CompiledSelection = (Vec<String>, Vec<OutField>, Vec<Delegation>);
 
 /// Why compilation failed. Every variant is a hard rejection — the connector never runs a
 /// partial or guessed query.
@@ -171,9 +197,9 @@ fn compile_root(
     // The root table is referenced by its (quoted) name; subqueries correlate to it.
     let qualifier = dialect.quote_ident(table_name);
 
-    // Projection (columns, relationship subqueries, __typename). Built first, so its
-    // subquery parameters number before the WHERE's.
-    let (select_exprs, projection) = compile_selection(
+    // Projection (columns, relationship subqueries, __typename) + delegated fields. Built
+    // first, so its subquery parameters number before the WHERE's.
+    let (select_exprs, projection, delegations) = compile_selection(
         &field.selection_set.items,
         table,
         &qualifier,
@@ -250,12 +276,14 @@ fn compile_root(
         params: cx.params,
         single,
         projection,
+        delegations,
     })
 }
 
 /// Compile a selection set on `table` (referenced by `qualifier`) into the `SELECT`
-/// expression list and the output projection. A scalar field is a qualified column; a
-/// relationship field is a correlated JSON subquery; `__typename` is a constant.
+/// expression list, the output projection, and any delegated fields. A scalar field is a
+/// qualified column; a relationship field is a correlated JSON subquery; a delegated field
+/// is resolved by a wasm function after the query; `__typename` is a constant.
 fn compile_selection(
     items: &[Selection<'_, String>],
     table: &Table,
@@ -264,10 +292,13 @@ fn compile_selection(
     policy: &DataPolicy,
     claims: &Claims,
     cx: &mut Cx<'_>,
-) -> Result<(Vec<String>, Vec<OutField>), CompileError> {
+) -> Result<CompiledSelection, CompileError> {
     let relationships = schema.relationships(&table.name);
     let mut exprs = Vec::new();
     let mut projection = Vec::new();
+    let mut delegations = Vec::new();
+    // Columns already in `exprs`, so a delegation can reuse a selected key column.
+    let mut column_index: BTreeMap<String, usize> = BTreeMap::new();
     for sel in items {
         let Selection::Field(f) = sel else {
             return Err(CompileError::Unsupported("fragments in a selection".into()));
@@ -296,6 +327,19 @@ fn compile_selection(
             });
             continue;
         }
+        // A field resolved by a wasm function (the config allowlist), not a column.
+        if let Some(function) = policy.delegated(&table.name, &f.name) {
+            delegations.push(compile_delegation(
+                f,
+                function,
+                table,
+                qualifier,
+                &mut exprs,
+                &mut column_index,
+                cx,
+            )?);
+            continue;
+        }
         // A scalar column.
         if !f.selection_set.items.is_empty()
             || table.column(&f.name).is_none()
@@ -306,14 +350,95 @@ fn compile_selection(
                 table.name, f.name
             )));
         }
-        let idx = exprs.len();
-        exprs.push(format!("{qualifier}.{}", cx.dialect.quote_ident(&f.name)));
+        let idx = ensure_column(&f.name, qualifier, &mut exprs, &mut column_index, cx);
         projection.push(OutField {
             key,
             source: OutSource::Column(idx),
         });
     }
-    Ok((exprs, projection))
+    Ok((exprs, projection, delegations))
+}
+
+/// Ensure `column` is selected (reusing an existing select expression), returning its index.
+fn ensure_column(
+    column: &str,
+    qualifier: &str,
+    exprs: &mut Vec<String>,
+    column_index: &mut BTreeMap<String, usize>,
+    cx: &Cx<'_>,
+) -> usize {
+    if let Some(idx) = column_index.get(column) {
+        return *idx;
+    }
+    let idx = exprs.len();
+    exprs.push(format!("{qualifier}.{}", cx.dialect.quote_ident(column)));
+    column_index.insert(column.to_string(), idx);
+    idx
+}
+
+/// Plan a delegated field: ensure the entity key columns are selected (so the runner can
+/// build one representation per row), and build the `_entities` query the function receives.
+fn compile_delegation(
+    field: &Field<'_, String>,
+    function: &str,
+    table: &Table,
+    qualifier: &str,
+    exprs: &mut Vec<String>,
+    column_index: &mut BTreeMap<String, usize>,
+    cx: &Cx<'_>,
+) -> Result<Delegation, CompileError> {
+    if field.selection_set.items.is_empty() {
+        return Err(CompileError::UnknownField(format!(
+            "{}.{}",
+            table.name, field.name
+        )));
+    }
+    if table.primary_key.is_empty() {
+        return Err(CompileError::Unsupported(format!(
+            "delegated field `{}.{}` needs a primary key to join on",
+            table.name, field.name
+        )));
+    }
+    let key = table
+        .primary_key
+        .iter()
+        .map(|pk| {
+            (
+                pk.clone(),
+                ensure_column(pk, qualifier, exprs, column_index, cx),
+            )
+        })
+        .collect();
+    let inner = serialize_field(field);
+    let entities_query = format!(
+        "query($representations:[_Any!]!){{ _entities(representations:$representations){{ ... on {} {{ {inner} }} }} }}",
+        table.name
+    );
+    Ok(Delegation {
+        response_key: field.alias.clone().unwrap_or_else(|| field.name.clone()),
+        field: field.name.clone(),
+        function: function.to_string(),
+        type_name: table.name.clone(),
+        key,
+        entities_query,
+    })
+}
+
+/// Serialize a field (name + nested selection) back to GraphQL text, for the delegated
+/// `_entities` query. Only fields are emitted (fragments are not delegated).
+fn serialize_field(field: &Field<'_, String>) -> String {
+    let mut out = field.name.clone();
+    if !field.selection_set.items.is_empty() {
+        out.push_str(" { ");
+        for sel in &field.selection_set.items {
+            if let Selection::Field(f) = sel {
+                out.push_str(&serialize_field(f));
+                out.push(' ');
+            }
+        }
+        out.push('}');
+    }
+    out
 }
 
 /// Lower a relationship field to a correlated JSON subquery selecting the target's scalar
@@ -875,6 +1000,32 @@ mod tests {
             "sql: {}",
             root.sql
         );
+    }
+
+    #[test]
+    fn a_delegated_field_becomes_a_batched_entities_fetch() {
+        let policy = DataPolicy::new().with_table(
+            "users",
+            TablePolicy::columns(["id", "name"]).with_resolver("reviews", "reviews"),
+        );
+        let root = compile_one(
+            "{ users { name reviews { body } } }",
+            &policy,
+            &Claims::default(),
+        )
+        .unwrap();
+        assert_eq!(root.delegations.len(), 1);
+        let d = &root.delegations[0];
+        assert_eq!(d.function, "reviews");
+        assert_eq!(d.field, "reviews");
+        assert_eq!(d.type_name, "users");
+        assert!(d.entities_query.contains("_entities"));
+        assert!(d.entities_query.contains("... on users"));
+        assert!(d.entities_query.contains("reviews { body }"));
+        // The key column `id` is added to the SELECT so the runner can build representations,
+        // even though the client didn't select it; `reviews` is not a SQL-projected field.
+        assert!(root.sql.contains(r#""users"."id""#), "sql: {}", root.sql);
+        assert!(!root.projection.iter().any(|f| f.key == "reviews"));
     }
 
     #[test]

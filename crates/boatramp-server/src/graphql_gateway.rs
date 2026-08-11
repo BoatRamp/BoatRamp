@@ -169,6 +169,7 @@ impl BackendRouter {
             &claims,
             query,
             &variables,
+            Some(self.invoker.as_ref()),
         )
         .await
     }

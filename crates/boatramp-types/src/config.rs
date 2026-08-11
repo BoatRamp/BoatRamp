@@ -722,6 +722,12 @@ pub struct HandlerGraphqlTableConfig {
     /// Row-level filter terms, all applied to every access — the tenant-isolation seam.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub row_filter: Vec<HandlerGraphqlRowTerm>,
+    /// Fields on this type resolved by a **wasm function** instead of a column: `field →
+    /// function name`. The connector resolves the row's columns from SQL, then batches one
+    /// invoke to the function (a local `_entities` fetch) to fill the field. This map is also
+    /// the allowlist — only these fields delegate, only to these functions.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub resolvers: std::collections::BTreeMap<String, String>,
 }
 
 /// One row-filter term: the `column` must equal the value of the request's `claim` (see

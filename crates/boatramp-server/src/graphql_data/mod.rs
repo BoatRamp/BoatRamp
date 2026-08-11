@@ -50,6 +50,9 @@ pub(crate) fn policy_from_config(cfg: &HandlerGraphqlDataConfig) -> DataPolicy {
                     .collect(),
             });
         }
+        for (field, function) in &table_cfg.resolvers {
+            table_policy = table_policy.with_resolver(field.clone(), function.clone());
+        }
         policy = policy.with_table(table.clone(), table_policy);
     }
     policy
