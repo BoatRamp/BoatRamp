@@ -46,8 +46,11 @@ versions.
   `mode=1777` (world-writable + sticky, matching a real `/tmp`/`/run`), so the entrypoint
   creates and owns its runtime dir exactly as it expects. General, not image-specific
   (MySQL's `/run/mysqld`, nginx's `/run/nginx`, … all rely on the same); `noexec`/`nosuid`
-  keep the mount hardened. Reproduced and fixed live against `postgres:16` under the exact
-  hardened flags.
+  keep the mount hardened. Reproduced and fixed live, rootless under the exact hardened
+  flags, against both **`postgres:16`** (`mkdir -p /var/run/postgresql`, silent under
+  `|| :`) and **`mysql:8.0`** (`mkdir -p /var/run/mysqld`, a hard `set -e` abort:
+  `mkdir: cannot create directory '/var/run/mysqld': Permission denied`) — each then
+  initializes its database with zero operator config.
 - **Untagged docker image references default to `:latest`.** `compute set/build --image
   <name>` with no tag (e.g. `--image alpine`) no longer pulls *every* tag of the repo
   (slow, and a hard failure on any repo that still carries an ancient v1-manifest tag) —
