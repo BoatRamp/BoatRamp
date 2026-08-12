@@ -224,3 +224,58 @@ interface invoke {
 world invoke-host {
   import invoke;
 }
+
+/// Value types for the `graphql` capability: run an operation against the project's
+/// composed federation supergraph in-process — the same planner + executor an external
+/// `/graphql` request uses — so a guest can query the unified API (cross-subgraph
+/// planning), without a network hop or egress surface.
+interface graphql-types {
+  /// A GraphQL operation to run against the supergraph. `variables` is a JSON object
+  /// encoded as a string (`{}` when none); `operation-name` selects one of several
+  /// operations in `query`; `bearer` forwards the caller's own credentials so each
+  /// subgraph's field guards see the guest's principal (re-verified per subgraph — the
+  /// guest cannot escalate by running this).
+  record graphql-request {
+    query: string,
+    variables: string,
+    operation-name: option<string>,
+    bearer: option<string>,
+  }
+
+  /// Why a supergraph run was refused.
+  variant graphql-error {
+    /// The `graphql` capability was not granted to this function.
+    access-denied,
+    /// The operation is not on the project's registered safelist. Guest-run operations
+    /// are deny-by-default: only pre-registered operations run.
+    not-safelisted,
+    /// The query could not be planned against the supergraph. Carries a reason.
+    plan-failed(string),
+    /// The maximum in-process call depth was exceeded (loop guard) — shared with `invoke`,
+    /// so a guest op → subgraph fetch → guest op chain cannot loop.
+    depth-exceeded,
+    /// The run failed (composition, execution, ...). Carries a reason.
+    failed(string),
+  }
+}
+
+/// The `graphql` capability: run a GraphQL operation against the project's composed
+/// supergraph in-process — cross-subgraph planning + execution over the invoke path, no
+/// network hop, no egress. Deny-by-default: only pre-registered (safelisted) operations
+/// run, and the caller's own bearer is forwarded and re-verified by each subgraph.
+interface graphql {
+  use graphql-types.{graphql-request, graphql-error};
+
+  /// Run `request` against the supergraph; returns the GraphQL response JSON bytes
+  /// (`{data, errors}`), the same result an external `/graphql` POST would produce.
+  run: func(request: graphql-request) -> result<list<u8>, graphql-error>;
+
+  /// Run a pre-registered operation by its safelist hash (sha256-hex of the query text),
+  /// with `variables` (a JSON object string) and the caller's `bearer`.
+  run-persisted: func(hash: string, variables: string, bearer: option<string>) -> result<list<u8>, graphql-error>;
+}
+
+/// The graphql capability world (imported into request handlers / functions).
+world graphql-host {
+  import graphql;
+}

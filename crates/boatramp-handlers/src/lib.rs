@@ -13,6 +13,8 @@ mod engine;
 #[cfg(feature = "engine")]
 pub mod logging;
 
+#[cfg(feature = "graphql")]
+pub use bindings::graphql::{GraphqlError, GraphqlRequest, SupergraphRunner};
 #[cfg(feature = "invoke")]
 pub use bindings::invoke::{
     InvokeError, InvokeRequest, InvokeResponse, InvokeStreamResponse, Invoker, MAX_INVOKE_DEPTH,

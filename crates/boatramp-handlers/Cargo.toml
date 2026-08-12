@@ -47,6 +47,10 @@ messaging = ["engine"]
 # `Invoker` (resolution + metering live a layer up). Needs async-trait for the
 # object-safe `Invoker` trait.
 invoke = ["engine", "dep:async-trait"]
+# The `graphql` binding: a guest runs an operation against the project's composed
+# supergraph in-process via the server's `SupergraphRunner` (registry + planner +
+# executor + safelist live a layer up). Shares the invoke depth cap.
+graphql = ["engine", "invoke", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true

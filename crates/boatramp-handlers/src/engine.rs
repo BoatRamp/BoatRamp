@@ -453,6 +453,10 @@ impl HandlerEngine {
         bindings::invoke::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::invoke::InvokeHost::new(&mut state.table, state.bindings.invoke())
         })?;
+        #[cfg(feature = "graphql")]
+        bindings::graphql::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::graphql::GraphqlHost::new(state.bindings.graphql())
+        })?;
         Ok(linker)
     }
 

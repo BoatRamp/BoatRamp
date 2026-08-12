@@ -21,6 +21,8 @@ use boatramp_core::sql::SqlBackend;
 use boatramp_core::Storage;
 
 pub mod blobstore;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "invoke")]
 pub mod invoke;
 pub mod keyvalue;
@@ -49,6 +51,10 @@ pub struct Bindings {
     /// allowlist, and this invocation's call depth. `None` = invoke not granted.
     #[cfg(feature = "invoke")]
     invoke: Option<invoke::InvokeBinding>,
+    /// The `graphql` grant (run an op against the project supergraph): the server's
+    /// runner + this invocation's call depth. `None` = graphql not granted.
+    #[cfg(feature = "graphql")]
+    graphql: Option<graphql::GraphqlBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -189,5 +195,21 @@ impl Bindings {
     #[cfg(feature = "invoke")]
     pub(crate) fn invoke(&self) -> Option<&invoke::InvokeBinding> {
         self.invoke.as_ref()
+    }
+
+    /// Grant the `graphql` capability: `runner` plans + executes an op against the
+    /// project's composed supergraph, and `depth` is this invocation's position in the
+    /// call chain (the host caps the next hop at
+    /// [`invoke::MAX_INVOKE_DEPTH`](invoke::MAX_INVOKE_DEPTH), shared with `invoke`).
+    #[cfg(feature = "graphql")]
+    pub fn with_graphql(mut self, runner: Arc<dyn graphql::SupergraphRunner>, depth: u32) -> Self {
+        self.graphql = Some(graphql::GraphqlBinding { runner, depth });
+        self
+    }
+
+    /// The granted graphql binding, if any.
+    #[cfg(feature = "graphql")]
+    pub(crate) fn graphql(&self) -> Option<&graphql::GraphqlBinding> {
+        self.graphql.as_ref()
     }
 }
