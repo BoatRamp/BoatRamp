@@ -39,6 +39,16 @@ const KV_COUNTER: &[u8] = include_bytes!("fixtures/kv-counter.wasm");
 /// ```
 #[cfg(feature = "invoke")]
 const INVOKE_CALLER: &[u8] = include_bytes!("fixtures/invoke-caller.wasm");
+/// A `wasi:http` guest that runs a GraphQL operation against the project supergraph through the
+/// boatramp `graphql` capability and returns the response. See `examples/handlers/graphql-run-caller`.
+/// Regenerate with:
+/// ```sh
+/// (cd examples/handlers/graphql-run-caller && cargo build --release --target wasm32-wasip2)
+/// cp examples/handlers/graphql-run-caller/target/wasm32-wasip2/release/boatramp_example_graphql_run_caller.wasm \
+///    crates/boatramp-handlers/tests/fixtures/graphql-run-caller.wasm
+/// ```
+#[cfg(feature = "graphql")]
+const GRAPHQL_RUN_CALLER: &[u8] = include_bytes!("fixtures/graphql-run-caller.wasm");
 
 fn engine() -> HandlerEngine {
     HandlerEngine::new(Limits::default(), 16).expect("engine")
@@ -53,6 +63,15 @@ fn request() -> http::Request<ReqBody> {
 fn request_path(path: &str) -> http::Request<ReqBody> {
     http::Request::builder()
         .uri(format!("http://example.test{path}"))
+        .body(empty_body())
+        .expect("request")
+}
+
+#[cfg(feature = "graphql")]
+fn request_with_auth(authorization: &str) -> http::Request<ReqBody> {
+    http::Request::builder()
+        .uri("http://example.test/")
+        .header("authorization", authorization)
         .body(empty_body())
         .expect("request")
 }
@@ -158,6 +177,83 @@ async fn invoke_caller_target_outside_allowlist() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(
         String::from_utf8_lossy(&body).contains("not in the allowlist"),
+        "{body:?}"
+    );
+}
+
+/// A test [`SupergraphRunner`](boatramp_handlers::SupergraphRunner) that records the forwarded
+/// bearer and returns a canned stitched response, so the `graphql` host binding (grant check,
+/// wire conversion, bearer forwarding) is exercised by a real guest without a whole supergraph.
+#[cfg(feature = "graphql")]
+struct StubSupergraphRunner {
+    seen_bearer: Arc<std::sync::Mutex<Option<String>>>,
+    response: &'static [u8],
+}
+
+#[cfg(feature = "graphql")]
+#[async_trait::async_trait]
+impl boatramp_handlers::SupergraphRunner for StubSupergraphRunner {
+    async fn run(
+        &self,
+        request: boatramp_handlers::GraphqlRequest,
+        _depth: u32,
+    ) -> Result<Vec<u8>, boatramp_handlers::GraphqlError> {
+        *self.seen_bearer.lock().unwrap() = request.bearer.clone();
+        Ok(self.response.to_vec())
+    }
+}
+
+/// A real guest importing `boatramp:handlers/graphql` runs an operation against the project
+/// supergraph through the host binding: the stitched response flows back into its body, and the
+/// runner sees the guest's **own** forwarded bearer (so a guest acts as itself — no escalation).
+#[cfg(feature = "graphql")]
+#[tokio::test(flavor = "multi_thread")]
+async fn graphql_run_caller_runs_a_supergraph_query_forwarding_its_bearer() {
+    let engine = engine();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let runner: Arc<dyn boatramp_handlers::SupergraphRunner> = Arc::new(StubSupergraphRunner {
+        seen_bearer: seen.clone(),
+        response: br#"{"data":{"me":{"name":"Alice","reviews":[{"body":"great"}]}}}"#,
+    });
+    let bindings = Bindings::new("test").with_graphql(runner, 0);
+    let response = engine
+        .serve(
+            "graphql-run-caller",
+            GRAPHQL_RUN_CALLER,
+            request_with_auth("Bearer t-acme"),
+            bindings,
+        )
+        .await
+        .expect("handler serves");
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    // The guest received the stitched supergraph response through the capability round-trip.
+    assert!(
+        String::from_utf8_lossy(&body).contains("\"reviews\""),
+        "{body:?}"
+    );
+    // ...and the run carried the guest's own bearer (forwarded for per-subgraph re-verification).
+    assert_eq!(*seen.lock().unwrap(), Some("Bearer t-acme".to_string()));
+}
+
+/// Without a graphql grant, the guest's `run` returns `access-denied`, surfaced as a 500.
+#[cfg(feature = "graphql")]
+#[tokio::test(flavor = "multi_thread")]
+async fn graphql_run_caller_denied_without_grant() {
+    let engine = engine();
+    let response = engine
+        .serve(
+            "graphql-run-caller",
+            GRAPHQL_RUN_CALLER,
+            request(),
+            no_caps(),
+        )
+        .await
+        .expect("handler serves");
+    assert_eq!(response.status(), 500);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&body).contains("capability not granted"),
         "{body:?}"
     );
 }

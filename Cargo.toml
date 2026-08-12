@@ -29,6 +29,7 @@ exclude = [
   "examples/handlers/sql-counter",
   "examples/handlers/event-consumer",
   "examples/handlers/invoke-caller",
+  "examples/handlers/graphql-run-caller",
   "examples/handlers/graphql-accounts",
   "examples/handlers/graphql-reviews",
   "examples/compose/edge",

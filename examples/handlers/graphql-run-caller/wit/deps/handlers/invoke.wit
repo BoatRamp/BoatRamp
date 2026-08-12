@@ -1,0 +1,64 @@
+// The boatramp `invoke` capability interfaces, vendored for the guest. These must
+// match the host's definitions in boatramp-handlers (crates/boatramp-handlers/
+// wit/world.wit) exactly so the component links against the engine's binding.
+package boatramp:handlers;
+
+interface invoke-types {
+  record header {
+    name: string,
+    value: list<u8>,
+  }
+
+  record invoke-request {
+    method: string,
+    path: string,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  record invoke-response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  variant error {
+    access-denied,
+    target-not-allowed(string),
+    not-found(string),
+    loop-detected,
+    failed(string),
+  }
+}
+
+interface invoke {
+  use invoke-types.{invoke-request, invoke-response, error};
+
+  invoke: func(target: string, request: invoke-request) -> result<invoke-response, error>;
+}
+
+// The boatramp `graphql` capability: run an operation against the project's composed
+// supergraph in-process. Must match the host's definitions exactly.
+interface graphql-types {
+  record graphql-request {
+    query: string,
+    variables: string,
+    operation-name: option<string>,
+    bearer: option<string>,
+  }
+
+  variant graphql-error {
+    access-denied,
+    not-safelisted,
+    plan-failed(string),
+    depth-exceeded,
+    failed(string),
+  }
+}
+
+interface graphql {
+  use graphql-types.{graphql-request, graphql-error};
+
+  run: func(request: graphql-request) -> result<list<u8>, graphql-error>;
+  run-persisted: func(hash: string, variables: string, bearer: option<string>) -> result<list<u8>, graphql-error>;
+}

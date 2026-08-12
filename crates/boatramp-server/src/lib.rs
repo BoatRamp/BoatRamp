@@ -2393,6 +2393,72 @@ mod tests {
         assert!(matches!(err, InvokeError::NotFound));
     }
 
+    /// The supergraph runner backing the `graphql` capability, driven end-to-end through a real
+    /// runtime: the safelist is the deny-by-default operation floor, and only a safelisted op
+    /// reaches planning. (The host-side grant + depth cap are unit-tested in
+    /// `boatramp_handlers::bindings::graphql`; stitching + bearer forwarding + depth dispatch in
+    /// `graphql_gateway`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn federation_runner_enforces_the_safelist_before_planning() {
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_handlers::{GraphqlError, GraphqlRequest, HandlerEngine, Limits};
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+        rt.set_invoker(deploy.clone());
+        let runner = rt
+            .inner
+            .as_ref()
+            .unwrap()
+            .federation_runner
+            .get()
+            .unwrap()
+            .scoped(ProjectRef::new("default"));
+
+        let req = |query: &str| GraphqlRequest {
+            query: Some(query.to_string()),
+            persisted_hash: None,
+            variables: "{}".to_string(),
+            operation_name: None,
+            bearer: None,
+        };
+
+        // A query that was never registered is refused (deny-by-default) before any planning.
+        assert!(matches!(
+            runner.run(req("{ me { id } }"), 1).await,
+            Err(GraphqlError::NotSafelisted)
+        ));
+
+        // Register it in the safelist (any writer of the APQ store) — now it passes the floor and
+        // reaches planning; against an empty supergraph the plan fails (proving the gate opened).
+        let query = "{ me { id } }";
+        let hash = crate::graphql_apq::sha256_hex(query);
+        kv.put(&format!("hapq/default/{hash}"), query.as_bytes().to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(
+            runner.run(req(query), 1).await,
+            Err(GraphqlError::PlanFailed(_))
+        ));
+
+        // A run-persisted with an unregistered hash is refused the same way.
+        let persisted = GraphqlRequest {
+            query: None,
+            persisted_hash: Some("deadbeef".to_string()),
+            variables: "{}".to_string(),
+            operation_name: None,
+            bearer: None,
+        };
+        assert!(matches!(
+            runner.run(persisted, 1).await,
+            Err(GraphqlError::NotSafelisted)
+        ));
+    }
+
     /// Tenant isolation (Step 7a): the background scheduler fans out over every
     /// project, so a **non-default** project's queued async invocation is drained
     /// and metered **within that project** — never leaking into `default`. Before
