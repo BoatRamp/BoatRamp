@@ -223,6 +223,21 @@ does not compose** (a field co-owned without `@shareable`, or SDL that does not
 parse) — a bad publish never corrupts the registry. Read the composed
 supergraph with `GET /api/projects/acme/graphql/supergraph`.
 
+A **function subgraph** can register itself by introspection instead of pasting SDL:
+deploy the function, then let boatramp read its schema from the federation `_service
+{ sdl }` field and publish it (no hand-written SDL — the parallel of the SQL path
+below):
+
+```bash
+curl -X PUT https://api.example.com/api/projects/acme/graphql/subgraphs/accounts/function
+```
+
+boatramp invokes the deployed function anonymously (the SDL is public), publishes the
+returned SDL (recomposed + validated like any subgraph), and records it as a function
+backend. If the function is not deployed yet the call is a `409`; if it does not answer
+`{ _service { sdl } }` (not a federation subgraph) it is a `422`; a schema that does not
+compose is a `400`. Re-run it after a schema change to refresh the registered SDL.
+
 A subgraph can also be **SQL-backed** — the [data connector](#graphql-from-your-database-no-resolver-code)
 acting as a federation subgraph. Register it by naming a site's managed database and
 what to expose; boatramp introspects the database and generates the `@key` SDL for you

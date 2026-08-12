@@ -251,6 +251,12 @@ pub fn router_with(
             "/api/graphql/subgraphs/{name}/sql",
             put(put_graphql_sql_subgraph),
         )
+        // Register a function-backed federation subgraph by introspection: invoke the deployed
+        // function's `_service { sdl }` and publish the returned SDL (no hand-written SDL).
+        .route(
+            "/api/graphql/subgraphs/{name}/function",
+            put(put_graphql_function_subgraph),
+        )
         .route("/api/graphql/supergraph", get(get_graphql_supergraph));
     // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
     // into the API's `require_auth` layer below) + the node's canonical origin, for

@@ -48,7 +48,8 @@ pub(crate) use admin_api::{
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
-    get_graphql_supergraph, put_graphql_sql_subgraph, put_graphql_subgraph,
+    get_graphql_supergraph, put_graphql_function_subgraph, put_graphql_sql_subgraph,
+    put_graphql_subgraph,
 };
 mod auth;
 #[cfg(feature = "console")]
@@ -334,6 +335,16 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub(crate) fn sql_provider(&self) -> Option<Arc<dyn boatramp_core::sql::SqlBackends>> {
         self.inner.as_ref().and_then(|inner| inner.sql.clone())
+    }
+
+    /// The function invoker, if wired (set at serve startup). Lets the control plane run a
+    /// deployed function in-process — e.g. to introspect a function subgraph's SDL via its
+    /// federation `_service { sdl }` field when registering it.
+    #[cfg(feature = "handlers")]
+    pub(crate) fn invoker(&self) -> Option<Arc<function_runtime::FunctionInvoker>> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.invoker.get().cloned())
     }
 
     /// Wire the function-to-function invoke resolver (FI). Set once at startup,

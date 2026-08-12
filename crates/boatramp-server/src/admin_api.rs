@@ -437,6 +437,124 @@ pub(super) async fn put_graphql_sql_subgraph(
     axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
 }
 
+/// Introspect a deployed function subgraph's SDL by invoking its federation `_service { sdl }`
+/// field **anonymously** (the SDL is a public field — no caller identity is forwarded for a
+/// schema read), with a timeout so a hung guest can't wedge the admin call. The failure surface
+/// maps to an HTTP status: the function is not deployed → `409`, the invoke fails or times out →
+/// `502`, and a response with no `data._service.sdl` (not a federation subgraph) → `422`.
+#[cfg(feature = "handlers")]
+async fn introspect_function_sdl(
+    invoker: &dyn boatramp_handlers::Invoker,
+    name: &str,
+) -> Result<String, (StatusCode, String)> {
+    let body = serde_json::json!({ "query": "{ _service { sdl } }" })
+        .to_string()
+        .into_bytes();
+    let request = boatramp_handlers::InvokeRequest {
+        method: "POST".to_string(),
+        path: "/".to_string(),
+        headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+        body,
+    };
+    let invoked = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        invoker.invoke(name, request, 0),
+    )
+    .await;
+    let response = match invoked {
+        Err(_elapsed) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("subgraph `{name}` timed out answering `_service {{ sdl }}`\n"),
+            ))
+        }
+        Ok(Err(boatramp_handlers::InvokeError::NotFound)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "no function named `{name}` is deployed — deploy it before registering it as a subgraph\n"
+                ),
+            ))
+        }
+        Ok(Err(boatramp_handlers::InvokeError::Failed(msg))) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("subgraph `{name}` failed answering `_service {{ sdl }}`: {msg}\n"),
+            ))
+        }
+        Ok(Ok(response)) => response,
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+    match parsed.pointer("/data/_service/sdl").and_then(|v| v.as_str()) {
+        Some(sdl) if !sdl.trim().is_empty() => Ok(sdl.to_string()),
+        _ => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "function `{name}` did not answer `{{ _service {{ sdl }} }}` — it may not be a federation subgraph\n"
+            ),
+        )),
+    }
+}
+
+/// `PUT /api/projects/{proj}/graphql/subgraphs/{name}/function` — register a **function-backed**
+/// federation subgraph *by introspection*. boatramp invokes the deployed function's federation
+/// `_service { sdl }` field, publishes the returned SDL to the registry (recomposed + validated
+/// like any subgraph), and records the function backend — so an operator never hand-writes SDL
+/// for a shim-authored subgraph (the parallel of the `/sql` path). Deploy the function first.
+#[cfg(feature = "handlers")]
+pub(super) async fn put_graphql_function_subgraph(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(resp) = reject_invalid_name("subgraph", &name) {
+        return resp;
+    }
+    let Some(invoker) = handlers.invoker() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server has no function invoker configured\n",
+        )
+            .into_response();
+    };
+    // Introspect anonymously, scoped to the project (an invoke never crosses tenants).
+    let scoped = invoker.scoped(boatramp_core::project::ProjectRef::new(&project.0));
+    let sdl = match introspect_function_sdl(scoped.as_ref(), &name).await {
+        Ok(sdl) => sdl,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+    let kv = deploy.kv().as_ref();
+    // Publish the SDL (recompose + validate) first — a bad compose never records a backend.
+    let sg = match crate::graphql_registry::publish(kv, &project.0, &name, &sdl).await {
+        Ok(sg) => sg,
+        Err(crate::graphql_registry::PublishError::Composition(e)) => {
+            return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response()
+        }
+        Err(crate::graphql_registry::PublishError::Store(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry store error: {e}\n"),
+            )
+                .into_response()
+        }
+    };
+    // Record the function backend explicitly (it is also the default) for parity with `/sql`.
+    let spec = crate::graphql_registry::SubgraphBackendSpec::Function;
+    if let Err(e) =
+        crate::graphql_registry::put_subgraph_backend(kv, &project.0, &name, &spec).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("registry store error: {e}\n"),
+        )
+            .into_response();
+    }
+    let names = crate::graphql_registry::subgraph_names(kv, &project.0).await;
+    axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
+}
+
 /// `GET /api/projects/{proj}/graphql/supergraph` — the composed supergraph summary
 /// (subgraphs, entities, root fields) for the project.
 #[cfg(feature = "handlers")]
@@ -877,5 +995,94 @@ mod tests {
         };
         let input: DeployMetaInput = q.into();
         assert!(input.tags.is_empty());
+    }
+
+    /// A mock invoker with a canned `_service { sdl }` answer, for testing subgraph SDL
+    /// introspection without a deployed component.
+    #[cfg(feature = "handlers")]
+    struct SdlInvoker(&'static str);
+
+    #[cfg(feature = "handlers")]
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for SdlInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            let body = serde_json::json!({ "data": { "_service": { "sdl": self.0 } } });
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![],
+                body: serde_json::to_vec(&body).unwrap(),
+            })
+        }
+    }
+
+    /// A mock invoker that answers with a body carrying no `_service` — i.e. a deployed
+    /// function that is not a federation subgraph.
+    #[cfg(feature = "handlers")]
+    struct NonSubgraphInvoker;
+
+    #[cfg(feature = "handlers")]
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for NonSubgraphInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            let body = serde_json::json!({ "data": { "hello": "world" } });
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![],
+                body: serde_json::to_vec(&body).unwrap(),
+            })
+        }
+    }
+
+    /// A mock invoker with nothing deployed — every target is `NotFound`.
+    #[cfg(feature = "handlers")]
+    struct UndeployedInvoker;
+
+    #[cfg(feature = "handlers")]
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for UndeployedInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            Err(boatramp_handlers::InvokeError::NotFound)
+        }
+    }
+
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn introspecting_a_subgraph_returns_its_sdl() {
+        let inv = SdlInvoker("type Query { me: String }");
+        let sdl = introspect_function_sdl(&inv, "accounts").await.unwrap();
+        assert!(sdl.contains("type Query"));
+    }
+
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn introspecting_an_undeployed_function_is_409() {
+        let (status, _msg) = introspect_function_sdl(&UndeployedInvoker, "ghost")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn introspecting_a_non_subgraph_function_is_422() {
+        let (status, _msg) = introspect_function_sdl(&NonSubgraphInvoker, "plain")
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
