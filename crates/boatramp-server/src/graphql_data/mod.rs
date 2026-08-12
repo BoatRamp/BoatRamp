@@ -66,3 +66,24 @@ pub(crate) fn request_claims(project: &str) -> Claims {
         SqlValue::Text(project.to_string()),
     )]))
 }
+
+/// Generate the **federation SDL** for a SQL-backed subgraph by introspecting `site`'s
+/// managed database and emitting `@key`-typed entities for the exposed tables. Used when
+/// registering a SQL subgraph, so an operator never hand-writes SDL.
+pub(crate) async fn generate_sql_subgraph_sdl(
+    provider: &dyn boatramp_core::sql::SqlBackends,
+    project: &str,
+    site: &str,
+    cfg: &HandlerGraphqlDataConfig,
+) -> Result<String, String> {
+    let backend = provider
+        .database(project, site, &cfg.source)
+        .await
+        .map_err(|e| format!("opening the `{site}` database: {e}"))?;
+    let schema = introspect::introspect_sqlite(backend.as_ref())
+        .await
+        .map_err(|e| format!("introspecting the `{site}` database: {e}"))?;
+    // The SDL exposes only the policy's tables/columns.
+    let exposed = policy_from_config(cfg).project_schema(&schema);
+    Ok(sdl::generate_federation_sdl(&exposed))
+}

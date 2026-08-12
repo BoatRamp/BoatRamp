@@ -28,8 +28,7 @@ fn backend_prefix(project: &str) -> String {
 
 /// How a registered subgraph's fetches are resolved: a wasm **function** (the default), or
 /// the **SQL** data connector reading a managed database. Persisted as JSON under
-/// `graphql/{project}/subgraph-backend/{name}` (a raw write today; a registration endpoint
-/// is a follow-up).
+/// `graphql/{project}/subgraph-backend/{name}`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(crate) enum SubgraphBackendSpec {
@@ -40,6 +39,23 @@ pub(crate) enum SubgraphBackendSpec {
         site: String,
         config: HandlerGraphqlDataConfig,
     },
+}
+
+/// Record subgraph `name`'s backend kind for `project`.
+pub(crate) async fn put_subgraph_backend(
+    kv: &dyn KvStore,
+    project: &str,
+    name: &str,
+    spec: &SubgraphBackendSpec,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(spec).map_err(|e| e.to_string())?;
+    kv.put(&backend_key(project, name), bytes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn backend_key(project: &str, name: &str) -> String {
+    format!("{}{name}", backend_prefix(project))
 }
 
 /// The SQL-backed subgraphs of `project`: `name → (site, data config)`. Function subgraphs

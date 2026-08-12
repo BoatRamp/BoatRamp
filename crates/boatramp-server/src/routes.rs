@@ -245,6 +245,12 @@ pub fn router_with(
         // validates the supergraph) and read the composed supergraph. Uses the
         // graphql-parser dependency, so it is behind the handlers feature.
         .route("/api/graphql/subgraphs/{name}", put(put_graphql_subgraph))
+        // Register a SQL-backed federation subgraph: introspect the named site's database,
+        // generate its `@key` SDL, and record the SQL backend.
+        .route(
+            "/api/graphql/subgraphs/{name}/sql",
+            put(put_graphql_sql_subgraph),
+        )
         .route("/api/graphql/supergraph", get(get_graphql_supergraph));
     // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
     // into the API's `require_auth` layer below) + the node's canonical origin, for

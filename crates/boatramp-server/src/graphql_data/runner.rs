@@ -6,7 +6,7 @@
 //! partial result. The connector remains a translator: the database executes, this maps
 //! rows to JSON.
 
-use super::compile::{compile, Delegation, OutSource, RootQuery};
+use super::compile::{compile, Delegation, OutField, OutSource};
 use super::dialect::Dialect;
 use super::policy::{Claims, DataPolicy};
 use super::schema::DbSchema;
@@ -46,7 +46,7 @@ pub(crate) async fn execute(
                 return errors(&format!("query failed: {err}"));
             }
         };
-        let mut objects = shape_objects(root, &rows);
+        let mut objects = shape_objects(&root.projection, &rows);
         for delegation in &root.delegations {
             if let Err(message) = apply_delegation(&mut objects, &rows, delegation, invoker).await {
                 let _ = tx.rollback().await;
@@ -106,14 +106,81 @@ pub(crate) async fn execute_mutation(
     json!({ "data": data })
 }
 
+/// Resolve a federation `_entities` fetch against `backend`: run the keyed `SELECT`, shape
+/// the rows, and join them back to the representations **by key, in representation order**
+/// (nulls for keys with no matching row). Returns `{"data": {"_entities": […]}}`. This makes
+/// a SQL source a full federation entity resolver, not only a root owner.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_entities(
+    backend: &dyn SqlBackend,
+    dialect: &dyn Dialect,
+    schema: &DbSchema,
+    policy: &DataPolicy,
+    claims: &Claims,
+    query: &str,
+    variables: &Value,
+    invoker: Option<&dyn Invoker>,
+) -> Value {
+    use super::compile::compile_entities;
+    let plan = match compile_entities(query, variables, schema, policy, claims, dialect) {
+        Ok(plan) => plan,
+        Err(err) => return errors(&err.to_string()),
+    };
+    if plan.representation_keys.is_empty() {
+        return json!({ "data": { "_entities": [] } });
+    }
+    let mut tx = match backend.begin_read_only().await {
+        Ok(tx) => tx,
+        Err(err) => return errors(&format!("database unavailable: {err}")),
+    };
+    let rows = match tx.query(&plan.sql, &plan.params).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return errors(&format!("query failed: {err}"));
+        }
+    };
+    let _ = tx.rollback().await;
+
+    let mut objects = shape_objects(&plan.projection, &rows);
+    for delegation in &plan.delegations {
+        if let Err(message) = apply_delegation(&mut objects, &rows, delegation, invoker).await {
+            return errors(&message);
+        }
+    }
+    // Index the resolved rows by their key tuple (as canonical JSON), then emit one entity per
+    // representation, preserving order.
+    let mut by_key: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for (row, object) in rows.rows.iter().zip(objects) {
+        let key: Vec<Value> = plan
+            .key_indices
+            .iter()
+            .map(|i| row.get(*i).map_or(Value::Null, sql_to_json))
+            .collect();
+        by_key.insert(Value::Array(key).to_string(), object);
+    }
+    let entities: Vec<Value> = plan
+        .representation_keys
+        .iter()
+        .map(|k| {
+            let key: Vec<Value> = k.iter().map(sql_to_json).collect();
+            by_key
+                .get(&Value::Array(key).to_string())
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+    json!({ "data": { "_entities": entities } })
+}
+
 /// Shape each returned row into its base GraphQL object (columns, relationships,
 /// `__typename`); delegated fields are filled afterward.
-fn shape_objects(root: &RootQuery, rows: &SqlRows) -> Vec<Value> {
+fn shape_objects(projection: &[OutField], rows: &SqlRows) -> Vec<Value> {
     rows.rows
         .iter()
         .map(|row| {
             let mut obj = Map::new();
-            for field in &root.projection {
+            for field in projection {
                 let value = match &field.source {
                     OutSource::Column(idx) => row.get(*idx).map_or(Value::Null, sql_to_json),
                     OutSource::Json(idx) => row.get(*idx).map_or(Value::Null, json_cell),
@@ -313,6 +380,41 @@ mod tests {
         assert_eq!(out["data"]["users"][0]["name"], json!("Alice"));
         assert_eq!(out["data"]["users"][1]["name"], Value::Null);
         assert_eq!(out["data"]["users"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn entities_are_joined_by_key_in_representation_order() {
+        // The keyed SELECT compiles to `SELECT "users"."name", "users"."id" …`, so the row
+        // is [name, id]; the fake returns Alice(1) and Bob(2) in that order.
+        let backend = FakeBackend(SqlRows {
+            columns: vec!["name".into(), "id".into()],
+            rows: vec![
+                vec![SqlValue::Text("Alice".into()), SqlValue::Text("1".into())],
+                vec![SqlValue::Text("Bob".into()), SqlValue::Text("2".into())],
+            ],
+        });
+        // Representations are in the order 2 then 1 — the output must follow.
+        let variables = json!({ "representations": [
+            { "__typename": "users", "id": "2" },
+            { "__typename": "users", "id": "1" },
+        ] });
+        let out = execute_entities(
+            &backend,
+            &super::super::dialect::Sqlite,
+            &schema(),
+            &policy(),
+            &Claims::default(),
+            "query($representations:[_Any!]!){ _entities(representations:$representations){ ... on users { name } } }",
+            &variables,
+            None,
+        )
+        .await;
+        let entities = out["data"]["_entities"]
+            .as_array()
+            .expect("_entities array");
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0]["name"], json!("Bob")); // representation id 2 → Bob
+        assert_eq!(entities[1]["name"], json!("Alice")); // representation id 1 → Alice
     }
 
     #[tokio::test]

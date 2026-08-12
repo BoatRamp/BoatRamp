@@ -24,11 +24,14 @@ versions.
   transaction, force the row filter onto every write, and refuse an unbounded update/delete.
   A field can also be **resolved by a wasm function** instead of a column (a per-field resolver
   map), filled by one batched invoke — GraphQL→SQL and GraphQL→Wasi blended at field grain. And
-  a SQL source can be a **federation subgraph**, composing with wasm subgraphs in one supergraph
-  (the gateway routes each fetch to its backend). Composes *beneath* the existing GraphQL edge
-  (guard, persisted queries, cache) and beside the wasm-resolver model. Off by default; libsql
-  today. Validated end-to-end against real libsql (reads, nested relationships with
-  depth isolation, delegation, SQL+wasm federation, and mutations).
+  a SQL source can be a **federation subgraph** — registered with
+  `PUT /api/projects/{proj}/graphql/subgraphs/{name}/sql` (boatramp introspects the database and
+  generates the `@key` SDL; no hand-written SDL), composing with wasm subgraphs in one supergraph
+  where the gateway routes each fetch to its backend and the SQL subgraph resolves both root and
+  `_entities` fetches. Composes *beneath* the existing GraphQL edge (guard, persisted queries,
+  cache) and beside the wasm-resolver model. Off by default; libsql today. Validated end-to-end
+  against real libsql (reads, nested relationships with depth isolation, delegation, SQL+wasm
+  federation with subgraph registration, and mutations).
 - **Edge response cache for handlers (`[handlers.cache]`).** A site can opt into a
   host-level cache that serves a cacheable `GET`/`HEAD` response **without
   re-instantiating the handler** — the execution analogue of the existing compile cache.

@@ -356,6 +356,87 @@ pub(super) async fn put_graphql_subgraph(
     }
 }
 
+/// The body of a SQL federation-subgraph registration: which site's managed database to
+/// expose, and the connector policy (exposed tables/columns) to expose it under.
+#[cfg(feature = "handlers")]
+#[derive(serde::Deserialize)]
+pub(super) struct SqlSubgraphRequest {
+    site: String,
+    #[serde(default)]
+    config: boatramp_core::config::HandlerGraphqlDataConfig,
+}
+
+/// `PUT /api/projects/{proj}/graphql/subgraphs/{name}/sql` — register a **SQL-backed**
+/// federation subgraph. boatramp introspects the named site's managed database, generates the
+/// subgraph's SDL (`@key` entities for the exposed tables — no hand-written SDL), publishes it
+/// to the registry (recomposed + validated like any subgraph), and records the SQL backend so
+/// the gateway resolves this subgraph's fetches by compiling to SQL.
+#[cfg(feature = "handlers")]
+pub(super) async fn put_graphql_sql_subgraph(
+    State(deploy): State<DeployStore>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path(name): Path<String>,
+    Json(request): Json<SqlSubgraphRequest>,
+) -> Response {
+    if let Some(resp) = reject_invalid_name("subgraph", &name) {
+        return resp;
+    }
+    if let Some(resp) = reject_invalid_name("site", &request.site) {
+        return resp;
+    }
+    let Some(provider) = handlers.sql_provider() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server has no SQL backend configured\n",
+        )
+            .into_response();
+    };
+    // Introspect the site's database and generate the subgraph SDL from its exposed shape.
+    let sdl = match crate::graphql_data::generate_sql_subgraph_sdl(
+        provider.as_ref(),
+        &project.0,
+        &request.site,
+        &request.config,
+    )
+    .await
+    {
+        Ok(sdl) => sdl,
+        Err(message) => return (StatusCode::BAD_GATEWAY, format!("{message}\n")).into_response(),
+    };
+    let kv = deploy.kv().as_ref();
+    // Publish the SDL (recompose + validate) first — a bad compose never records a backend.
+    let sg = match crate::graphql_registry::publish(kv, &project.0, &name, &sdl).await {
+        Ok(sg) => sg,
+        Err(crate::graphql_registry::PublishError::Composition(e)) => {
+            return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response()
+        }
+        Err(crate::graphql_registry::PublishError::Store(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry store error: {e}\n"),
+            )
+                .into_response()
+        }
+    };
+    // Record the SQL backend so the gateway routes this subgraph's fetches to the connector.
+    let spec = crate::graphql_registry::SubgraphBackendSpec::Sql {
+        site: request.site,
+        config: request.config,
+    };
+    if let Err(e) =
+        crate::graphql_registry::put_subgraph_backend(kv, &project.0, &name, &spec).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("registry store error: {e}\n"),
+        )
+            .into_response();
+    }
+    let names = crate::graphql_registry::subgraph_names(kv, &project.0).await;
+    axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
+}
+
 /// `GET /api/projects/{proj}/graphql/supergraph` — the composed supergraph summary
 /// (subgraphs, entities, root fields) for the project.
 #[cfg(feature = "handlers")]

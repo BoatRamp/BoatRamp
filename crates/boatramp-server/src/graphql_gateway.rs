@@ -161,17 +161,35 @@ impl BackendRouter {
         };
         let policy = crate::graphql_data::policy_from_config(config);
         let claims = crate::graphql_data::request_claims(&self.project);
-        crate::graphql_data::runner::execute(
-            backend.as_ref(),
-            &crate::graphql_data::dialect::Sqlite,
-            &schema,
-            &policy,
-            &claims,
-            query,
-            &variables,
-            Some(self.invoker.as_ref()),
-        )
-        .await
+        let dialect = crate::graphql_data::dialect::Sqlite;
+        let invoker = Some(self.invoker.as_ref());
+        // A SQL subgraph resolves both root fetches and — so it's a full federation entity
+        // resolver — `_entities` fetches (a keyed SELECT joined back by representation order).
+        if crate::graphql_data::compile::is_entities_query(query) {
+            crate::graphql_data::runner::execute_entities(
+                backend.as_ref(),
+                &dialect,
+                &schema,
+                &policy,
+                &claims,
+                query,
+                &variables,
+                invoker,
+            )
+            .await
+        } else {
+            crate::graphql_data::runner::execute(
+                backend.as_ref(),
+                &dialect,
+                &schema,
+                &policy,
+                &claims,
+                query,
+                &variables,
+                invoker,
+            )
+            .await
+        }
     }
 }
 

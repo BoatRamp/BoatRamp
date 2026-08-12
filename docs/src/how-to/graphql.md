@@ -192,6 +192,21 @@ does not compose** (a field co-owned without `@shareable`, or SDL that does not
 parse) — a bad publish never corrupts the registry. Read the composed
 supergraph with `GET /api/projects/acme/graphql/supergraph`.
 
+A subgraph can also be **SQL-backed** — the [data connector](#graphql-from-your-database-no-resolver-code)
+acting as a federation subgraph. Register it by naming a site's managed database and
+what to expose; boatramp introspects the database and generates the `@key` SDL for you
+(no hand-written SDL):
+
+```bash
+curl -X PUT https://api.example.com/api/projects/acme/graphql/subgraphs/accounts/sql \
+  -H 'content-type: application/json' \
+  -d '{"site": "accounts", "config": {"enabled": true, "tables": {"users": {"columns": ["id", "name"]}}}}'
+```
+
+The gateway then resolves that subgraph's fetches by compiling to SQL — both its root
+fields and its `_entities` fetches (a keyed `SELECT`), so a SQL source is a full
+federation citizen, composable with wasm subgraphs.
+
 ### The gateway
 
 Mark a site as the gateway:

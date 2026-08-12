@@ -6878,6 +6878,195 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
     let _ = std::fs::remove_dir_all(&sql_dir);
 }
 
+/// Registering a SQL federation subgraph through the admin API: `PUT
+/// /api/graphql/subgraphs/{name}/sql` introspects the named site's database, generates the
+/// `@key` SDL (no hand-written SDL), and records the SQL backend. The registered subgraph then
+/// composes with a wasm subgraph and serves a federated query — end to end, no raw kv writes.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::kv::KvStore;
+    use boatramp_core::sql::{SqlBackends, SqlValue};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const REVIEWS: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-reviews.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let sql_dir = std::env::temp_dir().join(format!("boatramp-conf-gqlreg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sql_dir);
+    let sql: Arc<dyn SqlBackends> = Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+    {
+        let backend = sql.database("default", "accounts", "").await.unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)", &[])
+            .await
+            .unwrap();
+        for (id, name) in [("1", "Alice"), ("2", "Bob")] {
+            tx.execute(
+                "INSERT INTO users (id, name) VALUES (?1, ?2)",
+                &[SqlValue::Text(id.into()), SqlValue::Text(name.into())],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    deploy_test_function(&deploy, "reviews", REVIEWS, Vec::new()).await;
+    // The wasm subgraph's SDL (a function subgraph, seeded directly as usual).
+    kv.put(
+        "graphql/default/subgraph/reviews",
+        b"type Review { id: ID! body: String } extend type users @key(fields: \"id\") { id: ID! @external reviews: [Review] }"
+            .to_vec(),
+    )
+    .await
+    .unwrap();
+
+    // The gateway site.
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let gw_id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw", &gw_id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        federated: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    runtime.set_invoker(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let with_conn = |mut req: Request<Body>| {
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        req
+    };
+
+    // Register the `accounts` SQL subgraph through the admin API — boatramp introspects the
+    // accounts database and generates the SDL; no SDL is supplied.
+    let register = with_conn(
+        Request::builder()
+            .method("PUT")
+            .uri("/api/graphql/subgraphs/accounts/sql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"site":"accounts","config":{"enabled":true,"tables":{"users":{"columns":["id","name"]}}}}"#,
+            ))
+            .unwrap(),
+    );
+    let response = app.clone().oneshot(register).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "register: {}",
+        String::from_utf8_lossy(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+    );
+
+    // The composed supergraph now lists both subgraphs and the `User` entity.
+    let response = app
+        .clone()
+        .oneshot(with_conn(
+            Request::builder()
+                .method("GET")
+                .uri("/api/graphql/supergraph")
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let subgraphs = summary["subgraphs"].as_array().expect("subgraphs");
+    assert!(
+        subgraphs.iter().any(|s| s == "accounts") && subgraphs.iter().any(|s| s == "reviews"),
+        "supergraph: {summary}"
+    );
+
+    // A federated query resolves `users` (columns from the introspected SQL subgraph) and
+    // `reviews` (from the wasm subgraph), stitched by key.
+    let query = with_conn(
+        Request::builder()
+            .method("POST")
+            .uri("/_sites/gw/graphql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"query":"{ users { name reviews { body } } }"}"#,
+            ))
+            .unwrap(),
+    );
+    let response = app.oneshot(query).await.unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let out: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        out["data"]["users"][0]["name"],
+        serde_json::json!("Alice"),
+        "{out}"
+    );
+    assert_eq!(
+        out["data"]["users"][0]["reviews"][0]["body"],
+        serde_json::json!("review for 1")
+    );
+    assert_eq!(out["data"]["users"][1]["name"], serde_json::json!("Bob"));
+
+    let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
 // ---- 0.2.0 project-scoped API ---------------------------------------------
 
 /// A `/api/projects/<proj>/…` request operates on that project's data, and the

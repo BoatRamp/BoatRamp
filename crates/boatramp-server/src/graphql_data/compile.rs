@@ -15,7 +15,9 @@ use super::dialect::{sql_string_literal, Dialect};
 use super::policy::{Claims, DataPolicy, PolicyError, RowOp};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
 use boatramp_core::sql::SqlValue;
-use graphql_parser::query::{Definition, Field, OperationDefinition, Selection, Value};
+use graphql_parser::query::{
+    Definition, Field, OperationDefinition, Selection, TypeCondition, Value,
+};
 use std::collections::BTreeMap;
 
 /// How one output field of a row is produced.
@@ -99,6 +101,207 @@ pub(crate) struct WriteStatement {
 #[derive(Debug, PartialEq)]
 pub(crate) struct MutationPlan {
     pub statements: Vec<WriteStatement>,
+}
+
+/// A federation `_entities` fetch lowered to a single keyed `SELECT`. The runner joins the
+/// returned rows back to the representations by key, in representation order (the `_entities`
+/// contract), so a SQL source is a full federation entity resolver.
+#[derive(Debug, PartialEq)]
+pub(crate) struct EntitiesPlan {
+    pub sql: String,
+    pub params: Vec<SqlValue>,
+    /// How to shape each returned row.
+    pub projection: Vec<OutField>,
+    /// Delegated fields within the entity selection (filled by the runner).
+    pub delegations: Vec<Delegation>,
+    /// The `SELECT`/row indices of the key columns (to match a row back to a representation).
+    pub key_indices: Vec<usize>,
+    /// The key tuple per representation, in request order (the output order).
+    pub representation_keys: Vec<Vec<SqlValue>>,
+}
+
+/// Whether `query` is a federation `_entities` fetch (a root `_entities` field).
+pub(crate) fn is_entities_query(query: &str) -> bool {
+    let Ok(doc) = graphql_parser::query::parse_query::<String>(query) else {
+        return false;
+    };
+    doc.definitions.iter().any(|d| {
+        let Definition::Operation(op) = d else {
+            return false;
+        };
+        let selection = match op {
+            OperationDefinition::Query(q) => &q.selection_set,
+            OperationDefinition::SelectionSet(ss) => ss,
+            _ => return false,
+        };
+        selection
+            .items
+            .iter()
+            .any(|s| matches!(s, Selection::Field(f) if f.name == "_entities"))
+    })
+}
+
+/// Compile a federation `_entities` fetch into one keyed `SELECT`. The `... on <Type>`
+/// selection names the entity table; each representation supplies the key. The row filter
+/// still applies, so a subgraph only resolves entities it's allowed to see.
+pub(crate) fn compile_entities(
+    query: &str,
+    variables: &serde_json::Value,
+    schema: &DbSchema,
+    policy: &DataPolicy,
+    claims: &Claims,
+    dialect: &dyn Dialect,
+) -> Result<EntitiesPlan, CompileError> {
+    let doc = graphql_parser::query::parse_query::<String>(query)
+        .map_err(|e| CompileError::Parse(e.to_string()))?;
+    let op = doc
+        .definitions
+        .iter()
+        .find_map(|d| match d {
+            Definition::Operation(op) => Some(op),
+            _ => None,
+        })
+        .ok_or(CompileError::NoOperation)?;
+    let selection = match op {
+        OperationDefinition::Query(q) => &q.selection_set,
+        OperationDefinition::SelectionSet(ss) => ss,
+        _ => {
+            return Err(CompileError::Unsupported(
+                "`_entities` must be a query".into(),
+            ))
+        }
+    };
+    let entities = selection
+        .items
+        .iter()
+        .find_map(|s| match s {
+            Selection::Field(f) if f.name == "_entities" => Some(f),
+            _ => None,
+        })
+        .ok_or_else(|| CompileError::Unsupported("expected an `_entities` query".into()))?;
+    // The `... on <Type> { … }` inline fragment names the entity type + its selection.
+    let (type_name, inner) = entities
+        .selection_set
+        .items
+        .iter()
+        .find_map(|s| match s {
+            Selection::InlineFragment(frag) => frag
+                .type_condition
+                .as_ref()
+                .map(|TypeCondition::On(name)| (name.clone(), &frag.selection_set.items)),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            CompileError::Unsupported("`_entities` needs an `... on Type` selection".into())
+        })?;
+
+    if !policy.is_table_exposed(&type_name) {
+        return Err(CompileError::UnknownField(type_name));
+    }
+    let table = schema
+        .table(&type_name)
+        .ok_or_else(|| CompileError::UnknownField(type_name.clone()))?;
+    if table.primary_key.is_empty() {
+        return Err(CompileError::Unsupported(format!(
+            "entity `{type_name}` has no primary key to resolve by"
+        )));
+    }
+
+    // One key tuple per representation, in order.
+    let reps = variables
+        .get("representations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut representation_keys = Vec::with_capacity(reps.len());
+    for rep in &reps {
+        let mut key = Vec::with_capacity(table.primary_key.len());
+        for pk in &table.primary_key {
+            key.push(json_to_sql(
+                rep.get(pk).unwrap_or(&serde_json::Value::Null),
+            )?);
+        }
+        representation_keys.push(key);
+    }
+
+    let mut cx = Cx {
+        dialect,
+        variables,
+        params: Vec::new(),
+        alias_seq: 1,
+    };
+    let qualifier = dialect.quote_ident(&type_name);
+    let (mut exprs, projection, delegations) =
+        compile_selection(inner, table, &qualifier, schema, policy, claims, &mut cx)?;
+    // Ensure the key columns are selected, so a row can be matched to its representation.
+    let mut key_indices = Vec::with_capacity(table.primary_key.len());
+    for pk in &table.primary_key {
+        let expr = format!("{qualifier}.{}", dialect.quote_ident(pk));
+        let idx = exprs.iter().position(|e| *e == expr).unwrap_or_else(|| {
+            exprs.push(expr);
+            exprs.len() - 1
+        });
+        key_indices.push(idx);
+    }
+
+    // WHERE: the key set + the row filter.
+    let mut clauses = Vec::new();
+    if !representation_keys.is_empty() {
+        if table.primary_key.len() == 1 {
+            let col = qualify(&qualifier, &table.primary_key[0], dialect);
+            let phs: Vec<String> = representation_keys
+                .iter()
+                .map(|k| cx.bind(k[0].clone()))
+                .collect();
+            clauses.push(format!("{col} IN ({})", phs.join(", ")));
+        } else {
+            let cols = table
+                .primary_key
+                .iter()
+                .map(|pk| qualify(&qualifier, pk, dialect))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tuples: Vec<String> = representation_keys
+                .iter()
+                .map(|k| {
+                    let phs = k
+                        .iter()
+                        .map(|v| cx.bind(v.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({phs})")
+                })
+                .collect();
+            clauses.push(format!("({cols}) IN ({})", tuples.join(", ")));
+        }
+    }
+    if let Some(filter) = policy.row_filter(&type_name, claims)? {
+        for term in filter.terms {
+            let col = qualify(&qualifier, &term.column, dialect);
+            let ph = cx.bind(term.value);
+            clauses.push(format!("{col} = {ph}"));
+        }
+    }
+
+    let select_list = if exprs.is_empty() {
+        "1".to_string()
+    } else {
+        exprs.join(", ")
+    };
+    let mut sql = format!("SELECT {select_list} FROM {qualifier}");
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+
+    Ok(EntitiesPlan {
+        sql,
+        params: cx.params,
+        projection,
+        delegations,
+        key_indices,
+        representation_keys,
+    })
 }
 
 /// Whether `query`'s operation is a mutation (so the caller runs it on a write transaction
@@ -1371,6 +1574,47 @@ mod tests {
             &super::super::dialect::Sqlite,
         )?;
         Ok(plan.statements.remove(0))
+    }
+
+    #[test]
+    fn entities_compiles_to_a_keyed_select_ordered_by_representation() {
+        let policy = open_policy();
+        let vars = serde_json::json!({ "representations": [
+            { "__typename": "users", "id": "2" },
+            { "__typename": "users", "id": "1" },
+        ] });
+        let plan = compile_entities(
+            "query($representations:[_Any!]!){ _entities(representations:$representations){ ... on users { name } } }",
+            &vars,
+            &schema(),
+            &policy,
+            &Claims::default(),
+            &super::super::dialect::Sqlite,
+        )
+        .unwrap();
+        // The key column is selected (for the join) even though only `name` was asked.
+        assert!(plan.sql.contains(r#""users"."name""#), "sql: {}", plan.sql);
+        assert!(
+            plan.sql.contains(r#""users"."id" IN (?1, ?2)"#),
+            "sql: {}",
+            plan.sql
+        );
+        assert_eq!(
+            plan.params,
+            vec![SqlValue::Text("2".into()), SqlValue::Text("1".into())]
+        );
+        // Representation order is preserved (2 before 1) for the runner to join back by.
+        assert_eq!(
+            plan.representation_keys,
+            vec![
+                vec![SqlValue::Text("2".into())],
+                vec![SqlValue::Text("1".into())]
+            ]
+        );
+        assert!(is_entities_query(
+            "{ _entities(representations: []) { __typename } }"
+        ));
+        assert!(!is_entities_query("{ users { id } }"));
     }
 
     #[test]
