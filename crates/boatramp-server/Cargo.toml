@@ -25,6 +25,7 @@ handlers = [
   "boatramp-handlers/invoke",
   "dep:chrono",
   "dep:graphql-parser",
+  "dep:wasmparser",
 ]
 
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
@@ -116,6 +117,11 @@ hickory-resolver = { version = "0.24", optional = true }
 
 # JWT verification for the `oidc` control-plane auth feature. Optional.
 jsonwebtoken = { version = "9", optional = true }
+
+# Reads a component's `boatramp:function-manifest` custom section at deploy to detect a
+# self-declared GraphQL subgraph (`handlers` feature). Optional; the static server never parses
+# wasm.
+wasmparser = { version = "0.252", optional = true }
 
 # On-the-fly response compression (`compression` feature): pure-Rust gzip +
 # brotli stream encoders over the body stream. Optional.

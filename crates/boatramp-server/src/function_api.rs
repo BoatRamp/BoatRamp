@@ -102,14 +102,55 @@ pub(super) struct DeployFunctionQuery {
     register_subgraph: Option<bool>,
 }
 
-/// If `name` is an already-registered federation subgraph, refresh its registered SDL from the
-/// **pending** component and **block** (return an error response) if the new schema does not
-/// compose — so a subgraph redeploy can never leave the project's supergraph invalid or stale.
-/// First registration stays an explicit operator action (a not-yet-registered function is left
-/// alone; register it with `PUT …/graphql/subgraphs/{name}/function`), and
-/// `?register_subgraph=false` skips this entirely. `Ok(())` ⇒ proceed with the deploy.
+/// Invoke `f` with the bytes of every `boatramp:function-manifest` custom section in a
+/// component — descending into its embedded core module(s), where the guest's `#[link_section]`
+/// manifest lives. Best-effort: a malformed component just yields nothing.
 #[cfg(feature = "handlers")]
-async fn refresh_registered_subgraph(
+fn scan_manifest_sections(bytes: &[u8], f: &mut impl FnMut(&[u8])) {
+    use wasmparser::{Parser, Payload};
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload {
+            Ok(Payload::CustomSection(reader)) if reader.name() == "boatramp:function-manifest" => {
+                f(reader.data());
+            }
+            Ok(Payload::ModuleSection {
+                unchecked_range, ..
+            }) => scan_manifest_sections(&bytes[unchecked_range], f),
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// Whether a component **self-declares** a GraphQL federation subgraph: any NDJSON line of its
+/// `boatramp:function-manifest` section carries `"subgraph": true` (the shim's
+/// `#[graphql_subgraph]` emits this). This is the intent signal that lets a first deploy
+/// auto-register the subgraph — a function that does not declare it is never touched.
+#[cfg(feature = "handlers")]
+fn component_declares_subgraph(component: &[u8]) -> bool {
+    let mut declared = false;
+    scan_manifest_sections(component, &mut |data| {
+        for line in data.split(|&b| b == b'\n') {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+                if v.get("subgraph").and_then(serde_json::Value::as_bool) == Some(true) {
+                    declared = true;
+                }
+            }
+        }
+    });
+    declared
+}
+
+/// Keep the project's GraphQL supergraph correct across a function deploy. The function is a
+/// subgraph to (re)register when it is **already registered** *or* its component
+/// **self-declares** one (the shim marker); in either case introspect the **pending** version's
+/// `_service { sdl }` before its activation flips and **block** the deploy (an error response) if
+/// the new schema does not compose. So a subgraph auto-registers on first deploy, refreshes on
+/// each later deploy, and can never leave the supergraph stale or broken. An ordinary function
+/// (no registry entry, no marker) is untouched, `?register_subgraph=false` opts out, and a node
+/// with no engine degrades to a skip. `Ok(())` ⇒ proceed with the deploy.
+#[cfg(feature = "handlers")]
+async fn maybe_register_subgraph(
     deploy: &DeployStore,
     handlers: &HandlerRuntime,
     project: boatramp_core::project::ProjectRef<'_>,
@@ -119,26 +160,30 @@ async fn refresh_registered_subgraph(
     register: Option<bool>,
 ) -> Result<(), Response> {
     if register == Some(false) {
-        return Ok(()); // explicit opt-out
+        return Ok(()); // explicit opt-out (the coordinated-migration escape hatch)
     }
     let kv = deploy.kv().as_ref();
     if !crate::graphql_registry::is_subgraph(kv, project.as_str(), name).await {
-        return Ok(()); // first registration is explicit
+        // First deploy: only auto-register a component that declares itself a subgraph; any
+        // ordinary function (or an unreadable blob) deploys untouched.
+        match crate::handler_dispatch::read_blob_fully(deploy, component).await {
+            Ok(blob) if component_declares_subgraph(&blob) => {}
+            _ => return Ok(()),
+        }
     }
     let sdl = match handlers
         .introspect_subgraph_sdl(deploy, project, function, component)
         .await
     {
         Ok(sdl) => sdl,
-        // No engine on this node — skip rather than block; the registered SDL isn't refreshed.
+        // No engine on this node — skip rather than block; the SDL simply isn't (re)published.
         Err(crate::function_runtime::SubgraphSdlError::Unavailable) => return Ok(()),
         Err(crate::function_runtime::SubgraphSdlError::NotASubgraph) => {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!(
-                    "the new version of registered subgraph `{name}` no longer answers \
-                     `{{ _service {{ sdl }} }}`; deploy with `?register_subgraph=false` to keep \
-                     the current SDL, or unregister it first\n"
+                    "subgraph `{name}` does not answer `{{ _service {{ sdl }} }}`; deploy with \
+                     `?register_subgraph=false` to skip subgraph registration\n"
                 ),
             )
                 .into_response())
@@ -146,7 +191,7 @@ async fn refresh_registered_subgraph(
         Err(crate::function_runtime::SubgraphSdlError::InvokeFailed(msg)) => {
             return Err((
                 StatusCode::BAD_GATEWAY,
-                format!("could not introspect subgraph `{name}`'s new version: {msg}\n"),
+                format!("could not introspect subgraph `{name}`: {msg}\n"),
             )
                 .into_response())
         }
@@ -156,8 +201,8 @@ async fn refresh_registered_subgraph(
         Err(crate::graphql_registry::PublishError::Composition(e)) => Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "the new version of subgraph `{name}` does not compose: {e}\n(deploy with \
-                 `?register_subgraph=false` to skip, or unregister a conflicting subgraph first)\n"
+                "subgraph `{name}` does not compose: {e}\n(deploy with `?register_subgraph=false` \
+                 to skip, or unregister a conflicting subgraph first)\n"
             ),
         )
             .into_response()),
@@ -169,9 +214,9 @@ async fn refresh_registered_subgraph(
     }
 }
 
-/// No wasm engine in this build → nothing to refresh; the deploy proceeds unchanged.
+/// No wasm engine in this build → no subgraph registry to maintain; the deploy proceeds unchanged.
 #[cfg(not(feature = "handlers"))]
-async fn refresh_registered_subgraph(
+async fn maybe_register_subgraph(
     _deploy: &DeployStore,
     _handlers: &HandlerRuntime,
     _project: boatramp_core::project::ProjectRef<'_>,
@@ -229,10 +274,10 @@ pub(super) async fn deploy_function(
         ),
         Err(err) => return deploy_error_response(err),
     };
-    // Before the new version becomes active: if this function is a registered federation
-    // subgraph, refresh its SDL and refuse the deploy if the new schema no longer composes with
-    // the project's supergraph (a redeploy must never leave the supergraph invalid or stale).
-    if let Err(resp) = refresh_registered_subgraph(
+    // Before the new version becomes active: if this function is (or self-declares) a federation
+    // subgraph, (re)register its SDL and refuse the deploy if the new schema does not compose with
+    // the project's supergraph (a deploy must never leave the supergraph invalid or stale).
+    if let Err(resp) = maybe_register_subgraph(
         &deploy,
         &handlers,
         project.as_ref(),
@@ -392,7 +437,7 @@ mod tests {
         let f = a_function();
 
         // Not a registered subgraph → no-op; nothing is published.
-        refresh_registered_subgraph(
+        maybe_register_subgraph(
             &deploy,
             &handlers,
             project,
@@ -417,7 +462,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_registered_subgraph(
+        maybe_register_subgraph(
             &deploy,
             &handlers,
             project,
@@ -431,7 +476,7 @@ mod tests {
 
         // Registered, no opt-out, but this node has no engine → Unavailable degrades to a skip
         // rather than blocking the deploy.
-        refresh_registered_subgraph(
+        maybe_register_subgraph(
             &deploy,
             &handlers,
             project,
@@ -442,5 +487,52 @@ mod tests {
         )
         .await
         .expect("a node with no engine skips the refresh, it does not block");
+    }
+
+    /// A minimal core wasm module carrying one `boatramp:function-manifest` custom section — the
+    /// shape the guest's `#[link_section]` manifest takes (here at the top level; a real
+    /// component nests it in an embedded core module, exercised end-to-end elsewhere).
+    fn leb128(mut n: usize, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    fn module_with_manifest(manifest: &[u8]) -> Vec<u8> {
+        let name = b"boatramp:function-manifest";
+        let mut payload = Vec::new();
+        leb128(name.len(), &mut payload);
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(manifest);
+        let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // \0asm + version 1
+        module.push(0x00); // custom section id
+        leb128(payload.len(), &mut module);
+        module.extend_from_slice(&payload);
+        module
+    }
+
+    #[test]
+    fn a_subgraph_marker_in_the_manifest_is_detected() {
+        assert!(component_declares_subgraph(&module_with_manifest(
+            br#"{"name":"schema","triggers":[{"on":"http","route":"POST /graphql"}],"authorize":"public","subgraph":true}"#
+        )));
+        // An ordinary managed handler manifest is not a subgraph.
+        assert!(!component_declares_subgraph(&module_with_manifest(
+            br#"{"name":"orders","authorize":"tenant"}"#
+        )));
+        // No manifest section at all → not a subgraph.
+        assert!(!component_declares_subgraph(&[
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00
+        ]));
+        // Garbage bytes are handled gracefully (best-effort parse).
+        assert!(!component_declares_subgraph(b"not a wasm module"));
     }
 }

@@ -223,27 +223,33 @@ does not compose** (a field co-owned without `@shareable`, or SDL that does not
 parse) — a bad publish never corrupts the registry. Read the composed
 supergraph with `GET /api/projects/acme/graphql/supergraph`.
 
-A **function subgraph** can register itself by introspection instead of pasting SDL:
-deploy the function, then let boatramp read its schema from the federation `_service
-{ sdl }` field and publish it (no hand-written SDL — the parallel of the SQL path
-below):
+A **function subgraph** registers itself — no hand-written SDL, and (for a subgraph built
+with the [uchron shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim)'s
+`#[graphql_subgraph]`) **no separate call at all**:
 
-```bash
-curl -X PUT https://api.example.com/api/projects/acme/graphql/subgraphs/accounts/function
-```
+- **Zero-touch.** A component that self-declares a subgraph (a `"subgraph": true` marker in
+  its `boatramp:function-manifest`) is **auto-registered on deploy**: boatramp reads the
+  marker from the uploaded component, introspects the pending version's `_service { sdl }`,
+  and publishes it. Just `boatramp deploy` (or `PUT /api/functions/accounts`) — the subgraph
+  joins the supergraph automatically.
+- **Explicit.** For a hand-written subgraph (or to register out-of-band), call it directly —
+  boatramp introspects the *deployed* function and publishes:
 
-boatramp invokes the deployed function anonymously (the SDL is public), publishes the
-returned SDL (recomposed + validated like any subgraph), and records it as a function
-backend. If the function is not deployed yet the call is a `409`; if it does not answer
+  ```bash
+  curl -X PUT https://api.example.com/api/projects/acme/graphql/subgraphs/accounts/function
+  ```
+
+boatramp invokes the function anonymously (the SDL is public), publishes the returned SDL
+(recomposed + validated like any subgraph), and records it as a function backend. If the
+function is not deployed yet the explicit call is a `409`; if it does not answer
 `{ _service { sdl } }` (not a federation subgraph) it is a `422`; a schema that does not
 compose is a `400`.
 
 Once a function is a registered subgraph, **each later redeploy refreshes its registered
 SDL automatically** — boatramp introspects the *pending* version before it goes live and
 **refuses the deploy (`400`) if the new schema no longer composes** with the rest of the
-supergraph, so the composed graph is never left stale or broken. First registration stays
-explicit (the `…/function` call above); an ordinary, non-subgraph function deploy is
-unaffected.
+supergraph, so the composed graph is never left stale or broken. An ordinary, non-subgraph
+function deploy is unaffected (no marker, no registry entry → no-op).
 
 For a **coordinated migration** across several subgraphs (an entity-key change, moving a
 field's ownership) where an intermediate step can't compose, use the escape hatches:
