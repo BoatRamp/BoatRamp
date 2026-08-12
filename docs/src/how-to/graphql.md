@@ -236,7 +236,21 @@ boatramp invokes the deployed function anonymously (the SDL is public), publishe
 returned SDL (recomposed + validated like any subgraph), and records it as a function
 backend. If the function is not deployed yet the call is a `409`; if it does not answer
 `{ _service { sdl } }` (not a federation subgraph) it is a `422`; a schema that does not
-compose is a `400`. Re-run it after a schema change to refresh the registered SDL.
+compose is a `400`.
+
+Once a function is a registered subgraph, **each later redeploy refreshes its registered
+SDL automatically** — boatramp introspects the *pending* version before it goes live and
+**refuses the deploy (`400`) if the new schema no longer composes** with the rest of the
+supergraph, so the composed graph is never left stale or broken. First registration stays
+explicit (the `…/function` call above); an ordinary, non-subgraph function deploy is
+unaffected.
+
+For a **coordinated migration** across several subgraphs (an entity-key change, moving a
+field's ownership) where an intermediate step can't compose, use the escape hatches:
+deploy the new version *without* touching the registry with
+`PUT /api/functions/accounts?register_subgraph=false`, or unregister the subgraph first
+with `DELETE /api/projects/acme/graphql/subgraphs/accounts`, then re-register when the set
+composes again.
 
 A subgraph can also be **SQL-backed** — the [data connector](#graphql-from-your-database-no-resolver-code)
 acting as a federation subgraph. Register it by naming a site's managed database and

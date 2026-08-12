@@ -129,6 +129,26 @@ pub(crate) async fn supergraph(
     compose(&load_subgraphs(kv, project).await)
 }
 
+/// Whether `name` is a currently-registered subgraph of `project` (an SDL is stored). Used to
+/// decide, on a function redeploy, whether to auto-refresh its registered SDL — first
+/// registration stays an explicit operator action.
+pub(crate) async fn is_subgraph(kv: &dyn KvStore, project: &str, name: &str) -> bool {
+    matches!(kv.get(&subgraph_key(project, name)).await, Ok(Some(_)))
+}
+
+/// Remove subgraph `name` from `project`'s registry (its SDL + backend record). The escape
+/// hatch for a coordinated schema migration: it does **not** recompose or validate the
+/// remainder, so an operator can deliberately drop a subgraph that others depend on as one step
+/// of a multi-subgraph change (the composed supergraph is recomposed lazily on read). Idempotent.
+pub(crate) async fn unpublish(kv: &dyn KvStore, project: &str, name: &str) -> Result<(), String> {
+    kv.delete(&subgraph_key(project, name))
+        .await
+        .map_err(|e| e.to_string())?;
+    kv.delete(&backend_key(project, name))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The names of the currently-registered subgraphs for `project`.
 pub(crate) async fn subgraph_names(kv: &dyn KvStore, project: &str) -> Vec<String> {
     let prefix = subgraph_prefix(project);
@@ -211,5 +231,22 @@ mod tests {
             .await
             .unwrap();
         assert!(subgraph_names(&kv, "other").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_subgraph_reflects_registration_and_unpublish_removes_it() {
+        let kv = MemoryKv::new();
+        assert!(!is_subgraph(&kv, "acme", "accounts").await);
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        put_subgraph_backend(&kv, "acme", "accounts", &SubgraphBackendSpec::Function)
+            .await
+            .unwrap();
+        assert!(is_subgraph(&kv, "acme", "accounts").await);
+
+        unpublish(&kv, "acme", "accounts").await.unwrap();
+        assert!(!is_subgraph(&kv, "acme", "accounts").await);
+        assert!(subgraph_names(&kv, "acme").await.is_empty());
+        // Idempotent: unpublishing a gone subgraph is not an error.
+        unpublish(&kv, "acme", "accounts").await.unwrap();
     }
 }

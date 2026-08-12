@@ -244,7 +244,10 @@ pub fn router_with(
         // GraphQL subgraph schema registry: publish a subgraph's SDL (recomposes +
         // validates the supergraph) and read the composed supergraph. Uses the
         // graphql-parser dependency, so it is behind the handlers feature.
-        .route("/api/graphql/subgraphs/{name}", put(put_graphql_subgraph))
+        .route(
+            "/api/graphql/subgraphs/{name}",
+            put(put_graphql_subgraph).delete(delete_graphql_subgraph),
+        )
         // Register a SQL-backed federation subgraph: introspect the named site's database,
         // generate its `@key` SDL, and record the SQL backend.
         .route(

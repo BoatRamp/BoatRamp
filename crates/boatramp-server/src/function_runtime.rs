@@ -696,6 +696,73 @@ async fn buffer_invoke_response(response: Response) -> boatramp_handlers::Invoke
     }
 }
 
+/// Why introspecting a function subgraph's SDL failed.
+#[cfg(feature = "handlers")]
+#[derive(Debug)]
+pub(super) enum SubgraphSdlError {
+    /// The handler runtime has no wasm engine, so the component cannot be run to introspect it.
+    Unavailable,
+    /// The component could not be run (trap, timeout, overload) or produced no usable response.
+    InvokeFailed(String),
+    /// The component ran but did not answer `{ _service { sdl } }` — it is not a federation
+    /// subgraph.
+    NotASubgraph,
+}
+
+/// Run `{ _service { sdl } }` against a **specific component blob** (by hash) and return its
+/// federation SDL. Unlike the [`Invoker`] path — which resolves the function's *active* version
+/// — this targets an arbitrary component, so a **pending** (about-to-be-activated) subgraph
+/// version can be composed-checked *before* its activation flips. Anonymous (a schema read needs
+/// no caller identity), with a timeout so a hung guest can't wedge the deploy.
+#[cfg(feature = "handlers")]
+pub(super) async fn introspect_service_sdl(
+    inner: &HandlerRuntimeInner,
+    deploy: &DeployStore,
+    project: ProjectRef<'_>,
+    function: &boatramp_core::function::Function,
+    component: &str,
+) -> Result<String, SubgraphSdlError> {
+    let body = serde_json::json!({ "query": "{ _service { sdl } }" })
+        .to_string()
+        .into_bytes();
+    let invoke = boatramp_handlers::InvokeRequest {
+        method: "POST".to_string(),
+        path: "/".to_string(),
+        headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+        body,
+    };
+    let request = build_internal_request(invoke).map_err(SubgraphSdlError::InvokeFailed)?;
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execute_function(inner, deploy, project, function, component, request, 0),
+    )
+    .await;
+    let (response, _ms) = match run {
+        Ok(pair) => pair,
+        Err(_elapsed) => {
+            return Err(SubgraphSdlError::InvokeFailed(
+                "timed out answering `_service { sdl }`".to_string(),
+            ))
+        }
+    };
+    let buffered = buffer_invoke_response(response).await;
+    if buffered.status >= 500 {
+        return Err(SubgraphSdlError::InvokeFailed(format!(
+            "status {}",
+            buffered.status
+        )));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&buffered.body).unwrap_or(serde_json::Value::Null);
+    match parsed
+        .pointer("/data/_service/sdl")
+        .and_then(|v| v.as_str())
+    {
+        Some(sdl) if !sdl.trim().is_empty() => Ok(sdl.to_string()),
+        _ => Err(SubgraphSdlError::NotASubgraph),
+    }
+}
+
 /// Adapt a [`Response`] into a streaming [`InvokeStreamResponse`](boatramp_handlers::InvokeStreamResponse):
 /// status + headers eagerly, the body as a chunk stream the caller pulls on demand
 /// (never buffered whole in host memory). A body-stream error surfaces as a chunk error.

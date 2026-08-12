@@ -555,6 +555,27 @@ pub(super) async fn put_graphql_function_subgraph(
     axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
 }
 
+/// `DELETE /api/projects/{proj}/graphql/subgraphs/{name}` — unregister a subgraph (remove its
+/// SDL + backend record). The escape hatch for a coordinated schema migration: it does **not**
+/// recompose the remainder, so an operator can deliberately drop a subgraph as one step of a
+/// multi-subgraph change. Idempotent → `204`.
+#[cfg(feature = "handlers")]
+pub(super) async fn delete_graphql_subgraph(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    let kv = deploy.kv().as_ref();
+    match crate::graphql_registry::unpublish(kv, &project.0, &name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("registry store error: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /api/projects/{proj}/graphql/supergraph` — the composed supergraph summary
 /// (subgraphs, entities, root fields) for the project.
 #[cfg(feature = "handlers")]

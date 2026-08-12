@@ -48,8 +48,8 @@ pub(crate) use admin_api::{
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
-    get_graphql_supergraph, put_graphql_function_subgraph, put_graphql_sql_subgraph,
-    put_graphql_subgraph,
+    delete_graphql_subgraph, get_graphql_supergraph, put_graphql_function_subgraph,
+    put_graphql_sql_subgraph, put_graphql_subgraph,
 };
 mod auth;
 #[cfg(feature = "console")]
@@ -106,7 +106,7 @@ pub(crate) use function_api::{
     alias_function, deploy_function, list_functions, remove_function, rollback_function,
 };
 #[cfg(all(test, feature = "handlers"))]
-use function_api::{AliasBody, FunctionUpsert, RollbackBody};
+use function_api::{AliasBody, DeployFunctionQuery, FunctionUpsert, RollbackBody};
 mod gateway;
 mod host;
 pub(crate) use host::{is_local_host, parse_deploy_host, strip_port};
@@ -345,6 +345,28 @@ impl HandlerRuntime {
         self.inner
             .as_ref()
             .and_then(|inner| inner.invoker.get().cloned())
+    }
+
+    /// Introspect a **specific component's** federation SDL by running `{ _service { sdl } }`
+    /// against it — targeting a pending (not-yet-active) version so a subgraph redeploy can be
+    /// composed-checked before it goes live. `Unavailable` if this node has no wasm engine.
+    #[cfg(feature = "handlers")]
+    pub(crate) async fn introspect_subgraph_sdl(
+        &self,
+        deploy: &DeployStore,
+        project: boatramp_core::project::ProjectRef<'_>,
+        function: &boatramp_core::function::Function,
+        component: &str,
+    ) -> Result<String, function_runtime::SubgraphSdlError> {
+        match self.inner.as_ref() {
+            Some(inner) => {
+                function_runtime::introspect_service_sdl(
+                    inner, deploy, project, function, component,
+                )
+                .await
+            }
+            None => Err(function_runtime::SubgraphSdlError::Unavailable),
+        }
     }
 
     /// Wire the function-to-function invoke resolver (FI). Set once at startup,
@@ -1431,6 +1453,8 @@ mod tests {
             deploy_function(
                 State(deploy.clone()),
                 axum::extract::Extension(crate::ProjectContext::default()),
+                axum::extract::Extension(Arc::new(crate::HandlerRuntime::disabled())),
+                axum::extract::Query(DeployFunctionQuery::default()),
                 Path("greeter".to_string()),
                 Json(FunctionUpsert {
                     component: v1.clone(),
@@ -1449,6 +1473,8 @@ mod tests {
             deploy_function(
                 State(deploy.clone()),
                 axum::extract::Extension(crate::ProjectContext::default()),
+                axum::extract::Extension(Arc::new(crate::HandlerRuntime::disabled())),
+                axum::extract::Query(DeployFunctionQuery::default()),
                 Path("greeter".to_string()),
                 Json(FunctionUpsert {
                     component: v2.clone(),
@@ -1527,6 +1553,8 @@ mod tests {
         let resp = deploy_function(
             State(empty),
             axum::extract::Extension(crate::ProjectContext::default()),
+            axum::extract::Extension(Arc::new(crate::HandlerRuntime::disabled())),
+            axum::extract::Query(DeployFunctionQuery::default()),
             Path("orphan".to_string()),
             Json(FunctionUpsert {
                 component: v1.clone(),

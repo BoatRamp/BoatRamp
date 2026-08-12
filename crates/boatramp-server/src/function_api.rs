@@ -91,6 +91,98 @@ pub(super) struct FunctionUpsert {
     pub(super) lifecycle: boatramp_core::function::Lifecycle,
 }
 
+/// Query for `PUT /api/functions/:name`.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct DeployFunctionQuery {
+    /// When this function is an **already-registered** federation subgraph, whether to refresh
+    /// its registered SDL from the new version and block the deploy if the new schema no longer
+    /// composes (default `true`). Set `false` to deploy without touching the registry — the
+    /// escape hatch for a coordinated multi-subgraph migration.
+    #[serde(default)]
+    register_subgraph: Option<bool>,
+}
+
+/// If `name` is an already-registered federation subgraph, refresh its registered SDL from the
+/// **pending** component and **block** (return an error response) if the new schema does not
+/// compose — so a subgraph redeploy can never leave the project's supergraph invalid or stale.
+/// First registration stays an explicit operator action (a not-yet-registered function is left
+/// alone; register it with `PUT …/graphql/subgraphs/{name}/function`), and
+/// `?register_subgraph=false` skips this entirely. `Ok(())` ⇒ proceed with the deploy.
+#[cfg(feature = "handlers")]
+async fn refresh_registered_subgraph(
+    deploy: &DeployStore,
+    handlers: &HandlerRuntime,
+    project: boatramp_core::project::ProjectRef<'_>,
+    name: &str,
+    function: &boatramp_core::function::Function,
+    component: &str,
+    register: Option<bool>,
+) -> Result<(), Response> {
+    if register == Some(false) {
+        return Ok(()); // explicit opt-out
+    }
+    let kv = deploy.kv().as_ref();
+    if !crate::graphql_registry::is_subgraph(kv, project.as_str(), name).await {
+        return Ok(()); // first registration is explicit
+    }
+    let sdl = match handlers
+        .introspect_subgraph_sdl(deploy, project, function, component)
+        .await
+    {
+        Ok(sdl) => sdl,
+        // No engine on this node — skip rather than block; the registered SDL isn't refreshed.
+        Err(crate::function_runtime::SubgraphSdlError::Unavailable) => return Ok(()),
+        Err(crate::function_runtime::SubgraphSdlError::NotASubgraph) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "the new version of registered subgraph `{name}` no longer answers \
+                     `{{ _service {{ sdl }} }}`; deploy with `?register_subgraph=false` to keep \
+                     the current SDL, or unregister it first\n"
+                ),
+            )
+                .into_response())
+        }
+        Err(crate::function_runtime::SubgraphSdlError::InvokeFailed(msg)) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("could not introspect subgraph `{name}`'s new version: {msg}\n"),
+            )
+                .into_response())
+        }
+    };
+    match crate::graphql_registry::publish(kv, project.as_str(), name, &sdl).await {
+        Ok(_) => Ok(()),
+        Err(crate::graphql_registry::PublishError::Composition(e)) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the new version of subgraph `{name}` does not compose: {e}\n(deploy with \
+                 `?register_subgraph=false` to skip, or unregister a conflicting subgraph first)\n"
+            ),
+        )
+            .into_response()),
+        Err(crate::graphql_registry::PublishError::Store(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("registry store error: {e}\n"),
+        )
+            .into_response()),
+    }
+}
+
+/// No wasm engine in this build → nothing to refresh; the deploy proceeds unchanged.
+#[cfg(not(feature = "handlers"))]
+async fn refresh_registered_subgraph(
+    _deploy: &DeployStore,
+    _handlers: &HandlerRuntime,
+    _project: boatramp_core::project::ProjectRef<'_>,
+    _name: &str,
+    _function: &boatramp_core::function::Function,
+    _component: &str,
+    _register: Option<bool>,
+) -> Result<(), Response> {
+    Ok(())
+}
+
 /// `PUT /api/functions/:name` (FA-2) — deploy a version of a top-level function.
 /// The component blob must already be uploaded. Creates the function if new;
 /// otherwise appends + activates the version (idempotent per component hash).
@@ -98,6 +190,8 @@ pub(super) struct FunctionUpsert {
 pub(super) async fn deploy_function(
     State(deploy): State<DeployStore>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    axum::extract::Query(q): axum::extract::Query<DeployFunctionQuery>,
     Path(name): Path<String>,
     Json(body): Json<FunctionUpsert>,
 ) -> Response {
@@ -135,6 +229,22 @@ pub(super) async fn deploy_function(
         ),
         Err(err) => return deploy_error_response(err),
     };
+    // Before the new version becomes active: if this function is a registered federation
+    // subgraph, refresh its SDL and refuse the deploy if the new schema no longer composes with
+    // the project's supergraph (a redeploy must never leave the supergraph invalid or stale).
+    if let Err(resp) = refresh_registered_subgraph(
+        &deploy,
+        &handlers,
+        project.as_ref(),
+        &name,
+        &f,
+        &body.component,
+        q.register_subgraph,
+    )
+    .await
+    {
+        return resp;
+    }
     if let Err(err) = deploy.put_function(project.as_ref(), &f).await {
         return deploy_error_response(err);
     }
@@ -207,5 +317,130 @@ pub(super) async fn remove_function(
     match deploy.delete_function(project.as_ref(), &name).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => deploy_error_response(err),
+    }
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod tests {
+    use super::*;
+    use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner};
+    use boatramp_core::kv::MemoryKv;
+    use std::sync::Arc;
+
+    /// A blob store the subgraph-refresh guard never reaches (it returns before touching blobs).
+    struct NullStorage;
+    #[async_trait::async_trait]
+    impl boatramp_core::Storage for NullStorage {
+        async fn get(
+            &self,
+            _: &str,
+        ) -> Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<boatramp_core::GetObject, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: boatramp_core::ByteStream,
+            _: boatramp_core::PutMeta,
+        ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::unsupported("null"))
+        }
+        async fn head(
+            &self,
+            _: &str,
+        ) -> Result<boatramp_core::ObjectMeta, boatramp_core::StorageError> {
+            Err(boatramp_core::StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), boatramp_core::StorageError> {
+            Ok(())
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> Result<Vec<boatramp_core::ObjectMeta>, boatramp_core::StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn a_function() -> Function {
+        Function::new(
+            "accounts",
+            Owner::Project("default".to_string()),
+            "component-hash",
+            FunctionConfig::default(),
+            Lifecycle::default(),
+            0,
+        )
+    }
+
+    /// The subgraph-refresh hook must never block or touch the registry for a function that is
+    /// not a registered subgraph, on an explicit opt-out, or on a node with no wasm engine — so
+    /// an ordinary function deploy (and the coordinated-migration escape hatch) is unaffected.
+    #[tokio::test]
+    async fn refresh_is_a_noop_unless_the_function_is_a_registered_subgraph() {
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let handlers = HandlerRuntime::disabled();
+        let project = boatramp_core::project::ProjectRef::new("default");
+        let f = a_function();
+
+        // Not a registered subgraph → no-op; nothing is published.
+        refresh_registered_subgraph(
+            &deploy,
+            &handlers,
+            project,
+            "accounts",
+            &f,
+            "component-hash",
+            None,
+        )
+        .await
+        .expect("an unregistered function deploys freely");
+        assert!(
+            !crate::graphql_registry::is_subgraph(deploy.kv().as_ref(), "default", "accounts")
+                .await
+        );
+
+        // Now registered: `?register_subgraph=false` opts out (the migration escape hatch).
+        crate::graphql_registry::publish(
+            deploy.kv().as_ref(),
+            "default",
+            "accounts",
+            "type Query { x: Int }",
+        )
+        .await
+        .unwrap();
+        refresh_registered_subgraph(
+            &deploy,
+            &handlers,
+            project,
+            "accounts",
+            &f,
+            "component-hash",
+            Some(false),
+        )
+        .await
+        .expect("opt-out never blocks");
+
+        // Registered, no opt-out, but this node has no engine → Unavailable degrades to a skip
+        // rather than blocking the deploy.
+        refresh_registered_subgraph(
+            &deploy,
+            &handlers,
+            project,
+            "accounts",
+            &f,
+            "component-hash",
+            None,
+        )
+        .await
+        .expect("a node with no engine skips the refresh, it does not block");
     }
 }
