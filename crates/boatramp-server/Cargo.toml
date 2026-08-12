@@ -181,6 +181,9 @@ boatramp-core = { workspace = true }
 # in the tree via `boatramp-core[authz]`; exposing it directly is cheap.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Ed25519 for signing a test app-token the GraphQL data connector verifies via a JWKS
+# (already in the tree via `boatramp-core[authz]`). Deterministic key, no keygen rng.
+ed25519-dalek = { version = "2" }
 # The SQL backend (libsql), for the handler `sql` e2e conformance test (gated
 # on the `handlers` feature).
 boatramp-storage = { workspace = true, features = ["sql"] }

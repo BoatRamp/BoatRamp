@@ -710,6 +710,37 @@ pub struct HandlerGraphqlDataConfig {
     /// unless a site opts in.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mutations: bool,
+    /// Bind `row_filter` claims from a **verified application bearer token** (the app's own
+    /// IdP), not only the host-asserted `project`. This unlocks multi-tenant-within-one-project
+    /// isolation: the app's tokens carry a tenant claim (e.g. `tid`) a `row_filter` scopes rows
+    /// by. A claim value is used **only** from a fully verified token; a missing/invalid token
+    /// leaves the claim absent, so a filter referencing it denies (never widens). Absent ⇒ only
+    /// the host `project` claim is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claims_from_token: Option<HandlerGraphqlTokenClaims>,
+}
+
+/// How to verify an application bearer token whose claims a `row_filter` may bind (see
+/// [`HandlerGraphqlDataConfig::claims_from_token`]). The token is verified against `issuer` +
+/// the JWKS (signature, `iss`, `exp`/`nbf`, `kid`); on success its scalar claims are merged in
+/// beside the host-asserted `project` (which a token can never override).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HandlerGraphqlTokenClaims {
+    /// The expected token issuer (`iss`).
+    pub issuer: String,
+    /// A **host environment variable** holding the app IdP's JWKS JSON — the operator maps
+    /// the app's public JWKS in, exactly like a handler secret. Re-read per request, so a
+    /// rotated JWKS takes effect without a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks_env: Option<String>,
+    /// Or a **URL** to fetch the JWKS from (cached per `kid`, refreshed on an unknown `kid` for
+    /// IdP key rollover). Operator-configured, so not a request-controlled fetch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// An optional expected audience (`aud`); unset skips audience validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
 }
 
 /// One exposed table's policy (see [`HandlerGraphqlDataConfig::tables`]).

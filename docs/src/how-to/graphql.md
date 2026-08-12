@@ -71,11 +71,42 @@ Two guarantees make this safe to point at real data:
 - **Deny-by-default.** Only the tables and columns you list are exposed; everything else is
   invisible and unqueryable. Selecting an unexposed column is an error, not a leak.
 - **Fail-closed row isolation.** A table's `row_filter` is applied to *every* access, its
-  value bound from a host-asserted claim (e.g. `project`). If the claim is absent the request
+  value bound from a verified claim (e.g. `project`). If the claim is absent the request
   is denied — a missing claim never widens access.
 
 Every value is a bound parameter (injection-safe), and every identifier comes only from the
 introspected, exposed schema. It's off by default; managed libsql is supported today.
+
+### Multi-tenant SaaS: isolate by a claim from your own app token
+
+By default a `row_filter` binds the host-asserted `project` claim — good for a project-per-tenant
+model. For a SaaS that keeps many tenants as **rows inside one project** (the Shopify shape),
+isolate by a claim from **your app's own bearer token** instead. Point the connector at your
+IdP's issuer + JWKS, and bind the tenant claim your tokens carry:
+
+```ron
+data: (
+    enabled: true,
+    // Verify the caller's `Authorization: Bearer` against your IdP; its claims become
+    // bindable. Map the app's public JWKS into a host env var (like a secret), or give a URL.
+    claims_from_token: ( issuer: "https://console.acme.com", jwks_env: "APP_JWKS" ),
+    tables: {
+        "portfolio_item": (
+            columns:   ["id", "title", "tenant_id"],
+            row_filter: [( column: "tenant_id", claim: "tid" )],   // `tid` from the verified token
+        ),
+    },
+)
+```
+
+The claim value is used **only from a fully verified token** — signature (RSA / EC / Ed25519,
+pinned to the JWKS key, never the token's `alg`), `iss`, `exp`/`nbf`, and a resolvable `kid`.
+A missing, expired, forged, or wrong-issuer token contributes no claim, so the filter denies
+(never "all rows"). The host-asserted `project` still applies and **a token can never override
+it**, so app-token isolation nests *inside* the project boundary. The same claim isolates at
+every depth (through relationships) and on every write (an insert is forced to carry the
+tenant), so there is nothing to miss. This is exactly what makes it safe to expose one shared
+database to many tenants with no resolver code.
 
 **Relationships.** Foreign keys become relationship fields — a to-one field for each outgoing
 FK and a to-many field for the rows that reference this one. A nested query resolves in **one

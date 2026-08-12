@@ -7067,6 +7067,322 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
     let _ = std::fs::remove_dir_all(&sql_dir);
 }
 
+/// The data connector isolates rows by a claim from a **verified application bearer token**
+/// (the app's own IdP), not only the host `project` — the multi-tenant-within-one-project
+/// case. A token for tenant `acme` sees only acme's rows (at the root, through a relationship,
+/// and on a mutation, which forces the tenant onto the new row); tenant `globex` sees only its
+/// own; and a request with no valid token is denied (the claim is absent → `MissingClaim`),
+/// never shown all rows. Drives the real router, connector, and libsql end to end.
+#[cfg(all(feature = "handlers", feature = "oidc"))]
+#[tokio::test]
+async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
+    use base64::Engine;
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlerGraphqlDataConfig,
+        HandlerGraphqlRowTerm, HandlerGraphqlTableConfig, HandlerGraphqlTokenClaims,
+        HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::sql::{SqlBackends, SqlValue};
+    use boatramp_handlers::{HandlerEngine, Limits};
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::collections::BTreeMap;
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+    const ISS: &str = "https://idp.test";
+
+    // The app IdP: a fixed Ed25519 key, its JWKS mapped into a host env var (as an operator
+    // would), and a signer that mints a token carrying the tenant claim `tid`.
+    let key = SigningKey::from_bytes(&[5u8; 32]);
+    let b64url = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let jwks = serde_json::json!({ "keys": [ {
+        "kty": "OKP", "crv": "Ed25519", "kid": "app",
+        "x": b64url(key.verifying_key().as_bytes()),
+    } ] })
+    .to_string();
+    std::env::set_var("TEST_GQL_MT_JWKS", &jwks);
+    let sign = |tid: &str| {
+        let header = b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "app" })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(
+            serde_json::json!({ "iss": ISS, "exp": 4_102_444_800_i64, "tid": tid })
+                .to_string()
+                .as_bytes(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        format!(
+            "{signing_input}.{}",
+            b64url(&key.sign(signing_input.as_bytes()).to_bytes())
+        )
+    };
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let sql_dir = std::env::temp_dir().join(format!("boatramp-conf-gqlmt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sql_dir);
+    let sql: Arc<dyn SqlBackends> = Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+
+    // Two tenants' data. `comment` c3 belongs to globex but hangs off acme's note n1 — so the
+    // relationship-depth filter must hide it from acme even though its parent is visible.
+    {
+        let backend = sql.database("default", "app", "").await.unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE note (id TEXT PRIMARY KEY, body TEXT, tid TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "CREATE TABLE comment (id TEXT PRIMARY KEY, note_id TEXT REFERENCES note(id), \
+             body TEXT, tid TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (id, body, tid) in [("n1", "acme note", "acme"), ("n2", "globex note", "globex")] {
+            tx.execute(
+                "INSERT INTO note (id, body, tid) VALUES (?1, ?2, ?3)",
+                &[
+                    SqlValue::Text(id.into()),
+                    SqlValue::Text(body.into()),
+                    SqlValue::Text(tid.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        for (id, note_id, body, tid) in [
+            ("c1", "n1", "acme comment", "acme"),
+            ("c2", "n2", "globex comment", "globex"),
+            ("c3", "n1", "globex snoop", "globex"),
+        ] {
+            tx.execute(
+                "INSERT INTO comment (id, note_id, body, tid) VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    SqlValue::Text(id.into()),
+                    SqlValue::Text(note_id.into()),
+                    SqlValue::Text(body.into()),
+                    SqlValue::Text(tid.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    // The data-connector site: both tables filtered by `tid = {claim:tid}`, mutations on, and
+    // claims sourced from the app IdP.
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "app", &id)
+        .await
+        .unwrap();
+    let tid_filter = || {
+        vec![HandlerGraphqlRowTerm {
+            column: "tid".into(),
+            claim: "tid".into(),
+        }]
+    };
+    let data_cfg = HandlerGraphqlDataConfig {
+        enabled: true,
+        mutations: true,
+        claims_from_token: Some(HandlerGraphqlTokenClaims {
+            issuer: ISS.into(),
+            jwks_env: Some("TEST_GQL_MT_JWKS".into()),
+            jwks_url: None,
+            audience: None,
+        }),
+        tables: BTreeMap::from([
+            (
+                "note".to_string(),
+                HandlerGraphqlTableConfig {
+                    columns: vec!["id".into(), "body".into()],
+                    row_filter: tid_filter(),
+                    resolvers: Default::default(),
+                },
+            ),
+            (
+                "comment".to_string(),
+                HandlerGraphqlTableConfig {
+                    columns: vec!["id".into(), "body".into(), "note_id".into()],
+                    row_filter: tid_filter(),
+                    resolvers: Default::default(),
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "app",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        data: Some(data_cfg),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let call = |app: axum::Router, token: Option<&str>, body: &'static str| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/_sites/app/graphql")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let mut req = builder.body(Body::from(body)).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        async move {
+            let response = app.oneshot(req).await.unwrap();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+
+    let acme = sign("acme");
+    let globex = sign("globex");
+
+    // Acme sees only its note, and — through the relationship — only its comment (globex's c3
+    // on acme's note is hidden by the depth filter).
+    let out = call(
+        app.clone(),
+        Some(&acme),
+        r#"{"query":"{ note { id body comment { body } } }"}"#,
+    )
+    .await;
+    let notes = out["data"]["note"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(notes.len(), 1, "acme sees only its note: {out}");
+    assert_eq!(
+        out["data"]["note"][0]["body"],
+        serde_json::json!("acme note")
+    );
+    let comments = out["data"]["note"][0]["comment"].as_array().unwrap();
+    assert_eq!(
+        comments.len(),
+        1,
+        "depth filter hides globex's comment on acme's note: {out}"
+    );
+    assert_eq!(comments[0]["body"], serde_json::json!("acme comment"));
+
+    // Globex sees only its own note.
+    let out = call(
+        app.clone(),
+        Some(&globex),
+        r#"{"query":"{ note { body } }"}"#,
+    )
+    .await;
+    assert_eq!(out["data"]["note"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        out["data"]["note"][0]["body"],
+        serde_json::json!("globex note")
+    );
+
+    // No token → the `tid` claim is absent → denied (never "all rows").
+    let out = call(app.clone(), None, r#"{"query":"{ note { id } }"}"#).await;
+    assert!(
+        out["data"].is_null(),
+        "no token must not return rows: {out}"
+    );
+    assert!(out["errors"][0]["message"].as_str().is_some());
+
+    // A mutation forces the tenant onto the new row: acme inserts a comment, and it's tagged
+    // acme, so acme (and only acme) then sees it.
+    let out = call(
+        app.clone(),
+        Some(&acme),
+        r#"{"query":"mutation { insert_comment(object: {id: \"c9\", note_id: \"n1\", body: \"fresh\"}) { affected_rows } }"}"#,
+    )
+    .await;
+    assert_eq!(
+        out["data"]["insert_comment"]["affected_rows"],
+        serde_json::json!(1),
+        "{out}"
+    );
+    let out = call(
+        app.clone(),
+        Some(&acme),
+        r#"{"query":"{ note { comment { body } } }"}"#,
+    )
+    .await;
+    let bodies: Vec<&str> = out["data"]["note"][0]["comment"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["body"].as_str())
+        .collect();
+    assert!(
+        bodies.contains(&"fresh"),
+        "acme sees its inserted comment: {out}"
+    );
+    // Globex still cannot see acme's new comment.
+    let out = call(app, Some(&globex), r#"{"query":"{ comment { body } }"}"#).await;
+    let globex_bodies: Vec<&str> = out["data"]["comment"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["body"].as_str())
+        .collect();
+    assert!(
+        !globex_bodies.contains(&"fresh"),
+        "globex must not see acme's insert: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
 // ---- 0.2.0 project-scoped API ---------------------------------------------
 
 /// A `/api/projects/<proj>/…` request operates on that project's data, and the

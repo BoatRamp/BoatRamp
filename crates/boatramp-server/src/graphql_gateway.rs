@@ -112,6 +112,8 @@ pub(crate) struct BackendRouter {
         String,
         (String, boatramp_core::config::HandlerGraphqlDataConfig),
     >,
+    /// The request's app bearer token, for a SQL subgraph's claim-bound `row_filter`.
+    bearer: Option<String>,
 }
 
 impl BackendRouter {
@@ -123,12 +125,14 @@ impl BackendRouter {
             String,
             (String, boatramp_core::config::HandlerGraphqlDataConfig),
         >,
+        bearer: Option<String>,
     ) -> Self {
         Self {
             invoker,
             project,
             sql_provider,
             sql_subgraphs,
+            bearer,
         }
     }
 
@@ -160,7 +164,9 @@ impl BackendRouter {
             }
         };
         let policy = crate::graphql_data::policy_from_config(config);
-        let claims = crate::graphql_data::request_claims(&self.project);
+        let claims =
+            crate::graphql_data::request_claims(&self.project, self.bearer.as_deref(), config)
+                .await;
         let dialect = crate::graphql_data::dialect::Sqlite;
         let invoker = Some(self.invoker.as_ref());
         // A SQL subgraph resolves both root fetches and — so it's a full federation entity
@@ -448,6 +454,7 @@ mod tests {
             "default".to_string(),
             None,
             std::collections::BTreeMap::new(),
+            None,
         );
         let resp = router.run("accounts", "{ me { id } }", json!({})).await;
         let msg = resp["errors"][0]["message"].as_str().unwrap_or_default();

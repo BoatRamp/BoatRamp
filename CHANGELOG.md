@@ -18,7 +18,12 @@ versions.
   the database executes. Exposure is **deny-by-default** and **fail-closed** — only the tables
   and columns the policy names are visible, and a per-table row filter bound to the
   host-asserted `project` claim isolates tenants at **every depth** (including inside a
-  relationship), a missing claim denying rather than widening. Every value is a bound parameter
+  relationship), a missing claim denying rather than widening. A `row_filter` can also bind a
+  claim from a **verified application bearer token** (`claims_from_token` — the app's own IdP
+  by issuer + JWKS, verified sig/`iss`/`exp`/`kid` with the algorithm pinned to the key), which
+  unlocks **multi-tenant-within-one-project** SaaS (many tenants as rows, isolated by an app
+  claim like `tid`); a missing/invalid token contributes no claim (so the filter denies), and a
+  token can never override the host-asserted `project`. Every value is a bound parameter
   (injection-safe) and every identifier comes only from the introspected, exposed schema.
   **Mutations** (`insert`/`update`/`delete`) are opt-in (`mutations: true`), run in a
   transaction, force the row filter onto every write, and refuse an unbounded update/delete.
@@ -31,7 +36,8 @@ versions.
   `_entities` fetches. Composes *beneath* the existing GraphQL edge (guard, persisted queries,
   cache) and beside the wasm-resolver model. Off by default; libsql today. Validated end-to-end
   against real libsql (reads, nested relationships with depth isolation, delegation, SQL+wasm
-  federation with subgraph registration, and mutations).
+  federation with subgraph registration, mutations, and app-token tenant isolation at the root,
+  through a relationship, and on a write).
 - **Edge response cache for handlers (`[handlers.cache]`).** A site can opt into a
   host-level cache that serves a cacheable `GET`/`HEAD` response **without
   re-instantiating the handler** — the execution analogue of the existing compile cache.

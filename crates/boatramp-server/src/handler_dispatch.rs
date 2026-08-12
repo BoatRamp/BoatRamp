@@ -159,6 +159,18 @@ pub(super) async fn dispatch_handler(
                     {
                         return graphql_guard::error_response(&reason);
                     }
+                    // The request's app bearer token (if any), whose verified claims the data
+                    // connector's `row_filter` may bind — sourced only when the site configures
+                    // `claims_from_token`, and only after full verification.
+                    let bearer = parts
+                        .headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| {
+                            s.strip_prefix("Bearer ")
+                                .or_else(|| s.strip_prefix("bearer "))
+                        })
+                        .map(str::to_string);
                     // GraphQL subscription: serve it as a graphql-sse event stream,
                     // deriving the messaging topic from the subscription's root field. A
                     // producer (a mutation, a function) publishes each execution result to
@@ -184,13 +196,21 @@ pub(super) async fn dispatch_handler(
                     // subgraphs and execute it by dispatching fetches to the subgraph
                     // functions, instead of running a single handler component.
                     if gql.federated {
-                        return federation_gateway(inner, project, query).await;
+                        return federation_gateway(inner, project, query, bearer.as_deref()).await;
                     }
                     // Declarative data connector: serve the query from the site's managed
                     // database (compiled to SQL), instead of running a handler component.
                     if let Some(data) = gql.data.as_ref().filter(|d| d.enabled) {
-                        return data_connector_serve(inner, project, site, data, query, &variables)
-                            .await;
+                        return data_connector_serve(
+                            inner,
+                            project,
+                            site,
+                            data,
+                            query,
+                            &variables,
+                            bearer.as_deref(),
+                        )
+                        .await;
                     }
                 }
                 // Put the (possibly query-injected) body back on the request.
@@ -330,7 +350,12 @@ pub(super) async fn dispatch_handler(
 /// it, execute the plan by dispatching each fetch to its subgraph function over the
 /// in-process invoke path, and return the stitched `{ "data": … }` response.
 #[cfg(feature = "handlers")]
-async fn federation_gateway(inner: &HandlerRuntimeInner, project: &str, query: &str) -> Response {
+async fn federation_gateway(
+    inner: &HandlerRuntimeInner,
+    project: &str,
+    query: &str,
+    bearer: Option<&str>,
+) -> Response {
     let supergraph = match crate::graphql_registry::supergraph(inner.kv.as_ref(), project).await {
         Ok(sg) => sg,
         Err(err) => {
@@ -365,6 +390,7 @@ async fn federation_gateway(inner: &HandlerRuntimeInner, project: &str, query: &
         project.to_string(),
         inner.sql.clone(),
         sql_subgraphs,
+        bearer.map(str::to_string),
     );
     axum::Json(crate::graphql_gateway::execute(&plan, &runner).await).into_response()
 }
@@ -374,7 +400,8 @@ async fn federation_gateway(inner: &HandlerRuntimeInner, project: &str, query: &
 /// policy from `[handlers.graphql.data]`, and compile + run the query to SQL — returning the
 /// GraphQL response. The backend is opened with the same project/site scoping handlers use,
 /// so tenant isolation is inherited; the policy's row filter binds the host-asserted
-/// `project` claim.
+/// `project` claim, plus any claims from a verified app bearer token (`bearer`) when the site
+/// configures `claims_from_token`.
 #[cfg(feature = "handlers")]
 async fn data_connector_serve(
     inner: &HandlerRuntimeInner,
@@ -383,6 +410,7 @@ async fn data_connector_serve(
     cfg: &boatramp_core::config::HandlerGraphqlDataConfig,
     query: &str,
     variables: &serde_json::Value,
+    bearer: Option<&str>,
 ) -> Response {
     let Some(provider) = &inner.sql else {
         return (
@@ -417,7 +445,7 @@ async fn data_connector_serve(
     // relationships, join keys) and the policy enforces exposure per field: deny-by-default,
     // so an unexposed table/column is rejected even though it's structurally present.
     let policy = crate::graphql_data::policy_from_config(cfg);
-    let claims = crate::graphql_data::request_claims(project);
+    let claims = crate::graphql_data::request_claims(project, bearer, cfg).await;
     let dialect = crate::graphql_data::dialect::Sqlite;
     let response = if crate::graphql_data::compile::is_mutation(query) {
         // A write: gated on the site opting into mutations (deny-by-default), run on a write
