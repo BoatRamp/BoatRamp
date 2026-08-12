@@ -197,6 +197,7 @@ impl BackendRouter {
                 query,
                 &variables,
                 invoker,
+                self.bearer.as_deref(),
             )
             .await
         } else {
@@ -209,6 +210,7 @@ impl BackendRouter {
                 query,
                 &variables,
                 invoker,
+                self.bearer.as_deref(),
             )
             .await
         }

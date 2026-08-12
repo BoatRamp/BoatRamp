@@ -17,7 +17,8 @@ use serde_json::{json, Map, Value};
 /// Execute `query` (with its `variables`) against `backend`, returning a GraphQL response
 /// (`{"data": …}` on success, `{"errors": …}` on a compile or SQL failure). `invoker`
 /// resolves delegated fields (a wasm function per the policy); a query that delegates
-/// without one configured is an error.
+/// without one configured is an error. `bearer` is the caller's verified token, forwarded to
+/// a delegated function so its own per-field authorization sees the same principal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute(
     backend: &dyn SqlBackend,
@@ -28,6 +29,7 @@ pub(crate) async fn execute(
     query: &str,
     variables: &Value,
     invoker: Option<&dyn Invoker>,
+    bearer: Option<&str>,
 ) -> Value {
     let planned = match compile(query, variables, schema, policy, claims, dialect) {
         Ok(planned) => planned,
@@ -48,7 +50,9 @@ pub(crate) async fn execute(
         };
         let mut objects = shape_objects(&root.projection, &rows);
         for delegation in &root.delegations {
-            if let Err(message) = apply_delegation(&mut objects, &rows, delegation, invoker).await {
+            if let Err(message) =
+                apply_delegation(&mut objects, &rows, delegation, invoker, bearer).await
+            {
                 let _ = tx.rollback().await;
                 return errors(&message);
             }
@@ -120,6 +124,7 @@ pub(crate) async fn execute_entities(
     query: &str,
     variables: &Value,
     invoker: Option<&dyn Invoker>,
+    bearer: Option<&str>,
 ) -> Value {
     use super::compile::compile_entities;
     let plan = match compile_entities(query, variables, schema, policy, claims, dialect) {
@@ -144,7 +149,9 @@ pub(crate) async fn execute_entities(
 
     let mut objects = shape_objects(&plan.projection, &rows);
     for delegation in &plan.delegations {
-        if let Err(message) = apply_delegation(&mut objects, &rows, delegation, invoker).await {
+        if let Err(message) =
+            apply_delegation(&mut objects, &rows, delegation, invoker, bearer).await
+        {
             return errors(&message);
         }
     }
@@ -201,6 +208,7 @@ async fn apply_delegation(
     rows: &SqlRows,
     delegation: &Delegation,
     invoker: Option<&dyn Invoker>,
+    bearer: Option<&str>,
 ) -> Result<(), String> {
     let Some(invoker) = invoker else {
         return Err(format!(
@@ -228,10 +236,21 @@ async fn apply_delegation(
     })
     .to_string()
     .into_bytes();
+    // Forward the caller's verified identity so a delegated function that authorizes per field
+    // sees the same principal — the same identity propagation the federation gateway does for a
+    // function subgraph. `bearer` is the raw token (the scheme was stripped at intake), so
+    // re-add it; the callee re-verifies, so this is propagation, not delegation.
+    let mut headers = vec![("content-type".to_string(), b"application/json".to_vec())];
+    if let Some(token) = bearer {
+        headers.push((
+            "authorization".to_string(),
+            format!("Bearer {token}").into_bytes(),
+        ));
+    }
     let request = InvokeRequest {
         method: "POST".to_string(),
         path: "/".to_string(),
-        headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+        headers,
         body,
     };
     let response = invoker
@@ -375,6 +394,7 @@ mod tests {
             "{ users { id name } }",
             &json!({}),
             None,
+            None,
         )
         .await;
         assert_eq!(out["data"]["users"][0]["name"], json!("Alice"));
@@ -407,6 +427,7 @@ mod tests {
             "query($representations:[_Any!]!){ _entities(representations:$representations){ ... on users { name } } }",
             &variables,
             None,
+            None,
         )
         .await;
         let entities = out["data"]["_entities"]
@@ -432,6 +453,7 @@ mod tests {
             r#"{ users_by_pk(id: "1") { name } }"#,
             &json!({}),
             None,
+            None,
         )
         .await;
         assert_eq!(out["data"]["users_by_pk"]["name"], json!("Alice"));
@@ -450,6 +472,7 @@ mod tests {
             "{ users { secret } }", // unexposed column
             &json!({}),
             None,
+            None,
         )
         .await;
         assert!(out["data"].is_null());
@@ -457,5 +480,79 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("secret"));
+    }
+
+    /// An invoker that reflects the `Authorization` header it received into the resolved
+    /// entity field — so a test can prove a delegated field forwards the caller's identity
+    /// (and sends none when the caller is anonymous), like the federation gateway does.
+    struct AuthEchoInvoker;
+
+    #[async_trait]
+    impl Invoker for AuthEchoInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            let authz = request
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_else(|| "anonymous".to_string());
+            let body = json!({ "data": { "_entities": [ { "reviews": authz } ] } });
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![],
+                body: serde_json::to_vec(&body).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegated_field_forwards_the_callers_bearer() {
+        let rows = SqlRows {
+            columns: vec!["id".into()],
+            rows: vec![vec![SqlValue::Text("1".into())]],
+        };
+        let delegation = Delegation {
+            response_key: "reviews".into(),
+            field: "reviews".into(),
+            function: "reviews".into(),
+            type_name: "User".into(),
+            key: vec![("id".into(), 0)],
+            entities_query:
+                "query($r:[_Any!]!){ _entities(representations:$r){ ... on User { reviews } } }"
+                    .into(),
+        };
+        let invoker = AuthEchoInvoker;
+
+        // A verified caller's identity rides the delegated invoke as `Bearer <token>`.
+        let mut objects = vec![json!({ "id": "1" })];
+        apply_delegation(
+            &mut objects,
+            &rows,
+            &delegation,
+            Some(&invoker as &dyn Invoker),
+            Some("t-acme"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(objects[0]["reviews"], json!("Bearer t-acme"));
+
+        // An anonymous connector query forwards no bearer — so a delegated function that
+        // authorizes per field sees an anonymous caller, exactly as it would at the gateway.
+        let mut objects = vec![json!({ "id": "1" })];
+        apply_delegation(
+            &mut objects,
+            &rows,
+            &delegation,
+            Some(&invoker as &dyn Invoker),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(objects[0]["reviews"], json!("anonymous"));
     }
 }

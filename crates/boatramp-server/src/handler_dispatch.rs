@@ -480,6 +480,7 @@ async fn data_connector_serve(
             query,
             variables,
             invoker.as_deref(),
+            bearer,
         )
         .await
     };
