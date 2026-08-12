@@ -23,6 +23,7 @@ handlers = [
   "boatramp-handlers/sql",
   "boatramp-handlers/messaging",
   "boatramp-handlers/invoke",
+  "boatramp-handlers/graphql",
   "dep:chrono",
   "dep:graphql-parser",
   "dep:wasmparser",

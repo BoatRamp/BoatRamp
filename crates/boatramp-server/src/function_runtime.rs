@@ -431,6 +431,14 @@ async fn build_function_bindings(
             );
         }
     }
+    // GraphQL supergraph capability: run an operation against the project's composed supergraph
+    // in-process, at this function's call depth (so a subgraph function reached from a guest run
+    // that itself runs an op counts against the shared cap).
+    if granted("graphql") {
+        if let Some(runner) = inner.federation_runner.get() {
+            bindings = bindings.with_graphql(runner.scoped(project), depth);
+        }
+    }
     inner.logs.configure(scope, None);
     bindings = bindings.with_logging(scope.to_string(), inner.logs.clone());
     let env: Vec<(String, String)> = config

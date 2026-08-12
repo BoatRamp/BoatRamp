@@ -281,6 +281,11 @@ struct HandlerRuntimeInner {
     /// ([`FunctionInvoker::scoped`]) resolving the caller's siblings within its
     /// own tenant project, not `default`.
     invoker: std::sync::OnceLock<Arc<function_runtime::FunctionInvoker>>,
+    /// The supergraph runner backing the `graphql` capability: runs a guest's GraphQL
+    /// operation against the project's composed supergraph in-process (plan + execute over
+    /// the invoke path). Set once at startup alongside [`invoker`](Self::invoker); unset ⇒ the
+    /// `graphql` capability is not offered. Project-scoped per grant, like the invoker.
+    federation_runner: std::sync::OnceLock<Arc<graphql_gateway::FederationRunner>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -326,6 +331,7 @@ impl HandlerRuntime {
                 watch_provider: std::sync::OnceLock::new(),
                 provision_tier: std::sync::OnceLock::new(),
                 invoker: std::sync::OnceLock::new(),
+                federation_runner: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -382,6 +388,12 @@ impl HandlerRuntime {
                 Arc::downgrade(inner),
             ));
             let _ = inner.invoker.set(invoker);
+            // The supergraph runner shares the same self-referential `Weak`; it reaches the
+            // invoker (set above) to dispatch a guest run's sub-fetches in-process.
+            let runner = Arc::new(graphql_gateway::FederationRunner::new(Arc::downgrade(
+                inner,
+            )));
+            let _ = inner.federation_runner.set(runner);
         }
     }
 

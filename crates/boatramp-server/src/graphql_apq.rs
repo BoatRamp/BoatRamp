@@ -111,6 +111,21 @@ fn apq_key(scope: &str, hash: &str) -> String {
     format!("hapq/{scope}/{hash}")
 }
 
+/// The stored (safelisted) query text for `hash` in `scope`, or `None` if not registered.
+/// Guest-run operations are **deny-by-default** — only pre-registered operations run,
+/// independent of the edge's safelist mode — so this is the guest capability's operation floor.
+pub(crate) async fn safelisted(
+    kv: &dyn boatramp_core::kv::KvStore,
+    scope: &str,
+    hash: &str,
+) -> Option<String> {
+    kv.get(&apq_key(scope, hash))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+}
+
 /// The edge resolution of an APQ request against the kv store.
 pub(crate) enum Resolved {
     /// Use this query text (resolved from the store, or the request's own query).
@@ -269,5 +284,21 @@ mod tests {
     #[test]
     fn non_apq_request_is_left_alone() {
         assert_eq!(resolve(ApqRequest::None, None, false), None);
+    }
+
+    #[tokio::test]
+    async fn safelisted_returns_a_registered_op_and_none_otherwise() {
+        use boatramp_core::kv::{KvStore, MemoryKv};
+        let kv = MemoryKv::new();
+        let h = hash_of(Q);
+        // Not registered → the guest safelist floor rejects it.
+        assert_eq!(safelisted(&kv, "acme", &h).await, None);
+        // Registering it (any writer of the APQ store) makes it runnable by a guest.
+        kv.put(&apq_key("acme", &h), Q.as_bytes().to_vec())
+            .await
+            .unwrap();
+        assert_eq!(safelisted(&kv, "acme", &h).await, Some(Q.to_string()));
+        // Tenant-isolated: another project's guest cannot see it.
+        assert_eq!(safelisted(&kv, "other", &h).await, None);
     }
 }

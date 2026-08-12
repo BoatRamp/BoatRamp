@@ -481,6 +481,7 @@ async fn data_connector_serve(
             variables,
             invoker.as_deref(),
             bearer,
+            0, // an external data-connector request is the root of the call chain
         )
         .await
     };
@@ -695,6 +696,16 @@ pub(super) async fn build_bindings(
             // A site handler invokes siblings within its own tenant project.
             bindings =
                 bindings.with_invoke(invoker.scoped(project), invoke_targets.to_vec(), depth);
+        }
+    }
+    // GraphQL supergraph capability: a handler may run a GraphQL operation against the project's
+    // composed supergraph in-process (cross-subgraph planning), forwarding its own bearer.
+    // Granted when the site allows `graphql`, the handler imports it, and the runtime has a
+    // supergraph runner. The handler is the root of the call chain (depth 0); the host caps the
+    // next hop against the depth budget shared with invoke.
+    if granted("graphql") {
+        if let Some(runner) = inner.federation_runner.get() {
+            bindings = bindings.with_graphql(runner.scoped(project), depth);
         }
     }
     // Capture stdout/stderr for *every* invocation — not a

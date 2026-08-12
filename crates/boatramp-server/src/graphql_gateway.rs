@@ -63,8 +63,10 @@ fn fetch_data(resp: &Value) -> &Value {
 
 /// Dispatch one fetch to a subgraph **function** over the in-process invoke path (no network
 /// hop, no SSRF surface) — the subgraph name is the function name — mapping the result (or a
-/// precise error) to a GraphQL response. The gateway is the root of the call chain, so it
-/// invokes at depth 0. Used by the [`BackendRouter`]'s function branch.
+/// precise error) to a GraphQL response. An external gateway request is the root of the call
+/// chain (`depth` 0); a **guest-initiated** run (via the `graphql` capability) dispatches at the
+/// guest's own depth so its sub-fetches count against the shared call-depth cap. Used by the
+/// [`BackendRouter`]'s function branch.
 ///
 /// The caller's verified `bearer` is forwarded as the `Authorization` header so a subgraph
 /// that authorizes per field sees the same principal on **every** fetch — a root fetch and a
@@ -77,6 +79,7 @@ async fn invoke_subgraph(
     query: &str,
     variables: Value,
     bearer: Option<&str>,
+    depth: u32,
 ) -> Value {
     let body = json!({ "query": query, "variables": variables })
         .to_string()
@@ -94,7 +97,7 @@ async fn invoke_subgraph(
         headers,
         body,
     };
-    match invoker.invoke(subgraph, request, 0).await {
+    match invoker.invoke(subgraph, request, depth).await {
         Ok(resp) => serde_json::from_slice(&resp.body).unwrap_or_else(|_| {
             json!({ "errors": [{ "message": format!("subgraph `{subgraph}` returned invalid JSON") }] })
         }),
@@ -130,6 +133,10 @@ pub(crate) struct BackendRouter {
     /// `row_filter`, and forwarded as `Authorization` to a function subgraph so its per-field
     /// authorization sees the same principal.
     bearer: Option<String>,
+    /// The call-chain depth at which sub-fetches are invoked. `0` for an external gateway
+    /// request (the root); a guest-initiated run sets its own depth so the shared cap counts
+    /// its sub-fetches. See [`BackendRouter::at_depth`].
+    depth: u32,
 }
 
 impl BackendRouter {
@@ -149,7 +156,16 @@ impl BackendRouter {
             sql_provider,
             sql_subgraphs,
             bearer,
+            depth: 0,
         }
+    }
+
+    /// Dispatch this router's sub-fetches at call-chain `depth` (default `0`, the external
+    /// gateway root). A guest-initiated run sets its own depth so the shared invoke depth cap
+    /// counts a guest op → subgraph fetch → guest op chain and stops it looping.
+    pub(crate) fn at_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
     }
 
     /// Resolve a fetch for a SQL-backed subgraph: open the site's database, introspect, and
@@ -198,6 +214,7 @@ impl BackendRouter {
                 &variables,
                 invoker,
                 self.bearer.as_deref(),
+                self.depth,
             )
             .await
         } else {
@@ -211,6 +228,7 @@ impl BackendRouter {
                 &variables,
                 invoker,
                 self.bearer.as_deref(),
+                self.depth,
             )
             .await
         }
@@ -229,8 +247,124 @@ impl SubgraphRunner for BackendRouter {
             query,
             variables,
             self.bearer.as_deref(),
+            self.depth,
         )
         .await
+    }
+}
+
+/// The server's [`SupergraphRunner`](boatramp_handlers::SupergraphRunner): runs a guest's
+/// GraphQL operation against the project's composed supergraph in-process — the same planner +
+/// executor an external `/graphql` request uses (via [`BackendRouter`]), plus two guest-specific
+/// gates: a **forced safelist** (only pre-registered operations run — deny-by-default) and the
+/// **shared depth cap** (sub-fetches dispatch at the guest's own depth so a run → subgraph fetch
+/// → run chain cannot loop). The caller's own bearer is forwarded and re-verified per subgraph,
+/// so a guest cannot escalate by running this.
+pub(crate) struct FederationRunner {
+    runtime: std::sync::Weak<crate::HandlerRuntimeInner>,
+    project: String,
+}
+
+impl FederationRunner {
+    /// A runner bound to `runtime`; scope it per request with [`FederationRunner::scoped`].
+    pub(crate) fn new(runtime: std::sync::Weak<crate::HandlerRuntimeInner>) -> Self {
+        Self {
+            runtime,
+            project: boatramp_core::project::DEFAULT_PROJECT.to_string(),
+        }
+    }
+
+    /// A runner scoped to `project` (all registry/plan/execute lookups are project-qualified),
+    /// as the guest grant needs — mirrors the invoker's per-tenant scoping.
+    pub(crate) fn scoped(
+        &self,
+        project: boatramp_core::project::ProjectRef<'_>,
+    ) -> std::sync::Arc<dyn boatramp_handlers::SupergraphRunner> {
+        std::sync::Arc::new(Self {
+            runtime: self.runtime.clone(),
+            project: project.as_str().to_string(),
+        })
+    }
+}
+
+/// Strip a leading `Bearer ` scheme (case-insensitive) from a forwarded Authorization value,
+/// leaving the raw token [`BackendRouter`] expects (it re-adds the scheme per subgraph).
+fn strip_bearer(raw: &str) -> &str {
+    raw.strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .unwrap_or(raw)
+}
+
+#[async_trait::async_trait]
+impl boatramp_handlers::SupergraphRunner for FederationRunner {
+    async fn run(
+        &self,
+        request: boatramp_handlers::GraphqlRequest,
+        depth: u32,
+    ) -> Result<Vec<u8>, boatramp_handlers::GraphqlError> {
+        use boatramp_handlers::GraphqlError;
+        let Some(inner) = self.runtime.upgrade() else {
+            return Err(GraphqlError::Failed(
+                "handler runtime is shutting down".into(),
+            ));
+        };
+        let kv = inner.kv.as_ref();
+        let project = self.project.as_str();
+
+        // Deny-by-default operation surface: a guest may run only a pre-registered (safelisted)
+        // operation — by its hash for `run-persisted`, or the hash of the supplied `query` for
+        // `run`. The subgraph field guards remain the hard enforcement; this is the floor.
+        let hash = match (&request.query, &request.persisted_hash) {
+            (Some(query), _) => crate::graphql_apq::sha256_hex(query),
+            (None, Some(hash)) => hash.clone(),
+            (None, None) => {
+                return Err(GraphqlError::PlanFailed(
+                    "no query or persisted hash supplied".into(),
+                ))
+            }
+        };
+        let Some(query) = crate::graphql_apq::safelisted(kv, project, &hash).await else {
+            return Err(GraphqlError::NotSafelisted);
+        };
+
+        // Query-guard the resolved operation (depth/complexity), exactly as at the edge.
+        let limits = crate::graphql_guard::limits_from(
+            &boatramp_core::config::HandlerGraphqlConfig::default(),
+        );
+        if let crate::graphql_guard::GuardVerdict::Reject(reason) =
+            crate::graphql_guard::guard_query(&query, &limits)
+        {
+            return Err(GraphqlError::PlanFailed(reason));
+        }
+
+        // Compose + plan against the project's registered subgraphs (the unified graph).
+        let supergraph = crate::graphql_registry::supergraph(kv, project)
+            .await
+            .map_err(|e| GraphqlError::Failed(format!("supergraph composition failed: {e}")))?;
+        let plan = crate::graphql_plan::plan(&query, &supergraph)
+            .map_err(|_| GraphqlError::PlanFailed("the query cannot be planned".into()))?;
+
+        let Some(invoker) = inner.invoker.get() else {
+            return Err(GraphqlError::Failed("no invoker configured".into()));
+        };
+        let sql_subgraphs = crate::graphql_registry::sql_subgraphs(kv, project).await;
+        // Forward the guest's own bearer (re-verified per subgraph — no escalation), and dispatch
+        // sub-fetches at this run's depth so the shared cap counts them.
+        let bearer = request
+            .bearer
+            .as_deref()
+            .map(|raw| strip_bearer(raw).to_string());
+        let router = BackendRouter::new(
+            invoker.scoped(boatramp_core::project::ProjectRef::new(project)),
+            project.to_string(),
+            inner.sql.clone(),
+            sql_subgraphs,
+            bearer,
+        )
+        .at_depth(depth);
+        let response = execute(&plan, &router).await;
+        serde_json::to_vec(&response)
+            .map_err(|e| GraphqlError::Failed(format!("serializing response: {e}")))
     }
 }
 
@@ -572,5 +706,56 @@ mod tests {
         let mut a = json!({ "me": { "name": "x" } });
         merge(&mut a, &json!({ "me": { "age": 3 }, "other": 1 }));
         assert_eq!(a, json!({ "me": { "name": "x", "age": 3 }, "other": 1 }));
+    }
+
+    /// An invoker that reflects the call-chain `depth` it was dispatched at back into its
+    /// response, so a test can prove `BackendRouter::at_depth` threads the guest's depth through
+    /// to the sub-fetch (the recursion-safety guarantee).
+    struct DepthEchoInvoker;
+
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for DepthEchoInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+                body: serde_json::to_vec(&json!({ "data": { "depth": depth } })).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn at_depth_dispatches_function_fetches_at_that_depth() {
+        // The external gateway is the root (depth 0)...
+        let root = BackendRouter::new(
+            std::sync::Arc::new(DepthEchoInvoker),
+            "default".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        );
+        assert_eq!(
+            root.run("s", "{ x }", json!({})).await["data"]["depth"],
+            json!(0)
+        );
+        // ...a guest-initiated run dispatches its sub-fetches at its own depth, so the shared
+        // invoke cap counts a run → subgraph → run chain and stops it looping.
+        let scoped = BackendRouter::new(
+            std::sync::Arc::new(DepthEchoInvoker),
+            "default".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .at_depth(4);
+        assert_eq!(
+            scoped.run("s", "{ x }", json!({})).await["data"]["depth"],
+            json!(4)
+        );
     }
 }

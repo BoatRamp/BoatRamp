@@ -30,6 +30,7 @@ pub(crate) async fn execute(
     variables: &Value,
     invoker: Option<&dyn Invoker>,
     bearer: Option<&str>,
+    depth: u32,
 ) -> Value {
     let planned = match compile(query, variables, schema, policy, claims, dialect) {
         Ok(planned) => planned,
@@ -51,7 +52,7 @@ pub(crate) async fn execute(
         let mut objects = shape_objects(&root.projection, &rows);
         for delegation in &root.delegations {
             if let Err(message) =
-                apply_delegation(&mut objects, &rows, delegation, invoker, bearer).await
+                apply_delegation(&mut objects, &rows, delegation, invoker, bearer, depth).await
             {
                 let _ = tx.rollback().await;
                 return errors(&message);
@@ -125,6 +126,7 @@ pub(crate) async fn execute_entities(
     variables: &Value,
     invoker: Option<&dyn Invoker>,
     bearer: Option<&str>,
+    depth: u32,
 ) -> Value {
     use super::compile::compile_entities;
     let plan = match compile_entities(query, variables, schema, policy, claims, dialect) {
@@ -150,7 +152,7 @@ pub(crate) async fn execute_entities(
     let mut objects = shape_objects(&plan.projection, &rows);
     for delegation in &plan.delegations {
         if let Err(message) =
-            apply_delegation(&mut objects, &rows, delegation, invoker, bearer).await
+            apply_delegation(&mut objects, &rows, delegation, invoker, bearer, depth).await
         {
             return errors(&message);
         }
@@ -209,6 +211,7 @@ async fn apply_delegation(
     delegation: &Delegation,
     invoker: Option<&dyn Invoker>,
     bearer: Option<&str>,
+    depth: u32,
 ) -> Result<(), String> {
     let Some(invoker) = invoker else {
         return Err(format!(
@@ -254,7 +257,7 @@ async fn apply_delegation(
         body,
     };
     let response = invoker
-        .invoke(&delegation.function, request, 0)
+        .invoke(&delegation.function, request, depth)
         .await
         .map_err(|_| {
             format!(
@@ -395,6 +398,7 @@ mod tests {
             &json!({}),
             None,
             None,
+            0,
         )
         .await;
         assert_eq!(out["data"]["users"][0]["name"], json!("Alice"));
@@ -428,6 +432,7 @@ mod tests {
             &variables,
             None,
             None,
+            0,
         )
         .await;
         let entities = out["data"]["_entities"]
@@ -454,6 +459,7 @@ mod tests {
             &json!({}),
             None,
             None,
+            0,
         )
         .await;
         assert_eq!(out["data"]["users_by_pk"]["name"], json!("Alice"));
@@ -473,6 +479,7 @@ mod tests {
             &json!({}),
             None,
             None,
+            0,
         )
         .await;
         assert!(out["data"].is_null());
@@ -536,6 +543,7 @@ mod tests {
             &delegation,
             Some(&invoker as &dyn Invoker),
             Some("t-acme"),
+            0,
         )
         .await
         .unwrap();
@@ -550,6 +558,7 @@ mod tests {
             &delegation,
             Some(&invoker as &dyn Invoker),
             None,
+            0,
         )
         .await
         .unwrap();
