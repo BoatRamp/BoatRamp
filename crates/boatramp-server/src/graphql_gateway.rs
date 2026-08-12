@@ -65,19 +65,33 @@ fn fetch_data(resp: &Value) -> &Value {
 /// hop, no SSRF surface) — the subgraph name is the function name — mapping the result (or a
 /// precise error) to a GraphQL response. The gateway is the root of the call chain, so it
 /// invokes at depth 0. Used by the [`BackendRouter`]'s function branch.
+///
+/// The caller's verified `bearer` is forwarded as the `Authorization` header so a subgraph
+/// that authorizes per field sees the same principal on **every** fetch — a root fetch and a
+/// dependent `_entities` hydration alike. Without it a subgraph's non-`public` field would see
+/// an anonymous caller and refuse. `bearer` is the raw token (the gateway already stripped the
+/// `Bearer ` scheme), so re-add it.
 async fn invoke_subgraph(
     invoker: &dyn boatramp_handlers::Invoker,
     subgraph: &str,
     query: &str,
     variables: Value,
+    bearer: Option<&str>,
 ) -> Value {
     let body = json!({ "query": query, "variables": variables })
         .to_string()
         .into_bytes();
+    let mut headers = vec![("content-type".to_string(), b"application/json".to_vec())];
+    if let Some(token) = bearer {
+        headers.push((
+            "authorization".to_string(),
+            format!("Bearer {token}").into_bytes(),
+        ));
+    }
     let request = boatramp_handlers::InvokeRequest {
         method: "POST".to_string(),
         path: "/".to_string(),
-        headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+        headers,
         body,
     };
     match invoker.invoke(subgraph, request, 0).await {
@@ -112,7 +126,9 @@ pub(crate) struct BackendRouter {
         String,
         (String, boatramp_core::config::HandlerGraphqlDataConfig),
     >,
-    /// The request's app bearer token, for a SQL subgraph's claim-bound `row_filter`.
+    /// The request's verified app bearer token — bound to a SQL subgraph's claim-based
+    /// `row_filter`, and forwarded as `Authorization` to a function subgraph so its per-field
+    /// authorization sees the same principal.
     bearer: Option<String>,
 }
 
@@ -205,7 +221,14 @@ impl SubgraphRunner for BackendRouter {
         if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
             return self.run_sql(subgraph, site, config, query, variables).await;
         }
-        invoke_subgraph(self.invoker.as_ref(), subgraph, query, variables).await
+        invoke_subgraph(
+            self.invoker.as_ref(),
+            subgraph,
+            query,
+            variables,
+            self.bearer.as_deref(),
+        )
+        .await
     }
 }
 
@@ -378,6 +401,40 @@ mod tests {
         }
     }
 
+    /// An [`Invoker`](boatramp_handlers::Invoker) that reflects the `Authorization` header it
+    /// received back into its response — modelling a subgraph that authorizes per field: with a
+    /// forwarded bearer it resolves (echoing the identity), without one it refuses with
+    /// `UNAUTHENTICATED`. It lets a test prove the gateway forwards the caller's identity on the
+    /// invoke path (root and `_entities` alike) rather than dropping it.
+    struct AuthEchoInvoker;
+
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for AuthEchoInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            let authz = request
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
+            let body = match authz {
+                Some(value) => json!({ "data": { "identity": value } }),
+                None => json!({ "errors": [
+                    { "message": "unauthenticated", "extensions": { "code": "UNAUTHENTICATED" } }
+                ] }),
+            };
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), b"application/json".to_vec())],
+                body: serde_json::to_vec(&body).unwrap(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn merges_root_fetches_from_distinct_subgraphs() {
         let sg = compose(&[
@@ -461,6 +518,50 @@ mod tests {
         assert!(
             msg.contains("no function named `accounts` is deployed"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_the_callers_verified_bearer_to_a_function_subgraph() {
+        let router = BackendRouter::new(
+            std::sync::Arc::new(AuthEchoInvoker),
+            "default".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            Some("t-acme".to_string()),
+        );
+        // A root fetch carries the caller's identity as `Bearer <token>`...
+        let root = router.run("orders", "{ me { id } }", json!({})).await;
+        assert_eq!(root["data"]["identity"], json!("Bearer t-acme"));
+        // ...and so does a dependent `_entities` hydration fetch (same dispatch path).
+        let entity = router
+            .run(
+                "orders",
+                "query($r: [_Any!]!) { _entities(representations: $r) { id } }",
+                json!({ "representations": [{ "__typename": "Order", "id": "1" }] }),
+            )
+            .await;
+        assert_eq!(
+            entity["data"]["identity"],
+            json!("Bearer t-acme"),
+            "the bearer must ride the _entities fetch too, or a stitched field would go anonymous"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_gateway_call_forwards_no_bearer_so_an_authed_field_is_refused() {
+        let router = BackendRouter::new(
+            std::sync::Arc::new(AuthEchoInvoker),
+            "default".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        );
+        let resp = router.run("orders", "{ me { id } }", json!({})).await;
+        assert_eq!(
+            resp["errors"][0]["extensions"]["code"],
+            json!("UNAUTHENTICATED"),
+            "with no forwarded identity a subgraph's authed field must refuse, not resolve anonymously"
         );
     }
 
