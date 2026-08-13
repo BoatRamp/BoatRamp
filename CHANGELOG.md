@@ -5,6 +5,21 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.6]
+
+### Fixed
+- **Federated GraphQL mutations now execute (and carry their arguments).** A mutation sent
+  through the federation gateway (or run in-process via the guest `graphql` capability) was
+  dispatched to its subgraph as an **anonymous query** — so the subgraph parsed `{ field(…) }`,
+  couldn't find the field (which lives on `Mutation`), and the resolver never ran (`data: null`).
+  The planner also rebuilt each fetch from the field **name only**, dropping every argument, and
+  the executor forwarded no variables. A Mutation root fetch is now a `mutation`; field arguments
+  are serialized (variable references, enums, lists, and input objects included); each fetch
+  declares exactly the variables it uses; and the operation's variables are forwarded to the
+  subgraph (merged with `representations` for `_entities` fetches). Queries were unaffected (and
+  stayed green because the tests used argument-less fields). Affected every federated mutation —
+  login/token exchange, writes, and agent tool calls.
+
 ## [0.2.5]
 
 ### Added
