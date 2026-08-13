@@ -649,8 +649,11 @@ pub struct HandlersSiteConfig {
     /// becomes the app bearer token everywhere the header bearer already flows (managed
     /// handlers, the GraphQL edge, the data connector, invoked functions, `graphql::run`). The
     /// `Authorization` header always wins, so API clients are unaffected. boatramp **only reads**
-    /// the cookie — the app's auth handler issues + refreshes it (set it `HttpOnly; Secure;
-    /// SameSite=Lax`). A cookie-authenticated request is CSRF-checked against `allowed_origins`.
+    /// the cookie — the app's auth handler issues + refreshes it. Set it `HttpOnly; Secure;
+    /// SameSite=Lax` (Lax is a CSRF requirement — the browser half of the defense) with a
+    /// `__Host-` name prefix; and keep cookie-auth `GET`/`HEAD` handlers side-effect-free (a
+    /// same-origin top-level navigation passes the CSRF gate). A cookie-authenticated request is
+    /// CSRF-checked against `allowed_origins`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie_auth: Option<CookieAuthConfig>,
 }
