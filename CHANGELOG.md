@@ -133,6 +133,45 @@ versions.
   `Accept: text/html` request) to a graphiql-enabled GraphQL endpoint gets the GraphiQL
   IDE, which posts queries back to the same URL. A developer convenience — off by default;
   pair with `introspection` for schema docs.
+- **Function-backed subgraph registration by introspection.** A federation subgraph backed
+  by a deployed wasm function is registered with
+  `PUT /api/projects/{proj}/graphql/subgraphs/{name}/function` — no hand-written SDL:
+  boatramp invokes the function's federation `_service { sdl }` field over the in-process
+  invoke path, publishes the returned SDL to the registry (recomposed + validated like any
+  subgraph, so a bad compose is rejected and never records a backend), and records the
+  function backend. The parallel of the `/sql` path for a subgraph function that answers the
+  `_service { sdl }` contract; deploy the function first. A subgraph's SDL can still be
+  published by hand (`PUT .../subgraphs/{name}`) when you'd rather manage it out of band.
+- **Caller identity forwarded across the federation gateway.** When a supergraph query is
+  planned into per-subgraph fetches, the caller's verified application bearer is forwarded
+  as `Authorization` to each function subgraph (re-verified per subgraph — no escalation) and
+  bound to each SQL subgraph's claim-based `row_filter`, so every subgraph resolves against
+  the **same principal** the edge authenticated. A subgraph therefore enforces its own
+  per-field authorization and row isolation on the real caller rather than an anonymous
+  gateway identity; an anonymous query forwards no token, and each subgraph decides whether to
+  answer or refuse.
+- **In-process supergraph runs from a handler (guest `graphql` capability).** A managed
+  handler can run a GraphQL operation against its project's composed supergraph **in-process**
+  — the same planner + executor an external `/graphql` request uses, no network hop — via a
+  guest `graphql::run` (full query) / `graphql::run-persisted` (operation hash) capability.
+  Guest runs are **deny-by-default**: only operations pre-registered in the project's
+  **safelist** execute (`run` hashes the supplied query and checks the same allowlist), which
+  the operator administers with `POST /api/projects/{proj}/graphql/safelist` (register, returns
+  the hash), `GET …/safelist` (list), and `DELETE …/safelist/{hash}` (remove). Sub-fetches
+  dispatch at the guest's own call depth (so a run → subgraph-fetch → run chain can't loop) and
+  the guest's own bearer is forwarded and re-verified per subgraph, so a handler cannot escalate
+  by running the supergraph.
+- **Browser cookie session auth for handlers (`[handlers.cookie_auth]`).** A site can name a
+  session cookie whose value boatramp treats as the application bearer when a request carries
+  the cookie but **no** `Authorization` header — so a browser app authenticates its GraphQL /
+  handler / data-connector / function-invoke calls from an `HttpOnly` cookie the app's own auth
+  handler issues, without shipping a token to JavaScript. boatramp **only reads** the cookie
+  (the app sets, refreshes, and verifies it — the value is an opaque app bearer, exactly like a
+  header bearer); the `Authorization` header always wins, so API clients are unaffected. A
+  cookie-authenticated request is CSRF-checked against a configured `allowed_origins` allowlist
+  (`Origin`/`Referer`), the browser half of the defense pairing with an app-set
+  `SameSite=Lax; __Host-` cookie; keep cookie-auth `GET`/`HEAD` handlers side-effect-free so a
+  same-origin top-level navigation passes the gate. Off unless configured.
 
 ## [0.2.4]
 
