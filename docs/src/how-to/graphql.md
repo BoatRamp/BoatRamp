@@ -11,6 +11,22 @@ your handler.
 
 Everything below is **opt-in per site** and off by default.
 
+## What you can turn on
+
+GraphQL support is a set of independent, composable features — reach for the ones
+you need:
+
+| Feature | What it does |
+| --- | --- |
+| [Query-guard](#the-query-guard) | Reject over-deep/complex or introspection queries at the edge. |
+| [Persisted queries + safelist](#persisted-queries--safelist) | Send a query hash instead of the full query; or lock serving to a pre-registered allowlist. |
+| [GraphiQL explorer](#the-graphiql-explorer) | Serve the in-browser IDE to a browser `GET`. |
+| [Data connector](#graphql-from-your-database-no-resolver-code) | Serve a GraphQL API generated from a managed database — no resolver code. |
+| [Subscriptions](#subscriptions) | Serve a subscription as a graphql-sse event stream off a messaging topic. |
+| [Federation](#federation) | Compose several subgraph handlers into one supergraph gateway. |
+| [Guest supergraph runs](#run-the-supergraph-from-a-guest) | Let a handler run a supergraph operation in-process. |
+| [Cookie session auth](#browser-session-auth-httponly-cookie) | Authenticate a browser app from an `HttpOnly` session cookie. |
+
 ## Turn it on
 
 ```ron
@@ -207,7 +223,7 @@ curl     https://api.example.com/api/projects/acme/graphql/safelist          # l
 curl -X DELETE https://api.example.com/api/projects/acme/graphql/safelist/<hash>  # remove
 ```
 
-### Running the supergraph from a guest function
+## Run the supergraph from a guest
 
 A function may **run a GraphQL operation against the project's composed supergraph
 in-process** (cross-subgraph planning, no network hop) through the host's `graphql`
