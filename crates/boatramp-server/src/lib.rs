@@ -48,8 +48,9 @@ pub(crate) use admin_api::{
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
-    delete_graphql_subgraph, get_graphql_supergraph, put_graphql_function_subgraph,
-    put_graphql_sql_subgraph, put_graphql_subgraph,
+    delete_graphql_safelist, delete_graphql_subgraph, get_graphql_supergraph,
+    list_graphql_safelist, put_graphql_function_subgraph, put_graphql_sql_subgraph,
+    put_graphql_subgraph, register_graphql_safelist,
 };
 mod auth;
 #[cfg(feature = "console")]

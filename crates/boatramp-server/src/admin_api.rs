@@ -576,6 +576,84 @@ pub(super) async fn delete_graphql_subgraph(
     }
 }
 
+/// The body of a safelist registration: the GraphQL operation text. Its sha256-hex is the hash a
+/// guest passes to `graphql::run_persisted`.
+#[cfg(feature = "handlers")]
+#[derive(serde::Deserialize)]
+pub(super) struct SafelistEntry {
+    query: String,
+}
+
+/// `POST /api/projects/{proj}/graphql/safelist` — register a **trusted operation** in the
+/// project's GraphQL **safelist** (the guest/agent operation allowlist) and return its hash.
+/// Guest runs (`graphql::run` / `run-persisted`) are deny-by-default: only safelisted operations
+/// run. The operation is validated (parse + depth/complexity) before it is stored, so a bad op is
+/// rejected here rather than at run time. Idempotent (the same operation re-registers to the same
+/// hash).
+#[cfg(feature = "handlers")]
+pub(super) async fn register_graphql_safelist(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Json(entry): Json<SafelistEntry>,
+) -> Response {
+    let query = entry.query.trim();
+    if query.is_empty() {
+        return (StatusCode::BAD_REQUEST, "operation is empty\n").into_response();
+    }
+    let limits =
+        crate::graphql_guard::limits_from(&boatramp_core::config::HandlerGraphqlConfig::default());
+    if let crate::graphql_guard::GuardVerdict::Reject(reason) =
+        crate::graphql_guard::guard_query(query, &limits)
+    {
+        return (StatusCode::BAD_REQUEST, format!("{reason}\n")).into_response();
+    }
+    match crate::graphql_apq::register(deploy.kv().as_ref(), &project.0, query).await {
+        Ok(hash) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "hash": hash })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("safelist store error: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/projects/{proj}/graphql/safelist` — list the registered operations (`{hash, query}`).
+#[cfg(feature = "handlers")]
+pub(super) async fn list_graphql_safelist(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    let entries: Vec<serde_json::Value> =
+        crate::graphql_apq::list(deploy.kv().as_ref(), &project.0)
+            .await
+            .into_iter()
+            .map(|(hash, query)| serde_json::json!({ "hash": hash, "query": query }))
+            .collect();
+    Json(entries).into_response()
+}
+
+/// `DELETE /api/projects/{proj}/graphql/safelist/{hash}` — remove an operation from the safelist.
+/// Idempotent → `204`.
+#[cfg(feature = "handlers")]
+pub(super) async fn delete_graphql_safelist(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path(hash): Path<String>,
+) -> Response {
+    match crate::graphql_apq::unregister(deploy.kv().as_ref(), &project.0, &hash).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("safelist store error: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /api/projects/{proj}/graphql/supergraph` — the composed supergraph summary
 /// (subgraphs, entities, root fields) for the project.
 #[cfg(feature = "handlers")]

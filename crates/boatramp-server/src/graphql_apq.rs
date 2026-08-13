@@ -126,6 +126,55 @@ pub(crate) async fn safelisted(
         .and_then(|b| String::from_utf8(b).ok())
 }
 
+/// The prefix under which `scope`'s registered operations live.
+fn apq_prefix(scope: &str) -> String {
+    format!("hapq/{scope}/")
+}
+
+/// Register `query` in `scope`'s safelist, returning its hash (sha256-hex of the query text) —
+/// the id a guest passes to `run-persisted`. Idempotent (the same query re-registers to the same
+/// hash).
+pub(crate) async fn register(
+    kv: &dyn boatramp_core::kv::KvStore,
+    scope: &str,
+    query: &str,
+) -> Result<String, String> {
+    let hash = sha256_hex(query);
+    kv.put(&apq_key(scope, &hash), query.as_bytes().to_vec())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hash)
+}
+
+/// Every `(hash, query)` registered in `scope`'s safelist, in store order.
+pub(crate) async fn list(
+    kv: &dyn boatramp_core::kv::KvStore,
+    scope: &str,
+) -> Vec<(String, String)> {
+    let prefix = apq_prefix(scope);
+    let mut out = Vec::new();
+    for key in kv.list_prefix(&prefix).await.unwrap_or_default() {
+        if let Ok(Some(bytes)) = kv.get(&key).await {
+            if let Ok(query) = String::from_utf8(bytes) {
+                let hash = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+                out.push((hash, query));
+            }
+        }
+    }
+    out
+}
+
+/// Remove `hash` from `scope`'s safelist. Idempotent.
+pub(crate) async fn unregister(
+    kv: &dyn boatramp_core::kv::KvStore,
+    scope: &str,
+    hash: &str,
+) -> Result<(), String> {
+    kv.delete(&apq_key(scope, hash))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The edge resolution of an APQ request against the kv store.
 pub(crate) enum Resolved {
     /// Use this query text (resolved from the store, or the request's own query).
@@ -300,5 +349,24 @@ mod tests {
         assert_eq!(safelisted(&kv, "acme", &h).await, Some(Q.to_string()));
         // Tenant-isolated: another project's guest cannot see it.
         assert_eq!(safelisted(&kv, "other", &h).await, None);
+    }
+
+    #[tokio::test]
+    async fn register_list_and_unregister_round_trip() {
+        use boatramp_core::kv::MemoryKv;
+        let kv = MemoryKv::new();
+        let hash = register(&kv, "acme", Q).await.unwrap();
+        assert_eq!(hash, hash_of(Q));
+        // Registered → runnable by a guest, and listed.
+        assert_eq!(safelisted(&kv, "acme", &hash).await, Some(Q.to_string()));
+        assert_eq!(list(&kv, "acme").await, vec![(hash.clone(), Q.to_string())]);
+        // Idempotent re-register keeps a single entry.
+        register(&kv, "acme", Q).await.unwrap();
+        assert_eq!(list(&kv, "acme").await.len(), 1);
+        // Unregister removes it (idempotent).
+        unregister(&kv, "acme", &hash).await.unwrap();
+        assert!(safelisted(&kv, "acme", &hash).await.is_none());
+        assert!(list(&kv, "acme").await.is_empty());
+        unregister(&kv, "acme", &hash).await.unwrap();
     }
 }

@@ -178,6 +178,34 @@ query alongside the hash and the edge registers it (after verifying the hash).
 never registers a new one — persisted queries become a **query allowlist**, a
 real security control.
 
+### The safelist (managing the allowlist)
+
+Curate the project's trusted operations with the safelist endpoint. Registering
+an operation returns its hash (validated for parse + depth/complexity first, so a
+bad operation is rejected here, not at run time):
+
+```bash
+# Register a trusted operation (returns { "hash": "<sha256>" })
+curl -X POST https://api.example.com/api/projects/acme/graphql/safelist \
+  -H 'content-type: application/json' \
+  -d '{"query": "{ me { name } }"}'
+
+curl     https://api.example.com/api/projects/acme/graphql/safelist          # list
+curl -X DELETE https://api.example.com/api/projects/acme/graphql/safelist/<hash>  # remove
+```
+
+### Running the supergraph from a guest function
+
+A function may **run a GraphQL operation against the project's composed supergraph
+in-process** (cross-subgraph planning, no network hop) through the `graphql`
+capability — the [uchron shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim)
+exposes it as `graphql::run(query, variables)` / `run_persisted(hash, variables)`. It
+is how an agent operates the unified API. Guest runs are **deny-by-default: only
+safelisted operations run** (register them above), the function forwards its own bearer
+(re-verified by each subgraph — no escalation), and the run counts against the shared
+in-process call-depth cap. Grant it by importing `graphql` (and allowing it in the
+site's `allow_imports`).
+
 ## Subscriptions
 
 A GraphQL **subscription** operation sent to a graphql-enabled site is served as a

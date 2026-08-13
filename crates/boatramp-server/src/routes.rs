@@ -260,6 +260,16 @@ pub fn router_with(
             "/api/graphql/subgraphs/{name}/function",
             put(put_graphql_function_subgraph),
         )
+        // The GraphQL operation safelist (the guest/agent allowlist): register (returns the
+        // hash) + list trusted operations, and delete one by hash. Guest runs are deny-by-default.
+        .route(
+            "/api/graphql/safelist",
+            post(register_graphql_safelist).get(list_graphql_safelist),
+        )
+        .route(
+            "/api/graphql/safelist/{hash}",
+            axum::routing::delete(delete_graphql_safelist),
+        )
         .route("/api/graphql/supergraph", get(get_graphql_supergraph));
     // An `Auth` clone for the `/mcp` channel gate (captured before `auth` is moved
     // into the API's `require_auth` layer below) + the node's canonical origin, for
