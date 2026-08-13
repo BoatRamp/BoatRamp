@@ -40,6 +40,7 @@ flags unique to each command:
 | [`sync <dir>`](#boatramp-sync) | Build (optional) and publish a folder as a new atomic deployment. |
 | [`build`](#boatramp-build) | Run the configured build command only. |
 | [`bundle`](#boatramp-bundle) | Bundle JS/TS + CSS in-process (`bundler` feature). |
+| [`compose`](#boatramp-compose) | Fuse several Wasm components into one linked handler. |
 | [`validate`](#boatramp-validate) | Parse and check a `project.cfg` (its `routing` section). |
 | [`deployments`](#boatramp-deployments) | List a site's deployment history. |
 | [`rollback`](#boatramp-rollback) | Roll back to the previous (or a specific) deployment. |
@@ -228,6 +229,22 @@ Run the configured build command only.
 
 Bundle JS/TS (Rolldown) + CSS (lightningcss) in-process. Needs the `bundler`
 feature; configured by the `bundle` section of [`project.cfg`](./project-cfg.md).
+
+## `boatramp compose`
+
+Fuse a root ("edge") component with one or more plugin components into a single
+linked component, in-process — no external toolchain, no network hop. The fused
+component's exports are unchanged (still e.g. `wasi:http/incoming-handler`); only
+the imports a plugin satisfies are linked internally, while host imports
+(`wasi:http`, `sql`, `kv`, …) stay imported for the runtime to supply. Deploy the
+one fused `.wasm` through the normal content-addressed path. See
+[Compose components into one handler](../how-to/compose.md).
+
+| Flag | Description |
+| --- | --- |
+| `--edge <COMPONENT>` | The root component: exports the handler world, imports what the plugins provide. |
+| `--plugin <COMPONENT>` | A plugin whose exports satisfy one of the edge's imports. Repeatable. |
+| `-o`, `--output <PATH>` | Where to write the fused component. |
 
 ## `boatramp validate`
 

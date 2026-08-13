@@ -33,6 +33,7 @@
 - [Encrypt secrets at rest](./how-to/secrets-at-rest.md)
 - [Enable the embedded web console](./how-to/web-console.md)
 - [Deploy a handler](./how-to/deploy-handler.md)
+- [Compose components into one handler](./how-to/compose.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
 - [Serve a GraphQL API](./how-to/graphql.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
