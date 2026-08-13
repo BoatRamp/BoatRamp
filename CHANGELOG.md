@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.2.5]
 
 ### Added
 - **GraphQL from your database (`[handlers.graphql.data]`).** A site can serve a GraphQL API
