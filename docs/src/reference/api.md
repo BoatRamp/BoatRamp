@@ -35,7 +35,7 @@ target the reserved `default` project and stay byte-identical to pre-0.2.0.
 | `GET` | `/api/projects/:project` | Get one project's record. |
 | `DELETE` | `/api/projects/:project` | Delete an empty project (refused while it owns resources or is `default`). |
 | any | `/api/projects/:project/sites/…` | Per-project site endpoints — the same shapes as [Sites & deployments](#sites--deployments), scoped to the project. |
-| any | `/api/projects/:project/{functions,compute,workflows}/…` | Per-project function / compute / workflow endpoints, scoped to the project. |
+| any | `/api/projects/:project/{functions,compute,workflows,graphql}/…` | Per-project function / compute / workflow / GraphQL-admin endpoints, scoped to the project. |
 
 ## Sites & deployments
 
@@ -151,6 +151,26 @@ scopes to another project.
 
 Requires KVM on the serving host; the control-plane surface is uniform whether or
 not execution is available. See [Run compute workloads](../how-to/compute.md).
+
+## GraphQL
+
+The subgraph registry, the operation safelist, and the composed supergraph — a
+project-owned surface. Top-level paths target the `default` project;
+`/api/projects/:project/graphql/…` scopes to another project. See
+[Serve a GraphQL API](../how-to/graphql.md).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `PUT`/`DELETE` | `/api/graphql/subgraphs/:name` | Register (SDL body) / unregister a subgraph; a publish recomposes and is rejected if it doesn't compose. |
+| `PUT` | `/api/graphql/subgraphs/:name/sql` | Register a SQL-backed subgraph by introspecting a site's managed database. |
+| `PUT` | `/api/graphql/subgraphs/:name/function` | Register a function-backed subgraph by introspecting its `_service { sdl }`. |
+| `GET` | `/api/graphql/supergraph` | The composed supergraph (subgraphs, `@key` entities, root fields). |
+| `POST`/`GET` | `/api/graphql/safelist` | Register a trusted operation (returns its hash) / list the safelist. |
+| `DELETE` | `/api/graphql/safelist/:hash` | Remove an operation from the safelist. |
+
+A function that self-declares a subgraph auto-registers on deploy; pass
+`?register_subgraph=false` to `PUT /api/functions/:name` to opt a deploy out. See
+[Federation](../how-to/graphql.md#federation).
 
 ## Per-site observability
 

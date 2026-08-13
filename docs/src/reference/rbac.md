@@ -33,7 +33,7 @@ Two resources are target-scoped: `site` (target `<project>/<site>`) and `project
 | Resource | Scoped | Governs |
 | --- | --- | --- |
 | `site` | `<project>/<site>` | Per-site deployments, config, aliases, domain verification, per-site observability. |
-| `project` | `<project>` | The project entity plus the resources it owns — its functions, compute workloads, and workflows. A `project` grant is the tenant boundary: a token scoped to one project cannot touch a sibling. |
+| `project` | `<project>` | The project entity plus the resources it owns — its functions, compute workloads, workflows, and GraphQL admin surface (subgraph registry + safelist). A `project` grant is the tenant boundary: a token scoped to one project cannot touch a sibling. |
 | `blobs` | global | Content-addressed blob uploads. |
 | `tokens` | global | API token management. |
 | `certs` | global | TLS certificate status. |
@@ -111,16 +111,16 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `POST` | `/api/projects` | `system` · `admin` |
 | `GET` | `/api/projects/<proj>` | `project` · `read` *(proj)* |
 | `DELETE` | `/api/projects/<proj>` | `project` · `admin` *(proj)* |
-| `GET` | `/api/projects/<proj>/{functions,compute,workflows}[/…]` | `project` · `read` *(proj)* |
-| `POST`/`PUT`/`DELETE` | `/api/projects/<proj>/{functions,compute,workflows}/…` | `project` · `deploy` *(proj)* |
+| `GET` | `/api/projects/<proj>/{functions,compute,workflows,graphql}[/…]` | `project` · `read` *(proj)* |
+| `POST`/`PUT`/`DELETE` | `/api/projects/<proj>/{functions,compute,workflows,graphql}/…` | `project` · `deploy` *(proj)* |
 | `POST` | `/api/[projects/<proj>/]sites/<site>/deployments` | `site` · `deploy` *(target)* |
 | `GET` | `/api/[projects/<proj>/]sites/<site>/deployments[/<id>]` | `site` · `read` *(target)* |
 | `POST` | `/api/[projects/<proj>/]sites/<site>/deployments/<id>/activate` | `site` · `deploy` *(target)* |
 | `GET` | `/api/[projects/<proj>/]sites/<site>/config` | `site` · `read` *(target)* |
 | `PUT` | `/api/[projects/<proj>/]sites/<site>/config` | `site` · `write` *(target)* |
 | `PUT`/`DELETE` | `/api/[projects/<proj>/]sites/<site>/aliases/<name>` | `site` · `write` *(target)* |
-| `GET` | `/api/functions`, `/api/compute`, `/api/workflows` (legacy) | `project` · `read` *(default)* |
-| `POST`/`PUT`/`DELETE` | `/api/{functions,compute,workflows}/…` (legacy) | `project` · `deploy` *(default)* |
+| `GET` | `/api/{functions,compute,workflows,graphql}[/…]` (legacy) | `project` · `read` *(default)* |
+| `POST`/`PUT`/`DELETE` | `/api/{functions,compute,workflows,graphql}/…` (legacy) | `project` · `deploy` *(default)* |
 | `POST`/`DELETE` | `/api/tokens[/<id>]` | `tokens` · `admin` |
 | `GET` | `/api/certs` | `certs` · `read` |
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |
