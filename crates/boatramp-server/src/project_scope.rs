@@ -7,8 +7,9 @@
 //!
 //! The rewrite is the one place a project-scoped URL becomes a global handler URL, so
 //! it is **whitelisted**: only the genuinely project-owned resource families
-//! ([`PROJECT_SCOPED_FAMILIES`] — `sites`, `functions`, `compute`, `workflows`) are
-//! rewritten. A `/api/projects/<proj>/tokens` (or any non-family sub-path) is **not**
+//! ([`PROJECT_SCOPED_FAMILIES`] — `sites`, `functions`, `compute`, `workflows`,
+//! `graphql`) are rewritten. A `/api/projects/<proj>/tokens` (or any non-family
+//! sub-path) is **not**
 //! rewritten, so it never reaches the global `/api/tokens` handler with mere
 //! project authority — it simply 404s. The project-entity paths (`/api/projects` and
 //! `/api/projects/<proj>`) are their own routes and are never rewritten.
@@ -30,7 +31,8 @@ use boatramp_core::project::{ProjectRef, DEFAULT_PROJECT};
 /// only sub-paths the middleware rewrites onto their global `/api/<family>/…`
 /// handlers. Everything else under a project (tokens, authz, daemon, …) is **not**
 /// project-owned and must not be reachable via the project path.
-pub const PROJECT_SCOPED_FAMILIES: &[&str] = &["sites", "functions", "compute", "workflows"];
+pub const PROJECT_SCOPED_FAMILIES: &[&str] =
+    &["sites", "functions", "compute", "workflows", "graphql"];
 
 /// The tenant project a request targets, injected as a request extension by
 /// [`project_scope`]. Handlers read it (defaulting to `default` when absent) and thread
@@ -212,6 +214,16 @@ mod tests {
 
         let s = scope_of("/api/projects/acme/compute/api");
         assert_eq!(s.rewrite.as_deref(), Some("/api/compute/api"));
+
+        // GraphQL admin (subgraph registration, safelist, supergraph) is a
+        // project-owned family: a project-scoped path rewrites onto the global handler
+        // so multi-project GraphQL administration works.
+        let s = scope_of("/api/projects/acme/graphql/safelist");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/graphql/safelist"));
+
+        let s = scope_of("/api/projects/acme/graphql/subgraphs/catalog");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/graphql/subgraphs/catalog"));
     }
 
     #[test]

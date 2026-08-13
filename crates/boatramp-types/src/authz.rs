@@ -282,6 +282,16 @@ impl Right {
                 let action = if get { Action::Read } else { Action::Deploy };
                 Self::new(Resource::Project, Some(default_project.clone()), action)
             }
+            // GraphQL administration — subgraph registration, the operation safelist,
+            // and the composed supergraph — is project-owned (0.2.0), the same as
+            // functions/compute/workflows: read the surface with `project·read`, mutate
+            // it with `project·deploy`, scoped to the default project for this global
+            // path (the project-scoped `/api/projects/<proj>/graphql/…` form is handled
+            // above).
+            p if p == "/api/graphql" || p.starts_with("/api/graphql/") => {
+                let action = if get { Action::Read } else { Action::Deploy };
+                Self::new(Resource::Project, Some(default_project.clone()), action)
+            }
             "/api/blobs" => Self::new(Resource::Blobs, None, Action::Deploy),
             "/api/certs" => Self::new(Resource::Certs, None, Action::Read),
             "/api/cache/invalidate" => Self::new(Resource::Cache, None, Action::Write),
@@ -1087,6 +1097,36 @@ mod tests {
                 "GET",
                 "/api/metrics",
                 Some(Right::new(Resource::System, None, Action::Read)),
+            ),
+            // GraphQL administration is project-owned (default project for the global
+            // path): read the surface with `project·read`, mutate it with
+            // `project·deploy` — the same shape as functions/compute/workflows.
+            (
+                "GET",
+                "/api/graphql/supergraph",
+                Some(Right::new(
+                    Resource::Project,
+                    Some("default".into()),
+                    Action::Read,
+                )),
+            ),
+            (
+                "PUT",
+                "/api/graphql/subgraphs/catalog",
+                Some(Right::new(
+                    Resource::Project,
+                    Some("default".into()),
+                    Action::Deploy,
+                )),
+            ),
+            (
+                "POST",
+                "/api/graphql/safelist",
+                Some(Right::new(
+                    Resource::Project,
+                    Some("default".into()),
+                    Action::Deploy,
+                )),
             ),
         ];
         for (method, path, expected) in cases {
