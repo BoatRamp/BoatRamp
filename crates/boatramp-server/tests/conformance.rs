@@ -1585,6 +1585,7 @@ async fn handler_route_dispatches_through_engine() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -1620,6 +1621,121 @@ async fn handler_route_dispatches_through_engine() {
     // The counter landed under the site's handler-kv prefix.
     use boatramp_core::kv::KvStore;
     assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
+}
+
+/// Browser cookie session auth through the real `router()` → dispatch: a cookie-authenticated
+/// request is CSRF-checked against the configured origins *before* the handler runs, and a
+/// same-origin one passes through. (The cookie value becomes a standard `Authorization: Bearer`
+/// header — its verification + tenant scoping is byte-identical to a header bearer, covered by
+/// the field-authz / data-connector tests; the `cookie_auth_outcome` unit tests cover the
+/// precedence + extraction. This proves the gate fires in the pipeline, for a *plain* handler —
+/// not only the GraphQL edge.)
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
+    use boatramp_core::config::{CookieAuthConfig, HandlerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    let hash = sha256_hex(HTTP_200);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "h.wasm".to_string(),
+        FileEntry {
+            hash: hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let config = DeployConfig {
+        handlers: vec![HandlerConfig {
+            route: "/api".to_string(),
+            methods: Vec::new(),
+            component: "h.wasm".to_string(),
+            imports: Vec::new(),
+            limits: None,
+            env: BTreeMap::new(),
+            invoke_targets: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let manifest = Manifest {
+        files,
+        config,
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "app", &id)
+        .await
+        .unwrap();
+
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "app",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    cookie_auth: Some(CookieAuthConfig {
+                        cookie_name: "session".to_string(),
+                        allowed_origins: vec!["https://app.example.com".to_string()],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let request = |origin: Option<&str>| {
+        let mut b = Request::builder()
+            .method("GET")
+            .uri("/_sites/app/api")
+            .header("cookie", "session=apptoken");
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        let mut req = b.body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        req
+    };
+
+    // Cross-origin cookie request → rejected before the handler runs (CSRF).
+    let resp = app
+        .clone()
+        .oneshot(request(Some("https://evil.example.net")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Same-origin cookie request → passes the gate and reaches the handler.
+    let resp = app
+        .clone()
+        .oneshot(request(Some("https://app.example.com")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // No Origin (a same-origin top-level navigation, e.g. an email link) → allowed.
+    let resp = app.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ---- function invoke API (FA-3) --------------------------------------------
@@ -2854,6 +2970,7 @@ async fn activation_during_traffic_drops_no_requests() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -2990,6 +3107,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -3101,6 +3219,7 @@ async fn activation_refuses_broken_component() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -3205,6 +3324,7 @@ async fn activation_refuses_disallowed_import() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -3300,6 +3420,7 @@ async fn activation_refuses_oversized_component() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -3397,6 +3518,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },
@@ -3519,6 +3641,7 @@ async fn per_site_timeout_cap_applies() {
                     max_log_rate: None,
                     cache: None,
                     graphql: None,
+                    cookie_auth: None,
                 }),
                 ..Default::default()
             },

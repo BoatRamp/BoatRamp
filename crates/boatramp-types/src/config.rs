@@ -644,6 +644,33 @@ pub struct HandlersSiteConfig {
     /// allowed) is a schema-introspection query. Defense-in-depth over the fuel cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<HandlerGraphqlConfig>,
+    /// Browser cookie session auth. Off unless present. When set, a request with the named
+    /// cookie but **no** `Authorization` header is authenticated from the cookie value: it
+    /// becomes the app bearer token everywhere the header bearer already flows (managed
+    /// handlers, the GraphQL edge, the data connector, invoked functions, `graphql::run`). The
+    /// `Authorization` header always wins, so API clients are unaffected. boatramp **only reads**
+    /// the cookie — the app's auth handler issues + refreshes it (set it `HttpOnly; Secure;
+    /// SameSite=Lax`). A cookie-authenticated request is CSRF-checked against `allowed_origins`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_auth: Option<CookieAuthConfig>,
+}
+
+/// Browser cookie session auth for a site (see [`HandlersSiteConfig::cookie_auth`]). boatramp
+/// only **reads** the cookie; the app sets it. The cookie value is the app bearer token, opaque
+/// to boatramp (the app's own `Authorizer` / OIDC config verifies it, exactly as for a header
+/// bearer).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CookieAuthConfig {
+    /// The cookie whose value is used as the bearer when no `Authorization` header is present.
+    pub cookie_name: String,
+    /// The CSRF allowlist: origins a cookie-authenticated request may come from. A request whose
+    /// `Origin` (or, absent that, `Referer`) is present and **not** listed is rejected. Each
+    /// entry is a scheme+host[+port] origin, e.g. `https://app.example.com`. Empty ⇒ every
+    /// cross-origin cookie-authenticated request is rejected (only same-origin, which sends no
+    /// `Origin` on a top-level navigation, passes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
 }
 
 /// Per-site GraphQL edge query-guard tuning (see [`HandlersSiteConfig::graphql`]).

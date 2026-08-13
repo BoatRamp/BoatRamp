@@ -62,6 +62,31 @@ pub(super) async fn dispatch_handler(
         return not_found();
     };
 
+    // Browser cookie session auth: if the site opts in and the request carries the configured
+    // cookie but no `Authorization` header, use the cookie value as the app bearer for **every**
+    // downstream consumer (managed handlers read it from the request; the GraphQL edge, data
+    // connector, invoked functions, and `graphql::run` all flow from the same bearer). The
+    // `Authorization` header always wins, so API clients are unaffected. boatramp only reads the
+    // cookie — the app sets it. A cookie-authenticated request is CSRF-checked against the
+    // configured origins first (boatramp's inbound defense, over the app's `SameSite=Lax`).
+    match cookie_auth_outcome(request.headers(), site_handlers.cookie_auth.as_ref()) {
+        CookieAuthOutcome::None => {}
+        CookieAuthOutcome::Reject => {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin cookie-authenticated request rejected\n",
+            )
+                .into_response();
+        }
+        CookieAuthOutcome::Inject(token) => {
+            // The cookie value is the app bearer — inject it as the standard header so every
+            // downstream consumer verifies it byte-identically to a client-supplied header bearer.
+            if let Ok(value) = HeaderValue::try_from(format!("Bearer {token}")) {
+                request.headers_mut().insert(header::AUTHORIZATION, value);
+            }
+        }
+    }
+
     // GraphQL edge processing: resolve a persisted-query hash to its text (registering
     // it on a verified first miss unless safelisted), then reject an over-limit (or,
     // when disabled, introspection) query — all before the handler runs. Every
@@ -614,6 +639,85 @@ pub(super) async fn read_blob_fully(deploy: &DeployStore, hash: &str) -> Result<
         .map_err(deploy_error_response)
 }
 
+/// What browser cookie session auth does with a request.
+enum CookieAuthOutcome {
+    /// Not cookie-authenticated (no config, an `Authorization` header is present, or the cookie
+    /// is absent) — proceed unchanged.
+    None,
+    /// Authenticate from the cookie: inject this value as the bearer.
+    Inject(String),
+    /// A cookie-authenticated request from a disallowed origin — reject it (CSRF).
+    Reject,
+}
+
+/// Decide browser cookie session auth for a request: use the configured cookie's value as the
+/// bearer **only** when the site opts in, no `Authorization` header is present (the header always
+/// wins), and the cookie is set — and only after the CSRF origin check passes. Pure over the
+/// request headers + config, so the precedence/CSRF policy is unit-tested directly.
+fn cookie_auth_outcome(
+    headers: &HeaderMap,
+    cookie_auth: Option<&boatramp_core::config::CookieAuthConfig>,
+) -> CookieAuthOutcome {
+    let Some(cookie_auth) = cookie_auth else {
+        return CookieAuthOutcome::None;
+    };
+    // The Authorization header always wins — an API client is never cookie-authenticated.
+    if headers.contains_key(header::AUTHORIZATION) {
+        return CookieAuthOutcome::None;
+    }
+    let Some(token) = cookie_value(headers, &cookie_auth.cookie_name) else {
+        return CookieAuthOutcome::None;
+    };
+    if !origin_allowed(headers, &cookie_auth.allowed_origins) {
+        return CookieAuthOutcome::Reject;
+    }
+    CookieAuthOutcome::Inject(token)
+}
+
+/// The value of cookie `name` from the request's `Cookie` header, if present (browser cookie
+/// session auth). A trivial `name=value; …` split — no attribute parsing, since the browser
+/// sends only name/value pairs on the request.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|pair| {
+        let (k, v) = pair.trim().split_once('=')?;
+        (k == name).then(|| v.trim().to_string())
+    })
+}
+
+/// The origin (`scheme://host[:port]`) of a `Referer` URL, if parseable (the CSRF fallback when
+/// no `Origin` header is present).
+fn referer_origin(referer: &str) -> Option<String> {
+    let (scheme, rest) = referer.split_once("://")?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// Whether a cookie-authenticated request's origin is allowed (the CSRF check). The request's
+/// `Origin` (or, absent that, the origin of `Referer`) must be listed in `allowed`. An **absent**
+/// Origin *and* Referer — a same-origin top-level navigation, or a non-browser client — passes:
+/// there is no cross-origin signal to reject on, and the browser's `SameSite=Lax` is the layer
+/// that withholds the cookie on a genuine cross-site POST/fetch.
+fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get(header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(referer_origin)
+        });
+    match origin {
+        None => true,
+        Some(origin) => allowed.iter().any(|a| a == &origin),
+    }
+}
+
 /// Grant the per-site bindings the handler requested *and* the site allows
 /// (effective imports = deploy ∩ site), served from the runtime's backends.
 ///
@@ -829,4 +933,131 @@ pub(super) async fn dispatch_consumer_batch(
         }
     }
     acked
+}
+
+#[cfg(test)]
+mod cookie_auth_tests {
+    use super::*;
+    use boatramp_core::config::CookieAuthConfig;
+
+    fn cfg(origins: &[&str]) -> CookieAuthConfig {
+        CookieAuthConfig {
+            cookie_name: "session".to_string(),
+            allowed_origins: origins
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn cookie_value_extracts_the_named_cookie() {
+        let h = headers(&[("cookie", "a=1; session=tok123; b=2")]);
+        assert_eq!(cookie_value(&h, "session").as_deref(), Some("tok123"));
+        assert_eq!(cookie_value(&h, "missing"), None);
+        assert_eq!(cookie_value(&HeaderMap::new(), "session"), None);
+    }
+
+    #[test]
+    fn referer_origin_is_the_scheme_host_port() {
+        assert_eq!(
+            referer_origin("https://app.example.com/a/b?q=1"),
+            Some("https://app.example.com".to_string())
+        );
+        assert_eq!(
+            referer_origin("http://localhost:3000/x"),
+            Some("http://localhost:3000".to_string())
+        );
+        assert_eq!(referer_origin("not a url"), None);
+    }
+
+    #[test]
+    fn origin_check_allows_listed_origins_and_absent_signal_but_rejects_others() {
+        let allowed = ["https://app.example.com".to_string()];
+        // Origin present + allowed.
+        assert!(origin_allowed(
+            &headers(&[("origin", "https://app.example.com")]),
+            &allowed
+        ));
+        // Origin present + not allowed → reject.
+        assert!(!origin_allowed(
+            &headers(&[("origin", "https://evil.example.net")]),
+            &allowed
+        ));
+        // No Origin, but Referer's origin is allowed.
+        assert!(origin_allowed(
+            &headers(&[("referer", "https://app.example.com/page")]),
+            &allowed
+        ));
+        // No Origin, Referer's origin not allowed → reject.
+        assert!(!origin_allowed(
+            &headers(&[("referer", "https://evil.example.net/page")]),
+            &allowed
+        ));
+        // Neither Origin nor Referer (same-origin top-level nav) → allow.
+        assert!(origin_allowed(&HeaderMap::new(), &allowed));
+    }
+
+    #[test]
+    fn outcome_injects_a_same_origin_cookie() {
+        let h = headers(&[
+            ("cookie", "session=tok"),
+            ("origin", "https://app.example.com"),
+        ]);
+        assert!(matches!(
+            cookie_auth_outcome(&h, Some(&cfg(&["https://app.example.com"]))),
+            CookieAuthOutcome::Inject(t) if t == "tok"
+        ));
+    }
+
+    #[test]
+    fn outcome_rejects_a_cross_origin_cookie_request() {
+        let h = headers(&[
+            ("cookie", "session=tok"),
+            ("origin", "https://evil.example.net"),
+        ]);
+        assert!(matches!(
+            cookie_auth_outcome(&h, Some(&cfg(&["https://app.example.com"]))),
+            CookieAuthOutcome::Reject
+        ));
+    }
+
+    #[test]
+    fn outcome_lets_the_authorization_header_win() {
+        // Both a cookie and a header → the header wins, cookie ignored (API clients unaffected).
+        let h = headers(&[
+            ("cookie", "session=cookietok"),
+            ("authorization", "Bearer headertok"),
+            ("origin", "https://evil.example.net"), // even a bad origin doesn't matter here
+        ]);
+        assert!(matches!(
+            cookie_auth_outcome(&h, Some(&cfg(&["https://app.example.com"]))),
+            CookieAuthOutcome::None
+        ));
+    }
+
+    #[test]
+    fn outcome_is_none_without_a_cookie_or_config() {
+        // No cookie → anonymous (None), so only public fields resolve downstream.
+        assert!(matches!(
+            cookie_auth_outcome(&HeaderMap::new(), Some(&cfg(&["https://app.example.com"]))),
+            CookieAuthOutcome::None
+        ));
+        // No cookie_auth config → never engaged.
+        assert!(matches!(
+            cookie_auth_outcome(&headers(&[("cookie", "session=tok")]), None),
+            CookieAuthOutcome::None
+        ));
+    }
 }

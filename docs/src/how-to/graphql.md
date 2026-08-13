@@ -108,6 +108,34 @@ every depth (through relationships) and on every write (an insert is forced to c
 tenant), so there is nothing to miss. This is exactly what makes it safe to expose one shared
 database to many tenants with no resolver code.
 
+### Browser session auth (httpOnly cookie)
+
+A browser SPA can authenticate with the app token entirely **out of JavaScript** — the token
+stays in an `HttpOnly` cookie the JS can't read (XSS-safe). Opt the site in and boatramp treats
+the named cookie as the bearer wherever the bearer already flows (the data connector above, the
+field-authz forwarding, invoked functions, `graphql::run`, and any managed handler):
+
+```ron
+// On the site's `handlers` config (general — not GraphQL-specific).
+cookie_auth: ( cookie_name: "session", allowed_origins: ["https://app.example.com"] )
+```
+
+When set, a request carrying the `session` cookie but **no** `Authorization` header is
+authenticated from the cookie value — verified byte-identically to a header bearer (the
+`claims_from_token` check, the field guards, everything). The **`Authorization` header always
+wins**, so API clients (curl, mobile) are unaffected.
+
+**boatramp only reads the cookie — your app sets it.** Your auth handler issues + refreshes it;
+set it `HttpOnly; Secure; SameSite=Lax`. Use **`Lax`, not `Strict`**: `Strict` withholds the
+cookie when a user arrives from an external link (an email, another site), landing them
+logged-out on first load; `Lax` still sends it on that top-level navigation while withholding it
+on the cross-site POST/fetch that a CSRF would use.
+
+**CSRF.** A cookie-authenticated request is checked against `allowed_origins`: if its `Origin`
+(or `Referer`) is present and not listed, it is rejected `403`. (A header-bearer request isn't
+CSRF-able — the attacker doesn't have the token — so it's exempt.) This is boatramp's inbound
+layer over the app's `SameSite=Lax`.
+
 **Relationships.** Foreign keys become relationship fields — a to-one field for each outgoing
 FK and a to-many field for the rows that reference this one. A nested query resolves in **one
 SQL statement** (relationships compile to correlated JSON subqueries), so there is no N+1, and
