@@ -221,7 +221,14 @@ pub(super) async fn dispatch_handler(
                     // subgraphs and execute it by dispatching fetches to the subgraph
                     // functions, instead of running a single handler component.
                     if gql.federated {
-                        return federation_gateway(inner, project, query, bearer.as_deref()).await;
+                        return federation_gateway(
+                            inner,
+                            project,
+                            query,
+                            &variables,
+                            bearer.as_deref(),
+                        )
+                        .await;
                     }
                     // Declarative data connector: serve the query from the site's managed
                     // database (compiled to SQL), instead of running a handler component.
@@ -379,6 +386,7 @@ async fn federation_gateway(
     inner: &HandlerRuntimeInner,
     project: &str,
     query: &str,
+    variables: &serde_json::Value,
     bearer: Option<&str>,
 ) -> Response {
     let supergraph = match crate::graphql_registry::supergraph(inner.kv.as_ref(), project).await {
@@ -417,7 +425,7 @@ async fn federation_gateway(
         sql_subgraphs,
         bearer.map(str::to_string),
     );
-    axum::Json(crate::graphql_gateway::execute(&plan, &runner).await).into_response()
+    axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
 }
 
 /// The declarative data connector: serve a GraphQL query from the site's managed database.

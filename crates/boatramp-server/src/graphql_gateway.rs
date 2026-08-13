@@ -23,14 +23,21 @@ pub(crate) trait SubgraphFetcher: Sync {
     async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value;
 }
 
-/// Execute `plan` with `fetcher`, returning the merged `{ "data": … }` response.
-pub(crate) async fn execute(plan: &QueryPlan, fetcher: &dyn SubgraphFetcher) -> Value {
+/// Execute `plan` with `fetcher`, returning the merged `{ "data": … }` response. `variables`
+/// is the incoming operation's variables (a JSON object, or null) — forwarded to every root
+/// fetch so a field argument bound to `$var` resolves; an `_entities` fetch also receives them
+/// alongside its `representations`.
+pub(crate) async fn execute(
+    plan: &QueryPlan,
+    fetcher: &dyn SubgraphFetcher,
+    variables: &Value,
+) -> Value {
     let mut data = json!({});
     for fetch in &plan.fetches {
         match &fetch.requires {
             None => {
                 let resp = fetcher
-                    .fetch(&fetch.subgraph, &fetch.query, json!({}))
+                    .fetch(&fetch.subgraph, &fetch.query, variables.clone())
                     .await;
                 merge(&mut data, fetch_data(&resp));
             }
@@ -43,7 +50,7 @@ pub(crate) async fn execute(plan: &QueryPlan, fetcher: &dyn SubgraphFetcher) -> 
                     .fetch(
                         &fetch.subgraph,
                         &fetch.query,
-                        json!({ "representations": reprs }),
+                        with_representations(variables, reprs),
                     )
                     .await;
                 let entities = resp
@@ -61,6 +68,17 @@ pub(crate) async fn execute(plan: &QueryPlan, fetcher: &dyn SubgraphFetcher) -> 
 /// A fetch response's data object (unwrapping a `{ "data": … }` envelope).
 fn fetch_data(resp: &Value) -> &Value {
     resp.get("data").unwrap_or(resp)
+}
+
+/// The variables for an `_entities` fetch: the incoming operation variables (when a JSON object)
+/// plus the computed `representations` the `_entities(representations: $representations)` binds.
+fn with_representations(variables: &Value, reprs: Value) -> Value {
+    let mut map = match variables {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    map.insert("representations".to_string(), reprs);
+    Value::Object(map)
 }
 
 /// Dispatch one fetch to a subgraph **function** over the in-process invoke path (no network
@@ -366,7 +384,11 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             bearer,
         )
         .at_depth(depth);
-        let response = execute(&plan, &router).await;
+        // The guest's operation variables (a JSON object string) — forwarded to the fetches so a
+        // mutation/field argument bound to `$var` resolves. An unparseable/empty value is `{}`.
+        let variables: Value =
+            serde_json::from_str(&request.variables).unwrap_or_else(|_| json!({}));
+        let response = execute(&plan, &router, &variables).await;
         serde_json::to_vec(&response)
             .map_err(|e| SupergraphRunError::Failed(format!("serializing response: {e}")))
     }
@@ -590,7 +612,7 @@ mod tests {
                 json!({ "data": { "topReviews": [{ "body": "ok" }] } }),
             ),
         ]));
-        let out = execute(&plan, &mock).await;
+        let out = execute(&plan, &mock, &json!({})).await;
         assert_eq!(out["data"]["me"]["name"], json!("Alice"));
         assert_eq!(out["data"]["topReviews"][0]["body"], json!("ok"));
     }
@@ -613,7 +635,7 @@ mod tests {
                 json!({ "data": { "_entities": [{ "reviews": [{ "body": "great" }] }] } }),
             ),
         ]));
-        let out = execute(&plan, &mock).await;
+        let out = execute(&plan, &mock, &json!({})).await;
         // The `me` object now carries both its accounts fields and the stitched reviews.
         assert_eq!(out["data"]["me"]["name"], json!("Alice"));
         assert_eq!(out["data"]["me"]["reviews"][0]["body"], json!("great"));
@@ -627,7 +649,7 @@ mod tests {
         ])
         .unwrap();
         let plan = plan("{ users { name reviews { body } } }", &sg).unwrap();
-        let out = execute(&plan, &ContractRunner).await;
+        let out = execute(&plan, &ContractRunner, &json!({})).await;
         // Each list element is joined to *its own* reviews by key — proving the
         // representations→`_entities`→stitch round-trip preserves per-element identity
         // (element 2 gets review-for-2, not review-for-1), which a canned mock can't show.

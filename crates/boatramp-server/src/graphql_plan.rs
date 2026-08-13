@@ -11,8 +11,10 @@
 //! Pure and deterministic — operation + model in, plan out; no I/O.
 
 use crate::graphql_federation::Supergraph;
-use graphql_parser::query::{Definition, Field, OperationDefinition, Selection, SelectionSet};
-use std::collections::{BTreeMap, VecDeque};
+use graphql_parser::query::{
+    Definition, Field, OperationDefinition, Selection, SelectionSet, Value,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// One fetch in a query plan.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +64,9 @@ struct DepFetch {
     path: Vec<String>,
     /// The selection to resolve on the entity in `subgraph` (the `... on Type { … }` body).
     selection: String,
+    /// Operation variables referenced within `selection` — their definitions are added to
+    /// the `_entities` fetch so a nested field argument like `field(first: $n)` still binds.
+    used_vars: BTreeSet<String>,
     /// Nested dependent fetches from within `selection`.
     deps: Vec<Self>,
 }
@@ -78,10 +83,20 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
             _ => None,
         })
         .ok_or(PlanError::NoOperation)?;
-    let (root_sel, root_type, roots) = match op {
-        OperationDefinition::Query(q) => (&q.selection_set, "Query", &sg.root_query),
-        OperationDefinition::SelectionSet(ss) => (ss, "Query", &sg.root_query),
-        OperationDefinition::Mutation(m) => (&m.selection_set, "Mutation", &sg.root_mutation),
+    let (root_sel, root_type, roots, var_types) = match op {
+        OperationDefinition::Query(q) => (
+            &q.selection_set,
+            "Query",
+            &sg.root_query,
+            var_type_map(&q.variable_definitions),
+        ),
+        OperationDefinition::SelectionSet(ss) => (ss, "Query", &sg.root_query, BTreeMap::new()),
+        OperationDefinition::Mutation(m) => (
+            &m.selection_set,
+            "Mutation",
+            &sg.root_mutation,
+            var_type_map(&m.variable_definitions),
+        ),
         OperationDefinition::Subscription(_) => return Err(PlanError::Unsupported("subscription")),
     };
 
@@ -101,19 +116,19 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
     let mut queue: VecDeque<(DepFetch, usize)> = VecDeque::new();
     for (subgraph, fields) in by_subgraph {
         let idx = fetches.len();
-        let mut selection = String::from("{ ");
+        let mut used = BTreeSet::new();
+        let mut body = String::new();
         for field in fields {
-            let (text, deps) = plan_field(sg, field, root_type, &subgraph);
-            selection.push_str(&text);
-            selection.push(' ');
+            let (text, deps) = plan_field(sg, field, root_type, &subgraph, &mut used);
+            body.push_str(&text);
+            body.push(' ');
             for d in deps {
                 queue.push_back((d, idx));
             }
         }
-        selection.push('}');
         fetches.push(Fetch {
             subgraph,
-            query: selection,
+            query: build_root_operation(root_type, &used, &var_types, &body),
             requires: None,
         });
     }
@@ -124,7 +139,7 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
         let idx = fetches.len();
         fetches.push(Fetch {
             subgraph: dep.subgraph,
-            query: entity_fetch_query(&dep.type_name, &dep.selection),
+            query: entity_fetch_query(&dep.type_name, &dep.selection, &dep.used_vars, &var_types),
             requires: Some(Requires {
                 type_name: dep.type_name,
                 key: dep.key,
@@ -148,6 +163,7 @@ fn plan_selection(
     sel_set: &SelectionSet<'_, String>,
     parent_type: &str,
     subgraph: &str,
+    used: &mut BTreeSet<String>,
 ) -> (String, Vec<DepFetch>) {
     let mut local = String::from("{ ");
     let mut deps = Vec::new();
@@ -169,19 +185,23 @@ fn plan_selection(
                     }
                     key_injected = true;
                 }
-                let (selection, nested) = plan_field(sg, field, parent_type, &owner);
+                // The entity sub-query is a distinct operation (a different subgraph), so it
+                // carries its own variable references, not this fetch's.
+                let mut dep_used = BTreeSet::new();
+                let (selection, nested) = plan_field(sg, field, parent_type, &owner, &mut dep_used);
                 deps.push(DepFetch {
                     subgraph: owner,
                     type_name: parent_type.to_string(),
                     key: sg.entities[parent_type].key.clone(),
                     path: Vec::new(),
                     selection,
+                    used_vars: dep_used,
                     deps: nested,
                 });
             }
             // Local (same-subgraph, or an unowned scalar like __typename).
             _ => {
-                let (text, field_deps) = plan_field(sg, field, parent_type, subgraph);
+                let (text, field_deps) = plan_field(sg, field, parent_type, subgraph, used);
                 local.push_str(&text);
                 local.push(' ');
                 deps.extend(field_deps);
@@ -199,16 +219,21 @@ fn plan_field(
     field: &Field<'_, String>,
     parent_type: &str,
     subgraph: &str,
+    used: &mut BTreeSet<String>,
 ) -> (String, Vec<DepFetch>) {
+    // Field arguments must survive into the subgraph fetch — `agent(input: $x)`, not `agent`.
+    // Any `$var` referenced is recorded so its definition is emitted on this fetch's operation.
+    let args = render_arguments(&field.arguments, used);
     if field.selection_set.items.is_empty() {
-        return (field.name.clone(), Vec::new());
+        return (format!("{}{args}", field.name), Vec::new());
     }
     let child_type = sg
         .field_types
         .get(&(parent_type.to_string(), field.name.clone()))
         .cloned()
         .unwrap_or_default();
-    let (child_sel, child_deps) = plan_selection(sg, &field.selection_set, &child_type, subgraph);
+    let (child_sel, child_deps) =
+        plan_selection(sg, &field.selection_set, &child_type, subgraph, used);
     let deps = child_deps
         .into_iter()
         .map(|mut d| {
@@ -216,7 +241,87 @@ fn plan_field(
             d
         })
         .collect();
-    (format!("{} {}", field.name, child_sel), deps)
+    (format!("{}{args} {child_sel}", field.name), deps)
+}
+
+/// Render a field's arguments as ` (name: value, …)` (empty when there are none), recording
+/// every `$var` referenced (recursively, into lists/objects) so the fetch operation can define
+/// it. Values render via `graphql-parser`'s `Display` — correct GraphQL literal syntax including
+/// `$var` references, unquoted enum values, lists, and input objects.
+fn render_arguments(args: &[(String, Value<'_, String>)], used: &mut BTreeSet<String>) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("(");
+    for (i, (name, value)) in args.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(&value.to_string());
+        collect_vars(value, used);
+    }
+    out.push(')');
+    out
+}
+
+/// Record every variable (`$name`) referenced inside `value`, descending into lists and objects.
+fn collect_vars(value: &Value<'_, String>, used: &mut BTreeSet<String>) {
+    match value {
+        Value::Variable(name) => {
+            used.insert(name.clone());
+        }
+        Value::List(items) => items.iter().for_each(|v| collect_vars(v, used)),
+        Value::Object(fields) => fields.values().for_each(|v| collect_vars(v, used)),
+        _ => {}
+    }
+}
+
+/// The variable name → type-string map from an operation's variable definitions (types render
+/// via `Type`'s `Display`, e.g. `AgentInput!`).
+fn var_type_map(
+    defs: &[graphql_parser::query::VariableDefinition<'_, String>],
+) -> BTreeMap<String, String> {
+    defs.iter()
+        .map(|d| (d.name.clone(), d.var_type.to_string()))
+        .collect()
+}
+
+/// The ` ($a: TA, $b: TB)` variable-definition list for exactly the `used` variables, in a
+/// stable order — empty when none are used. A subgraph operation must define every variable it
+/// uses (and, per the spec, none it doesn't), so this is subset to the fetch's own references.
+fn render_var_defs(used: &BTreeSet<String>, types: &BTreeMap<String, String>) -> String {
+    let defs: Vec<String> = used
+        .iter()
+        .filter_map(|n| types.get(n).map(|t| format!("${n}: {t}")))
+        .collect();
+    if defs.is_empty() {
+        String::new()
+    } else {
+        format!("({})", defs.join(", "))
+    }
+}
+
+/// Build a root fetch's operation string. A var-less **query** stays the anonymous `{ … }` form
+/// (unchanged); a **mutation** (or any operation using variables) is a named operation with its
+/// keyword + variable definitions, so the subgraph executes it against the right root type and
+/// binds its arguments.
+fn build_root_operation(
+    root_type: &str,
+    used: &BTreeSet<String>,
+    types: &BTreeMap<String, String>,
+    body: &str,
+) -> String {
+    if root_type == "Query" && used.is_empty() {
+        return format!("{{ {body}}}");
+    }
+    let keyword = if root_type == "Mutation" {
+        "mutation"
+    } else {
+        "query"
+    };
+    format!("{keyword}{} {{ {body}}}", render_var_defs(used, types))
 }
 
 /// Which subgraph resolves `field` on `parent_type` from the vantage of `current` — the
@@ -238,10 +343,21 @@ fn owner_of(sg: &Supergraph, parent_type: &str, field: &str, current: &str) -> O
     }
 }
 
-/// The `_entities` query that resolves `selection` on entities of `type_name`.
-fn entity_fetch_query(type_name: &str, selection: &str) -> String {
+/// The `_entities` query that resolves `selection` on entities of `type_name`. Entity hydration
+/// is always a `query` (regardless of the operation's root type); any variables the entity
+/// `selection` references are added to its definition list alongside `$representations`.
+fn entity_fetch_query(
+    type_name: &str,
+    selection: &str,
+    used_vars: &BTreeSet<String>,
+    types: &BTreeMap<String, String>,
+) -> String {
+    let extra: String = used_vars
+        .iter()
+        .filter_map(|n| types.get(n).map(|t| format!(", ${n}: {t}")))
+        .collect();
     format!(
-        "query($representations:[_Any!]!){{ _entities(representations:$representations){{ ... on {type_name} {{ {selection} }} }} }}"
+        "query($representations:[_Any!]!{extra}){{ _entities(representations:$representations){{ ... on {type_name} {{ {selection} }} }} }}"
     )
 }
 
@@ -318,5 +434,107 @@ mod tests {
             plan("{ nope }", &supergraph()),
             Err(PlanError::UnknownRootField(f)) if f == "nope"
         ));
+    }
+
+    // A subgraph that owns a `Mutation` root field (plus a query, as a subgraph conventionally has).
+    const AGENT: &str = r#"
+        type Query { ping: String }
+        type Mutation { agent(input: String): String }
+    "#;
+
+    fn supergraph_with_mutation() -> Supergraph {
+        compose(&[
+            ("accounts".into(), ACCOUNTS.into()),
+            ("agent".into(), AGENT.into()),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn a_mutation_root_fetch_is_dispatched_as_a_mutation_with_its_arguments() {
+        let mplan = plan(
+            "mutation { agent(input: \"hi\") }",
+            &supergraph_with_mutation(),
+        )
+        .unwrap();
+        assert_eq!(mplan.fetches.len(), 1);
+        assert_eq!(mplan.fetches[0].subgraph, "agent");
+        let q = mplan.fetches[0].query.trim_start();
+        // The operation is a `mutation` (else the subgraph parses it as a query and the field,
+        // which lives on Mutation, never resolves) …
+        assert!(
+            q.starts_with("mutation {"),
+            "a Mutation must be dispatched as a `mutation`, got: {q}"
+        );
+        // … and the field's arguments survive into the fetch (not just `agent`).
+        assert!(
+            q.contains("agent(input: \"hi\")"),
+            "field arguments must reach the subgraph, got: {q}"
+        );
+        // A query operation must NOT get the mutation keyword.
+        let qplan = plan("{ me { name } }", &supergraph_with_mutation()).unwrap();
+        assert!(
+            !qplan.fetches[0].query.trim_start().starts_with("mutation"),
+            "a Query operation's root fetch must stay a query"
+        );
+    }
+
+    #[test]
+    fn a_mutation_forwards_variables_and_defines_them_on_the_fetch() {
+        // The common client shape: arguments passed as operation variables.
+        let mplan = plan(
+            "mutation Turn($input: AgentInput!) { agent(input: $input) }",
+            &supergraph_with_mutation(),
+        )
+        .unwrap();
+        let q = &mplan.fetches[0].query;
+        // The fetch must (a) declare the variable it uses — a subgraph rejects an undefined
+        // variable — and (b) reference it in the argument.
+        assert!(
+            q.contains("mutation($input: AgentInput!)"),
+            "the fetch must define the variable it uses, got: {q}"
+        );
+        assert!(
+            q.contains("agent(input: $input)"),
+            "the argument must reference the variable, got: {q}"
+        );
+    }
+
+    // An entity whose field takes an argument, to prove nested-field args + variable defs reach
+    // the `_entities` fetch too (not only the root).
+    const REVIEWS_ARG: &str = r#"
+        type Query { topReviews: [Review] }
+        type Review { id: ID! body: String }
+        extend type User @key(fields: "id") { id: ID! @external reviews(first: Int): [Review] }
+    "#;
+
+    #[test]
+    fn an_entity_fetch_carries_nested_field_arguments_and_their_variable_defs() {
+        let sg = compose(&[
+            ("accounts".into(), ACCOUNTS.into()),
+            ("reviews".into(), REVIEWS_ARG.into()),
+        ])
+        .unwrap();
+        let plan = plan(
+            "query Q($n: Int){ me { reviews(first: $n) { body } } }",
+            &sg,
+        )
+        .unwrap();
+        let dep = &plan.fetches[1];
+        assert!(
+            dep.query.contains("_entities"),
+            "expected an entities fetch: {}",
+            dep.query
+        );
+        assert!(
+            dep.query.contains("reviews(first: $n)"),
+            "nested field argument must survive into the entities fetch, got: {}",
+            dep.query
+        );
+        assert!(
+            dep.query.contains("$n: Int"),
+            "the entities fetch must define the variable it uses, got: {}",
+            dep.query
+        );
     }
 }
