@@ -197,8 +197,8 @@ impl boatramp_handlers::SupergraphRunner for StubSupergraphRunner {
         &self,
         request: boatramp_handlers::GraphqlRequest,
         _depth: u32,
-    ) -> Result<Vec<u8>, boatramp_handlers::GraphqlError> {
-        *self.seen_bearer.lock().unwrap() = request.bearer.clone();
+    ) -> Result<Vec<u8>, boatramp_handlers::SupergraphRunError> {
+        *self.seen_bearer.lock().unwrap() = request.authorization.clone();
         Ok(self.response.to_vec())
     }
 }

@@ -44,7 +44,7 @@ interface graphql-types {
     query: string,
     variables: string,
     operation-name: option<string>,
-    bearer: option<string>,
+    authorization: option<string>,
   }
 
   variant graphql-error {
@@ -60,5 +60,5 @@ interface graphql {
   use graphql-types.{graphql-request, graphql-error};
 
   run: func(request: graphql-request) -> result<list<u8>, graphql-error>;
-  run-persisted: func(hash: string, variables: string, bearer: option<string>) -> result<list<u8>, graphql-error>;
+  run-persisted: func(hash: string, variables: string, authorization: option<string>) -> result<list<u8>, graphql-error>;
 }

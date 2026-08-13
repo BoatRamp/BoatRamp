@@ -2403,7 +2403,7 @@ mod tests {
     async fn federation_runner_enforces_the_safelist_before_planning() {
         use boatramp_core::deploy::DeployStore;
         use boatramp_core::project::ProjectRef;
-        use boatramp_handlers::{GraphqlError, GraphqlRequest, HandlerEngine, Limits};
+        use boatramp_handlers::{GraphqlRequest, HandlerEngine, Limits, SupergraphRunError};
 
         let storage = Arc::new(MemStorage::default());
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
@@ -2425,13 +2425,13 @@ mod tests {
             persisted_hash: None,
             variables: "{}".to_string(),
             operation_name: None,
-            bearer: None,
+            authorization: None,
         };
 
         // A query that was never registered is refused (deny-by-default) before any planning.
         assert!(matches!(
             runner.run(req("{ me { id } }"), 1).await,
-            Err(GraphqlError::NotSafelisted)
+            Err(SupergraphRunError::NotSafelisted)
         ));
 
         // Register it in the safelist (any writer of the APQ store) — now it passes the floor and
@@ -2443,7 +2443,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             runner.run(req(query), 1).await,
-            Err(GraphqlError::PlanFailed(_))
+            Err(SupergraphRunError::PlanFailed(_))
         ));
 
         // A run-persisted with an unregistered hash is refused the same way.
@@ -2452,11 +2452,11 @@ mod tests {
             persisted_hash: Some("deadbeef".to_string()),
             variables: "{}".to_string(),
             operation_name: None,
-            bearer: None,
+            authorization: None,
         };
         assert!(matches!(
             runner.run(persisted, 1).await,
-            Err(GraphqlError::NotSafelisted)
+            Err(SupergraphRunError::NotSafelisted)
         ));
     }
 

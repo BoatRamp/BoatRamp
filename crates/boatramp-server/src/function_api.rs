@@ -163,7 +163,7 @@ async fn maybe_register_subgraph(
         return Ok(()); // explicit opt-out (the coordinated-migration escape hatch)
     }
     let kv = deploy.kv().as_ref();
-    if !crate::graphql_registry::is_subgraph(kv, project.as_str(), name).await {
+    if !crate::graphql_registry::is_registered_subgraph(kv, project.as_str(), name).await {
         // First deploy: only auto-register a component that declares itself a subgraph; any
         // ordinary function (or an unreadable blob) deploys untouched.
         match crate::handler_dispatch::read_blob_fully(deploy, component).await {
@@ -449,8 +449,12 @@ mod tests {
         .await
         .expect("an unregistered function deploys freely");
         assert!(
-            !crate::graphql_registry::is_subgraph(deploy.kv().as_ref(), "default", "accounts")
-                .await
+            !crate::graphql_registry::is_registered_subgraph(
+                deploy.kv().as_ref(),
+                "default",
+                "accounts"
+            )
+            .await
         );
 
         // Now registered: `?register_subgraph=false` opts out (the migration escape hatch).

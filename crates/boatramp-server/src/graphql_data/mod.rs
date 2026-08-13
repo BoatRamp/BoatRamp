@@ -10,7 +10,7 @@
 //! already has correct semantics.
 //!
 //! It composes with the wasm-resolver model (GraphQL→Wasi) through the federation
-//! `SubgraphRunner` seam, and sits underneath the existing aware-edge (guard, persisted
+//! `SubgraphFetcher` seam, and sits underneath the existing aware-edge (guard, persisted
 //! queries, cache). Exposure is deny-by-default and fail-closed — a database-derived API
 //! must never leak by default.
 //!

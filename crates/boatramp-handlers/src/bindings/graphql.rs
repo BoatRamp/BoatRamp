@@ -36,14 +36,15 @@ pub struct GraphqlRequest {
     pub variables: String,
     /// The selected operation name, if the document holds several.
     pub operation_name: Option<String>,
-    /// The caller's forwarded bearer (raw `Authorization` value), re-verified per subgraph.
-    pub bearer: Option<String>,
+    /// The caller's forwarded raw `Authorization` header value (scheme included), re-verified
+    /// per subgraph. The server strips the scheme to the token.
+    pub authorization: Option<String>,
 }
 
 /// Why a supergraph run failed, as the [`SupergraphRunner`] reports it. Capability failures
 /// (missing grant, depth cap) are the host's concern and never reach the runner.
 #[derive(Debug)]
-pub enum GraphqlError {
+pub enum SupergraphRunError {
     /// The operation is not on the project's registered safelist (guest ops are deny-by-default).
     NotSafelisted,
     /// The query could not be planned against the supergraph. Carries a reason.
@@ -58,7 +59,8 @@ pub enum GraphqlError {
 /// so its sub-fetches are depth-capped against [`MAX_INVOKE_DEPTH`](super::invoke::MAX_INVOKE_DEPTH).
 #[async_trait::async_trait]
 pub trait SupergraphRunner: Send + Sync {
-    async fn run(&self, request: GraphqlRequest, depth: u32) -> Result<Vec<u8>, GraphqlError>;
+    async fn run(&self, request: GraphqlRequest, depth: u32)
+        -> Result<Vec<u8>, SupergraphRunError>;
 }
 
 /// The per-invocation `graphql` grant: the server-provided runner + this invocation's call
@@ -95,11 +97,11 @@ impl<'a> GraphqlHost<'a> {
 }
 
 /// Map the server-facing error to the guest-visible wire error.
-fn map_error(err: GraphqlError) -> graphql_types::GraphqlError {
+fn map_error(err: SupergraphRunError) -> graphql_types::GraphqlError {
     match err {
-        GraphqlError::NotSafelisted => graphql_types::GraphqlError::NotSafelisted,
-        GraphqlError::PlanFailed(m) => graphql_types::GraphqlError::PlanFailed(m),
-        GraphqlError::Failed(m) => graphql_types::GraphqlError::Failed(m),
+        SupergraphRunError::NotSafelisted => graphql_types::GraphqlError::NotSafelisted,
+        SupergraphRunError::PlanFailed(m) => graphql_types::GraphqlError::PlanFailed(m),
+        SupergraphRunError::Failed(m) => graphql_types::GraphqlError::Failed(m),
     }
 }
 
@@ -114,7 +116,7 @@ impl graphql_iface::Host for GraphqlHost<'_> {
             persisted_hash: None,
             variables: request.variables,
             operation_name: request.operation_name,
-            bearer: request.bearer,
+            authorization: request.authorization,
         };
         runner.run(req, depth).await.map_err(map_error)
     }
@@ -123,7 +125,7 @@ impl graphql_iface::Host for GraphqlHost<'_> {
         &mut self,
         hash: String,
         variables: String,
-        bearer: Option<String>,
+        authorization: Option<String>,
     ) -> Result<Vec<u8>, graphql_types::GraphqlError> {
         let (runner, depth) = self.admit()?;
         let req = GraphqlRequest {
@@ -131,7 +133,7 @@ impl graphql_iface::Host for GraphqlHost<'_> {
             persisted_hash: Some(hash),
             variables,
             operation_name: None,
-            bearer,
+            authorization,
         };
         runner.run(req, depth).await.map_err(map_error)
     }
@@ -159,7 +161,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SupergraphRunner for RecordingRunner {
-        async fn run(&self, request: GraphqlRequest, depth: u32) -> Result<Vec<u8>, GraphqlError> {
+        async fn run(
+            &self,
+            request: GraphqlRequest,
+            depth: u32,
+        ) -> Result<Vec<u8>, SupergraphRunError> {
             let tag = request.query.or(request.persisted_hash).unwrap_or_default();
             self.calls.lock().unwrap().push((tag, depth));
             Ok(br#"{"data":{"ok":true}}"#.to_vec())
@@ -175,7 +181,7 @@ mod tests {
             query: "{ me { id } }".into(),
             variables: "{}".into(),
             operation_name: None,
-            bearer: Some("t-acme".into()),
+            authorization: Some("Bearer t-acme".into()),
         }
     }
 

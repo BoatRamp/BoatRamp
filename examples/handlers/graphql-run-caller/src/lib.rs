@@ -22,25 +22,25 @@ struct Component;
 impl Guest for Component {
     fn handle(request: IncomingRequest, outparam: ResponseOutparam) {
         // Forward this request's own Authorization to the supergraph (re-verified per subgraph).
-        let bearer = request
+        let authorization = request
             .headers()
             .get(&"authorization".to_string())
             .into_iter()
             .next()
             .and_then(|v| String::from_utf8(v).ok());
-        match run_supergraph(bearer) {
+        match run_supergraph(authorization) {
             Ok(body) => respond(outparam, 200, &body),
             Err(message) => respond(outparam, 500, message.as_bytes()),
         }
     }
 }
 
-fn run_supergraph(bearer: Option<String>) -> Result<Vec<u8>, String> {
+fn run_supergraph(authorization: Option<String>) -> Result<Vec<u8>, String> {
     let request = GraphqlRequest {
         query: "{ me { name reviews { body } } }".to_string(),
         variables: "{}".to_string(),
         operation_name: None,
-        bearer,
+        authorization,
     };
     graphql::run(&request).map_err(describe)
 }

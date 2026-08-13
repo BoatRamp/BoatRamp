@@ -132,7 +132,7 @@ pub(crate) async fn supergraph(
 /// Whether `name` is a currently-registered subgraph of `project` (an SDL is stored). Used to
 /// decide, on a function redeploy, whether to auto-refresh its registered SDL — first
 /// registration stays an explicit operator action.
-pub(crate) async fn is_subgraph(kv: &dyn KvStore, project: &str, name: &str) -> bool {
+pub(crate) async fn is_registered_subgraph(kv: &dyn KvStore, project: &str, name: &str) -> bool {
     matches!(kv.get(&subgraph_key(project, name)).await, Ok(Some(_)))
 }
 
@@ -234,17 +234,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_subgraph_reflects_registration_and_unpublish_removes_it() {
+    async fn is_registered_subgraph_reflects_registration_and_unpublish_removes_it() {
         let kv = MemoryKv::new();
-        assert!(!is_subgraph(&kv, "acme", "accounts").await);
+        assert!(!is_registered_subgraph(&kv, "acme", "accounts").await);
         publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
         put_subgraph_backend(&kv, "acme", "accounts", &SubgraphBackendSpec::Function)
             .await
             .unwrap();
-        assert!(is_subgraph(&kv, "acme", "accounts").await);
+        assert!(is_registered_subgraph(&kv, "acme", "accounts").await);
 
         unpublish(&kv, "acme", "accounts").await.unwrap();
-        assert!(!is_subgraph(&kv, "acme", "accounts").await);
+        assert!(!is_registered_subgraph(&kv, "acme", "accounts").await);
         assert!(subgraph_names(&kv, "acme").await.is_empty());
         // Idempotent: unpublishing a gone subgraph is not an error.
         unpublish(&kv, "acme", "accounts").await.unwrap();

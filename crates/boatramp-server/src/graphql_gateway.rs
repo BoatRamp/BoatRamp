@@ -4,7 +4,7 @@
 //! each — a root fetch, or a dependent `_entities` fetch whose representations are built
 //! from an earlier fetch's data — and merges every fetch's result into one response,
 //! joining entities by their `@key`. Dispatching a fetch to its subgraph is abstracted
-//! behind [`SubgraphRunner`], so the stitching logic is tested with a mock and reused over
+//! behind [`SubgraphFetcher`], so the stitching logic is tested with a mock and reused over
 //! the real [`BackendRouter`] in the serving path — which routes each fetch to its
 //! subgraph's backend (a wasm function, or the SQL data connector), letting a GraphQL→SQL
 //! subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
@@ -19,17 +19,19 @@ use serde_json::{json, Map, Value};
 /// Dispatches one planned fetch to a subgraph and returns its GraphQL response JSON
 /// (an object with a `data` field, or a bare data object).
 #[async_trait::async_trait]
-pub(crate) trait SubgraphRunner: Sync {
-    async fn run(&self, subgraph: &str, query: &str, variables: Value) -> Value;
+pub(crate) trait SubgraphFetcher: Sync {
+    async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value;
 }
 
-/// Execute `plan` with `runner`, returning the merged `{ "data": … }` response.
-pub(crate) async fn execute(plan: &QueryPlan, runner: &dyn SubgraphRunner) -> Value {
+/// Execute `plan` with `fetcher`, returning the merged `{ "data": … }` response.
+pub(crate) async fn execute(plan: &QueryPlan, fetcher: &dyn SubgraphFetcher) -> Value {
     let mut data = json!({});
     for fetch in &plan.fetches {
         match &fetch.requires {
             None => {
-                let resp = runner.run(&fetch.subgraph, &fetch.query, json!({})).await;
+                let resp = fetcher
+                    .fetch(&fetch.subgraph, &fetch.query, json!({}))
+                    .await;
                 merge(&mut data, fetch_data(&resp));
             }
             Some(req) => {
@@ -37,8 +39,8 @@ pub(crate) async fn execute(plan: &QueryPlan, runner: &dyn SubgraphRunner) -> Va
                 // provider's response path, run the `_entities` fetch, and stitch the
                 // resolved entity fields back in at that path.
                 let reprs = representations(&data, &req.path, &req.type_name, &req.key);
-                let resp = runner
-                    .run(
+                let resp = fetcher
+                    .fetch(
                         &fetch.subgraph,
                         &fetch.query,
                         json!({ "representations": reprs }),
@@ -115,7 +117,7 @@ async fn invoke_subgraph(
     }
 }
 
-/// A [`SubgraphRunner`] that dispatches each fetch to the **right backend**: a SQL-backed
+/// A [`SubgraphFetcher`] that dispatches each fetch to the **right backend**: a SQL-backed
 /// subgraph (compiled to SQL against a managed database) or, by default, a wasm function.
 /// This is where a GraphQL→SQL subgraph and a GraphQL→Wasi subgraph compose in one
 /// supergraph — the gateway plans uniformly and this routes each fetch by its subgraph's
@@ -236,8 +238,8 @@ impl BackendRouter {
 }
 
 #[async_trait::async_trait]
-impl SubgraphRunner for BackendRouter {
-    async fn run(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+impl SubgraphFetcher for BackendRouter {
+    async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value {
         if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
             return self.run_sql(subgraph, site, config, query, variables).await;
         }
@@ -301,10 +303,10 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
         &self,
         request: boatramp_handlers::GraphqlRequest,
         depth: u32,
-    ) -> Result<Vec<u8>, boatramp_handlers::GraphqlError> {
-        use boatramp_handlers::GraphqlError;
+    ) -> Result<Vec<u8>, boatramp_handlers::SupergraphRunError> {
+        use boatramp_handlers::SupergraphRunError;
         let Some(inner) = self.runtime.upgrade() else {
-            return Err(GraphqlError::Failed(
+            return Err(SupergraphRunError::Failed(
                 "handler runtime is shutting down".into(),
             ));
         };
@@ -318,13 +320,13 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             (Some(query), _) => crate::graphql_apq::sha256_hex(query),
             (None, Some(hash)) => hash.clone(),
             (None, None) => {
-                return Err(GraphqlError::PlanFailed(
+                return Err(SupergraphRunError::PlanFailed(
                     "no query or persisted hash supplied".into(),
                 ))
             }
         };
-        let Some(query) = crate::graphql_apq::safelisted(kv, project, &hash).await else {
-            return Err(GraphqlError::NotSafelisted);
+        let Some(query) = crate::graphql_apq::safelisted_query(kv, project, &hash).await else {
+            return Err(SupergraphRunError::NotSafelisted);
         };
 
         // Query-guard the resolved operation (depth/complexity), exactly as at the edge.
@@ -334,24 +336,26 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
         if let crate::graphql_guard::GuardVerdict::Reject(reason) =
             crate::graphql_guard::guard_query(&query, &limits)
         {
-            return Err(GraphqlError::PlanFailed(reason));
+            return Err(SupergraphRunError::PlanFailed(reason));
         }
 
         // Compose + plan against the project's registered subgraphs (the unified graph).
         let supergraph = crate::graphql_registry::supergraph(kv, project)
             .await
-            .map_err(|e| GraphqlError::Failed(format!("supergraph composition failed: {e}")))?;
+            .map_err(|e| {
+                SupergraphRunError::Failed(format!("supergraph composition failed: {e}"))
+            })?;
         let plan = crate::graphql_plan::plan(&query, &supergraph)
-            .map_err(|_| GraphqlError::PlanFailed("the query cannot be planned".into()))?;
+            .map_err(|_| SupergraphRunError::PlanFailed("the query cannot be planned".into()))?;
 
         let Some(invoker) = inner.invoker.get() else {
-            return Err(GraphqlError::Failed("no invoker configured".into()));
+            return Err(SupergraphRunError::Failed("no invoker configured".into()));
         };
         let sql_subgraphs = crate::graphql_registry::sql_subgraphs(kv, project).await;
         // Forward the guest's own bearer (re-verified per subgraph — no escalation), and dispatch
         // sub-fetches at this run's depth so the shared cap counts them.
         let bearer = request
-            .bearer
+            .authorization
             .as_deref()
             .map(|raw| strip_bearer(raw).to_string());
         let router = BackendRouter::new(
@@ -364,7 +368,7 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
         .at_depth(depth);
         let response = execute(&plan, &router).await;
         serde_json::to_vec(&response)
-            .map_err(|e| GraphqlError::Failed(format!("serializing response: {e}")))
+            .map_err(|e| SupergraphRunError::Failed(format!("serializing response: {e}")))
     }
 }
 
@@ -474,8 +478,8 @@ mod tests {
     struct Mock(HashMap<&'static str, Value>);
 
     #[async_trait::async_trait]
-    impl SubgraphRunner for Mock {
-        async fn run(&self, subgraph: &str, _query: &str, _variables: Value) -> Value {
+    impl SubgraphFetcher for Mock {
+        async fn fetch(&self, subgraph: &str, _query: &str, _variables: Value) -> Value {
             self.0.get(subgraph).cloned().unwrap_or_else(|| json!({}))
         }
     }
@@ -489,8 +493,8 @@ mod tests {
     struct ContractRunner;
 
     #[async_trait::async_trait]
-    impl SubgraphRunner for ContractRunner {
-        async fn run(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+    impl SubgraphFetcher for ContractRunner {
+        async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value {
             match subgraph {
                 "accounts" => json!({ "data": { "users": [
                     { "__typename": "User", "id": "1", "name": "Alice" },
@@ -521,7 +525,7 @@ mod tests {
     }
 
     /// An [`Invoker`](boatramp_handlers::Invoker) with no functions deployed — every
-    /// target resolves to `NotFound`, so [`InvokeRunner`] must report the
+    /// target resolves to `NotFound`, so [`invoke_subgraph`] must report the
     /// registered-but-undeployed subgraph precisely.
     struct MissingInvoker;
 
@@ -649,7 +653,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             None,
         );
-        let resp = router.run("accounts", "{ me { id } }", json!({})).await;
+        let resp = router.fetch("accounts", "{ me { id } }", json!({})).await;
         let msg = resp["errors"][0]["message"].as_str().unwrap_or_default();
         assert!(
             msg.contains("no function named `accounts` is deployed"),
@@ -667,11 +671,11 @@ mod tests {
             Some("t-acme".to_string()),
         );
         // A root fetch carries the caller's identity as `Bearer <token>`...
-        let root = router.run("orders", "{ me { id } }", json!({})).await;
+        let root = router.fetch("orders", "{ me { id } }", json!({})).await;
         assert_eq!(root["data"]["identity"], json!("Bearer t-acme"));
         // ...and so does a dependent `_entities` hydration fetch (same dispatch path).
         let entity = router
-            .run(
+            .fetch(
                 "orders",
                 "query($r: [_Any!]!) { _entities(representations: $r) { id } }",
                 json!({ "representations": [{ "__typename": "Order", "id": "1" }] }),
@@ -693,7 +697,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             None,
         );
-        let resp = router.run("orders", "{ me { id } }", json!({})).await;
+        let resp = router.fetch("orders", "{ me { id } }", json!({})).await;
         assert_eq!(
             resp["errors"][0]["extensions"]["code"],
             json!("UNAUTHENTICATED"),
@@ -740,7 +744,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            root.run("s", "{ x }", json!({})).await["data"]["depth"],
+            root.fetch("s", "{ x }", json!({})).await["data"]["depth"],
             json!(0)
         );
         // ...a guest-initiated run dispatches its sub-fetches at its own depth, so the shared
@@ -754,7 +758,7 @@ mod tests {
         )
         .at_depth(4);
         assert_eq!(
-            scoped.run("s", "{ x }", json!({})).await["data"]["depth"],
+            scoped.fetch("s", "{ x }", json!({})).await["data"]["depth"],
             json!(4)
         );
     }

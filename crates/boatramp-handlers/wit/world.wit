@@ -232,14 +232,14 @@ world invoke-host {
 interface graphql-types {
   /// A GraphQL operation to run against the supergraph. `variables` is a JSON object
   /// encoded as a string (`{}` when none); `operation-name` selects one of several
-  /// operations in `query`; `bearer` forwards the caller's own credentials so each
-  /// subgraph's field guards see the guest's principal (re-verified per subgraph — the
-  /// guest cannot escalate by running this).
+  /// operations in `query`; `authorization` forwards the caller's own raw `Authorization`
+  /// header value (scheme included) so each subgraph's field guards see the guest's principal
+  /// (re-verified per subgraph — the guest cannot escalate by running this).
   record graphql-request {
     query: string,
     variables: string,
     operation-name: option<string>,
-    bearer: option<string>,
+    authorization: option<string>,
   }
 
   /// Why a supergraph run was refused.
@@ -262,7 +262,7 @@ interface graphql-types {
 /// The `graphql` capability: run a GraphQL operation against the project's composed
 /// supergraph in-process — cross-subgraph planning + execution over the invoke path, no
 /// network hop, no egress. Deny-by-default: only pre-registered (safelisted) operations
-/// run, and the caller's own bearer is forwarded and re-verified by each subgraph.
+/// run, and the caller's own `Authorization` is forwarded and re-verified by each subgraph.
 interface graphql {
   use graphql-types.{graphql-request, graphql-error};
 
@@ -271,8 +271,8 @@ interface graphql {
   run: func(request: graphql-request) -> result<list<u8>, graphql-error>;
 
   /// Run a pre-registered operation by its safelist hash (sha256-hex of the query text),
-  /// with `variables` (a JSON object string) and the caller's `bearer`.
-  run-persisted: func(hash: string, variables: string, bearer: option<string>) -> result<list<u8>, graphql-error>;
+  /// with `variables` (a JSON object string) and the caller's raw `authorization` header.
+  run-persisted: func(hash: string, variables: string, authorization: option<string>) -> result<list<u8>, graphql-error>;
 }
 
 /// The graphql capability world (imported into request handlers / functions).

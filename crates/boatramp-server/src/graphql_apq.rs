@@ -114,7 +114,7 @@ fn apq_key(scope: &str, hash: &str) -> String {
 /// The stored (safelisted) query text for `hash` in `scope`, or `None` if not registered.
 /// Guest-run operations are **deny-by-default** — only pre-registered operations run,
 /// independent of the edge's safelist mode — so this is the guest capability's operation floor.
-pub(crate) async fn safelisted(
+pub(crate) async fn safelisted_query(
     kv: &dyn boatramp_core::kv::KvStore,
     scope: &str,
     hash: &str,
@@ -341,14 +341,14 @@ mod tests {
         let kv = MemoryKv::new();
         let h = hash_of(Q);
         // Not registered → the guest safelist floor rejects it.
-        assert_eq!(safelisted(&kv, "acme", &h).await, None);
+        assert_eq!(safelisted_query(&kv, "acme", &h).await, None);
         // Registering it (any writer of the APQ store) makes it runnable by a guest.
         kv.put(&apq_key("acme", &h), Q.as_bytes().to_vec())
             .await
             .unwrap();
-        assert_eq!(safelisted(&kv, "acme", &h).await, Some(Q.to_string()));
+        assert_eq!(safelisted_query(&kv, "acme", &h).await, Some(Q.to_string()));
         // Tenant-isolated: another project's guest cannot see it.
-        assert_eq!(safelisted(&kv, "other", &h).await, None);
+        assert_eq!(safelisted_query(&kv, "other", &h).await, None);
     }
 
     #[tokio::test]
@@ -358,14 +358,17 @@ mod tests {
         let hash = register(&kv, "acme", Q).await.unwrap();
         assert_eq!(hash, hash_of(Q));
         // Registered → runnable by a guest, and listed.
-        assert_eq!(safelisted(&kv, "acme", &hash).await, Some(Q.to_string()));
+        assert_eq!(
+            safelisted_query(&kv, "acme", &hash).await,
+            Some(Q.to_string())
+        );
         assert_eq!(list(&kv, "acme").await, vec![(hash.clone(), Q.to_string())]);
         // Idempotent re-register keeps a single entry.
         register(&kv, "acme", Q).await.unwrap();
         assert_eq!(list(&kv, "acme").await.len(), 1);
         // Unregister removes it (idempotent).
         unregister(&kv, "acme", &hash).await.unwrap();
-        assert!(safelisted(&kv, "acme", &hash).await.is_none());
+        assert!(safelisted_query(&kv, "acme", &hash).await.is_none());
         assert!(list(&kv, "acme").await.is_empty());
         unregister(&kv, "acme", &hash).await.unwrap();
     }
