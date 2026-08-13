@@ -111,8 +111,8 @@ routing: (
 A handler is the root of a call chain (depth 0), and — unlike the platform's external
 function-invoke path, which stamps the control-plane token — an in-process `invoke`
 passes the caller's request headers through verbatim, so the user's `Authorization`
-reaches the callee unchanged (the guest-side [shim forwards it
-automatically](../how-to/handler-bindings.md)).
+reaches the callee unchanged (no forwarding to wire up by hand; see
+[handler bindings](../how-to/handler-bindings.md)).
 
 Reach for `invoke` to compose functions directly (a thin API function fanning out to
 workers); reach for a [workflow](../how-to/workflows.md) when you want *declarative*

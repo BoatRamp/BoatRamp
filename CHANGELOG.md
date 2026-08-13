@@ -133,15 +133,20 @@ versions.
   `Accept: text/html` request) to a graphiql-enabled GraphQL endpoint gets the GraphiQL
   IDE, which posts queries back to the same URL. A developer convenience — off by default;
   pair with `introspection` for schema docs.
-- **Function-backed subgraph registration by introspection.** A federation subgraph backed
-  by a deployed wasm function is registered with
-  `PUT /api/projects/{proj}/graphql/subgraphs/{name}/function` — no hand-written SDL:
-  boatramp invokes the function's federation `_service { sdl }` field over the in-process
-  invoke path, publishes the returned SDL to the registry (recomposed + validated like any
-  subgraph, so a bad compose is rejected and never records a backend), and records the
-  function backend. The parallel of the `/sql` path for a subgraph function that answers the
-  `_service { sdl }` contract; deploy the function first. A subgraph's SDL can still be
-  published by hand (`PUT .../subgraphs/{name}`) when you'd rather manage it out of band.
+- **Function subgraphs register themselves — zero-touch on deploy.** A wasm function that
+  self-declares a federation subgraph — a `"subgraph": true` entry in its
+  `boatramp:function-manifest` custom section — is **auto-registered when it deploys**: before
+  the new version activates, boatramp introspects the pending component's federation
+  `_service { sdl }` field over the in-process invoke path and publishes the SDL to the
+  project's registry (recomposed + validated like any subgraph). It **refreshes on every later
+  deploy** and **refuses the deploy** (`400`) if the new schema no longer composes with the
+  rest of the supergraph, so a deploy can never leave the composed graph stale or broken; an
+  ordinary function (no marker, no registry entry) deploys untouched, and
+  `?register_subgraph=false` opts a deploy out (the coordinated-migration escape hatch).
+  A subgraph can also be registered explicitly by introspection —
+  `PUT /api/projects/{proj}/graphql/subgraphs/{name}/function` invokes the already-deployed
+  function's `_service { sdl }` and publishes it — or by hand
+  (`PUT .../subgraphs/{name}` with the SDL body) for a subgraph managed out of band.
 - **Caller identity forwarded across the federation gateway.** When a supergraph query is
   planned into per-subgraph fetches, the caller's verified application bearer is forwarded
   as `Authorization` to each function subgraph (re-verified per subgraph — no escalation) and

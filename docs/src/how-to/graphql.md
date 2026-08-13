@@ -242,14 +242,15 @@ curl -X DELETE https://api.example.com/api/projects/acme/graphql/safelist/<hash>
 ### Running the supergraph from a guest function
 
 A function may **run a GraphQL operation against the project's composed supergraph
-in-process** (cross-subgraph planning, no network hop) through the `graphql`
-capability — the [uchron shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim)
-exposes it as `graphql::run(query, variables)` / `run_persisted(hash, variables)`. It
-is how an agent operates the unified API. Guest runs are **deny-by-default: only
-safelisted operations run** (register them above), the function forwards its own bearer
-(re-verified by each subgraph — no escalation), and the run counts against the shared
-in-process call-depth cap. Grant it by importing `graphql` (and allowing it in the
-site's `allow_imports`).
+in-process** (cross-subgraph planning, no network hop) through the host's `graphql`
+capability — a WIT interface a guest imports, exposing `run(query, variables)` (the full
+operation) and `run-persisted(hash, variables)` (by safelist hash). It is how a guest
+operates the unified API without a network round-trip. Guest runs are **deny-by-default:
+only safelisted operations run** (register them above — `run` hashes the supplied query and
+checks the same allowlist), the function forwards its own bearer (re-verified by each
+subgraph — no escalation), and the run dispatches at the guest's own call depth against the
+shared in-process cap (so a run → subgraph-fetch → run chain can't loop). Grant it by
+importing `graphql` (and allowing it in the site's `allow_imports`).
 
 ## Subscriptions
 
@@ -296,15 +297,15 @@ does not compose** (a field co-owned without `@shareable`, or SDL that does not
 parse) — a bad publish never corrupts the registry. Read the composed
 supergraph with `GET /api/projects/acme/graphql/supergraph`.
 
-A **function subgraph** registers itself — no hand-written SDL, and (for a subgraph built
-with the [uchron shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim)'s
-`#[graphql_subgraph]`) **no separate call at all**:
+A **function subgraph** registers itself — no hand-written SDL, and often **no separate call
+at all**:
 
-- **Zero-touch.** A component that self-declares a subgraph (a `"subgraph": true` marker in
-  its `boatramp:function-manifest`) is **auto-registered on deploy**: boatramp reads the
-  marker from the uploaded component, introspects the pending version's `_service { sdl }`,
-  and publishes it. Just `boatramp deploy` (or `PUT /api/functions/accounts`) — the subgraph
-  joins the supergraph automatically.
+- **Zero-touch.** A component that self-declares a subgraph — a `"subgraph": true` entry in
+  its `boatramp:function-manifest` custom section (any guest toolchain that emits the marker
+  qualifies) — is **auto-registered on deploy**: boatramp reads the marker from the uploaded
+  component, introspects the pending version's `_service { sdl }`, and publishes it. Just
+  `boatramp deploy` (or `PUT /api/functions/accounts`) — the subgraph joins the supergraph
+  automatically.
 - **Explicit.** For a hand-written subgraph (or to register out-of-band), call it directly —
   boatramp introspects the *deployed* function and publishes:
 
