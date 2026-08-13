@@ -87,8 +87,54 @@ gets `vary: accept-language`. A shared cache then keys on that dimension and nev
 serves one visitor's redirect to another. You don't set this by hand; conditions
 that read only the URL + deploy content (`path`, `file_exists`) add no `Vary`.
 
+## Cache handler responses at the edge
+
+Everything above is about **static files**. A **handler** (a Wasm component) can
+also opt into a host-level **response cache** that serves a cacheable `GET`/`HEAD`
+response **without re-instantiating the handler** — the execution analogue of the
+compile cache. It's off by default; turn it on in the site's handler config:
+
+```ron
+// boatramp.cfg — the site's handler config
+handlers: (
+    enabled: true,
+    cache: (
+        enabled: true,
+        max_entry_bytes: Some(262144),   // largest cacheable response; default 256 KiB
+        max_ttl_secs:    Some(3600),     // clamp an over-long max-age; default 3600s
+    ),
+)
+```
+
+The cache is **opt-in per response**, driven by the handler's own headers — it
+never guesses. A response is stored only when **all** of these hold:
+
+- the request is a `GET` or `HEAD`,
+- the handler sets `Cache-Control: max-age=…` (or `s-maxage=…`),
+- its size is known (`Content-Length`) and within `max_entry_bytes`.
+
+And it is **never** stored when the response is private:
+
+- `Cache-Control: no-store`, `private`, or `no-cache`,
+- it carries a `Set-Cookie`,
+- `Vary: *`, or
+- the **request** carried an `Authorization` header and the response did not
+  explicitly opt in with `public` or `s-maxage`.
+
+Entries are keyed by the request's **project-qualified scope** (so two tenants
+never collide), honor the response's `Vary` header, and expire by TTL (clamped to
+`max_ttl_secs`, lazily evicted on read). The cache is backed by the site's KV
+store.
+
+> **With cookie auth.** A [cookie-authenticated](./handler-bindings.md#authenticate-a-browser-with-a-session-cookie)
+> request carries an `Authorization` header (boatramp injects it from the
+> cookie), so it inherits the rule above: a per-user response is not cached unless
+> the handler explicitly marks it `public`/`s-maxage`. **Never** mark a per-user
+> response `public` — that would let it be stored and served to another user.
+
 ## Reference
 
 - Full `routing` schema, including `cache.default` and header-rule fields:
   [project.cfg reference](../reference/project-cfg.md).
+- Handler `cache` fields: [SiteConfig reference](../reference/siteconfig.md).
 - Content negotiation and `Content-Encoding`: [Enable compression](./compression.md).

@@ -67,6 +67,80 @@ site that does not permit it refuses the handler at activation. The callee is
 quota-admitted and depth-capped, and the caller's `Authorization` header is
 forwarded to it unchanged.
 
+### Stream a large response
+
+`invoke` returns the callee's response **whole** — the simple default. When a
+sibling returns a large or incrementally-produced result, use the streaming
+variant instead so the body is never buffered whole in host memory. It hands back
+`status` and `headers` up front and an `incoming-response` resource you pull the
+body from incrementally:
+
+```rust
+let resp = invoke::invoke_streaming("report", &request)?;   // same target allowlist
+let status = resp.status();
+loop {
+    let chunk = resp.read(64 * 1024)?;   // up to N more bytes, blocking
+    if chunk.is_empty() { break; }        // empty ⇒ end of stream
+    sink.write_all(&chunk);
+}
+```
+
+Both variants share the exact same in-process path, target allowlist, and
+call-depth cap; only the response body's delivery differs. The **request** body is
+still passed whole (request streaming is a separate step). Streamed responses are
+metered at hand-off from a declared `Content-Length` when present.
+
+## Authenticate a browser with a session cookie
+
+A browser app usually holds its session in an `HttpOnly` cookie its own auth
+handler sets — a token JavaScript can't read (so it survives XSS). boatramp can
+treat that cookie as the **application bearer** for a site, so every handler,
+GraphQL query, data-connector read, and sibling `invoke` sees the caller's
+identity **without the app ever putting a token in JavaScript**. Opt in on the
+site's `handlers` config (it's general — not GraphQL-specific):
+
+```ron
+handlers: (
+    enabled: true,
+    cookie_auth: (
+        cookie_name: "__Host-session",
+        allowed_origins: ["https://app.example.com"],
+    ),
+)
+```
+
+When set, a request that carries the named cookie but **no** `Authorization`
+header is authenticated from the cookie value — boatramp injects it as
+`Authorization: Bearer <value>` at the edge, so it flows everywhere a header
+bearer already does and is verified byte-identically (your app's own authorizer /
+OIDC config, the data connector's `claims_from_token`, the GraphQL field guards).
+The **`Authorization` header always wins**, so API clients (curl, mobile) are
+unaffected.
+
+**boatramp only reads the cookie — your app sets, refreshes, and verifies it.**
+The value is an opaque app bearer. Set these attributes on the cookie; two are
+**security requirements**, not just advice (boatramp can't enforce a cookie it
+only reads):
+
+- **`HttpOnly`** — unreadable by JS (the whole point; XSS-safe).
+- **`Secure`** — HTTPS only.
+- **`SameSite=Lax` (required for CSRF safety).** A `Lax` cookie is withheld on the
+  cross-site POST/`fetch` an attack would use — the browser half of the defense.
+  Use **`Lax`, not `Strict`**: `Strict` withholds the cookie when a user arrives
+  from an external link (email, another site), landing them logged-out on first
+  load; `Lax` still sends it on that top-level navigation.
+- **`__Host-` name prefix** (recommended). It forbids a `Domain` attribute, so a
+  sibling or parent subdomain can't set a cookie that shadows yours.
+
+**CSRF.** A cookie-authenticated request is checked against `allowed_origins`: if
+its `Origin` (or `Referer`) is present and not listed, it's rejected `403`. A
+header-bearer request isn't CSRF-able (the attacker doesn't have the token), so
+it's exempt. A request with **no** `Origin`/`Referer` — a same-origin top-level
+navigation — is allowed, so a **cookie-auth handler must keep its `GET`/`HEAD`
+side-effect-free** (state changes go through `POST`/etc., where the browser sends
+`Origin`). If the site also enables the [response cache](./caching.md#cache-handler-responses-at-the-edge),
+never mark a per-user response `public`.
+
 ## Configure the `sql` backend
 
 The `sql` binding is the one data binding with a server-side backend choice, set

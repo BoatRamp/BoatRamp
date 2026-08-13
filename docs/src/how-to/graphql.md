@@ -111,47 +111,15 @@ database to many tenants with no resolver code.
 ### Browser session auth (httpOnly cookie)
 
 A browser SPA can authenticate with the app token entirely **out of JavaScript** — the token
-stays in an `HttpOnly` cookie the JS can't read (XSS-safe). Opt the site in and boatramp treats
-the named cookie as the bearer wherever the bearer already flows (the data connector above, the
-field-authz forwarding, invoked functions, `graphql::run`, and any managed handler):
+stays in an `HttpOnly` cookie the JS can't read (XSS-safe). Opt the site in with `cookie_auth`
+and boatramp treats the named cookie as the bearer wherever the bearer already flows, including
+the data connector's `claims_from_token` check above: a verified cookie isolates a SaaS tenant
+by its token claim exactly as a header bearer would, with no token ever exposed to JavaScript.
 
-```ron
-// On the site's `handlers` config (general — not GraphQL-specific).
-cookie_auth: ( cookie_name: "__Host-session", allowed_origins: ["https://app.example.com"] )
-```
-
-When set, a request carrying the cookie but **no** `Authorization` header is authenticated from
-the cookie value — verified byte-identically to a header bearer (the `claims_from_token` check,
-the field guards, everything). The **`Authorization` header always wins**, so API clients (curl,
-mobile) are unaffected.
-
-**boatramp only reads the cookie — your app sets it.** Your auth handler issues + refreshes it.
-Set the following attributes; two of them are **security requirements**, not just recommendations
-(boatramp can't enforce a cookie it only reads):
-
-- **`HttpOnly`** — the whole point: the token is unreadable by JS (XSS-safe).
-- **`Secure`** — HTTPS only.
-- **`SameSite=Lax` (required for CSRF safety).** This is the browser half of the CSRF defense: a
-  `Lax` cookie is withheld on the cross-site POST/`fetch` an attack would use, so the
-  `allowed_origins` check below is a second layer, not the only one. Use **`Lax`, not `Strict`**:
-  `Strict` withholds the cookie when a user arrives from an external link (email, another site),
-  landing them logged-out on first load; `Lax` still sends it on that top-level navigation.
-- **`__Host-` name prefix** (e.g. `__Host-session`, recommended). The prefix forbids a `Domain`
-  attribute, so a sibling or parent subdomain can never set a cookie that shadows yours — closing
-  a session-fixation vector the exact-origin check alone can't.
-
-**CSRF.** A cookie-authenticated request is checked against `allowed_origins`: if its `Origin`
-(or `Referer`) is present and not listed, it is rejected `403`. (A header-bearer request isn't
-CSRF-able — the attacker doesn't have the token — so it's exempt.) A request with **no** Origin
-or Referer — a same-origin top-level navigation — is allowed, so **a cookie-auth handler must not
-change state on a `GET`/`HEAD`** (keep those safe/idempotent, as HTTP requires); state changes go
-through `POST`/etc., where the browser sends `Origin`.
-
-> **With the edge cache.** If a site enables both `cookie_auth` and the response `cache`, never
-> mark a **per-user** response `Cache-Control: public` (or `s-maxage`) — that would let it be
-> stored and served to another user. boatramp already refuses to cache a response to a request
-> carrying `Authorization` (which a cookie-auth request now does) unless the app explicitly opts
-> in with `public`/`s-maxage`, so the only way to leak is to opt a private response in by mistake.
+This is a **general handler auth method**, not GraphQL-specific — see
+[Authenticate a browser with a session cookie](./handler-bindings.md#authenticate-a-browser-with-a-session-cookie)
+for the config, the cookie attributes it requires (`HttpOnly; Secure; SameSite=Lax; __Host-`),
+and the CSRF model.
 
 **Relationships.** Foreign keys become relationship fields — a to-one field for each outgoing
 FK and a to-many field for the rows that reference this one. A nested query resolves in **one
