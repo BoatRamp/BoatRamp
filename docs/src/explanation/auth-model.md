@@ -74,6 +74,43 @@ revokes every credential delegated from it. This is how you hand a further-scope
 credential to a third party without minting a new token — see
 [Make a scoped CI deploy token](../how-to/ci-token.md).
 
+## Two planes: control-plane vs application identity
+
+Everything above is the **control plane** — the operator credential that publishes,
+configures, and mints. A running **handler** has a second, entirely separate notion
+of identity: the **application's own end users**. These never mix:
+
+- A **control-plane token** (`COSE`/`CWT`, above) authorizes `/api/…` and is verified
+  against the root public key. It is boatramp's.
+- An **application bearer** — whatever token your app's users carry (an OIDC JWT, a
+  session token) — is **opaque to boatramp**. The platform doesn't mint or validate
+  it as a control-plane credential; it forwards it to the handler, which verifies it
+  with **its own** authorizer/OIDC config. The app owns its user identity.
+
+boatramp only gives the application bearer *structured meaning* where you ask it to:
+
+- The GraphQL [data connector](../how-to/graphql.md#multi-tenant-saas-isolate-by-a-claim-from-your-own-app-token)
+  can verify the bearer against **your** IdP (`claims_from_token`: issuer + JWKS,
+  signature/`iss`/`exp` with the algorithm pinned to the key) and bind a claim from
+  it to a row filter — for multi-tenant SaaS isolation. A missing or invalid token
+  contributes no claim, so the filter **denies** rather than widens, and an app claim
+  can never override the host-asserted `project`.
+- The **federation gateway** forwards the caller's verified bearer to each subgraph
+  (re-verified per subgraph — no escalation), so every subgraph enforces per-field
+  authorization and row isolation on the *real* caller, not an anonymous gateway.
+
+### Sourcing the application bearer from a cookie
+
+Normally the application bearer arrives in the `Authorization` header. A browser app
+can instead keep it in an `HttpOnly` **session cookie** (out of JavaScript's reach)
+and opt the site into
+[`cookie_auth`](../how-to/handler-bindings.md#authenticate-a-browser-with-a-session-cookie):
+when a request carries the named cookie but no `Authorization` header, boatramp reads
+the cookie and injects it as `Authorization: Bearer <value>` at the edge, so it flows
+to every consumer above **exactly as a header bearer would** (the header always wins).
+boatramp only *reads* the cookie — your app issues, refreshes, and verifies it — and a
+cookie-authenticated request is CSRF-checked against a configured origin allowlist.
+
 ## Where auth does not apply
 
 Public content serving is unauthenticated by design — a visitor fetching a page

@@ -30,6 +30,28 @@ the backend as soon as the pipeline resolves it.
 An early stage can end the request — a rejected access-control check, a redirect,
 a handler that answers — before the later stages run.
 
+## Inside handler dispatch
+
+When stage 5 routes a request to a **handler** (a Wasm component) rather than
+static content, a small sub-pipeline runs around the component, in this order:
+
+1. **Cookie session auth.** If the site enables
+   [`cookie_auth`](../how-to/handler-bindings.md#authenticate-a-browser-with-a-session-cookie)
+   and the request carries the named cookie but no `Authorization` header, boatramp
+   injects `Authorization: Bearer <cookie>` **here**, before anything downstream —
+   so the GraphQL edge, the data connector, the handler, and any sibling `invoke`
+   all see the same bearer. A cookie-authenticated request is CSRF-checked first.
+2. **GraphQL edge** (if `graphql` is on). The [query-guard](../how-to/graphql.md#the-query-guard)
+   rejects an over-deep/complex or disallowed operation before the handler runs;
+   persisted-query/safelist resolution and — for a gateway site — federation
+   planning + execution happen here instead of invoking a single component.
+3. **Response cache lookup** (if [`cache`](../how-to/caching.md#cache-handler-responses-at-the-edge)
+   is on). A cacheable `GET`/`HEAD` hit is served without instantiating the handler.
+4. **Handler execution.** The component runs with its granted host bindings.
+5. **Response cache store.** A cacheable response is stored **after** the bearer
+   injection above, so its cache key already reflects the authenticated request and
+   a private per-user response is not stored (see the caching rules).
+
 ## Why the order is fixed
 
 The order encodes precedence you would otherwise have to reason about per

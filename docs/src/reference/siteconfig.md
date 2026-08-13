@@ -86,10 +86,61 @@ entirely.
 | `background_aliases` | list\<string\> | `[]` | Named aliases (besides current) whose deployments also run consumers and crons. See [Run background work](../how-to/background-work.md). |
 | `max_stream_connections` | u32? | — | Cap on concurrent SSE/WebSocket connections for the site. |
 | `max_log_rate` | u32? | — | Cap on captured guest log lines per second (over-cap lines are dropped, counted). |
+| `cache` | HandlerCacheConfig? | `None` (off) | [Edge response cache](#handlerscache). |
+| `graphql` | HandlerGraphqlConfig? | `None` (off) | [GraphQL edge features](#handlersgraphql). |
+| `cookie_auth` | CookieAuthConfig? | `None` (off) | [Browser cookie session auth](#handlerscookie_auth). |
 
 A handler that requests an import not in `allow_imports`, or exceeds a cap, is
 rejected at activation — not at request time. See
 [Handler host bindings](../how-to/handler-bindings.md).
+
+### `handlers.cache`
+
+Host-level **response cache**: a cacheable `GET`/`HEAD` response is served for a
+later identical request **without re-instantiating the handler**. Opt-in per
+response, driven by the handler's own `Cache-Control`; never caches a private
+response (`no-store`/`private`/`no-cache`, a `Set-Cookie`, `Vary: *`, or an
+`Authorization` request without `public`/`s-maxage`). Entries are keyed by the
+request's project-qualified scope, honor `Vary`, and expire by TTL. Backed by the
+site's KV store. See [Cache handler responses](../how-to/caching.md#cache-handler-responses-at-the-edge).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Master switch; inert even if present when `false`. |
+| `max_entry_bytes` | u64? | `262144` (256 KiB) | Largest cacheable entry (status+headers+body); a bigger response streams through uncached. |
+| `max_ttl_secs` | u64? | `3600` | Upper bound on a stored entry's TTL, clamping an over-long `max-age`. |
+
+### `handlers.graphql`
+
+GraphQL edge features. Off unless present + `enabled`. See
+[Serve a GraphQL API](../how-to/graphql.md).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Master switch for the GraphQL edge. |
+| `max_depth` | u32? | server default | Deepest allowed selection nesting (fragments expanded). |
+| `max_complexity` | u32? | server default | Largest allowed total field count (schema-free cost proxy). |
+| `introspection` | bool? | posture default | Allow schema-introspection queries (off under the multi-tenant posture). |
+| `persisted_queries` | bool | `false` | Resolve a query hash to the stored query (bandwidth + parse saving). |
+| `safelist` | bool | `false` | Only pre-registered query hashes run (a query allowlist); implies and is stronger than `persisted_queries`. |
+| `federated` | bool | `false` | This site is a supergraph **gateway**: plan a query against the project's registered subgraphs and dispatch fetches to them. |
+| `graphiql` | bool | `false` | Serve the in-browser GraphiQL explorer to a browser `GET`. |
+| `data` | HandlerGraphqlDataConfig? | `None` | Declarative [data connector](../how-to/graphql.md#graphql-from-your-database-no-resolver-code): generate the API from a managed database (queries compiled to SQL). Deny-by-default exposure; a `claims_from_token` block can bind a claim from a verified application bearer for multi-tenant row isolation. |
+
+### `handlers.cookie_auth`
+
+Browser **cookie session auth**. Off unless present. A request carrying the named
+cookie but **no** `Authorization` header is authenticated from the cookie value —
+boatramp injects it as the app bearer everywhere the header bearer flows (the
+`Authorization` header always wins). boatramp **only reads** the cookie; the app
+sets, refreshes, and verifies it. Set the cookie `HttpOnly; Secure; SameSite=Lax`
+with a `__Host-` prefix. See
+[Authenticate a browser with a session cookie](../how-to/handler-bindings.md#authenticate-a-browser-with-a-session-cookie).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cookie_name` | string | — | The cookie whose value becomes the bearer when no `Authorization` header is present. |
+| `allowed_origins` | list\<string\> | `[]` | CSRF allowlist: a cookie-authenticated request whose `Origin`/`Referer` is present and not listed is rejected `403`. Empty ⇒ only same-origin (no `Origin`) passes. Each entry is a `scheme://host[:port]` origin. |
 
 ## `compression`
 
