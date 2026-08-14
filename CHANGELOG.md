@@ -5,6 +5,18 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Fixed
+- **Cookie session auth no longer CSRF-rejects a site's own same-origin browser requests.** The
+  origin check now treats a request whose `Origin`/`Referer` authority equals its own `Host` as
+  same-origin and always allows it (definitionally CSRF-safe — a cross-site attacker's browser
+  sends *their* origin, never the target's `Host`). `handlers.cookie_auth.allowed_origins` is now
+  purely the **additional cross-origin** allowlist, so an empty list means **same-origin only**
+  rather than "reject every browser `fetch`". Previously an SPA calling its own `/graphql` (which
+  the browser sends with an `Origin` header) got a `403` unless its exact origin was listed. No
+  configuration change is needed for the common single-origin case.
+
 ## [0.2.7]
 
 ### Changed

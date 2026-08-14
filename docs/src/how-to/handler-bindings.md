@@ -104,7 +104,9 @@ handlers: (
     enabled: true,
     cookie_auth: (
         cookie_name: "__Host-session",
-        allowed_origins: ["https://app.example.com"],
+        // Omit `allowed_origins` for the common case — the app and its API share
+        // one origin. Only list the *extra* origins a browser app served from a
+        // **different** origin than this API needs (see CSRF below).
     ),
 )
 ```
@@ -132,14 +134,21 @@ only reads):
 - **`__Host-` name prefix** (recommended). It forbids a `Domain` attribute, so a
   sibling or parent subdomain can't set a cookie that shadows yours.
 
-**CSRF.** A cookie-authenticated request is checked against `allowed_origins`: if
-its `Origin` (or `Referer`) is present and not listed, it's rejected `403`. A
-header-bearer request isn't CSRF-able (the attacker doesn't have the token), so
-it's exempt. A request with **no** `Origin`/`Referer` — a same-origin top-level
-navigation — is allowed, so a **cookie-auth handler must keep its `GET`/`HEAD`
-side-effect-free** (state changes go through `POST`/etc., where the browser sends
-`Origin`). If the site also enables the [response cache](./caching.md#cache-handler-responses-at-the-edge),
-never mark a per-user response `public`.
+**CSRF.** A cookie-authenticated request passes the origin check when it is
+**same-origin** — its `Origin` (or, absent that, `Referer`) authority equals the
+request's own `Host`. That covers the normal SPA case (a page calling its own
+`/graphql`) with **no configuration**: `allowed_origins: []` means *same-origin
+only*. A cross-site attacker's browser sends *their* origin, never your `Host`,
+so same-origin is definitionally CSRF-safe. `allowed_origins` then lists only the
+**extra** cross-origins to accept — for a browser app served from a *different*
+origin than this API. A cross-origin request that's neither same-origin nor listed
+is rejected `403`. A header-bearer request isn't CSRF-able (the attacker doesn't
+have the token), so it's exempt. A request with **no** `Origin`/`Referer` — a
+same-origin top-level navigation — is allowed, so a **cookie-auth handler must
+keep its `GET`/`HEAD` side-effect-free** (state changes go through `POST`/etc.,
+where the browser sends `Origin`). If the site also enables the
+[response cache](./caching.md#cache-handler-responses-at-the-edge), never mark a
+per-user response `public`.
 
 ## Configure the `sql` backend
 

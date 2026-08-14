@@ -140,7 +140,7 @@ with a `__Host-` prefix. See
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `cookie_name` | string | — | The cookie whose value becomes the bearer when no `Authorization` header is present. |
-| `allowed_origins` | list\<string\> | `[]` | CSRF allowlist: a cookie-authenticated request whose `Origin`/`Referer` is present and not listed is rejected `403`. Empty ⇒ only same-origin (no `Origin`) passes. Each entry is a `scheme://host[:port]` origin. |
+| `allowed_origins` | list\<string\> | `[]` | **Additional** cross-origin CSRF allowlist. Same-origin (request `Origin`/`Referer` authority == own `Host`) always passes, so `[]` ⇒ *same-origin only* — no config for the usual SPA. List the extra origins a browser app on a **different** origin than this API may use; a cross-origin request that's neither same-origin nor listed is rejected `403`. Each entry is a `scheme://host[:port]` origin. |
 
 ## `compression`
 

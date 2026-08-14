@@ -653,7 +653,7 @@ pub struct HandlersSiteConfig {
     /// SameSite=Lax` (Lax is a CSRF requirement — the browser half of the defense) with a
     /// `__Host-` name prefix; and keep cookie-auth `GET`/`HEAD` handlers side-effect-free (a
     /// same-origin top-level navigation passes the CSRF gate). A cookie-authenticated request is
-    /// CSRF-checked against `allowed_origins`.
+    /// CSRF-checked: same-origin always passes, and `allowed_origins` adds any cross-origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie_auth: Option<CookieAuthConfig>,
 }
@@ -667,11 +667,13 @@ pub struct HandlersSiteConfig {
 pub struct CookieAuthConfig {
     /// The cookie whose value is used as the bearer when no `Authorization` header is present.
     pub cookie_name: String,
-    /// The CSRF allowlist: origins a cookie-authenticated request may come from. A request whose
-    /// `Origin` (or, absent that, `Referer`) is present and **not** listed is rejected. Each
-    /// entry is a scheme+host[+port] origin, e.g. `https://app.example.com`. Empty ⇒ every
-    /// cross-origin cookie-authenticated request is rejected (only same-origin, which sends no
-    /// `Origin` on a top-level navigation, passes).
+    /// The **additional cross-origin** CSRF allowlist. A **same-origin** request (its `Origin`
+    /// authority equals the request's own `Host`) is always allowed — a page calling its own
+    /// origin, the normal SPA case, is definitionally CSRF-safe. This list adds the *other*
+    /// origins a browser app served from a **different** origin than this API may come from; each
+    /// entry is a scheme+host[+port] origin, e.g. `https://app.example.com`. A cross-origin
+    /// request whose `Origin` (or, absent that, `Referer`) is not same-origin and **not** listed
+    /// is rejected. **Empty ⇒ same-origin only** — the common case needs no configuration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_origins: Vec<String>,
 }

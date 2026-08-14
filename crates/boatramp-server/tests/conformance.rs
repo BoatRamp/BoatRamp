@@ -1701,12 +1701,13 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
 
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
-    let app = router(deploy, Auth::disabled(), runtime);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
 
     let request = |origin: Option<&str>| {
         let mut b = Request::builder()
             .method("GET")
             .uri("/_sites/app/api")
+            .header("host", "api.example.com")
             .header("cookie", "session=apptoken");
         if let Some(o) = origin {
             b = b.header("origin", o);
@@ -1717,7 +1718,10 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
         req
     };
 
-    // Cross-origin cookie request → rejected before the handler runs (CSRF).
+    // The API is served from `api.example.com`; the browser app lives on the allowlisted
+    // `app.example.com` — an explicit *cross-origin* allowlist entry.
+
+    // Cross-origin cookie request from an unlisted origin → rejected before the handler runs (CSRF).
     let resp = app
         .clone()
         .oneshot(request(Some("https://evil.example.net")))
@@ -1725,7 +1729,7 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // Same-origin cookie request → passes the gate and reaches the handler.
+    // Allowlisted cross-origin cookie request → passes the gate and reaches the handler.
     let resp = app
         .clone()
         .oneshot(request(Some("https://app.example.com")))
@@ -1736,6 +1740,44 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
     // No Origin (a same-origin top-level navigation, e.g. an email link) → allowed.
     let resp = app.clone().oneshot(request(None)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    // The footgun regression: reconfigure with an **empty** allowlist. A same-origin SPA
+    // fetch — its `Origin` authority equals the request's own `Host` — must still reach the
+    // handler; `allowed_origins: []` means "same-origin only", not "reject every browser fetch".
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "app",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    cookie_auth: Some(CookieAuthConfig {
+                        cookie_name: "session".to_string(),
+                        allowed_origins: Vec::new(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Same-origin (Origin == own Host) with an empty allowlist → allowed.
+    let resp = app
+        .clone()
+        .oneshot(request(Some("https://api.example.com")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Cross-origin with an empty allowlist → still rejected (no blanket browser bypass).
+    let resp = app
+        .clone()
+        .oneshot(request(Some("https://app.example.com")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ---- function invoke API (FA-3) --------------------------------------------

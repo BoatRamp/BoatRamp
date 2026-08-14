@@ -704,11 +704,21 @@ fn referer_origin(referer: &str) -> Option<String> {
     Some(format!("{scheme}://{authority}"))
 }
 
-/// Whether a cookie-authenticated request's origin is allowed (the CSRF check). The request's
-/// `Origin` (or, absent that, the origin of `Referer`) must be listed in `allowed`. An **absent**
-/// Origin *and* Referer — a same-origin top-level navigation, or a non-browser client — passes:
-/// there is no cross-origin signal to reject on, and the browser's `SameSite=Lax` is the layer
-/// that withholds the cookie on a genuine cross-site POST/fetch.
+/// Whether a cookie-authenticated request's origin is allowed (the CSRF check).
+///
+/// The request's `Origin` (or, absent that, the origin of `Referer`) passes when it is either:
+/// - **same-origin** — its authority equals the request's own `Host` (a page calling its own
+///   origin, the SPA's normal case), which is *always* allowed because it is definitionally
+///   CSRF-safe: a cross-site attacker's browser sends *their* origin, never the target's `Host`;
+///   or
+/// - listed in `allowed` — the **additional cross-origin** allowlist for a browser app served
+///   from a *different* origin than this API.
+///
+/// So an empty `allowed` means **same-origin only** (not "non-browser only" — an SPA's own
+/// `fetch` carries an `Origin` and must not be rejected). An **absent** Origin *and* Referer —
+/// a same-origin top-level navigation or a non-browser client — also passes; the browser's
+/// `SameSite=Lax` cookie is the layer that withholds the cookie on a genuine cross-site
+/// POST/fetch.
 fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
     let origin = headers
         .get(header::ORIGIN)
@@ -722,8 +732,20 @@ fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
         });
     match origin {
         None => true,
-        Some(origin) => allowed.iter().any(|a| a == &origin),
+        Some(origin) => is_same_origin(headers, &origin) || allowed.iter().any(|a| a == &origin),
     }
+}
+
+/// Whether `origin` is the request's **own** origin — its authority (host[:port]) equals the
+/// request's `Host` header. Host-based (scheme-agnostic) on purpose: the cookie is `Secure`
+/// (https-only) so a same-host http page never carries it, and a proxy may rewrite the scheme —
+/// but a cross-site attacker's `Origin` carries a *different host*, so same-host is CSRF-safe.
+fn is_same_origin(headers: &HeaderMap, origin: &str) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let origin_authority = origin.split_once("://").map_or(origin, |(_, a)| a);
+    !host.is_empty() && origin_authority.eq_ignore_ascii_case(host)
 }
 
 /// Grant the per-site bindings the handler requested *and* the site allows
@@ -991,7 +1013,9 @@ mod cookie_auth_tests {
     }
 
     #[test]
-    fn origin_check_allows_listed_origins_and_absent_signal_but_rejects_others() {
+    fn origin_check_allows_listed_cross_origins_and_absent_signal_but_rejects_others() {
+        // No Host header here, so `is_same_origin` never fires — this exercises purely the
+        // *additional cross-origin* allowlist path (a browser app served from a different origin).
         let allowed = ["https://app.example.com".to_string()];
         // Origin present + allowed.
         assert!(origin_allowed(
@@ -1018,9 +1042,74 @@ mod cookie_auth_tests {
     }
 
     #[test]
-    fn outcome_injects_a_same_origin_cookie() {
+    fn origin_check_auto_allows_same_origin_even_with_an_empty_allowlist() {
+        // The footgun fix: a page calling its own origin (Origin authority == Host) is
+        // same-origin and always passes, so `allowed_origins: []` means "same-origin only",
+        // not "non-browser only". An SPA's own `fetch` must never be CSRF-rejected.
+        let empty: [String; 0] = [];
+        assert!(origin_allowed(
+            &headers(&[
+                ("host", "app.example.com"),
+                ("origin", "https://app.example.com"),
+            ]),
+            &empty
+        ));
+        // Same-origin via Referer (no Origin header) also passes.
+        assert!(origin_allowed(
+            &headers(&[
+                ("host", "app.example.com"),
+                ("referer", "https://app.example.com/dashboard"),
+            ]),
+            &empty
+        ));
+        // Same host, non-default port carried on both Origin and Host → still same-origin.
+        assert!(origin_allowed(
+            &headers(&[
+                ("host", "localhost:3000"),
+                ("origin", "http://localhost:3000"),
+            ]),
+            &empty
+        ));
+        // A genuine cross-origin request with an empty allowlist → reject (attacker's Origin
+        // carries their host, never the target's Host).
+        assert!(!origin_allowed(
+            &headers(&[
+                ("host", "app.example.com"),
+                ("origin", "https://evil.example.net"),
+            ]),
+            &empty
+        ));
+        // Cross-scheme is *not* rejected on scheme alone (host-based check): the cookie is
+        // `Secure` so a same-host http page never carries it — a deliberate, safe relaxation.
+        assert!(origin_allowed(
+            &headers(&[
+                ("host", "app.example.com"),
+                ("origin", "http://app.example.com")
+            ]),
+            &empty
+        ));
+    }
+
+    #[test]
+    fn outcome_injects_a_same_origin_cookie_with_an_empty_allowlist() {
+        // The end-to-end footgun regression: same-origin SPA fetch + `allowed_origins: []`.
         let h = headers(&[
             ("cookie", "session=tok"),
+            ("host", "app.example.com"),
+            ("origin", "https://app.example.com"),
+        ]);
+        assert!(matches!(
+            cookie_auth_outcome(&h, Some(&cfg(&[]))),
+            CookieAuthOutcome::Inject(t) if t == "tok"
+        ));
+    }
+
+    #[test]
+    fn outcome_injects_a_listed_cross_origin_cookie() {
+        // A browser app served from a *different* origin, explicitly allowlisted.
+        let h = headers(&[
+            ("cookie", "session=tok"),
+            ("host", "api.example.com"),
             ("origin", "https://app.example.com"),
         ]);
         assert!(matches!(
@@ -1033,6 +1122,7 @@ mod cookie_auth_tests {
     fn outcome_rejects_a_cross_origin_cookie_request() {
         let h = headers(&[
             ("cookie", "session=tok"),
+            ("host", "app.example.com"),
             ("origin", "https://evil.example.net"),
         ]);
         assert!(matches!(
