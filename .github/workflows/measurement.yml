@@ -77,9 +77,16 @@ jobs:
           # test suite filtered to `graphql` (the fast graphql unit tests that exercise
           # these modules). A mutant that survives every one of those tests is a
           # weak-assertion finding.
+          # `--file` globs match against the full path; use basename globs so they match
+          # crates/boatramp-server/src/graphql_plan.rs regardless of the package base
+          # (the earlier `src/graphql_plan.rs` matched nothing → 0 mutants, a silent no-op).
           cargo mutants -p boatramp-server --features handlers \
-            --file 'src/graphql_plan.rs' --file 'src/graphql_federation.rs' \
+            --file '**/graphql_plan.rs' --file '**/graphql_federation.rs' \
             --test-tool cargo --timeout 120 --no-shuffle -- graphql || true
+          # Guard against another silent no-op: 0 mutants means the scope is wrong.
+          if grep -q 'Found 0 mutants' mutants.out/debug.log 2>/dev/null; then
+            echo "::warning::cargo-mutants found 0 mutants — file scope did not match"
+          fi
           echo "=== outcome counts ==="
           grep -oE '"(MISSED|CAUGHT|TIMEOUT|UNVIABLE)"' mutants.out/outcomes.json 2>/dev/null \
             | sort | uniq -c || true

@@ -102,14 +102,13 @@ jobs:
   # CRIU checkpoint/restore. Uses a busybox rootfs exported from the public busybox
   # image (a test-double, not a private artifact). No secrets.
   container:
-    name: container launch + CRIU (root, informational)
-    # Ubuntu 24.04 (noble) dropped the `criu` package (no install candidate); jammy
-    # still ships it. INFORMATIONAL tier: the backend writes cgroup-v2 limits under
-    # /sys/fs/cgroup/boatramp/<id>, which needs a *delegated* cgroup subtree — on a
-    # systemd-managed hosted runner the "no internal processes" rule can block enabling
-    # controllers on the root, so this may not run to green without a privileged/
-    # delegated runner. It's attempted + surfaced (not a merge gate); the microVM (KVM)
-    # job is the hard compute gate. CRIU/namespaces/veth themselves work on jammy.
+    name: container launch (root) + CRIU (informational)
+    # Ubuntu 24.04 (noble) dropped the `criu` package; jammy still ships it. The native
+    # container backend LAUNCH (userns + veth into br-boatramp + cgroup-v2 limits under a
+    # delegated /sys/fs/cgroup/boatramp subtree + serve over HTTP) runs to GREEN here and
+    # is a HARD GATE. Only CRIU *restore* is informational: it segfaults on the hosted
+    # runner's kernel (restore is highly kernel/environment-sensitive) — attempted +
+    # surfaced, non-gating.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -147,17 +146,25 @@ jobs:
           echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/boatramp/cgroup.subtree_control >/dev/null 2>&1 || true
           cat /sys/fs/cgroup/cgroup.controllers || true
 
-      - name: Launch + hold a container, then CRIU checkpoint/restore (informational)
-        continue-on-error: true
+      - name: Launch + serve a container (hard gate)
         run: |
           set -o pipefail
           BIN="$(realpath target/debug/boatramp)"
-          timeout -k 30 480 sudo -E env "PATH=$PATH" \
+          timeout -k 30 300 sudo -E env "PATH=$PATH" \
             "BOATRAMP_BIN=$BIN" "BOATRAMP_CONTAINER_ROOTFS=/tmp/bb-rootfs.tar.gz" \
             cargo test -p boatramp-container --test container_live \
-            -- --ignored --nocapture 2>&1 | tee container.log
-          grep -qE 'running [1-9][0-9]* tests?' container.log \
-            || { echo "::error::container live ran 0 tests" >&2; exit 1; }
+            container_live_launch_and_hold -- --ignored --nocapture 2>&1 | tee container.log
+          grep -qE 'test result: ok' container.log \
+            || { echo "::error::container launch+serve failed" >&2; exit 1; }
+
+      - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
+        continue-on-error: true
+        run: |
+          BIN="$(realpath target/debug/boatramp)"
+          timeout -k 30 300 sudo -E env "PATH=$PATH" \
+            "BOATRAMP_BIN=$BIN" "BOATRAMP_CONTAINER_ROOTFS=/tmp/bb-rootfs.tar.gz" \
+            cargo test -p boatramp-container --test container_live \
+            container_criu_roundtrip -- --ignored --nocapture 2>&1 | tee criu.log || true
 
   # Tier F — ACME DNS-01 issuance against a throwaway local Pebble CA (a test-double).
   # No real ACME account, no real DNS, no secrets — Pebble + challtestsrv bind local
