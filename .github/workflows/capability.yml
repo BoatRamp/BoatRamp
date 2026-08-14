@@ -127,6 +127,15 @@ jobs:
       - name: Build the boatramp binary (BOATRAMP_BIN)
         run: cargo build -p boatramp --no-default-features --features fs
 
+      - name: Create the container bridge (the documented prereq)
+        run: |
+          # The native container backend attaches each container's host veth to a
+          # bridge with the gateway IP (the test's runbook). Create it on the runner.
+          sudo ip link add br-boatramp type bridge 2>/dev/null || true
+          sudo ip addr add 10.0.0.1/24 dev br-boatramp 2>/dev/null || true
+          sudo ip link set br-boatramp up
+          ip -brief addr show br-boatramp
+
       - name: Launch + hold a container, then CRIU checkpoint/restore
         run: |
           set -o pipefail
@@ -164,10 +173,15 @@ jobs:
           # PATH lookup expects.
           gh release download "$PEBBLE_VERSION" -R letsencrypt/pebble \
             -p 'pebble-linux-amd64.tar.gz' -p 'pebble-challtestsrv-linux-amd64.tar.gz' --clobber
-          tar xzf pebble-linux-amd64.tar.gz
-          tar xzf pebble-challtestsrv-linux-amd64.tar.gz
-          peb="$(find . -type f -perm -u+x -name '*pebble*' ! -name '*challtestsrv*' ! -name '*.tar.gz' | head -1)"
-          cts="$(find . -type f -perm -u+x -name '*challtestsrv*' ! -name '*.tar.gz' | head -1)"
+          # Extract each archive into its own dir so the pebble dir can't contain
+          # challtestsrv; take the single binary file from each (name varies by release).
+          mkdir -p p c
+          tar xzf pebble-linux-amd64.tar.gz -C p
+          tar xzf pebble-challtestsrv-linux-amd64.tar.gz -C c
+          echo "extracted pebble dir:"; find p -type f
+          echo "extracted challtestsrv dir:"; find c -type f
+          peb="$(find p -type f -name '*pebble*' ! -name '*.tar.gz' | head -1)"
+          cts="$(find c -type f -name '*challtestsrv*' ! -name '*.tar.gz' | head -1)"
           echo "pebble=$peb challtestsrv=$cts"
           sudo install -m 0755 "$peb" /usr/local/bin/pebble
           sudo install -m 0755 "$cts" /usr/local/bin/pebble-challtestsrv
