@@ -1,0 +1,90 @@
+name: Measurement (coverage + mutation testing)
+
+# Report-only reliability instrumentation (PLAN-test-reliability Part C). Neither job
+# gates a merge yet — they surface signal:
+#   • coverage — cargo-llvm-cov over the handlers surface, summary in the job log.
+#   • mutants  — cargo-mutants on the PURE, deterministic GraphQL cores (the planner +
+#                composer). It mutates the code and fails a mutant only if NO test dies —
+#                i.e. it finds assertions too weak to catch a real change, which is exactly
+#                the class that hid the federated-mutation argument-drop (a `.contains()`
+#                that would pass a malformed splice). A "survived" mutant is a named,
+#                line-numbered weak spot to strengthen.
+# Nightly + on-demand; heavy, so off the per-push path.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC (weekly — mutation testing is expensive)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: coverage (llvm-cov, report-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Ensure build deps
+        run: |
+          if ! (command -v cmake >/dev/null && command -v nasm >/dev/null); then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: measurement-coverage
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary (boatramp-server, handlers)
+        run: |
+          cargo llvm-cov -p boatramp-server --features handlers --summary-only \
+            | tee coverage-summary.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage-summary.txt
+
+  mutants:
+    name: mutants (pure GraphQL cores, report-only)
+    runs-on: ubuntu-latest
+    # Mutation testing rebuilds + re-tests once per mutant; bound the whole job.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+      - name: Ensure build deps
+        run: |
+          if ! (command -v cmake >/dev/null && command -v nasm >/dev/null); then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: measurement-mutants
+      - uses: taiki-e/install-action@cargo-mutants
+      # Scope to the two smallest, purest, highest-consequence modules (the planner and
+      # the composer — where Incident 1 and the determinism bug lived). Each mutant runs
+      # only the fast graphql unit tests. Report-only: a surviving mutant is a finding to
+      # triage, not a gate (yet).
+      - name: Mutate the planner + composer
+        continue-on-error: true
+        run: |
+          # cargo-mutants builds with `--features handlers` and, per mutant, runs the
+          # test suite filtered to `graphql` (the fast graphql unit tests that exercise
+          # these modules). A mutant that survives every one of those tests is a
+          # weak-assertion finding.
+          cargo mutants -p boatramp-server --features handlers \
+            --file 'src/graphql_plan.rs' --file 'src/graphql_federation.rs' \
+            --test-tool cargo --timeout 120 --no-shuffle -- graphql || true
+          echo "=== outcome counts ==="
+          grep -oE '"(MISSED|CAUGHT|TIMEOUT|UNVIABLE)"' mutants.out/outcomes.json 2>/dev/null \
+            | sort | uniq -c || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants.out/
