@@ -116,6 +116,19 @@ pub(crate) fn compose(subgraphs: &[(String, String)]) -> Result<Supergraph, Comp
             });
         }
     }
+
+    // Canonicalize the order-dependent lists so composition is **deterministic**: the same set
+    // of subgraphs must yield the same supergraph regardless of the order they were composed in
+    // (registry list order / deploy order is caller-driven). Without this, the `entity.subgraphs`
+    // and `field_owners` lists reflect ingestion order, so the `/api/graphql/supergraph` summary
+    // would change spuriously across recompositions. The planner doesn't consume this order (it
+    // resolves by `@key`), so sorting is purely canonicalizing.
+    for entity in sg.entities.values_mut() {
+        entity.subgraphs.sort();
+    }
+    for owners in sg.field_owners.values_mut() {
+        owners.sort();
+    }
     Ok(sg)
 }
 
@@ -340,5 +353,47 @@ extend schema @link(
     fn unparsable_sdl_is_a_composition_error() {
         let err = compose(&[sub("bad", "type Query { ")]).unwrap_err();
         assert!(matches!(err, CompositionError::Parse { subgraph, .. } if subgraph == "bad"));
+    }
+
+    /// Property: composition is **order-independent**. A supergraph is a set-like merge of its
+    /// subgraphs, so composing them in any permutation must yield the same entities, keys, and
+    /// root ownership. (A lightweight stand-in for a proptest — a fixed set of permutations.)
+    /// Composition order is caller-driven (registry list order, deploy order), so an
+    /// order-sensitive bug would be a subtle, hard-to-reproduce corruption; this pins it out.
+    #[test]
+    fn composition_is_order_independent() {
+        let a = sub(
+            "accounts",
+            "type Query { me: User } type User @key(fields: \"id\") { id: ID! name: String }",
+        );
+        let b = sub(
+            "reviews",
+            "type Query { top: [Review] } type Review { id: ID! } extend type User @key(fields: \"id\") { id: ID! @external reviews: [Review] }",
+        );
+        let c = sub(
+            "catalog",
+            "type Query { items: [Item] } type Item @key(fields: \"sku\") { sku: ID! }",
+        );
+
+        let baseline = compose(&[a.clone(), b.clone(), c.clone()]).unwrap();
+        for perm in [
+            [c.clone(), a.clone(), b.clone()],
+            [b.clone(), c.clone(), a.clone()],
+            [b.clone(), a.clone(), c.clone()],
+        ] {
+            let sg = compose(&perm).unwrap();
+            // The whole supergraph model must be identical regardless of input order.
+            assert_eq!(sg.entities, baseline.entities, "entities differ by order");
+            assert_eq!(
+                sg.root_query, baseline.root_query,
+                "root_query differs by order"
+            );
+            assert_eq!(
+                sg.field_owners, baseline.field_owners,
+                "field_owners differ by order"
+            );
+            // Every `@key` entity survives every ordering.
+            assert!(sg.entities.contains_key("User") && sg.entities.contains_key("Item"));
+        }
     }
 }
