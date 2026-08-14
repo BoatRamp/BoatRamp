@@ -353,4 +353,47 @@ mod tests {
         );
         assert_ne!(a, c);
     }
+
+    /// Golden: the exact create/replace body for every kind, pinning Akamai Edge
+    /// DNS's `rdata` array with full-FQDN names, quoted TXT, and dotted CNAME.
+    #[test]
+    fn record_body_golden_for_every_kind() {
+        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            value: value.into(),
+            ttl,
+        };
+        assert_eq!(
+            AkamaiDns::record_body(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            serde_json::json!({"name": "deploy.example.com", "type": "A", "ttl": 60, "rdata": ["203.0.113.7"]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Aaaa,
+                "deploy.example.com",
+                "2001:db8::1",
+                60
+            )),
+            serde_json::json!({"name": "deploy.example.com", "type": "AAAA", "ttl": 60, "rdata": ["2001:db8::1"]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Cname,
+                "www.example.com",
+                "lb.example.net",
+                300
+            )),
+            serde_json::json!({"name": "www.example.com", "type": "CNAME", "ttl": 300, "rdata": ["lb.example.net."]})
+        );
+        assert_eq!(
+            AkamaiDns::record_body(&rec(
+                RecordKind::Txt,
+                "_acme-challenge.example.com",
+                "tok",
+                60
+            )),
+            serde_json::json!({"name": "_acme-challenge.example.com", "type": "TXT", "ttl": 60, "rdata": ["\"tok\""]})
+        );
+    }
 }

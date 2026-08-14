@@ -228,4 +228,44 @@ mod tests {
         });
         assert_eq!(body["content"], "lb.example.net.");
     }
+
+    /// Golden: the exact create body for every kind, pinning DNSimple's
+    /// `content`-keyed, relative-name (apex → empty string) wire shape.
+    #[test]
+    fn record_body_golden_for_every_kind() {
+        let p = provider();
+        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            value: value.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.record_body(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            serde_json::json!({"name": "deploy", "type": "A", "content": "203.0.113.7", "ttl": 60})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Aaaa,
+                "deploy.example.com",
+                "2001:db8::1",
+                60
+            )),
+            serde_json::json!({"name": "deploy", "type": "AAAA", "content": "2001:db8::1", "ttl": 60})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Cname,
+                "www.example.com",
+                "lb.example.net",
+                300
+            )),
+            serde_json::json!({"name": "www", "type": "CNAME", "content": "lb.example.net.", "ttl": 300})
+        );
+        // The apex resolves to an empty relative name.
+        assert_eq!(
+            p.record_body(&rec(RecordKind::Txt, "example.com", "tok", 60)),
+            serde_json::json!({"name": "", "type": "TXT", "content": "tok", "ttl": 60})
+        );
+    }
 }

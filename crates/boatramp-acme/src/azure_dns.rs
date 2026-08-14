@@ -195,4 +195,39 @@ mod tests {
         });
         assert_eq!(c["properties"]["CNAMERecord"]["cname"], "lb.example.net");
     }
+
+    /// Golden: the exact per-type `properties` body for every kind (singular
+    /// `CNAMERecord`, plural `*Records` arrays) plus the apex/subdomain relative-name
+    /// encoding — Azure's DNS record-set wire shape, pinned against drift.
+    #[test]
+    fn body_and_relative_name_golden_for_every_kind() {
+        let rec = |kind, value: &str| DnsRecord {
+            kind,
+            name: "x.example.com".into(),
+            value: value.into(),
+            ttl: 60,
+        };
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::A, "203.0.113.7")),
+            serde_json::json!({"properties": {"TTL": 60, "ARecords": [{"ipv4Address": "203.0.113.7"}]}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Aaaa, "2001:db8::1")),
+            serde_json::json!({"properties": {"TTL": 60, "AAAARecords": [{"ipv6Address": "2001:db8::1"}]}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Cname, "lb.example.net")),
+            serde_json::json!({"properties": {"TTL": 60, "CNAMERecord": {"cname": "lb.example.net"}}})
+        );
+        assert_eq!(
+            AzureDns::body(&rec(RecordKind::Txt, "tok")),
+            serde_json::json!({"properties": {"TTL": 60, "TXTRecords": [{"value": ["tok"]}]}})
+        );
+        // The apex resolves to `@`; a subdomain drops the zone suffix.
+        assert_eq!(provider().relative_name("example.com"), "@");
+        assert_eq!(
+            provider().relative_name("_acme-challenge.deploy.example.com"),
+            "_acme-challenge.deploy"
+        );
+    }
 }

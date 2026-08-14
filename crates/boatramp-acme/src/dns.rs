@@ -242,6 +242,10 @@ mod tests {
         assert!(!value.contains('+') && !value.contains('/') && !value.contains('='));
         // SHA-256 → 32 bytes → 43 base64url chars unpadded.
         assert_eq!(value.len(), 43);
+        // Known-answer vector: base64url_nopad(SHA-256("token.thumbprint")). Pins the
+        // exact bytes — determinism + length + alphabet alone would not catch a
+        // double-hash or a swapped digest that preserved the shape.
+        assert_eq!(value, "61rBZ_4knHblO0MNoxFsXZ_eTFUHum0B6IVRbhvUn5I");
     }
 
     #[test]

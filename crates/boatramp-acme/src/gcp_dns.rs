@@ -218,4 +218,48 @@ mod tests {
         });
         assert_eq!(rr["rrdatas"][0], "203.0.113.7");
     }
+
+    /// Golden: the exact `rrset` object for every kind, pinning GCP's FQDN-with-dot
+    /// name, quoted-TXT, dotted-CNAME `rrdatas` wire shape.
+    #[test]
+    fn rrset_golden_for_every_kind() {
+        let p = provider();
+        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            value: value.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.rrset(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            serde_json::json!({"name": "deploy.example.com.", "type": "A", "ttl": 60, "rrdatas": ["203.0.113.7"]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Aaaa,
+                "deploy.example.com",
+                "2001:db8::1",
+                60
+            )),
+            serde_json::json!({"name": "deploy.example.com.", "type": "AAAA", "ttl": 60, "rrdatas": ["2001:db8::1"]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Cname,
+                "www.example.com",
+                "lb.example.net",
+                300
+            )),
+            serde_json::json!({"name": "www.example.com.", "type": "CNAME", "ttl": 300, "rrdatas": ["lb.example.net."]})
+        );
+        assert_eq!(
+            p.rrset(&rec(
+                RecordKind::Txt,
+                "_acme-challenge.example.com",
+                "tok",
+                60
+            )),
+            serde_json::json!({"name": "_acme-challenge.example.com.", "type": "TXT", "ttl": 60, "rrdatas": ["\"tok\""]})
+        );
+    }
 }

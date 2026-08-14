@@ -293,4 +293,35 @@ mod tests {
         assert_eq!(body["items"][0]["domain"], "_acme-challenge.example.com");
         assert_eq!(body["items"][0]["ttl"], 60);
     }
+
+    /// Golden: the exact RRSet replacement body for every kind. OCI takes the raw
+    /// value in `rdata` for all types (it normalizes TXT quoting and CNAME
+    /// trailing-dots server-side), so — unlike most providers — no client-side
+    /// transform is applied. Pinned here; a live-OCI round-trip is the follow-up
+    /// that would confirm the server accepts these unadorned values.
+    #[test]
+    fn rrset_body_golden_for_every_kind() {
+        let rec = |kind, value: &str| DnsRecord {
+            kind,
+            name: "x.example.com".into(),
+            value: value.into(),
+            ttl: 60,
+        };
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::A, "203.0.113.7")),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "A", "rdata": "203.0.113.7", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Aaaa, "2001:db8::1")),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "AAAA", "rdata": "2001:db8::1", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Cname, "lb.example.net")),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "CNAME", "rdata": "lb.example.net", "ttl": 60}]})
+        );
+        assert_eq!(
+            OciDns::rrset_body(&rec(RecordKind::Txt, "tok")),
+            serde_json::json!({"items": [{"domain": "x.example.com", "rtype": "TXT", "rdata": "tok", "ttl": 60}]})
+        );
+    }
 }

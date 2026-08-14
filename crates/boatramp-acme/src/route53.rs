@@ -146,4 +146,29 @@ mod tests {
         assert_eq!(rr_type(RecordKind::Cname), RrType::Cname);
         assert_eq!(rr_type(RecordKind::Txt), RrType::Txt);
     }
+
+    /// Golden: the exact resource-record value for every kind. Route 53 passes
+    /// address/CNAME values verbatim and wraps TXT in double quotes (escaping any
+    /// embedded quote) — the one Route 53-specific transform, pinned here.
+    #[test]
+    fn rr_value_golden_for_every_kind() {
+        let rec = |kind, value: &str| DnsRecord {
+            kind,
+            name: "x.example.com".into(),
+            value: value.into(),
+            ttl: 60,
+        };
+        assert_eq!(rr_value(&rec(RecordKind::A, "203.0.113.7")), "203.0.113.7");
+        assert_eq!(
+            rr_value(&rec(RecordKind::Aaaa, "2001:db8::1")),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            rr_value(&rec(RecordKind::Cname, "app.fly.dev")),
+            "app.fly.dev"
+        );
+        assert_eq!(rr_value(&rec(RecordKind::Txt, "tok")), "\"tok\"");
+        // An embedded quote is backslash-escaped inside the Route 53 quoting.
+        assert_eq!(rr_value(&rec(RecordKind::Txt, "a\"b")), "\"a\\\"b\"");
+    }
 }

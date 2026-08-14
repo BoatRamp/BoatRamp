@@ -220,4 +220,53 @@ mod tests {
         assert!(txt.get("proxied").is_none());
         assert_eq!(txt["ttl"], 60);
     }
+
+    /// Golden: the exact create/replace body for every record kind (unproxied),
+    /// pinning Cloudflare's `content`-keyed wire shape against accidental drift.
+    #[test]
+    fn record_body_golden_for_every_kind() {
+        let cf = CloudflareDns::new("z", "t");
+        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            value: value.into(),
+            ttl,
+        };
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::A,
+                "deploy.example.com",
+                "203.0.113.7",
+                300
+            )),
+            serde_json::json!({"type": "A", "name": "deploy.example.com", "content": "203.0.113.7", "ttl": 300})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Aaaa,
+                "deploy.example.com",
+                "2001:db8::1",
+                300
+            )),
+            serde_json::json!({"type": "AAAA", "name": "deploy.example.com", "content": "2001:db8::1", "ttl": 300})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Cname,
+                "www.example.com",
+                "app.fly.dev",
+                300
+            )),
+            serde_json::json!({"type": "CNAME", "name": "www.example.com", "content": "app.fly.dev", "ttl": 300})
+        );
+        assert_eq!(
+            cf.record_body(&rec(
+                RecordKind::Txt,
+                "_acme-challenge.example.com",
+                "tok",
+                60
+            )),
+            serde_json::json!({"type": "TXT", "name": "_acme-challenge.example.com", "content": "tok", "ttl": 60})
+        );
+    }
 }

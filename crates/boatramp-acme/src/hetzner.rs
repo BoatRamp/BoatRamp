@@ -234,4 +234,43 @@ mod tests {
         });
         assert_eq!(body["value"], "lb.example.net.");
     }
+
+    /// Golden: the exact create/replace body for every kind, pinning Hetzner's
+    /// `zone_id` + `value`-keyed, relative-name (apex → `@`) wire shape.
+    #[test]
+    fn record_body_golden_for_every_kind() {
+        let p = provider();
+        let rec = |kind, name: &str, value: &str, ttl| DnsRecord {
+            kind,
+            name: name.into(),
+            value: value.into(),
+            ttl,
+        };
+        assert_eq!(
+            p.record_body(&rec(RecordKind::A, "deploy.example.com", "203.0.113.7", 60)),
+            serde_json::json!({"zone_id": "zone123", "type": "A", "name": "deploy", "value": "203.0.113.7", "ttl": 60})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Aaaa,
+                "deploy.example.com",
+                "2001:db8::1",
+                60
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "AAAA", "name": "deploy", "value": "2001:db8::1", "ttl": 60})
+        );
+        assert_eq!(
+            p.record_body(&rec(
+                RecordKind::Cname,
+                "www.example.com",
+                "lb.example.net",
+                300
+            )),
+            serde_json::json!({"zone_id": "zone123", "type": "CNAME", "name": "www", "value": "lb.example.net.", "ttl": 300})
+        );
+        assert_eq!(
+            p.record_body(&rec(RecordKind::Txt, "example.com", "tok", 60)),
+            serde_json::json!({"zone_id": "zone123", "type": "TXT", "name": "@", "value": "tok", "ttl": 60})
+        );
+    }
 }
