@@ -11,9 +11,11 @@
 //! Pure and deterministic — operation + model in, plan out; no I/O.
 
 use crate::graphql_federation::Supergraph;
-use graphql_parser::query::{
-    Definition, Field, OperationDefinition, Selection, SelectionSet, Value,
+use async_graphql_parser::types::{
+    DocumentOperations, Field, OperationType, Selection, SelectionSet, VariableDefinition,
 };
+use async_graphql_parser::Positioned;
+use async_graphql_value::{Name, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// One fetch in a query plan.
@@ -73,42 +75,34 @@ struct DepFetch {
 
 /// Plan `query` against the composed supergraph `sg`.
 pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError> {
-    let doc = graphql_parser::query::parse_query::<String>(query)
-        .map_err(|e| PlanError::Parse(e.to_string()))?;
-    let op = doc
-        .definitions
-        .iter()
-        .find_map(|d| match d {
-            Definition::Operation(op) => Some(op),
-            _ => None,
-        })
-        .ok_or(PlanError::NoOperation)?;
-    let (root_sel, root_type, roots, var_types) = match op {
-        OperationDefinition::Query(q) => (
-            &q.selection_set,
-            "Query",
-            &sg.root_query,
-            var_type_map(&q.variable_definitions),
-        ),
-        OperationDefinition::SelectionSet(ss) => (ss, "Query", &sg.root_query, BTreeMap::new()),
-        OperationDefinition::Mutation(m) => (
-            &m.selection_set,
-            "Mutation",
-            &sg.root_mutation,
-            var_type_map(&m.variable_definitions),
-        ),
-        OperationDefinition::Subscription(_) => return Err(PlanError::Unsupported("subscription")),
+    let doc =
+        async_graphql_parser::parse_query(query).map_err(|e| PlanError::Parse(e.to_string()))?;
+    // The operation to plan: the sole operation, or the first of a multi-operation document
+    // (the federation gateway plans one operation). An anonymous `{ … }` shorthand parses as a
+    // single query operation, so no separate arm is needed.
+    let op = match &doc.operations {
+        DocumentOperations::Single(op) => &op.node,
+        DocumentOperations::Multiple(map) => {
+            &map.values().next().ok_or(PlanError::NoOperation)?.node
+        }
     };
+    let (root_type, roots) = match op.ty {
+        OperationType::Query => ("Query", &sg.root_query),
+        OperationType::Mutation => ("Mutation", &sg.root_mutation),
+        OperationType::Subscription => return Err(PlanError::Unsupported("subscription")),
+    };
+    let var_types = var_type_map(&op.variable_definitions);
 
     // Group the root fields by the subgraph that owns them → one root fetch per subgraph.
-    let mut by_subgraph: BTreeMap<String, Vec<&Field<'_, String>>> = BTreeMap::new();
-    for sel in &root_sel.items {
-        if let Selection::Field(field) = sel {
+    let mut by_subgraph: BTreeMap<String, Vec<&Field>> = BTreeMap::new();
+    for sel in &op.selection_set.node.items {
+        if let Selection::Field(field) = &sel.node {
+            let fname = field.node.name.node.as_str();
             let owner = roots
-                .get(&field.name)
+                .get(fname)
                 .cloned()
-                .ok_or_else(|| PlanError::UnknownRootField(field.name.clone()))?;
-            by_subgraph.entry(owner).or_default().push(field);
+                .ok_or_else(|| PlanError::UnknownRootField(fname.to_string()))?;
+            by_subgraph.entry(owner).or_default().push(&field.node);
         }
     }
 
@@ -160,7 +154,7 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
 /// fields trigger.
 fn plan_selection(
     sg: &Supergraph,
-    sel_set: &SelectionSet<'_, String>,
+    sel_set: &SelectionSet,
     parent_type: &str,
     subgraph: &str,
     used: &mut BTreeSet<String>,
@@ -170,10 +164,11 @@ fn plan_selection(
     let is_entity = sg.entities.contains_key(parent_type);
     let mut key_injected = false;
     for sel in &sel_set.items {
-        let Selection::Field(field) = sel else {
+        let Selection::Field(field) = &sel.node else {
             continue; // fragments are not planned in the core scope
         };
-        match owner_of(sg, parent_type, &field.name, subgraph) {
+        let field = &field.node;
+        match owner_of(sg, parent_type, field.name.node.as_str(), subgraph) {
             // A field owned by another subgraph on an entity type → an entity jump.
             Some(owner) if owner != subgraph && is_entity => {
                 if !key_injected {
@@ -216,39 +211,43 @@ fn plan_selection(
 /// the response path of any dependent fetch found inside it.
 fn plan_field(
     sg: &Supergraph,
-    field: &Field<'_, String>,
+    field: &Field,
     parent_type: &str,
     subgraph: &str,
     used: &mut BTreeSet<String>,
 ) -> (String, Vec<DepFetch>) {
+    let field_name = field.name.node.as_str();
     // Field arguments must survive into the subgraph fetch — `agent(input: $x)`, not `agent`.
     // Any `$var` referenced is recorded so its definition is emitted on this fetch's operation.
     let args = render_arguments(&field.arguments, used);
-    if field.selection_set.items.is_empty() {
-        return (format!("{}{args}", field.name), Vec::new());
+    if field.selection_set.node.items.is_empty() {
+        return (format!("{field_name}{args}"), Vec::new());
     }
     let child_type = sg
         .field_types
-        .get(&(parent_type.to_string(), field.name.clone()))
+        .get(&(parent_type.to_string(), field_name.to_string()))
         .cloned()
         .unwrap_or_default();
     let (child_sel, child_deps) =
-        plan_selection(sg, &field.selection_set, &child_type, subgraph, used);
+        plan_selection(sg, &field.selection_set.node, &child_type, subgraph, used);
     let deps = child_deps
         .into_iter()
         .map(|mut d| {
-            d.path.insert(0, field.name.clone());
+            d.path.insert(0, field_name.to_string());
             d
         })
         .collect();
-    (format!("{}{args} {child_sel}", field.name), deps)
+    (format!("{field_name}{args} {child_sel}"), deps)
 }
 
 /// Render a field's arguments as ` (name: value, …)` (empty when there are none), recording
 /// every `$var` referenced (recursively, into lists/objects) so the fetch operation can define
-/// it. Values render via `graphql-parser`'s `Display` — correct GraphQL literal syntax including
-/// `$var` references, unquoted enum values, lists, and input objects.
-fn render_arguments(args: &[(String, Value<'_, String>)], used: &mut BTreeSet<String>) -> String {
+/// it. Values render via `async-graphql-value`'s `Display` — correct GraphQL literal syntax
+/// including `$var` references, unquoted enum values, lists, and input objects.
+fn render_arguments(
+    args: &[(Positioned<Name>, Positioned<Value>)],
+    used: &mut BTreeSet<String>,
+) -> String {
     if args.is_empty() {
         return String::new();
     }
@@ -257,20 +256,20 @@ fn render_arguments(args: &[(String, Value<'_, String>)], used: &mut BTreeSet<St
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(name);
+        out.push_str(name.node.as_str());
         out.push_str(": ");
-        out.push_str(&value.to_string());
-        collect_vars(value, used);
+        out.push_str(&value.node.to_string());
+        collect_vars(&value.node, used);
     }
     out.push(')');
     out
 }
 
 /// Record every variable (`$name`) referenced inside `value`, descending into lists and objects.
-fn collect_vars(value: &Value<'_, String>, used: &mut BTreeSet<String>) {
+fn collect_vars(value: &Value, used: &mut BTreeSet<String>) {
     match value {
         Value::Variable(name) => {
-            used.insert(name.clone());
+            used.insert(name.to_string());
         }
         Value::List(items) => items.iter().for_each(|v| collect_vars(v, used)),
         Value::Object(fields) => fields.values().for_each(|v| collect_vars(v, used)),
@@ -280,11 +279,14 @@ fn collect_vars(value: &Value<'_, String>, used: &mut BTreeSet<String>) {
 
 /// The variable name → type-string map from an operation's variable definitions (types render
 /// via `Type`'s `Display`, e.g. `AgentInput!`).
-fn var_type_map(
-    defs: &[graphql_parser::query::VariableDefinition<'_, String>],
-) -> BTreeMap<String, String> {
+fn var_type_map(defs: &[Positioned<VariableDefinition>]) -> BTreeMap<String, String> {
     defs.iter()
-        .map(|d| (d.name.clone(), d.var_type.to_string()))
+        .map(|d| {
+            (
+                d.node.name.node.to_string(),
+                d.node.var_type.node.to_string(),
+            )
+        })
         .collect()
 }
 

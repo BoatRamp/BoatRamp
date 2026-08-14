@@ -26,6 +26,8 @@ handlers = [
   "boatramp-handlers/graphql",
   "dep:chrono",
   "dep:graphql-parser",
+  "dep:async-graphql-parser",
+  "dep:async-graphql-value",
   "dep:wasmparser",
 ]
 
@@ -153,10 +155,15 @@ webpki-roots = "1.0"
 tower = { version = "0.5", features = ["util"], optional = true }
 # Error enums (the OIDC verifier's error type).
 thiserror.workspace = true
-# GraphQL query parsing for the edge query-guard (`handlers` feature): parse an
-# incoming operation to enforce depth/complexity limits + introspection policy
-# before the handler runs. A small standalone parser (no async-graphql runtime).
+# GraphQL parsing (`handlers` feature). `async-graphql-parser` is the parser
+# async-graphql itself uses, so boatramp parses exactly what a subgraph emits —
+# crucially the federation-v2 `extend schema @link(...)` SDL that the unmaintained,
+# pre-v2 `graphql-parser` 0.4 rejects. `async-graphql-value` carries the shared
+# `Value`/`ConstValue`/`Type` AST leaf types (Display renders GraphQL; variables
+# resolve to JSON). No async-graphql runtime is pulled in.
 graphql-parser = { version = "0.4", optional = true }
+async-graphql-parser = { version = "7", optional = true }
+async-graphql-value = { version = "7", optional = true }
 
 # External signer backends (optional). AWS KMS reuses the workspace `aws-config`
 # (already in the tree for s3) + the KMS SDK; PKCS#11 uses `cryptoki` (a thin,

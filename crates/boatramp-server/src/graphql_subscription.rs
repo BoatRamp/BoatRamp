@@ -11,19 +11,29 @@
 //! boatramp stays GraphQL-*aware*, not an engine: the payload published to the topic is
 //! the subscription result your producer computes; the host just fans it out (framed).
 
-use graphql_parser::query::{Definition, OperationDefinition, Selection};
+use async_graphql_parser::types::{
+    DocumentOperations, OperationDefinition, OperationType, Selection,
+};
+use async_graphql_parser::Positioned;
 
 /// If `query` is a subscription operation, return the messaging topic it streams from —
 /// its single root field's name (a subscription has exactly one root field per the
 /// GraphQL spec). Returns `None` for a query/mutation or a malformed subscription.
 pub(crate) fn subscription_topic(query: &str) -> Option<String> {
-    let doc = graphql_parser::query::parse_query::<String>(query).ok()?;
-    doc.definitions.iter().find_map(|def| {
-        let Definition::Operation(OperationDefinition::Subscription(sub)) = def else {
+    let doc = async_graphql_parser::parse_query(query).ok()?;
+    let ops: Vec<&OperationDefinition> = match &doc.operations {
+        DocumentOperations::Single(op) => vec![&op.node],
+        DocumentOperations::Multiple(map) => map.values().map(|op| &op.node).collect(),
+    };
+    ops.into_iter().find_map(|op| {
+        if op.ty != OperationType::Subscription {
             return None;
-        };
-        match sub.selection_set.items.first() {
-            Some(Selection::Field(field)) => Some(field.name.clone()),
+        }
+        match op.selection_set.node.items.first() {
+            Some(Positioned {
+                node: Selection::Field(field),
+                ..
+            }) => Some(field.node.name.node.to_string()),
             _ => None,
         }
     })
