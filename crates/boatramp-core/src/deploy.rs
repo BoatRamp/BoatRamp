@@ -3531,6 +3531,148 @@ mod tests {
         assert_eq!(resolved("example.com").await, None);
     }
 
+    /// Multi-tenant wildcard-vhost precedence (regression pin). In ONE project, a **wildcard**
+    /// site (`*.construens.com` → `portal`) coexists in the same suffix with an **exact** site
+    /// (`console.construens.com` → `console`) and a per-tenant **exact** custom host on a third
+    /// site (`vip.construens.com` → `vip`). The pins: exact always beats the wildcard, and the
+    /// wildcard catches every un-attached tenant label at any depth.
+    #[tokio::test]
+    async fn wildcard_vhost_precedence_exact_beats_wildcard() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let attach = |site: &'static str, domains: DomainConfig| {
+            let store = store.clone();
+            async move {
+                store
+                    .set_site_config(
+                        ProjectRef::DEFAULT,
+                        site,
+                        &SiteConfig {
+                            domains,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        // `portal` owns the wildcard for the whole suffix.
+        attach(
+            "portal",
+            DomainConfig {
+                wildcards: vec!["*.construens.com".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        // `console` owns an EXACT host under the same suffix.
+        attach(
+            "console",
+            DomainConfig {
+                primary: Some("console.construens.com".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        // A per-tenant custom EXACT host under the suffix, on a third site.
+        attach(
+            "vip",
+            DomainConfig {
+                primary: Some("vip.construens.com".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let resolved = |host: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .resolve_site_by_host(host)
+                    .await
+                    .unwrap()
+                    .map(|o| o.site)
+            }
+        };
+        // Exact beats wildcard: an exactly-attached host wins over `*.construens.com`.
+        assert_eq!(
+            resolved("console.construens.com").await.as_deref(),
+            Some("console")
+        );
+        assert_eq!(resolved("vip.construens.com").await.as_deref(), Some("vip"));
+        // The wildcard catches every un-attached tenant label — at any depth.
+        assert_eq!(
+            resolved("tenant7.construens.com").await.as_deref(),
+            Some("portal")
+        );
+        assert_eq!(
+            resolved("anything-else.construens.com").await.as_deref(),
+            Some("portal")
+        );
+        assert_eq!(
+            resolved("deep.team.construens.com").await.as_deref(),
+            Some("portal")
+        );
+        // A host outside the suffix has no claim (the bare suffix is not a sub-label match either).
+        assert_eq!(resolved("construens.com").await, None);
+        assert_eq!(resolved("console.example.com").await, None);
+    }
+
+    /// A `*.`-host attaches and routes with **no real DNS** via the admin override (what
+    /// `attach_domain_unverified` does: start a DNS challenge, mark it verified without a proof,
+    /// attach) — so an operator can wire `*.construens.com` in a dev run and have every tenant
+    /// label route immediately.
+    #[tokio::test]
+    async fn wildcard_attaches_and_routes_without_real_dns_admin_override() {
+        use crate::domain_verify::VerificationMethod;
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let site = SiteName::new("portal");
+        // The admin-override sequence, with no live DNS lookup anywhere: a wildcard needs the DNS
+        // method, but the proof is asserted out-of-band (marked verified), then attached.
+        store
+            .start_domain_verification(
+                ProjectRef::DEFAULT,
+                &site,
+                "*.construens.com",
+                VerificationMethod::Dns,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(ProjectRef::DEFAULT, &site, "*.construens.com")
+            .await
+            .unwrap();
+        store
+            .attach_verified_domain(ProjectRef::DEFAULT, &site, "*.construens.com")
+            .await
+            .unwrap();
+
+        // It routes immediately: any tenant label under the suffix resolves to the portal site.
+        assert_eq!(
+            store
+                .resolve_site_by_host("tenant7.construens.com")
+                .await
+                .unwrap()
+                .map(|o| o.site)
+                .as_deref(),
+            Some("portal")
+        );
+        // The wildcard matches sub-labels only — the bare suffix is not claimed.
+        assert_eq!(
+            store
+                .resolve_site_by_host("construens.com")
+                .await
+                .unwrap()
+                .map(|o| o.site),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn site_config_is_content_addressed_and_dedups() {
         use crate::config::SiteConfig;

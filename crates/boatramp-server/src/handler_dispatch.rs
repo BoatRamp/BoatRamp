@@ -1027,6 +1027,43 @@ pub(super) async fn dispatch_consumer_batch(
 }
 
 #[cfg(all(test, feature = "handlers"))]
+mod vhost_tests {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_routed_request_carries_the_real_public_host_to_the_guest() {
+        // A tenant host routed via a *wildcard* site: the guest must still see the **real** Host
+        // so it can resolve tenant-by-host. The host survives on the `Host` header AND becomes the
+        // `wasi:http` request authority (the URI the guest observes), plus `X-Forwarded-Host`. The
+        // URI rewrite swaps only the *path* to the site-relative form — it never rewrites the host.
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/_sites/portal/dashboard?tenant=7")
+            .header("host", "tenant7.construens.com")
+            .body(Body::empty())
+            .unwrap();
+        set_forwarded_headers(&mut req, std::net::IpAddr::from([203, 0, 113, 9]));
+        rewrite_request_uri(&mut req, "/dashboard");
+        // The guest's `wasi:http` request authority is the real public host — not `localhost`, and
+        // not the internal `/_sites/<site>/…` form. This is what a handler resolving its tenant
+        // reads off the incoming request.
+        assert_eq!(req.uri().host(), Some("tenant7.construens.com"));
+        assert_eq!(req.uri().path(), "/dashboard");
+        assert_eq!(req.uri().query(), Some("tenant=7"));
+        // The `Host` header is preserved verbatim (the other channel a guest may read).
+        assert_eq!(
+            req.headers().get(header::HOST).unwrap(),
+            "tenant7.construens.com"
+        );
+        // ...and mirrored to `X-Forwarded-Host`.
+        assert_eq!(
+            req.headers().get("x-forwarded-host").unwrap(),
+            "tenant7.construens.com"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "handlers"))]
 mod sql_grant_tests {
     use super::granted_sql_databases;
 
