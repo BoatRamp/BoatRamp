@@ -8,6 +8,16 @@ versions.
 ## [Unreleased]
 
 ### Fixed
+- **The federation gateway no longer silently discards subgraph errors.** `graphql_gateway::execute`
+  assembled only `data` and dropped every fetch's `errors`, so a subgraph returning a spec-correct
+  `{ "data": null, "errors": [...] }` (a denied field, a failed non-null field, a backend error)
+  reached the client as a bare `{ "data": null }` — the real message ("FORBIDDEN", validation
+  detail, etc.) lost, and denied vs. error vs. legitimately-null indistinguishable. The gateway now
+  accumulates the `errors` array from every fetch (root and `_entities`), prefixes each error's
+  `path` with the fetch's response path, and returns `{ data, errors }` (a fully-successful query is
+  unchanged — no `errors` key). A partial failure now returns the healthy subgraphs' data plus the
+  failing one's error instead of a total wipe; an error-only infra response is no longer merged into
+  `data`.
 - **`boatramp operator crds` / `operator manifests` emitted invalid CRD YAML for numeric
   defaults.** A transitive dependency enables serde_json's `arbitrary_precision` feature, under
   which a `serde_json::Value::Number` (a CRD schema `default`, e.g. `BoatRampCluster.replicas`'s

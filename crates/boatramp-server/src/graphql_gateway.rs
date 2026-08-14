@@ -33,13 +33,18 @@ pub(crate) async fn execute(
     variables: &Value,
 ) -> Value {
     let mut data = json!({});
+    let mut errors: Vec<Value> = Vec::new();
     for fetch in &plan.fetches {
         match &fetch.requires {
             None => {
                 let resp = fetcher
                     .fetch(&fetch.subgraph, &fetch.query, variables.clone())
                     .await;
-                merge(&mut data, fetch_data(&resp));
+                // A root fetch's errors carry their own path relative to the root.
+                collect_errors(&mut errors, &resp, &[]);
+                if let Some(d) = fetch_data(&resp) {
+                    merge(&mut data, d);
+                }
             }
             Some(req) => {
                 // Build the entity representations from the already-stitched tree at the
@@ -53,6 +58,9 @@ pub(crate) async fn execute(
                         with_representations(variables, reprs),
                     )
                     .await;
+                // An `_entities` fetch's errors are relative to `_entities[i]`; prefix them
+                // with the provider path so a client can locate the failing field.
+                collect_errors(&mut errors, &resp, &req.path);
                 let entities = resp
                     .pointer("/data/_entities")
                     .or_else(|| resp.pointer("/_entities"))
@@ -62,12 +70,56 @@ pub(crate) async fn execute(
             }
         }
     }
-    json!({ "data": data })
+    // Assemble the spec envelope: `errors` is present only when at least one fetch reported
+    // one, so a wholly-successful query is byte-identical to before.
+    if errors.is_empty() {
+        json!({ "data": data })
+    } else {
+        json!({ "data": data, "errors": errors })
+    }
 }
 
-/// A fetch response's data object (unwrapping a `{ "data": … }` envelope).
-fn fetch_data(resp: &Value) -> &Value {
-    resp.get("data").unwrap_or(resp)
+/// The data of a fetch response's `{ "data": … }` envelope to merge into the composed tree,
+/// or `None` when there is nothing to merge. An **error-only** response (the infra-failure
+/// paths in this file build `{ "errors": [...] }` with no `data`) and an explicit top-level
+/// `{ "data": null }` (a subgraph's non-null field failed) both contribute no data — so a
+/// failing subgraph never wipes the other subgraphs' data, and its `{"errors":…}` object is
+/// never itself merged in as data. A response with neither key is treated as envelope-less
+/// raw data (the lenient path some mocks use).
+fn fetch_data(resp: &Value) -> Option<&Value> {
+    match resp.get("data") {
+        Some(Value::Null) => None,
+        Some(d) => Some(d),
+        None if resp.get("errors").is_some() => None,
+        None => Some(resp),
+    }
+}
+
+/// Accumulate a fetch response's `errors` into `acc`, prefixing each error's `path` with
+/// `base_path` (the fetch's response path — empty for a root fetch, the provider path for an
+/// `_entities`/`requires` fetch). `message`, `extensions`, and `locations` are forwarded
+/// verbatim. An absent / empty / non-array `errors` contributes nothing, so a legitimately
+/// null field with no error stays error-free.
+fn collect_errors(acc: &mut Vec<Value>, resp: &Value, base_path: &[String]) {
+    let Some(errs) = resp.get("errors").and_then(Value::as_array) else {
+        return;
+    };
+    for err in errs {
+        let mut err = err.clone();
+        if !base_path.is_empty() {
+            let suffix = err
+                .get("path")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut full: Vec<Value> = base_path.iter().map(|s| Value::String(s.clone())).collect();
+            full.extend(suffix);
+            if let Value::Object(m) = &mut err {
+                m.insert("path".to_string(), Value::Array(full));
+            }
+        }
+        acc.push(err);
+    }
 }
 
 /// The variables for an `_entities` fetch: the incoming operation variables (when a JSON object)
@@ -623,6 +675,83 @@ mod tests {
         let out = execute(&plan, &mock, &json!({})).await;
         assert_eq!(out["data"]["me"]["name"], json!("Alice"));
         assert_eq!(out["data"]["topReviews"][0]["body"], json!("ok"));
+        // A wholly-successful query carries no `errors` key (byte-identical to before).
+        assert!(out.get("errors").is_none(), "no errors on success: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_root_fetch_error_is_surfaced_and_its_field_stays_null() {
+        // A subgraph returns a spec-correct `{ data: null, errors: [...] }`. The gateway must
+        // forward the real message (not collapse to a bare `data: null`), and the failing
+        // field reads null without an invented error.
+        let sg = compose(&[
+            ("accounts".into(), ACCOUNTS.into()),
+            ("reviews".into(), REVIEWS.into()),
+        ])
+        .unwrap();
+        let plan = plan("{ me { name } }", &sg).unwrap();
+        let mock = Mock(HashMap::from([(
+            "accounts",
+            json!({ "data": null, "errors": [{ "message": "boom", "path": ["me"] }] }),
+        )]));
+        let out = execute(&plan, &mock, &json!({})).await;
+        assert_eq!(out["errors"][0]["message"], json!("boom"));
+        assert_eq!(out["errors"][0]["path"], json!(["me"]));
+        // The failing field reads null; the `{"errors":…}` object was NOT merged as data.
+        assert_eq!(out["data"]["me"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn partial_success_keeps_the_healthy_subgraph_and_surfaces_the_other_error() {
+        // Two root fetches: one succeeds, one errors. The successful field survives in `data`
+        // and the failing field's error surfaces — a partial failure is not a total wipe.
+        let sg = compose(&[
+            ("accounts".into(), ACCOUNTS.into()),
+            ("reviews".into(), REVIEWS.into()),
+        ])
+        .unwrap();
+        let plan = plan("{ me { name } topReviews { body } }", &sg).unwrap();
+        let mock = Mock(HashMap::from([
+            ("accounts", json!({ "data": { "me": { "name": "Alice" } } })),
+            (
+                "reviews",
+                json!({ "data": null, "errors": [{ "message": "reviews down", "path": ["topReviews"] }] }),
+            ),
+        ]));
+        let out = execute(&plan, &mock, &json!({})).await;
+        assert_eq!(out["data"]["me"]["name"], json!("Alice"));
+        assert_eq!(out["data"]["topReviews"], json!(null));
+        assert_eq!(out["errors"][0]["message"], json!("reviews down"));
+    }
+
+    #[tokio::test]
+    async fn an_entities_fetch_error_is_surfaced_with_the_provider_path() {
+        // A dependent `_entities` fetch errors. Its error is surfaced, prefixed with the
+        // provider path (`me`), while the root subgraph's data survives.
+        let sg = compose(&[
+            ("accounts".into(), ACCOUNTS.into()),
+            ("reviews".into(), REVIEWS.into()),
+        ])
+        .unwrap();
+        let plan = plan("{ me { name reviews { body } } }", &sg).unwrap();
+        let mock = Mock(HashMap::from([
+            (
+                "accounts",
+                json!({ "data": { "me": { "name": "Alice", "__typename": "User", "id": "1" } } }),
+            ),
+            (
+                "reviews",
+                json!({ "errors": [{ "message": "FORBIDDEN", "path": ["_entities", 0, "reviews"] }] }),
+            ),
+        ]));
+        let out = execute(&plan, &mock, &json!({})).await;
+        // Root data intact; the entity error surfaces with the provider path prefixed.
+        assert_eq!(out["data"]["me"]["name"], json!("Alice"));
+        assert_eq!(out["errors"][0]["message"], json!("FORBIDDEN"));
+        assert_eq!(
+            out["errors"][0]["path"],
+            json!(["me", "_entities", 0, "reviews"])
+        );
     }
 
     #[tokio::test]
