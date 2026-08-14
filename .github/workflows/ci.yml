@@ -10,7 +10,11 @@ name: CI
 #                      cluster+tls+acme-dns feature union (a light slice of
 #                      --all-features) so a feature-combination regression fails
 #                      the PR gate, not only nightly.
-#   • test           — workspace tests, default features.
+#   • test           — workspace tests, lean fs+SlateDB slice.
+#   • test-server-features — the `boatramp-server` feature-gated integration surface
+#                      (handlers/oidc/mcp/compression/dns-verify) AT THE MERGE GATE.
+#                      The lean `test` lane can't see this code; running it nightly-only
+#                      is how two total failures shipped through green CI, so it gates now.
 #   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
 # clippy and test are the two full workspace compiles; running them as separate
 # jobs lets them build concurrently on separate runners instead of one after the
@@ -19,10 +23,12 @@ name: CI
 # The shipped `default` feature set is now **all** features (batteries-included),
 # so per-push compiles deliberately opt DOWN to a lean fs+SlateDB slice
 # (`--no-default-features --features boatramp/fs,boatramp/slatedb`) plus the light
-# feature-clippy slice — no wasmtime/openraft-heavy union, so each job stays quick.
+# feature-clippy slice — so those jobs stay quick. But feature-gated *integration
+# tests* must still gate merges (not run nightly-only), so `test-server-features`
+# runs the server's handlers/oidc/mcp/compression/dns-verify surface per-push; the
+# heavier openraft/cloud-SDK feature unions stay in nightly's `--all-features` lane.
 # The full default (`--all-features` == default) clippy + test and the reproducible
-# `nix flake check` run in the nightly workflow (.github/workflows/nightly.yml), or
-# on demand via its workflow_dispatch; the heaviest feature-gated code is covered nightly.
+# `nix flake check` run in the nightly workflow (.github/workflows/nightly.yml).
 on:
   push:
     branches: [main]
@@ -188,6 +194,37 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
+
+  # The lean `test` lane above opts down to `fs,slatedb` for speed, which enables
+  # NEITHER `handlers` NOR the other feature-gated surfaces — so the whole GraphQL /
+  # federation / data-connector suite (245 handlers-gated cfgs) plus oidc/mcp/
+  # compression/dns-verify ran only in nightly `--all-features`. That blind spot let
+  # two total failures ship through green CI (federated mutations broken; federation-v2
+  # SDL rejected). This lane runs that feature-gated integration surface AT THE MERGE
+  # GATE. Scoped to `boatramp-server` (one crate + wasmtime) so it stays affordable;
+  # the heavy openraft/cloud-SDK unions stay nightly.
+  test-server-features:
+    name: test (server feature union)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-server-features
+
+      - name: Test (handlers + oidc + mcp + compression + dns-verify)
+        run: cargo test -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns
 
   deny:
     name: cargo-deny
