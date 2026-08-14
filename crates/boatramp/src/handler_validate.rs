@@ -318,6 +318,15 @@ mod imp {
                 lbl("boatramp:handlers", "sql-types"),
             ];
             assert!(check_interface_policy(&sql, &exports, &["sql".into()], Role::Handler).is_ok());
+            // A **named** grant satisfies the single `sql` import too — a component imports one
+            // `sql` interface and selects the database by name at runtime.
+            assert!(
+                check_interface_policy(&sql, &exports, &["sql:product".into()], Role::Handler)
+                    .is_ok()
+            );
+            assert!(
+                check_interface_policy(&sql, &exports, &["sql:*".into()], Role::Handler).is_ok()
+            );
             // Undeclared → rejected, and the message names the capability token.
             let err = check_interface_policy(&sql, &exports, &[], Role::Handler).unwrap_err();
             assert!(err.contains("`sql`"), "{err}");
