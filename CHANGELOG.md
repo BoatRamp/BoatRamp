@@ -46,7 +46,8 @@ versions.
   `path` with the fetch's response path, and returns `{ data, errors }` (a fully-successful query is
   unchanged — no `errors` key). A partial failure now returns the healthy subgraphs' data plus the
   failing one's error instead of a total wipe; an error-only infra response is no longer merged into
-  `data`.
+  `data`. Per GraphQL error propagation, a query that fully errors (nothing resolves) returns
+  `data: null` rather than an empty `{}` — a fully-errored non-nullable root field nulls `data`.
 - **`boatramp operator crds` / `operator manifests` emitted invalid CRD YAML for numeric
   defaults.** A transitive dependency enables serde_json's `arbitrary_precision` feature, under
   which a `serde_json::Value::Number` (a CRD schema `default`, e.g. `BoatRampCluster.replicas`'s

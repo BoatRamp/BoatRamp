@@ -73,10 +73,18 @@ pub(crate) async fn execute(
     // Assemble the spec envelope: `errors` is present only when at least one fetch reported
     // one, so a wholly-successful query is byte-identical to before.
     if errors.is_empty() {
-        json!({ "data": data })
-    } else {
-        json!({ "data": data, "errors": errors })
+        return json!({ "data": data });
     }
+    // GraphQL error propagation: when a query fully errors so that **nothing** resolved (every
+    // contributing fetch nulled its own data or errored, leaving `data` an empty object), the
+    // response `data` is `null`, not `{}` — a fully-errored non-nullable root field nulls the
+    // whole `data`. A *partial* success (some field resolved, or a nullable field arrived as
+    // `{field: null}`) leaves `data` non-empty and is preserved.
+    let data = match &data {
+        Value::Object(map) if map.is_empty() => Value::Null,
+        _ => data,
+    };
+    json!({ "data": data, "errors": errors })
 }
 
 /// The data of a fetch response's `{ "data": … }` envelope to merge into the composed tree,
@@ -687,10 +695,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_root_fetch_error_is_surfaced_and_its_field_stays_null() {
-        // A subgraph returns a spec-correct `{ data: null, errors: [...] }`. The gateway must
-        // forward the real message (not collapse to a bare `data: null`), and the failing
-        // field reads null without an invented error.
+    async fn a_fully_errored_root_nulls_data_and_surfaces_the_error() {
+        // A subgraph returns a spec-correct `{ data: null, errors: [...] }` and it is the only
+        // root fetch, so nothing resolves. The gateway must forward the real message AND, per
+        // GraphQL error propagation, null the whole `data` (a fully-errored non-nullable root
+        // field nulls `data`) — not leave it a bare `{}`.
         let sg = compose(&[
             ("accounts".into(), ACCOUNTS.into()),
             ("reviews".into(), REVIEWS.into()),
@@ -704,8 +713,9 @@ mod tests {
         let out = execute(&plan, &mock, &json!({})).await;
         assert_eq!(out["errors"][0]["message"], json!("boom"));
         assert_eq!(out["errors"][0]["path"], json!(["me"]));
-        // The failing field reads null; the `{"errors":…}` object was NOT merged as data.
-        assert_eq!(out["data"]["me"], json!(null));
+        // Nothing resolved → `data` is null (not `{}`), and the `{"errors":…}` object was never
+        // merged as data.
+        assert_eq!(out["data"], json!(null));
     }
 
     #[tokio::test]
@@ -726,6 +736,8 @@ mod tests {
             ),
         ]));
         let out = execute(&plan, &mock, &json!({})).await;
+        // `data` is NOT nulled — a partial success is preserved (contrast the fully-errored case).
+        assert!(!out["data"].is_null(), "partial success keeps data: {out}");
         assert_eq!(out["data"]["me"]["name"], json!("Alice"));
         assert_eq!(out["data"]["topReviews"], json!(null));
         assert_eq!(out["errors"][0]["message"], json!("reviews down"));
