@@ -14,11 +14,32 @@
 use super::dialect::{sql_string_literal, Dialect};
 use super::policy::{Claims, DataPolicy, PolicyError, RowOp};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
-use boatramp_core::sql::SqlValue;
-use graphql_parser::query::{
-    Definition, Field, OperationDefinition, Selection, TypeCondition, Value,
+use async_graphql_parser::types::{
+    DocumentOperations, ExecutableDocument, Field, OperationDefinition, OperationType, Selection,
 };
+use async_graphql_parser::Positioned;
+use async_graphql_value::Value;
+use boatramp_core::sql::SqlValue;
 use std::collections::BTreeMap;
+
+/// The operation to compile: the sole operation, or the first of a multi-operation document
+/// (the data connector compiles one operation). An anonymous `{ … }` shorthand parses as a
+/// single query operation.
+fn first_operation(doc: &ExecutableDocument) -> Option<&OperationDefinition> {
+    match &doc.operations {
+        DocumentOperations::Single(op) => Some(&op.node),
+        DocumentOperations::Multiple(map) => map.values().next().map(|op| &op.node),
+    }
+}
+
+/// The response key a field projects under: its alias, else its name.
+fn field_response_key(field: &Field) -> String {
+    field
+        .alias
+        .as_ref()
+        .map(|a| a.node.to_string())
+        .unwrap_or_else(|| field.name.node.to_string())
+}
 
 /// How one output field of a row is produced.
 #[derive(Debug, PartialEq)]
@@ -122,23 +143,19 @@ pub(crate) struct EntitiesPlan {
 
 /// Whether `query` is a federation `_entities` fetch (a root `_entities` field).
 pub(crate) fn is_entities_query(query: &str) -> bool {
-    let Ok(doc) = graphql_parser::query::parse_query::<String>(query) else {
+    let Ok(doc) = async_graphql_parser::parse_query(query) else {
         return false;
     };
-    doc.definitions.iter().any(|d| {
-        let Definition::Operation(op) = d else {
-            return false;
-        };
-        let selection = match op {
-            OperationDefinition::Query(q) => &q.selection_set,
-            OperationDefinition::SelectionSet(ss) => ss,
-            _ => return false,
-        };
-        selection
+    let Some(op) = first_operation(&doc) else {
+        return false;
+    };
+    op.ty == OperationType::Query
+        && op
+            .selection_set
+            .node
             .items
             .iter()
-            .any(|s| matches!(s, Selection::Field(f) if f.name == "_entities"))
-    })
+            .any(|s| matches!(&s.node, Selection::Field(f) if f.node.name.node == "_entities"))
 }
 
 /// Compile a federation `_entities` fetch into one keyed `SELECT`. The `... on <Type>`
@@ -152,43 +169,37 @@ pub(crate) fn compile_entities(
     claims: &Claims,
     dialect: &dyn Dialect,
 ) -> Result<EntitiesPlan, CompileError> {
-    let doc = graphql_parser::query::parse_query::<String>(query)
-        .map_err(|e| CompileError::Parse(e.to_string()))?;
-    let op = doc
-        .definitions
-        .iter()
-        .find_map(|d| match d {
-            Definition::Operation(op) => Some(op),
-            _ => None,
-        })
-        .ok_or(CompileError::NoOperation)?;
-    let selection = match op {
-        OperationDefinition::Query(q) => &q.selection_set,
-        OperationDefinition::SelectionSet(ss) => ss,
-        _ => {
-            return Err(CompileError::Unsupported(
-                "`_entities` must be a query".into(),
-            ))
-        }
-    };
-    let entities = selection
+    let doc =
+        async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
+    let op = first_operation(&doc).ok_or(CompileError::NoOperation)?;
+    if op.ty != OperationType::Query {
+        return Err(CompileError::Unsupported(
+            "`_entities` must be a query".into(),
+        ));
+    }
+    let entities = op
+        .selection_set
+        .node
         .items
         .iter()
-        .find_map(|s| match s {
-            Selection::Field(f) if f.name == "_entities" => Some(f),
+        .find_map(|s| match &s.node {
+            Selection::Field(f) if f.node.name.node == "_entities" => Some(&f.node),
             _ => None,
         })
         .ok_or_else(|| CompileError::Unsupported("expected an `_entities` query".into()))?;
     // The `... on <Type> { … }` inline fragment names the entity type + its selection.
     let (type_name, inner) = entities
         .selection_set
+        .node
         .items
         .iter()
-        .find_map(|s| match s {
-            Selection::InlineFragment(frag) => frag
-                .type_condition
-                .as_ref()
-                .map(|TypeCondition::On(name)| (name.clone(), &frag.selection_set.items)),
+        .find_map(|s| match &s.node {
+            Selection::InlineFragment(frag) => frag.node.type_condition.as_ref().map(|tc| {
+                (
+                    tc.node.on.node.to_string(),
+                    &frag.node.selection_set.node.items,
+                )
+            }),
             _ => None,
         })
         .ok_or_else(|| {
@@ -307,15 +318,9 @@ pub(crate) fn compile_entities(
 /// Whether `query`'s operation is a mutation (so the caller runs it on a write transaction
 /// and only if the site opted into mutations).
 pub(crate) fn is_mutation(query: &str) -> bool {
-    graphql_parser::query::parse_query::<String>(query)
+    async_graphql_parser::parse_query(query)
         .ok()
-        .and_then(|doc| {
-            doc.definitions.into_iter().find_map(|d| match d {
-                Definition::Operation(OperationDefinition::Mutation(_)) => Some(true),
-                Definition::Operation(_) => Some(false),
-                _ => None,
-            })
-        })
+        .and_then(|doc| first_operation(&doc).map(|op| op.ty == OperationType::Mutation))
         .unwrap_or(false)
 }
 
@@ -345,34 +350,29 @@ pub(crate) fn compile(
     claims: &Claims,
     dialect: &dyn Dialect,
 ) -> Result<PlannedSql, CompileError> {
-    let doc = graphql_parser::query::parse_query::<String>(query)
-        .map_err(|e| CompileError::Parse(e.to_string()))?;
-    let op = doc
-        .definitions
-        .iter()
-        .find_map(|d| match d {
-            Definition::Operation(op) => Some(op),
-            _ => None,
-        })
-        .ok_or(CompileError::NoOperation)?;
-    let selection = match op {
-        OperationDefinition::Query(q) => &q.selection_set,
-        OperationDefinition::SelectionSet(ss) => ss,
-        OperationDefinition::Mutation(_) => {
-            return Err(CompileError::Unsupported("mutations".into()))
-        }
-        OperationDefinition::Subscription(_) => {
+    let doc =
+        async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
+    let op = first_operation(&doc).ok_or(CompileError::NoOperation)?;
+    match op.ty {
+        OperationType::Query => {}
+        OperationType::Mutation => return Err(CompileError::Unsupported("mutations".into())),
+        OperationType::Subscription => {
             return Err(CompileError::Unsupported("subscriptions".into()))
         }
-    };
+    }
 
     let mut roots = Vec::new();
-    for item in &selection.items {
-        let Selection::Field(field) = item else {
+    for item in &op.selection_set.node.items {
+        let Selection::Field(field) = &item.node else {
             return Err(CompileError::Unsupported("fragments at the root".into()));
         };
         roots.push(compile_root(
-            field, variables, schema, policy, claims, dialect,
+            &field.node,
+            variables,
+            schema,
+            policy,
+            claims,
+            dialect,
         )?);
     }
     Ok(PlannedSql { roots })
@@ -391,26 +391,24 @@ pub(crate) fn compile_mutation(
     claims: &Claims,
     dialect: &dyn Dialect,
 ) -> Result<MutationPlan, CompileError> {
-    let doc = graphql_parser::query::parse_query::<String>(query)
-        .map_err(|e| CompileError::Parse(e.to_string()))?;
-    let op = doc
-        .definitions
-        .iter()
-        .find_map(|d| match d {
-            Definition::Operation(op) => Some(op),
-            _ => None,
-        })
-        .ok_or(CompileError::NoOperation)?;
-    let OperationDefinition::Mutation(mutation) = op else {
+    let doc =
+        async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
+    let op = first_operation(&doc).ok_or(CompileError::NoOperation)?;
+    if op.ty != OperationType::Mutation {
         return Err(CompileError::Unsupported("expected a mutation".into()));
-    };
+    }
     let mut statements = Vec::new();
-    for sel in &mutation.selection_set.items {
-        let Selection::Field(field) = sel else {
+    for sel in &op.selection_set.node.items {
+        let Selection::Field(field) = &sel.node else {
             return Err(CompileError::Unsupported("fragments in a mutation".into()));
         };
         statements.push(compile_write(
-            field, variables, schema, policy, claims, dialect,
+            &field.node,
+            variables,
+            schema,
+            policy,
+            claims,
+            dialect,
         )?);
     }
     Ok(MutationPlan { statements })
@@ -424,29 +422,30 @@ enum WriteKind {
 }
 
 fn compile_write(
-    field: &Field<'_, String>,
+    field: &Field,
     variables: &serde_json::Value,
     schema: &DbSchema,
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
 ) -> Result<WriteStatement, CompileError> {
-    let response_key = field.alias.clone().unwrap_or_else(|| field.name.clone());
-    let (table_name, kind) = if let Some(t) = field.name.strip_prefix("insert_") {
+    let response_key = field_response_key(field);
+    let field_name = field.name.node.as_str();
+    let (table_name, kind) = if let Some(t) = field_name.strip_prefix("insert_") {
         (t, WriteKind::Insert)
-    } else if let Some(t) = field.name.strip_prefix("update_") {
+    } else if let Some(t) = field_name.strip_prefix("update_") {
         (t, WriteKind::Update)
-    } else if let Some(t) = field.name.strip_prefix("delete_") {
+    } else if let Some(t) = field_name.strip_prefix("delete_") {
         (t, WriteKind::Delete)
     } else {
-        return Err(CompileError::UnknownField(field.name.clone()));
+        return Err(CompileError::UnknownField(field_name.to_string()));
     };
     if !policy.is_table_exposed(table_name) {
-        return Err(CompileError::UnknownField(field.name.clone()));
+        return Err(CompileError::UnknownField(field_name.to_string()));
     }
     let table = schema
         .table(table_name)
-        .ok_or_else(|| CompileError::UnknownField(field.name.clone()))?;
+        .ok_or_else(|| CompileError::UnknownField(field_name.to_string()))?;
 
     let mut cx = Cx {
         dialect,
@@ -468,13 +467,18 @@ fn compile_write(
 
 /// `INSERT INTO <t> (…) VALUES (…)` from an `object` argument, with the row filter forced.
 fn compile_insert(
-    field: &Field<'_, String>,
+    field: &Field,
     table: &Table,
     policy: &DataPolicy,
     claims: &Claims,
     cx: &mut Cx<'_>,
 ) -> Result<String, CompileError> {
-    let Some((_, Value::Object(map))) = field.arguments.iter().find(|(n, _)| n == "object") else {
+    let Some((_, arg)) = field.arguments.iter().find(|(n, _)| n.node == "object") else {
+        return Err(CompileError::Unsupported(
+            "insert requires an `object` argument".into(),
+        ));
+    };
+    let Value::Object(map) = &arg.node else {
         return Err(CompileError::Unsupported(
             "insert requires an `object` argument".into(),
         ));
@@ -482,10 +486,11 @@ fn compile_insert(
     let mut columns: Vec<String> = Vec::new();
     let mut values: Vec<SqlValue> = Vec::new();
     for (col, val) in map {
+        let col = col.as_str();
         if table.column(col).is_none() || !policy.is_column_exposed(&table.name, col) {
             return Err(CompileError::UnknownField(format!("{}.{col}", table.name)));
         }
-        columns.push(col.clone());
+        columns.push(col.to_string());
         values.push(resolve_value(val, cx.variables)?);
     }
     // A new row must belong to the tenant: force the row-filter columns to the claim values.
@@ -521,13 +526,18 @@ fn compile_insert(
 
 /// `UPDATE <t> SET … WHERE …` from `_set` + `where`; refuses an unbounded update.
 fn compile_update(
-    field: &Field<'_, String>,
+    field: &Field,
     table: &Table,
     policy: &DataPolicy,
     claims: &Claims,
     cx: &mut Cx<'_>,
 ) -> Result<String, CompileError> {
-    let Some((_, Value::Object(map))) = field.arguments.iter().find(|(n, _)| n == "_set") else {
+    let Some((_, arg)) = field.arguments.iter().find(|(n, _)| n.node == "_set") else {
+        return Err(CompileError::Unsupported(
+            "update requires a `_set` argument".into(),
+        ));
+    };
+    let Value::Object(map) = &arg.node else {
         return Err(CompileError::Unsupported(
             "update requires a `_set` argument".into(),
         ));
@@ -537,6 +547,7 @@ fn compile_update(
     }
     let mut assignments = Vec::new();
     for (col, val) in map {
+        let col = col.as_str();
         if table.column(col).is_none() || !policy.is_column_exposed(&table.name, col) {
             return Err(CompileError::UnknownField(format!("{}.{col}", table.name)));
         }
@@ -558,7 +569,7 @@ fn compile_update(
 
 /// `DELETE FROM <t> WHERE …`; refuses an unbounded delete.
 fn compile_delete(
-    field: &Field<'_, String>,
+    field: &Field,
     table: &Table,
     policy: &DataPolicy,
     claims: &Claims,
@@ -578,15 +589,15 @@ fn compile_delete(
 /// The write `WHERE`: the client `where` argument combined with the table's row filter
 /// (unqualified columns — a single-table statement). `None` when both are absent.
 fn compile_write_where(
-    field: &Field<'_, String>,
+    field: &Field,
     table: &Table,
     policy: &DataPolicy,
     claims: &Claims,
     cx: &mut Cx<'_>,
 ) -> Result<Option<String>, CompileError> {
     let mut clauses = Vec::new();
-    if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n == "where") {
-        if let Some(expr) = compile_bool_exp(where_arg, table, "", policy, cx)? {
+    if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n.node == "where") {
+        if let Some(expr) = compile_bool_exp(&where_arg.node, table, "", policy, cx)? {
             clauses.push(expr);
         }
     }
@@ -629,25 +640,26 @@ impl Cx<'_> {
 }
 
 fn compile_root(
-    field: &Field<'_, String>,
+    field: &Field,
     variables: &serde_json::Value,
     schema: &DbSchema,
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
 ) -> Result<RootQuery, CompileError> {
-    let response_key = field.alias.clone().unwrap_or_else(|| field.name.clone());
-    let (table_name, single) = match field.name.strip_suffix("_by_pk") {
+    let response_key = field_response_key(field);
+    let field_name = field.name.node.as_str();
+    let (table_name, single) = match field_name.strip_suffix("_by_pk") {
         Some(t) => (t, true),
-        None => (field.name.as_str(), false),
+        None => (field_name, false),
     };
 
     if !policy.is_table_exposed(table_name) {
-        return Err(CompileError::UnknownField(field.name.clone()));
+        return Err(CompileError::UnknownField(field_name.to_string()));
     }
     let table = schema
         .table(table_name)
-        .ok_or_else(|| CompileError::UnknownField(field.name.clone()))?;
+        .ok_or_else(|| CompileError::UnknownField(field_name.to_string()))?;
 
     let mut cx = Cx {
         dialect,
@@ -661,7 +673,7 @@ fn compile_root(
     // Projection (columns, relationship subqueries, __typename) + delegated fields. Built
     // first, so its subquery parameters number before the WHERE's.
     let (select_exprs, projection, delegations) = compile_selection(
-        &field.selection_set.items,
+        &field.selection_set.node.items,
         table,
         &qualifier,
         schema,
@@ -684,21 +696,21 @@ fn compile_root(
     }
     if single {
         if table.primary_key.is_empty() {
-            return Err(CompileError::UnknownField(field.name.clone()));
+            return Err(CompileError::UnknownField(field_name.to_string()));
         }
         for pk in &table.primary_key {
             let arg = field
                 .arguments
                 .iter()
-                .find(|(name, _)| name == pk)
+                .find(|(name, _)| name.node.as_str() == pk)
                 .ok_or_else(|| CompileError::UnknownField(format!("{table_name}_by_pk.{pk}")))?;
-            let value = resolve_value(&arg.1, variables)?;
+            let value = resolve_value(&arg.1.node, variables)?;
             let col = format!("{qualifier}.{}", dialect.quote_ident(pk));
             let ph = cx.bind(value);
             clauses.push(format!("{col} = {ph}"));
         }
-    } else if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n == "where") {
-        if let Some(expr) = compile_bool_exp(where_arg, table, &qualifier, policy, &mut cx)? {
+    } else if let Some((_, where_arg)) = field.arguments.iter().find(|(n, _)| n.node == "where") {
+        if let Some(expr) = compile_bool_exp(&where_arg.node, table, &qualifier, policy, &mut cx)? {
             clauses.push(expr);
         }
     }
@@ -721,12 +733,12 @@ fn compile_root(
             sql.push_str(" ORDER BY ");
             sql.push_str(&order);
         }
-        if let Some((_, limit)) = field.arguments.iter().find(|(n, _)| n == "limit") {
-            let ph = cx.bind(resolve_value(limit, variables)?);
+        if let Some((_, limit)) = field.arguments.iter().find(|(n, _)| n.node == "limit") {
+            let ph = cx.bind(resolve_value(&limit.node, variables)?);
             sql.push_str(&format!(" LIMIT {ph}"));
         }
-        if let Some((_, offset)) = field.arguments.iter().find(|(n, _)| n == "offset") {
-            let ph = cx.bind(resolve_value(offset, variables)?);
+        if let Some((_, offset)) = field.arguments.iter().find(|(n, _)| n.node == "offset") {
+            let ph = cx.bind(resolve_value(&offset.node, variables)?);
             sql.push_str(&format!(" OFFSET {ph}"));
         }
     }
@@ -746,7 +758,7 @@ fn compile_root(
 /// qualified column; a relationship field is a correlated JSON subquery; a delegated field
 /// is resolved by a wasm function after the query; `__typename` is a constant.
 fn compile_selection(
-    items: &[Selection<'_, String>],
+    items: &[Positioned<Selection>],
     table: &Table,
     qualifier: &str,
     schema: &DbSchema,
@@ -761,22 +773,24 @@ fn compile_selection(
     // Columns already in `exprs`, so a delegation can reuse a selected key column.
     let mut column_index: BTreeMap<String, usize> = BTreeMap::new();
     for sel in items {
-        let Selection::Field(f) = sel else {
+        let Selection::Field(f) = &sel.node else {
             return Err(CompileError::Unsupported("fragments in a selection".into()));
         };
-        let key = f.alias.clone().unwrap_or_else(|| f.name.clone());
-        if f.name == "__typename" {
+        let f = &f.node;
+        let f_name = f.name.node.as_str();
+        let key = field_response_key(f);
+        if f_name == "__typename" {
             projection.push(OutField {
                 key,
                 source: OutSource::Typename(table.name.clone()),
             });
             continue;
         }
-        if let Some(rel) = relationships.iter().find(|r| r.field == f.name) {
-            if f.selection_set.items.is_empty() {
+        if let Some(rel) = relationships.iter().find(|r| r.field == f_name) {
+            if f.selection_set.node.items.is_empty() {
                 return Err(CompileError::UnknownField(format!(
-                    "{}.{}",
-                    table.name, f.name
+                    "{}.{f_name}",
+                    table.name
                 )));
             }
             let subquery = relationship_subquery(rel, f, qualifier, schema, policy, claims, cx)?;
@@ -789,7 +803,7 @@ fn compile_selection(
             continue;
         }
         // A field resolved by a wasm function (the config allowlist), not a column.
-        if let Some(function) = policy.delegated(&table.name, &f.name) {
+        if let Some(function) = policy.delegated(&table.name, f_name) {
             delegations.push(compile_delegation(
                 f,
                 function,
@@ -802,16 +816,16 @@ fn compile_selection(
             continue;
         }
         // A scalar column.
-        if !f.selection_set.items.is_empty()
-            || table.column(&f.name).is_none()
-            || !policy.is_column_exposed(&table.name, &f.name)
+        if !f.selection_set.node.items.is_empty()
+            || table.column(f_name).is_none()
+            || !policy.is_column_exposed(&table.name, f_name)
         {
             return Err(CompileError::UnknownField(format!(
-                "{}.{}",
-                table.name, f.name
+                "{}.{f_name}",
+                table.name
             )));
         }
-        let idx = ensure_column(&f.name, qualifier, &mut exprs, &mut column_index, cx);
+        let idx = ensure_column(f_name, qualifier, &mut exprs, &mut column_index, cx);
         projection.push(OutField {
             key,
             source: OutSource::Column(idx),
@@ -840,7 +854,7 @@ fn ensure_column(
 /// Plan a delegated field: ensure the entity key columns are selected (so the runner can
 /// build one representation per row), and build the `_entities` query the function receives.
 fn compile_delegation(
-    field: &Field<'_, String>,
+    field: &Field,
     function: &str,
     table: &Table,
     qualifier: &str,
@@ -848,16 +862,17 @@ fn compile_delegation(
     column_index: &mut BTreeMap<String, usize>,
     cx: &Cx<'_>,
 ) -> Result<Delegation, CompileError> {
-    if field.selection_set.items.is_empty() {
+    let field_name = field.name.node.as_str();
+    if field.selection_set.node.items.is_empty() {
         return Err(CompileError::UnknownField(format!(
-            "{}.{}",
-            table.name, field.name
+            "{}.{field_name}",
+            table.name
         )));
     }
     if table.primary_key.is_empty() {
         return Err(CompileError::Unsupported(format!(
-            "delegated field `{}.{}` needs a primary key to join on",
-            table.name, field.name
+            "delegated field `{}.{field_name}` needs a primary key to join on",
+            table.name
         )));
     }
     let key = table
@@ -876,8 +891,8 @@ fn compile_delegation(
         table.name
     );
     Ok(Delegation {
-        response_key: field.alias.clone().unwrap_or_else(|| field.name.clone()),
-        field: field.name.clone(),
+        response_key: field_response_key(field),
+        field: field_name.to_string(),
         function: function.to_string(),
         type_name: table.name.clone(),
         key,
@@ -887,13 +902,13 @@ fn compile_delegation(
 
 /// Serialize a field (name + nested selection) back to GraphQL text, for the delegated
 /// `_entities` query. Only fields are emitted (fragments are not delegated).
-fn serialize_field(field: &Field<'_, String>) -> String {
-    let mut out = field.name.clone();
-    if !field.selection_set.items.is_empty() {
+fn serialize_field(field: &Field) -> String {
+    let mut out = field.name.node.to_string();
+    if !field.selection_set.node.items.is_empty() {
         out.push_str(" { ");
-        for sel in &field.selection_set.items {
-            if let Selection::Field(f) = sel {
-                out.push_str(&serialize_field(f));
+        for sel in &field.selection_set.node.items {
+            if let Selection::Field(f) = &sel.node {
+                out.push_str(&serialize_field(&f.node));
                 out.push(' ');
             }
         }
@@ -907,7 +922,7 @@ fn serialize_field(field: &Field<'_, String>) -> String {
 /// selection must be scalar-only — a relationship nested beyond one level is rejected.
 fn relationship_subquery(
     rel: &Relationship,
-    field: &Field<'_, String>,
+    field: &Field,
     outer_qualifier: &str,
     schema: &DbSchema,
     policy: &DataPolicy,
@@ -925,32 +940,30 @@ fn relationship_subquery(
 
     // The per-row JSON object: scalar fields + __typename only.
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for sel in &field.selection_set.items {
-        let Selection::Field(sf) = sel else {
+    for sel in &field.selection_set.node.items {
+        let Selection::Field(sf) = &sel.node else {
             return Err(CompileError::Unsupported("fragments in a selection".into()));
         };
-        let key = sf.alias.clone().unwrap_or_else(|| sf.name.clone());
-        if sf.name == "__typename" {
+        let sf = &sf.node;
+        let sf_name = sf.name.node.as_str();
+        let key = field_response_key(sf);
+        if sf_name == "__typename" {
             pairs.push((key, sql_string_literal(&rel.target_table)));
             continue;
         }
-        if !sf.selection_set.items.is_empty() {
+        if !sf.selection_set.node.items.is_empty() {
             return Err(CompileError::Unsupported(
                 "a relationship nested beyond one level".into(),
             ));
         }
-        if target.column(&sf.name).is_none()
-            || !policy.is_column_exposed(&rel.target_table, &sf.name)
+        if target.column(sf_name).is_none() || !policy.is_column_exposed(&rel.target_table, sf_name)
         {
             return Err(CompileError::UnknownField(format!(
-                "{}.{}",
-                rel.target_table, sf.name
+                "{}.{sf_name}",
+                rel.target_table
             )));
         }
-        pairs.push((
-            key,
-            format!("{qalias}.{}", cx.dialect.quote_ident(&sf.name)),
-        ));
+        pairs.push((key, format!("{qalias}.{}", cx.dialect.quote_ident(sf_name))));
     }
     let object = cx.dialect.json_object(&pairs);
 
@@ -984,7 +997,7 @@ fn relationship_subquery(
 
 /// Compile a `<table>_bool_exp` value into a SQL boolean expression (or `None` if empty).
 fn compile_bool_exp(
-    value: &Value<'_, String>,
+    value: &Value,
     table: &Table,
     qualifier: &str,
     policy: &DataPolicy,
@@ -1026,7 +1039,7 @@ fn compile_bool_exp(
 
 /// Compile an `_and`/`_or` list of bool-exps, joined by `sep`.
 fn compile_junction(
-    value: &Value<'_, String>,
+    value: &Value,
     table: &Table,
     qualifier: &str,
     policy: &DataPolicy,
@@ -1057,7 +1070,7 @@ fn qualify(qualifier: &str, column: &str, dialect: &dyn Dialect) -> String {
 fn compile_comparison(
     qualifier: &str,
     column: &str,
-    value: &Value<'_, String>,
+    value: &Value,
     cx: &mut Cx<'_>,
 ) -> Result<String, CompileError> {
     let Value::Object(ops) = value else {
@@ -1119,16 +1132,16 @@ fn compile_comparison(
 
 /// The `ORDER BY` clause from the `order_by` argument (a list of `{col: asc|desc}`).
 fn order_by_clause(
-    field: &Field<'_, String>,
+    field: &Field,
     table: &Table,
     qualifier: &str,
     policy: &DataPolicy,
     dialect: &dyn Dialect,
 ) -> Result<Option<String>, CompileError> {
-    let Some((_, arg)) = field.arguments.iter().find(|(n, _)| n == "order_by") else {
+    let Some((_, arg)) = field.arguments.iter().find(|(n, _)| n.node == "order_by") else {
         return Ok(None);
     };
-    let entries: Vec<&Value<'_, String>> = match arg {
+    let entries: Vec<&Value> = match &arg.node {
         Value::List(items) => items.iter().collect(),
         obj @ Value::Object(_) => vec![obj],
         _ => {
@@ -1145,6 +1158,7 @@ fn order_by_clause(
             ));
         };
         for (column, dir) in obj {
+            let column = column.as_str();
             if table.column(column).is_none() || !policy.is_column_exposed(&table.name, column) {
                 return Err(CompileError::UnknownField(format!(
                     "{}.{column}",
@@ -1152,8 +1166,8 @@ fn order_by_clause(
                 )));
             }
             let direction = match dir {
-                Value::Enum(e) if e == "asc" => "ASC",
-                Value::Enum(e) if e == "desc" => "DESC",
+                Value::Enum(e) if e.as_str() == "asc" => "ASC",
+                Value::Enum(e) if e.as_str() == "desc" => "DESC",
                 Value::String(s) if s == "asc" => "ASC",
                 Value::String(s) if s == "desc" => "DESC",
                 _ => return Err(CompileError::Unsupported("order_by direction".into())),
@@ -1172,26 +1186,28 @@ fn order_by_clause(
 }
 
 /// Resolve a GraphQL value (resolving a variable reference) to a single SQL value.
-fn resolve_value(
-    value: &Value<'_, String>,
-    variables: &serde_json::Value,
-) -> Result<SqlValue, CompileError> {
+fn resolve_value(value: &Value, variables: &serde_json::Value) -> Result<SqlValue, CompileError> {
     match value {
         Value::Variable(name) => json_to_sql(
             variables
                 .get(name.as_str())
                 .unwrap_or(&serde_json::Value::Null),
         ),
-        Value::Int(n) => n
-            .as_i64()
-            .map(SqlValue::Integer)
-            .ok_or_else(|| CompileError::Unsupported("integer out of range".into())),
-        Value::Float(f) => Ok(SqlValue::Real(*f)),
+        // async-graphql-value unifies integers and floats under one `Number`.
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(SqlValue::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(SqlValue::Real(f))
+            } else {
+                Err(CompileError::Unsupported("numeric out of range".into()))
+            }
+        }
         Value::String(s) => Ok(SqlValue::Text(s.clone())),
         Value::Boolean(b) => Ok(SqlValue::Boolean(*b)),
         Value::Null => Ok(SqlValue::Null),
-        Value::Enum(e) => Ok(SqlValue::Text(e.clone())),
-        Value::List(_) | Value::Object(_) => Err(CompileError::Unsupported(
+        Value::Enum(e) => Ok(SqlValue::Text(e.as_str().to_string())),
+        Value::List(_) | Value::Object(_) | Value::Binary(_) => Err(CompileError::Unsupported(
             "a scalar value was expected".into(),
         )),
     }
@@ -1200,7 +1216,7 @@ fn resolve_value(
 /// Resolve a value expected to be a list (an inline list, or a variable holding a JSON
 /// array) into SQL values.
 fn resolve_list(
-    value: &Value<'_, String>,
+    value: &Value,
     variables: &serde_json::Value,
 ) -> Result<Vec<SqlValue>, CompileError> {
     match value {

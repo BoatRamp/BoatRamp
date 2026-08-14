@@ -8,7 +8,9 @@
 //! not a GraphQL engine: it parses only far enough to measure depth/breadth and spot
 //! introspection; execution semantics stay in the handler.
 
-use graphql_parser::query::{Definition, Document, OperationDefinition, Selection, SelectionSet};
+use async_graphql_parser::types::{
+    DocumentOperations, ExecutableDocument, OperationDefinition, Selection, SelectionSet,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The site's GraphQL guard limits (resolved from `[handlers.graphql]`).
@@ -100,7 +102,7 @@ pub(crate) fn query_from_body(content_type: Option<&str>, body: &[u8]) -> Option
 /// handler would reject it anyway; failing at the edge is cheaper and consistent).
 /// The document is parsed to owned strings so the AST needs only one borrow lifetime.
 pub(crate) fn guard_query(query: &str, limits: &GraphqlLimits) -> GuardVerdict {
-    let doc = match graphql_parser::query::parse_query::<String>(query) {
+    let doc = match async_graphql_parser::parse_query(query) {
         Ok(doc) => doc,
         Err(err) => return GuardVerdict::Reject(format!("invalid GraphQL query: {err}")),
     };
@@ -123,53 +125,44 @@ pub(crate) fn guard_query(query: &str, limits: &GraphqlLimits) -> GuardVerdict {
     GuardVerdict::Allow
 }
 
-/// The selection set of any operation shape (named query/mutation/subscription or the
-/// bare `{ … }` shorthand). `'a` is the AST's content lifetime; `'b` the borrow.
-fn operation_selection_set<'a, 'b>(
-    op: &'b OperationDefinition<'a, String>,
-) -> &'b SelectionSet<'a, String> {
-    match op {
-        OperationDefinition::Query(q) => &q.selection_set,
-        OperationDefinition::Mutation(m) => &m.selection_set,
-        OperationDefinition::Subscription(s) => &s.selection_set,
-        OperationDefinition::SelectionSet(ss) => ss,
+/// Every operation in the document (the sole operation, or each of a multi-operation
+/// document). An anonymous `{ … }` shorthand parses as a single query operation.
+fn operations(doc: &ExecutableDocument) -> Vec<&OperationDefinition> {
+    match &doc.operations {
+        DocumentOperations::Single(op) => vec![&op.node],
+        DocumentOperations::Multiple(map) => map.values().map(|op| &op.node).collect(),
     }
 }
 
 /// Whether any operation selects `__schema` or `__type` at its root — a schema
 /// introspection query. `__typename` (allowed anywhere) is deliberately not counted.
-fn has_root_introspection(doc: &Document<'_, String>) -> bool {
-    doc.definitions.iter().any(|def| {
-        let Definition::Operation(op) = def else {
-            return false;
-        };
-        operation_selection_set(op).items.iter().any(
-            |sel| matches!(sel, Selection::Field(f) if f.name == "__schema" || f.name == "__type"),
-        )
+fn has_root_introspection(doc: &ExecutableDocument) -> bool {
+    operations(doc).iter().any(|op| {
+        op.selection_set.node.items.iter().any(|sel| {
+            matches!(&sel.node, Selection::Field(f)
+                if f.node.name.node == "__schema" || f.node.name.node == "__type")
+        })
     })
 }
 
 /// Measure `(max depth, total field count)` across every operation, expanding named
 /// fragments (cycle-guarded) so a query can't hide depth behind a fragment.
-fn measure(doc: &Document<'_, String>) -> (u32, u32) {
-    let fragments: HashMap<&str, &SelectionSet<'_, String>> = doc
-        .definitions
+fn measure(doc: &ExecutableDocument) -> (u32, u32) {
+    // async-graphql-parser exposes fragments as a map already; project it to the
+    // `name → selection-set` shape `walk` needs.
+    let fragments: HashMap<&str, &SelectionSet> = doc
+        .fragments
         .iter()
-        .filter_map(|def| match def {
-            Definition::Fragment(f) => Some((f.name.as_str(), &f.selection_set)),
-            _ => None,
-        })
+        .map(|(name, f)| (name.as_str(), &f.node.selection_set.node))
         .collect();
 
     let mut max_depth = 0;
     let mut complexity = 0;
-    for def in &doc.definitions {
-        if let Definition::Operation(op) = def {
-            let mut visiting = HashSet::new();
-            let (d, c) = walk(operation_selection_set(op), &fragments, 1, &mut visiting);
-            max_depth = max_depth.max(d);
-            complexity += c;
-        }
+    for op in operations(doc) {
+        let mut visiting = HashSet::new();
+        let (d, c) = walk(&op.selection_set.node, &fragments, 1, &mut visiting);
+        max_depth = max_depth.max(d);
+        complexity += c;
     }
     (max_depth, complexity)
 }
@@ -177,34 +170,35 @@ fn measure(doc: &Document<'_, String>) -> (u32, u32) {
 /// Recursively measure one selection set: `depth` is the nesting level of the fields in
 /// `ss`; a field with children recurses at `depth + 1`. Returns the deepest level
 /// reached and the number of fields counted.
-fn walk<'a, 'b>(
-    ss: &'b SelectionSet<'a, String>,
-    fragments: &HashMap<&'b str, &'b SelectionSet<'a, String>>,
+fn walk<'a>(
+    ss: &'a SelectionSet,
+    fragments: &HashMap<&'a str, &'a SelectionSet>,
     depth: u32,
-    visiting: &mut HashSet<&'b str>,
+    visiting: &mut HashSet<&'a str>,
 ) -> (u32, u32) {
     let mut max_depth = depth;
     let mut count = 0;
     for sel in &ss.items {
-        match sel {
+        match &sel.node {
             Selection::Field(field) => {
                 count += 1;
-                if !field.selection_set.items.is_empty() {
-                    let (d, c) = walk(&field.selection_set, fragments, depth + 1, visiting);
+                let child = &field.node.selection_set.node;
+                if !child.items.is_empty() {
+                    let (d, c) = walk(child, fragments, depth + 1, visiting);
                     max_depth = max_depth.max(d);
                     count += c;
                 }
             }
             // Inline fragments contribute their fields at the same depth.
             Selection::InlineFragment(inline) => {
-                let (d, c) = walk(&inline.selection_set, fragments, depth, visiting);
+                let (d, c) = walk(&inline.node.selection_set.node, fragments, depth, visiting);
                 max_depth = max_depth.max(d);
                 count += c;
             }
             // A named fragment expands to its selection set at the same depth; the
             // `visiting` set breaks a fragment cycle (which the parser permits).
             Selection::FragmentSpread(spread) => {
-                let name = spread.fragment_name.as_str();
+                let name = spread.node.fragment_name.node.as_str();
                 if visiting.insert(name) {
                     if let Some(frag_ss) = fragments.get(name) {
                         let (d, c) = walk(frag_ss, fragments, depth, visiting);

@@ -242,8 +242,8 @@ pub fn router_with(
             get(get_workflow_run_handler),
         )
         // GraphQL subgraph schema registry: publish a subgraph's SDL (recomposes +
-        // validates the supergraph) and read the composed supergraph. Uses the
-        // graphql-parser dependency, so it is behind the handlers feature.
+        // validates the supergraph) and read the composed supergraph. Parses SDL, so
+        // it is behind the handlers feature.
         .route(
             "/api/graphql/subgraphs/{name}",
             put(put_graphql_subgraph).delete(delete_graphql_subgraph),
