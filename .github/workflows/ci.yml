@@ -69,6 +69,20 @@ jobs:
             exit 1
           fi
 
+      # Every `#[ignore]` (a capability-gated live seam that runs nowhere automated on
+      # a stock runner) MUST carry a `= "reason"` explaining its gate, so the coverage it
+      # represents stays auditable and an ignore is never an unexplained silent skip. A
+      # bare `#[ignore]` attribute fails the gate. (Matches the attribute on its own line;
+      # doc/comment mentions of `#[ignore]` are unaffected.)
+      - name: Every #[ignore] carries a reason
+        run: |
+          set -eo pipefail
+          if grep -rnE --include='*.rs' '^[[:space:]]*#\[ignore\][[:space:]]*$' crates/; then
+            echo "::error::a bare #[ignore] has no reason — use #[ignore = \"why + how it runs\"]"
+            exit 1
+          fi
+          echo "all #[ignore] attributes carry a reason"
+
       # rustfmt only — no workspace build, so this lane stays sub-minute.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -225,6 +239,24 @@ jobs:
 
       - name: Test (handlers + oidc + mcp + compression + dns-verify)
         run: cargo test -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns
+
+      # Tripwire: fail if this lane's test count drops below the committed floor. A
+      # `#[cfg]`/feature-gate mistake that silently drops a whole module shrinks the
+      # count — which is how the GraphQL surface once went dark — so a shrink fails the
+      # gate rather than passing quietly. Adding tests raises the floor (bump the file).
+      - name: Test-count tripwire (no silent drop)
+        run: |
+          set -eo pipefail
+          # shellcheck disable=SC1091
+          . .github/test-count-baseline
+          live=$(cargo test -p boatramp-server \
+            --features handlers,oidc,mcp,compression,domain-verify-dns \
+            -- --list 2>/dev/null | grep -cE ': test$')
+          echo "server-features tests: live=$live floor=$SERVER_FEATURES_MIN"
+          if [ "$live" -lt "$SERVER_FEATURES_MIN" ]; then
+            echo "::error::server-features test count $live dropped below the floor $SERVER_FEATURES_MIN — a feature-gate mistake may have silently dropped tests. If the drop is intentional, lower .github/test-count-baseline deliberately."
+            exit 1
+          fi
 
   deny:
     name: cargo-deny
