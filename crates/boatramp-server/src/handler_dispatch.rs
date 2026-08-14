@@ -293,6 +293,12 @@ pub(super) async fn dispatch_handler(
         Err(response) => return response,
     };
 
+    // The correlation id assigned by the access-log layer, so captured guest logs carry the
+    // same id as the request's `boatramp::access` line.
+    let request_id = request
+        .extensions()
+        .get::<crate::RequestId>()
+        .map(|r| r.0.clone());
     let bindings = build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -306,6 +312,7 @@ pub(super) async fn dispatch_handler(
         // A site handler is the entry point of a call chain (reached over HTTP), so it
         // invokes siblings at depth 0; the host caps each subsequent hop.
         0,
+        request_id.as_deref(),
     )
     .await;
 
@@ -772,6 +779,7 @@ pub(super) async fn build_bindings(
     deploy_env: &std::collections::BTreeMap<String, String>,
     invoke_targets: &[String],
     depth: u32,
+    request_id: Option<&str>,
 ) -> boatramp_handlers::Bindings {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -847,7 +855,11 @@ pub(super) async fn build_bindings(
     // a site's live + preview output aggregates under it) and rate-capped per
     // the site's `maxLogRate`.
     inner.logs.configure(site, site_handlers.max_log_rate);
-    bindings = bindings.with_logging(site.to_string(), inner.logs.clone());
+    bindings = bindings.with_logging(
+        site.to_string(),
+        request_id.map(str::to_string),
+        inner.logs.clone(),
+    );
 
     // Environment for the guest: the deploy's static `env`
     // strings, plus the site's `secrets` — each a *reference* to a host

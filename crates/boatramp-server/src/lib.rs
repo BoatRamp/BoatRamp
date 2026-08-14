@@ -1125,10 +1125,35 @@ async fn readyz(State(deploy): State<DeployStore>) -> Response {
     }
 }
 
+/// A per-request correlation id assigned by the access-log layer and readable downstream via
+/// the request extensions — the handler dispatch tags captured guest logs with it, so a guest
+/// line correlates with its `boatramp::access` line. Public so an embedder (or a test) can seed
+/// its own id into the request extensions.
+#[derive(Clone)]
+pub struct RequestId(pub String);
+
+/// The correlation id for a request: an upstream proxy's `X-Request-Id` when present (sanitized,
+/// length-capped), else a generated time-ordered, per-process-unique id.
+fn request_id_for(headers: &HeaderMap) -> String {
+    if let Some(id) = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return id.chars().filter(|c| !c.is_control()).take(128).collect();
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}", boatramp_core::time::now_unix_ms(), n)
+}
+
 /// One access-log line, emitted when the response body finishes streaming, so
 /// `bytes` (response size) and `elapsed_ms` (time-to-last-byte) are accurate for
 /// fixed-size *and* streamed/proxied responses.
 struct AccessLog {
+    request_id: String,
     method: Method,
     path: String,
     host: String,
@@ -1148,6 +1173,7 @@ impl Drop for AccessLog {
         srvmetrics::server_metrics().record_request(self.status, bytes);
         tracing::info!(
             target: "boatramp::access",
+            request_id = %self.request_id,
             method = %self.method,
             path = %self.path,
             host = %self.host,
@@ -1165,9 +1191,15 @@ impl Drop for AccessLog {
 /// Structured access-log middleware: method, path, host, client IP, status,
 /// response bytes, and duration. The line is emitted once the body has fully
 /// streamed (or the connection drops), counting bytes as they pass through.
-async fn access_log(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+async fn access_log(mut request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    // Assign the correlation id and make it readable downstream (handler dispatch tags
+    // captured guest logs with it) before running the request.
+    let request_id = request_id_for(request.headers());
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
     let host = request
         .headers()
         .get(header::HOST)
@@ -1189,6 +1221,7 @@ async fn access_log(request: axum::extract::Request, next: axum::middleware::Nex
         .unwrap_or("identity")
         .to_string();
     let log = AccessLog {
+        request_id,
         method,
         path,
         host,

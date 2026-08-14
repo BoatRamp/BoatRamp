@@ -136,12 +136,17 @@ impl LogStore {
 
 impl LogSink for LogStore {
     fn append(&self, scope: &str, stream: LogStream, line: &str) {
+        self.append_tagged(scope, None, stream, line);
+    }
+
+    fn append_tagged(&self, scope: &str, request_id: Option<&str>, stream: LogStream, line: &str) {
         // Mirror every captured line into the structured server log (`serve.log`) under the
         // `boatramp::guest` target, so an operator tailing `serve.log` sees guest output too —
         // not only the per-site log store / SSE tail. Gated by the tracing level (off at the
         // default `info`, on at `debug`), so it never floods production; it fires before the
         // rate cap so `serve.log` is the full firehose while the API-served ring stays bounded.
-        tracing::debug!(target: "boatramp::guest", site = scope, stream = stream.as_str(), "{line}");
+        // The `request_id` matches the `boatramp::access` line, so the two correlate.
+        tracing::debug!(target: "boatramp::guest", site = scope, request_id, stream = stream.as_str(), "{line}");
         let mut sites = self.sites.lock().unwrap();
         let site = sites
             .entry(scope.to_string())
@@ -156,6 +161,7 @@ impl LogSink for LogStore {
             ts_ms: now_unix_ms(),
             stream: stream.as_str().to_string(),
             line: line.to_string(),
+            request_id: request_id.map(str::to_string),
         };
         // Fan out to live SSE tails (best-effort; no subscribers → ignored).
         let _ = self.events.send((scope.to_string(), entry.clone()));

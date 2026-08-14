@@ -4372,10 +4372,13 @@ async fn guest_logs_captured_and_served() {
     let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
     let app = router(deploy, Auth::disabled(), runtime);
 
-    // Invoke the handler; it prints to stdout + stderr before responding.
+    // Invoke the handler; it prints to stdout + stderr before responding. An inbound
+    // `X-Request-Id` is honored by the access-log layer and threaded into the captured logs,
+    // so we can assert the lines are correlated with the request.
     let mut req = Request::builder()
         .method("GET")
         .uri("/_sites/blog/log")
+        .header("x-request-id", "req-abc123")
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
@@ -4409,6 +4412,12 @@ async fn guest_logs_captured_and_served() {
     assert!(
         lines.contains(&("stderr", "hello to stderr")),
         "captured: {lines:?}"
+    );
+    // Every captured line is correlated with the request that produced it (the same id the
+    // access-log line carries).
+    assert!(
+        entries.iter().all(|e| e["request_id"] == "req-abc123"),
+        "each captured line carries its request id: {entries:?}"
     );
 
     // Stream filter: only stderr.

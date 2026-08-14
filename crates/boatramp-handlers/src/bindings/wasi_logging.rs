@@ -70,8 +70,9 @@ impl logging_iface::Host for WasiLoggingHost<'_> {
         let Some(binding) = self.binding else {
             return; // no sink wired → drop (capture is host-side observability, not a grant)
         };
-        binding.sink.append(
+        binding.sink.append_tagged(
             &binding.scope,
+            binding.request_id.as_deref(),
             level_stream(level),
             &render(level, &context, &message),
         );
@@ -93,41 +94,57 @@ mod tests {
     use crate::logging::LogSink;
     use std::sync::{Arc, Mutex};
 
-    /// Records every appended `(scope, stream, line)`.
+    /// One recorded append: `(scope, request_id, stream, line)`.
+    type Recorded = (String, Option<String>, LogStream, String);
+
+    /// Records every appended line.
     #[derive(Default)]
-    struct RecordingSink(Mutex<Vec<(String, LogStream, String)>>);
+    struct RecordingSink(Mutex<Vec<Recorded>>);
 
     impl LogSink for RecordingSink {
         fn append(&self, scope: &str, stream: LogStream, line: &str) {
-            self.0
-                .lock()
-                .unwrap()
-                .push((scope.to_string(), stream, line.to_string()));
+            self.append_tagged(scope, None, stream, line);
+        }
+        fn append_tagged(
+            &self,
+            scope: &str,
+            request_id: Option<&str>,
+            stream: LogStream,
+            line: &str,
+        ) {
+            self.0.lock().unwrap().push((
+                scope.to_string(),
+                request_id.map(str::to_string),
+                stream,
+                line.to_string(),
+            ));
         }
     }
 
-    fn binding(sink: Arc<dyn LogSink>) -> LoggingBinding {
+    fn binding(sink: Arc<dyn LogSink>, request_id: Option<&str>) -> LoggingBinding {
         LoggingBinding {
             sink,
             scope: "blog".to_string(),
+            request_id: request_id.map(str::to_string),
         }
     }
 
     #[test]
-    fn a_granted_log_is_captured_with_its_level_and_stream() {
+    fn a_granted_log_is_captured_with_its_level_stream_and_request_id() {
         let sink = Arc::new(RecordingSink::default());
-        let b = binding(sink.clone());
+        let b = binding(sink.clone(), Some("r-7"));
         let mut host = WasiLoggingHost::new(Some(&b));
         host.log(Level::Info, "auth".into(), "signed in".into());
         host.log(Level::Error, String::new(), "boom".into());
         let calls = sink.0.lock().unwrap();
-        // info → stdout, context folded into the line as a prefix.
+        // info → stdout, context folded into the line as a prefix, tagged with the request id.
         assert_eq!(calls[0].0, "blog");
-        assert_eq!(calls[0].1, LogStream::Stdout);
-        assert_eq!(calls[0].2, "[info] auth: signed in");
+        assert_eq!(calls[0].1.as_deref(), Some("r-7"));
+        assert_eq!(calls[0].2, LogStream::Stdout);
+        assert_eq!(calls[0].3, "[info] auth: signed in");
         // error → stderr; empty context omits the tag.
-        assert_eq!(calls[1].1, LogStream::Stderr);
-        assert_eq!(calls[1].2, "[error] boom");
+        assert_eq!(calls[1].2, LogStream::Stderr);
+        assert_eq!(calls[1].3, "[error] boom");
     }
 
     #[test]

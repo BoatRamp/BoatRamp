@@ -342,6 +342,8 @@ pub(super) async fn run_scheduler_tick(
                             // Consumers do not get the invoke capability (no allowlist field).
                             &[],
                             0,
+                            // Background consumers have no request context to correlate with.
+                            None,
                         )
                         .await;
                         acked += dispatch_consumer_batch(
@@ -491,6 +493,8 @@ async fn fire_cron(
         // invoke allowlist applies the same as on the HTTP path.
         &handler.invoke_targets,
         0,
+        // A cron trigger has no inbound request to correlate with.
+        None,
     )
     .await;
     let limits = effective_limits(site_handlers, handler);

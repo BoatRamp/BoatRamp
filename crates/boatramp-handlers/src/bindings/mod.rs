@@ -113,16 +113,19 @@ impl Bindings {
         self.blobstore.as_ref()
     }
 
-    /// Capture this invocation's stdout/stderr into `sink`, tagged with `scope`.
-    /// Without this the guest's stdio is inherited.
+    /// Capture this invocation's stdout/stderr (and `wasi:logging`) into `sink`, tagged with
+    /// `scope` and correlated with `request_id` (the request that produced the output, when the
+    /// dispatch layer assigned one). Without this the guest's stdio is discarded.
     pub fn with_logging(
         mut self,
         scope: impl Into<String>,
+        request_id: Option<String>,
         sink: Arc<dyn crate::logging::LogSink>,
     ) -> Self {
         self.logging = Some(crate::logging::LoggingBinding {
             sink,
             scope: scope.into(),
+            request_id,
         });
         self
     }

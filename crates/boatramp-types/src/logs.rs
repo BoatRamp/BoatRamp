@@ -16,6 +16,12 @@ pub struct LogEntry {
     pub stream: String,
     /// The line text (newline stripped).
     pub line: String,
+    /// The id of the request that produced this line, when the platform assigned one
+    /// (the same id the `boatramp::access` line carries), so a captured line is
+    /// correlatable with its request. Absent for lines with no request context (e.g. a
+    /// background consumer). Omitted from the wire when absent — backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// The logs endpoint response: recent captured lines + the rate-cap drop count.
@@ -40,7 +46,9 @@ mod tests {
             ts_ms: 1_700_000_000_000,
             stream: "stdout".into(),
             line: "hello".into(),
+            request_id: None,
         };
+        // `request_id: None` is omitted, so the wire shape is unchanged.
         assert_eq!(
             serde_json::to_value(&entry).unwrap(),
             serde_json::json!({
@@ -49,6 +57,15 @@ mod tests {
                 "stream": "stdout",
                 "line": "hello",
             })
+        );
+        // A present request id is emitted for correlation with the access line.
+        let tagged = LogEntry {
+            request_id: Some("r-42".into()),
+            ..entry.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&tagged).unwrap()["request_id"],
+            serde_json::json!("r-42")
         );
         let resp = LogsResponse {
             entries: vec![entry.clone()],

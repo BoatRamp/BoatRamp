@@ -37,14 +37,26 @@ pub trait LogSink: Send + Sync {
     /// Append one captured line (newline already stripped) emitted by `scope`'s
     /// guest on `stream`.
     fn append(&self, scope: &str, stream: LogStream, line: &str);
+
+    /// Append one captured line correlated with the request `request_id` (when the dispatch
+    /// layer assigned one — the same id the `boatramp::access` line carries). Defaults to the
+    /// untagged [`append`](Self::append); a sink that surfaces the id (the server's log store)
+    /// overrides this.
+    fn append_tagged(&self, scope: &str, request_id: Option<&str>, stream: LogStream, line: &str) {
+        let _ = request_id;
+        self.append(scope, stream, line);
+    }
 }
 
 /// The logging capability handed to an invocation: where its captured output
-/// goes, and under what scope it is tagged.
+/// goes, under what scope it is tagged, and the request it belongs to.
 #[derive(Clone)]
 pub struct LoggingBinding {
     pub(crate) sink: Arc<dyn LogSink>,
     pub(crate) scope: String,
+    /// The request id captured lines are tagged with (for access-log correlation), when the
+    /// dispatch layer assigned one. `None` for invocations with no request context.
+    pub(crate) request_id: Option<String>,
 }
 
 /// Longest newline-free run buffered before it is force-flushed as one line, so
@@ -56,6 +68,7 @@ const MAX_LINE: usize = 16 * 1024;
 pub(crate) struct SinkStdout {
     sink: Arc<dyn LogSink>,
     scope: String,
+    request_id: Option<String>,
     stream: LogStream,
 }
 
@@ -64,6 +77,7 @@ impl SinkStdout {
         Self {
             sink: binding.sink.clone(),
             scope: binding.scope.clone(),
+            request_id: binding.request_id.clone(),
             stream,
         }
     }
@@ -74,6 +88,7 @@ impl StdoutStream for SinkStdout {
         Box::new(SinkWriter {
             sink: self.sink.clone(),
             scope: self.scope.clone(),
+            request_id: self.request_id.clone(),
             stream: self.stream,
             buf: Vec::new(),
         })
@@ -88,6 +103,7 @@ impl StdoutStream for SinkStdout {
 struct SinkWriter {
     sink: Arc<dyn LogSink>,
     scope: String,
+    request_id: Option<String>,
     stream: LogStream,
     buf: Vec<u8>,
 }
@@ -99,12 +115,17 @@ impl SinkWriter {
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
             let text = String::from_utf8_lossy(&line[..line.len() - 1]);
-            self.sink
-                .append(&self.scope, self.stream, text.trim_end_matches('\r'));
+            self.sink.append_tagged(
+                &self.scope,
+                self.request_id.as_deref(),
+                self.stream,
+                text.trim_end_matches('\r'),
+            );
         }
         if self.buf.len() > MAX_LINE {
             let text = String::from_utf8_lossy(&self.buf);
-            self.sink.append(&self.scope, self.stream, &text);
+            self.sink
+                .append_tagged(&self.scope, self.request_id.as_deref(), self.stream, &text);
             self.buf.clear();
         }
     }
@@ -139,8 +160,12 @@ impl Drop for SinkWriter {
         // the end of the invocation.
         if !self.buf.is_empty() {
             let text = String::from_utf8_lossy(&self.buf);
-            self.sink
-                .append(&self.scope, self.stream, text.trim_end_matches('\r'));
+            self.sink.append_tagged(
+                &self.scope,
+                self.request_id.as_deref(),
+                self.stream,
+                text.trim_end_matches('\r'),
+            );
         }
     }
 }

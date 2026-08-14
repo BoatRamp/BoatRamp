@@ -440,7 +440,9 @@ async fn build_function_bindings(
         }
     }
     inner.logs.configure(scope, None);
-    bindings = bindings.with_logging(scope.to_string(), inner.logs.clone());
+    // A function invocation (API or in-process subgraph fetch) does not thread a request id
+    // through the invoke path yet; its logs are scope-tagged but not request-correlated.
+    bindings = bindings.with_logging(scope.to_string(), None, inner.logs.clone());
     let env: Vec<(String, String)> = config
         .env
         .iter()
