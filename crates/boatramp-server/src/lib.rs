@@ -76,6 +76,8 @@ pub mod envelope;
 #[cfg(feature = "handlers")]
 mod graphql_apq;
 #[cfg(feature = "handlers")]
+mod graphql_cache;
+#[cfg(feature = "handlers")]
 mod graphql_data;
 #[cfg(feature = "handlers")]
 mod graphql_federation;
@@ -241,6 +243,11 @@ struct HandlerRuntimeInner {
     metrics: metrics::Metrics,
     /// Captured guest stdout/stderr: per-site ring + rate cap.
     logs: Arc<logs::LogStore>,
+    /// Per-project memoized composed supergraph + query plans (the federation hot path),
+    /// keyed on the registry composition version. Shared by the edge and in-process
+    /// `graphql::run` paths; a registry mutation bumps the version and invalidates it.
+    #[cfg(feature = "handlers")]
+    graphql_cache: graphql_cache::GraphqlCache,
     /// Optional **cron leader gate**: in cluster mode the
     /// scheduler fires crons only when this returns `true` (the node is the Raft
     /// leader), so a cron fires exactly once cluster-wide. `None` (single-node)
@@ -324,6 +331,8 @@ impl HandlerRuntime {
                 stream_ip_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 metrics: metrics::Metrics::default(),
                 logs: Arc::new(logs::LogStore::default()),
+                #[cfg(feature = "handlers")]
+                graphql_cache: graphql_cache::GraphqlCache::default(),
                 cron_leader_gate: std::sync::OnceLock::new(),
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),

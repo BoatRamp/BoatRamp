@@ -409,19 +409,26 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             return Err(SupergraphRunError::PlanFailed(reason));
         }
 
-        // Compose + plan against the project's registered subgraphs (the unified graph).
-        let supergraph = crate::graphql_registry::supergraph(kv, project)
+        // Compose + plan against the project's registered subgraphs — memoized per project by
+        // composition version (and, for the plan, the operation hash `hash`), so an agent turn's
+        // N runs don't each re-list, re-parse every SDL, and re-plan a graph that only changes on
+        // deploy. Invalidation is the version check inside the cache.
+        let cached = inner
+            .graphql_cache
+            .supergraph(kv, project)
             .await
             .map_err(|e| {
                 SupergraphRunError::Failed(format!("supergraph composition failed: {e}"))
             })?;
-        let plan = crate::graphql_plan::plan(&query, &supergraph)
+        let plan = inner
+            .graphql_cache
+            .plan(project, cached.version, &hash, &query, &cached.supergraph)
             .map_err(|_| SupergraphRunError::PlanFailed("the query cannot be planned".into()))?;
 
         let Some(invoker) = inner.invoker.get() else {
             return Err(SupergraphRunError::Failed("no invoker configured".into()));
         };
-        let sql_subgraphs = crate::graphql_registry::sql_subgraphs(kv, project).await;
+        let sql_subgraphs = (*cached.sql_subgraphs).clone();
         // Forward the guest's own bearer (re-verified per subgraph — no escalation), and dispatch
         // sub-fetches at this run's depth so the shared cap counts them.
         let bearer = request

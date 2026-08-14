@@ -396,8 +396,15 @@ async fn federation_gateway(
     variables: &serde_json::Value,
     bearer: Option<&str>,
 ) -> Response {
-    let supergraph = match crate::graphql_registry::supergraph(inner.kv.as_ref(), project).await {
-        Ok(sg) => sg,
+    // Compose + plan, memoized per project by composition version (and the operation hash for
+    // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
+    // path re-lists/re-parses/re-plans a graph that only changes on deploy.
+    let cached = match inner
+        .graphql_cache
+        .supergraph(inner.kv.as_ref(), project)
+        .await
+    {
+        Ok(c) => c,
         Err(err) => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -406,14 +413,19 @@ async fn federation_gateway(
                 .into_response()
         }
     };
-    let plan = match crate::graphql_plan::plan(query, &supergraph) {
-        Ok(plan) => plan,
-        Err(_) => {
-            return graphql_guard::error_response(
-                "the query cannot be planned against the supergraph",
-            )
-        }
-    };
+    let op_hash = crate::graphql_apq::sha256_hex(query);
+    let plan =
+        match inner
+            .graphql_cache
+            .plan(project, cached.version, &op_hash, query, &cached.supergraph)
+        {
+            Ok(plan) => plan,
+            Err(_) => {
+                return graphql_guard::error_response(
+                    "the query cannot be planned against the supergraph",
+                )
+            }
+        };
     let Some(invoker) = inner.invoker.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -424,7 +436,7 @@ async fn federation_gateway(
     // Route each fetch to its subgraph's backend: a SQL-backed subgraph resolves via the
     // data connector, a function subgraph via the invoke path. This is where a GraphQL→SQL
     // subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
-    let sql_subgraphs = crate::graphql_registry::sql_subgraphs(inner.kv.as_ref(), project).await;
+    let sql_subgraphs = (*cached.sql_subgraphs).clone();
     let runner = crate::graphql_gateway::BackendRouter::new(
         invoker.scoped(boatramp_core::project::ProjectRef::new(project)),
         project.to_string(),

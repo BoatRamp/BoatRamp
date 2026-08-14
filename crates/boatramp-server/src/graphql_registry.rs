@@ -15,6 +15,39 @@ fn subgraph_prefix(project: &str) -> String {
     format!("graphql/{project}/subgraph/")
 }
 
+/// The key holding a project's **composition version** — a monotonic counter bumped on every
+/// registry mutation (subgraph publish/unpublish, backend-kind change). The composed supergraph
+/// and query plans are memoized against it (see `graphql_cache`); a bump invalidates the cache.
+/// A discrete key (a cheap `get`, cacheable + rideable by the shared-store change poller), not a
+/// `list_prefix`, so the per-request version check is cheap and topology-correct.
+fn version_key(project: &str) -> String {
+    format!("graphql/{project}/version")
+}
+
+/// The current composition version for `project` (`0` if never written). Cheap enough to read
+/// once per request to key the supergraph/plan caches.
+pub(crate) async fn composition_version(kv: &dyn KvStore, project: &str) -> u64 {
+    match kv.get(&version_key(project)).await {
+        Ok(Some(bytes)) if bytes.len() == 8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes);
+            u64::from_be_bytes(arr)
+        }
+        _ => 0,
+    }
+}
+
+/// Bump the composition version, invalidating any `(project, version)`-keyed cache entry. Called
+/// after every registry mutation. (A read-modify-write; concurrent same-project registry writes —
+/// rare, serialized operator/deploy actions — could lose a bump, briefly serving a stale cache
+/// until the next mutation. Acceptable for the write cadence; the read path always version-checks.)
+async fn bump_version(kv: &dyn KvStore, project: &str) -> Result<(), String> {
+    let next = composition_version(kv, project).await.wrapping_add(1);
+    kv.put(&version_key(project), next.to_be_bytes().to_vec())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn subgraph_key(project: &str, name: &str) -> String {
     format!("{}{name}", subgraph_prefix(project))
 }
@@ -51,7 +84,9 @@ pub(crate) async fn put_subgraph_backend(
     let bytes = serde_json::to_vec(spec).map_err(|e| e.to_string())?;
     kv.put(&backend_key(project, name), bytes)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // A backend-kind change alters routing (function ↔ SQL), so it must invalidate the cache.
+    bump_version(kv, project).await
 }
 
 fn backend_key(project: &str, name: &str) -> String {
@@ -118,6 +153,9 @@ pub(crate) async fn publish(
     kv.put(&subgraph_key(project, name), sdl.as_bytes().to_vec())
         .await
         .map_err(|e| PublishError::Store(e.to_string()))?;
+    bump_version(kv, project)
+        .await
+        .map_err(PublishError::Store)?;
     Ok(sg)
 }
 
@@ -146,7 +184,8 @@ pub(crate) async fn unpublish(kv: &dyn KvStore, project: &str, name: &str) -> Re
         .map_err(|e| e.to_string())?;
     kv.delete(&backend_key(project, name))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    bump_version(kv, project).await
 }
 
 /// The names of the currently-registered subgraphs for `project`.
@@ -266,6 +305,27 @@ extend schema @link(
         assert!(matches!(err, Err(PublishError::Composition(_))));
         // The rejected subgraph was not persisted.
         assert_eq!(subgraph_names(&kv, "acme").await, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn every_registry_mutation_bumps_the_composition_version() {
+        let kv = MemoryKv::new();
+        assert_eq!(composition_version(&kv, "acme").await, 0);
+        // publish bumps...
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        let v1 = composition_version(&kv, "acme").await;
+        assert_eq!(v1, 1);
+        // a backend-kind change bumps (routing change)...
+        put_subgraph_backend(&kv, "acme", "accounts", &SubgraphBackendSpec::Function)
+            .await
+            .unwrap();
+        let v2 = composition_version(&kv, "acme").await;
+        assert!(v2 > v1, "backend change bumps the version");
+        // unpublish bumps.
+        unpublish(&kv, "acme", "accounts").await.unwrap();
+        assert!(composition_version(&kv, "acme").await > v2);
+        // A different project's version is independent.
+        assert_eq!(composition_version(&kv, "other").await, 0);
     }
 
     #[tokio::test]

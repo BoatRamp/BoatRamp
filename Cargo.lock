@@ -1856,6 +1856,7 @@ dependencies = [
  "hyper-util",
  "include_dir",
  "jsonwebtoken",
+ "lru 0.16.4",
  "p256",
  "quinn",
  "rand_core 0.6.4",
