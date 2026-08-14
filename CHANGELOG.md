@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.2.8] - 2026-08-14
 
 ### Added
 - **Per-site guest-log capture opt-out** (`handlers.disable_log_capture`). Capture stays on by
