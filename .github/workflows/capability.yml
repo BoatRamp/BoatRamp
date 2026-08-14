@@ -103,7 +103,10 @@ jobs:
   # image (a test-double, not a private artifact). No secrets.
   container:
     name: container launch + CRIU (root)
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 (noble) dropped the `criu` package (no install candidate); jammy
+    # still ships it. The container backend's namespaces/veth/CRIU are kernel
+    # features present on both.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -154,12 +157,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          dl=/usr/local/bin
+          set -eo pipefail
+          mkdir -p /tmp/pebble && cd /tmp/pebble
+          # Release assets are hyphenated `.tar.gz` archives (e.g. pebble-linux-amd64.tar.gz),
+          # each containing a single binary; extract and install under the names the test's
+          # PATH lookup expects.
           gh release download "$PEBBLE_VERSION" -R letsencrypt/pebble \
-            -p 'pebble_linux-amd64' -p 'pebble-challtestsrv_linux-amd64' -D /tmp/pebble --clobber
-          sudo install -m 0755 /tmp/pebble/pebble_linux-amd64 "$dl/pebble"
-          sudo install -m 0755 /tmp/pebble/pebble-challtestsrv_linux-amd64 "$dl/pebble-challtestsrv"
-          pebble -version || true
+            -p 'pebble-linux-amd64.tar.gz' -p 'pebble-challtestsrv-linux-amd64.tar.gz' --clobber
+          tar xzf pebble-linux-amd64.tar.gz
+          tar xzf pebble-challtestsrv-linux-amd64.tar.gz
+          peb="$(find . -type f -perm -u+x -name '*pebble*' ! -name '*challtestsrv*' ! -name '*.tar.gz' | head -1)"
+          cts="$(find . -type f -perm -u+x -name '*challtestsrv*' ! -name '*.tar.gz' | head -1)"
+          echo "pebble=$peb challtestsrv=$cts"
+          sudo install -m 0755 "$peb" /usr/local/bin/pebble
+          sudo install -m 0755 "$cts" /usr/local/bin/pebble-challtestsrv
           command -v pebble pebble-challtestsrv
 
       - name: Issue a wildcard cert via DNS-01 against the local Pebble CA
