@@ -184,10 +184,11 @@ jobs:
           diff -u charts/boatramp-operator/crds/boatramp-crds.yaml /tmp/crds.yaml
 
       # The operator unit tests (CRD drift guard + the least-privilege ClusterRole pin)
-      # otherwise run nightly-only. Gate them here — a privilege broadening or a
-      # chart↔types drift must fail a push, not a nightly. Reuses the build above.
+      # otherwise run nightly-only. Gate them here - a privilege broadening or a
+      # chart-vs-types drift must fail a push, not a nightly. Reuses the build above.
       - name: operator unit tests
-        run: cargo test -p boatramp --no-default-features --features operator operator::
+        run: |
+          cargo test -p boatramp --no-default-features --features operator operator::
 
       - name: Lint + render the chart
         run: |
