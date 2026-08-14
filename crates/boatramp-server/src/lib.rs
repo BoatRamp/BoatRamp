@@ -2925,4 +2925,75 @@ mod tests {
         assert!(handles.is_empty(), "a non-leader must not fire crons");
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), None);
     }
+
+    /// Named SQL binding dispatch through the real `build_bindings` + a real (libsql) provider:
+    /// the granted databases in the resulting `Bindings` are exactly what the per-handler grant
+    /// grammar allows, with the site as the ceiling. This is the config→dispatch→backends half of
+    /// the tenant-isolation story (the guest-open half is the binding layer's
+    /// `two_named_databases_are_independent`; a full guest `open("named")` e2e needs a wasm
+    /// fixture and is a live-validation follow-up).
+    #[tokio::test]
+    async fn build_bindings_dispatches_named_sql_databases_with_least_privilege() {
+        use boatramp_core::config::HandlersSiteConfig;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_handlers::{HandlerEngine, Limits};
+
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let storage: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        // A real per-site libsql provider (opens a distinct database per name).
+        let sql_dir =
+            std::env::temp_dir().join(format!("boatramp-named-sql-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let sql: Arc<dyn boatramp_core::sql::SqlBackends> =
+            Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+        let inner = rt.inner.as_ref().unwrap();
+
+        // The site exposes the default + two named databases — the ceiling.
+        let site = HandlersSiteConfig {
+            enabled: true,
+            allow_imports: vec!["sql".into(), "sql:product".into(), "sql:privileged".into()],
+            ..Default::default()
+        };
+        let env = std::collections::BTreeMap::new();
+        let build = |imports: &[&str]| {
+            let imports: Vec<String> = imports.iter().copied().map(String::from).collect();
+            let site = &site;
+            let env = &env;
+            async move {
+                crate::handler_dispatch::build_bindings(
+                    inner,
+                    ProjectRef::new("default"),
+                    "shop",
+                    "shop",
+                    None,
+                    &imports,
+                    site,
+                    env,
+                    &[],
+                    0,
+                    None,
+                )
+                .await
+                .sql_database_names()
+            }
+        };
+
+        // Least-privilege: a handler asking only for the default + product gets exactly those —
+        // never `privileged`, even though the site exposes it.
+        assert_eq!(build(&["sql", "sql:product"]).await, vec!["", "product"]);
+        // A wildcard handler gets every name the site exposes (default via bare `sql` + all named).
+        assert_eq!(
+            build(&["sql", "sql:*"]).await,
+            vec!["", "privileged", "product"]
+        );
+        // Fail-closed: requesting a name the site does not expose grants nothing.
+        assert!(build(&["sql:secret"]).await.is_empty());
+        // No bare `sql` → the default `""` database is not granted either.
+        assert_eq!(build(&["sql:product"]).await, vec!["product"]);
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+    }
 }

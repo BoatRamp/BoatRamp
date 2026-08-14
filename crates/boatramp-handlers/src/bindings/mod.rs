@@ -154,6 +154,15 @@ impl Bindings {
         self.sql.clone()
     }
 
+    /// The names of the granted SQL databases (sorted). Lets a caller assert *which* databases a
+    /// guest can open — the observable result of the named-binding dispatch + authz.
+    #[cfg(feature = "sql")]
+    pub fn sql_database_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.sql.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Grant the `wasi:messaging` producer capability, backed by `messaging`,
     /// with every published topic namespaced under `prefix` (per-site/alias
     /// isolation — the guest can't publish outside its own namespace).
