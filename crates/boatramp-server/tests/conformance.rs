@@ -2374,6 +2374,55 @@ async fn workflow_failing_step_triggers_compensation() {
     assert_eq!(run["steps"]["a"]["status"], "compensated");
 }
 
+/// Saga rollback across **multiple** succeeded steps: `s1 → s2 → boom` where `s1` and `s2`
+/// both succeed and `boom` fails. The run must fail, `boom` must be `failed`, and **both**
+/// earlier steps must be `compensated`. The run's `completed_order` (which the executor rolls
+/// back in reverse) must be exactly `[s1, s2]` — so compensation runs `s2` then `s1`, the
+/// saga's reverse-completion-order contract. (The single-step compensation test above can't
+/// observe ordering; this exercises the multi-step reverse rollback.)
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_compensates_multiple_steps_in_reverse_completion_order() {
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "ok", HTTP_200, Vec::new()).await;
+    deploy_test_function(&deploy, "comp", HTTP_200, Vec::new()).await;
+    // A non-Wasm blob → the step function compile-fails → a step failure.
+    deploy_test_function(&deploy, "bad", b"not a wasm component", Vec::new()).await;
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let steps = serde_json::json!([
+        { "id": "s1", "function": "ok", "compensate": "comp" },
+        { "id": "s2", "function": "ok", "compensate": "comp", "depends_on": ["s1"] },
+        { "id": "boom", "function": "bad", "depends_on": ["s2"] },
+    ]);
+    assert_eq!(define_workflow(&app, "saga2", steps).await, StatusCode::OK);
+    let id = start_run(&app, "saga2").await;
+
+    let run = poll_run(&app, "saga2", &id).await;
+    assert_eq!(run["status"], "failed");
+    assert_eq!(run["steps"]["boom"]["status"], "failed");
+    // Both succeeded steps rolled back.
+    assert_eq!(run["steps"]["s1"]["status"], "compensated");
+    assert_eq!(run["steps"]["s2"]["status"], "compensated");
+    // The completion order — the executor compensates its reverse (s2 then s1).
+    assert_eq!(
+        run["completed_order"],
+        serde_json::json!(["s1", "s2"]),
+        "completion order drives reverse-order compensation; got {}",
+        run["completed_order"]
+    );
+}
+
 /// The define endpoint validates the DAG: a cycle is a `400`.
 #[cfg(feature = "handlers")]
 #[tokio::test]
