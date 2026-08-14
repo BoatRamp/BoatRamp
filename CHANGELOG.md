@@ -5,6 +5,17 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.7]
+
+### Changed
+- **GraphQL parsing moved to `async-graphql-parser`; the unmaintained `graphql-parser` 0.4 is
+  gone.** Every GraphQL parse site — the edge query-guard, subscription detection, federation
+  composition + query planning, and the GraphQL→SQL data connector — now uses the same parser
+  async-graphql itself uses, so boatramp parses exactly what a real subgraph emits. This
+  natively accepts the federation-v2 `extend schema @link(...)` SDL that the old parser
+  rejected, so the schema-preamble workaround shipped in 0.2.5 is removed. Behavior-preserving
+  (a `handlers`-feature internal change); no configuration or API change.
+
 ## [0.2.6]
 
 ### Fixed
