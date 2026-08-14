@@ -1,0 +1,171 @@
+name: Capability e2e (privileged live seams)
+
+# The capability runner for the #[ignore]d live-seam tests that need real host
+# capabilities (KVM, root+namespaces+criu) or local test-doubles (a throwaway ACME
+# CA) — the tests that otherwise run nowhere automated. Runs on GitHub's EPHEMERAL
+# hosted runners: a fresh, single-use VM per job, destroyed afterward, with NO SSH
+# key / VPN / LAN route to any private infrastructure and NO stored secrets. The
+# isolation is the throwaway runner itself; every test here uses a capability
+# (/dev/kvm, root) or a local test-double (busybox rootfs, Pebble CA), never a real
+# cloud account or private host. This is why it is safe to run privileged test code
+# on hosted infra rather than a self-hosted box that sits on your network.
+#
+# Nightly + on-demand. Public repo ⇒ these hosted runners are free.
+
+on:
+  schedule:
+    - cron: "0 5 * * *" # 05:00 UTC daily (after the main nightly at 04:00)
+  workflow_dispatch:
+    inputs:
+      vmlinux_tag:
+        description: "boatramp-vmlinux release tag to boot"
+        required: false
+        default: "v0.2.3"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The built-in BOATRAMP_KERNEL_SIGNING_PUBKEY: the released kernel must verify
+  # against this exact key (the production verify-before-boot bar) or the gate fails.
+  BOATRAMP_RELEASE_PUBKEY: "es256:02c4e4af2e9cba6ba6745c513f193622e6674a8b2d0187ebea5612f5b46a7eade4"
+
+jobs:
+  # Tier A — the microVM (KVM) compute backend: fetch the PUBLISHED signed kernel,
+  # verify hash+signature, boot it on /dev/kvm, then build a busybox rootfs and serve
+  # a workload end to end. Needs only the ephemeral runner's /dev/kvm — no secrets.
+  microvm:
+    name: microVM boot + serve (KVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Confirm KVM is available on the hosted runner
+        run: |
+          test -e /dev/kvm && ls -l /dev/kvm
+          sudo chmod 666 /dev/kvm || true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-microvm
+
+      - name: Host build deps (mke2fs for the scratch rootfs)
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Download the released kernel + .sha256 + .sig
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.vmlinux_tag || 'v0.2.3' }}"
+          gh release download "$tag" -R BoatRamp/boatramp-vmlinux \
+            -p 'boatramp-vmlinux-x86_64' \
+            -p 'boatramp-vmlinux-x86_64.sha256' \
+            -p 'boatramp-vmlinux-x86_64.sig' \
+            -D rel --clobber
+          ls -l rel/
+
+      - name: Verify content hash + ES256 signature (verify-before-boot bar)
+        run: |
+          cd rel
+          printf '%s  boatramp-vmlinux-x86_64\n' "$(cat boatramp-vmlinux-x86_64.sha256)" | sha256sum -c -
+          cd ..
+          export BOATRAMP_RELEASE_KERNEL="$(realpath rel/boatramp-vmlinux-x86_64)"
+          export BOATRAMP_RELEASE_SHA256="$(cat rel/boatramp-vmlinux-x86_64.sha256)"
+          export BOATRAMP_RELEASE_SIG="$(cat rel/boatramp-vmlinux-x86_64.sig)"
+          cargo test -p boatramp-core --features authz \
+            kernel_trust::tests::released_kernel_verifies_under_strict -- --ignored --nocapture
+
+      - name: Boot the kernel to serial console (hard gate)
+        run: |
+          set -o pipefail
+          KERNEL="$(realpath rel/boatramp-vmlinux-x86_64)"
+          timeout -k 30 360 sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$KERNEL" \
+            cargo test -p boatramp-firecracker --lib --features build,backend,embedded \
+            boots_a_real_kernel_to_serial -- --ignored --nocapture 2>&1 | tee serial.log
+          grep -qE 'running [1-9][0-9]* tests?' serial.log \
+            || { echo "::error::serial boot ran 0 tests (embedded backend cfg'd out)" >&2; exit 1; }
+
+      - name: Build a busybox rootfs + serve a workload end to end (hard gate)
+        run: |
+          set -o pipefail
+          KERNEL="$(realpath rel/boatramp-vmlinux-x86_64)"
+          timeout -k 30 720 sudo -E env "PATH=$PATH" "BOATRAMP_TEST_KERNEL=$KERNEL" \
+            cargo test -p boatramp-firecracker --features build,backend,embedded \
+            --test embedded_backend_live serves_an_oci_workload_end_to_end \
+            -- --ignored --nocapture 2>&1 | tee serve.log
+          grep -qE 'running [1-9][0-9]* tests?' serve.log \
+            || { echo "::error::serve path ran 0 tests" >&2; exit 1; }
+
+  # Tier B — the native container backend: root + user namespaces + a veth bridge +
+  # CRIU checkpoint/restore. Uses a busybox rootfs exported from the public busybox
+  # image (a test-double, not a private artifact). No secrets.
+  container:
+    name: container launch + CRIU (root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-container
+
+      - name: Host deps (criu) + a busybox rootfs tarball
+        run: |
+          sudo apt-get update && sudo apt-get install -y criu
+          # A minimal rootfs from the public busybox image — a test-double, built on
+          # the runner, never a private artifact.
+          cid="$(docker create busybox:latest)"
+          docker export "$cid" | gzip > /tmp/bb-rootfs.tar.gz
+          docker rm "$cid"
+          ls -l /tmp/bb-rootfs.tar.gz
+
+      - name: Build the boatramp binary (BOATRAMP_BIN)
+        run: cargo build -p boatramp --no-default-features --features fs
+
+      - name: Launch + hold a container, then CRIU checkpoint/restore
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          timeout -k 30 480 sudo -E env "PATH=$PATH" \
+            "BOATRAMP_BIN=$BIN" "BOATRAMP_CONTAINER_ROOTFS=/tmp/bb-rootfs.tar.gz" \
+            cargo test -p boatramp-container --test container_live \
+            -- --ignored --nocapture 2>&1 | tee container.log
+          grep -qE 'running [1-9][0-9]* tests?' container.log \
+            || { echo "::error::container live ran 0 tests" >&2; exit 1; }
+
+  # Tier F — ACME DNS-01 issuance against a throwaway local Pebble CA (a test-double).
+  # No real ACME account, no real DNS, no secrets — Pebble + challtestsrv bind local
+  # ports on the ephemeral runner and are gone with it.
+  acme:
+    name: ACME DNS-01 (Pebble CA)
+    runs-on: ubuntu-latest
+    env:
+      PEBBLE_VERSION: "v2.6.0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-acme
+
+      - name: Install Pebble + challtestsrv binaries onto PATH
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dl=/usr/local/bin
+          gh release download "$PEBBLE_VERSION" -R letsencrypt/pebble \
+            -p 'pebble_linux-amd64' -p 'pebble-challtestsrv_linux-amd64' -D /tmp/pebble --clobber
+          sudo install -m 0755 /tmp/pebble/pebble_linux-amd64 "$dl/pebble"
+          sudo install -m 0755 /tmp/pebble/pebble-challtestsrv_linux-amd64 "$dl/pebble-challtestsrv"
+          pebble -version || true
+          command -v pebble pebble-challtestsrv
+
+      - name: Issue a wildcard cert via DNS-01 against the local Pebble CA
+        run: |
+          set -o pipefail
+          cargo test -p boatramp-acme --features acme --test pebble_dns01 \
+            -- --ignored --nocapture 2>&1 | tee acme.log
+          grep -qE 'running [1-9][0-9]* tests?' acme.log \
+            || { echo "::error::pebble ACME ran 0 tests" >&2; exit 1; }
