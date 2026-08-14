@@ -8,6 +8,14 @@ versions.
 ## [Unreleased]
 
 ### Fixed
+- **`boatramp operator crds` / `operator manifests` emitted invalid CRD YAML for numeric
+  defaults.** A transitive dependency enables serde_json's `arbitrary_precision` feature, under
+  which a `serde_json::Value::Number` (a CRD schema `default`, e.g. `BoatRampCluster.replicas`'s
+  `3`) serialized through serde_yaml as an internal `$serde_json::private::Number` newtype instead
+  of a plain scalar — so a generated CRD carried `default: {$serde_json::private::Number: '3'}`,
+  which Kubernetes rejects. The emitter now round-trips object → JSON → YAML (JSON is a YAML
+  subset), recovering clean scalars. A new test also guards the Helm chart's checked-in CRDs
+  (`charts/boatramp-operator/crds/`) against drift from the Rust CRD types.
 - **Cookie session auth no longer CSRF-rejects a site's own same-origin browser requests.** The
   origin check now treats a request whose `Origin`/`Referer` authority equals its own `Host` as
   same-origin and always allows it (definitionally CSRF-safe — a cross-site attacker's browser

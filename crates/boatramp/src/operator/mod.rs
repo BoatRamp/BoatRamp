@@ -30,6 +30,9 @@ pub enum Error {
     /// Serializing a manifest to YAML failed.
     #[error("manifest: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    /// Serializing a manifest through JSON (the CRD emit round-trip) failed.
+    #[error("manifest json: {0}")]
+    Json(#[from] serde_json::Error),
     /// An HTTP call to the cluster control-plane API (membership executor) failed.
     #[error("cluster api: {0}")]
     Http(#[from] reqwest::Error),

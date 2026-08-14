@@ -33,28 +33,57 @@ pub struct ManifestArgs {
     replicas: i32,
 }
 
+/// The three CRDs as a YAML document stream, from the Rust definitions — the exact
+/// bytes `operator crds` prints. Pure (no I/O) so it can be diffed in a test against
+/// the checked-in chart copy (`charts/boatramp-operator/crds/…`), the drift guard.
+pub(crate) fn crds_yaml() -> Result<String> {
+    let mut out = String::new();
+    for crd in [BoatRampCluster::crd(), Site::crd(), Function::crd()] {
+        emit_to(&mut out, &crd)?;
+    }
+    Ok(out)
+}
+
+/// The full install bundle as a YAML document stream: CRDs + RBAC + operator
+/// Deployment. Pure counterpart of [`print_manifests`], for snapshot tests.
+pub(crate) fn manifests_yaml(args: &ManifestArgs) -> Result<String> {
+    let mut out = crds_yaml()?;
+    emit_to(&mut out, &service_account(&args.namespace))?;
+    emit_to(&mut out, &cluster_role())?;
+    emit_to(&mut out, &cluster_role_binding(&args.namespace))?;
+    emit_to(
+        &mut out,
+        &deployment(&args.namespace, &args.image, args.replicas),
+    )?;
+    Ok(out)
+}
+
 /// Print the three CRDs as YAML, from the Rust definitions.
 pub fn print_crds() -> Result<()> {
-    for crd in [BoatRampCluster::crd(), Site::crd(), Function::crd()] {
-        emit(&crd)?;
-    }
+    print!("{}", crds_yaml()?);
     Ok(())
 }
 
 /// Print the full install bundle: CRDs + RBAC + operator Deployment.
 pub fn print_manifests(args: &ManifestArgs) -> Result<()> {
-    print_crds()?;
-    emit(&service_account(&args.namespace))?;
-    emit(&cluster_role())?;
-    emit(&cluster_role_binding(&args.namespace))?;
-    emit(&deployment(&args.namespace, &args.image, args.replicas))?;
+    print!("{}", manifests_yaml(args)?);
     Ok(())
 }
 
-/// Serialize one object to a YAML document (k8s-openapi emits `apiVersion`/`kind`).
-fn emit<T: serde::Serialize>(obj: &T) -> Result<()> {
-    println!("---");
-    print!("{}", serde_yaml::to_string(obj)?);
+/// Append one object as a YAML document (k8s-openapi emits `apiVersion`/`kind`).
+///
+/// Serializes via **JSON → YAML**, not straight to YAML. A transitive dependency
+/// turns on serde_json's `arbitrary_precision` feature; under it, a
+/// `serde_json::Value::Number` (a CRD schema's `default`, e.g. `replicas`'s `3`)
+/// serializes through any non-serde_json serializer as an internal
+/// `$serde_json::private::Number` newtype — which would emit **invalid CRD YAML**.
+/// JSON serialization stays inside serde_json (always correct), and YAML is a JSON
+/// superset, so re-parsing the JSON into a `serde_yaml::Value` recovers clean scalars.
+fn emit_to<T: serde::Serialize>(out: &mut String, obj: &T) -> Result<()> {
+    out.push_str("---\n");
+    let json = serde_json::to_string(obj)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&json)?;
+    out.push_str(&serde_yaml::to_string(&value)?);
     Ok(())
 }
 
@@ -237,5 +266,88 @@ mod tests {
         assert!(dep.contains("kind: Deployment") && dep.contains("img:test"));
         // The operator is the same binary running `operator run`.
         assert!(dep.contains("- operator") && dep.contains("- run"));
+    }
+
+    /// Least-privilege pin: the operator's `ClusterRole` rules verbatim. A silent
+    /// broadening — an added verb/resource/apiGroup, or a wildcard — is a
+    /// privilege-escalation regression, so pin the exact rule set (the `no '*'`
+    /// substring check alone wouldn't catch e.g. gaining `delete` on `pods`).
+    #[test]
+    fn cluster_role_rules_are_exactly_the_least_privilege_set() {
+        let s = |xs: &[&str]| {
+            xs.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let all = s(&[
+            "get", "list", "watch", "create", "update", "patch", "delete",
+        ]);
+        let got: Vec<(Vec<String>, Vec<String>, Vec<String>)> = cluster_role()
+            .rules
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.api_groups.clone().unwrap_or_default(),
+                    r.resources.clone().unwrap_or_default(),
+                    r.verbs.clone(),
+                )
+            })
+            .collect();
+        let expected = vec![
+            (
+                s(&["boatramp.dev"]),
+                s(&[
+                    "boatrampclusters",
+                    "boatrampclusters/status",
+                    "sites",
+                    "sites/status",
+                    "functions",
+                    "functions/status",
+                ]),
+                all.clone(),
+            ),
+            (
+                s(&["apps"]),
+                s(&["statefulsets", "deployments"]),
+                all.clone(),
+            ),
+            (
+                s(&[""]),
+                s(&[
+                    "services",
+                    "configmaps",
+                    "secrets",
+                    "persistentvolumeclaims",
+                ]),
+                all.clone(),
+            ),
+            (s(&["policy"]), s(&["poddisruptionbudgets"]), all.clone()),
+            (
+                s(&["autoscaling"]),
+                s(&["horizontalpodautoscalers"]),
+                all.clone(),
+            ),
+            (s(&[""]), s(&["pods"]), s(&["get", "list", "watch"])),
+            (s(&[""]), s(&["events"]), s(&["create", "patch"])),
+        ];
+        assert_eq!(got, expected, "operator ClusterRole privileges changed");
+    }
+
+    /// Drift guard (the load-bearing B10 test): the CRDs shipped in the Helm chart
+    /// (`charts/boatramp-operator/crds/boatramp-crds.yaml`) are a **static copy** that
+    /// must stay byte-identical to what the Rust CRD types emit. A change to any
+    /// `#[derive(CustomResource)]` type (a field, a default, a print column) silently
+    /// diverges the chart otherwise — this fails the moment they drift.
+    #[test]
+    fn chart_crds_are_in_sync_with_the_rust_types() {
+        let generated = crds_yaml().unwrap();
+        let checked_in =
+            include_str!("../../../../charts/boatramp-operator/crds/boatramp-crds.yaml");
+        assert_eq!(
+            generated, checked_in,
+            "charts/boatramp-operator/crds/boatramp-crds.yaml is stale — regenerate it with \
+             `cargo run -p boatramp -- operator crds > charts/boatramp-operator/crds/boatramp-crds.yaml`"
+        );
     }
 }
