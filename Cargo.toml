@@ -27,6 +27,7 @@ exclude = [
   "examples/handlers/http-200",
   "examples/handlers/kv-counter",
   "examples/handlers/sql-counter",
+  "examples/handlers/sql-named",
   "examples/handlers/event-consumer",
   "examples/handlers/invoke-caller",
   "examples/handlers/graphql-run-caller",

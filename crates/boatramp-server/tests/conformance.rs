@@ -3671,6 +3671,126 @@ async fn handler_route_with_sql_dispatches_through_engine() {
     let _ = std::fs::remove_dir_all(&sql_dir);
 }
 
+/// **Named SQL binding dispatch, from a real guest** (the A2 e2e). A handler granted the default
+/// (`sql`) + a named database (`sql:product`) — but NOT `sql:privileged`, which the *site* exposes
+/// — opens both, reads **distinct** data from each, and finds the un-granted name **denied**. This
+/// exercises the whole config→dispatch→provider→guest chain plus least-privilege fail-closed: the
+/// site is the ceiling, but a handler only receives the names it requested.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_opens_named_sql_databases_with_least_privilege() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const SQL_NAMED: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/sql-named.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let hash = sha256_hex(SQL_NAMED);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(SQL_NAMED)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "h.wasm".to_string(),
+        FileEntry {
+            hash,
+            size: SQL_NAMED.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/sql".to_string(),
+                methods: Vec::new(),
+                component: "h.wasm".to_string(),
+                // The handler requests the default + `product` — NOT `privileged`.
+                imports: vec!["sql".to_string(), "sql:product".to_string()],
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    // The site EXPOSES all three, but the handler only gets the two it requested.
+                    allow_imports: vec![
+                        "sql".into(),
+                        "sql:product".into(),
+                        "sql:privileged".into(),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sql_dir =
+        std::env::temp_dir().join(format!("boatramp-conf-named-sql-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sql_dir);
+    let sql: Arc<dyn boatramp_core::sql::SqlBackends> =
+        Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // Activate: the component imports the single `sql` interface; the named grant satisfies it.
+    let mut activate = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sites/blog/deployments/{id}/activate"))
+        .body(Body::empty())
+        .unwrap();
+    activate
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    assert_eq!(
+        app.clone().oneshot(activate).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/_sites/blog/sql")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    // Distinct data from the default + the named `product` database, and `privileged` denied.
+    assert_eq!(
+        &body[..],
+        b"default=from-default product=from-product privileged_denied=true\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&sql_dir);
+}
+
 /// A site's `maxTimeoutMs` cap is applied per invocation: a looping handler is
 /// killed at the site cap, not the engine's (much larger) default — verified by
 /// both the 504 and the fast turnaround.
