@@ -1158,6 +1158,56 @@ mod tests {
     }
 
     #[test]
+    fn site_config_round_trips_through_json_and_ron() {
+        // A fully-populated SiteConfig, exercising the newer handler sub-configs (cache,
+        // graphql, cookie_auth) that the API stores and returns. `SiteConfig` has
+        // `deny_unknown_fields`, so any serde drift — a field that serializes under one name
+        // but deserializes under another, or one that silently drops — makes the round-trip
+        // fail to parse or fail equality. This is the guard for the "config field doesn't
+        // round-trip" class (write a config, can't read it back).
+        let cfg = SiteConfig {
+            handlers: Some(HandlersSiteConfig {
+                enabled: true,
+                allow_imports: vec!["sql".into(), "graphql".into()],
+                cache: Some(HandlerCacheConfig {
+                    enabled: true,
+                    max_entry_bytes: Some(262_144),
+                    max_ttl_secs: Some(600),
+                }),
+                graphql: Some(HandlerGraphqlConfig {
+                    enabled: true,
+                    federated: true,
+                    max_depth: Some(12),
+                    safelist: true,
+                    ..Default::default()
+                }),
+                cookie_auth: Some(CookieAuthConfig {
+                    cookie_name: "__Host-session".into(),
+                    allowed_origins: vec!["https://app.example.com".into()],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // JSON is the API wire format (PUT/GET /api/sites/:site/config); `from_json` is the
+        // parser the server uses, so this exercises the exact path.
+        let json = serde_json::to_vec(&cfg).unwrap();
+        let from_json = SiteConfig::from_json(&json)
+            .unwrap_or_else(|e| panic!("SiteConfig JSON round-trip failed to parse: {e}"));
+        assert_eq!(
+            from_json, cfg,
+            "SiteConfig did not survive a JSON round-trip"
+        );
+
+        // And RON (via the derived Deserialize), the on-disk config format.
+        let ron = ron::ser::to_string(&cfg).unwrap();
+        let from_ron: SiteConfig = ron::from_str(&ron)
+            .unwrap_or_else(|e| panic!("SiteConfig RON round-trip failed to parse: {e}\n{ron}"));
+        assert_eq!(from_ron, cfg, "SiteConfig did not survive a RON round-trip");
+    }
+
+    #[test]
     fn handler_validation_rejects_bad_config() {
         // Unknown import.
         assert!(DeployConfig::from_ron(
