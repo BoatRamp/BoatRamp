@@ -778,6 +778,40 @@ fn is_same_origin(headers: &HeaderMap, origin: &str) -> bool {
 /// *not* handed the composite `scope`): for a preview the runtime applies the
 /// operator's configured [`PreviewSqlMode`](boatramp_core::sql::PreviewSqlMode)
 /// (empty / branch / shared) rather than blindly using the scoped name.
+/// The SQL databases a handler may open, resolving the named-binding grant grammar (the
+/// security-critical core of least-privilege tenant isolation, pure + unit-tested):
+///
+/// - `""` (the default database) — granted only when **both** the handler and the site grant the
+///   bare `sql` (backward-compatible).
+/// - a **named** database — the site's `allow_imports` enumerates the names it exposes
+///   (`sql:<name>`); the site is the ceiling. A handler is granted such a name when it requests it
+///   explicitly (`sql:<name>`) or via its own `sql:*` wildcard. A handler that asks only for
+///   `sql:product` therefore never receives a `privileged` backend, so a single missed
+///   WHERE-clause can't reach across tenants. A name the site doesn't expose is never granted,
+///   even if the handler requests it (fail-closed). A site-side `sql:*` is not a concrete name —
+///   the site must enumerate — so it grants nothing.
+#[cfg(feature = "handlers")]
+pub(super) fn granted_sql_databases(imports: &[String], allow_imports: &[String]) -> Vec<String> {
+    let has = |list: &[String], v: &str| list.iter().any(|i| i == v);
+    let mut names: Vec<String> = Vec::new();
+    if has(imports, "sql") && has(allow_imports, "sql") {
+        names.push(String::new()); // the default database
+    }
+    let handler_wildcard = has(imports, "sql:*");
+    for allowed in allow_imports {
+        let Some(name) = allowed.strip_prefix("sql:") else {
+            continue;
+        };
+        if name.is_empty() || name == "*" {
+            continue; // `""` is the default; a site must enumerate concrete names, not wildcard
+        }
+        if handler_wildcard || has(imports, allowed) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_bindings(
@@ -804,28 +838,28 @@ pub(super) async fn build_bindings(
         let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
         bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
     }
-    if granted("sql") {
-        // Grant the default (`""`) SQL database; the guest selects it via
-        // `sql.open("")`. A live request gets the site's database; a preview
-        // gets one per the configured preview mode. A provider error is logged
-        // and left ungranted so the guest sees `access denied`, not a 500.
-        if let Some(provider) = &inner.sql {
-            // The SQL provider validates + qualifies `project` and `site`
-            // internally (it rejects a `/`-bearing composite `site`), so pass the
-            // *raw* project + bare site here — never the already-qualified
-            // `scope`. This tenant-isolates the SQL identity the same way as
-            // kv/blob above, without double-qualifying.
+    if let Some(provider) = &inner.sql {
+        // The SQL provider validates + qualifies `project`/`site` internally (it rejects a
+        // `/`-bearing composite `site`), so pass the *raw* project + bare site here — never the
+        // already-qualified `scope`. Each granted database is opened independently; a provider
+        // error is logged and that binding left ungranted (the guest sees `access denied` for
+        // that name, not a 500 for the whole request), so one broken database can't fail the
+        // others. A preview routes through `preview_database` so a named external DB honors its
+        // `allow_preview`.
+        for name in granted_sql_databases(imports, &site_handlers.allow_imports) {
             let opened = match preview {
                 Some(id) => {
                     provider
-                        .preview_database(project.as_str(), site, "", id)
+                        .preview_database(project.as_str(), site, &name, id)
                         .await
                 }
-                None => provider.database(project.as_str(), site, "").await,
+                None => provider.database(project.as_str(), site, &name).await,
             };
             match opened {
-                Ok(backend) => bindings = bindings.with_sql("", backend),
-                Err(err) => tracing::warn!(site, %err, "opening site SQL database failed"),
+                Ok(backend) => bindings = bindings.with_sql(name.clone(), backend),
+                Err(err) => {
+                    tracing::warn!(site, database = %name, %err, "opening SQL database failed");
+                }
             }
         }
     }
@@ -987,6 +1021,60 @@ pub(super) async fn dispatch_consumer_batch(
         }
     }
     acked
+}
+
+#[cfg(all(test, feature = "handlers"))]
+mod sql_grant_tests {
+    use super::granted_sql_databases;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().copied().map(String::from).collect()
+    }
+
+    #[test]
+    fn bare_sql_grants_only_the_default_database() {
+        // Backward-compatible: `sql` on both sides → the default (`""`) database, nothing named.
+        assert_eq!(granted_sql_databases(&v(&["sql"]), &v(&["sql"])), v(&[""]));
+        // Bare `sql` granted by only one side → nothing (the existing intersection).
+        assert!(granted_sql_databases(&v(&["sql"]), &v(&[])).is_empty());
+        assert!(granted_sql_databases(&v(&[]), &v(&["sql"])).is_empty());
+    }
+
+    #[test]
+    fn a_named_grant_is_the_intersection_and_the_site_is_the_ceiling() {
+        // The handler asks for `product`; the site exposes it → granted.
+        assert_eq!(
+            granted_sql_databases(&v(&["sql:product"]), &v(&["sql:product"])),
+            v(&["product"])
+        );
+        // The handler asks for `privileged` but the site exposes only `product` → fail-closed.
+        assert!(granted_sql_databases(&v(&["sql:privileged"]), &v(&["sql:product"])).is_empty());
+        // Least-privilege: a `product`-only handler on a site that also exposes `privileged`
+        // never receives the `privileged` backend.
+        assert_eq!(
+            granted_sql_databases(
+                &v(&["sql", "sql:product"]),
+                &v(&["sql", "sql:product", "sql:privileged"]),
+            ),
+            v(&["", "product"])
+        );
+    }
+
+    #[test]
+    fn a_handler_wildcard_grants_every_name_the_site_exposes() {
+        // `sql:*` on the handler → every named database the site enumerates (but not the default,
+        // which is the bare `sql`).
+        assert_eq!(
+            granted_sql_databases(&v(&["sql:*"]), &v(&["sql:product", "sql:privileged"])),
+            v(&["product", "privileged"])
+        );
+        // The site is still the ceiling: a `sql:*` handler on a site that exposes only the
+        // default (no named entries) gets nothing named.
+        assert!(granted_sql_databases(&v(&["sql:*"]), &v(&["sql"])).is_empty());
+        // A site-side `sql:*` is not a concrete name — the site must enumerate — so it grants
+        // nothing named even to a wildcard handler.
+        assert!(granted_sql_databases(&v(&["sql:*"]), &v(&["sql:*"])).is_empty());
+    }
 }
 
 #[cfg(test)]

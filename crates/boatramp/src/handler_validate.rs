@@ -134,7 +134,17 @@ mod imp {
             // wasi:sockets, an unknown boatramp:handlers interface, ...) is
             // refused even when it appears in `imports`.
             match capability_token(pkg, iface) {
-                Some(token) if declared.iter().any(|d| d == token) => continue,
+                // The bare token (`sql`), or a **named** grant of the same capability
+                // (`sql:product`, `sql:*`) — a component imports the single `sql` interface and
+                // selects the database by name at runtime, so any `sql:*`/`sql:<name>` grant
+                // satisfies its `sql` import.
+                Some(token)
+                    if declared.iter().any(|d| {
+                        d == token || d.strip_prefix(token).is_some_and(|r| r.starts_with(':'))
+                    }) =>
+                {
+                    continue
+                }
                 Some(token) => {
                     return Err(format!(
                         "component imports {pkg}/{iface} (the `{token}` capability) \

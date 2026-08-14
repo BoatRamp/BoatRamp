@@ -397,19 +397,34 @@ async fn build_function_bindings(
         let max_blob = inner.max_blob_bytes.get().copied().unwrap_or(0);
         bindings = bindings.with_blobstore(scope, inner.storage.clone(), max_blob);
     }
-    if granted("sql") {
-        if let Some(provider) = &inner.sql {
-            // `sql_site` is the *raw* `fn/<name>` identity; the provider
-            // qualifies it by `project` internally (default → `fn/<name>`,
-            // else `{project}/fn/<name>` — matching `scope`) and validates it
-            // segment-wise, so we pass the raw identity, never the already
-            // project-qualified `scope`. (Before this fix the function path
-            // passed the `/`-bearing `fn/<name>` as the `site` arg, which the
-            // provider's `validate_db_name` rejected — function SQL was silently
-            // ungranted; segment-wise validation now accepts the composite.)
-            match provider.database(project.as_str(), sql_site, "").await {
-                Ok(backend) => bindings = bindings.with_sql("", backend),
-                Err(err) => tracing::warn!(scope, %err, "opening function SQL database failed"),
+    if let Some(provider) = &inner.sql {
+        // A top-level function is admin-deployed, so its declared `imports` **are** its grants
+        // (no site allowlist ceiling). The bare `sql` grants the default (`""`) database;
+        // `sql:<name>` grants a named database — same least-privilege isolation as a site handler
+        // (a normal `product` role vs a `privileged` role, each its own connection). A `sql:*` on
+        // a function has no site universe to enumerate, so it grants no named database.
+        //
+        // `sql_site` is the *raw* `fn/<name>` identity; the provider qualifies it by `project`
+        // internally (default → `fn/<name>`, else `{project}/fn/<name>` — matching `scope`) and
+        // validates it segment-wise, so we pass the raw identity, never the project-qualified
+        // `scope`.
+        let mut names: Vec<&str> = Vec::new();
+        if granted("sql") {
+            names.push(""); // the default database
+        }
+        for imp in &config.imports {
+            if let Some(name) = imp.strip_prefix("sql:") {
+                if !name.is_empty() && name != "*" {
+                    names.push(name);
+                }
+            }
+        }
+        for name in names {
+            match provider.database(project.as_str(), sql_site, name).await {
+                Ok(backend) => bindings = bindings.with_sql(name, backend),
+                Err(err) => {
+                    tracing::warn!(scope, database = name, %err, "opening function SQL database failed");
+                }
             }
         }
     }

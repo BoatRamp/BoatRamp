@@ -7,7 +7,36 @@ versions.
 
 ## [Unreleased]
 
+### Added
+- **Named SQL bindings for least-privilege tenant isolation.** A handler (or function) could open
+  only the single default (`""`) database, so a multi-tenant app had to run its product queries
+  and its privileged cross-tenant reads over **one** connection — a broad role that defeats
+  Postgres `FORCE ROW LEVEL SECURITY`. A deploy can now grant **named** databases: `sql:<name>`
+  grants a specific database and `sql:*` grants every named database the site exposes, each its
+  own connection + credential (so `product` can be an RLS-enforced role and `privileged` a
+  separate role). The site's `allow_imports` enumerates the names it exposes and is the hard
+  ceiling; a handler is granted a name only if it requests it (explicitly or via `sql:*`) **and**
+  the site exposes it — so a least-privilege handler that asks only for `sql:product` never
+  receives the `privileged` backend, and a name a handler wasn't granted fails closed. The bare
+  `sql` (the default database) is unchanged. Named previews route through the provider's
+  `preview_database` (honoring `allow_preview`), and one broken database no longer fails a request
+  that doesn't touch it.
+
+### Performance
+- **The federation gateway memoizes the composed supergraph + query plans per project.** It
+  re-listed the registry, re-parsed every subgraph's SDL, and re-planned the operation on every
+  request (the edge `/graphql` and every in-process `graphql::run`) — an agent turn of N tool
+  calls paid N× that for a graph that only changes on deploy. Both paths now serve a cached,
+  composed supergraph + plan keyed on a per-project composition version (bumped on every registry
+  mutation), so a repeated operation costs a single version check.
+
 ### Fixed
+- **Guest logs are now discoverable in `serve.log` and correlate with their request.** Guest
+  stdout/stderr were captured to a per-site store but never reached `serve.log`, and structured
+  `wasi:logging` was advertised as importable yet had no host implementation (a guest importing it
+  failed to instantiate). Captured lines now also emit to the `boatramp::guest` tracing target;
+  `wasi:logging/logging` is implemented (level-preserving); and each captured line + the
+  `boatramp::access` line share a request id (an inbound `X-Request-Id` is honored).
 - **The federation gateway no longer silently discards subgraph errors.** `graphql_gateway::execute`
   assembled only `data` and dropped every fetch's `errors`, so a subgraph returning a spec-correct
   `{ "data": null, "errors": [...] }` (a denied field, a failed non-null field, a backend error)

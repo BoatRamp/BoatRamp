@@ -297,12 +297,27 @@ fn shannon_entropy_bits(s: &str) -> f64 {
         .sum()
 }
 
+/// Whether `import` is a **named SQL binding** grant: `sql:<name>` (a specific database) or
+/// `sql:*` (every named database the site exposes). The bare `sql` (in `KNOWN_IMPORTS`) remains
+/// the default database. A name is a conservative identifier so it can't smuggle a path or
+/// injection through `sql.open(name)`.
+fn is_named_sql_import(import: &str) -> bool {
+    let Some(name) = import.strip_prefix("sql:") else {
+        return false;
+    };
+    name == "*"
+        || (!name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+}
+
 fn check_import(import: &str) -> Result<(), ConfigError> {
-    if KNOWN_IMPORTS.contains(&import) {
+    if KNOWN_IMPORTS.contains(&import) || is_named_sql_import(import) {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}",
+            "unknown handler import {import:?}; allowed: {}, or a named SQL binding `sql:<name>` / `sql:*`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -1111,6 +1126,23 @@ mod tests {
     #[test]
     fn rejects_unknown_field() {
         assert!(DeployConfig::from_ron("( nope: true )").is_err());
+    }
+
+    #[test]
+    fn accepts_named_sql_imports_and_rejects_malformed_ones() {
+        use super::check_import;
+        // The bare capability + named-database grants are accepted.
+        assert!(check_import("sql").is_ok());
+        assert!(check_import("sql:product").is_ok());
+        assert!(check_import("sql:privileged_2-a").is_ok());
+        assert!(check_import("sql:*").is_ok());
+        // Malformed named grants are rejected: empty name, or a name that could smuggle a path /
+        // injection through `sql.open(name)`.
+        assert!(check_import("sql:").is_err());
+        assert!(check_import("sql:a/b").is_err());
+        assert!(check_import("sql:a b").is_err());
+        // A wholly-unknown import is still rejected.
+        assert!(check_import("wasi:filesystem").is_err());
     }
 
     #[test]
