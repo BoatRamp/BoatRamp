@@ -6,4 +6,4 @@
 # exactly how 59 handlers-gated tests once ran nowhere — a shrinking count is a Mode-D
 # regression, and this catches it at the merge gate. Adding tests only ever raises the
 # floor; bump this number deliberately when you do (never lower it to make CI pass).
-SERVER_FEATURES_MIN=318
+SERVER_FEATURES_MIN=319

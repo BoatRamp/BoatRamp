@@ -211,6 +211,50 @@ mod tests {
         );
     }
 
+    // The verbatim `_service { sdl }` a real async-graphql v7 `.enable_federation()` subgraph
+    // emits: a federation-v2 document with the `extend schema @link(...)` preamble, block-string
+    // descriptions, and built-in directive definitions. This is a *real client artifact*, not a
+    // hand-written approximation — the documented, recommended way to author a subgraph. It is
+    // the exact SDL shape that once failed to parse (and would have 400'd every real subgraph
+    // registration); this dogfoods the documented path through the whole publish→compose→read.
+    const ASYNC_GRAPHQL_V2: &str = r#"type Query {
+	users: [User!]!
+}
+
+type User @key(fields: "id") {
+	id: ID!
+	name: String!
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+extend schema @link(
+	url: "https://specs.apollo.dev/federation/v2.5",
+	import: ["@key", "@tag", "@shareable", "@inaccessible", "@override", "@external", "@provides", "@requires", "@composeDirective", "@interfaceObject"]
+)
+"#;
+
+    #[tokio::test]
+    async fn publishes_real_async_graphql_v2_sdl_the_documented_way() {
+        let kv = MemoryKv::new();
+        // Register a real async-graphql-emitted subgraph SDL — the recommended authoring path.
+        let sg = publish(&kv, "acme", "users", ASYNC_GRAPHQL_V2)
+            .await
+            .unwrap();
+        // Its type-system facts survive the whole path (the `@link` preamble is ignored).
+        assert_eq!(
+            sg.root_query.get("users").map(String::as_str),
+            Some("users")
+        );
+        assert!(sg.entities.contains_key("User"), "User entity registered");
+        // And it reads back as the composed supergraph, so the gateway can plan against it.
+        let current = supergraph(&kv, "acme").await.unwrap();
+        assert!(current.root_query.contains_key("users"));
+        assert_eq!(subgraph_names(&kv, "acme").await, vec!["users".to_string()]);
+    }
+
     #[tokio::test]
     async fn an_incompatible_publish_is_rejected_and_not_stored() {
         let kv = MemoryKv::new();
