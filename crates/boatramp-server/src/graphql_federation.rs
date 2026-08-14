@@ -281,7 +281,13 @@ mod tests {
         let a = "type Query { x: Int } type T { f: Int }";
         let b = "type T { f: Int }";
         let err = compose(&[sub("a", a), sub("b", b)]).unwrap_err();
-        assert!(matches!(err, CompositionError::FieldConflict { field, .. } if field == "f"));
+        assert!(matches!(&err, CompositionError::FieldConflict { field, .. } if field == "f"));
+        // The message must name the conflicting field + cite @shareable (guides the fix).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("T.f") && msg.contains("@shareable"),
+            "unexpected message: {msg}"
+        );
     }
 
     #[test]
@@ -352,7 +358,14 @@ extend schema @link(
     #[test]
     fn unparsable_sdl_is_a_composition_error() {
         let err = compose(&[sub("bad", "type Query { ")]).unwrap_err();
-        assert!(matches!(err, CompositionError::Parse { subgraph, .. } if subgraph == "bad"));
+        assert!(matches!(&err, CompositionError::Parse { subgraph, .. } if subgraph == "bad"));
+        // The operator-facing message must name the subgraph + say it didn't parse (the Display
+        // impl is otherwise untested — a mutant that blanks it survives without this).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad") && msg.contains("did not parse"),
+            "unexpected message: {msg}"
+        );
     }
 
     /// Property: composition is **order-independent**. A supergraph is a set-like merge of its

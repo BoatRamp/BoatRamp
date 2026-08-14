@@ -567,4 +567,61 @@ mod tests {
             }
         }
     }
+
+    /// Multiple arguments and variables nested inside list/object argument values —
+    /// exact-output. This closes three weak spots a mutation-testing run surfaced (no test
+    /// exercised: the comma between multiple arguments; a `$var` inside a list value; a `$var`
+    /// inside an object value). All three are the general form of the argument/variable
+    /// serialization that shipped broken in the federated-mutation bug.
+    #[test]
+    fn renders_multiple_arguments_and_variables_nested_in_lists_and_objects() {
+        let sg = supergraph_with_mutation();
+        let plan = plan(
+            "mutation T($n: Int, $t: Int, $o: Int){ agent(input: \"hi\", count: $n, tags: [$t], meta: {k: $o}) }",
+            &sg,
+        )
+        .unwrap();
+        let q = &plan.fetches[0].query;
+        // Exact multi-argument rendering — the `, ` separators must be present (a single-arg
+        // test can't catch a broken separator), and the list/object literals intact.
+        assert_eq!(
+            *q,
+            "mutation($n: Int, $o: Int, $t: Int) { agent(input: \"hi\", count: $n, tags: [$t], meta: {k: $o}) }"
+        );
+        // Every variable is defined — including `$t` (nested in a list) and `$o` (nested in an
+        // object), which are only reached by descending into those argument values.
+        for v in ["$n: Int", "$t: Int", "$o: Int"] {
+            assert!(q.contains(v), "missing var def `{v}` in: {q}");
+        }
+    }
+
+    /// A `@shareable` field co-owned by the current subgraph must resolve **locally**, not jump
+    /// to another owner — even when that other owner sorts first. Here `reviews` co-owns
+    /// `User.name`, and a fetch rooted in `reviews` must keep `name` local (one fetch, no
+    /// `_entities` jump), though `accounts` sorts first among the owners. (Closes the
+    /// `owner_of` locality-guard weak spot a mutation-testing run surfaced.)
+    #[test]
+    fn a_shareable_field_the_current_subgraph_owns_stays_local() {
+        let accounts =
+            "type Query { me: User } type User @key(fields: \"id\") { id: ID! name: String @shareable }";
+        let reviews =
+            "type Query { topReviewer: User } extend type User @key(fields: \"id\") { id: ID! @external name: String @shareable }";
+        let sg = compose(&[
+            ("accounts".into(), accounts.into()),
+            ("reviews".into(), reviews.into()),
+        ])
+        .unwrap();
+        let plan = plan("{ topReviewer { name } }", &sg).unwrap();
+        assert_eq!(
+            plan.fetches.len(),
+            1,
+            "expected `name` resolved locally (no entity jump), got: {:?}",
+            plan.fetches
+        );
+        assert_eq!(plan.fetches[0].subgraph, "reviews");
+        assert!(
+            plan.fetches[0].requires.is_none(),
+            "no dependent fetch expected"
+        );
+    }
 }
