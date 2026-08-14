@@ -1,15 +1,16 @@
-name: Measurement (coverage + mutation testing)
+name: Measurement (mutation testing)
 
-# Report-only reliability instrumentation (PLAN-test-reliability Part C). Neither job
-# gates a merge yet — they surface signal:
-#   • coverage — cargo-llvm-cov over the handlers surface, summary in the job log.
+# Report-only reliability instrumentation (PLAN-test-reliability Part C):
 #   • mutants  — cargo-mutants on the PURE, deterministic GraphQL cores (the planner +
 #                composer). It mutates the code and fails a mutant only if NO test dies —
 #                i.e. it finds assertions too weak to catch a real change, which is exactly
 #                the class that hid the federated-mutation argument-drop (a `.contains()`
 #                that would pass a malformed splice). A "survived" mutant is a named,
 #                line-numbered weak spot to strengthen.
-# Nightly + on-demand; heavy, so off the per-push path.
+# Weekly + on-demand; heavy, so off the per-push path.
+#
+# Coverage moved to a per-push GATE in ci.yml (`coverage-gate`): it enforces a
+# ratchet floor (`.github/coverage-baseline`), so a coverage drop fails a push.
 
 on:
   schedule:
@@ -23,32 +24,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  coverage:
-    name: coverage (llvm-cov, report-only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Ensure build deps
-        run: |
-          if ! (command -v cmake >/dev/null && command -v nasm >/dev/null); then
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: measurement-coverage
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage summary (boatramp-server, handlers)
-        run: |
-          cargo llvm-cov -p boatramp-server --features handlers --summary-only \
-            | tee coverage-summary.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage-summary
-          path: coverage-summary.txt
-
   mutants:
     name: mutants (pure GraphQL cores, report-only)
     runs-on: ubuntu-latest

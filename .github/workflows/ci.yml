@@ -302,3 +302,38 @@ jobs:
         continue-on-error: true
         with:
           command: check advisories
+
+  # Coverage ratchet: fail a push if line coverage of the handlers surface drops
+  # below the recorded floor (`.github/coverage-baseline`). A floor, not a target —
+  # raise the baseline as coverage grows so it never backslides. The summary is
+  # printed either way, so the current number is visible to ratchet from.
+  coverage-gate:
+    name: coverage ratchet (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-gate
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage must not drop below the baseline
+        run: |
+          baseline="$(cat .github/coverage-baseline)"
+          echo "line-coverage floor: ${baseline}%"
+          cargo llvm-cov -p boatramp-server --features handlers --summary-only \
+            --fail-under-lines "${baseline}" | tee coverage-summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-summary
+          path: coverage-summary.txt
