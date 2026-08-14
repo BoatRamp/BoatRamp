@@ -8,6 +8,10 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **Per-site guest-log capture opt-out** (`handlers.disable_log_capture`). Capture stays on by
+  default (served via the logs endpoint + SSE tail, mirrored to `serve.log`); set it `true` to
+  discard a site's guest `stdout`/`stderr` + `wasi:logging` — e.g. when output may carry
+  secrets/PII.
 - **Named SQL bindings for least-privilege tenant isolation.** A handler (or function) could open
   only the single default (`""`) database, so a multi-tenant app had to run its product queries
   and its privileged cross-tenant reads over **one** connection — a broad role that defeats
