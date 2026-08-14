@@ -1,5 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="6" fill="#0f172a" />
-  <path d="M6 22 L16 8 L26 22 Z" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linejoin="round" />
-  <line x1="6" y1="24" x2="26" y2="24" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" />
+<!-- boatramp glyph: a ramp (orange) dipping through a launch chevron into a seafoam waterline. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" role="img" aria-label="boatramp">
+  <rect width="32" height="32" rx="7" fill="#05141f"/>
+  <path d="M6 9 L17 19.5" stroke="#ff6b35" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M12.5 16 L17 22.5 L21.5 16" stroke="#ffd23f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M4 26 q3.5 -3.4 7 0 t7 0 t7 0" stroke="#35e0c4" stroke-width="2.2" stroke-linecap="round"/>
 </svg>
