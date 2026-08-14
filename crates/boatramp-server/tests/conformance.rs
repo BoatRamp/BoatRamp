@@ -6222,6 +6222,146 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
     );
 }
 
+/// A federated **mutation** end to end: a `mutation { agent(input: …) }` planned by the real
+/// planner, dispatched by the gateway to the `agent` subgraph over the invoke path, and its
+/// result returned — the exact path that shipped broken (the planner sent an anonymous *query*
+/// and dropped the argument, so the Mutation field never ran → `data:null`). The `agent`
+/// subgraph fixture **echoes the argument it received** (`ran:<input>`), so this asserts the
+/// mutation keyword *and* the argument survived router → planner → gateway → invoke → guest —
+/// not a canned answer. Covers both the inline-argument and the variable form.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
+    use boatramp_core::config::{
+        DeployConfig, HandlerConfig, HandlerGraphqlConfig, HandlersSiteConfig, SiteConfig,
+    };
+    use boatramp_core::kv::KvStore;
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const AGENT: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/graphql-agent.wasm");
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    deploy_test_function(&deploy, "agent", AGENT, Vec::new()).await;
+    // Register the agent subgraph — a supergraph with a `Mutation.agent` root field.
+    kv.put(
+        "graphql/default/subgraph/agent",
+        b"type Query { ping: String } type Mutation { agent(input: String): String }".to_vec(),
+    )
+    .await
+    .unwrap();
+
+    // The gateway site (its component is never run for a federated op; point it at http-200).
+    let gw_hash = sha256_hex(HTTP_200);
+    let gw_bytes = HTTP_200.to_vec();
+    let gw_stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from(gw_bytes)) }).boxed();
+    deploy.put_blob(&gw_hash, gw_stream).await.unwrap();
+    let mut files = BTreeMap::new();
+    files.insert(
+        "gw.wasm".to_string(),
+        FileEntry {
+            hash: gw_hash.clone(),
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/graphql".into(),
+                methods: Vec::new(),
+                component: "gw.wasm".into(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "gw", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "gw",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    graphql: Some(HandlerGraphqlConfig {
+                        enabled: true,
+                        federated: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, None);
+    runtime.set_invoker(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // Helper: POST a GraphQL body to the gateway and return the parsed JSON.
+    async fn post_graphql(app: &axum::Router, body: &'static str) -> serde_json::Value {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/_sites/gw/graphql")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40001))));
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // Inline-argument form: the guest echoes the input it received, proving the mutation
+    // keyword AND the argument reached the subgraph. A regression (anonymous op or dropped
+    // arg) makes the guest error or echo `<missing>` — either fails the assertion.
+    let out = post_graphql(&app, r#"{"query":"mutation { agent(input: \"hi\") }"}"#).await;
+    assert_eq!(
+        out["data"]["agent"],
+        serde_json::json!("ran:hi"),
+        "out: {out}"
+    );
+
+    // Variable form (the common client shape): the variable value must be forwarded.
+    let out = post_graphql(
+        &app,
+        r#"{"query":"mutation T($input: String){ agent(input: $input) }","variables":{"input":"bye"}}"#,
+    )
+    .await;
+    assert_eq!(
+        out["data"]["agent"],
+        serde_json::json!("ran:bye"),
+        "out: {out}"
+    );
+}
+
 // ---- GraphQL declarative data connector end-to-end (real libsql) ------------
 
 /// A site configured with `[handlers.graphql.data]` serves a GraphQL API generated from its
