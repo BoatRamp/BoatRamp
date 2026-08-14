@@ -15,6 +15,8 @@ name: CI
 #                      (handlers/oidc/mcp/compression/dns-verify) AT THE MERGE GATE.
 #                      The lean `test` lane can't see this code; running it nightly-only
 #                      is how two total failures shipped through green CI, so it gates now.
+#   • test-cluster   — the embedded-Raft cluster tests (consensus + leader-loss failover),
+#                      behind the `raft`/`http` features — also nightly-only before, now gated.
 #   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
 # clippy and test are the two full workspace compiles; running them as separate
 # jobs lets them build concurrently on separate runners instead of one after the
@@ -257,6 +259,24 @@ jobs:
             echo "::error::server-features test count $live dropped below the floor $SERVER_FEATURES_MIN — a feature-gate mistake may have silently dropped tests. If the drop is intentional, lower .github/test-count-baseline deliberately."
             exit 1
           fi
+
+  # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
+  # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
+  # nightly `--all-features` — the same merge-gate blind spot as the GraphQL surface.
+  # They're the correctness core of the cluster (a replicated write surviving a leader
+  # kill), so they gate merges here. Scoped to `boatramp-cluster` (+ openraft) — ~26s
+  # with a warm cache.
+  test-cluster:
+    name: test (cluster consensus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-cluster
+      - name: Test (raft + http)
+        run: cargo test -p boatramp-cluster --features raft,http
 
   deny:
     name: cargo-deny

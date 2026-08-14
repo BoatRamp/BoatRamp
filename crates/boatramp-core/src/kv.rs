@@ -352,4 +352,70 @@ mod tests {
         assert_eq!(backing.get("a").await.unwrap(), Some(b"1".to_vec()));
         assert_eq!(backing.get("old").await.unwrap(), None);
     }
+
+    /// A shared **conformance suite** every `KvStore` must satisfy identically. Running the
+    /// same assertions against multiple backends is what keeps them from drifting (B7): a
+    /// caching or storage layer that got `list_prefix`, overwrite, delete-of-missing, or empty
+    /// values subtly wrong fails here rather than in production. New in-process backends
+    /// (SlateDB, …) should call this too.
+    async fn kv_conformance(store: &dyn KvStore) {
+        // Missing key → None; delete of a missing key is a no-op (idempotent).
+        assert_eq!(store.get("missing").await.unwrap(), None);
+        store.delete("missing").await.unwrap();
+
+        // Put/get round-trip, including an EMPTY value (distinct from absent) and binary bytes.
+        store.put("k/1", b"one".to_vec()).await.unwrap();
+        store.put("k/empty", Vec::new()).await.unwrap();
+        store.put("k/bin", vec![0u8, 159, 146, 150]).await.unwrap();
+        assert_eq!(store.get("k/1").await.unwrap(), Some(b"one".to_vec()));
+        assert_eq!(store.get("k/empty").await.unwrap(), Some(Vec::new()));
+        assert_eq!(
+            store.get("k/bin").await.unwrap(),
+            Some(vec![0, 159, 146, 150])
+        );
+
+        // Overwrite replaces the value.
+        store.put("k/1", b"ONE".to_vec()).await.unwrap();
+        assert_eq!(store.get("k/1").await.unwrap(), Some(b"ONE".to_vec()));
+
+        // list_prefix returns exactly the matching keys (not others), regardless of order.
+        store.put("other/x", b"x".to_vec()).await.unwrap();
+        let mut got = store.list_prefix("k/").await.unwrap();
+        got.sort();
+        assert_eq!(got, vec!["k/1", "k/bin", "k/empty"]);
+        assert_eq!(
+            store.list_prefix("nope/").await.unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Delete removes just that key; the prefix set shrinks accordingly.
+        store.delete("k/1").await.unwrap();
+        assert_eq!(store.get("k/1").await.unwrap(), None);
+        let mut after = store.list_prefix("k/").await.unwrap();
+        after.sort();
+        assert_eq!(after, vec!["k/bin", "k/empty"]);
+
+        // write_batch applies puts + deletes together.
+        store
+            .write_batch(vec![
+                WriteOp::Put("k/2".into(), b"two".to_vec()),
+                WriteOp::Delete("k/empty".into()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(store.get("k/2").await.unwrap(), Some(b"two".to_vec()));
+        assert_eq!(store.get("k/empty").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn memorykv_satisfies_the_conformance_suite() {
+        kv_conformance(&MemoryKv::new()).await;
+    }
+
+    #[tokio::test]
+    async fn cachedkv_satisfies_the_conformance_suite() {
+        // The caching layer must be semantically identical to its backing store on every op.
+        let kv = CachedKv::new(Arc::new(MemoryKv::new()), 16);
+        kv_conformance(&kv).await;
+    }
 }
