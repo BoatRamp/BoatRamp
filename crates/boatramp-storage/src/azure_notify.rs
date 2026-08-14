@@ -194,10 +194,12 @@ impl WatchProvider for AzureWatchProvider {
     }
 
     async fn verify(&self, prefix: &str) -> Result<bool, ProvisionError> {
-        // No side-effect-free existence probe is exposed; a zero-message peek
-        // succeeds iff the queue exists (it neither reads nor hides a message).
+        // Get Queue Metadata (`GET ?comp=metadata`) is the side-effect-free existence
+        // probe: 200 for an existing queue (empty or not), 404 when it is absent. It
+        // neither reads nor hides a message. (A `get_messages` peek can't stand in — its
+        // `numofmessages` must be 1–32, so a zero-message probe is a 400.)
         let queue = self.queues.queue_client(queue_name(prefix));
-        match queue.get_messages().number_of_messages(0u8).await {
+        match queue.get_metadata().await {
             Ok(_) => Ok(true),
             Err(err) if is_not_found(&err) => Ok(false),
             Err(err) => Err(az_err(err)),
