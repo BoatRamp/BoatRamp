@@ -896,16 +896,19 @@ pub(super) async fn build_bindings(
             bindings = bindings.with_graphql(runner.scoped(project), depth);
         }
     }
-    // Capture stdout/stderr for *every* invocation — not a
-    // guest-requested import, but host-side observability. Tagged by `site` (so
-    // a site's live + preview output aggregates under it) and rate-capped per
-    // the site's `maxLogRate`.
-    inner.logs.configure(site, site_handlers.max_log_rate);
-    bindings = bindings.with_logging(
-        site.to_string(),
-        request_id.map(str::to_string),
-        inner.logs.clone(),
-    );
+    // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested
+    // import, but host-side observability. Tagged by `site` (so a site's live + preview output
+    // aggregates under it), rate-capped per the site's `maxLogRate`, and correlated with the
+    // request id. A site may opt out (`disable_log_capture`), e.g. when guest output may carry
+    // secrets/PII; then no sink is wired and the guest's stdio is discarded.
+    if !site_handlers.disable_log_capture {
+        inner.logs.configure(site, site_handlers.max_log_rate);
+        bindings = bindings.with_logging(
+            site.to_string(),
+            request_id.map(str::to_string),
+            inner.logs.clone(),
+        );
+    }
 
     // Environment for the guest: the deploy's static `env`
     // strings, plus the site's `secrets` — each a *reference* to a host

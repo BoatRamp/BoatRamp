@@ -1583,6 +1583,7 @@ async fn handler_route_dispatches_through_engine() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3059,6 +3060,7 @@ async fn activation_during_traffic_drops_no_requests() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3196,6 +3198,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3308,6 +3311,7 @@ async fn activation_refuses_broken_component() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3413,6 +3417,7 @@ async fn activation_refuses_disallowed_import() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3509,6 +3514,7 @@ async fn activation_refuses_oversized_component() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3607,6 +3613,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -3730,6 +3737,7 @@ async fn per_site_timeout_cap_applies() {
                     background_aliases: Vec::new(),
                     max_stream_connections: None,
                     max_log_rate: None,
+                    disable_log_capture: false,
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
@@ -4432,6 +4440,101 @@ async fn guest_logs_captured_and_served() {
     let entries = logs["entries"].as_array().unwrap();
     assert!(!entries.is_empty());
     assert!(entries.iter().all(|e| e["stream"] == "stderr"));
+}
+
+/// A site that opts out of capture (`disable_log_capture`) captures nothing: the same handler
+/// that writes to stdout/stderr produces no stored lines.
+#[cfg(feature = "handlers")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_logs_suppressed_when_capture_disabled() {
+    use boatramp_core::config::{HandlerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    let hash = sha256_hex(HTTP_200);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "h.wasm".to_string(),
+        FileEntry {
+            hash,
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            handlers: vec![HandlerConfig {
+                route: "/log".to_string(),
+                methods: Vec::new(),
+                component: "h.wasm".to_string(),
+                imports: Vec::new(),
+                limits: None,
+                env: BTreeMap::new(),
+                invoke_targets: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .activate(ProjectRef::DEFAULT, "blog", &id)
+        .await
+        .unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    disable_log_capture: true, // opt out
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/_sites/blog/log")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    // The handler wrote to stdout/stderr, but capture is off → no stored lines.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/sites/blog/_boatramp/logs")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let logs: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        logs["entries"].as_array().unwrap().is_empty(),
+        "capture disabled → no captured lines: {logs}"
+    );
 }
 
 // ---- wildcard preview host form --------------------------------------------

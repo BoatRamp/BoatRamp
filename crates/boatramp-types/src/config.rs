@@ -645,6 +645,13 @@ pub struct HandlersSiteConfig {
     /// dropped (counted). `None` = the server default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_log_rate: Option<u32>,
+    /// Opt **out** of capturing the site's guest `stdout`/`stderr` + `wasi:logging`. Capture is
+    /// **on by default** (served via the logs endpoint + SSE tail, mirrored to `serve.log`); set
+    /// this `true` to disable it — e.g. when a guest's output may carry secrets/PII. When
+    /// disabled, the guest's stdio is discarded and never reaches the store, the logs API, or
+    /// `serve.log`. (Inverted so the default — capture on — matches `Default`.)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_log_capture: bool,
     /// Edge response cache. Off unless present + `enabled`. When on, a
     /// cacheable `GET`/`HEAD` response the handler opts in via
     /// `Cache-Control: max-age=…` is stored and served for later identical

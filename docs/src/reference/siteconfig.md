@@ -86,6 +86,7 @@ entirely.
 | `background_aliases` | list\<string\> | `[]` | Named aliases (besides current) whose deployments also run consumers and crons. See [Run background work](../how-to/background-work.md). |
 | `max_stream_connections` | u32? | — | Cap on concurrent SSE/WebSocket connections for the site. |
 | `max_log_rate` | u32? | — | Cap on captured guest log lines per second (over-cap lines are dropped, counted). |
+| `disable_log_capture` | bool | `false` | Opt **out** of capturing guest `stdout`/`stderr` + `wasi:logging`. Capture is on by default (logs endpoint + SSE tail + `serve.log` mirror); set `true` to discard it, e.g. when guest output may carry secrets/PII. |
 | `cache` | HandlerCacheConfig? | `None` (off) | [Edge response cache](#handlerscache). |
 | `graphql` | HandlerGraphqlConfig? | `None` (off) | [GraphQL edge features](#handlersgraphql). |
 | `cookie_auth` | CookieAuthConfig? | `None` (off) | [Browser cookie session auth](#handlerscookie_auth). |
