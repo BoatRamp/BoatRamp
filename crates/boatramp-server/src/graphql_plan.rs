@@ -535,4 +535,36 @@ mod tests {
             dep.query
         );
     }
+
+    /// The invariant Incident 1 violated in its general form: **no root field and no argument
+    /// is ever silently dropped** from a plan. For a range of operation shapes, every root
+    /// field name and every argument token in the input must appear somewhere in the emitted
+    /// fetches. A table-driven check (a lightweight stand-in for a property test) so a
+    /// regression in argument/field serialization fails loudly regardless of the exact shape.
+    #[test]
+    fn no_root_field_or_argument_is_ever_dropped_from_a_plan() {
+        let sg = supergraph_with_mutation();
+        // (operation, tokens that MUST survive into some fetch)
+        let cases: &[(&str, &[&str])] = &[
+            ("{ me { name } }", &["me", "name"]),
+            (
+                "mutation { agent(input: \"hi\") }",
+                &["agent", "input:", "\"hi\""],
+            ),
+            (
+                "mutation T($x: String){ agent(input: $x) }",
+                &["agent", "input:", "$x"],
+            ),
+        ];
+        for (op, must_survive) in cases {
+            let plan = plan(op, &sg).unwrap();
+            let all: String = plan.fetches.iter().map(|f| f.query.as_str()).collect();
+            for tok in *must_survive {
+                assert!(
+                    all.contains(tok),
+                    "planning `{op}` dropped `{tok}` — emitted fetches: {all}"
+                );
+            }
+        }
+    }
 }
