@@ -981,3 +981,53 @@ impl ServerHandler for BoatrampMcp {
         self.tool_router.get(name).cloned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift guard for the MCP tool surface: the server mirrors the control-plane API as a
+    /// fixed set of typed tools, so an accidental removal, rename, or a tool shipped without a
+    /// description (an agent relies on the description + schema to choose a tool) is caught here
+    /// rather than surfacing as a silently-shrunken agent capability. `tool_router()` is the
+    /// macro-generated static, so this needs no backend. Bump the count deliberately when adding
+    /// a tool.
+    #[test]
+    fn tool_surface_is_pinned_and_well_formed() {
+        let router = BoatrampMcp::tool_router();
+        let tools = router.list_all();
+
+        assert_eq!(
+            tools.len(),
+            46,
+            "MCP tool count changed to {} — update this count intentionally. Tools: {:?}",
+            tools.len(),
+            tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>()
+        );
+
+        // Every tool must carry a non-empty description (an agent selects tools by it).
+        for t in &tools {
+            assert!(
+                t.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "MCP tool `{}` has no description",
+                t.name
+            );
+        }
+
+        // A few load-bearing tools must exist by name — a rename is a breaking API change.
+        let names: std::collections::BTreeSet<&str> =
+            tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "list_instances",
+            "list_sites",
+            "get_site_config",
+            "put_site_config",
+            "activate_deployment",
+        ] {
+            assert!(
+                names.contains(expected),
+                "MCP tool `{expected}` is missing (renamed?) — known tools: {names:?}"
+            );
+        }
+    }
+}
