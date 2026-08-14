@@ -260,3 +260,44 @@ jobs:
             -- --ignored --nocapture 2>&1 | tee softhsm.log
           grep -qE 'test result: ok' softhsm.log \
             || { echo "::error::PKCS#11 signer round-trip failed" >&2; exit 1; }
+
+  # Tier D — Azure blob-change notify against Azurite (the local Azure emulator). The
+  # cloud-notify code ships but its live test runs nowhere; Azurite exercises the
+  # Storage-Queue provision/verify/retract path with NO real Azure account — the
+  # well-known dev account only. (S3-notify could use LocalStack; GCS notify has no
+  # emulator, so it stays real-cloud-only.)
+  azure-notify:
+    name: Azure notify (Azurite emulator)
+    runs-on: ubuntu-latest
+    env:
+      BOATRAMP_TEST_AZURE_NOTIFY_ACCOUNT: devstoreaccount1
+      BOATRAMP_TEST_AZURE_NOTIFY_CONTAINER: boatramp
+      BOATRAMP_TEST_AZURE_EMULATOR: "1"
+      # The Azurite well-known dev-account key (public, not a secret).
+      AZURE_STORAGE_ACCESS_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-azure
+
+      - name: Start Azurite (queue + blob emulator)
+        run: |
+          npm install -g azurite
+          azurite --silent --location /tmp/azurite \
+            --blobHost 127.0.0.1 --blobPort 10000 \
+            --queueHost 127.0.0.1 --queuePort 10001 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:10001/devstoreaccount1 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "azurite up"
+
+      - name: Provision / verify / retract a Storage Queue via Azurite (hard gate)
+        run: |
+          set -o pipefail
+          cargo test -p boatramp-storage --features azure --test azure_notify_live \
+            -- --ignored --nocapture 2>&1 | tee azure.log
+          grep -qE 'test result: ok. 1 passed' azure.log \
+            || { echo "::error::azure notify emulator test did not pass" >&2; exit 1; }
