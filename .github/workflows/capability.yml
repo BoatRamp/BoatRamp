@@ -213,3 +213,50 @@ jobs:
             -- --ignored --nocapture 2>&1 | tee acme.log
           grep -qE 'running [1-9][0-9]* tests?' acme.log \
             || { echo "::error::pebble ACME ran 0 tests" >&2; exit 1; }
+
+  # Tier E — the PKCS#11 signer against SoftHSM2 (a SOFTWARE HSM). Brings the HSM
+  # signing path — which ships in the binary but whose live test runs nowhere — under
+  # CI, secret-free: SoftHSM2 + a throwaway P-256 token/key provisioned on the
+  # ephemeral runner, gone with it. (The KMS/Vault signers need real accounts; those
+  # stay out — SoftHSM covers the PKCS#11 code path itself.)
+  softhsm:
+    name: PKCS#11 signer (SoftHSM2)
+    runs-on: ubuntu-latest
+    env:
+      PKCS11_PIN: "1234"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-softhsm
+
+      - name: Install SoftHSM2 + provision a token and a P-256 signing key
+        run: |
+          set -eo pipefail
+          sudo apt-get update && sudo apt-get install -y softhsm2 opensc
+          # A user-writable token store so no step needs root.
+          conf="$HOME/softhsm2.conf"
+          mkdir -p "$HOME/softhsm-tokens"
+          printf 'directories.tokendir = %s/softhsm-tokens\nobjectstore.backend = file\n' "$HOME" > "$conf"
+          echo "SOFTHSM2_CONF=$conf" >> "$GITHUB_ENV"
+          export SOFTHSM2_CONF="$conf"
+          softhsm2-util --init-token --free --label boatramp-test \
+            --pin "$PKCS11_PIN" --so-pin "$PKCS11_PIN"
+          module="$(find /usr/lib -name 'libsofthsm2.so' | head -1)"
+          echo "module: $module"
+          pkcs11-tool --module "$module" --token-label boatramp-test --login --pin "$PKCS11_PIN" \
+            --keypairgen --key-type EC:prime256v1 --label boatramp-signing-key --id 01
+          echo "PKCS11_MODULE=$module" >> "$GITHUB_ENV"
+
+      - name: Sign round-trip against SoftHSM2 (hard gate)
+        env:
+          BOATRAMP_TEST_PKCS11_MODULE: ${{ env.PKCS11_MODULE }}
+          BOATRAMP_TEST_PKCS11_TOKEN: boatramp-test
+          BOATRAMP_TEST_PKCS11_KEY: boatramp-signing-key
+        run: |
+          set -o pipefail
+          cargo test -p boatramp-server --features signer-pkcs11 pkcs11_live \
+            -- --ignored --nocapture 2>&1 | tee softhsm.log
+          grep -qE 'test result: ok' softhsm.log \
+            || { echo "::error::PKCS#11 signer round-trip failed" >&2; exit 1; }
