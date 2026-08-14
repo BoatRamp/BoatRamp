@@ -461,37 +461,33 @@ mod tests {
         .unwrap();
         assert_eq!(mplan.fetches.len(), 1);
         assert_eq!(mplan.fetches[0].subgraph, "agent");
-        let q = mplan.fetches[0].query.trim_start();
-        // The operation is a `mutation` (else the subgraph parses it as a query and the field,
-        // which lives on Mutation, never resolves) …
-        assert!(
-            q.starts_with("mutation {"),
-            "a Mutation must be dispatched as a `mutation`, got: {q}"
-        );
-        // … and the field's arguments survive into the fetch (not just `agent`).
-        assert!(
-            q.contains("agent(input: \"hi\")"),
-            "field arguments must reach the subgraph, got: {q}"
-        );
-        // A query operation must NOT get the mutation keyword.
+        // Exact-output assertion (not `.contains()`): the whole emitted fetch string must be
+        // byte-for-byte correct. The operation must be a `mutation` (else the subgraph parses
+        // it as a query and the Mutation-typed field never resolves — the shipped bug) AND the
+        // argument must be present (dropping it was the second half of the bug). A `.contains()`
+        // on a fragment would pass even for a malformed splice; exact equality cannot.
+        assert_eq!(mplan.fetches[0].query, "mutation { agent(input: \"hi\") }");
+        // A query operation must NOT get the mutation keyword — also asserted exactly.
         let qplan = plan("{ me { name } }", &supergraph_with_mutation()).unwrap();
-        assert!(
-            !qplan.fetches[0].query.trim_start().starts_with("mutation"),
-            "a Query operation's root fetch must stay a query"
-        );
+        assert_eq!(qplan.fetches[0].query, "{ me { name } }");
     }
 
     #[test]
     fn a_mutation_forwards_variables_and_defines_them_on_the_fetch() {
-        // The common client shape: arguments passed as operation variables.
+        // The common client shape: arguments passed as operation variables. Exact-output:
+        // the fetch must be a `mutation`, declare exactly the variable it uses (a subgraph
+        // rejects an undefined — or unused — variable), and reference it in the argument.
         let mplan = plan(
             "mutation Turn($input: AgentInput!) { agent(input: $input) }",
             &supergraph_with_mutation(),
         )
         .unwrap();
+        assert_eq!(
+            mplan.fetches[0].query,
+            "mutation($input: AgentInput!) { agent(input: $input) }"
+        );
         let q = &mplan.fetches[0].query;
-        // The fetch must (a) declare the variable it uses — a subgraph rejects an undefined
-        // variable — and (b) reference it in the argument.
+        // Redundant sub-assertions kept as intent documentation on top of the exact match.
         assert!(
             q.contains("mutation($input: AgentInput!)"),
             "the fetch must define the variable it uses, got: {q}"

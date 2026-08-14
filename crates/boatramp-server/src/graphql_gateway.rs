@@ -385,7 +385,7 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
         )
         .at_depth(depth);
         // The guest's operation variables (a JSON object string) — forwarded to the fetches so a
-        // mutation/field argument bound to `$var` resolves. An unparseable/empty value is `{}`.
+        // mutation/field argument bound to `$var` resolves. An unparsable/empty value is `{}`.
         let variables: Value =
             serde_json::from_str(&request.variables).unwrap_or_else(|_| json!({}));
         let response = execute(&plan, &router, &variables).await;
@@ -496,12 +496,20 @@ mod tests {
         extend type User @key(fields: "id") { id: ID! @external reviews: [Review] }
     "#;
 
-    /// A mock runner returning a canned response per subgraph.
+    /// A mock runner returning a canned response per subgraph. It is **adversarial about its
+    /// input**: it asserts the query the gateway sent actually parses as a GraphQL operation
+    /// before answering. A mock that ignores its query manufactures confidence — it passes even
+    /// when the planner emits garbage (an anonymous mutation, a dropped argument), which is
+    /// exactly how a broken planner shipped green. This one cannot.
     struct Mock(HashMap<&'static str, Value>);
 
     #[async_trait::async_trait]
     impl SubgraphFetcher for Mock {
-        async fn fetch(&self, subgraph: &str, _query: &str, _variables: Value) -> Value {
+        async fn fetch(&self, subgraph: &str, query: &str, _variables: Value) -> Value {
+            assert!(
+                async_graphql_parser::parse_query(query).is_ok(),
+                "gateway sent subgraph `{subgraph}` an unparsable query: {query}"
+            );
             self.0.get(subgraph).cloned().unwrap_or_else(|| json!({}))
         }
     }
@@ -663,6 +671,72 @@ mod tests {
             out["data"]["users"][1]["reviews"][0]["body"],
             json!("review for 2")
         );
+    }
+
+    // A subgraph owning a `Mutation` root field (plus a query, as a subgraph conventionally has).
+    const AGENT: &str = r#"
+        type Query { ping: String }
+        type Mutation { agent(input: String): String }
+    "#;
+
+    /// A subgraph fetcher that is **adversarial about a mutation**: it refuses unless the query it
+    /// received is a genuine `mutation` operation carrying its argument (and, for the variable
+    /// form, the forwarded variable value). This is the regression guard for the shipped bug —
+    /// the planner dispatched a Mutation as an anonymous query and dropped arguments/variables, so
+    /// the resolver never ran (`data:null`). A test double that echoed a canned answer could not
+    /// tell; this one asserts the contract the real subgraph would enforce.
+    struct MutationRunner;
+
+    #[async_trait::async_trait]
+    impl SubgraphFetcher for MutationRunner {
+        async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+            assert_eq!(subgraph, "agent");
+            let doc = async_graphql_parser::parse_query(query)
+                .unwrap_or_else(|e| panic!("mutation fetch didn't parse: {e}\nquery: {query}"));
+            // It MUST be a mutation operation — an anonymous/query op is the shipped bug.
+            let op = match &doc.operations {
+                async_graphql_parser::types::DocumentOperations::Single(op) => &op.node,
+                async_graphql_parser::types::DocumentOperations::Multiple(m) => {
+                    &m.values().next().unwrap().node
+                }
+            };
+            assert_eq!(
+                op.ty,
+                async_graphql_parser::types::OperationType::Mutation,
+                "the gateway must dispatch a Mutation as a `mutation`, got: {query}"
+            );
+            // The argument must have arrived — either an inline value or a forwarded variable.
+            let inline = query.contains("agent(input:");
+            let via_var = variables.get("input").is_some();
+            assert!(
+                inline && (query.contains("\"hi\"") || via_var),
+                "the mutation argument was dropped; query={query} vars={variables}"
+            );
+            json!({ "data": { "agent": "ok" } })
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_a_federated_mutation_dispatching_it_as_a_mutation_with_arguments() {
+        // The exact class that shipped broken: a federated mutation with an argument, driven
+        // through the real plan()→execute() path. MutationRunner asserts the subgraph actually
+        // received a `mutation { agent(input: …) }`, so a regression (anonymous op or dropped
+        // arg) fails here instead of silently returning data:null in production.
+        let sg = compose(&[
+            ("accounts".into(), ACCOUNTS.into()),
+            ("agent".into(), AGENT.into()),
+        ])
+        .unwrap();
+
+        // Inline-argument form.
+        let plan_inline = plan("mutation { agent(input: \"hi\") }", &sg).unwrap();
+        let out = execute(&plan_inline, &MutationRunner, &json!({})).await;
+        assert_eq!(out["data"]["agent"], json!("ok"), "out: {out}");
+
+        // Variable form — the common client shape; the variable value must be forwarded.
+        let plan_var = plan("mutation T($input: String){ agent(input: $input) }", &sg).unwrap();
+        let out = execute(&plan_var, &MutationRunner, &json!({ "input": "hi" })).await;
+        assert_eq!(out["data"]["agent"], json!("ok"), "out: {out}");
     }
 
     #[tokio::test]
