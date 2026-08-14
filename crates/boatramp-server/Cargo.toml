@@ -189,6 +189,10 @@ chrono = { version = "0.4", default-features = false, features = [
 
 [dev-dependencies]
 boatramp-core = { workspace = true }
+# The full async-graphql runtime, dev-only (the shipped binary uses just the parser).
+# Emits federation SDL exactly as a live subgraph's `_service { sdl }` does, so the
+# composer is tested against real federation-v2 SDL — not only synthetic fixtures.
+async-graphql = { version = "7" }
 # P-256 for the signer backends' unit tests (building SPKI/DER fixtures). Already
 # in the tree via `boatramp-core[authz]`; exposing it directly is cheap.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }

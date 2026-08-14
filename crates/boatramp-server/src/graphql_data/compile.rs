@@ -1456,12 +1456,11 @@ mod tests {
             &Claims::default(),
         )
         .unwrap();
-        assert!(
-            root.sql.contains(
-                r#"(SELECT json_group_array(json_object('id', "t1"."id")) FROM "posts" AS "t1" WHERE "t1"."author_id" = "users"."id")"#
-            ),
-            "sql: {}",
-            root.sql
+        // Exact full SQL: the correlated JSON subquery is embedded inline in the SELECT
+        // list of the root query (pins the whole shape, not just the subquery fragment).
+        assert_eq!(
+            root.sql,
+            r#"SELECT "users"."name", (SELECT json_group_array(json_object('id', "t1"."id")) FROM "posts" AS "t1" WHERE "t1"."author_id" = "users"."id") FROM "users""#
         );
         // The `posts` field is a JSON-sourced projection.
         assert!(root
@@ -1480,12 +1479,10 @@ mod tests {
             &Claims::default(),
         )
         .unwrap();
-        assert!(
-            root.sql.contains(
-                r#"(SELECT json_object('name', "t1"."name") FROM "users" AS "t1" WHERE "t1"."id" = "posts"."author_id")"#
-            ),
-            "sql: {}",
-            root.sql
+        // Exact full SQL: a to-one relationship is a single-object correlated subquery.
+        assert_eq!(
+            root.sql,
+            r#"SELECT "posts"."id", (SELECT json_object('name', "t1"."name") FROM "users" AS "t1" WHERE "t1"."id" = "posts"."author_id") FROM "posts""#
         );
     }
 
@@ -1506,12 +1503,18 @@ mod tests {
         assert_eq!(d.function, "reviews");
         assert_eq!(d.field, "reviews");
         assert_eq!(d.type_name, "users");
-        assert!(d.entities_query.contains("_entities"));
-        assert!(d.entities_query.contains("... on users"));
-        assert!(d.entities_query.contains("reviews { body }"));
-        // The key column `id` is added to the SELECT so the runner can build representations,
-        // even though the client didn't select it; `reviews` is not a SQL-projected field.
-        assert!(root.sql.contains(r#""users"."id""#), "sql: {}", root.sql);
+        // Exact delegated `_entities` query dispatched to the subgraph function.
+        assert_eq!(
+            d.entities_query,
+            "query($representations:[_Any!]!){ _entities(representations:$representations){ ... on users { reviews { body } } } }"
+        );
+        // Exact root SQL: the key column `id` is appended to the SELECT so the runner can
+        // build entity representations, even though the client didn't select it; `reviews`
+        // is delegated, not SQL-projected.
+        assert_eq!(
+            root.sql,
+            r#"SELECT "users"."name", "users"."id" FROM "users""#
+        );
         assert!(!root.projection.iter().any(|f| f.key == "reviews"));
     }
 
@@ -1608,12 +1611,11 @@ mod tests {
             &super::super::dialect::Sqlite,
         )
         .unwrap();
-        // The key column is selected (for the join) even though only `name` was asked.
-        assert!(plan.sql.contains(r#""users"."name""#), "sql: {}", plan.sql);
-        assert!(
-            plan.sql.contains(r#""users"."id" IN (?1, ?2)"#),
-            "sql: {}",
-            plan.sql
+        // Exact full SQL: only `name` was asked, but the key column `id` is selected (for
+        // the runner to join representations back) and filtered by the keyed `IN` list.
+        assert_eq!(
+            plan.sql,
+            r#"SELECT "users"."name", "users"."id" FROM "users" WHERE "users"."id" IN (?1, ?2)"#
         );
         assert_eq!(
             plan.params,
@@ -1733,5 +1735,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CompileError::UnknownField(f) if f == "users.tenant_id"));
+    }
+
+    #[test]
+    fn a_bounded_delete_compiles_to_a_parameterized_delete() {
+        let stmt = mutate(
+            r#"mutation { delete_users(where: {id: {_eq: "9"}}) { affected_rows } }"#,
+            &open_policy(),
+            &Claims::default(),
+        )
+        .unwrap();
+        assert_eq!(stmt.sql, r#"DELETE FROM "users" WHERE "id" = ?1"#);
+        assert_eq!(stmt.params, vec![SqlValue::Text("9".into())]);
     }
 }

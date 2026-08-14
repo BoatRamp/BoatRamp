@@ -236,6 +236,57 @@ mod tests {
         (name.to_string(), sdl.to_string())
     }
 
+    /// A **real** async-graphql federation subgraph: build a schema, emit its SDL exactly
+    /// as a live subgraph's `_service { sdl }` returns it, and compose that. This proves the
+    /// composer accepts real federation-v2 output — the `extend schema @link(...)` preamble,
+    /// `@key`, and the `_Entity`/`_Service` plumbing — not just the hand-written SDL above
+    /// (the class of gap behind the federation-v2-SDL-rejected incident).
+    #[test]
+    fn composes_sdl_emitted_by_a_real_async_graphql_subgraph() {
+        use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema, SimpleObject, ID};
+
+        #[derive(SimpleObject)]
+        struct User {
+            id: ID,
+            name: String,
+        }
+
+        struct Query;
+
+        #[Object]
+        impl Query {
+            async fn me(&self) -> User {
+                User {
+                    id: ID::from("1"),
+                    name: "Ada".into(),
+                }
+            }
+            // A federation entity resolver ⇒ async-graphql emits `User @key(fields: "id")`.
+            #[graphql(entity)]
+            async fn find_user_by_id(&self, id: ID) -> User {
+                User {
+                    id,
+                    name: "Ada".into(),
+                }
+            }
+        }
+
+        let schema = Schema::build(Query, EmptyMutation, EmptySubscription).finish();
+        let sdl = schema.sdl_with_options(async_graphql::SDLExportOptions::new().federation());
+
+        let sg = compose(&[sub("accounts", &sdl)]).expect("compose real subgraph SDL");
+        // The real subgraph's root `me: User` is owned by accounts.
+        assert_eq!(
+            sg.root_query.get("me").map(String::as_str),
+            Some("accounts")
+        );
+        // `User` is composed as an entity keyed by `id`, parsed from the exact federation
+        // SDL async-graphql emits.
+        let user = sg.entities.get("User").expect("User is an entity");
+        assert_eq!(user.key, vec!["id".to_string()]);
+        assert_eq!(user.subgraphs, vec!["accounts".to_string()]);
+    }
+
     #[test]
     fn composes_root_fields_by_owning_subgraph() {
         let sg = compose(&[sub("accounts", ACCOUNTS), sub("reviews", REVIEWS)]).unwrap();
