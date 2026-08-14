@@ -531,6 +531,41 @@ mod tests {
     }
 
     #[test]
+    fn active_health_probes_eject_after_threshold_and_recover() {
+        use boatramp_core::gateway::ActiveHealth;
+        let mut up = pool(&["a", "b"]);
+        let health = ActiveHealth {
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            ..Default::default()
+        };
+        up.active_health = Some(health.clone());
+        let state = UpstreamState::default();
+        let now = Instant::now();
+        let bs = backends(&up);
+        let has_a = |s: &UpstreamState| -> bool {
+            (0..6)
+                .flat_map(|_| s.candidates(&bs, &up, now, None))
+                .any(|c| c == "a")
+        };
+
+        // One failed probe is below `unhealthy_threshold` — "a" stays in rotation.
+        state.record_probe("a", false, &health);
+        assert!(has_a(&state), "one failed probe must not eject");
+
+        // A second consecutive failure crosses the threshold → "a" is taken out.
+        state.record_probe("a", false, &health);
+        assert!(!has_a(&state), "two failed probes must eject");
+
+        // Recovery is also threshold-gated: one success clears the fail count but does not
+        // bring it back (needs `healthy_threshold` consecutive successes).
+        state.record_probe("a", true, &health);
+        assert!(!has_a(&state), "one success must not yet recover");
+        state.record_probe("a", true, &health);
+        assert!(has_a(&state), "two successes must recover");
+    }
+
+    #[test]
     fn all_ejected_falls_back_to_full_pool() {
         let mut up = pool(&["a", "b"]);
         up.passive_health = Some(PassiveHealth {
