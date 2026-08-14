@@ -213,6 +213,17 @@ handlers: (
 ),
 ```
 
+**Grant a named database explicitly.** The bare `sql` capability grants only the *default*
+(managed, per-site libsql) database — `sql.open("")`. A **named** database needs its own grant: the
+handler imports `sql:<name>` (e.g. `sql:analytics`) — or `sql:*` for every name the site exposes —
+and the site's [`allow_imports`](../reference/siteconfig.md#handlers) must list it too (the site is
+the hard ceiling). A handler that opens only `analytics` imports `sql:analytics`, and
+`sql.open("events")` from it then **fails closed**. This is the seam for **least-privilege tenant
+isolation**: give the tenant-facing path a normal role (say `sql:product`) and any privileged path
+its own binding (`sql:privileged`) — each a distinct connection + credential — so one missed
+`WHERE tenant_id = ?` can't leak across tenants, and Postgres `FORCE ROW LEVEL SECURITY` becomes a
+live backstop instead of resting on app discipline alone.
+
 The guest code is unchanged — the name simply resolves to the external database
 instead of a per-site libsql one, and the **placeholders stay `?N`** on every
 engine (the host rewrites them to Postgres `$N` / MySQL `?` for you):
@@ -233,10 +244,12 @@ Keep these properties in mind — they are the deliberate trade-off of pointing 
 a database boatramp doesn't manage:
 
 - **Isolation is yours.** An external database is a single, *shared* endpoint:
-  every site/function that is granted the `sql` binding and opens the name
-  reaches the same database with whatever the connection URL can do (it runs
+  every site/function granted `sql:<name>` (or `sql:*`) and opening the name
+  reaches the same database with whatever that connection's role can do (it runs
   arbitrary SQL there). Prefer it for a single-tenant deployment or a genuinely
-  shared database; keep competing tenants' data on the managed libsql default.
+  shared database; keep competing tenants' data on the managed libsql default —
+  or, when the shared DB *is* multi-tenant, give the tenant path a
+  least-privilege named binding (above) and enforce `FORCE ROW LEVEL SECURITY`.
 - **Previews are refused by default.** A preview deployment can't open an
   external database unless it was declared with `allow_preview: true`, so a
   preview never accidentally writes to your live data.

@@ -20,10 +20,12 @@ BOATRAMP_LOG_FORMAT=json boatramp serve
 Each request writes one JSON object to stdout:
 
 ```text
-{"target":"boatramp::access","method":"GET","path":"/index.html","host":"my-site.example","client_ip":"203.0.113.7","status":200,"bytes":1841,"encoding":"br","cache_result":"full","duration_ms":3}
+{"target":"boatramp::access","request_id":"1a2b3c-4","method":"GET","path":"/index.html","host":"my-site.example","client_ip":"203.0.113.7","status":200,"bytes":1841,"encoding":"br","cache_result":"full","duration_ms":3}
 ```
 
-The `cache_result` field is one of `full`, `partial`, `not-modified`,
+The `request_id` is assigned per request (an inbound `X-Request-Id` is honored, else generated),
+and the same id tags the request's captured **guest** log lines — so you can correlate a handler's
+output with its access line. The `cache_result` field is one of `full`, `partial`, `not-modified`,
 `redirect`, or `error`. Verbosity follows `RUST_LOG` (default `boatramp=info`).
 Pipe the sink to your log shipper, or to `jq` to read one field:
 
@@ -86,7 +88,8 @@ For every metric, its labels, and their meaning, see the
 ## Tail guest logs and read handler stats
 
 For sites running handlers, two commands report per-site activity. Tail the
-captured guest stdout and stderr, with `--follow` to stream new lines:
+captured guest stdout, stderr, and `wasi:logging` messages, with `--follow` to
+stream new lines:
 
 ```sh
 boatramp logs my-site --follow
@@ -112,6 +115,12 @@ site my-site
 Messages that exhaust their retry budget are dead-lettered — kept with their
 payload and counted here. Inspect the cause in `logs`, then redrive or purge
 them; see [Run consumers, crons, and streams](./background-work.md).
+
+Captured guest lines are also mirrored to the server log under the `boatramp::guest` target (at
+`debug`), so `RUST_LOG=boatramp=debug` surfaces guest output in `serve.log` too — handy in
+development. Each captured line carries the request's `request_id` (above). A site that opts out
+with [`disable_log_capture`](../reference/siteconfig.md#handlers) captures nothing — its guest
+stdio is discarded, useful when output may carry secrets.
 
 ## Reference
 

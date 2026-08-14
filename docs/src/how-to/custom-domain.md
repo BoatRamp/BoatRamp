@@ -148,6 +148,29 @@ the TXT record or token file is published the host goes live on its own — no
   boatramp domain add store.example.com --unverified
   ```
 
+## Wildcard hosts (multi-tenant portal)
+
+Attach a **wildcard** `*.suffix` to a site so every sub-label routes there — the pattern for a
+multi-tenant portal where `<tenant>.example.com` all serve one app:
+
+```sh
+# A wildcard needs DNS-01 proof (no single host for an HTTP token) — see below.
+boatramp domain add '*.example.com' --site my-portal --method dns
+```
+
+**Exact always beats the wildcard.** In the same suffix you can attach exact hosts to *other*
+sites, and they win: `console.example.com` (attached to a console site) and a per-tenant custom
+host serve their exact site, while `tenant7.example.com` (no exact claim) falls through to the
+`*.example.com` portal — at any sub-label depth. So a tenant can never shadow an exact host, and
+the hijack guard blocks one site from claiming a host (exact or wildcard) another already owns.
+
+The portal handler **sees the real `Host`** (`tenant7.example.com`) on the wildcard route — on the
+`Host` header, the `wasi:http` request authority, and `X-Forwarded-Host` — so it can resolve the
+tenant by host. For HTTPS across all sub-labels, issue a wildcard certificate with
+[DNS-01](./wildcard-dns01.md). To wire a wildcard in a **dev run with no real DNS**, use the
+admin `--unverified` override (`boatramp domain add '*.example.com' --site my-portal --unverified`);
+it routes immediately.
+
 ## Remove a domain
 
 Detach a host — attached or still pending — with `domain rm`. It stops routing

@@ -216,8 +216,10 @@ rejected at validate.
 | `wasi:keyvalue` | Per-site KV store. |
 | `wasi:blobstore` | Per-site blob store. |
 | `wasi:messaging` | Publish / subscribe on topics. |
-| `sql` | Per-site SQL database (managed libsql), or an operator-configured external Postgres/MySQL opened by name. |
-| `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities. |
+| `sql` | The **default** per-site SQL database (managed libsql), opened as `sql.open("")`. |
+| `sql:<name>` | A specific operator-configured [named database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql) (e.g. `sql:analytics`), opened as `sql.open("<name>")` — its own connection + role, for least-privilege isolation. |
+| `sql:*` | Every named database the site exposes (a convenience grant; the site's `allow_imports` is still the hard ceiling). |
+| `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities (`wasi:logging` messages are captured into the site's logs alongside stdout/stderr). |
 
 The site's [`allow_imports`](./siteconfig.md#handlers) is the allowlist; a
 handler requesting an import the site does not permit is denied at activation.
