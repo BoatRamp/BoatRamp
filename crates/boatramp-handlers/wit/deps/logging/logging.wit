@@ -1,0 +1,23 @@
+// The `wasi:logging` proposal interface, vendored (unversioned, matching the
+// proposal's canonical WIT). A guest that imports `wasi:logging/logging` emits
+// structured log messages with a priority level + a context tag.
+package wasi:logging;
+
+/// WASI Logging lets a guest emit log messages with a simple priority level and
+/// an uninterpreted context string.
+interface logging {
+  /// A log level, describing a kind of message.
+  enum level {
+    trace,
+    debug,
+    info,
+    warn,
+    error,
+    critical,
+  }
+
+  /// Emit a log message: a `level` (kind of message), a `context` (an
+  /// uninterpreted string that helps consumers group similar messages), and the
+  /// `message` itself.
+  log: func(level: level, context: string, message: string);
+}

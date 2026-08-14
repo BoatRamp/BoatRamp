@@ -279,3 +279,11 @@ interface graphql {
 world graphql-host {
   import graphql;
 }
+
+/// The `wasi:logging` capability world. A guest that imports `wasi:logging/logging`
+/// gets its structured `log(level, context, message)` messages captured into the same
+/// host sink as stdout/stderr, with the level preserved. Like stdio capture (and unlike
+/// the grantable capabilities) this is host-side observability, not a deny-by-default grant.
+world wasi-logging-host {
+  import wasi:logging/logging;
+}

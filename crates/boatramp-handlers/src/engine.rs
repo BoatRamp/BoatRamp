@@ -435,6 +435,11 @@ impl HandlerEngine {
         let mut linker = Linker::<HostState>::new(&self.engine);
         wasmtime_wasi::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+        // `wasi:logging` is host-side observability (captured like stdout/stderr), always linked
+        // — not a grantable capability. A guest that imports it emits into the same log sink.
+        bindings::wasi_logging::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::wasi_logging::WasiLoggingHost::new(state.bindings.logging())
+        })?;
         bindings::keyvalue::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::keyvalue::KvHost::new(&mut state.table, state.bindings.keyvalue())
         })?;
@@ -475,8 +480,11 @@ impl HandlerEngine {
     }
 
     fn new_store(&self, bindings: Bindings, limits: Limits) -> Store<HostState> {
-        // Capture stdout/stderr into the host log sink when granted; otherwise
-        // the guest's stdio is inherited (host stdio).
+        // Capture stdout/stderr into the host log sink. The server wires a sink for
+        // *every* dispatched invocation (host-side observability, not a guest-requested
+        // capability), so this branch is the normal case. Without a sink the guest's
+        // stdio is **discarded** — `WasiCtxBuilder` defaults to a null stream; it is never
+        // wired to the host's stdout — so guest output reaches an operator only via a sink.
         let mut wasi_builder = WasiCtxBuilder::new();
         if let Some(logging) = bindings.logging() {
             use crate::logging::{LogStream, SinkStdout};

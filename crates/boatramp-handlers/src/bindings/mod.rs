@@ -30,6 +30,7 @@ pub mod keyvalue;
 pub mod messaging;
 #[cfg(feature = "sql")]
 pub mod sql;
+pub mod wasi_logging;
 
 /// The per-site capability handles for one handler invocation.
 ///

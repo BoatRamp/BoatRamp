@@ -136,6 +136,12 @@ impl LogStore {
 
 impl LogSink for LogStore {
     fn append(&self, scope: &str, stream: LogStream, line: &str) {
+        // Mirror every captured line into the structured server log (`serve.log`) under the
+        // `boatramp::guest` target, so an operator tailing `serve.log` sees guest output too —
+        // not only the per-site log store / SSE tail. Gated by the tracing level (off at the
+        // default `info`, on at `debug`), so it never floods production; it fires before the
+        // rate cap so `serve.log` is the full firehose while the API-served ring stays bounded.
+        tracing::debug!(target: "boatramp::guest", site = scope, stream = stream.as_str(), "{line}");
         let mut sites = self.sites.lock().unwrap();
         let site = sites
             .entry(scope.to_string())
