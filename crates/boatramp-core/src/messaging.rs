@@ -48,6 +48,22 @@ pub struct ClaimedMessage {
     pub payload: Vec<u8>,
     /// Delivery attempts so far, including this one (starts at 1).
     pub attempts: u32,
+    /// The consumer group this was claimed for. Empty (`""`) is the default
+    /// work-queue (competing consumers, delete-on-ack); a non-empty group is a
+    /// durable fan-out subscriber with its own cursor. `ack`/`nack` branch on it.
+    pub group: String,
+}
+
+/// Where a **new** consumer group starts consuming a topic (its initial cursor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartPosition {
+    /// Only events published from the group's first subscription onward (the
+    /// conventional default; prior history is not replayed).
+    #[default]
+    Latest,
+    /// Every event still retained on the topic, oldest-first (replay the backlog).
+    Earliest,
 }
 
 /// Why a messaging operation failed.
@@ -88,6 +104,32 @@ pub trait Messaging: Send + Sync {
         max_batch: usize,
         max_attempts: u32,
     ) -> Result<Vec<ClaimedMessage>, MessagingError>;
+
+    /// Claim up to `max_batch` deliverable messages for a **consumer group** — a
+    /// durable fan-out subscriber that consumes *every* message on `topic`
+    /// independently of other groups (its own cursor, lease, retry, dead-letter),
+    /// as opposed to [`claim`](Self::claim)'s competing-consumer work-queue. A new
+    /// group's initial cursor is set by `start`. The claimed messages carry
+    /// `group`, so [`ack`](Self::ack) / [`nack`](Self::nack) route to the group's
+    /// state. The default impl supports only the default group (`""`, delegating
+    /// to `claim`) and errors otherwise, so a backend without group support fails
+    /// closed rather than silently under-delivering.
+    async fn claim_grouped(
+        &self,
+        topic: &str,
+        group: &str,
+        _start: StartPosition,
+        lease: Duration,
+        max_batch: usize,
+        max_attempts: u32,
+    ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+        if group.is_empty() {
+            return self.claim(topic, lease, max_batch, max_attempts).await;
+        }
+        Err(MessagingError::Backend(
+            "this messaging backend does not support consumer groups".into(),
+        ))
+    }
 
     /// Acknowledge successful processing — the message is removed for good.
     async fn ack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError>;
@@ -265,6 +307,48 @@ pub fn dead_prefix(topic: &str) -> String {
     format!("mqdead/{topic}/")
 }
 
+// --- consumer-group (durable fan-out) keyspace ---
+// The default work-queue above deletes a message on the single ack. Fan-out
+// needs the message **retained** until each group's cursor passes it, so a
+// grouped topic keeps a parallel, retained log + payload (GC'd by a TTL derived
+// from the timestamp embedded in the id), plus per-group cursor + in-flight state.
+
+/// KV key for a grouped topic's retained log entry (existence marker; the id
+/// carries the publish time, so no value is needed).
+pub fn glog_key(topic: &str, id: &str) -> String {
+    format!("mqglog/{topic}/{id}")
+}
+/// KV prefix for a grouped topic's retained log.
+pub fn glog_prefix(topic: &str) -> String {
+    format!("mqglog/{topic}/")
+}
+/// [`Storage`] key for a grouped topic's retained payload (kept until TTL GC,
+/// independent of any group's ack).
+pub fn gpayload_key(topic: &str, id: &str) -> String {
+    format!("mqgp/{topic}/{id}")
+}
+/// KV key for a group's in-flight record for one message (attempts + lease).
+pub fn gmeta_key(topic: &str, group: &str, id: &str) -> String {
+    format!("mqgm/{topic}/{group}/{id}")
+}
+/// KV prefix for a group's in-flight records.
+pub fn gmeta_prefix(topic: &str, group: &str) -> String {
+    format!("mqgm/{topic}/{group}/")
+}
+/// KV key for a group's pull cursor (the max log id it has materialized). Its
+/// existence also registers the group on the topic.
+pub fn gcursor_key(topic: &str, group: &str) -> String {
+    format!("mqgc/{topic}/{group}")
+}
+/// KV prefix over a topic's group cursors (⇒ the set of registered groups).
+pub fn gcursor_prefix(topic: &str) -> String {
+    format!("mqgc/{topic}/")
+}
+/// KV key for a group's dead-lettered record.
+pub fn gdead_key(topic: &str, group: &str, id: &str) -> String {
+    format!("mqgd/{topic}/{group}/{id}")
+}
+
 /// True when `key` is a *direct* child of `prefix` (its id segment has no
 /// further `/`), so a parent topic's scan never includes its subtopics.
 pub fn is_direct_child(key: &str, prefix: &str) -> bool {
@@ -389,6 +473,25 @@ pub struct LogMessaging {
     seq: AtomicU64,
     /// Local live SSE-stream fan-out (at-most-once + resume ring).
     hubs: StreamHubs,
+    /// Cache of topics that have ≥1 registered consumer group, so `publish` writes
+    /// the retained fan-out log **only** for grouped topics (a non-grouped topic
+    /// pays nothing extra). `None` until lazily loaded from the persisted cursor
+    /// registry on first use.
+    grouped_topics: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
+}
+
+/// How long a grouped topic retains a message (its log + payload) before TTL GC,
+/// derived from the millis embedded in the id. A group must consume within this
+/// window; a slow/absent group loses aged-out messages (bounded retention, like
+/// Kafka's `retention.ms`).
+const GROUP_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Parse the leading unix-millis out of a message id (`{013 millis}-{016 seq}`).
+fn id_millis(id: &str) -> u64 {
+    id.split('-')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0)
 }
 
 impl LogMessaging {
@@ -400,13 +503,59 @@ impl LogMessaging {
             claim_lock: futures::lock::Mutex::new(()),
             seq: AtomicU64::new(0),
             hubs: StreamHubs::new(),
+            grouped_topics: std::sync::Mutex::new(None),
         }
     }
 
+    /// Whether `topic` has ≥1 registered consumer group (so `publish` retains the
+    /// fan-out log/payload). Loads the set once from the persisted cursor registry
+    /// (`mqgc/…`) so it survives a restart, then serves from memory.
+    async fn topic_has_groups(&self, topic: &str) -> bool {
+        {
+            let cache = self.grouped_topics.lock().unwrap();
+            if let Some(set) = cache.as_ref() {
+                return set.contains(topic);
+            }
+        }
+        // Not loaded yet: scan every group cursor once and extract its topic.
+        let keys = self.kv.list_prefix("mqgc/").await.unwrap_or_default();
+        let mut set = std::collections::HashSet::new();
+        for key in keys {
+            // `mqgc/{topic}/{group}` → topic is everything between the first and
+            // last `/`.
+            if let Some(rest) = key.strip_prefix("mqgc/") {
+                if let Some(slash) = rest.rfind('/') {
+                    set.insert(rest[..slash].to_string());
+                }
+            }
+        }
+        let has = set.contains(topic);
+        *self.grouped_topics.lock().unwrap() = Some(set);
+        has
+    }
+
+    /// Mark `topic` as grouped in the in-memory cache (called when a group first
+    /// registers), so subsequent publishes retain its fan-out log.
+    fn mark_grouped(&self, topic: &str) {
+        let mut cache = self.grouped_topics.lock().unwrap();
+        cache
+            .get_or_insert_with(std::collections::HashSet::new)
+            .insert(topic.to_string());
+    }
+
     async fn read_payload(&self, topic: &str, id: &str) -> Result<Vec<u8>, MessagingError> {
+        self.read_storage(&payload_key(topic, id)).await
+    }
+
+    /// Read a retained fan-out payload (the grouped-consumer store).
+    async fn read_gpayload(&self, topic: &str, id: &str) -> Result<Vec<u8>, MessagingError> {
+        self.read_storage(&gpayload_key(topic, id)).await
+    }
+
+    async fn read_storage(&self, key: &str) -> Result<Vec<u8>, MessagingError> {
         let object = self
             .storage
-            .get(&payload_key(topic, id))
+            .get(key)
             .await
             .map_err(MessagingError::backend)?;
         let mut body = object.body;
@@ -451,6 +600,22 @@ impl Messaging for LogMessaging {
             .put(&meta_key(topic, &id), json)
             .await
             .map_err(MessagingError::backend)?;
+        // Grouped (fan-out) topics keep a **retained** copy of the payload + a log
+        // entry, so each group can consume the message on its own cursor long
+        // after the default queue's ack would have deleted it. Only paid on topics
+        // that actually have a registered group.
+        if self.topic_has_groups(topic).await {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(&gpayload_key(topic, &id), body, PutMeta::default())
+                .await
+                .map_err(MessagingError::backend)?;
+            self.kv
+                .put(&glog_key(topic, &id), Vec::new())
+                .await
+                .map_err(MessagingError::backend)?;
+        }
         // Notify live SSE subscribers (best-effort, separate from the durable
         // queue above).
         self.hubs.broadcast(topic, &id, payload);
@@ -513,6 +678,7 @@ impl Messaging for LogMessaging {
                         topic: topic.to_string(),
                         payload,
                         attempts: record.attempts,
+                        group: String::new(),
                     });
                 }
                 ClaimAction::DeadLetter { id, record } => {
@@ -533,7 +699,180 @@ impl Messaging for LogMessaging {
         Ok(claimed)
     }
 
+    async fn claim_grouped(
+        &self,
+        topic: &str,
+        group: &str,
+        start: StartPosition,
+        lease: Duration,
+        max_batch: usize,
+        max_attempts: u32,
+    ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+        // The default group is the legacy work-queue (unchanged).
+        if group.is_empty() {
+            return self.claim(topic, lease, max_batch, max_attempts).await;
+        }
+        let _guard = self.claim_lock.lock().await;
+        let now = now_unix_ms();
+
+        // The retained fan-out log ids, oldest-first.
+        let log_prefix = glog_prefix(topic);
+        let log_keys = self
+            .kv
+            .list_prefix(&log_prefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        let mut log_ids: Vec<String> = log_keys
+            .iter()
+            .filter(|k| is_direct_child(k, &log_prefix))
+            .map(|k| k[log_prefix.len()..].to_string())
+            .collect();
+        log_ids.sort();
+
+        // TTL GC (folded into this scan): drop retained log + payload past the
+        // window, and this group's now-orphaned in-flight record for them.
+        let mut retained = Vec::new();
+        for id in log_ids {
+            if id_millis(&id) + GROUP_RETENTION_MS < now {
+                let _ = self.kv.delete(&glog_key(topic, &id)).await;
+                let _ = self.storage.delete(&gpayload_key(topic, &id)).await;
+                let _ = self.kv.delete(&gmeta_key(topic, group, &id)).await;
+                continue;
+            }
+            retained.push(id);
+        }
+
+        // The group's pull cursor (high-water). First claim initializes it per
+        // `start` and registers the group: `latest` = the current max id (skip
+        // history), `earliest` = "" (replay all retained).
+        let cursor_key = gcursor_key(topic, group);
+        let orig_hw = match self
+            .kv
+            .get(&cursor_key)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            Some(raw) => String::from_utf8_lossy(&raw).into_owned(),
+            None => {
+                self.mark_grouped(topic);
+                match start {
+                    StartPosition::Latest => retained.last().cloned().unwrap_or_default(),
+                    StartPosition::Earliest => String::new(),
+                }
+            }
+        };
+
+        // Materialize a fresh in-flight record for each retained id above the
+        // cursor (new to this group); advance the high-water to the max retained
+        // id. Monotonic ids ⇒ future publishes are always > hw, and an acked id
+        // (≤ hw, its record deleted) is never re-materialized.
+        let mut hw = orig_hw.clone();
+        for id in &retained {
+            if id.as_str() > orig_hw.as_str() {
+                let meta_k = gmeta_key(topic, group, id);
+                if self
+                    .kv
+                    .get(&meta_k)
+                    .await
+                    .map_err(MessagingError::backend)?
+                    .is_none()
+                {
+                    let json =
+                        serde_json::to_vec(&Record::fresh()).map_err(MessagingError::backend)?;
+                    self.kv
+                        .put(&meta_k, json)
+                        .await
+                        .map_err(MessagingError::backend)?;
+                }
+            }
+            if id.as_str() > hw.as_str() {
+                hw = id.clone();
+            }
+        }
+        self.kv
+            .put(&cursor_key, hw.into_bytes())
+            .await
+            .map_err(MessagingError::backend)?;
+
+        // The group's in-flight records → the shared claim/dead-letter decision.
+        let meta_prefix = gmeta_prefix(topic, group);
+        let meta_keys = self
+            .kv
+            .list_prefix(&meta_prefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        let mut records = Vec::new();
+        for key in meta_keys {
+            if !is_direct_child(&key, &meta_prefix) {
+                continue;
+            }
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            records.push((key[meta_prefix.len()..].to_string(), record));
+        }
+        let actions = plan_claim(
+            records,
+            now,
+            lease.as_millis() as u64,
+            max_batch,
+            max_attempts,
+        );
+
+        let mut claimed = Vec::new();
+        for action in actions {
+            match action {
+                ClaimAction::Lease { id, record } => {
+                    // The retained payload may have been TTL-GC'd out from under a
+                    // slow group — drop the record rather than deliver an empty body.
+                    let payload = match self.read_gpayload(topic, &id).await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let _ = self.kv.delete(&gmeta_key(topic, group, &id)).await;
+                            continue;
+                        }
+                    };
+                    let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+                    self.kv
+                        .put(&gmeta_key(topic, group, &id), json)
+                        .await
+                        .map_err(MessagingError::backend)?;
+                    claimed.push(ClaimedMessage {
+                        id,
+                        topic: topic.to_string(),
+                        payload,
+                        attempts: record.attempts,
+                        group: group.to_string(),
+                    });
+                }
+                ClaimAction::DeadLetter { id, record } => {
+                    let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+                    self.kv
+                        .put(&gdead_key(topic, group, &id), json)
+                        .await
+                        .map_err(MessagingError::backend)?;
+                    self.kv
+                        .delete(&gmeta_key(topic, group, &id))
+                        .await
+                        .map_err(MessagingError::backend)?;
+                }
+            }
+        }
+        Ok(claimed)
+    }
+
     async fn ack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
+        // A grouped ack removes only *this group's* in-flight record; the retained
+        // payload stays for the other groups (TTL GC reclaims it).
+        if !msg.group.is_empty() {
+            return self
+                .kv
+                .delete(&gmeta_key(&msg.topic, &msg.group, &msg.id))
+                .await
+                .map_err(MessagingError::backend);
+        }
         self.kv
             .delete(&meta_key(&msg.topic, &msg.id))
             .await
@@ -554,7 +893,12 @@ impl Messaging for LogMessaging {
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
-        let key = meta_key(&msg.topic, &msg.id);
+        // Grouped messages carry their state in the group's in-flight record.
+        let key = if msg.group.is_empty() {
+            meta_key(&msg.topic, &msg.id)
+        } else {
+            gmeta_key(&msg.topic, &msg.group, &msg.id)
+        };
         let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
             return Ok(()); // already acked/gone
         };
@@ -733,6 +1077,94 @@ mod tests {
     }
 
     const LEASE: Duration = Duration::from_secs(30);
+
+    fn payloads(msgs: &[ClaimedMessage]) -> Vec<Vec<u8>> {
+        msgs.iter().map(|m| m.payload.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn consumer_groups_fan_out_and_ack_independently() {
+        let mq = mq();
+        let t = "bus/orders";
+        // Two groups subscribe (first claim registers them + turns on retention),
+        // *then* events flow — the fabric shape (workers deployed before events).
+        assert!(mq
+            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mq
+            .claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(t, b"a").await.unwrap();
+        mq.publish(t, b"b").await.unwrap();
+
+        // Each group independently receives BOTH messages, in order.
+        let billing = mq
+            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&billing), vec![b"a".to_vec(), b"b".to_vec()]);
+        let audit = mq
+            .claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&audit), vec![b"a".to_vec(), b"b".to_vec()]);
+
+        // Billing acks both; that removes only billing's copies — audit is untouched.
+        for m in &billing {
+            mq.ack(m).await.unwrap();
+        }
+        assert!(mq
+            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        // Audit still has its two (leased) messages: nack makes them claimable now.
+        for m in &audit {
+            mq.nack(m).await.unwrap();
+        }
+        let audit_again = mq
+            .claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&audit_again), vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn consumer_group_start_position_latest_vs_earliest() {
+        let mq = mq();
+        let t = "bus/events";
+        // A registered group turns on retention, then two events are published.
+        assert!(mq
+            .claim_grouped(t, "seed", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(t, b"a").await.unwrap();
+        mq.publish(t, b"b").await.unwrap();
+
+        // A NEW `earliest` group replays the retained backlog…
+        let replay = mq
+            .claim_grouped(t, "replay", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&replay), vec![b"a".to_vec(), b"b".to_vec()]);
+        // …while a NEW `latest` group starts empty (only events after it subscribes).
+        let live = mq
+            .claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert!(live.is_empty());
+        mq.publish(t, b"c").await.unwrap();
+        let live_after = mq
+            .claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&live_after), vec![b"c".to_vec()]);
+    }
 
     #[tokio::test]
     async fn publish_claim_ack_roundtrip_and_fifo() {

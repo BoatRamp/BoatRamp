@@ -241,6 +241,10 @@ impl Messaging for RaftMessaging {
                 topic: topic.to_string(),
                 payload,
                 attempts: record.attempts,
+                // Cluster consumer groups are a follow-up; the Raft coordinator
+                // serves the default work-queue group. `claim_grouped` for a
+                // non-empty group falls through to the trait default (errors).
+                group: String::new(),
             });
         }
         Ok(claimed)
