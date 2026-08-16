@@ -142,6 +142,13 @@ pub struct WebhookConfig {
     /// Max request body accepted before verifying/dispatching (default 1 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body_bytes: Option<u64>,
+    /// If set, a **verified** webhook publishes its body onto the project bus at
+    /// this topic (a consumer subscribes with `bus:<topic>`) and returns `202`,
+    /// **without running any component** — the "external event → the fabric"
+    /// ingress, so a quick webhook needs no dedicated `wasi:http` function. Unset
+    /// ⇒ the verified webhook invokes the function as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<String>,
 }
 
 impl WebhookConfig {
@@ -1221,6 +1228,7 @@ mod tests {
             algorithm: WebhookAlgorithm::HmacSha256,
             signature_header: None,
             max_body_bytes: None,
+            publish: None,
         };
         assert_eq!(w.header(), "x-boatramp-signature");
         assert_eq!(w.body_cap(), 1024 * 1024);
@@ -1242,6 +1250,7 @@ mod tests {
             algorithm: WebhookAlgorithm::HmacSha256,
             signature_header: Some("x-hub-signature-256".into()),
             max_body_bytes: Some(4096),
+            publish: None,
         };
         assert_eq!(custom.header(), "x-hub-signature-256");
         assert_eq!(custom.body_cap(), 4096);

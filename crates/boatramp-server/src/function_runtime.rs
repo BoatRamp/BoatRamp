@@ -1553,12 +1553,15 @@ async fn dispatch_function_queue(
 
 // ---- signed webhook ingress (FA-5) -------------------------------------------
 
-/// `POST /_webhooks/:name` (FA-5) — signed inbound-webhook ingress. **Public** but
+/// `POST /_webhooks/:name` — signed inbound-webhook ingress. **Public** but
 /// signature-gated: the request signature is verified over the raw body,
-/// constant-time, **before** the guest runs (the SSRF/abuse guard). Requires the
+/// constant-time, **before** anything runs (the SSRF/abuse guard). Requires the
 /// function to declare a `webhook` config whose `secret_env` names a set host env
-/// var. A valid signature invokes the function (sync, active version) and returns
-/// its response; a missing/invalid signature is `401`, an oversize body `413`.
+/// var. On a valid signature: if the webhook declares a `publish` topic, the body
+/// is dropped onto the project bus and `202` returned (the fabric ingress — no
+/// component runs); otherwise the function is invoked (sync, active version) and
+/// its response returned. A missing/invalid signature is `401`, an oversize body
+/// `413`, a missing secret `503`.
 #[cfg(feature = "handlers")]
 pub(super) async fn webhook_ingress(
     State(deploy): State<DeployStore>,
@@ -1623,6 +1626,26 @@ pub(super) async fn webhook_ingress(
     // Rate-limit quota (fail-closed) applies to a verified webhook like any invoke.
     if let Err(response) = admit_by_quota(inner, &deploy, project.as_ref(), &function).await {
         return response;
+    }
+    // Ingress mode: a verified webhook with a `publish` topic drops the raw body
+    // onto the **project bus** (a consumer subscribes with `bus:<topic>`) and
+    // returns 202 — external input into the fabric with no component to run. The
+    // whole path stayed default-deny (secret required, signature verified, body
+    // capped, quota-admitted) before we got here; a spoofed post never reaches it.
+    if let Some(topic) = &webhook.publish {
+        let Some(messaging) = inner.messaging.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "messaging backend not configured\n",
+            )
+                .into_response();
+        };
+        let bus_topic = format!("{}/{topic}", project.as_ref().qualified("bus"));
+        if let Err(err) = messaging.publish(&bus_topic, &body).await {
+            tracing::warn!(function = %name, topic, %err, "webhook ingress publish failed");
+            return (StatusCode::BAD_GATEWAY, "webhook publish failed\n").into_response();
+        }
+        return (StatusCode::ACCEPTED, "published\n").into_response();
     }
     let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
         return handler_unavailable();

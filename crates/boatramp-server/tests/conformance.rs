@@ -2124,6 +2124,7 @@ async fn deploy_webhook_function(
     name: &str,
     component: &[u8],
     secret_env: &str,
+    publish: Option<&str>,
 ) -> String {
     use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner, WebhookConfig};
     let hash = sha256_hex(component);
@@ -2137,6 +2138,7 @@ async fn deploy_webhook_function(
             algorithm: Default::default(),
             signature_header: None,
             max_body_bytes: None,
+            publish: publish.map(str::to_string),
         }),
         ..Default::default()
     };
@@ -2192,7 +2194,7 @@ async fn function_webhook_verifies_signature_before_dispatch() {
     let storage = Arc::new(MemStorage::default());
     let kv = Arc::new(MemoryKv::new());
     let deploy = DeployStore::new(storage.clone(), kv.clone());
-    deploy_webhook_function(&deploy, "hook", HTTP_200, secret_env).await;
+    deploy_webhook_function(&deploy, "hook", HTTP_200, secret_env, None).await;
     // A plain function (no webhook config) for the 404 case.
     deploy_test_function(&deploy, "plain", HTTP_200, Vec::new()).await;
 
@@ -2255,6 +2257,69 @@ async fn function_webhook_verifies_signature_before_dispatch() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The fabric ingress: a webhook with a `publish` topic drops the **verified**
+/// body onto the project bus (a consumer subscribes with `bus:<topic>`) and
+/// returns 202 — no component runs. A spoofed post never reaches the bus.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn webhook_ingress_publishes_verified_event_to_the_bus() {
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+    let secret_env = "BOATRAMP_TEST_INGRESS_SECRET";
+    std::env::set_var(secret_env, "ingress-key");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    // A webhook that publishes onto the bus rather than invoking a component.
+    deploy_webhook_function(
+        &deploy,
+        "ingest",
+        HTTP_200,
+        secret_env,
+        Some("orders.created"),
+    )
+    .await;
+
+    let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
+    let app = router(deploy, Auth::disabled(), runtime);
+
+    let body = br#"{"id":"o-1"}"#;
+    let sig = hmac_sha256_hex(b"ingress-key", body);
+
+    // A verified webhook is Accepted (202) and the event lands on the project bus
+    // (default project → bare `bus/…`), with the exact body.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("ingest", body, Some(&sig)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let batch = messaging
+        .claim(
+            "bus/orders.created",
+            std::time::Duration::from_secs(30),
+            10,
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].payload, body);
+
+    // A spoofed (unsigned) post is rejected before publish — nothing new on the bus.
+    let resp = app
+        .clone()
+        .oneshot(webhook_request("ingest", body, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---- workflow orchestration (FA-6) -----------------------------------------
