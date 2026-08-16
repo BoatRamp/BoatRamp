@@ -94,10 +94,12 @@ lru = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
-# SlateDB keeps process-global background state, so several `kv_slatedb` tests
-# opening their own instances concurrently intermittently deadlock on close/reopen.
-# `#[serial]` runs them one at a time (they use distinct temp dirs, so this only
-# gates concurrency, not correctness).
+# The `kv_slatedb` tests open a SlateDB instance and close/reopen it. `close()`
+# awaits the background compactor + GC task shutdowns, which could stall on a
+# loaded CI host — the tests now open with those tasks disabled (see
+# `kv_slatedb::tests::test_settings`), which removes the stall. `#[serial]` stays
+# as a secondary guard (one instance at a time; distinct temp dirs, so it gates
+# concurrency, not correctness).
 serial_test = "3"
 
 [lints]

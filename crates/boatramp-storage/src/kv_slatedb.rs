@@ -239,14 +239,33 @@ impl KvStore for SlateKv {
 mod tests {
     use super::*;
 
-    /// Run a SlateDB test `body` under a timeout, retrying on a **fresh** directory.
-    /// SlateDB keeps process-global background state whose close/reopen can
-    /// **intermittently stall on a loaded CI host** (a drain that doesn't complete) —
-    /// a deadlock we could never reproduce locally. `#[serial]` (below) removes
-    /// intra-binary concurrency; this wrapper is the belt-and-suspenders: a stalled
-    /// attempt is abandoned (its dir left behind) and retried on a clean dir, so the
-    /// flake can neither hang the job nor fail the suite on a single bad roll. If
-    /// every attempt stalls it fails **fast** (≈100s), never a multi-hour hang.
+    /// SlateDB settings for tests: the background **compactor and GC tasks are
+    /// disabled** (`None`), so `close()` has nothing to drain. Those two task
+    /// shutdowns — `close()` awaits `shutdown_task(COMPACTOR)` then
+    /// `shutdown_task(GC)` — were the source of the intermittent close/reopen
+    /// stall on a loaded CI host. The durability path these tests exercise (WAL
+    /// flush → L0 → reopen) is unaffected; production keeps both enabled (it
+    /// wants compaction + space reclamation over the store's lifetime).
+    ///
+    /// `flush_interval: None` keeps SlateDB's default flush timer (mirrors
+    /// [`SlateKv::open_local`]); `Some(d)` overrides it (mirrors
+    /// [`SlateKv::open_local_with_flush`]).
+    fn test_settings(flush_interval: Option<Duration>) -> Settings {
+        let mut settings = Settings::default();
+        if let Some(interval) = flush_interval {
+            settings.flush_interval = Some(interval);
+        }
+        settings.compactor_options = None;
+        settings.garbage_collector_options = None;
+        settings
+    }
+
+    /// Run a SlateDB test `body` under a timeout guard, retrying on a **fresh**
+    /// directory. With the background compactor + GC disabled ([`test_settings`])
+    /// the close/reopen stall this used to paper over is gone, so this is now a
+    /// cheap backstop only: `#[serial]` (below) removes intra-binary concurrency,
+    /// and should any future hang appear it fails **fast** (≈100s) rather than
+    /// stalling the job for hours.
     async fn with_fresh_slatedb_dir<F, Fut>(name: &str, body: F)
     where
         F: Fn(std::path::PathBuf) -> Fut,
@@ -277,7 +296,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_round_trips() {
         with_fresh_slatedb_dir("roundtrip", |dir| async move {
-            let kv = SlateKv::open_local(&dir).await.unwrap();
+            let kv = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
 
             kv.put("alias/blog/staging", b"id-1".to_vec())
                 .await
@@ -308,14 +329,19 @@ mod tests {
         with_fresh_slatedb_dir("flush", |dir| async move {
             // A long flush interval so the periodic timer won't auto-persist; the
             // explicit `flush()` (SHUT-1) must be what makes the write durable.
-            let kv = SlateKv::open_local_with_flush(&dir, std::time::Duration::from_secs(3600))
-                .await
-                .unwrap();
+            let kv = SlateKv::open_local_settings(
+                &dir,
+                test_settings(Some(std::time::Duration::from_secs(3600))),
+            )
+            .await
+            .unwrap();
             kv.put("k", b"v".to_vec()).await.unwrap();
             kv.flush().await.unwrap(); // force durability now, not on the timer
             kv.close().await.unwrap();
 
-            let reopened = SlateKv::open_local(&dir).await.unwrap();
+            let reopened = SlateKv::open_local_settings(&dir, test_settings(None))
+                .await
+                .unwrap();
             assert_eq!(reopened.get("k").await.unwrap(), Some(b"v".to_vec()));
             reopened.close().await.unwrap();
         })
@@ -329,9 +355,10 @@ mod tests {
             // The writer process commits config, then flushes/closes so the manifest
             // reflects it (a real replica polls the manifest; here we close to make
             // the committed state visible to a freshly-opened reader).
-            let writer = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
-                .await
-                .unwrap();
+            let writer =
+                SlateKv::open_local_settings(&dir, test_settings(Some(Duration::from_millis(5))))
+                    .await
+                    .unwrap();
             writer.put("site/blog", b"hash-1".to_vec()).await.unwrap();
             writer
                 .write_batch(vec![
@@ -366,9 +393,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn slatedb_write_batch_commits_group() {
         with_fresh_slatedb_dir("batch", |dir| async move {
-            let kv = SlateKv::open_local_with_flush(&dir, Duration::from_millis(5))
-                .await
-                .unwrap();
+            let kv =
+                SlateKv::open_local_settings(&dir, test_settings(Some(Duration::from_millis(5))))
+                    .await
+                    .unwrap();
 
             kv.put("manifests/dep-1", b"old".to_vec()).await.unwrap();
             kv.write_batch(vec![
