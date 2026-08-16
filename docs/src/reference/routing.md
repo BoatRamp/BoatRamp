@@ -258,9 +258,11 @@ A component invoked once per message on a topic. See
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `topic` | string | Topic to subscribe to (namespaced). |
+| `topic` | string | Topic to subscribe to. A `bus:<topic>` prefix subscribes to the shared, project-scoped bus (so producers and consumers in different components meet on one topic); a plain topic is site-private. |
 | `component` | string | Path to the component `.wasm`. |
 | `imports` | list\<string\> | Requested capabilities. |
+| `group` | string | Consumer group. Empty (default) = the competing-consumer **work-queue** (one consumer handles each message); a non-empty name = a durable **fan-out** subscriber that receives *every* message on its own cursor, independent of other groups. |
+| `start` | `latest` \| `earliest` | Where a non-empty `group` starts on first subscription: `latest` (default — only new events) or `earliest` (replay the retained backlog). Ignored for the work-queue. |
 
 ## `crons`
 

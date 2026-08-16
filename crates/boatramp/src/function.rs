@@ -99,6 +99,12 @@ enum FunctionCommand {
         /// verifying secret (never the secret itself).
         #[arg(long)]
         webhook_secret_env: Option<String>,
+        /// Make the webhook an **ingress**: a verified request publishes its body
+        /// onto the project bus at this topic (a consumer subscribes with
+        /// `bus:<topic>`) and returns 202 — no component runs. Needs
+        /// `--webhook-secret-env`.
+        #[arg(long)]
+        webhook_publish: Option<String>,
         /// Server base URL.
         #[arg(long)]
         server: Option<String>,
@@ -386,6 +392,7 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
             component,
             runtime,
             webhook_secret_env,
+            webhook_publish,
             server,
         } => {
             let (server, http) = client::connect(server, config)?;
@@ -402,10 +409,12 @@ pub async fn run(args: FunctionArgs, config: &ProjectConfig) -> Result<()> {
                 cfg.insert("runtime".to_string(), serde_json::json!(r));
             }
             if let Some(secret_env) = &webhook_secret_env {
-                cfg.insert(
-                    "webhook".to_string(),
-                    serde_json::json!({ "secret_env": secret_env }),
-                );
+                let mut webhook = serde_json::Map::new();
+                webhook.insert("secret_env".to_string(), serde_json::json!(secret_env));
+                if let Some(topic) = &webhook_publish {
+                    webhook.insert("publish".to_string(), serde_json::json!(topic));
+                }
+                cfg.insert("webhook".to_string(), serde_json::Value::Object(webhook));
             }
             // Top-level functions carry their own version line (decision 3).
             let body = serde_json::json!({

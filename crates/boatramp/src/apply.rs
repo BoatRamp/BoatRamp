@@ -260,6 +260,11 @@ pub struct ApplyFunction {
     /// (never the secret itself).
     #[serde(default)]
     pub webhook_secret_env: Option<String>,
+    /// Make the webhook an ingress: a verified request publishes its body onto the
+    /// project bus at this topic (`bus:<topic>` for consumers) and returns 202, with
+    /// no component run. Requires `webhook_secret_env`.
+    #[serde(default)]
+    pub webhook_publish: Option<String>,
     /// Requested host capabilities (`sql`, `wasi:keyvalue`, `invoke`, …), gated by
     /// the function import policy — parity with a site handler's `imports`.
     #[serde(default)]
@@ -498,7 +503,12 @@ async fn apply_function<C: ControlPlane>(
         cfg.insert("runtime".to_string(), json!(runtime));
     }
     if let Some(secret_env) = &function.webhook_secret_env {
-        cfg.insert("webhook".to_string(), json!({ "secret_env": secret_env }));
+        let mut webhook = serde_json::Map::new();
+        webhook.insert("secret_env".to_string(), json!(secret_env));
+        if let Some(topic) = &function.webhook_publish {
+            webhook.insert("publish".to_string(), json!(topic));
+        }
+        cfg.insert("webhook".to_string(), serde_json::Value::Object(webhook));
     }
     if !function.imports.is_empty() {
         cfg.insert("imports".to_string(), json!(function.imports));
@@ -670,6 +680,7 @@ mod tests {
             component: "resize.wasm".into(),
             runtime: None,
             webhook_secret_env: None,
+            webhook_publish: None,
             imports: vec![],
             env: Default::default(),
             invoke_targets: vec![],

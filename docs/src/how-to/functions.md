@@ -297,6 +297,12 @@ verifies the signature **constant-time, before the function runs** — a missing
 wrong signature is `401`, and the secret lives only in the host env var you named,
 never in the stored config.
 
+Add `--webhook-publish <topic>` to make the webhook an **ingress** instead: a
+verified request publishes its body onto the project bus at that topic (and returns
+`202`) rather than running the function — bringing external events into a
+message-queue-connected system through one hardened door. See
+[Ingest external events](./background-work.md#ingest-external-events).
+
 ## Remove it
 
 ```console

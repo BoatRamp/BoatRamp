@@ -22,6 +22,81 @@ routing: (
 ),
 ```
 
+## Share a topic across components: the project bus
+
+A plain consumer `topic` is site-private — only that site's own handlers publish to
+it. To let **different components** talk over one topic — a handler in one site, a
+function, or an [external webhook](#ingest-external-events) — publish to and
+subscribe from the shared **project bus** with a `bus:` prefix:
+
+```ron
+routing: (
+    consumers: [
+        // Subscribe to the project-wide `orders.created` bus topic.
+        ( topic: "bus:orders.created", component: "fulfil.wasm",
+          imports: ["wasi:messaging"] ),
+    ],
+),
+```
+
+Anything in the project publishes to the same topic — a guest via `wasi:messaging`
+(`publish("bus:orders.created", …)`), a function's queue trigger, or a webhook
+ingress. The bus is scoped to the **project** (a workspace): every member shares
+it, and it is isolated from other projects. Producer and consumer are decoupled —
+add or remove consumers without touching the producer.
+
+## Fan out to independent workers: consumer groups
+
+By default the consumers on a topic form a **work-queue**: each message goes to
+exactly one of them (competing consumers — add more to scale throughput). Give a
+consumer a **`group`** and it becomes a durable **fan-out subscriber** instead — it
+receives *every* message on the topic, on its own cursor, with its own retries and
+dead-letters. Consumers in different groups each process every message:
+
+```ron
+routing: (
+    consumers: [
+        ( topic: "bus:orders.created", component: "billing.wasm",
+          group: "billing", imports: ["sql"] ),
+        ( topic: "bus:orders.created", component: "audit.wasm",
+          group: "audit", imports: ["wasi:blobstore"] ),
+    ],
+),
+```
+
+`billing` and `audit` each receive every order event; a slow or failing group never
+blocks the other. A new group starts at `start: latest` (only events published after
+it subscribes — the default) or `start: earliest` (replay the retained backlog):
+
+```ron
+( topic: "bus:orders.created", component: "reindex.wasm",
+  group: "reindex", start: earliest ),
+```
+
+Omitting `group` keeps the work-queue behaviour — unchanged.
+
+## Ingest external events
+
+To bring an **external** event (a Stripe or GitHub webhook, a partner callback)
+onto the bus without writing a consumer, deploy a function whose webhook
+*publishes* to a bus topic. A signature-verified request drops its body onto the
+bus and returns `202` — no code runs — and consumer groups process it like any
+other event:
+
+```sh
+BOATRAMP_STRIPE_SECRET=… boatramp function deploy stripe-events \
+    --component ./noop.wasm \
+    --webhook-secret-env BOATRAMP_STRIPE_SECRET \
+    --webhook-publish payments.event
+```
+
+Callers `POST /_webhooks/stripe-events` with the signature header, and a verified
+event lands on `bus:payments.event`. It stays **deny-by-default** — no secret ⇒
+`503`, a missing or wrong signature ⇒ `401`, an oversize body ⇒ `413` — so a
+spoofed post never reaches the bus. (The `--component` is still required today but
+is never run for a publishing webhook.) For the signature scheme, see
+[signed webhooks](./functions.md#signed-webhooks).
+
 ## Declare a cron
 
 A cron invokes an existing route on a schedule, using a standard five-field cron
