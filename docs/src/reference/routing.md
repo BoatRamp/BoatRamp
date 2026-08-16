@@ -244,7 +244,12 @@ handlers: [ (route: "/api", component: "api.wasm", imports: ["invoke"], invoke_t
 | `timeout_ms` | u32? | Wall-clock timeout, ms. |
 | `fuel` | u64? | CPU budget in wasmtime fuel units (deterministic instruction-count bound). Omitted = unmetered. |
 
-Each field may only **lower** the corresponding site cap, never raise it.
+Each field may only **lower** the corresponding site cap, never raise it. A request
+handler is connection-bearing, so its `timeout_ms` is additionally capped by the
+engine's **sync** ceiling (`handlers.sync_max_timeout_ms`, default 10s) — a route that
+declares more is clamped back down. Genuinely long-running work belongs on the
+[async path](../how-to/functions.md#long-running-jobs-run-async-not-sync) (a durable
+`--async` invocation or a workflow), not a request handler held open.
 
 ## `consumers`
 
