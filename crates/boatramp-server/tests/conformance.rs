@@ -3455,6 +3455,8 @@ async fn activation_refuses_a_non_consumer_component() {
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
+                group: String::new(),
+                start: Default::default(),
             }],
             ..Default::default()
         },
@@ -4509,6 +4511,8 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
+                group: String::new(),
+                start: Default::default(),
             }],
             ..Default::default()
         },

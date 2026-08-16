@@ -54,17 +54,9 @@ pub struct ClaimedMessage {
     pub group: String,
 }
 
-/// Where a **new** consumer group starts consuming a topic (its initial cursor).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StartPosition {
-    /// Only events published from the group's first subscription onward (the
-    /// conventional default; prior history is not replayed).
-    #[default]
-    Latest,
-    /// Every event still retained on the topic, oldest-first (replay the backlog).
-    Earliest,
-}
+// A new consumer group's start position — defined in `boatramp-types` (so the
+// deploy config can carry it) and re-exported here for the messaging API.
+pub use boatramp_types::config::StartPosition;
 
 /// Why a messaging operation failed.
 #[derive(Debug, Clone, thiserror::Error)]

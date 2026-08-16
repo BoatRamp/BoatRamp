@@ -989,6 +989,10 @@ pub(super) async fn dispatch_consumer_batch(
     site: &str,
     namespaced_topic: &str,
     scope_prefix: &str,
+    // Empty `group` = the default work-queue (one consumer per message); a
+    // non-empty group is a durable fan-out subscriber with its own cursor.
+    group: &str,
+    start: boatramp_core::messaging::StartPosition,
     component_hash: &str,
     component: &[u8],
     bindings: &boatramp_handlers::Bindings,
@@ -998,7 +1002,7 @@ pub(super) async fn dispatch_consumer_batch(
     batch: usize,
 ) -> usize {
     let claimed = match messaging
-        .claim(namespaced_topic, lease, batch, max_attempts)
+        .claim_grouped(namespaced_topic, group, start, lease, batch, max_attempts)
         .await
     {
         Ok(claimed) => claimed,

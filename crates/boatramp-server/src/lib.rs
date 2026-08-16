@@ -2214,6 +2214,8 @@ mod tests {
                 "blog",
                 topic,
                 "blog/",
+                "",
+                boatramp_core::messaging::StartPosition::Latest,
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
@@ -2243,6 +2245,8 @@ mod tests {
                 "blog",
                 topic,
                 "blog/",
+                "",
+                boatramp_core::messaging::StartPosition::Latest,
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
@@ -2258,6 +2262,76 @@ mod tests {
         assert_eq!(
             kv.get("hkv/blog/delivered/orders/created").await.unwrap(),
             Some(b"3".to_vec())
+        );
+    }
+
+    /// Config-driven fan-out through the dispatcher: two consumers with different
+    /// **groups** on one topic each receive every message (not one-of-N), each
+    /// with its own cursor + ack. The one delivered message increments the
+    /// consumer's counter once *per group*.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consumer_groups_fan_out_through_the_dispatcher() {
+        use boatramp_handlers::{Bindings, HandlerEngine, Limits};
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage, kv.clone());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let hash = boatramp_core::deploy::sha256_hex(EVENT_CONSUMER);
+        let bindings = Bindings::new("blog").with_keyvalue("blog", kv.clone());
+        let topic = "blog/orders/created";
+        let start = boatramp_core::messaging::StartPosition::Latest;
+
+        // Both groups subscribe first (registering them turns on retention), then
+        // one event is published — the fabric shape (workers deployed, then events).
+        for g in ["billing", "audit"] {
+            let n = dispatch_consumer_batch(
+                &engine,
+                &mq,
+                &metrics::Metrics::default(),
+                "blog",
+                topic,
+                "blog/",
+                g,
+                start,
+                &hash,
+                EVENT_CONSUMER,
+                &bindings,
+                Limits::default(),
+                Duration::from_secs(30),
+                5,
+                10,
+            )
+            .await;
+            assert_eq!(n, 0, "no events yet for group {g}");
+        }
+        mq.publish(topic, b"ok").await.unwrap();
+
+        // Each group independently delivers the one message.
+        for g in ["billing", "audit"] {
+            let n = dispatch_consumer_batch(
+                &engine,
+                &mq,
+                &metrics::Metrics::default(),
+                "blog",
+                topic,
+                "blog/",
+                g,
+                start,
+                &hash,
+                EVENT_CONSUMER,
+                &bindings,
+                Limits::default(),
+                Duration::from_secs(30),
+                5,
+                10,
+            )
+            .await;
+            assert_eq!(n, 1, "group {g} should receive the message");
+        }
+        // Delivered once per group ⇒ counted twice (fan-out), not once.
+        assert_eq!(
+            kv.get("hkv/blog/delivered/orders/created").await.unwrap(),
+            Some(b"2".to_vec())
         );
     }
 
@@ -2300,6 +2374,8 @@ mod tests {
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
+                    group: String::new(),
+                    start: Default::default(),
                 }],
                 ..Default::default()
             },

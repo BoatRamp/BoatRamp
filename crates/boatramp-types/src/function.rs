@@ -216,8 +216,16 @@ pub enum TriggerKind {
     },
     /// A stable invoke name — `/api/functions/<name>` (the FaaS verb, FA-3).
     Invoke { name: String },
-    /// A message topic — the "consumer" shape.
-    Queue { topic: String },
+    /// A message topic — the "consumer" shape. An empty `group` is the default
+    /// work-queue; a non-empty `group` is a durable fan-out subscriber (every
+    /// message, its own cursor) starting at `start` on first subscription.
+    Queue {
+        topic: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        group: String,
+        #[serde(default, skip_serializing_if = "crate::config::is_default_start")]
+        start: crate::config::StartPosition,
+    },
     /// A cron schedule — the "cron" shape.
     Cron {
         schedule: String,
@@ -253,7 +261,7 @@ impl std::fmt::Display for Trigger {
                 write!(f, "route {m} {path}")
             }
             TriggerKind::Invoke { name } => write!(f, "invoke {name}"),
-            TriggerKind::Queue { topic } => write!(f, "queue {topic}"),
+            TriggerKind::Queue { topic, .. } => write!(f, "queue {topic}"),
             TriggerKind::Cron { schedule, .. } => write!(f, "cron {schedule}"),
             TriggerKind::Blob { prefix } => write!(f, "blob {prefix}"),
             TriggerKind::Webhook { path, .. } => write!(f, "webhook {path}"),
@@ -782,6 +790,8 @@ pub fn desugar(cfg: &DeployConfig) -> (Vec<FunctionSpec>, Vec<Trigger>) {
         triggers.push(Trigger {
             kind: TriggerKind::Queue {
                 topic: c.topic.clone(),
+                group: c.group.clone(),
+                start: c.start,
             },
             target: Some(FunctionRef {
                 name,
@@ -918,6 +928,8 @@ mod tests {
                 topic: "orders".into(),
                 component: "orders.wasm".into(),
                 imports: vec!["sql".into()],
+                group: String::new(),
+                start: Default::default(),
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),
@@ -969,7 +981,7 @@ mod tests {
         // The queue trigger.
         let queue = triggers
             .iter()
-            .find(|t| matches!(&t.kind, TriggerKind::Queue { topic } if topic == "orders"))
+            .find(|t| matches!(&t.kind, TriggerKind::Queue { topic, .. } if topic == "orders"))
             .unwrap();
         assert_eq!(queue.target.as_ref().unwrap().name, "consumer-orders");
 

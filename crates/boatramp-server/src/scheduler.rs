@@ -369,6 +369,8 @@ pub(super) async fn run_scheduler_tick(
                             &site,
                             &consumer_topic,
                             &consumer_prefix,
+                            &consumer.group,
+                            consumer.start,
                             &entry.hash,
                             wasm,
                             &bindings,

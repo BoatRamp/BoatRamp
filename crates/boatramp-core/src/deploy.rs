@@ -3293,6 +3293,8 @@ mod tests {
             id: "jobs".into(),
             kind: TriggerKind::Queue {
                 topic: "jobs".into(),
+                group: String::new(),
+                start: Default::default(),
             },
             last_fired_minute: None,
         };

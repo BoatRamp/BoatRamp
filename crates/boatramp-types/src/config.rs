@@ -470,6 +470,19 @@ pub struct HandlerLimits {
     pub fuel: Option<u64>,
 }
 
+/// Where a **new** consumer group starts consuming a topic (its initial cursor).
+/// A group with no `group` name is the default work-queue and ignores this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartPosition {
+    /// Only events published from the group's first subscription onward (the
+    /// conventional default; prior history is not replayed).
+    #[default]
+    Latest,
+    /// Every event still retained on the topic, oldest-first (replay the backlog).
+    Earliest,
+}
+
 /// A message-consumer component, invoked per message on a topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -481,6 +494,22 @@ pub struct ConsumerConfig {
     /// Requested capabilities.
     #[serde(default)]
     pub imports: Vec<String>,
+    /// Consumer **group**: empty (default) = the competing-consumer work-queue
+    /// (one of the site's consumers processes each message); a non-empty name = a
+    /// durable fan-out subscriber that receives *every* message on the topic
+    /// independently of other groups. Two consumers with different groups on one
+    /// topic each get every message.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// Where a non-empty `group` starts on first subscription (`latest` |
+    /// `earliest`). Ignored for the default work-queue.
+    #[serde(default, skip_serializing_if = "crate::config::is_default_start")]
+    pub start: StartPosition,
+}
+
+/// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
+pub fn is_default_start(s: &StartPosition) -> bool {
+    *s == StartPosition::default()
 }
 
 /// A scheduled invocation of a declared handler route.

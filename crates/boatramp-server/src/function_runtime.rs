@@ -1420,8 +1420,13 @@ pub(super) async fn dispatch_function_triggers(
                 trigger.last_fired_minute = Some(now.minute_stamp);
                 let _ = deploy.put_trigger(project, &function.name, &trigger).await;
             }
-            TriggerKind::Queue { topic } => {
-                dispatch_function_queue(inner, deploy, project, function, topic).await;
+            TriggerKind::Queue {
+                topic,
+                group,
+                start,
+            } => {
+                dispatch_function_queue(inner, deploy, project, function, topic, group, *start)
+                    .await;
             }
             // Route / Invoke / Webhook are request-driven; Blob / Stream are not
             // dispatched from the scheduler in this pass.
@@ -1471,6 +1476,8 @@ async fn dispatch_function_queue(
     project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
     topic: &str,
+    group: &str,
+    start: boatramp_core::messaging::StartPosition,
 ) {
     let Some(messaging) = inner.messaging.clone() else {
         return;
@@ -1484,9 +1491,14 @@ async fn dispatch_function_queue(
         Some(bus_topic) => format!("{}/{bus_topic}", project.qualified("bus")),
         None => project.qualified(&format!("fn/{}/{topic}", function.name)),
     };
+    // An empty `group` is the default work-queue (`claim_grouped` delegates to
+    // `claim`); a non-empty group is a durable fan-out subscriber with its own
+    // cursor, so several functions can each consume every event on one bus topic.
     let batch = match messaging
-        .claim(
+        .claim_grouped(
             &namespaced,
+            group,
+            start,
             CONSUMER_LEASE,
             CONSUMER_BATCH,
             CONSUMER_MAX_ATTEMPTS,
