@@ -300,6 +300,88 @@ async fn looping_handler_runs_out_of_fuel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sync_lane_clamps_a_declared_timeout_to_the_engine_ceiling() {
+    // The engine sync ceiling is 100ms; a handler that *declares* a far larger
+    // budget is clamped down to it (an override may only lower, never raise) —
+    // so a connection-bearing request can never hold longer than the ceiling.
+    let limits = Limits {
+        timeout_ms: 100,
+        ..Limits::default()
+    };
+    let engine = HandlerEngine::new(limits, 16).expect("engine");
+    let declares_10s = Limits {
+        timeout_ms: 10_000,
+        ..Limits::default()
+    };
+    let err = engine
+        .serve_with_limits(
+            "http-200",
+            HTTP_200,
+            request_path("/loop"),
+            no_caps(),
+            declares_10s,
+        )
+        .await
+        .expect_err("declared 10s is clamped to the 100ms sync ceiling");
+    assert!(matches!(err, HandlerError::Timeout), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn async_lane_uses_its_own_ceiling_not_the_sync_one() {
+    // Sync ceiling is a generous 10s, but the async ceiling is 100ms. A call on
+    // the async lane is bounded by the *async* ceiling — proof the two lanes are
+    // clamped independently (here the async job traps fast despite the roomy sync
+    // ceiling; in production the roles are reversed — async is the larger one).
+    let sync_ceiling = Limits {
+        timeout_ms: 10_000,
+        ..Limits::default()
+    };
+    let async_ceiling = Limits {
+        timeout_ms: 100,
+        ..Limits::default()
+    };
+    let engine = HandlerEngine::new(sync_ceiling, 16)
+        .expect("engine")
+        .with_async_limits(async_ceiling);
+    let declares_10s = Limits {
+        timeout_ms: 10_000,
+        ..Limits::default()
+    };
+    let err = engine
+        .serve_with_limits_async(
+            "http-200",
+            HTTP_200,
+            request_path("/loop"),
+            no_caps(),
+            declares_10s,
+        )
+        .await
+        .expect_err("the async lane clamps to its own 100ms ceiling");
+    assert!(matches!(err, HandlerError::Timeout), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn async_ceiling_defaults_to_the_sync_ceiling_until_opted_in() {
+    // Back-compat: an engine built the old way behaves identically on both lanes
+    // (the async ceiling mirrors the sync one) until a caller opts into a larger
+    // async lane — so existing deployments see no change.
+    let engine = HandlerEngine::new(Limits::default(), 16).expect("engine");
+    assert_eq!(engine.async_timeout_ms(), Limits::default().timeout_ms);
+    assert_eq!(
+        engine.async_max_concurrency(),
+        Limits::default().max_concurrency
+    );
+
+    let raised = engine.with_async_limits(Limits {
+        timeout_ms: 900_000,
+        max_concurrency: 8,
+        ..Limits::default()
+    });
+    assert_eq!(raised.async_timeout_ms(), 900_000);
+    assert_eq!(raised.async_max_concurrency(), 8);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pooling_allocator_serves_real_components() {
     // The pooling allocator must be sized so a real wasi:http + wasi:keyvalue
     // component instantiates and serves (under-sizing fails instantiation).

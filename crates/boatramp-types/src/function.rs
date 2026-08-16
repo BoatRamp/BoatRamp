@@ -497,6 +497,13 @@ pub struct Invocation {
     /// Delivery attempts so far (async).
     #[serde(default)]
     pub attempts: u32,
+    /// Lease expiry (unix seconds) while an async invocation is `Running`: the
+    /// drain that claims it stamps `now + ceiling + margin`, and the drain
+    /// treats a `Running` record whose lease has elapsed as reclaimable — so a
+    /// node that crashes mid-invocation never orphans the job. `None` once the
+    /// invocation settles (or while still `Queued`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires: Option<u64>,
     /// The request body the function receives, base64.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_b64: Option<String>,
@@ -1116,6 +1123,7 @@ mod tests {
             status: InvocationStatus::Queued,
             idempotency_key: Some("k".into()),
             attempts: 0,
+            lease_expires: None,
             request_b64: Some("aGk=".into()),
             request_content_type: Some("text/plain".into()),
             result: None,

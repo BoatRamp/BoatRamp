@@ -2995,6 +2995,7 @@ mod tests {
             status: InvocationStatus::Queued,
             idempotency_key: Some("key-1".into()),
             attempts: 0,
+            lease_expires: None,
             request_b64: None,
             request_content_type: None,
             result: None,

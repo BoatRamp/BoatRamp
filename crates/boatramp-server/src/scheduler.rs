@@ -255,6 +255,7 @@ async fn enqueue_blob_invocation(
         status: boatramp_core::function::InvocationStatus::Queued,
         idempotency_key: None,
         attempts: 0,
+        lease_expires: None,
         request_b64: (!payload.is_empty()).then(|| b64_encode(&payload)),
         request_content_type: Some("application/json".to_string()),
         result: None,
@@ -427,8 +428,11 @@ pub(super) async fn run_scheduler_tick(
     }
     // --- async function invocations (FA-3) ---
     // Drain each top-level function's queued invocations. Leader-gated like crons
-    // (`None` = single node) so a durable async call runs exactly once
-    // cluster-wide; the drain runs inline so the outcome is settled this tick.
+    // (`None` = single node) so a durable async call is claimed exactly once
+    // cluster-wide; the claim is persisted with a lease and the run is spawned off
+    // the tick, so a long background job never stalls this loop (crons, other
+    // drains, workflow progress) and a crash mid-run is reclaimed when the lease
+    // elapses.
     let invoke_enabled = inner.cron_leader_gate.get().is_none_or(|gate| gate());
     if invoke_enabled {
         // Same per-project fan-out as the site loop: each project's functions +

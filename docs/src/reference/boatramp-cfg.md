@@ -126,6 +126,11 @@ Wasm handler runtime. Parsed always, consumed only with the `handlers` feature.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `pooling` | bool | `false` | Use the wasmtime pooling allocator (faster instantiation, large virtual-memory reservation). |
+| `sync_max_timeout_ms` | int | `10000` | Safety-max wall-clock for a **connection-bearing** invocation (a site handler or a synchronous function/webhook invoke). A route/function may declare a *lower* timeout, never a higher one. Kept tight: a client + proxy + the shared request pool block while it runs. |
+| `async_max_timeout_ms` | int | `900000` | Safety-max for a **durable async** invocation — the drain running `?mode=async` calls, workflow steps, cron/queue/blob triggers, and messaging consumers. No client is connected and the work is retried + dead-lettered, so this can be far larger (default 15 min). Runs on its own concurrency budget, so a long job never starves live traffic. |
+| `async_max_concurrency` | int | `8` | Max concurrent in-flight async-lane invocations — a pool separate from (and smaller than) the request pool, so a burst of long background jobs can't exhaust the slots live site traffic needs. |
+| `async_max_fuel` | int | — | Optional CPU **fuel** ceiling for an async-lane invocation. A large async timeout bounds only wall-clock; pair it with a fuel bound to keep a CPU-bound guest from spinning the whole window. Omit ⇒ unmetered. |
+| `outbound_timeout_ms` | int | — | Optional ceiling on a guest's **outbound** `wasi:http` call (connect + first-byte), independent of the invocation timeout, so a hung upstream is bounded on its own terms. The streaming (between-bytes) timeout is left at the default so a slow token stream isn't cut. Omit ⇒ wasmtime default. |
 | `bindings.sql` | table | — | The `sql` host binding. Omit for single-node (a per-site embedded libsql file); set `url` for a shared `sqld`. |
 
 `bindings.sql` fields: `dir`, `url`, `admin_url`, `replica_url`, `token_env`,

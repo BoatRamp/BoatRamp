@@ -79,7 +79,9 @@ pub fn build_engine_pooling(limits: &Limits) -> Result<Engine, HandlerError> {
     pool.total_memories(concurrency.saturating_mul(8).max(16));
     pool.total_tables(concurrency.saturating_mul(8).max(16));
     pool.total_core_instances(concurrency.saturating_mul(8).max(16));
-    pool.total_stacks(concurrency.max(1));
+    // Headroom for the separate async lane's concurrent instances on top of the
+    // sync pool, so both lanes at capacity never run out of async stacks.
+    pool.total_stacks(concurrency.saturating_mul(2).max(16));
     pool.max_memories_per_component(8);
     pool.max_core_instances_per_component(32);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
@@ -119,6 +121,23 @@ impl Default for Limits {
             max_body_bytes: Some(16 * 1024 * 1024),
         }
     }
+}
+
+/// Which resource lane an invocation runs in. The engine keeps a **separate
+/// ceiling and concurrency budget** per lane so the two cannot starve each
+/// other:
+/// - [`Lane::Sync`] — a connection-bearing request (a site handler or a
+///   synchronous function/webhook invoke). A client, proxy, and the shared
+///   request pool are all blocked while it runs, so its ceiling stays tight.
+/// - [`Lane::Async`] — the durable drain / workflow-step path. No client is
+///   connected, the work is retried and dead-lettered, so it can carry a much
+///   larger ceiling on its own concurrency budget without touching live traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// Connection-bearing; tight ceiling; the shared request concurrency pool.
+    Sync,
+    /// Durable background; large ceiling; an isolated concurrency budget.
+    Async,
 }
 
 /// Epoch ticks happen every this many milliseconds; the store deadline is
@@ -170,6 +189,9 @@ struct HostState {
     http: WasiHttpCtx,
     limits: StoreLimits,
     bindings: Bindings,
+    /// Ceiling on this invocation's outbound `wasi:http` connect + first-byte
+    /// wait (from the engine), independent of the invocation's own timeout.
+    outbound_timeout: Option<Duration>,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -200,8 +222,16 @@ impl WasiHttpView for HostState {
     fn send_request(
         &mut self,
         request: http::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        mut config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        // Bound a hung upstream on its own terms (connect + first byte), so it
+        // can't silently ride the whole invocation budget. `None` keeps the
+        // wasmtime default. The between-bytes timeout is left alone so a slow
+        // streaming body (e.g. an LLM token stream) is not cut mid-flight.
+        if let Some(timeout) = self.outbound_timeout {
+            config.connect_timeout = timeout;
+            config.first_byte_timeout = timeout;
+        }
         let use_tls = config.use_tls;
         let handle = wasmtime_wasi::runtime::spawn(async move {
             let result = match egress_target_allowed(request.uri(), use_tls).await {
@@ -260,8 +290,22 @@ pub struct HandlerEngine {
     /// different world (`handle` export) than the request `ProxyPre`.
     #[cfg(feature = "messaging")]
     consumer_cache: Mutex<LruCache<String, consumer_world::ConsumerPre<HostState>>>,
+    /// The [`Lane::Sync`] ceiling — connection-bearing requests are clamped to
+    /// this (default 10s). Named `limits` for back-compat with existing callers.
     limits: Limits,
+    /// The [`Lane::Async`] ceiling — the durable drain / workflow-step path is
+    /// clamped to this instead. Defaults to `limits` (identical behavior) until a
+    /// caller opts into a larger one via [`with_async_limits`](Self::with_async_limits).
+    async_limits: Limits,
+    /// Concurrency gate for the sync lane (the shared request pool).
     semaphore: Semaphore,
+    /// A **separate** concurrency gate for the async lane, so a long background
+    /// job can never exhaust the pool live site traffic draws from.
+    async_semaphore: Semaphore,
+    /// Optional ceiling on a guest's **outbound** `wasi:http` call (connect +
+    /// time-to-first-byte), independent of the invocation's own timeout, so a
+    /// hung upstream is bounded on its own terms. `None` keeps wasmtime's default.
+    outbound_timeout: Option<Duration>,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -310,9 +354,49 @@ impl HandlerEngine {
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            // The async lane defaults to the sync ceiling + an equally-sized,
+            // *independent* pool, so an engine built without opting in behaves
+            // exactly as before (back-compat for tests and existing callers).
+            async_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            async_limits: limits,
+            outbound_timeout: None,
             limits,
             epoch_ticker,
         })
+    }
+
+    /// Set the [`Lane::Async`] ceiling — the drain / workflow-step path is
+    /// clamped to this instead of the sync ceiling, on its own concurrency
+    /// budget (`async_limits.max_concurrency`). This is what lets a durable
+    /// background job declare (and actually get) a timeout well beyond the tight
+    /// sync default, without a long job ever holding a slot live traffic needs.
+    #[must_use]
+    pub fn with_async_limits(mut self, async_limits: Limits) -> Self {
+        self.async_semaphore = Semaphore::new(async_limits.max_concurrency.max(1));
+        self.async_limits = async_limits;
+        self
+    }
+
+    /// Set the ceiling on a guest's **outbound** `wasi:http` request (applied to
+    /// the connect + first-byte timeouts), independent of the invocation budget.
+    #[must_use]
+    pub fn with_outbound_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.outbound_timeout = timeout;
+        self
+    }
+
+    /// The [`Lane::Async`] wall-clock ceiling, milliseconds — the drain reads
+    /// this to size an invocation's lease (it can run for at most this long).
+    #[must_use]
+    pub fn async_timeout_ms(&self) -> u64 {
+        self.async_limits.timeout_ms
+    }
+
+    /// The [`Lane::Async`] concurrency budget — the drain sizes its own claim
+    /// gate to this so it never spawns more background jobs than the lane can run.
+    #[must_use]
+    pub fn async_max_concurrency(&self) -> usize {
+        self.async_limits.max_concurrency
     }
 
     /// Compile (and cache) a component without serving it — the activation
@@ -381,12 +465,15 @@ impl HandlerEngine {
         bindings: Bindings,
         limits: Limits,
     ) -> Result<(), HandlerError> {
+        // A `wasi:messaging` consumer is durable background work (no connected
+        // client), so it runs in the async lane — its own concurrency budget and
+        // the larger async ceiling, never competing with live requests.
         let _permit = self
-            .semaphore
+            .lane_semaphore(Lane::Async)
             .try_acquire()
             .map_err(|_| HandlerError::Overloaded)?;
         let consumer_pre = self.consumer_pre(hash, wasm)?;
-        let mut store = self.new_store(bindings, self.effective_limits(limits));
+        let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
         let consumer = consumer_pre
             .instantiate_async(&mut store)
             .await
@@ -465,17 +552,35 @@ impl HandlerEngine {
         Ok(linker)
     }
 
-    /// Clamp `requested` to the engine's configured ceiling — a per-invocation
+    /// The configured ceiling for `lane`.
+    fn lane_ceiling(&self, lane: Lane) -> Limits {
+        match lane {
+            Lane::Sync => self.limits,
+            Lane::Async => self.async_limits,
+        }
+    }
+
+    /// The concurrency gate for `lane` — the sync lane shares the request pool;
+    /// the async lane has its own, so the two can't starve each other.
+    fn lane_semaphore(&self, lane: Lane) -> &Semaphore {
+        match lane {
+            Lane::Sync => &self.semaphore,
+            Lane::Async => &self.async_semaphore,
+        }
+    }
+
+    /// Clamp `requested` to `lane`'s configured ceiling — a per-invocation
     /// (per-site) override may only *lower* the limits, never raise them.
-    fn effective_limits(&self, requested: Limits) -> Limits {
+    fn effective_limits(&self, lane: Lane, requested: Limits) -> Limits {
+        let ceiling = self.lane_ceiling(lane);
         Limits {
-            memory_bytes: requested.memory_bytes.min(self.limits.memory_bytes),
-            timeout_ms: requested.timeout_ms.min(self.limits.timeout_ms),
-            max_concurrency: requested.max_concurrency.min(self.limits.max_concurrency),
+            memory_bytes: requested.memory_bytes.min(ceiling.memory_bytes),
+            timeout_ms: requested.timeout_ms.min(ceiling.timeout_ms),
+            max_concurrency: requested.max_concurrency.min(ceiling.max_concurrency),
             // A `None` (unmetered) on either side is the larger bound, so the
             // effective fuel is the smaller of any present budgets.
-            fuel: min_opt(requested.fuel, self.limits.fuel),
-            max_body_bytes: min_opt(requested.max_body_bytes, self.limits.max_body_bytes),
+            fuel: min_opt(requested.fuel, ceiling.fuel),
+            max_body_bytes: min_opt(requested.max_body_bytes, ceiling.max_body_bytes),
         }
     }
 
@@ -508,6 +613,7 @@ impl HandlerEngine {
             http: WasiHttpCtx::new(),
             limits: store_limits,
             bindings,
+            outbound_timeout: self.outbound_timeout,
             #[cfg(feature = "sql")]
             sql,
         };
@@ -546,8 +652,9 @@ impl HandlerEngine {
     }
 
     /// Like [`serve`](Self::serve) but with per-invocation `limits` (e.g. a
-    /// site's caps). They are clamped to the engine's configured ceiling — a
-    /// site may only lower the memory/timeout, never raise them.
+    /// site's caps), on the **sync** lane: a connection-bearing request clamped
+    /// to the tight sync ceiling. A site may only lower the memory/timeout,
+    /// never raise them.
     pub async fn serve_with_limits<B>(
         &self,
         hash: &str,
@@ -560,13 +667,52 @@ impl HandlerEngine {
         B: HttpBody<Data = Bytes> + Send + 'static,
         B::Error: std::fmt::Display + Send,
     {
+        self.serve_lane(hash, wasm, request, bindings, limits, Lane::Sync)
+            .await
+    }
+
+    /// Like [`serve_with_limits`](Self::serve_with_limits) but on the **async**
+    /// lane: the durable drain / workflow-step path, clamped to the larger async
+    /// ceiling on its own concurrency budget. No client is connected, so a long
+    /// background job here never blocks live traffic.
+    pub async fn serve_with_limits_async<B>(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        request: http::Request<B>,
+        bindings: Bindings,
+        limits: Limits,
+    ) -> Result<http::Response<HyperOutgoingBody>, HandlerError>
+    where
+        B: HttpBody<Data = Bytes> + Send + 'static,
+        B::Error: std::fmt::Display + Send,
+    {
+        self.serve_lane(hash, wasm, request, bindings, limits, Lane::Async)
+            .await
+    }
+
+    /// The shared serve core: acquire `lane`'s concurrency permit, clamp to
+    /// `lane`'s ceiling, and drive the guest.
+    async fn serve_lane<B>(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        request: http::Request<B>,
+        bindings: Bindings,
+        limits: Limits,
+        lane: Lane,
+    ) -> Result<http::Response<HyperOutgoingBody>, HandlerError>
+    where
+        B: HttpBody<Data = Bytes> + Send + 'static,
+        B::Error: std::fmt::Display + Send,
+    {
         let _permit = self
-            .semaphore
+            .lane_semaphore(lane)
             .try_acquire()
             .map_err(|_| HandlerError::Overloaded)?;
         let proxy_pre = self.proxy_pre(hash, wasm)?;
 
-        let effective = self.effective_limits(limits);
+        let effective = self.effective_limits(lane, limits);
         let mut store = self.new_store(bindings, effective);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let out = store

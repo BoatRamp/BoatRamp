@@ -15,6 +15,20 @@ use boatramp_core::kv::KvStore;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Default async-lane wall-clock ceiling: 15 minutes. Large enough for a
+/// genuinely long background job (an LLM generation, a batch transform) while
+/// staying bounded — work that needs longer belongs in a workflow, one bounded
+/// invocation per step. The lease that guards a crashed-node reclaim is sized
+/// from this, so a bounded value also bounds the orphan-recovery window.
+#[cfg(feature = "handlers")]
+const DEFAULT_ASYNC_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+
+/// Default async-lane concurrency: a small, isolated pool. The point of the
+/// separate budget is that a burst of long background jobs cannot exhaust the
+/// (much larger) request pool live site traffic draws from.
+#[cfg(feature = "handlers")]
+const DEFAULT_ASYNC_CONCURRENCY: usize = 8;
+
 /// Build the WebAssembly handler runtime. With the `handlers` feature it wraps a
 /// wasmtime engine serving the kv/blob bindings from the server's own backends;
 /// otherwise it is an empty placeholder (handler routes fall through to static).
@@ -33,14 +47,44 @@ pub async fn build_handler_runtime(
     deploy: &DeployStore,
     secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {
-    // Opt-in pooling allocator: faster instantiation, large
-    // up-front virtual reservation — benchmark before enabling.
-    let limits = boatramp_handlers::Limits::default();
-    let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
-        boatramp_handlers::HandlerEngine::with_pooling(limits, 64)?
-    } else {
-        boatramp_handlers::HandlerEngine::new(limits, 64)?
+    // Two engine ceilings by lane. The **sync** ceiling bounds connection-bearing
+    // requests (site handlers, synchronous invokes) — kept tight so a slow
+    // handler can't pin a client, a proxy, and the shared request pool; default
+    // 10s. The **async** ceiling bounds the durable drain / workflow / trigger /
+    // messaging path — no client is connected and the work is retried +
+    // dead-lettered, so it can run far longer (default 15 min) on its own
+    // concurrency budget, which is how a legitimately long background job (e.g.
+    // an LLM generation) can declare and actually get minutes of runtime without
+    // ever starving live site traffic.
+    let defaults = boatramp_handlers::Limits::default();
+    let sync_limits = boatramp_handlers::Limits {
+        timeout_ms: handlers_cfg
+            .and_then(|h| h.sync_max_timeout_ms)
+            .unwrap_or(defaults.timeout_ms),
+        ..defaults
     };
+    let async_limits = boatramp_handlers::Limits {
+        timeout_ms: handlers_cfg
+            .and_then(|h| h.async_max_timeout_ms)
+            .unwrap_or(DEFAULT_ASYNC_TIMEOUT_MS),
+        max_concurrency: handlers_cfg
+            .and_then(|h| h.async_max_concurrency)
+            .unwrap_or(DEFAULT_ASYNC_CONCURRENCY),
+        fuel: handlers_cfg.and_then(|h| h.async_max_fuel),
+        ..sync_limits
+    };
+    let outbound_timeout = handlers_cfg
+        .and_then(|h| h.outbound_timeout_ms)
+        .map(std::time::Duration::from_millis);
+    // Opt-in pooling allocator: faster instantiation, large up-front virtual
+    // reservation — benchmark before enabling.
+    let engine = if handlers_cfg.is_some_and(|h| h.pooling) {
+        boatramp_handlers::HandlerEngine::with_pooling(sync_limits, 64)?
+    } else {
+        boatramp_handlers::HandlerEngine::new(sync_limits, 64)?
+    }
+    .with_async_limits(async_limits)
+    .with_outbound_timeout(outbound_timeout);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
         data_dir,

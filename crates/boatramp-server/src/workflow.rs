@@ -230,8 +230,19 @@ async fn run_workflow_step(
     };
     let component = function.resolve(&function.active).map(str::to_owned)?;
     let request = build_step_request(input);
-    let (response, _duration) =
-        execute_function(inner, deploy, project, &function, &component, request, 0).await;
+    // A workflow step is durable background work → async lane (large ceiling,
+    // isolated pool): a slow step never blocks live traffic or the tick.
+    let (response, _duration) = execute_function(
+        inner,
+        deploy,
+        project,
+        &function,
+        &component,
+        request,
+        0,
+        boatramp_handlers::Lane::Async,
+    )
+    .await;
     let (status, _content_type, body) = capture_response(response).await;
     // A guest response (any status the guest itself set, incl. 4xx) is delivered;
     // an engine wrapper 5xx (timeout/trap/overload/missing blob) is a failure.
@@ -261,9 +272,17 @@ async fn compensate_run(
                 if let Some(component) = function.resolve(&function.active).map(str::to_owned) {
                     let request = build_step_request(Vec::new());
                     // Best-effort rollback; its outcome does not change the verdict.
-                    let _ =
-                        execute_function(inner, deploy, project, &function, &component, request, 0)
-                            .await;
+                    let _ = execute_function(
+                        inner,
+                        deploy,
+                        project,
+                        &function,
+                        &component,
+                        request,
+                        0,
+                        boatramp_handlers::Lane::Async,
+                    )
+                    .await;
                 }
             }
         }

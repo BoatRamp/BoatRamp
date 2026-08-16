@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Added
+- **Long-running background jobs get their own timeout + concurrency lane.** The wasm handler
+  engine had a single wall-clock ceiling (10s) that clamped *every* invocation, so a function or
+  route that declared a longer `timeout_ms` for a legitimately long durable job — an LLM
+  generation, a batch transform run via `--async`, a workflow step, a cron/queue/blob trigger, a
+  messaging consumer — was silently clamped back to 10s, with no way to run longer. The engine now
+  keeps **two** ceilings: a tight **sync** ceiling for connection-bearing requests (a site handler
+  or synchronous invoke — a client, proxy, and the shared request pool block while it runs;
+  `handlers.sync_max_timeout_ms`, default 10s) and a much larger **async** ceiling for the durable
+  drain (`handlers.async_max_timeout_ms`, default 15 min) on its **own concurrency budget**
+  (`handlers.async_max_concurrency`, default 8), so a long background job runs to completion — its
+  declared `timeout_ms` honored up to the async ceiling — without ever starving live site traffic.
+  New knobs `handlers.async_max_fuel` (a CPU bound to pair with the larger wall-clock window) and
+  `handlers.outbound_timeout_ms` (bound a hung upstream `wasi:http` call on its own terms). Defaults
+  preserve prior behavior byte-for-byte for anything that didn't declare a longer timeout.
+
+### Changed
+- **The async invocation drain runs off the scheduler tick and is crash-safe.** It previously ran
+  each queued invocation inline on the 500ms tick, so a single long job stalled all crons, other
+  drains, and workflow progress. The drain now **claims** an invocation (persisting a lease) and
+  **spawns** the run, bounded by the async concurrency budget. A claim carries a lease sized to the
+  async ceiling: if the node dies mid-run, a later drain (this node after restart, or a new leader)
+  reclaims the invocation once the lease elapses and retries it — a background job is never silently
+  lost. Work that needs longer than one async ceiling should be a workflow (one bounded invocation
+  per step).
+
 ## [0.2.8] - 2026-08-14
 
 ### Added

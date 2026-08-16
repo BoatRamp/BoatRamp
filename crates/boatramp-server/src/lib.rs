@@ -217,6 +217,12 @@ pub struct HandlerRuntime {
 #[cfg(feature = "handlers")]
 struct HandlerRuntimeInner {
     engine: boatramp_handlers::HandlerEngine,
+    /// Claim gate for the durable async drain, sized to the engine's async-lane
+    /// concurrency. The drain acquires an owned permit before claiming +
+    /// spawning an invocation and holds it for the whole run, so a backlog can
+    /// never spawn more background jobs than the async lane can run (bounded
+    /// fan-out, no attempt-burning overload storm).
+    async_drain_gate: Arc<tokio::sync::Semaphore>,
     kv: Arc<dyn boatramp_core::kv::KvStore>,
     storage: Arc<dyn boatramp_core::Storage>,
     /// Per-site SQL database provider (libsql — single-node files by default;
@@ -319,9 +325,13 @@ impl HandlerRuntime {
         sql: Option<Arc<dyn boatramp_core::sql::SqlBackends>>,
         messaging: Option<Arc<dyn boatramp_core::messaging::Messaging>>,
     ) -> Self {
+        // Size the async drain gate to the engine's async-lane concurrency
+        // (read before `engine` is moved into the runtime).
+        let async_drain_slots = engine.async_max_concurrency().max(1);
         Self {
             inner: Some(Arc::new(HandlerRuntimeInner {
                 engine,
+                async_drain_gate: Arc::new(tokio::sync::Semaphore::new(async_drain_slots)),
                 kv,
                 storage,
                 sql,
@@ -2553,6 +2563,7 @@ mod tests {
             status: InvocationStatus::Queued,
             idempotency_key: None,
             attempts: 0,
+            lease_expires: None,
             request_b64: None,
             request_content_type: None,
             result: None,
@@ -2581,12 +2592,10 @@ mod tests {
             .await
             .unwrap();
 
+        // The drain claims + spawns the run off the tick, so poll for the
+        // terminal transition rather than assuming synchronous settlement.
+        let settled = poll_invocation_settled(&deploy, acme, "worker", "inv1").await;
         // The invocation settled Succeeded **in `acme`** …
-        let settled = deploy
-            .get_invocation(acme, "worker", "inv1")
-            .await
-            .unwrap()
-            .expect("invocation still present in acme");
         assert_eq!(settled.status, InvocationStatus::Succeeded);
         // … metered in `acme` …
         let metering = deploy.get_metering(acme, "worker").await.unwrap().unwrap();
@@ -2602,6 +2611,149 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Poll a durable invocation until it leaves the in-flight states — the drain
+    /// spawns the run off the tick, so settlement is asynchronous. Panics on
+    /// timeout so a stuck run fails the test rather than hanging it.
+    #[cfg(feature = "handlers")]
+    async fn poll_invocation_settled(
+        deploy: &boatramp_core::deploy::DeployStore,
+        project: ProjectRef<'_>,
+        function: &str,
+        id: &str,
+    ) -> boatramp_core::function::Invocation {
+        use boatramp_core::function::InvocationStatus;
+        for _ in 0..200 {
+            if let Some(inv) = deploy.get_invocation(project, function, id).await.unwrap() {
+                if matches!(
+                    inv.status,
+                    InvocationStatus::Succeeded | InvocationStatus::Failed
+                ) {
+                    return inv;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("invocation {function}/{id} never settled");
+    }
+
+    /// A `Running` invocation whose **lease has elapsed** (the node holding it
+    /// crashed mid-run) is reclaimed by a later drain and runs to completion; one
+    /// whose lease is still in the future is left untouched (no double-run). This
+    /// is the crash-recovery guarantee that makes a large async ceiling safe.
+    #[cfg(feature = "handlers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_reclaims_an_expired_lease_and_skips_a_live_one() {
+        use crate::scheduler::{run_scheduler_tick, CronNow};
+        use boatramp_core::deploy::DeployStore;
+        use boatramp_core::function::{
+            Function, FunctionVersion, Invocation, InvocationStatus, InvokeMode, Lifecycle, Owner,
+        };
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use futures::StreamExt;
+
+        const HTTP_200: &[u8] =
+            include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+        let hash = boatramp_core::deploy::sha256_hex(HTTP_200);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+
+        let function = Function {
+            name: "worker".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: Default::default(),
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        // Two `Running` records: one already claimed by a now-dead node (lease in
+        // the past), one held by a live node (lease far in the future).
+        let base = Invocation {
+            id: String::new(),
+            function: "worker".into(),
+            version: "v1".into(),
+            mode: InvokeMode::Async,
+            status: InvocationStatus::Running,
+            idempotency_key: None,
+            attempts: 1,
+            lease_expires: None,
+            request_b64: None,
+            request_content_type: None,
+            result: None,
+            created: 0,
+            updated: 0,
+        };
+        let orphan = Invocation {
+            id: "orphan".into(),
+            lease_expires: Some(1),
+            ..base.clone()
+        };
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &orphan)
+            .await
+            .unwrap();
+        let live = Invocation {
+            id: "live".into(),
+            lease_expires: Some(u64::MAX),
+            ..base.clone()
+        };
+        deploy
+            .put_invocation(ProjectRef::DEFAULT, &live)
+            .await
+            .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage.clone(), None, None);
+        let inner = rt.inner.as_ref().unwrap();
+
+        let now = CronNow {
+            minute: 0,
+            hour: 0,
+            dom: 1,
+            month: 1,
+            dow: 0,
+            minute_stamp: 0,
+        };
+        let mut wasm_cache = std::collections::HashMap::new();
+        let mut cron_state = std::collections::HashMap::new();
+        run_scheduler_tick(inner, &deploy, &mut wasm_cache, &mut cron_state, now)
+            .await
+            .unwrap();
+
+        // The orphan was reclaimed and ran to completion, its attempt advanced …
+        let settled =
+            poll_invocation_settled(&deploy, ProjectRef::DEFAULT, "worker", "orphan").await;
+        assert_eq!(settled.status, InvocationStatus::Succeeded);
+        assert_eq!(settled.attempts, 2, "a reclaim counts as another attempt");
+        assert_eq!(
+            settled.lease_expires, None,
+            "a settled invocation drops its lease"
+        );
+        // … while the live-lease invocation was left exactly as it was.
+        let live_after = deploy
+            .get_invocation(ProjectRef::DEFAULT, "worker", "live")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live_after.status, InvocationStatus::Running);
+        assert_eq!(live_after.attempts, 1, "a live lease is never reclaimed");
+        assert_eq!(live_after.lease_expires, Some(u64::MAX));
     }
 
     /// BR-TEN-1 (Critical) gate: a same-named **function** in two tenant
@@ -2677,8 +2829,17 @@ mod tests {
         // `default`, all named identically.
         let component = store.resolve(&store.active).unwrap().to_owned();
         for project in [acme, globex, ProjectRef::DEFAULT] {
-            let (response, _) =
-                execute_function(inner, &deploy, project, &store, &component, request(), 0).await;
+            let (response, _) = execute_function(
+                inner,
+                &deploy,
+                project,
+                &store,
+                &component,
+                request(),
+                0,
+                boatramp_handlers::Lane::Sync,
+            )
+            .await;
             assert!(response.status().is_success(), "invocation should succeed");
         }
 

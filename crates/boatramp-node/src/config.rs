@@ -392,6 +392,37 @@ pub struct HandlersConfig {
     /// instantiation at the cost of a large up-front virtual-memory reservation.
     /// Off by default — opt in and benchmark for your workload.
     pub pooling: bool,
+    /// Engine-wide **safety max** on a *connection-bearing* invocation (a site
+    /// handler or a synchronous function/webhook invoke), milliseconds. A route
+    /// or function may declare a *lower* timeout, never a higher one. Kept tight
+    /// on purpose: a client, proxy, and the shared request pool are all blocked
+    /// while a sync handler runs. Absent ⇒ 10s (the historical default). This is
+    /// a node safety ceiling, not a per-invocation budget, and is distinct from
+    /// a per-site `max_timeout_ms`.
+    pub sync_max_timeout_ms: Option<u64>,
+    /// Engine-wide safety max on a *durable async* invocation — the drain that
+    /// runs `?mode=async` calls, workflow steps, cron/queue/blob triggers, and
+    /// `wasi:messaging` consumers, milliseconds. No client is connected and the
+    /// work is retried + dead-lettered, so this can be far larger than the sync
+    /// ceiling: it is what lets a legitimately long background job (e.g. an LLM
+    /// generation) declare and actually get minutes of runtime. Absent ⇒ 15
+    /// minutes. Runs on its own concurrency budget (`async_max_concurrency`), so
+    /// a long job never starves live traffic.
+    pub async_max_timeout_ms: Option<u64>,
+    /// Max concurrent in-flight *async-lane* invocations, kept separate from the
+    /// (larger) request pool so a burst of long background jobs can't exhaust the
+    /// slots live site traffic needs. Absent ⇒ 8.
+    pub async_max_concurrency: Option<usize>,
+    /// Optional CPU **fuel** ceiling for an async-lane invocation. A large async
+    /// timeout bounds only wall-clock; without a fuel bound a CPU-bound guest can
+    /// spin for the whole window. Absent ⇒ unmetered (same as the sync default).
+    pub async_max_fuel: Option<u64>,
+    /// Optional ceiling on a guest's **outbound** `wasi:http` call — the connect
+    /// and time-to-first-byte wait — milliseconds, independent of the invocation
+    /// timeout, so a hung upstream is bounded on its own terms. The streaming
+    /// (between-bytes) timeout is left at wasmtime's default so a slow token
+    /// stream is not cut mid-flight. Absent ⇒ wasmtime's default.
+    pub outbound_timeout_ms: Option<u64>,
 }
 
 /// `handlers.bindings` — per-binding backend configuration. kv/blob reuse the

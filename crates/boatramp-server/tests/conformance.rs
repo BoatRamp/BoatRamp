@@ -2567,15 +2567,30 @@ async fn function_cron_trigger_runs_a_scheduled_invocation() {
     let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
     assert!(n >= 1, "counter did not advance: {n}");
 
-    // A durable, succeeded invocation was recorded for the fire.
-    let invs = deploy
-        .list_invocations(ProjectRef::DEFAULT, "counter")
-        .await
-        .unwrap();
-    assert!(invs.iter().any(|i| matches!(
-        i.status,
-        boatramp_core::function::InvocationStatus::Succeeded
-    )));
+    // A durable, succeeded invocation was recorded for the fire. The run settles
+    // off the scheduler tick (spawned), so poll for the terminal transition
+    // rather than assuming it lands the instant the counter is visible.
+    let mut settled = false;
+    for _ in 0..120 {
+        let invs = deploy
+            .list_invocations(ProjectRef::DEFAULT, "counter")
+            .await
+            .unwrap();
+        if invs.iter().any(|i| {
+            matches!(
+                i.status,
+                boatramp_core::function::InvocationStatus::Succeeded
+            )
+        }) {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        settled,
+        "no succeeded invocation was recorded for the cron fire"
+    );
 
     // Delete removes it (idempotent).
     let del = Request::builder()

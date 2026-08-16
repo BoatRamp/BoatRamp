@@ -19,6 +19,13 @@ const INVOKE_AUTHORITY: &str = "function.invoke";
 #[cfg(feature = "handlers")]
 const MAX_INVOKE_ATTEMPTS: u32 = 5;
 
+/// Grace added to the async ceiling when stamping a claimed invocation's lease.
+/// The lease elapses only after the whole ceiling *plus* this margin, so it can
+/// never expire under a legitimately long run — only after a real crash — while
+/// keeping the crash-recovery window bounded (ceiling + margin).
+#[cfg(feature = "handlers")]
+const LEASE_MARGIN_SECS: u64 = 60;
+
 /// Max request body buffered when **enqueuing** an async invocation. The sync
 /// path streams into the guest and never buffers; async must persist the body,
 /// so it is bounded here (mirrors the engine's default body cap).
@@ -149,8 +156,17 @@ async fn execute_sync(
     request: Request,
     idem_key: Option<String>,
 ) -> Response {
-    let (response, duration_ms) =
-        execute_function(inner, deploy, project, function, component, request, 0).await;
+    let (response, duration_ms) = execute_function(
+        inner,
+        deploy,
+        project,
+        function,
+        component,
+        request,
+        0,
+        boatramp_handlers::Lane::Sync,
+    )
+    .await;
     let Some(key) = idem_key else {
         // No capture on the plain streaming path: meter counts + duration + a
         // head-status success signal (byte totals are metered on the buffered
@@ -183,6 +199,7 @@ async fn execute_sync(
         status: boatramp_core::function::InvocationStatus::Succeeded,
         idempotency_key: Some(key.clone()),
         attempts: 1,
+        lease_expires: None,
         request_b64: None,
         request_content_type: None,
         result: Some(boatramp_core::function::InvocationResult {
@@ -241,6 +258,7 @@ async fn enqueue_invocation(
         status: boatramp_core::function::InvocationStatus::Queued,
         idempotency_key: idem_key.clone(),
         attempts: 0,
+        lease_expires: None,
         request_b64: (!body.is_empty()).then(|| b64_encode(&body)),
         request_content_type: content_type,
         result: None,
@@ -305,6 +323,7 @@ fn replay_invocation(inv: &boatramp_core::function::Invocation) -> Response {
 /// `max_concurrent`-full function yields `503` (a retryable delivery failure for
 /// the async drain).
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_function(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
@@ -313,6 +332,10 @@ pub(super) async fn execute_function(
     component: &str,
     request: Request,
     depth: u32,
+    // Which engine lane to run in: `Sync` for a connection-bearing invoke
+    // (tight ceiling, shared pool), `Async` for the durable drain / workflow
+    // step (large ceiling, isolated pool). See [`boatramp_handlers::Lane`].
+    lane: boatramp_handlers::Lane,
 ) -> (Response, u64) {
     // Concurrency quota (held through the head, mirroring the site permit).
     // Keyed by the **project-qualified** function identity so a same-named
@@ -349,10 +372,20 @@ pub(super) async fn execute_function(
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
-    let result = inner
-        .engine
-        .serve_with_limits(component, &wasm, request, bindings, limits)
-        .await;
+    let result = match lane {
+        boatramp_handlers::Lane::Sync => {
+            inner
+                .engine
+                .serve_with_limits(component, &wasm, request, bindings, limits)
+                .await
+        }
+        boatramp_handlers::Lane::Async => {
+            inner
+                .engine
+                .serve_with_limits_async(component, &wasm, request, bindings, limits)
+                .await
+        }
+    };
     let elapsed = start.elapsed();
     inner.metrics.observe(
         &function.name,
@@ -596,6 +629,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             &component,
             axum_request,
             depth,
+            boatramp_handlers::Lane::Sync,
         )
         .await;
         let invoke_response = buffer_invoke_response(response).await;
@@ -647,6 +681,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             &component,
             axum_request,
             depth,
+            boatramp_handlers::Lane::Sync,
         )
         .await;
         let stream_response = stream_invoke_response(response);
@@ -759,7 +794,16 @@ pub(super) async fn introspect_service_sdl(
     let request = build_internal_request(invoke).map_err(SubgraphSdlError::InvokeFailed)?;
     let run = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        execute_function(inner, deploy, project, function, component, request, 0),
+        execute_function(
+            inner,
+            deploy,
+            project,
+            function,
+            component,
+            request,
+            0,
+            boatramp_handlers::Lane::Sync,
+        ),
     )
     .await;
     let (response, _ms) = match run {
@@ -860,16 +904,20 @@ pub(super) fn b64_decode(s: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Drain a function's queued async invocations: run each once, capturing its
-/// result. A failed run is retried next tick until [`MAX_INVOKE_ATTEMPTS`], then
-/// dead-lettered (left `failed` for inspection). Driven from the scheduler tick.
+/// Drain a function's queued async invocations: claim each within the async
+/// lane's budget and run it **off the tick**, so a long background job never
+/// stalls crons, other drains, or workflow progress. A crash mid-run leaves a
+/// `Running` record whose **lease** eventually elapses; a later drain (this node
+/// after restart, or a new leader) reclaims it. A failed run is retried until
+/// [`MAX_INVOKE_ATTEMPTS`], then dead-lettered (left `failed` for inspection).
 #[cfg(feature = "handlers")]
 pub(super) async fn drain_function_invocations(
-    inner: &HandlerRuntimeInner,
+    inner: &Arc<HandlerRuntimeInner>,
     deploy: &DeployStore,
     project: ProjectRef<'_>,
     function: &boatramp_core::function::Function,
 ) {
+    use boatramp_core::function::InvocationStatus;
     let queued = match deploy.list_invocations(project, &function.name).await {
         Ok(list) => list,
         Err(err) => {
@@ -877,21 +925,75 @@ pub(super) async fn drain_function_invocations(
             return;
         }
     };
+    let now = now_unix();
     for inv in queued {
-        if !matches!(
-            inv.status,
-            boatramp_core::function::InvocationStatus::Queued
-        ) {
+        // Claimable = freshly queued, or a `Running` whose lease has elapsed (the
+        // node holding it died mid-run — reclaim it, counting the attempt).
+        let claimable = match inv.status {
+            InvocationStatus::Queued => true,
+            InvocationStatus::Running => inv.lease_expires.is_none_or(|exp| exp <= now),
+            InvocationStatus::Succeeded | InvocationStatus::Failed => false,
+        };
+        if !claimable {
             continue;
         }
-        run_queued_invocation(inner, deploy, project, function, inv).await;
+        // Bound fan-out to the async lane's capacity by holding an owned permit
+        // for the whole run. When the gate is full, leave the rest queued for a
+        // later tick — no unbounded spawn, and backpressure never burns an attempt.
+        let Ok(permit) = inner.async_drain_gate.clone().try_acquire_owned() else {
+            break;
+        };
+        // Claim: pin `Running` + a lease sized to the async ceiling, count the
+        // attempt, and persist. The persisted lease is the cluster-wide claim —
+        // another leader won't re-run it until the lease elapses; counting the
+        // attempt *before* running means a run that crashes the node still
+        // advances toward the dead-letter cap, so a poison job can't loop forever.
+        let mut claimed = inv;
+        claimed.status = InvocationStatus::Running;
+        claimed.attempts = claimed.attempts.saturating_add(1);
+        claimed.lease_expires = Some(now.saturating_add(lease_ttl_secs(inner)));
+        claimed.updated = now;
+        if let Err(err) = deploy.put_invocation(project, &claimed).await {
+            tracing::warn!(function = %function.name, %err, "claiming invocation failed");
+            drop(permit);
+            continue;
+        }
+        let inner = inner.clone();
+        let deploy = deploy.clone();
+        let project = project.as_str().to_string();
+        let function = function.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // released when the run settles
+            run_claimed_invocation(
+                &inner,
+                &deploy,
+                ProjectRef::new(&project),
+                &function,
+                claimed,
+            )
+            .await;
+        });
     }
 }
 
-/// Execute one queued invocation against its pinned version, persisting the
-/// terminal outcome (or re-queuing for retry / dead-lettering on failure).
+/// The lease TTL (seconds) stamped on a claimed invocation: the async ceiling
+/// (the longest a run can take) plus a margin, so the lease only elapses after a
+/// genuine crash, never under a legitimately long-running job.
 #[cfg(feature = "handlers")]
-async fn run_queued_invocation(
+fn lease_ttl_secs(inner: &HandlerRuntimeInner) -> u64 {
+    inner
+        .engine
+        .async_timeout_ms()
+        .div_ceil(1000)
+        .saturating_add(LEASE_MARGIN_SECS)
+}
+
+/// Run an already-**claimed** (`Running`) invocation against its pinned version
+/// and persist the settled outcome — terminal (`succeeded`/`failed`) or requeued
+/// for retry. The claim (status / attempt / lease) was written by the drain;
+/// this clears the lease once the invocation settles.
+#[cfg(feature = "handlers")]
+async fn run_claimed_invocation(
     inner: &HandlerRuntimeInner,
     deploy: &DeployStore,
     project: ProjectRef<'_>,
@@ -903,25 +1005,30 @@ async fn run_queued_invocation(
     let Some(component) = function.resolve(&inv.version).map(str::to_owned) else {
         // The pinned version is gone (rolled off / pruned) — unrunnable, so fail.
         inv.status = InvocationStatus::Failed;
+        inv.lease_expires = None;
         inv.updated = now_unix();
         let _ = deploy.put_invocation(project, &inv).await;
         return;
     };
-    inv.status = InvocationStatus::Running;
-    inv.attempts = inv.attempts.saturating_add(1);
-    inv.updated = now_unix();
-    if let Err(err) = deploy.put_invocation(project, &inv).await {
-        tracing::warn!(function = %function.name, %err, "marking invocation running failed");
-        return;
-    }
     let bytes_in = inv
         .request_b64
         .as_deref()
         .map(|b| b64_decode(b).len() as u64)
         .unwrap_or(0);
     let request = build_stored_request(&inv);
-    let (response, duration_ms) =
-        execute_function(inner, deploy, project, function, &component, request, 0).await;
+    // The durable drain runs in the async lane: no client is connected, so it
+    // gets the larger async ceiling on the isolated async pool.
+    let (response, duration_ms) = execute_function(
+        inner,
+        deploy,
+        project,
+        function,
+        &component,
+        request,
+        0,
+        boatramp_handlers::Lane::Async,
+    )
+    .await;
     let (status, content_type, body) = capture_response(response).await;
     // A function that returns a 5xx from the engine wrapper (timeout/trap/etc.)
     // is a delivery failure worth retrying; any response the guest itself
@@ -941,6 +1048,9 @@ async fn run_queued_invocation(
     } else {
         inv.status = InvocationStatus::Queued;
     }
+    // The lease only guards an in-flight `Running` claim; drop it now the
+    // invocation has settled (terminal or requeued for a later tick).
+    inv.lease_expires = None;
     inv.updated = now_unix();
     let _ = deploy.put_invocation(project, &inv).await;
     // Meter a settled attempt (a requeue-for-retry is not yet a completed
@@ -1331,6 +1441,7 @@ async fn enqueue_scheduled_invocation(
         status: boatramp_core::function::InvocationStatus::Queued,
         idempotency_key: None,
         attempts: 0,
+        lease_expires: None,
         request_b64: None,
         request_content_type: None,
         result: None,
@@ -1387,8 +1498,18 @@ async fn dispatch_function_queue(
     for msg in batch {
         let bytes_in = msg.payload.len() as u64;
         let request = build_webhook_request(None, msg.payload.clone());
-        let (response, duration_ms) =
-            execute_function(inner, deploy, project, function, &component, request, 0).await;
+        // Queue-drained messages are durable background work → async lane.
+        let (response, duration_ms) = execute_function(
+            inner,
+            deploy,
+            project,
+            function,
+            &component,
+            request,
+            0,
+            boatramp_handlers::Lane::Async,
+        )
+        .await;
         let (status, _content_type, body) = capture_response(response).await;
         let delivered = status != StatusCode::INTERNAL_SERVER_ERROR
             && status != StatusCode::GATEWAY_TIMEOUT
@@ -1486,6 +1607,8 @@ pub(super) async fn webhook_ingress(
     };
     let bytes_in = body.len() as u64;
     let request = build_webhook_request(content_type, body.to_vec());
+    // An inbound webhook is connection-bearing (the sender awaits the response)
+    // → sync lane.
     let (response, duration_ms) = execute_function(
         inner,
         &deploy,
@@ -1494,6 +1617,7 @@ pub(super) async fn webhook_ingress(
         &component,
         request,
         0,
+        boatramp_handlers::Lane::Sync,
     )
     .await;
     let sample = boatramp_core::function::MeteringSample {

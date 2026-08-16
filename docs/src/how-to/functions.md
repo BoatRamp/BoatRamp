@@ -124,6 +124,32 @@ $ boatramp function invocation greeter 7f3a…
   result: HTTP 200
 ```
 
+### Long-running jobs run async, not sync
+
+A **synchronous** invoke is connection-bearing — a client, a proxy, and the shared
+request pool all block while it runs — so it is held to a tight ceiling
+(`handlers.sync_max_timeout_ms`, default 10s). A route or function that *declares*
+a longer `timeout_ms` on the sync path is clamped back down to it.
+
+Genuinely long work — an LLM generation, a batch transform — belongs on the
+**async** path. The drain that runs `--async` invocations (and workflow steps,
+cron/queue/blob triggers, messaging consumers) is held to a much larger ceiling
+(`handlers.async_max_timeout_ms`, default 15 min) on its own concurrency budget,
+so a long background job runs to completion without ever blocking live site
+traffic. A function's declared `timeout_ms` takes effect up to that async ceiling.
+Raise the ceiling for a deployment that needs longer:
+
+```ron
+// boatramp.cfg — allow async jobs up to 30 minutes.
+handlers: ( async_max_timeout_ms: 1800000 ),
+```
+
+A claimed async run carries a **lease**, so if the node dies mid-run another drain
+reclaims and retries it once the lease elapses — the job is never silently lost.
+Work that needs to run **longer than one async ceiling** should be a
+[workflow](./workflows.md): each step is its own bounded invocation, so no single
+run is pinned for the whole duration and each step is independently retried.
+
 ### Idempotency
 
 Pass `--idempotency-key <key>` to make an invoke safe to retry: a repeat with the

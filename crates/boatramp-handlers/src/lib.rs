@@ -23,7 +23,7 @@ pub use bindings::invoke::{
 pub use bindings::Bindings;
 #[cfg(feature = "engine")]
 pub use engine::{
-    build_engine, build_engine_pooling, empty_body, HandlerEngine, HandlerError, Limits,
+    build_engine, build_engine_pooling, empty_body, HandlerEngine, HandlerError, Lane, Limits,
 };
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};
