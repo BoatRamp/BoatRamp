@@ -144,9 +144,19 @@ impl RaftMessaging {
 
     /// Read a message payload from the shared store.
     async fn read_payload(&self, topic: &str, id: &str) -> Result<Vec<u8>, MessagingError> {
+        self.read_storage(&messaging::payload_key(topic, id)).await
+    }
+
+    /// Read a retained fan-out (consumer-group) payload from the shared store.
+    async fn read_gpayload(&self, topic: &str, id: &str) -> Result<Vec<u8>, MessagingError> {
+        self.read_storage(&messaging::gpayload_key(topic, id)).await
+    }
+
+    /// Read + drain a shared-store object into memory.
+    async fn read_storage(&self, key: &str) -> Result<Vec<u8>, MessagingError> {
         let object = self
             .storage
-            .get(&messaging::payload_key(topic, id))
+            .get(key)
             .await
             .map_err(|e| MessagingError::Backend(e.to_string()))?;
         let mut body = object.body;
@@ -155,6 +165,21 @@ impl RaftMessaging {
             buf.extend_from_slice(&chunk.map_err(|e| MessagingError::Backend(e.to_string()))?);
         }
         Ok(buf)
+    }
+
+    /// Whether `topic` has ≥1 registered consumer group, read from this node's
+    /// applied state. A publisher uses this to decide whether to **retain** the
+    /// fan-out log/payload. It can lag a just-committed registration on a follower;
+    /// in the fabric's register-then-publish usage the window is narrow, and the
+    /// publisher passes the same decision into the proposal so the replicated log
+    /// entry and the `Storage` payload always agree (no dangling log entry).
+    async fn topic_has_groups(&self, topic: &str) -> bool {
+        let prefix = messaging::gstate_prefix(topic);
+        self.state
+            .list_prefix(&prefix)
+            .await
+            .iter()
+            .any(|k| messaging::is_direct_child(k, &prefix))
     }
 
     /// Count direct-child keys under `prefix` in this node's applied state.
@@ -197,9 +222,27 @@ impl Messaging for RaftMessaging {
             )
             .await
             .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        // On a grouped topic, also write the **retained** fan-out payload before
+        // proposing, so the replicated `glog` entry (written in the same proposal
+        // when `retain`) never references a missing payload — the same
+        // payload-first invariant, split across `Storage` (here) and the log.
+        let retain = self.topic_has_groups(topic).await;
+        if retain {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(
+                    &messaging::gpayload_key(topic, &id),
+                    body,
+                    PutMeta::default(),
+                )
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
         self.propose(WriteOp::MqPublish {
             topic: topic.to_string(),
             id: id.clone(),
+            retain,
         })
         .await?;
         // Live SSE fan-out across the cluster (best-effort, separate from the
@@ -241,17 +284,78 @@ impl Messaging for RaftMessaging {
                 topic: topic.to_string(),
                 payload,
                 attempts: record.attempts,
-                // Cluster consumer groups are a follow-up; the Raft coordinator
-                // serves the default work-queue group. `claim_grouped` for a
-                // non-empty group falls through to the trait default (errors).
+                // The default work-queue group; a non-empty group goes through
+                // `claim_grouped` below.
                 group: String::new(),
             });
         }
         Ok(claimed)
     }
 
+    async fn claim_grouped(
+        &self,
+        topic: &str,
+        group: &str,
+        start: messaging::StartPosition,
+        lease: Duration,
+        max_batch: usize,
+        max_attempts: u32,
+    ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+        // The default group is the work-queue path (unchanged).
+        if group.is_empty() {
+            return self.claim(topic, lease, max_batch, max_attempts).await;
+        }
+        // One Raft proposal: the leader applies the shared offset-log decision over
+        // the group's replicated state, so a message is leased to exactly one
+        // claimer of this group cluster-wide. The issuing node stamps `now_ms`.
+        let response = self
+            .propose(WriteOp::MqClaimGrouped {
+                topic: topic.to_string(),
+                group: group.to_string(),
+                start,
+                now_ms: now_unix_ms(),
+                lease_ms: lease.as_millis() as u64,
+                max_batch: max_batch as u32,
+                max_attempts,
+            })
+            .await?;
+        let WriteResponse::Claimed(records) = response else {
+            return Err(MessagingError::Backend(
+                "grouped claim proposal returned a non-claim response".into(),
+            ));
+        };
+        // Fetch retained fan-out payloads from the shared store. One that is
+        // unexpectedly absent is skipped this round (it stays leased in the
+        // replicated state and redelivers on lease expiry) — never delivered empty.
+        let mut claimed = Vec::with_capacity(records.len());
+        for record in records {
+            match self.read_gpayload(topic, &record.id).await {
+                Ok(payload) => claimed.push(ClaimedMessage {
+                    id: record.id,
+                    topic: topic.to_string(),
+                    payload,
+                    attempts: record.attempts,
+                    group: group.to_string(),
+                }),
+                Err(_) => continue,
+            }
+        }
+        Ok(claimed)
+    }
+
     async fn ack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
-        // Drop the index record first (no longer claimable), then the payload.
+        // A grouped ack drops only this group's in-flight entry (the retained
+        // payload stays for the other groups until the sweep reclaims it).
+        if !msg.group.is_empty() {
+            self.propose(WriteOp::MqAckGrouped {
+                topic: msg.topic.clone(),
+                group: msg.group.clone(),
+                id: msg.id.clone(),
+            })
+            .await?;
+            return Ok(());
+        }
+        // Work-queue: drop the index record first (no longer claimable), then the payload.
         self.propose(WriteOp::MqAck {
             topic: msg.topic.clone(),
             id: msg.id.clone(),
@@ -265,6 +369,15 @@ impl Messaging for RaftMessaging {
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
+        if !msg.group.is_empty() {
+            self.propose(WriteOp::MqNackGrouped {
+                topic: msg.topic.clone(),
+                group: msg.group.clone(),
+                id: msg.id.clone(),
+            })
+            .await?;
+            return Ok(());
+        }
         self.propose(WriteOp::MqNack {
             topic: msg.topic.clone(),
             id: msg.id.clone(),
@@ -318,9 +431,12 @@ impl Messaging for RaftMessaging {
             .iter()
             .flat_map(|id| {
                 [
+                    // Redrive re-arms the **work-queue** record only (dead letters
+                    // are a work-queue concept); never retain the fan-out log here.
                     WriteOp::MqPublish {
                         topic: topic.to_string(),
                         id: id.clone(),
+                        retain: false,
                     },
                     WriteOp::Delete {
                         key: messaging::dead_key(topic, id),
@@ -329,6 +445,32 @@ impl Messaging for RaftMessaging {
             })
             .collect();
         self.propose(WriteOp::Batch(ops)).await?;
+        Ok(ids.len())
+    }
+
+    async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
+        // The state machine reclaims the replicated log entries no group needs and
+        // returns their ids; only the client can delete the `Storage` payloads
+        // (consensus never touches `Storage`). Idempotent under concurrent sweeps:
+        // the SM applies proposals in order, so a second sweep sees the first's
+        // deletions, and a repeated `Storage` delete is a no-op.
+        let response = self
+            .propose(WriteOp::MqSweepGrouped {
+                topic: topic.to_string(),
+                now_ms: now_unix_ms(),
+            })
+            .await?;
+        let WriteResponse::Reclaimed(ids) = response else {
+            return Err(MessagingError::Backend(
+                "sweep proposal returned a non-sweep response".into(),
+            ));
+        };
+        for id in &ids {
+            self.storage
+                .delete(&messaging::gpayload_key(topic, id))
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
         Ok(ids.len())
     }
 
@@ -758,6 +900,264 @@ mod tests {
         let (rafts, mqs) = cluster_mq(3).await;
         let leader = rafts[&1].metrics().borrow().current_leader.unwrap();
         assert_conformance(mqs[&leader].as_ref(), "conformance/topic").await;
+        shutdown(rafts).await;
+    }
+
+    fn payloads(msgs: &[ClaimedMessage]) -> Vec<Vec<u8>> {
+        msgs.iter().map(|m| m.payload.clone()).collect()
+    }
+
+    /// The **consumer-group** conformance battery: durable fan-out, independent
+    /// per-group ack/nack, configurable start position, dead-letter, and the
+    /// retention sweep — the same assertions must hold for every coordinator, so
+    /// grouped delivery is identical single-node and cluster. Each sub-scenario
+    /// runs on its own topic (fan-out means every publish reaches every group).
+    async fn assert_grouped_conformance(mq: &dyn Messaging, base: &str) {
+        use boatramp_core::messaging::StartPosition;
+        const LEASE: Duration = Duration::from_secs(60);
+
+        // --- fan-out + independent ack/nack + start position -------------------
+        let t = base;
+        for g in ["billing", "audit"] {
+            assert!(mq
+                .claim_grouped(t, g, StartPosition::Latest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        mq.publish(t, b"a").await.unwrap();
+        mq.publish(t, b"b").await.unwrap();
+
+        // Each group independently receives BOTH, in order, attempt 1.
+        let billing = mq
+            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&billing), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(billing.iter().all(|m| m.attempts == 1));
+        let audit = mq
+            .claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&audit), vec![b"a".to_vec(), b"b".to_vec()]);
+
+        // Leased: a re-claim sees nothing until ack/nack/expiry.
+        assert!(mq
+            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // billing acks both → billing drains; audit is untouched.
+        for m in &billing {
+            mq.ack(m).await.unwrap();
+        }
+        assert!(mq
+            .claim_grouped(t, "billing", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // audit nacks both → redelivered with the attempt re-charged.
+        for m in &audit {
+            mq.nack(m).await.unwrap();
+        }
+        let audit2 = mq
+            .claim_grouped(t, "audit", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&audit2), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(audit2.iter().all(|m| m.attempts == 2));
+        for m in &audit2 {
+            mq.ack(m).await.unwrap();
+        }
+
+        // A NEW `earliest` group replays the retained backlog; a NEW `latest`
+        // group starts empty (only events after it subscribes).
+        let replay = mq
+            .claim_grouped(t, "replay", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&replay), vec![b"a".to_vec(), b"b".to_vec()]);
+        for m in &replay {
+            mq.ack(m).await.unwrap();
+        }
+        assert!(mq
+            .claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(t, b"c").await.unwrap();
+        let live = mq
+            .claim_grouped(t, "live", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&live), vec![b"c".to_vec()]);
+        for m in &live {
+            mq.ack(m).await.unwrap();
+        }
+
+        // --- grouped dead-letter (own topic, single group) ---------------------
+        let dl = format!("{base}-dl");
+        assert!(mq
+            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(&dl, b"z").await.unwrap();
+        for expected in 1..=2 {
+            let m = mq
+                .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap();
+            assert_eq!(m.len(), 1, "grouped attempt {expected}");
+            assert_eq!(m[0].attempts, expected);
+        }
+        // Third claim exhausts attempts → dead-letter, deliver nothing, stay empty.
+        assert!(mq
+            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mq
+            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // --- retention sweep reclaims only fully-consumed messages -------------
+        let gc = format!("{base}-gc");
+        for g in ["one", "two"] {
+            assert!(mq
+                .claim_grouped(&gc, g, StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        mq.publish(&gc, b"a").await.unwrap();
+        mq.publish(&gc, b"b").await.unwrap();
+        let one = mq
+            .claim_grouped(&gc, "one", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        for m in &one {
+            mq.ack(m).await.unwrap();
+        }
+        // "two" still needs both → nothing reclaimable yet.
+        assert_eq!(mq.retention_sweep(&gc).await.unwrap(), 0);
+        let two = mq
+            .claim_grouped(&gc, "two", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&two), vec![b"a".to_vec(), b"b".to_vec()]);
+        for m in &two {
+            mq.ack(m).await.unwrap();
+        }
+        // Both consumed by every group → the sweep reclaims both, idempotently.
+        assert_eq!(mq.retention_sweep(&gc).await.unwrap(), 2);
+        assert_eq!(
+            mq.retention_sweep(&gc).await.unwrap(),
+            0,
+            "sweep is idempotent"
+        );
+        // A caught-up group still returns empty (state intact, log reclaimed).
+        assert!(mq
+            .claim_grouped(&gc, "one", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Grouped conformance — **single-node** (`LogMessaging`).
+    #[tokio::test]
+    async fn conformance_grouped_single_node() {
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::messaging::LogMessaging;
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+        assert_grouped_conformance(&mq, "bus/grouped").await;
+    }
+
+    /// Grouped conformance — **cluster** (`RaftMessaging`), on the leader. The
+    /// identical battery proving the offset-log fan-out is byte-for-byte the same
+    /// across modes (the shared `plan_claim_grouped` decision, applied in the SM).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_grouped_cluster() {
+        let (rafts, mqs) = cluster_mq(3).await;
+        let leader = rafts[&1].metrics().borrow().current_leader.unwrap();
+        assert_grouped_conformance(mqs[&leader].as_ref(), "bus/grouped").await;
+        shutdown(rafts).await;
+    }
+
+    /// **Grouped no-double-delivery across nodes.** A group registered cluster-wide
+    /// is drained concurrently from every node; the leader serializes each group's
+    /// claim, so each message is delivered to the group exactly once regardless of
+    /// which node claimed it.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_groups_fan_out_across_nodes() {
+        use boatramp_core::messaging::StartPosition;
+        let (rafts, mqs) = cluster_mq(3).await;
+        let t = "bus/work";
+
+        // Register the group (earliest, retention on) before publishing.
+        assert!(mqs[&1]
+            .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 4, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        const N: usize = 30;
+        for i in 0..N {
+            let node = (i as u64 % 3) + 1;
+            mqs[&node]
+                .publish(t, format!("m-{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        // Every node drains the same group concurrently; a long lease + no acks
+        // means each stops on its first empty batch.
+        let collected: Arc<StdMutex<Vec<ClaimedMessage>>> = Arc::new(StdMutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for id in 1..=3u64 {
+            let mq = mqs[&id].clone();
+            let collected = collected.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let batch = mq
+                        .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 4, 5)
+                        .await
+                        .unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    collected.lock().unwrap().extend(batch);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let claimed = std::mem::take(&mut *collected.lock().unwrap());
+        let ids: HashSet<&str> = claimed.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            claimed.len(),
+            "a grouped message was delivered to more than one node"
+        );
+        assert_eq!(
+            claimed.len(),
+            N,
+            "every message reached the group exactly once"
+        );
+        let got: HashSet<String> = claimed
+            .iter()
+            .map(|m| String::from_utf8(m.payload.clone()).unwrap())
+            .collect();
+        let expected: HashSet<String> = (0..N).map(|i| format!("m-{i}")).collect();
+        assert_eq!(got, expected);
+
         shutdown(rafts).await;
     }
 

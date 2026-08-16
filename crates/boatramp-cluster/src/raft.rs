@@ -113,10 +113,16 @@ pub enum WriteOp {
     },
     Batch(Vec<Self>),
     /// Append a message's index record (`attempts=0`, claimable now). The
-    /// payload was already written to shared `Storage` by the publisher.
+    /// payload was already written to shared `Storage` by the publisher. When
+    /// `retain` (the publisher observed a registered consumer group on the topic),
+    /// also append the fan-out log entry and advance the per-topic `logmax` gate —
+    /// the publisher wrote the retained fan-out payload to `Storage` first, so the
+    /// replicated log entry never references a missing payload.
     MqPublish {
         topic: String,
         id: String,
+        #[serde(default)]
+        retain: bool,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -138,6 +144,43 @@ pub enum WriteOp {
     MqNack {
         topic: String,
         id: String,
+    },
+    /// Atomically claim up to `max_batch` messages for a **consumer group** (the
+    /// durable fan-out path). The leader applies the shared offset-log decision
+    /// ([`messaging::plan_claim_grouped`]) over the group's compact state — the
+    /// same one the single-node coordinator runs — so a group's delivery is
+    /// identical across modes. `now_ms` is stamped by the issuing node (the state
+    /// machine reads no clock). Registers the group + turns on retention on first
+    /// claim, per `start`.
+    MqClaimGrouped {
+        topic: String,
+        group: String,
+        start: messaging::StartPosition,
+        now_ms: u64,
+        lease_ms: u64,
+        max_batch: u32,
+        max_attempts: u32,
+    },
+    /// Ack a grouped delivery: drop the id from the group's in-flight set (the
+    /// retained payload stays for the other groups until the sweep reclaims it).
+    MqAckGrouped {
+        topic: String,
+        group: String,
+        id: String,
+    },
+    /// Nack a grouped delivery: reset its in-flight lease so it redelivers.
+    MqNackGrouped {
+        topic: String,
+        group: String,
+        id: String,
+    },
+    /// **Retention sweep** for a grouped topic: reclaim the replicated log entries
+    /// that no group still needs (with an id-age TTL backstop), returning the
+    /// reclaimed ids so the caller can delete their `Storage` payloads (which the
+    /// state machine cannot touch). `now_ms` is stamped by the issuing node.
+    MqSweepGrouped {
+        topic: String,
+        now_ms: u64,
     },
     /// Admit a joining node from a verified single-use join token. Applied
     /// deterministically: a **no-op if `jti` was already spent**
@@ -255,7 +298,7 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             WriteResponse::Kv
         }
-        WriteOp::MqPublish { topic, id } => {
+        WriteOp::MqPublish { topic, id, retain } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
             let key = messaging::meta_key(&topic, &id);
@@ -263,6 +306,24 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 let fresh =
                     serde_json::to_vec(&messaging::Record::fresh()).expect("record serializes");
                 target.put(key, fresh);
+            }
+            if retain {
+                // Fan-out log entry (existence marker) + the per-topic gate marker,
+                // advanced to the max id seen so out-of-order applies (ids carry a
+                // node segment) never move it backward.
+                let glog = messaging::glog_key(&topic, &id);
+                if !target.data.contains_key(&glog) {
+                    target.put(glog, Vec::new());
+                }
+                let logmax = messaging::logmax_key(&topic);
+                let cur = target
+                    .data
+                    .get(&logmax)
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default();
+                if id.as_str() > cur.as_str() {
+                    target.put(logmax, id.into_bytes());
+                }
             }
             WriteResponse::Kv
         }
@@ -295,6 +356,53 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 }
             }
             WriteResponse::Kv
+        }
+        WriteOp::MqClaimGrouped {
+            topic,
+            group,
+            start,
+            now_ms,
+            lease_ms,
+            max_batch,
+            max_attempts,
+        } => WriteResponse::Claimed(apply_mq_claim_grouped(
+            target,
+            &topic,
+            &group,
+            start,
+            now_ms,
+            lease_ms,
+            max_batch as usize,
+            max_attempts,
+        )),
+        WriteOp::MqAckGrouped { topic, group, id } => {
+            if let Some(mut state) = load_group_state(target, &topic, &group) {
+                let before = state.in_flight.len();
+                state.in_flight.retain(|f| f.id != id);
+                if state.in_flight.len() != before {
+                    put_group_state(target, &topic, &group, &state);
+                }
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqNackGrouped { topic, group, id } => {
+            if let Some(mut state) = load_group_state(target, &topic, &group) {
+                let mut changed = false;
+                for entry in &mut state.in_flight {
+                    if entry.id == id {
+                        entry.lease_until_ms = 0; // claimable again now
+                        changed = true;
+                        break;
+                    }
+                }
+                if changed {
+                    put_group_state(target, &topic, &group, &state);
+                }
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqSweepGrouped { topic, now_ms } => {
+            WriteResponse::Reclaimed(apply_mq_sweep_grouped(target, &topic, now_ms))
         }
         WriteOp::MeshAdmit {
             jti,
@@ -378,6 +486,167 @@ fn apply_mq_claim(
     claimed
 }
 
+/// Load a consumer group's compact state from the applied map (`None` if the
+/// group is not yet registered).
+fn load_group_state(
+    target: &ApplyTarget,
+    topic: &str,
+    group: &str,
+) -> Option<messaging::GroupState> {
+    let raw = target.data.get(&messaging::gstate_key(topic, group))?;
+    serde_json::from_slice(raw).ok()
+}
+
+/// Persist a consumer group's compact state into the applied map (recording the
+/// durable mutation for the persistent state machine).
+fn put_group_state(
+    target: &mut ApplyTarget,
+    topic: &str,
+    group: &str,
+    state: &messaging::GroupState,
+) {
+    let json = serde_json::to_vec(state).expect("group state serializes");
+    target.put(messaging::gstate_key(topic, group), json);
+}
+
+/// The cluster analogue of `LogMessaging::claim_grouped`: run the **shared**
+/// offset-log decision ([`messaging::plan_claim_grouped`]) over the group's
+/// compact state in the applied map, applying the lease/dead-letter transitions
+/// in place and returning the leased records for the caller to fetch payloads.
+/// Registers the group (initial high-water per `start`) on first claim.
+#[allow(clippy::too_many_arguments)]
+fn apply_mq_claim_grouped(
+    target: &mut ApplyTarget,
+    topic: &str,
+    group: &str,
+    start: messaging::StartPosition,
+    now_ms: u64,
+    lease_ms: u64,
+    max_batch: usize,
+    max_attempts: u32,
+) -> Vec<ClaimedRecord> {
+    // Load or register the group. `latest` starts at the current gate (skip the
+    // backlog); `earliest` at "" (replay everything retained).
+    let (mut state, existed) = match load_group_state(target, topic, group) {
+        Some(state) => (state, true),
+        None => {
+            let hwm = match start {
+                messaging::StartPosition::Latest => target
+                    .data
+                    .get(&messaging::logmax_key(topic))
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default(),
+                messaging::StartPosition::Earliest => String::new(),
+            };
+            (messaging::GroupState::new(hwm), false)
+        }
+    };
+
+    // New-message candidates: the fan-out log ids strictly after the high-water,
+    // in order, capped at the batch — a direct BTreeMap range scan.
+    let mut new_ids = Vec::new();
+    if state.hwm.as_str()
+        < target
+            .data
+            .get(&messaging::logmax_key(topic))
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default()
+            .as_str()
+    {
+        let log_prefix = messaging::glog_prefix(topic);
+        let from = format!("{log_prefix}{}", state.hwm);
+        for (key, _) in target.data.range(from..) {
+            if !key.starts_with(&log_prefix) {
+                break;
+            }
+            if !messaging::is_direct_child(key, &log_prefix) {
+                continue;
+            }
+            let id = &key[log_prefix.len()..];
+            if id > state.hwm.as_str() {
+                new_ids.push(id.to_string());
+                if new_ids.len() >= max_batch {
+                    break;
+                }
+            }
+        }
+    }
+
+    let plan = messaging::plan_claim_grouped(
+        &mut state,
+        now_ms,
+        lease_ms,
+        max_batch,
+        max_attempts,
+        &new_ids,
+    );
+
+    // Dead-letter the exhausted ids (preserve the record under the group's DLQ).
+    for (id, attempts) in &plan.dead {
+        let record = messaging::Record {
+            version: boatramp_core::SCHEMA_VERSION,
+            attempts: *attempts,
+            lease_until_ms: 0,
+        };
+        let json = serde_json::to_vec(&record).expect("record serializes");
+        target.put(messaging::gdead_key(topic, group, id), json);
+    }
+
+    // Persist the advanced state (register on first claim, or when it changed).
+    if !existed || !plan.leased.is_empty() || !plan.dead.is_empty() {
+        put_group_state(target, topic, group, &state);
+    }
+
+    plan.leased
+        .into_iter()
+        .map(|(id, attempts)| ClaimedRecord { id, attempts })
+        .collect()
+}
+
+/// The cluster analogue of `LogMessaging::gc_grouped`: reclaim the replicated
+/// fan-out log entries no group still needs ([`messaging::grouped_message_needed`]),
+/// with the id-age TTL as a backstop, and return the reclaimed ids so the caller
+/// deletes their `Storage` payloads (the state machine cannot touch `Storage`).
+fn apply_mq_sweep_grouped(target: &mut ApplyTarget, topic: &str, now_ms: u64) -> Vec<String> {
+    // Snapshot every registered group's state.
+    let state_prefix = messaging::gstate_prefix(topic);
+    let mut states = Vec::new();
+    for (key, raw) in target.data.range(state_prefix.clone()..) {
+        if !key.starts_with(&state_prefix) {
+            break;
+        }
+        if !messaging::is_direct_child(key, &state_prefix) {
+            continue;
+        }
+        if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(raw) {
+            states.push(state);
+        }
+    }
+
+    // Collect the log ids first (can't mutate `target.data` while ranging it).
+    let log_prefix = messaging::glog_prefix(topic);
+    let mut ids = Vec::new();
+    for (key, _) in target.data.range(log_prefix.clone()..) {
+        if !key.starts_with(&log_prefix) {
+            break;
+        }
+        if messaging::is_direct_child(key, &log_prefix) {
+            ids.push(key[log_prefix.len()..].to_string());
+        }
+    }
+
+    let mut reclaimed = Vec::new();
+    for id in ids {
+        let needed = messaging::grouped_message_needed(&states, &id);
+        let expired = messaging::id_millis(&id) + messaging::GROUP_RETENTION_MS < now_ms;
+        if !needed || expired {
+            target.remove(messaging::glog_key(topic, &id));
+            reclaimed.push(id);
+        }
+    }
+    reclaimed
+}
+
 /// A message leased by an [`WriteOp::MqClaim`] proposal: the durable id and the
 /// attempt charged. The claiming node fetches the payload from shared `Storage`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -397,6 +666,9 @@ pub enum WriteResponse {
     Kv,
     /// A claim's leased records (id + attempt count).
     Claimed(Vec<ClaimedRecord>),
+    /// A grouped retention sweep's reclaimed message ids (the caller deletes their
+    /// `Storage` payloads).
+    Reclaimed(Vec<String>),
     /// A [`WriteOp::MeshAdmit`] outcome (see [`AdmitOutcome`]).
     Admitted(AdmitOutcome),
 }

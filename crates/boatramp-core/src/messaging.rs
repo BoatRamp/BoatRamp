@@ -387,13 +387,108 @@ pub struct GroupState {
 impl GroupState {
     /// A freshly-registered group starting at high-water `hwm` with nothing
     /// in-flight (`latest` passes the current max id, `earliest` passes `""`).
-    fn new(hwm: String) -> Self {
+    pub fn new(hwm: String) -> Self {
         Self {
             version: crate::SCHEMA_VERSION,
             hwm,
             in_flight: Vec::new(),
         }
     }
+}
+
+/// The transitions a grouped claim produces, from [`plan_claim_grouped`]. The
+/// `state` it was computed over is mutated in place (in-flight + high-water
+/// advanced); this carries what the *caller* must still do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupedClaim {
+    /// `(id, attempts)` to **deliver** — the caller fetches each payload and
+    /// returns a [`ClaimedMessage`]. Redelivered in-flight messages and freshly
+    /// leased new ones both appear here, oldest-first.
+    pub leased: Vec<(String, u32)>,
+    /// `(id, attempts)` that exhausted `max_attempts` → the caller writes each to
+    /// the group's dead-letter store ([`gdead_key`]) and it is already dropped
+    /// from `state.in_flight`.
+    pub dead: Vec<(String, u32)>,
+}
+
+/// The **pure, deterministic** consumer-group claim decision — the offset-log
+/// analogue of [`plan_claim`], shared by every coordinator (the single-node
+/// [`LogMessaging`], the cluster Raft state machine, ...) so grouped delivery is
+/// identical across modes by construction, not by mirroring.
+///
+/// Given the group's `state` and the batch parameters, plus `new_ids` (the log
+/// ids `> state.hwm`, oldest-first, already filtered to direct children and
+/// capped at `max_batch` by the caller — the one I/O the caller does), it:
+/// processes the bounded in-flight set (keep still-leased, redeliver expired
+/// charging an attempt up to the batch budget, dead-letter exhausted), then, if
+/// budget remains, leases new ids in order — appending them to `in_flight` and
+/// advancing `hwm`. No I/O, no clock reads (`now_ms` is stamped by the caller),
+/// so a cluster's replicas all compute the same result and converge.
+pub fn plan_claim_grouped(
+    state: &mut GroupState,
+    now_ms: u64,
+    lease_ms: u64,
+    max_batch: usize,
+    max_attempts: u32,
+    new_ids: &[String],
+) -> GroupedClaim {
+    let mut out = GroupedClaim::default();
+    let mut budget = max_batch;
+
+    // 1) The bounded in-flight set, in deterministic id order.
+    let mut in_flight = std::mem::take(&mut state.in_flight);
+    in_flight.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut kept = Vec::with_capacity(in_flight.len());
+    for mut entry in in_flight {
+        if entry.lease_until_ms > now_ms {
+            kept.push(entry); // still leased to a live delivery
+            continue;
+        }
+        if entry.attempts >= max_attempts {
+            out.dead.push((entry.id.clone(), entry.attempts)); // dropped from in-flight
+            continue;
+        }
+        if budget == 0 {
+            kept.push(entry); // expired but no room; a later claim redelivers it
+            continue;
+        }
+        entry.attempts += 1;
+        entry.lease_until_ms = now_ms + lease_ms;
+        budget -= 1;
+        out.leased.push((entry.id.clone(), entry.attempts));
+        kept.push(entry);
+    }
+    state.in_flight = kept;
+
+    // 2) Lease new messages (log ids > hwm) while the batch has room.
+    for id in new_ids {
+        if budget == 0 {
+            break;
+        }
+        if id.as_str() <= state.hwm.as_str() {
+            continue; // defensive: the caller already filtered to > hwm
+        }
+        state.hwm = id.clone();
+        state.in_flight.push(InFlight {
+            id: id.clone(),
+            attempts: 1,
+            lease_until_ms: now_ms + lease_ms,
+        });
+        out.leased.push((id.clone(), 1));
+        budget -= 1;
+    }
+    out
+}
+
+/// Whether message `id` is still needed by **any** consumer group — the shared
+/// retention predicate for the grouped-log sweep. A group needs `id` if it is in
+/// that group's `in_flight` (leased, unacked) **or** `id > hwm` (future backlog it
+/// has not leased yet). A message below every group's high-water that no group
+/// holds in-flight has been consumed by all and is reclaimable.
+pub fn grouped_message_needed(states: &[GroupState], id: &str) -> bool {
+    states
+        .iter()
+        .any(|s| id > s.hwm.as_str() || s.in_flight.iter().any(|f| f.id == id))
 }
 
 /// True when `key` is a *direct* child of `prefix` (its id segment has no
@@ -527,14 +622,16 @@ pub struct LogMessaging {
     grouped_topics: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
 }
 
-/// How long a grouped topic retains a message (its log + payload) before TTL GC,
-/// derived from the millis embedded in the id. A group must consume within this
-/// window; a slow/absent group loses aged-out messages (bounded retention, like
-/// Kafka's `retention.ms`).
-const GROUP_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a grouped topic retains a message (its log + payload) before the
+/// retention sweep's TTL backstop reclaims it, derived from the millis embedded
+/// in the id. A group must consume within this window; a slow/absent group loses
+/// aged-out messages (bounded retention, like Kafka's `retention.ms`). Shared by
+/// the single-node sweep and the cluster state machine.
+pub const GROUP_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Parse the leading unix-millis out of a message id (`{013 millis}-{016 seq}`).
-fn id_millis(id: &str) -> u64 {
+/// Parse the leading unix-millis out of a message id (`{013 millis}-{...}`) — the
+/// retention TTL's age source, shared across coordinators.
+pub fn id_millis(id: &str) -> u64 {
     id.split('-')
         .next()
         .and_then(|m| m.parse().ok())
@@ -761,9 +858,7 @@ impl LogMessaging {
                 continue;
             }
             let id = &key[log_prefix.len()..];
-            let needed = states
-                .iter()
-                .any(|s| id > s.hwm.as_str() || s.in_flight.iter().any(|f| f.id == id));
+            let needed = grouped_message_needed(&states, id);
             let expired = id_millis(id) + GROUP_RETENTION_MS < now;
             if !needed || expired {
                 let _ = self.storage.delete(&gpayload_key(topic, id)).await;
@@ -812,11 +907,22 @@ impl Messaging for LogMessaging {
                 .put(&glog_key(topic, &id), Vec::new())
                 .await
                 .map_err(MessagingError::backend)?;
-            // Ids are monotonic, so the just-published id is the new max.
-            self.kv
-                .put(&logmax_key(topic), id.clone().into_bytes())
+            // Advance the gate to the max id seen — never backward, so two
+            // concurrent same-ms publishes can't leave it below a retained id
+            // (which would wrongly close the gate on the higher one).
+            let cur = self
+                .kv
+                .get(&logmax_key(topic))
                 .await
-                .map_err(MessagingError::backend)?;
+                .map_err(MessagingError::backend)?
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default();
+            if id.as_str() > cur.as_str() {
+                self.kv
+                    .put(&logmax_key(topic), id.clone().into_bytes())
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
         }
         // Notify live SSE subscribers (best-effort, separate from the durable
         // queue above).
@@ -933,102 +1039,54 @@ impl Messaging for LogMessaging {
             }
         };
 
-        let mut claimed = Vec::new();
-        let mut budget = max_batch;
-        let mut dirty = !existed; // a freshly-registered group must be persisted
+        // Fetch the new-message candidates (log ids > hwm, up to the batch) only
+        // when the gate is open — an idle caught-up group does no scan at all.
+        let new_ids = if state.hwm.as_str() < self.read_logmax(topic).await?.as_str() {
+            self.log_ids_after(topic, &state.hwm, max_batch).await?
+        } else {
+            Vec::new()
+        };
 
-        // 1) Process the bounded in-flight set: keep still-leased entries, redeliver
-        //    expired ones (charging an attempt) up to the batch budget, and
-        //    dead-letter any that have exhausted `max_attempts`. Deterministic order.
-        let mut in_flight = std::mem::take(&mut state.in_flight);
-        in_flight.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut kept = Vec::with_capacity(in_flight.len());
-        for mut entry in in_flight {
-            if entry.lease_until_ms > now {
-                kept.push(entry); // still leased to a live delivery
-                continue;
-            }
-            if entry.attempts >= max_attempts {
-                // Exhausted → dead-letter (preserve the record), drop from in-flight.
-                let record = Record {
-                    version: crate::SCHEMA_VERSION,
-                    attempts: entry.attempts,
-                    lease_until_ms: 0,
-                };
-                let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
-                self.kv
-                    .put(&gdead_key(topic, group, &entry.id), json)
-                    .await
-                    .map_err(MessagingError::backend)?;
-                dirty = true;
-                continue;
-            }
-            if budget == 0 {
-                // Expired but no room this batch: leave it claimable (a later claim
-                // redelivers it) without charging an attempt now.
-                kept.push(entry);
-                continue;
-            }
-            // Redeliver: charge an attempt, re-lease, and deliver the retained body.
-            let payload = match self.read_gpayload(topic, &entry.id).await {
-                Ok(p) => p,
-                Err(_) => {
-                    // Payload reclaimed out from under a lagging group — drop it.
-                    dirty = true;
-                    continue;
-                }
+        // The shared, deterministic decision advances `state` (in-flight + hwm) and
+        // tells us what to deliver and what to dead-letter.
+        let plan = plan_claim_grouped(&mut state, now, lease_ms, max_batch, max_attempts, &new_ids);
+
+        // Dead-letter the exhausted ones (preserve the record under the group's DLQ).
+        for (id, attempts) in &plan.dead {
+            let record = Record {
+                version: crate::SCHEMA_VERSION,
+                attempts: *attempts,
+                lease_until_ms: 0,
             };
-            entry.attempts += 1;
-            entry.lease_until_ms = now + lease_ms;
-            budget -= 1;
-            dirty = true;
-            claimed.push(ClaimedMessage {
-                id: entry.id.clone(),
-                topic: topic.to_string(),
-                payload,
-                attempts: entry.attempts,
-                group: group.to_string(),
-            });
-            kept.push(entry);
+            let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+            self.kv
+                .put(&gdead_key(topic, group, id), json)
+                .await
+                .map_err(MessagingError::backend)?;
         }
-        state.in_flight = kept;
 
-        // 2) If room remains and the gate is open (hwm behind logmax), lease NEW
-        //    messages — the log ids strictly above the high-water — via a bounded
-        //    range scan. An idle group whose hwm == logmax does no scan at all.
-        if budget > 0 {
-            let logmax = self.read_logmax(topic).await?;
-            if state.hwm.as_str() < logmax.as_str() {
-                let new_ids = self.log_ids_after(topic, &state.hwm, budget).await?;
-                for id in new_ids {
-                    // Advance the high-water across every id we consider, so a
-                    // reclaimed-payload gap can't wedge the scan on the same id.
-                    if id.as_str() > state.hwm.as_str() {
-                        state.hwm = id.clone();
-                        dirty = true;
-                    }
-                    let payload = match self.read_gpayload(topic, &id).await {
-                        Ok(p) => p,
-                        Err(_) => continue, // reclaimed before we got to it
-                    };
-                    state.in_flight.push(InFlight {
-                        id: id.clone(),
-                        attempts: 1,
-                        lease_until_ms: now + lease_ms,
-                    });
-                    claimed.push(ClaimedMessage {
-                        id,
-                        topic: topic.to_string(),
-                        payload,
-                        attempts: 1,
-                        group: group.to_string(),
-                    });
-                    dirty = true;
-                }
+        // The plan mutated `state` (in-flight + hwm) iff it leased or dead-lettered
+        // anything; persist then, or when the group was just registered.
+        let changed = !existed || !plan.leased.is_empty() || !plan.dead.is_empty();
+
+        // Deliver each leased id, fetching its retained payload. A payload that is
+        // unexpectedly absent (a publish still landing, or reclaimed) is simply not
+        // delivered this round — the id stays leased and redelivers on lease expiry.
+        let mut claimed = Vec::new();
+        for (id, attempts) in plan.leased {
+            match self.read_gpayload(topic, &id).await {
+                Ok(payload) => claimed.push(ClaimedMessage {
+                    id,
+                    topic: topic.to_string(),
+                    payload,
+                    attempts,
+                    group: group.to_string(),
+                }),
+                Err(_) => continue,
             }
         }
 
-        if dirty {
+        if changed {
             self.put_group_state(topic, group, &state).await?;
         }
         Ok(claimed)
