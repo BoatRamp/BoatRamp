@@ -408,6 +408,16 @@ impl HandlerEngine {
         self.proxy_pre(hash, wasm).map(|_| ())
     }
 
+    /// Precompile + validate a component as a **`wasi:messaging` consumer** (it
+    /// must export `messaging-handler`) — the activation gate for a `consumers`
+    /// entry, mirroring [`precompile`](Self::precompile) for request handlers. A
+    /// component that is not a consumer world fails here, at deploy, instead of
+    /// silently at drain time.
+    #[cfg(feature = "messaging")]
+    pub fn precompile_consumer(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
+        self.consumer_pre(hash, wasm).map(|_| ())
+    }
+
     /// Compile a component (cached by `hash`) into a reusable [`ProxyPre`].
     fn proxy_pre(&self, hash: &str, wasm: &[u8]) -> Result<ProxyPre<HostState>, HandlerError> {
         if let Some(pre) = self.cache.lock().unwrap().get(hash) {

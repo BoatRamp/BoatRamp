@@ -604,6 +604,11 @@ pub(super) async fn precheck_component(
     imports: &[String],
     component: &str,
     label: &str,
+    // `true` validates against the **consumer** world (`messaging-handler`),
+    // `false` against the request-handler (`wasi:http/proxy`) world. A `consumers`
+    // entry pointing at a non-consumer component must fail here, not silently at
+    // drain.
+    is_consumer: bool,
 ) -> Result<(), String> {
     for import in imports {
         if !site_handlers.allow_imports.iter().any(|a| a == import) {
@@ -636,10 +641,22 @@ pub(super) async fn precheck_component(
     let wasm = read_blob_bytes(deploy, &entry.hash)
         .await
         .map_err(|err| format!("reading {label} component: {err}"))?;
-    inner
-        .engine
-        .precompile(&entry.hash, &wasm)
-        .map_err(|err| format!("{label} failed to compile: {err}"))?;
+    // A consumer must instantiate the **consumer** world (`messaging-handler`);
+    // a handler the request world. Validating a consumer as an http handler was
+    // the bug that let a non-consumer pass the gate and then under-deliver
+    // silently. `handlers` always compiles in `boatramp-handlers/messaging`, so
+    // `precompile_consumer` is always available here.
+    if is_consumer {
+        inner
+            .engine
+            .precompile_consumer(&entry.hash, &wasm)
+            .map_err(|err| format!("{label} is not a valid wasi:messaging consumer: {err}"))?;
+    } else {
+        inner
+            .engine
+            .precompile(&entry.hash, &wasm)
+            .map_err(|err| format!("{label} failed to compile: {err}"))?;
+    }
     Ok(())
 }
 

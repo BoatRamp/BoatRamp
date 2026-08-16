@@ -517,6 +517,22 @@ async fn consumer_dispatch_handles_and_counts() {
 
 #[cfg(feature = "messaging")]
 #[tokio::test(flavor = "multi_thread")]
+async fn precompile_consumer_accepts_a_consumer_and_rejects_a_handler() {
+    // The activation gate for a `consumers` entry: a real consumer world (exports
+    // `messaging-handler`) validates, and a plain `wasi:http` handler is rejected
+    // *here* rather than passing the gate and silently under-delivering at drain.
+    let engine = engine();
+    engine
+        .precompile_consumer("event-consumer", EVENT_CONSUMER)
+        .expect("a real consumer world validates");
+    let err = engine
+        .precompile_consumer("http-200", HTTP_200)
+        .expect_err("an http handler is not a consumer");
+    assert!(matches!(err, HandlerError::Compile(_)), "{err}");
+}
+
+#[cfg(feature = "messaging")]
+#[tokio::test(flavor = "multi_thread")]
 async fn consumer_without_keyvalue_grant_errors() {
     // Deny by default: the consumer needs kv to count; ungranted, its `handle`
     // returns an error (which the dispatcher treats as a failed delivery).

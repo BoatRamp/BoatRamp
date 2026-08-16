@@ -519,6 +519,7 @@ impl HandlerRuntime {
                 &handler.imports,
                 &handler.component,
                 &format!("handler {:?}", handler.route),
+                false,
             )
             .await?;
         }
@@ -532,6 +533,7 @@ impl HandlerRuntime {
                 &consumer.imports,
                 &consumer.component,
                 &format!("consumer {:?}", consumer.topic),
+                true,
             )
             .await?;
         }

@@ -3368,6 +3368,113 @@ async fn activation_refuses_broken_component() {
     );
 }
 
+/// A `consumers` entry pointing at a component that is **not** a messaging
+/// consumer (here a plain `wasi:http` handler) is refused at activation: the gate
+/// validates the *consumer* world, so a misconfigured consumer fails loudly at
+/// deploy instead of passing the gate and silently under-delivering at drain.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn activation_refuses_a_non_consumer_component() {
+    use boatramp_core::config::{ConsumerConfig, HandlersSiteConfig};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const HTTP_200: &[u8] = include_bytes!("../../boatramp-handlers/tests/fixtures/http-200.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+    // A valid wasi:http handler — but NOT a wasi:messaging consumer.
+    let hash = sha256_hex(HTTP_200);
+    let stream: ByteStream =
+        futures::stream::once(async move { Ok(bytes::Bytes::from_static(HTTP_200)) }).boxed();
+    deploy.put_blob(&hash, stream).await.unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "consumer.wasm".to_string(),
+        FileEntry {
+            hash,
+            size: HTTP_200.len() as u64,
+            content_type: None,
+            variants: BTreeMap::new(),
+        },
+    );
+    let manifest = Manifest {
+        files,
+        config: DeployConfig {
+            consumers: vec![ConsumerConfig {
+                topic: "orders/created".to_string(),
+                component: "consumer.wasm".to_string(),
+                imports: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = deploy.put_manifest(&manifest).await.unwrap();
+    deploy
+        .set_site_config(
+            ProjectRef::DEFAULT,
+            "blog",
+            &SiteConfig {
+                handlers: Some(HandlersSiteConfig {
+                    enabled: true,
+                    allow_imports: Vec::new(),
+                    max_memory_mb: None,
+                    max_timeout_ms: None,
+                    max_concurrency: None,
+                    max_fuel: None,
+                    secrets: BTreeMap::new(),
+                    background_aliases: Vec::new(),
+                    max_stream_connections: None,
+                    max_log_rate: None,
+                    disable_log_capture: false,
+                    cache: None,
+                    graphql: None,
+                    cookie_auth: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv, storage, None, None);
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/sites/blog/deployments/{id}/activate"))
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("not a valid wasi:messaging consumer"),
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    // Nothing flipped: the broken consumer never went live.
+    assert_eq!(
+        deploy
+            .current_id(ProjectRef::DEFAULT, "blog")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 /// Activation is refused when a handler requests an import the site does not
 /// allow (the resolution rule), even though the component itself compiles.
 #[cfg(feature = "handlers")]
