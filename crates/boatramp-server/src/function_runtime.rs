@@ -463,7 +463,13 @@ async fn build_function_bindings(
     }
     if granted("wasi:messaging") {
         if let Some(messaging) = &inner.messaging {
-            bindings = bindings.with_messaging(format!("{scope}/"), messaging.clone());
+            // Private topics namespace under the function's own scope; `bus:<topic>`
+            // publishes route to the shared, project-scoped bus.
+            bindings = bindings.with_messaging(
+                format!("{scope}/"),
+                format!("{}/", project.qualified("bus")),
+                messaging.clone(),
+            );
         }
     }
     // Function-to-function invoke (FI): granted only when the function imports
@@ -1469,11 +1475,15 @@ async fn dispatch_function_queue(
     let Some(messaging) = inner.messaging.clone() else {
         return;
     };
-    // Project-qualify the substrate topic so a same-named function's queue in
-    // two tenants stays distinct (matches the function's messaging binding
-    // namespace, `{qualified(project, fn/<name>)}/`). `default` → bare
-    // `fn/<name>/<topic>` (back-compat).
-    let namespaced = project.qualified(&format!("fn/{}/{topic}", function.name));
+    // A `bus:<topic>` trigger drains the shared project bus (so a worker consumes
+    // events a *different* component published); a plain topic drains the
+    // function's own queue. Project-qualifying keeps a same-named function's
+    // private queue distinct across tenants (matches the function's messaging
+    // binding namespace); `default` → bare `fn/<name>/<topic>` (back-compat).
+    let namespaced = match topic.strip_prefix(boatramp_handlers::BUS_TOPIC_SELECTOR) {
+        Some(bus_topic) => format!("{}/{bus_topic}", project.qualified("bus")),
+        None => project.qualified(&format!("fn/{}/{topic}", function.name)),
+    };
     let batch = match messaging
         .claim(
             &namespaced,

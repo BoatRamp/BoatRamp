@@ -881,11 +881,16 @@ pub(super) async fn build_bindings(
         }
     }
     if granted("wasi:messaging") {
-        // Topics are namespaced under the binding `scope` (the site, or the
+        // Plain topics are namespaced under the binding `scope` (the site, or the
         // preview scope), so a guest publishes only into its own namespace and
-        // previews can't touch live topics.
+        // previews can't touch live topics; `bus:<topic>` publishes route to the
+        // shared, project-scoped bus.
         if let Some(messaging) = &inner.messaging {
-            bindings = bindings.with_messaging(format!("{scope}/"), messaging.clone());
+            bindings = bindings.with_messaging(
+                format!("{scope}/"),
+                format!("{}/", project.qualified("bus")),
+                messaging.clone(),
+            );
         }
     }
     // Function-to-function invoke (FI): a site handler reached over HTTP can call

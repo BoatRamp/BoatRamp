@@ -19,6 +19,8 @@ pub use bindings::graphql::{GraphqlRequest, SupergraphRunError, SupergraphRunner
 pub use bindings::invoke::{
     InvokeError, InvokeRequest, InvokeResponse, InvokeStreamResponse, Invoker, MAX_INVOKE_DEPTH,
 };
+#[cfg(feature = "messaging")]
+pub use bindings::messaging::BUS_TOPIC_SELECTOR;
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
 #[cfg(feature = "engine")]

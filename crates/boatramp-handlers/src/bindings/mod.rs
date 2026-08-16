@@ -163,18 +163,22 @@ impl Bindings {
         names
     }
 
-    /// Grant the `wasi:messaging` producer capability, backed by `messaging`,
-    /// with every published topic namespaced under `prefix` (per-site/alias
-    /// isolation — the guest can't publish outside its own namespace).
+    /// Grant the `wasi:messaging` producer capability, backed by `messaging`. A
+    /// plain topic is namespaced under `prefix` (per-site/alias isolation — the
+    /// guest can't publish outside its own namespace); a `bus:<topic>` is
+    /// namespaced under `bus_prefix` (the shared `{project}/bus/` space, so a
+    /// producer and a consumer in different components can meet on one topic).
     #[cfg(feature = "messaging")]
     pub fn with_messaging(
         mut self,
         prefix: impl Into<String>,
+        bus_prefix: impl Into<String>,
         messaging: Arc<dyn Messaging>,
     ) -> Self {
         self.messaging = Some(messaging::MessagingBinding {
             messaging,
             prefix: prefix.into(),
+            bus_prefix: bus_prefix.into(),
         });
         self
     }

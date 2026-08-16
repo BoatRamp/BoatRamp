@@ -2646,6 +2646,54 @@ async fn function_queue_trigger_dispatches_a_message() {
     assert!(n >= 1, "worker did not run: {n}");
 }
 
+/// A `bus:<topic>` queue trigger drains the shared, **project-scoped bus** — so a
+/// worker consumes an event that a *different* component published (no
+/// self-queue). Here the event is placed on the bus directly, standing in for
+/// another function's `publish("bus:jobs")` (the publish→bus routing is unit
+/// tested in the messaging binding), and a distinct `worker` function drains it.
+#[cfg(feature = "handlers")]
+#[tokio::test]
+async fn bus_queue_trigger_drains_the_shared_project_bus() {
+    use boatramp_core::messaging::{LogMessaging, Messaging};
+    use boatramp_handlers::{HandlerEngine, Limits};
+
+    const KV_COUNTER: &[u8] =
+        include_bytes!("../../boatramp-handlers/tests/fixtures/kv-counter.wasm");
+
+    let storage = Arc::new(MemStorage::default());
+    let kv = Arc::new(MemoryKv::new());
+    let deploy = DeployStore::new(storage.clone(), kv.clone());
+    deploy_test_function(&deploy, "worker", KV_COUNTER, vec!["wasi:keyvalue".into()]).await;
+
+    let messaging: Arc<dyn Messaging> = Arc::new(LogMessaging::new(storage.clone(), kv.clone()));
+    // An event on the shared project bus (default project → bare `bus/…`),
+    // published by some *other* component — not the worker's own private queue.
+    messaging.publish("bus/jobs", b"job-1").await.unwrap();
+
+    let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+    let runtime = HandlerRuntime::new(engine, kv.clone(), storage, None, Some(messaging.clone()));
+    let _scheduler = runtime.spawn_scheduler(deploy.clone());
+    let app = router(deploy.clone(), Auth::disabled(), runtime);
+
+    // The worker subscribes to the bus topic via a `bus:` queue trigger.
+    assert_eq!(
+        put_trigger(
+            &app,
+            "worker",
+            "jobs",
+            serde_json::json!({ "type": "queue", "topic": "bus:jobs" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // The scheduler claims the bus message and invokes the worker → counter++,
+    // even though the worker never published it.
+    let hits = poll_kv(&kv, "hkv/fn/worker/hits").await;
+    let n: u32 = String::from_utf8_lossy(&hits).trim().parse().unwrap();
+    assert!(n >= 1, "worker did not drain the bus: {n}");
+}
+
 /// A `blob` trigger fires the function when an object appears under the watched
 /// prefix — notify-only, so it fires for *any* writer (here a direct storage
 /// write). Requires a backend that natively watches (`FsStorage`).

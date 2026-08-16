@@ -24,13 +24,24 @@ mod generated {
 
 use generated::boatramp::handlers::{messaging_producer, messaging_types};
 
-/// A per-site messaging grant: the backend plus the topic-namespace prefix the
-/// host prepends to every published topic (so the guest's `orders/created`
-/// becomes `{site}/{alias}/orders/created`).
+/// The reserved topic selector for the shared **project bus**. A guest that
+/// publishes (or a consumer that subscribes to) `bus:<topic>` addresses the
+/// project-wide bus instead of its own component-private namespace, so a
+/// producer and a consumer in *different* components can meet on one topic.
+pub const BUS_TOPIC_SELECTOR: &str = "bus:";
+
+/// A per-site messaging grant: the backend plus the topic-namespace prefixes the
+/// host prepends. A plain `orders/created` is namespaced under the
+/// component-private [`prefix`](Self::prefix) (`{site}/{alias}/orders/created`);
+/// a `bus:orders.created` is namespaced under the project-shared
+/// [`bus_prefix`](Self::bus_prefix) (`{project}/bus/orders.created`).
 #[derive(Clone)]
 pub struct MessagingBinding {
     pub(crate) messaging: Arc<dyn Messaging>,
     pub(crate) prefix: String,
+    /// The shared project-bus prefix (`{project}/bus/`). A `bus:<topic>` publish
+    /// routes here; a plain topic uses the private [`prefix`](Self::prefix).
+    pub(crate) bus_prefix: String,
 }
 
 /// Per-invocation view over the (optional) messaging grant.
@@ -54,7 +65,12 @@ impl messaging_producer::Host for MessagingHost<'_> {
         let Some(binding) = self.binding else {
             return Err(messaging_types::Error::AccessDenied);
         };
-        let namespaced = format!("{}{topic}", binding.prefix);
+        // A `bus:<topic>` publish targets the shared project bus; anything else
+        // stays in the component-private namespace (back-compat).
+        let namespaced = match topic.strip_prefix(BUS_TOPIC_SELECTOR) {
+            Some(bus_topic) => format!("{}{bus_topic}", binding.bus_prefix),
+            None => format!("{}{topic}", binding.prefix),
+        };
         binding
             .messaging
             .publish(&namespaced, &data)
@@ -112,21 +128,42 @@ mod tests {
         }
     }
 
+    fn binding(backend: Arc<FakeMessaging>) -> MessagingBinding {
+        MessagingBinding {
+            messaging: backend,
+            prefix: "blog/production/".to_string(),
+            bus_prefix: "acme/bus/".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn publish_namespaces_the_topic() {
         let backend = Arc::new(FakeMessaging::default());
-        let binding = MessagingBinding {
-            messaging: backend.clone(),
-            prefix: "blog/production/".to_string(),
-        };
+        let binding = binding(backend.clone());
         let mut host = MessagingHost::new(Some(&binding));
         host.publish("orders/created".into(), b"hello".to_vec())
             .await
             .unwrap();
         let published = backend.published.lock().unwrap();
         assert_eq!(published.len(), 1);
+        // A plain topic stays in the component-private namespace.
         assert_eq!(published[0].0, "blog/production/orders/created");
         assert_eq!(published[0].1, b"hello");
+    }
+
+    #[tokio::test]
+    async fn publish_routes_a_bus_topic_to_the_project_bus() {
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding(backend.clone());
+        let mut host = MessagingHost::new(Some(&binding));
+        // `bus:<topic>` lands in the shared project bus, not the private prefix —
+        // so a consumer in another component subscribed to the same bus topic
+        // receives it.
+        host.publish("bus:concept.generate".into(), b"go".to_vec())
+            .await
+            .unwrap();
+        let published = backend.published.lock().unwrap();
+        assert_eq!(published[0].0, "acme/bus/concept.generate");
     }
 
     #[tokio::test]

@@ -347,13 +347,28 @@ pub(super) async fn run_scheduler_tick(
                             None,
                         )
                         .await;
+                        // A `bus:<topic>` consumer subscribes to the shared,
+                        // project-scoped bus (so it consumes events a *different*
+                        // component published); a plain topic drains its own site
+                        // scope (back-compat). The prefix is stripped before the
+                        // guest sees the topic.
+                        let (consumer_topic, consumer_prefix) = match consumer
+                            .topic
+                            .strip_prefix(boatramp_handlers::BUS_TOPIC_SELECTOR)
+                        {
+                            Some(bus_topic) => {
+                                let bus = project.qualified("bus");
+                                (format!("{bus}/{bus_topic}"), format!("{bus}/"))
+                            }
+                            None => (format!("{scope}/{}", consumer.topic), format!("{scope}/")),
+                        };
                         acked += dispatch_consumer_batch(
                             &inner.engine,
                             messaging.as_ref(),
                             &inner.metrics,
                             &site,
-                            &format!("{scope}/{}", consumer.topic),
-                            &format!("{scope}/"),
+                            &consumer_topic,
+                            &consumer_prefix,
                             &entry.hash,
                             wasm,
                             &bindings,
