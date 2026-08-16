@@ -89,6 +89,10 @@ impl HandlerRuntime {
                 std::collections::HashMap::new();
             let mut cron_state: std::collections::HashMap<String, CronEntry> =
                 std::collections::HashMap::new();
+            // Last minute-stamp a grouped topic's retention sweep ran, so the sweep
+            // fires at most once per minute per topic (off the hot claim path).
+            let mut sweep_state: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
             // Live blob-change watchers, keyed by `<function>|<trigger id>`; each
             // owns a native watch stream + its drain task (FA-5).
             let mut blob_watchers: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
@@ -103,6 +107,7 @@ impl HandlerRuntime {
                     &deploy,
                     &mut wasm_cache,
                     &mut cron_state,
+                    &mut sweep_state,
                     CronNow::now(),
                 )
                 .await
@@ -277,6 +282,7 @@ pub(super) async fn run_scheduler_tick(
     deploy: &DeployStore,
     wasm_cache: &mut std::collections::HashMap<String, Vec<u8>>,
     cron_state: &mut std::collections::HashMap<String, CronEntry>,
+    sweep_state: &mut std::collections::HashMap<String, i64>,
     now: CronNow,
 ) -> Result<(usize, Vec<tokio::task::JoinHandle<()>>), DeployError> {
     use std::sync::atomic::Ordering;
@@ -380,6 +386,29 @@ pub(super) async fn run_scheduler_tick(
                             CONSUMER_BATCH,
                         )
                         .await;
+                        // A grouped (fan-out) topic keeps a retained log; reclaim
+                        // fully-consumed messages once a minute per topic, off the
+                        // hot claim path, on the leader only (single node = always).
+                        if !consumer.group.is_empty()
+                            && inner.cron_leader_gate.get().is_none_or(|gate| gate())
+                            && sweep_state
+                                .get(&consumer_topic)
+                                .is_none_or(|stamp| *stamp != now.minute_stamp)
+                        {
+                            sweep_state.insert(consumer_topic.clone(), now.minute_stamp);
+                            match messaging.retention_sweep(&consumer_topic).await {
+                                Ok(n) if n > 0 => tracing::debug!(
+                                    topic = %consumer_topic,
+                                    reclaimed = n,
+                                    "consumer-group retention sweep"
+                                ),
+                                Ok(_) => {}
+                                Err(err) => tracing::warn!(
+                                    topic = %consumer_topic, %err,
+                                    "consumer-group retention sweep failed"
+                                ),
+                            }
+                        }
                     }
                 }
                 // --- crons (leader-only in cluster mode) ---

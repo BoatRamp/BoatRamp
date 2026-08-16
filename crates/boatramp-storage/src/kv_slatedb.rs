@@ -220,6 +220,37 @@ impl KvStore for SlateKv {
         Ok(out)
     }
 
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        // Seek straight to the cursor in the ordered keyspace and walk forward,
+        // capped at `limit` — O(limit), not O(keys-under-prefix) like the default.
+        let start = format!("{prefix}{after}").into_bytes();
+        let range = (
+            std::ops::Bound::Excluded(start),
+            std::ops::Bound::<Vec<u8>>::Unbounded,
+        );
+        let mut iter = match &self.backend {
+            Backend::Writer(db) => db.scan(range).await.map_err(backend)?,
+            Backend::Reader(reader) => reader.scan(range).await.map_err(backend)?,
+        };
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(kv) = iter.next().await.map_err(backend)? else {
+                break;
+            };
+            let key = String::from_utf8_lossy(kv.key.as_ref());
+            if !key.starts_with(prefix) {
+                break;
+            }
+            out.push(key.into_owned());
+        }
+        Ok(out)
+    }
+
     async fn write_batch(&self, ops: Vec<WriteOp>) -> Result<(), KvError> {
         // Collect the whole group into one SlateDB WriteBatch: a single atomic,
         // durable commit (one flush) rather than one per key.
@@ -314,6 +345,28 @@ mod tests {
             let mut keys = kv.list_prefix("alias/blog/").await.unwrap();
             keys.sort();
             assert_eq!(keys, vec!["alias/blog/prod", "alias/blog/staging"]);
+
+            // Native bounded range scan: ordered, cursor-exclusive, limited, and
+            // it never leaks the `other/x` key that sorts just past the prefix.
+            assert_eq!(
+                kv.list_from("alias/blog/", "", 10).await.unwrap(),
+                vec!["alias/blog/prod", "alias/blog/staging"],
+            );
+            assert_eq!(
+                kv.list_from("alias/blog/", "", 1).await.unwrap(),
+                vec!["alias/blog/prod"],
+                "limit caps the batch",
+            );
+            assert_eq!(
+                kv.list_from("alias/blog/", "prod", 10).await.unwrap(),
+                vec!["alias/blog/staging"],
+                "resumes strictly after the cursor",
+            );
+            assert_eq!(
+                kv.list_from("alias/blog/", "staging", 10).await.unwrap(),
+                Vec::<String>::new(),
+                "past the last key → empty (no other-prefix leak)",
+            );
 
             kv.delete("alias/blog/staging").await.unwrap();
             assert_eq!(kv.get("alias/blog/staging").await.unwrap(), None);

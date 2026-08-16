@@ -2417,6 +2417,7 @@ mod tests {
         let inner = rt.inner.clone().unwrap();
         let mut cache = std::collections::HashMap::new();
         let mut crons = std::collections::HashMap::new();
+        let mut sweep = std::collections::HashMap::new();
         let now = CronNow {
             minute: 0,
             hour: 0,
@@ -2426,7 +2427,7 @@ mod tests {
             minute_stamp: 0,
         };
         for _ in 0..3 {
-            run_scheduler_tick(&inner, &deploy, &mut cache, &mut crons, now)
+            run_scheduler_tick(&inner, &deploy, &mut cache, &mut crons, &mut sweep, now)
                 .await
                 .unwrap();
         }
@@ -2658,6 +2659,7 @@ mod tests {
         // under `acme`. A fixed `CronNow` (no cron to match) keeps it deterministic.
         let mut wasm_cache = std::collections::HashMap::new();
         let mut cron_state = std::collections::HashMap::new();
+        let mut sweep = std::collections::HashMap::new();
         let now = CronNow {
             minute: 0,
             hour: 0,
@@ -2666,9 +2668,16 @@ mod tests {
             dow: 0,
             minute_stamp: 0,
         };
-        run_scheduler_tick(inner, &deploy, &mut wasm_cache, &mut cron_state, now)
-            .await
-            .unwrap();
+        run_scheduler_tick(
+            inner,
+            &deploy,
+            &mut wasm_cache,
+            &mut cron_state,
+            &mut sweep,
+            now,
+        )
+        .await
+        .unwrap();
 
         // The drain claims + spawns the run off the tick, so poll for the
         // terminal transition rather than assuming synchronous settlement.
@@ -2810,9 +2819,17 @@ mod tests {
         };
         let mut wasm_cache = std::collections::HashMap::new();
         let mut cron_state = std::collections::HashMap::new();
-        run_scheduler_tick(inner, &deploy, &mut wasm_cache, &mut cron_state, now)
-            .await
-            .unwrap();
+        let mut sweep = std::collections::HashMap::new();
+        run_scheduler_tick(
+            inner,
+            &deploy,
+            &mut wasm_cache,
+            &mut cron_state,
+            &mut sweep,
+            now,
+        )
+        .await
+        .unwrap();
 
         // The orphan was reclaimed and ran to completion, its attempt advanced …
         let settled =
@@ -3020,6 +3037,7 @@ mod tests {
         let inner = rt.inner.clone().unwrap();
         let mut wasm = std::collections::HashMap::new();
         let mut crons = std::collections::HashMap::new();
+        let mut sweep = std::collections::HashMap::new();
         let at = |stamp| CronNow {
             minute: 0,
             hour: 0,
@@ -3030,25 +3048,28 @@ mod tests {
         };
 
         // Fires once for the minute.
-        let (_, handles) = run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, at(100))
-            .await
-            .unwrap();
+        let (_, handles) =
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100))
+                .await
+                .unwrap();
         for h in handles {
             h.await.unwrap();
         }
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"1".to_vec()));
 
         // Same minute → deduped (no fire).
-        let (_, handles) = run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, at(100))
-            .await
-            .unwrap();
+        let (_, handles) =
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(100))
+                .await
+                .unwrap();
         assert!(handles.is_empty());
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"1".to_vec()));
 
         // Next minute → fires again.
-        let (_, handles) = run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, at(101))
-            .await
-            .unwrap();
+        let (_, handles) =
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(101))
+                .await
+                .unwrap();
         for h in handles {
             h.await.unwrap();
         }
@@ -3062,9 +3083,10 @@ mod tests {
             .unwrap()
             .running
             .store(true, Ordering::Release);
-        let (_, handles) = run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, at(102))
-            .await
-            .unwrap();
+        let (_, handles) =
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, at(102))
+                .await
+                .unwrap();
         assert!(handles.is_empty());
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), Some(b"2".to_vec()));
     }
@@ -3148,6 +3170,7 @@ mod tests {
         let inner = rt.inner.clone().unwrap();
         let mut wasm = std::collections::HashMap::new();
         let mut crons = std::collections::HashMap::new();
+        let mut sweep = std::collections::HashMap::new();
         let now = CronNow {
             minute: 0,
             hour: 0,
@@ -3157,9 +3180,10 @@ mod tests {
             minute_stamp: 100,
         };
 
-        let (_, handles) = run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, now)
-            .await
-            .unwrap();
+        let (_, handles) =
+            run_scheduler_tick(&inner, &deploy, &mut wasm, &mut crons, &mut sweep, now)
+                .await
+                .unwrap();
         // No cron fired (a follower); the counter was never written.
         assert!(handles.is_empty(), "a non-leader must not fire crons");
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), None);

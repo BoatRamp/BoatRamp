@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -45,6 +46,30 @@ pub trait KvStore: Send + Sync {
 
     /// List all keys beginning with `prefix`.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, KvError>;
+
+    /// List up to `limit` keys under `prefix` that sort **strictly after**
+    /// `{prefix}{after}` (an empty `after` starts at the beginning), in key order
+    /// — a bounded, resumable range scan. The default rebuilds it from
+    /// [`list_prefix`](Self::list_prefix) (O(keys-under-prefix)); ordered backends
+    /// override it with a native seek so a caller paging forward from a cursor is
+    /// O(`limit`), not O(prefix size) — the messaging fan-out claim relies on this.
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        let start = format!("{prefix}{after}");
+        let mut keys: Vec<String> = self
+            .list_prefix(prefix)
+            .await?
+            .into_iter()
+            .filter(|k| k.as_str() > start.as_str())
+            .collect();
+        keys.sort();
+        keys.truncate(limit);
+        Ok(keys)
+    }
 
     /// Durably persist any buffered writes, keeping the store usable. The default
     /// is a no-op (in-memory + write-through backends are already durable on
@@ -130,6 +155,26 @@ impl KvStore for MemoryKv {
             .keys()
             .filter(|key| key.starts_with(prefix))
             .cloned()
+            .collect())
+    }
+
+    async fn list_from(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        // The BTreeMap is already sorted, so seek straight to the cursor and walk
+        // forward — O(limit) rather than the default's O(keys-under-prefix).
+        let start = format!("{prefix}{after}");
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .range((Bound::Excluded(start), Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .take(limit)
+            .map(|(key, _)| key.clone())
             .collect())
     }
 
@@ -386,6 +431,35 @@ mod tests {
         assert_eq!(
             store.list_prefix("nope/").await.unwrap(),
             Vec::<String>::new()
+        );
+
+        // list_from is a bounded, resumable range scan: only keys strictly after
+        // the cursor, in order, capped at `limit` — the messaging fan-out claim
+        // relies on this being identical across backends.
+        assert_eq!(
+            store.list_from("k/", "", 10).await.unwrap(),
+            vec!["k/1", "k/bin", "k/empty"],
+            "empty cursor starts at the beginning, in key order"
+        );
+        assert_eq!(
+            store.list_from("k/", "", 2).await.unwrap(),
+            vec!["k/1", "k/bin"],
+            "limit caps the batch"
+        );
+        assert_eq!(
+            store.list_from("k/", "bin", 10).await.unwrap(),
+            vec!["k/empty"],
+            "resumes strictly after the cursor"
+        );
+        assert_eq!(
+            store.list_from("k/", "empty", 10).await.unwrap(),
+            Vec::<String>::new(),
+            "past the last key → empty"
+        );
+        assert_eq!(
+            store.list_from("k/", "1", 10).await.unwrap(),
+            vec!["k/bin", "k/empty"],
+            "the cursor itself is excluded, and other prefixes never leak in"
         );
 
         // Delete removes just that key; the prefix set shrinks accordingly.

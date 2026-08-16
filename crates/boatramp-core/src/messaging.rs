@@ -161,6 +161,16 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
+    /// every consumer group has already consumed (a message below every group's
+    /// high-water with none holding it in-flight), with an age-based TTL backstop.
+    /// A *periodic* maintenance sweep the scheduler calls off the hot claim path —
+    /// bounds a grouped topic's storage without slowing delivery. Returns the
+    /// number reclaimed; default no-op (`0`) for backends without a retained log.
+    async fn retention_sweep(&self, _topic: &str) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
     /// Subscribe to a **live, at-most-once** broadcast of `topic` — for SSE
     /// streams, *not* the durable consumer path. Every
     /// message published after the subscription is delivered once to each live
@@ -299,11 +309,16 @@ pub fn dead_prefix(topic: &str) -> String {
     format!("mqdead/{topic}/")
 }
 
-// --- consumer-group (durable fan-out) keyspace ---
+// --- consumer-group (durable fan-out) keyspace: the offset-log model ---
 // The default work-queue above deletes a message on the single ack. Fan-out
-// needs the message **retained** until each group's cursor passes it, so a
-// grouped topic keeps a parallel, retained log + payload (GC'd by a TTL derived
-// from the timestamp embedded in the id), plus per-group cursor + in-flight state.
+// needs the message **retained** until every group has consumed it, so a grouped
+// topic keeps one parallel, retained **append-only log** (`mqglog`) + payload
+// (`mqgp`), plus a per-topic `logmax` gate marker. A group is **not** a row per
+// backlog message: it is one compact `GroupState { hwm, in_flight }` value
+// (`mqgstate`) — the high-water it has leased up to, and its bounded in-flight
+// set. New messages for a group are simply the log ids **> hwm** (a bounded
+// range scan, never a full-log materialization). Retention is reclaimed by a
+// **separate** [`LogMessaging::gc_grouped`] sweep, not the hot claim path.
 
 /// KV key for a grouped topic's retained log entry (existence marker; the id
 /// carries the publish time, so no value is needed).
@@ -314,31 +329,71 @@ pub fn glog_key(topic: &str, id: &str) -> String {
 pub fn glog_prefix(topic: &str) -> String {
     format!("mqglog/{topic}/")
 }
-/// [`Storage`] key for a grouped topic's retained payload (kept until TTL GC,
-/// independent of any group's ack).
+/// [`Storage`] key for a grouped topic's retained payload (kept until the
+/// retention sweep, independent of any single group's ack).
 pub fn gpayload_key(topic: &str, id: &str) -> String {
     format!("mqgp/{topic}/{id}")
 }
-/// KV key for a group's in-flight record for one message (attempts + lease).
-pub fn gmeta_key(topic: &str, group: &str, id: &str) -> String {
-    format!("mqgm/{topic}/{group}/{id}")
+/// KV key for a consumer group's compact state (`hwm` + `in_flight`). Its
+/// existence also registers the group on the topic (⇒ publish retains the log).
+pub fn gstate_key(topic: &str, group: &str) -> String {
+    format!("mqgstate/{topic}/{group}")
 }
-/// KV prefix for a group's in-flight records.
-pub fn gmeta_prefix(topic: &str, group: &str) -> String {
-    format!("mqgm/{topic}/{group}/")
+/// KV prefix over a topic's group states (⇒ the set of registered groups).
+pub fn gstate_prefix(topic: &str) -> String {
+    format!("mqgstate/{topic}/")
 }
-/// KV key for a group's pull cursor (the max log id it has materialized). Its
-/// existence also registers the group on the topic.
-pub fn gcursor_key(topic: &str, group: &str) -> String {
-    format!("mqgc/{topic}/{group}")
-}
-/// KV prefix over a topic's group cursors (⇒ the set of registered groups).
-pub fn gcursor_prefix(topic: &str) -> String {
-    format!("mqgc/{topic}/")
+/// KV key for a per-topic "latest published id" marker — the backlog gate. An
+/// idle claim whose `hwm` already equals this returns without a range scan (and
+/// a `latest`-start group initializes its `hwm` from it).
+pub fn logmax_key(topic: &str) -> String {
+    format!("mqlogmax/{topic}")
 }
 /// KV key for a group's dead-lettered record.
 pub fn gdead_key(topic: &str, group: &str, id: &str) -> String {
     format!("mqgd/{topic}/{group}/{id}")
+}
+
+/// One leased-but-unacked message in a consumer group's [`GroupState`]. The set
+/// is bounded by `max_batch` × the lease window, **not** by the backlog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InFlight {
+    /// The message's log id.
+    pub id: String,
+    /// Delivery attempts charged so far (including the current lease).
+    pub attempts: u32,
+    /// Unix-millis until which this delivery is leased; `0` = claimable now.
+    pub lease_until_ms: u64,
+}
+
+/// A consumer group's entire durable state — one compact KV value per
+/// `(topic, group)`, the heart of the offset-log model. `hwm` is the high-water:
+/// the max log id ever **leased** to this group, so its un-seen backlog is
+/// exactly the log ids `> hwm` (found by a bounded range scan, never
+/// materialized). `in_flight` is the bounded leased-but-unacked set. The group's
+/// retention low-water is `min(in_flight)` if any, else `hwm` — everything below
+/// it is acked and reclaimable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupState {
+    /// Pinned schema discriminant (`v1`), like every boatramp schema.
+    #[serde(default = "crate::schema_version")]
+    pub version: u32,
+    /// High-water: the max log id ever leased to this group.
+    pub hwm: String,
+    /// Leased-but-unacked messages (bounded by batch × lease, not by backlog).
+    pub in_flight: Vec<InFlight>,
+}
+
+impl GroupState {
+    /// A freshly-registered group starting at high-water `hwm` with nothing
+    /// in-flight (`latest` passes the current max id, `earliest` passes `""`).
+    fn new(hwm: String) -> Self {
+        Self {
+            version: crate::SCHEMA_VERSION,
+            hwm,
+            in_flight: Vec::new(),
+        }
+    }
 }
 
 /// True when `key` is a *direct* child of `prefix` (its id segment has no
@@ -467,8 +522,8 @@ pub struct LogMessaging {
     hubs: StreamHubs,
     /// Cache of topics that have ≥1 registered consumer group, so `publish` writes
     /// the retained fan-out log **only** for grouped topics (a non-grouped topic
-    /// pays nothing extra). `None` until lazily loaded from the persisted cursor
-    /// registry on first use.
+    /// pays nothing extra). `None` until lazily loaded from the persisted
+    /// group-state registry on first use.
     grouped_topics: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
 }
 
@@ -500,8 +555,9 @@ impl LogMessaging {
     }
 
     /// Whether `topic` has ≥1 registered consumer group (so `publish` retains the
-    /// fan-out log/payload). Loads the set once from the persisted cursor registry
-    /// (`mqgc/…`) so it survives a restart, then serves from memory.
+    /// fan-out log/payload + advances the `logmax` gate). Loads the set once from
+    /// the persisted group-state registry (`mqgstate/…`) so it survives a restart,
+    /// then serves from memory.
     async fn topic_has_groups(&self, topic: &str) -> bool {
         {
             let cache = self.grouped_topics.lock().unwrap();
@@ -509,13 +565,13 @@ impl LogMessaging {
                 return set.contains(topic);
             }
         }
-        // Not loaded yet: scan every group cursor once and extract its topic.
-        let keys = self.kv.list_prefix("mqgc/").await.unwrap_or_default();
+        // Not loaded yet: scan every group state once and extract its topic.
+        let keys = self.kv.list_prefix("mqgstate/").await.unwrap_or_default();
         let mut set = std::collections::HashSet::new();
         for key in keys {
-            // `mqgc/{topic}/{group}` → topic is everything between the first and
-            // last `/`.
-            if let Some(rest) = key.strip_prefix("mqgc/") {
+            // `mqgstate/{topic}/{group}` → topic is everything between the first
+            // and last `/`.
+            if let Some(rest) = key.strip_prefix("mqgstate/") {
                 if let Some(slash) = rest.rfind('/') {
                     set.insert(rest[..slash].to_string());
                 }
@@ -569,6 +625,154 @@ impl LogMessaging {
             .map_err(MessagingError::backend)?;
         Ok(keys.iter().filter(|k| is_direct_child(k, prefix)).count())
     }
+
+    /// The per-topic `logmax` gate marker: the id of the last message published
+    /// to a grouped topic (`""` if none yet). Both the backlog gate and a
+    /// `latest`-start group's initial high-water read this — one O(1) `get`.
+    async fn read_logmax(&self, topic: &str) -> Result<String, MessagingError> {
+        Ok(self
+            .kv
+            .get(&logmax_key(topic))
+            .await
+            .map_err(MessagingError::backend)?
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+            .unwrap_or_default())
+    }
+
+    /// Persist a group's compact state.
+    async fn put_group_state(
+        &self,
+        topic: &str,
+        group: &str,
+        state: &GroupState,
+    ) -> Result<(), MessagingError> {
+        let json = serde_json::to_vec(state).map_err(MessagingError::backend)?;
+        self.kv
+            .put(&gstate_key(topic, group), json)
+            .await
+            .map_err(MessagingError::backend)
+    }
+
+    /// Load a group's compact state, if it is registered.
+    async fn get_group_state(
+        &self,
+        topic: &str,
+        group: &str,
+    ) -> Result<Option<GroupState>, MessagingError> {
+        let Some(raw) = self
+            .kv
+            .get(&gstate_key(topic, group))
+            .await
+            .map_err(MessagingError::backend)?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|e| MessagingError::Decode(e.to_string()))
+    }
+
+    /// Collect up to `limit` **new** log ids strictly after `after` (direct
+    /// children only — subtopics sharing the prefix are skipped), oldest-first.
+    /// A bounded, resumable range scan (`KvStore::list_from`): O(`limit`) on an
+    /// ordered backend, not O(retained log). This is what makes a grouped claim
+    /// cost O(batch + in-flight), independent of the backlog size.
+    async fn log_ids_after(
+        &self,
+        topic: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, MessagingError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = glog_prefix(topic);
+        let mut out = Vec::new();
+        let mut cursor = after.to_string();
+        loop {
+            let batch = self
+                .kv
+                .list_from(&prefix, &cursor, limit)
+                .await
+                .map_err(MessagingError::backend)?;
+            let Some(last) = batch.last().cloned() else {
+                break; // scan exhausted
+            };
+            let scanned = batch.len();
+            for key in batch {
+                if is_direct_child(&key, &prefix) {
+                    out.push(key[prefix.len()..].to_string());
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            // Advance past the last key we saw; stop once the backend returned a
+            // short page (nothing more to scan).
+            cursor = last[prefix.len()..].to_string();
+            if scanned < limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// **Retention sweep** for a grouped topic — a *separate* periodic action,
+    /// deliberately **not** on the hot claim path. Reclaims every retained log
+    /// entry + payload that **no** registered group still needs, with the id's
+    /// embedded age as a secondary TTL backstop so an abandoned group can't pin
+    /// the log forever. Returns the number of messages reclaimed.
+    ///
+    /// A group still needs message `id` iff it is in that group's `in_flight`
+    /// (leased, unacked) **or** `id > hwm` (future backlog it hasn't leased yet).
+    /// A message below every group's high-water with no group holding it in-flight
+    /// has been consumed by all and is safe to drop.
+    pub async fn gc_grouped(&self, topic: &str) -> Result<usize, MessagingError> {
+        let _guard = self.claim_lock.lock().await;
+        let now = now_unix_ms();
+
+        // Snapshot every registered group's compact state once.
+        let state_prefix = gstate_prefix(topic);
+        let state_keys = self
+            .kv
+            .list_prefix(&state_prefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        let mut states = Vec::new();
+        for key in state_keys {
+            if !is_direct_child(&key, &state_prefix) {
+                continue;
+            }
+            let group = &key[state_prefix.len()..];
+            if let Some(state) = self.get_group_state(topic, group).await? {
+                states.push(state);
+            }
+        }
+
+        let log_prefix = glog_prefix(topic);
+        let log_keys = self
+            .kv
+            .list_prefix(&log_prefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        let mut reclaimed = 0;
+        for key in log_keys {
+            if !is_direct_child(&key, &log_prefix) {
+                continue;
+            }
+            let id = &key[log_prefix.len()..];
+            let needed = states
+                .iter()
+                .any(|s| id > s.hwm.as_str() || s.in_flight.iter().any(|f| f.id == id));
+            let expired = id_millis(id) + GROUP_RETENTION_MS < now;
+            if !needed || expired {
+                let _ = self.storage.delete(&gpayload_key(topic, id)).await;
+                let _ = self.kv.delete(&glog_key(topic, id)).await;
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
+    }
 }
 
 #[async_trait]
@@ -592,10 +796,11 @@ impl Messaging for LogMessaging {
             .put(&meta_key(topic, &id), json)
             .await
             .map_err(MessagingError::backend)?;
-        // Grouped (fan-out) topics keep a **retained** copy of the payload + a log
-        // entry, so each group can consume the message on its own cursor long
-        // after the default queue's ack would have deleted it. Only paid on topics
-        // that actually have a registered group.
+        // Grouped (fan-out) topics keep a **retained** copy of the payload + an
+        // append-only log entry, so each group can consume the message on its own
+        // high-water long after the default queue's ack would have deleted it, and
+        // advance the per-topic `logmax` gate marker (so an idle group's claim
+        // early-returns without a scan). Only paid on topics with a registered group.
         if self.topic_has_groups(topic).await {
             let bytes = bytes::Bytes::copy_from_slice(payload);
             let body = futures::stream::once(async move { Ok(bytes) }).boxed();
@@ -605,6 +810,11 @@ impl Messaging for LogMessaging {
                 .map_err(MessagingError::backend)?;
             self.kv
                 .put(&glog_key(topic, &id), Vec::new())
+                .await
+                .map_err(MessagingError::backend)?;
+            // Ids are monotonic, so the just-published id is the new max.
+            self.kv
+                .put(&logmax_key(topic), id.clone().into_bytes())
                 .await
                 .map_err(MessagingError::backend)?;
         }
@@ -700,170 +910,146 @@ impl Messaging for LogMessaging {
         max_batch: usize,
         max_attempts: u32,
     ) -> Result<Vec<ClaimedMessage>, MessagingError> {
-        // The default group is the legacy work-queue (unchanged).
+        // The default group is the legacy work-queue (unchanged, released format).
         if group.is_empty() {
             return self.claim(topic, lease, max_batch, max_attempts).await;
         }
         let _guard = self.claim_lock.lock().await;
         let now = now_unix_ms();
+        let lease_ms = lease.as_millis() as u64;
 
-        // The retained fan-out log ids, oldest-first.
-        let log_prefix = glog_prefix(topic);
-        let log_keys = self
-            .kv
-            .list_prefix(&log_prefix)
-            .await
-            .map_err(MessagingError::backend)?;
-        let mut log_ids: Vec<String> = log_keys
-            .iter()
-            .filter(|k| is_direct_child(k, &log_prefix))
-            .map(|k| k[log_prefix.len()..].to_string())
-            .collect();
-        log_ids.sort();
-
-        // TTL GC (folded into this scan): drop retained log + payload past the
-        // window, and this group's now-orphaned in-flight record for them.
-        let mut retained = Vec::new();
-        for id in log_ids {
-            if id_millis(&id) + GROUP_RETENTION_MS < now {
-                let _ = self.kv.delete(&glog_key(topic, &id)).await;
-                let _ = self.storage.delete(&gpayload_key(topic, &id)).await;
-                let _ = self.kv.delete(&gmeta_key(topic, group, &id)).await;
-                continue;
-            }
-            retained.push(id);
-        }
-
-        // The group's pull cursor (high-water). First claim initializes it per
-        // `start` and registers the group: `latest` = the current max id (skip
-        // history), `earliest` = "" (replay all retained).
-        let cursor_key = gcursor_key(topic, group);
-        let orig_hw = match self
-            .kv
-            .get(&cursor_key)
-            .await
-            .map_err(MessagingError::backend)?
-        {
-            Some(raw) => String::from_utf8_lossy(&raw).into_owned(),
+        // Load the group's compact state, or register it on first claim: `latest`
+        // starts at the current max id (skip the backlog), `earliest` at `""`
+        // (replay everything retained). Registering turns on publish-time retention.
+        let (mut state, existed) = match self.get_group_state(topic, group).await? {
+            Some(state) => (state, true),
             None => {
                 self.mark_grouped(topic);
-                match start {
-                    StartPosition::Latest => retained.last().cloned().unwrap_or_default(),
+                let hwm = match start {
+                    StartPosition::Latest => self.read_logmax(topic).await?,
                     StartPosition::Earliest => String::new(),
-                }
+                };
+                (GroupState::new(hwm), false)
             }
         };
 
-        // Materialize a fresh in-flight record for each retained id above the
-        // cursor (new to this group); advance the high-water to the max retained
-        // id. Monotonic ids ⇒ future publishes are always > hw, and an acked id
-        // (≤ hw, its record deleted) is never re-materialized.
-        let mut hw = orig_hw.clone();
-        for id in &retained {
-            if id.as_str() > orig_hw.as_str() {
-                let meta_k = gmeta_key(topic, group, id);
-                if self
-                    .kv
-                    .get(&meta_k)
-                    .await
-                    .map_err(MessagingError::backend)?
-                    .is_none()
-                {
-                    let json =
-                        serde_json::to_vec(&Record::fresh()).map_err(MessagingError::backend)?;
-                    self.kv
-                        .put(&meta_k, json)
-                        .await
-                        .map_err(MessagingError::backend)?;
-                }
-            }
-            if id.as_str() > hw.as_str() {
-                hw = id.clone();
-            }
-        }
-        self.kv
-            .put(&cursor_key, hw.into_bytes())
-            .await
-            .map_err(MessagingError::backend)?;
-
-        // The group's in-flight records → the shared claim/dead-letter decision.
-        let meta_prefix = gmeta_prefix(topic, group);
-        let meta_keys = self
-            .kv
-            .list_prefix(&meta_prefix)
-            .await
-            .map_err(MessagingError::backend)?;
-        let mut records = Vec::new();
-        for key in meta_keys {
-            if !is_direct_child(&key, &meta_prefix) {
-                continue;
-            }
-            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
-                continue;
-            };
-            let record: Record =
-                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
-            records.push((key[meta_prefix.len()..].to_string(), record));
-        }
-        let actions = plan_claim(
-            records,
-            now,
-            lease.as_millis() as u64,
-            max_batch,
-            max_attempts,
-        );
-
         let mut claimed = Vec::new();
-        for action in actions {
-            match action {
-                ClaimAction::Lease { id, record } => {
-                    // The retained payload may have been TTL-GC'd out from under a
-                    // slow group — drop the record rather than deliver an empty body.
+        let mut budget = max_batch;
+        let mut dirty = !existed; // a freshly-registered group must be persisted
+
+        // 1) Process the bounded in-flight set: keep still-leased entries, redeliver
+        //    expired ones (charging an attempt) up to the batch budget, and
+        //    dead-letter any that have exhausted `max_attempts`. Deterministic order.
+        let mut in_flight = std::mem::take(&mut state.in_flight);
+        in_flight.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut kept = Vec::with_capacity(in_flight.len());
+        for mut entry in in_flight {
+            if entry.lease_until_ms > now {
+                kept.push(entry); // still leased to a live delivery
+                continue;
+            }
+            if entry.attempts >= max_attempts {
+                // Exhausted → dead-letter (preserve the record), drop from in-flight.
+                let record = Record {
+                    version: crate::SCHEMA_VERSION,
+                    attempts: entry.attempts,
+                    lease_until_ms: 0,
+                };
+                let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+                self.kv
+                    .put(&gdead_key(topic, group, &entry.id), json)
+                    .await
+                    .map_err(MessagingError::backend)?;
+                dirty = true;
+                continue;
+            }
+            if budget == 0 {
+                // Expired but no room this batch: leave it claimable (a later claim
+                // redelivers it) without charging an attempt now.
+                kept.push(entry);
+                continue;
+            }
+            // Redeliver: charge an attempt, re-lease, and deliver the retained body.
+            let payload = match self.read_gpayload(topic, &entry.id).await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Payload reclaimed out from under a lagging group — drop it.
+                    dirty = true;
+                    continue;
+                }
+            };
+            entry.attempts += 1;
+            entry.lease_until_ms = now + lease_ms;
+            budget -= 1;
+            dirty = true;
+            claimed.push(ClaimedMessage {
+                id: entry.id.clone(),
+                topic: topic.to_string(),
+                payload,
+                attempts: entry.attempts,
+                group: group.to_string(),
+            });
+            kept.push(entry);
+        }
+        state.in_flight = kept;
+
+        // 2) If room remains and the gate is open (hwm behind logmax), lease NEW
+        //    messages — the log ids strictly above the high-water — via a bounded
+        //    range scan. An idle group whose hwm == logmax does no scan at all.
+        if budget > 0 {
+            let logmax = self.read_logmax(topic).await?;
+            if state.hwm.as_str() < logmax.as_str() {
+                let new_ids = self.log_ids_after(topic, &state.hwm, budget).await?;
+                for id in new_ids {
+                    // Advance the high-water across every id we consider, so a
+                    // reclaimed-payload gap can't wedge the scan on the same id.
+                    if id.as_str() > state.hwm.as_str() {
+                        state.hwm = id.clone();
+                        dirty = true;
+                    }
                     let payload = match self.read_gpayload(topic, &id).await {
                         Ok(p) => p,
-                        Err(_) => {
-                            let _ = self.kv.delete(&gmeta_key(topic, group, &id)).await;
-                            continue;
-                        }
+                        Err(_) => continue, // reclaimed before we got to it
                     };
-                    let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
-                    self.kv
-                        .put(&gmeta_key(topic, group, &id), json)
-                        .await
-                        .map_err(MessagingError::backend)?;
+                    state.in_flight.push(InFlight {
+                        id: id.clone(),
+                        attempts: 1,
+                        lease_until_ms: now + lease_ms,
+                    });
                     claimed.push(ClaimedMessage {
                         id,
                         topic: topic.to_string(),
                         payload,
-                        attempts: record.attempts,
+                        attempts: 1,
                         group: group.to_string(),
                     });
-                }
-                ClaimAction::DeadLetter { id, record } => {
-                    let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
-                    self.kv
-                        .put(&gdead_key(topic, group, &id), json)
-                        .await
-                        .map_err(MessagingError::backend)?;
-                    self.kv
-                        .delete(&gmeta_key(topic, group, &id))
-                        .await
-                        .map_err(MessagingError::backend)?;
+                    dirty = true;
                 }
             }
+        }
+
+        if dirty {
+            self.put_group_state(topic, group, &state).await?;
         }
         Ok(claimed)
     }
 
     async fn ack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
-        // A grouped ack removes only *this group's* in-flight record; the retained
-        // payload stays for the other groups (TTL GC reclaims it).
+        // A grouped ack drops only *this group's* in-flight entry; the retained
+        // payload stays for the other groups (the retention sweep reclaims it once
+        // every group has passed it). Serialized with `claim` — both mutate the
+        // single compact group-state value.
         if !msg.group.is_empty() {
-            return self
-                .kv
-                .delete(&gmeta_key(&msg.topic, &msg.group, &msg.id))
-                .await
-                .map_err(MessagingError::backend);
+            let _guard = self.claim_lock.lock().await;
+            let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? else {
+                return Ok(()); // group gone
+            };
+            let before = state.in_flight.len();
+            state.in_flight.retain(|f| f.id != msg.id);
+            if state.in_flight.len() != before {
+                self.put_group_state(&msg.topic, &msg.group, &state).await?;
+            }
+            return Ok(());
         }
         self.kv
             .delete(&meta_key(&msg.topic, &msg.id))
@@ -885,12 +1071,27 @@ impl Messaging for LogMessaging {
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
-        // Grouped messages carry their state in the group's in-flight record.
-        let key = if msg.group.is_empty() {
-            meta_key(&msg.topic, &msg.id)
-        } else {
-            gmeta_key(&msg.topic, &msg.group, &msg.id)
-        };
+        // A grouped nack resets the in-flight entry's lease to `0` (claimable now)
+        // in the compact group-state value; serialized with `claim`.
+        if !msg.group.is_empty() {
+            let _guard = self.claim_lock.lock().await;
+            let Some(mut state) = self.get_group_state(&msg.topic, &msg.group).await? else {
+                return Ok(()); // group gone
+            };
+            let mut changed = false;
+            for entry in &mut state.in_flight {
+                if entry.id == msg.id {
+                    entry.lease_until_ms = 0;
+                    changed = true;
+                    break;
+                }
+            }
+            if changed {
+                self.put_group_state(&msg.topic, &msg.group, &state).await?;
+            }
+            return Ok(());
+        }
+        let key = meta_key(&msg.topic, &msg.id);
         let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
             return Ok(()); // already acked/gone
         };
@@ -961,6 +1162,10 @@ impl Messaging for LogMessaging {
             redriven += 1;
         }
         Ok(redriven)
+    }
+
+    async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
+        self.gc_grouped(topic).await
     }
 
     fn subscribe(
@@ -1156,6 +1361,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(payloads(&live_after), vec![b"c".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn consumer_group_batches_backlog_by_max_batch() {
+        // A group replays a backlog larger than one batch across successive claims,
+        // advancing its high-water by at most `max_batch` each time (the bounded
+        // range scan, not a full-log materialization).
+        let mq = mq();
+        let t = "bus/jobs";
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        for n in 0..5u8 {
+            mq.publish(t, &[b'0' + n]).await.unwrap();
+        }
+        // Three claims of batch 2 drain 2 + 2 + 1, in order, with no overlap.
+        let first = mq
+            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&first), vec![b"0".to_vec(), b"1".to_vec()]);
+        let second = mq
+            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&second), vec![b"2".to_vec(), b"3".to_vec()]);
+        let third = mq
+            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&third), vec![b"4".to_vec()]);
+        // Caught up: the gate is closed, so a further claim scans nothing.
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Earliest, LEASE, 2, 5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumer_group_dead_letters_after_max_attempts() {
+        // A grouped message that never acks dead-letters after `max_attempts`
+        // rather than redelivering forever, and is dropped from in-flight.
+        let mq = mq();
+        let t = "bus/flaky";
+        assert!(mq
+            .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(t, b"x").await.unwrap();
+        // Zero lease ⇒ each claim finds the in-flight entry immediately expired.
+        for expected in 1..=2 {
+            let batch = mq
+                .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap();
+            assert_eq!(batch.len(), 1, "attempt {expected}");
+            assert_eq!(batch[0].attempts, expected);
+        }
+        // Third claim exhausts attempts → dead-letter, deliver nothing, and stay empty.
+        assert!(mq
+            .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mq
+            .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumer_group_survives_restart() {
+        // The group's compact state lives in the KV, so a fresh LogMessaging over
+        // the same backends resumes at the same high-water — an already-acked
+        // message is not redelivered, and un-acked work is.
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let t = "bus/resume";
+        {
+            let mq = LogMessaging::new(storage.clone(), kv.clone());
+            assert!(mq
+                .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+            mq.publish(t, b"a").await.unwrap();
+            mq.publish(t, b"b").await.unwrap();
+            // Zero lease so the un-acked message is immediately re-claimable after
+            // the restart (no need to wait out a real lease in a test).
+            let batch = mq
+                .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 5)
+                .await
+                .unwrap();
+            assert_eq!(payloads(&batch), vec![b"a".to_vec(), b"b".to_vec()]);
+            mq.ack(&batch[0]).await.unwrap(); // ack "a" only
+        } // restart
+
+        let mq = LogMessaging::new(storage, kv);
+        // The resumed state still holds "b" in-flight with an expired lease → it
+        // redelivers; "a" (acked, dropped from in-flight) never comes back.
+        let redelivered = mq
+            .claim_grouped(t, "g", StartPosition::Earliest, Duration::ZERO, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&redelivered), vec![b"b".to_vec()]);
+        assert_eq!(
+            redelivered[0].attempts, 2,
+            "redelivery re-charges the attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_grouped_reclaims_only_fully_consumed_messages() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv);
+        let t = "bus/retain";
+        // Two groups; publish two messages both retain.
+        for g in ["one", "two"] {
+            assert!(mq
+                .claim_grouped(t, g, StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        mq.publish(t, b"a").await.unwrap();
+        mq.publish(t, b"b").await.unwrap();
+
+        // Group "one" claims + acks both; "two" hasn't consumed anything yet.
+        let one = mq
+            .claim_grouped(t, "one", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        for m in &one {
+            mq.ack(m).await.unwrap();
+        }
+        // Nothing is reclaimable: "two" still needs both (id > its hwm of "").
+        assert_eq!(mq.gc_grouped(t).await.unwrap(), 0);
+
+        // "two" claims + acks both → now every group has consumed both.
+        let two = mq
+            .claim_grouped(t, "two", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&two), vec![b"a".to_vec(), b"b".to_vec()]);
+        for m in &two {
+            mq.ack(m).await.unwrap();
+        }
+        // Both are fully consumed → the sweep reclaims both log entries + payloads.
+        assert_eq!(mq.gc_grouped(t).await.unwrap(), 2);
+        let ids: Vec<String> = one.iter().map(|m| m.id.clone()).collect();
+        for id in &ids {
+            assert!(
+                storage.head(&gpayload_key(t, id)).await.is_err(),
+                "reclaimed payload for {id}"
+            );
+        }
+        // A caught-up group still returns empty (state intact, log gone).
+        assert!(mq
+            .claim_grouped(t, "one", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
