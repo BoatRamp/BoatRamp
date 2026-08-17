@@ -27,7 +27,7 @@ proven; the remaining work is real-environment operation, not implementation.
 | Single-node deployment | Stable. |
 | Clustering (Raft) | In-process complete; live multi-host operation is the remaining seam. |
 | Compute — containers & microVMs | The backends and the embedded VMM boot and serve real images; scale-to-zero snapshot/restore is validated live. The automatic idle→snapshot reconcile and VMM persistent volumes are being finished. |
-| Cloudflare Containers target | Declarative generate + deploy is complete; live cloud deploy/scale is a beta seam. |
+| Cloudflare Containers target | Native deploy over the CF REST API (no wrangler), validated live: `/healthz` + an authenticated control-plane round-trip through the edge → DO → container, with durable state in R2 (blobs + a SlateDB KV). A single durable instance — a multi-node Raft quorum isn't possible on the platform. |
 
 ## Support
 
