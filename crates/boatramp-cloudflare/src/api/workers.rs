@@ -74,6 +74,22 @@ pub struct Migrations {
     pub deleted_classes: Vec<String>,
 }
 
+/// A container/Durable-Object link in the Worker metadata: marks a DO `class_name`
+/// as the class that backs a **container** application. Without it, creating the
+/// container app fails with `DURABLE_OBJECT_NOT_CONTAINER_ENABLED` — the DO must
+/// be declared container-backed at Worker-upload time. The container's image +
+/// instances are set separately via the container API, not here.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ContainerRef {
+    /// The exported DO class that backs the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    /// The container application name (the API resolves the DO from either this or
+    /// `class_name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// The `metadata` part of a Worker script upload (the fields boatramp sets).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ScriptMetadata {
@@ -83,6 +99,9 @@ pub struct ScriptMetadata {
     /// The bindings attached to the Worker.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<Binding>,
+    /// DO classes that back container applications (container-enables them).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub containers: Vec<ContainerRef>,
     /// The DO migration to apply (first upload creates the DO namespaces).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migrations: Option<Migrations>,
@@ -189,6 +208,10 @@ mod tests {
                     text: "enam".into(),
                 },
             ],
+            containers: vec![ContainerRef {
+                class_name: Some("BoatrampNode".into()),
+                name: None,
+            }],
             migrations: Some(Migrations {
                 new_tag: "v1".into(),
                 new_sqlite_classes: vec!["BoatrampNode".into(), "CacheCoordinator".into()],
@@ -205,6 +228,8 @@ mod tests {
         assert_eq!(json["bindings"][1]["type"], "durable_object_namespace");
         assert_eq!(json["bindings"][1]["class_name"], "BoatrampNode");
         assert_eq!(json["bindings"][2]["type"], "plain_text");
+        // The container link that enables the DO as a container.
+        assert_eq!(json["containers"][0]["class_name"], "BoatrampNode");
         // First upload: no old_tag; SQLite DO classes created under the new tag.
         assert!(json["migrations"].get("old_tag").is_none());
         assert_eq!(json["migrations"]["new_tag"], "v1");

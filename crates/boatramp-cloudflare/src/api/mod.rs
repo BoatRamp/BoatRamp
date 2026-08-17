@@ -41,7 +41,10 @@ pub enum ApiError {
 #[derive(serde::Deserialize)]
 struct Envelope<T> {
     success: bool,
-    #[serde(default)]
+    // Some CF endpoints (e.g. the DO-namespaces list) return `"errors": null`
+    // rather than `[]`; a plain `#[serde(default)]` only covers an *absent*
+    // field, not an explicit null, so map null → empty too.
+    #[serde(default, deserialize_with = "null_to_default")]
     errors: Vec<EnvelopeError>,
     #[serde(default = "none")]
     result: Option<T>,
@@ -49,6 +52,17 @@ struct Envelope<T> {
 
 fn none<T>() -> Option<T> {
     None
+}
+
+/// Deserialize a field that may be absent **or** explicitly `null` into `T`'s
+/// default (Cloudflare uses `null` for empty `errors`/`messages` on some
+/// endpoints).
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(<Option<T> as serde::Deserialize>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(serde::Deserialize)]
@@ -127,10 +141,18 @@ pub struct CfApi {
 }
 
 impl CfApi {
-    /// Build a client for the given account id + API token.
+    /// Build a client for the given account id + API token. The client sets an
+    /// explicit User-Agent (identifies boatramp to the API) and does **not**
+    /// follow redirects — the container ("cloudchamber") API endpoints are fixed,
+    /// and a silently-followed redirect would drop a POST/PATCH body.
     pub fn new(account_id: impl Into<String>, token: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("boatramp/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             account_id: account_id.into(),
             token: token.into(),
         }
@@ -184,11 +206,13 @@ impl CfApi {
         url: String,
         body: &B,
     ) -> Result<T, ApiError> {
+        let json = serde_json::to_vec(body).map_err(|e| ApiError::Decode(e.to_string()))?;
         let resp = self
             .client
             .request(method, &url)
             .bearer_auth(&self.token)
-            .json(body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(json)
             .send()
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
@@ -235,13 +259,13 @@ impl CfApi {
         .await
     }
 
-    /// Modify an existing container application (`PATCH /applications/{id}`).
-    /// Sends the same desired shape as create (name is stable); the platform
-    /// applies the diff and bumps the version.
+    /// Modify an existing container application (`PATCH /applications/{id}`) — a
+    /// different body than create (`configuration`, no create-only fields); the
+    /// platform applies the diff and bumps the version.
     pub async fn modify_application(
         &self,
         id: &str,
-        req: &models::CreateApplicationRequest,
+        req: &models::ModifyApplicationRequest,
     ) -> Result<models::Application, ApiError> {
         self.send(
             reqwest::Method::PATCH,
@@ -320,6 +344,17 @@ mod tests {
     }
 
     #[test]
+    fn tolerates_explicit_null_errors() {
+        // The DO-namespaces list returns `"errors":null` (not `[]`) — the envelope
+        // must still parse the result rather than choke on the null.
+        let body = br#"{"result":[{"id":"ns-1","script":"boatramp","class":"BoatrampNode"}],
+            "success":true,"errors":null,"messages":null}"#;
+        let nss: Vec<super::resources::DoNamespace> = parse_envelope(body).unwrap();
+        assert_eq!(nss.len(), 1);
+        assert_eq!(nss[0].id, "ns-1");
+    }
+
+    #[test]
     fn success_without_result_is_a_decode_error() {
         let body = br#"{"success":true,"errors":[]}"#;
         let err = parse_envelope::<models::Application>(body).unwrap_err();
@@ -366,6 +401,7 @@ mod tests {
             name: "boatramp".into(),
             scheduling_policy: "default".into(),
             instances: 1,
+            max_instances: Some(1),
             configuration: models::UserDeploymentConfiguration {
                 image: "registry.cloudflare.com/acct/boatramp:latest".into(),
                 instance_type: Some("standard".into()),

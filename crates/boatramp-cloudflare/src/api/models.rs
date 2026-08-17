@@ -39,6 +39,9 @@ pub struct CreateApplicationRequest {
     pub scheduling_policy: String,
     /// Desired instance count.
     pub instances: u32,
+    /// Maximum instance count — **required** for a Durable-Object-backed app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
     /// The per-instance deployment configuration (image, size, env, …).
     pub configuration: UserDeploymentConfiguration,
     /// Region/placement constraints (the primary vs learner regions).
@@ -47,6 +50,26 @@ pub struct CreateApplicationRequest {
     /// The Durable Object namespace this app is bound to (its DO class).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_objects: Option<DurableObjectsConfiguration>,
+}
+
+/// The body of `PATCH /applications/{id}` (modify). Unlike create, it uses
+/// `configuration` (not `target_configuration`) and omits the immutable
+/// create-only fields (`name`, `durable_objects`) — mirrors wrangler's
+/// `createApplicationToModifyApplication`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModifyApplicationRequest {
+    /// Desired instance count (0 for a DO-backed app; see [`CreateApplicationRequest`]).
+    pub instances: u32,
+    /// Maximum instance count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
+    /// The per-instance deployment configuration.
+    pub configuration: UserDeploymentConfiguration,
+    /// Region/placement constraints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<ApplicationConstraints>,
+    /// Scheduling/placement policy.
+    pub scheduling_policy: String,
 }
 
 /// The per-instance deployment configuration (`configuration` on an application).
@@ -84,7 +107,11 @@ pub struct EnvironmentVariable {
 /// `regions` for the primary/learner region split.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ApplicationConstraints {
-    /// The regions the app may be placed in (CF region codes).
+    /// Placement tier (1 = default). Required-ish: the live API expects a
+    /// constraint, and `{ tier: 1 }` is the plain default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<u32>,
+    /// The regions the app may be placed in (CF region codes, upper-cased).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<String>,
     /// Specific cities (finer than regions), if any.

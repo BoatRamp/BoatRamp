@@ -8,9 +8,9 @@
 
 use crate::api::models::{
     ApplicationConstraints, CreateApplicationRequest, DurableObjectsConfiguration,
-    EnvironmentVariable, UserDeploymentConfiguration,
+    EnvironmentVariable, ModifyApplicationRequest, UserDeploymentConfiguration,
 };
-use crate::api::workers::{Binding, Migrations, ScriptMetadata};
+use crate::api::workers::{Binding, ContainerRef, Migrations, ScriptMetadata};
 
 /// The DO class the container node runs under (the `Container` = a Durable
 /// Object; the Worker's `NODE` binding + the container app both reference it).
@@ -25,7 +25,8 @@ pub const APP_NAME: &str = "boatramp";
 /// The Worker bindings for the deploy: R2 (blobs), D1 (`sql`), the two Durable
 /// Object namespaces (the container node + the cache coordinator), and the
 /// primary-region marker the edge reads. `d1_id` is the database id resolved by
-/// ensuring the D1 database.
+/// ensuring the D1 database. (The control-plane root key is delivered to the
+/// container via its app-config environment, not a Worker binding.)
 pub fn worker_bindings(r2_bucket: &str, d1_id: &str, primary_region: &str) -> Vec<Binding> {
     vec![
         Binding::R2Bucket {
@@ -62,6 +63,11 @@ pub fn worker_metadata(
     ScriptMetadata {
         main_module: "shim.mjs".into(),
         bindings,
+        // Container-enable the node DO class (the cache coordinator is a plain DO).
+        containers: vec![ContainerRef {
+            class_name: Some(NODE_CLASS.into()),
+            name: None,
+        }],
         migrations: Some(Migrations {
             new_tag: migration_tag.into(),
             new_sqlite_classes: vec![NODE_CLASS.into(), CACHE_CLASS.into()],
@@ -72,14 +78,14 @@ pub fn worker_metadata(
     }
 }
 
-/// The container-application request: `instances` replicas of `image`, placed in
-/// `regions` (the primary + learner regions), bound to the node DO namespace
-/// `do_namespace_id`, with the per-node cluster config passed as environment
-/// (`env`). `instance_type` is the CF instance tier (e.g. `"standard"`).
+/// The container-application request: a scale-to-zero app running `image`, capped
+/// at `instances`, bound to the node DO namespace `do_namespace_id`, with any
+/// per-node config passed as environment (`env`). `instance_type` is the CF
+/// instance tier (e.g. `"standard"`). Region placement (`constraints.regions`) is
+/// a follow-up — the single instance is placed by the platform.
 pub fn application_request(
     image: &str,
     instances: u32,
-    regions: &[String],
     instance_type: &str,
     env: Vec<(String, String)>,
     do_namespace_id: &str,
@@ -87,7 +93,11 @@ pub fn application_request(
     CreateApplicationRequest {
         name: APP_NAME.into(),
         scheduling_policy: "default".into(),
-        instances,
+        // A Durable-Object-backed app scales **on demand per DO id**: the desired
+        // `instances` is 0 and `max_instances` caps the total (matches wrangler's
+        // apply). `instances` here is the requested cap.
+        instances: 0,
+        max_instances: Some(instances),
         configuration: UserDeploymentConfiguration {
             image: image.into(),
             instance_type: Some(instance_type.into()),
@@ -97,13 +107,30 @@ pub fn application_request(
                 .collect(),
             ..Default::default()
         },
-        constraints: (!regions.is_empty()).then(|| ApplicationConstraints {
-            regions: regions.to_vec(),
+        // `{ tier: 1 }` is the proven-working default — CF places the single
+        // instance itself. (Region pinning via `constraints.regions` — upper-cased
+        // codes, per wrangler — is a follow-up; the account reported no locations.)
+        constraints: Some(ApplicationConstraints {
+            tier: Some(1),
             ..Default::default()
         }),
         durable_objects: Some(DurableObjectsConfiguration {
             namespace_id: do_namespace_id.into(),
         }),
+    }
+}
+
+/// The **modify** body for an existing application, derived from the desired
+/// [`CreateApplicationRequest`] — carries the mutable fields (`configuration`,
+/// `instances`, `max_instances`, `constraints`, `scheduling_policy`) and drops the
+/// create-only ones (`name`, `durable_objects`).
+pub fn modify_request(create: &CreateApplicationRequest) -> ModifyApplicationRequest {
+    ModifyApplicationRequest {
+        instances: create.instances,
+        max_instances: create.max_instances,
+        configuration: create.configuration.clone(),
+        constraints: create.constraints.clone(),
+        scheduling_policy: create.scheduling_policy.clone(),
     }
 }
 
@@ -148,29 +175,33 @@ mod tests {
         let req = application_request(
             "registry.cloudflare.com/acct/boatramp:v1",
             3,
-            &["enam".to_string(), "weur".to_string()],
             "standard",
             vec![("BOATRAMP_CLUSTER_INIT".into(), "1".into())],
             "ns-node",
         );
         assert_eq!(req.name, APP_NAME);
-        assert_eq!(req.instances, 3);
+        // DO-backed: desired instances 0, cap = the requested count.
+        assert_eq!(req.instances, 0);
+        assert_eq!(req.max_instances, Some(3));
         assert_eq!(
             req.configuration.image,
             "registry.cloudflare.com/acct/boatramp:v1"
         );
         assert_eq!(req.configuration.instance_type.as_deref(), Some("standard"));
         assert_eq!(req.configuration.environment_variables.len(), 1);
-        assert_eq!(
-            req.constraints.as_ref().unwrap().regions,
-            vec!["enam", "weur"]
-        );
+        // The proven-working default constraint is `{ tier: 1 }`.
+        assert_eq!(req.constraints.as_ref().unwrap().tier, Some(1));
         assert_eq!(req.durable_objects.unwrap().namespace_id, "ns-node");
     }
 
     #[test]
-    fn application_request_omits_constraints_when_no_regions() {
-        let req = application_request("img", 1, &[], "dev", vec![], "ns");
-        assert!(req.constraints.is_none());
+    fn modify_request_drops_create_only_fields() {
+        let create = application_request("img", 1, "standard", vec![], "ns");
+        let modify = modify_request(&create);
+        // Modify carries the mutable state, not the create-only DO binding.
+        assert_eq!(modify.instances, create.instances);
+        assert_eq!(modify.max_instances, create.max_instances);
+        assert_eq!(modify.configuration, create.configuration);
+        assert_eq!(modify.constraints.unwrap().tier, Some(1));
     }
 }

@@ -4,9 +4,9 @@
 //! one-token, env-provided UX as the S3/GCS/Azure backends.
 //!
 //! From a small set of inputs (regions, the voting-quorum region, the container
-//! image) it plans the cluster **topology** (a voting quorum in the primary region
-//! + read-only learners elsewhere), then drives the deploy through
-//! [`boatramp_cloudflare::api`]:
+//! image) it plans the cluster **topology** (a voting quorum in the primary
+//! region, plus read-only learners elsewhere), then drives the deploy through
+//! the [`boatramp_cloudflare::api`] client. The three steps are:
 //!
 //! 1. ensure the R2 bucket (blobs) + D1 database (the `sql` binding), idempotently;
 //! 2. upload a self-contained edge Worker — one ES module defining the
@@ -94,6 +94,15 @@ pub struct CloudflareArgs {
     /// Internal port the Containers' `/raft` + `/stream` mesh listens on.
     #[arg(long, default_value_t = 7000)]
     mesh_port: u16,
+
+    /// Control-plane root **private** key (`<alg>:<hex>`, from `boatramp auth
+    /// init`) to enable control-plane auth on the container. Stored as an encrypted
+    /// `secret_text` Worker binding and forwarded to the container at start. If
+    /// omitted, a fresh key is generated and printed once — save it to redeploy
+    /// with the same root (a lost key can't be recovered; CF secrets are
+    /// write-only).
+    #[arg(long, env = "BOATRAMP_AUTH_ROOT_PRIVATE_KEY")]
+    auth_root_private_key: Option<String>,
 
     /// Print the deploy plan (resources, image, Worker metadata, container
     /// application) and mutate nothing.
@@ -453,7 +462,10 @@ fn emit_artifacts(args: &CloudflareArgs, dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// The native-deploy defaults.
+/// The native-deploy defaults. `standard` (0.5 vCPU, 4 GiB, 8 GB disk) is the
+/// smallest tier whose disk holds the batteries-included image (the `lite`/`basic`
+/// tiers' ~2 GB disk is too small for the unpacked image and fails the pull); a
+/// slimmer image could drop to a smaller tier — a follow-up.
 const NATIVE_INSTANCE_TYPE: &str = "standard";
 const NATIVE_COMPAT_DATE: &str = "2025-01-01";
 const NATIVE_MIGRATION_TAG: &str = "v1";
@@ -478,10 +490,40 @@ fn edge_worker_module() -> String {
 // HTTP port; subsequent requests reuse the running instance.
 export class BoatrampNode extends DurableObject {{
   async fetch(request) {{
-    const c = this.ctx.container;
-    if (!c) return new Response("no container binding on this DO", {{ status: 500 }});
-    if (!c.running) c.start({{ enableInternet: true }});
-    return await c.getTcpPort({port}).fetch(request);
+    try {{
+      const c = this.ctx.container;
+      if (!c) return new Response("no container binding on this DO", {{ status: 500 }});
+      // The container port speaks plain HTTP (TLS terminates at the edge); rewrite
+      // the request URL scheme so the proxied fetch doesn't try HTTPS.
+      const url = new URL(request.url);
+      url.protocol = "http:";
+      const req = new Request(url, request);
+      // Cold start: provisioning (image pull) + boot + boatramp's own init take
+      // up to ~2 min, and a scale-to-zero container may be stopped between
+      // requests. So (re)start whenever it isn't running and retry the proxied
+      // fetch through the whole window — the transient errors here are
+      // "not running"/"not listening"/connection-refused, all expected while it
+      // comes up, so retry on any failure rather than an error-string allowlist.
+      let lastErr;
+      for (let i = 0; i < 120; i++) {{
+        if (!c.running) {{
+          try {{
+            c.start({{ enableInternet: true }});
+          }} catch (e) {{
+            // Already starting (a concurrent request won the race) — fine.
+          }}
+        }}
+        try {{
+          return await c.getTcpPort({port}).fetch(req.clone());
+        }} catch (e) {{
+          lastErr = e;
+          await new Promise((r) => setTimeout(r, 1000));
+        }}
+      }}
+      return new Response("container did not become ready: " + lastErr, {{ status: 503 }});
+    }} catch (e) {{
+      return new Response("BoatrampNode: " + (e && e.stack || e), {{ status: 502 }});
+    }}
   }}
 }}
 
@@ -496,8 +538,12 @@ export class CacheCoordinator extends DurableObject {{
 // Forward every request to the single container node (singleton instance).
 export default {{
   async fetch(request, env) {{
-    const id = env.NODE.idFromName("boatramp");
-    return env.NODE.get(id).fetch(request);
+    try {{
+      const id = env.NODE.idFromName("boatramp");
+      return await env.NODE.get(id).fetch(request);
+    }} catch (e) {{
+      return new Response("edge: " + (e && e.stack || e), {{ status: 502 }});
+    }}
   }}
 }};
 "#,
@@ -510,7 +556,7 @@ export default {{
 /// uploads the edge Worker (creating the DO namespaces), then creates/rolls out
 /// the container application referencing the boatramp image.
 async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
-    use boatramp_cloudflare::api::{models, plan_application, ApplicationAction, CfApi};
+    use boatramp_cloudflare::api::{plan_application, ApplicationAction, CfApi};
     use boatramp_cloudflare::deploy;
 
     let nodes = plan_topology(&args.regions, &args.primary, args.quorum, args.mesh_port)?;
@@ -521,11 +567,47 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
         return Err(Error::NativeMultiInstance(nodes.len()));
     }
     let instances = nodes.len() as u32;
-    let env: Vec<(String, String)> = vec![("BOATRAMP_CLUSTER_INIT".into(), "1".into())];
 
     if args.dry_run {
-        return print_native_plan(args, instances, env);
+        // The plan redacts the key; the real deploy fills it from the resolved
+        // root key below.
+        let plan_env = vec![(
+            "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
+            "<auth-root-key>".to_string(),
+        )];
+        return print_native_plan(args, instances, plan_env);
     }
+
+    // Resolve the control-plane root key. boatramp refuses to bind a public
+    // listener with auth disabled (fail-closed), and the container must bind
+    // 0.0.0.0 so the edge DO can reach it — so auth must be on. Prefer an
+    // operator-provided key (stable across redeploys); otherwise generate one and
+    // print it once so the operator can mint tokens + redeploy with the same root.
+    let auth_root_key = match args.auth_root_private_key.clone() {
+        Some(key) => key,
+        None => {
+            let signer =
+                boatramp_core::cose::LocalSigner::generate(boatramp_core::cose::TokenAlg::Es256);
+            let key = signer.private_hex();
+            println!(
+                "cloudflare: generated a control-plane root key — SAVE IT (mint tokens with it, \
+                 and set it to redeploy with the same root):\n  \
+                 BOATRAMP_AUTH_ROOT_PRIVATE_KEY={key}"
+            );
+            key
+        }
+    };
+    // Deliver the root key to the container as environment (the image already sets
+    // the bind address + writable state/cache dirs). The container runs on a
+    // private network reachable only through the edge Worker, so its config env is
+    // not internet-exposed; hardening this to Cloudflare's Secrets Store is a
+    // follow-up. State under the image's `/data` is ephemeral per-instance (a
+    // scale-to-zero container loses it on stop) — R2-backed durable state is the
+    // next step the image is built for.
+    let container_env = vec![(
+        "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
+        auth_root_key.clone(),
+    )];
 
     let api = CfApi::from_env()?;
     // Fail loud early if the pinned (non-public) container API drifted or the
@@ -541,10 +623,20 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
         args.r2_bucket, d1.name, d1.uuid
     );
 
-    // 2. Upload the edge Worker — this creates the BoatrampNode + CacheCoordinator
-    //    DO namespaces (via the migration) the container app binds to.
+    // 2. Upload the edge Worker — the DO migration creates the BoatrampNode +
+    //    CacheCoordinator namespaces the container app binds to. Only migrate on
+    //    the *first* upload: on a redeploy the namespaces already exist, and a
+    //    repeated first-upload migration (`old_tag: None`) would conflict, so we
+    //    re-upload just the code.
     let bindings = deploy::worker_bindings(&args.r2_bucket, &d1.uuid, &args.primary);
-    let metadata = deploy::worker_metadata(bindings, NATIVE_MIGRATION_TAG, NATIVE_COMPAT_DATE);
+    let mut metadata = deploy::worker_metadata(bindings, NATIVE_MIGRATION_TAG, NATIVE_COMPAT_DATE);
+    let already_migrated = api
+        .find_do_namespace(deploy::WORKER_NAME, deploy::NODE_CLASS)
+        .await?
+        .is_some();
+    if already_migrated {
+        metadata.migrations = None;
+    }
     let module = boatramp_cloudflare::api::workers::WorkerModule::js(
         metadata.main_module.clone(),
         edge_worker_module().into_bytes(),
@@ -566,12 +658,15 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     let request = deploy::application_request(
         &args.image,
         instances,
-        &args.regions,
         NATIVE_INSTANCE_TYPE,
-        env,
+        container_env,
         &ns_id,
     );
     let existing = api.list_applications().await?;
+    // A DO-backed, scale-to-zero app has no persistent instances to roll across:
+    // create/modify sets the active version in the app config, and the next
+    // `container.start()` (driven by the DO on first request) provisions an
+    // instance from it — so no separate rollout call is needed.
     let app = match plan_application(&existing, deploy::APP_NAME) {
         ApplicationAction::Create => {
             println!(
@@ -582,24 +677,19 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
         }
         ApplicationAction::Modify(id) => {
             println!("cloudflare: updating container application {id}");
-            api.modify_application(&id, &request).await?
+            // Modify uses a distinct body (`configuration`, no create-only fields).
+            let modify = deploy::modify_request(&request);
+            api.modify_application(&id, &modify).await?
         }
     };
-
-    // 4. Roll the new version out across the instance(s).
-    if let (Some(id), Some(version)) = (app.id.as_deref(), app.version) {
-        api.create_rollout(
-            id,
-            &models::CreateRolloutRequest {
-                target_version: version,
-                strategy: "rolling".into(),
-                description: Some("boatramp native deploy".into()),
-            },
-        )
-        .await?;
-        println!("cloudflare: rolled out version {version}");
-    }
-    println!("cloudflare: native deploy complete — cluster running on CF Containers");
+    println!(
+        "cloudflare: container application {:?} at version {} ({} tier); an instance provisions \
+         on the first request",
+        deploy::APP_NAME,
+        app.version.map(|v| v.to_string()).unwrap_or_default(),
+        NATIVE_INSTANCE_TYPE,
+    );
+    println!("cloudflare: native deploy complete — boatramp running on CF Containers");
     Ok(())
 }
 
@@ -617,7 +707,6 @@ fn print_native_plan(
     let app = deploy::application_request(
         &args.image,
         instances,
-        &args.regions,
         NATIVE_INSTANCE_TYPE,
         env,
         "<node-do-namespace>",
@@ -681,6 +770,7 @@ mod tests {
             r2_bucket: "boatramp-blobs".into(),
             d1: "boatramp-sql".into(),
             mesh_port: 7000,
+            auth_root_private_key: None,
             dry_run: true,
             emit_artifacts: None,
         }

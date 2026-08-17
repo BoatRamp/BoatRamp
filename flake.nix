@@ -255,6 +255,13 @@
                 pkg
                 pkgs.cacert
               ];
+              # The hardened non-root image (uid 65534) has no writable directory of
+              # its own — its CWD `/` and `/tmp` are root-owned — so the filesystem
+              # state backends (SlateDB kv / fs blobs) can't create their dirs and
+              # `serve` exits with a kv permission error. Ship a world-writable `/data`
+              # (1777, like `/tmp`) so the non-root binary has an ephemeral state dir;
+              # durable state still belongs on a mounted volume (root image) or R2.
+              extraCommands = "mkdir -p data && chmod 1777 data";
               config = {
                 Entrypoint = [ "${lib.getExe pkg}" ];
                 Cmd = [ "serve" ];
@@ -262,6 +269,11 @@
                 Env = [
                   "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                   "BOATRAMP_ADDR=0.0.0.0:8080"
+                  # Filesystem state + HOME-relative caches (wasmtime compile cache)
+                  # go under the world-writable `/data` so the non-root binary can
+                  # write them. Durable state still belongs on a volume or R2.
+                  "BOATRAMP_DATA_DIR=/data"
+                  "HOME=/data"
                 ];
               }
               // lib.optionalAttrs (user != null) { User = user; };
