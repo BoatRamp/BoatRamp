@@ -66,9 +66,13 @@ cloudflare: account reachable; container API responsive
 cloudflare: ensured R2 bucket "boatramp-blobs" + D1 database "boatramp-sql" (…)
 cloudflare: uploaded edge Worker "boatramp"
 cloudflare: creating container application "boatramp"
-cloudflare: rolled out version 1
-cloudflare: native deploy complete — cluster running on CF Containers
+cloudflare: container application "boatramp" at version 1 (standard tier); an instance provisions on the first request
+cloudflare: native deploy complete — boatramp running on CF Containers
 ```
+
+The container is **scale-to-zero**: no instance runs until the first request,
+which provisions one (a cold start pulls the image + boots — up to ~2 minutes; the
+edge Worker rides it out and retries). Subsequent requests reuse the warm instance.
 
 `--primary` hosts the voting quorum; other regions host read-only learners that
 serve local reads and forward writes to the leader. The node config is **uniform**
@@ -81,10 +85,27 @@ serve local reads and forward writes to the leader. The node config is **uniform
 > in progress. To inspect the reference artifacts (Dockerfile, Worker source,
 > node configs) without deploying, add `--emit-artifacts ./cloudflare`.
 
+### Control-plane auth
+
+The container binds a public port (behind the edge Worker), so boatramp requires
+control-plane auth to be enabled. Set `BOATRAMP_AUTH_ROOT_PRIVATE_KEY` (from
+`boatramp auth init`) before deploying — the deploy delivers it to the container so
+public site routes stay open while `/api/*` requires a token. If you don't set one,
+the deploy **generates and prints** a key once; save it (mint tokens with it, and
+reuse it to redeploy with the same root — Cloudflare can't return it later). Mint an
+admin token offline with the same key: `boatramp token mint --role admin`.
+
+> **Ephemeral state.** The container writes its filesystem state (SlateDB metadata,
+> `fs` blobs) to an in-image `/data` that a scale-to-zero instance **loses when it
+> stops**. This footprint is for validation + stateless serving; R2-backed durable
+> state is a follow-up. Deploy content is still re-applied idempotently from your
+> local source via `boatramp sync`.
+
 ## 3. Publish and verify
 
-Point publishing at the deployed domain — it behaves the same as any boatramp
-server, because content is backend-durable:
+Point publishing at the deployed domain — it behaves like any boatramp server (note
+the ephemeral-state caveat above; re-run `sync` after a cold start until R2-backed
+state lands):
 
 ```sh
 boatramp sync ./dist --site my-site --server https://example.com

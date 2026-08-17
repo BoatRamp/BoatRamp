@@ -85,12 +85,14 @@ passes the *same* `assert_conformance` battery.
   requests to the Container cluster.
 - **Native deployment** — `boatramp cloudflare` drives the Cloudflare REST API
   directly (no wrangler): ensure R2/D1/KV, upload the edge Worker (its bindings +
-  the Durable-Object migration), and create + roll out the **container
-  application** over the container ("cloudchamber") API — endpoints proven from
-  wrangler's open-source client and ported into `boatramp-cloudflare::api`. Same
+  the Durable-Object migration), and create/reconcile the **container application**
+  over the container ("cloudchamber") API — endpoints proven from wrangler's
+  open-source client and ported into `boatramp-cloudflare::api`. The app is
+  Durable-Object-backed + scale-to-zero (no separate rollout: create/modify sets the
+  active version, and the next request provisions an instance from it). Same
   one-token, env-provided UX as the S3/GCS/Azure backends; the request shaping is
-  unit-tested offline against the exact API shapes. See
-  `PLAN-native-cloudflare-deploy.md`.
+  unit-tested offline against the exact API shapes, and the whole flow is
+  live-validated end-to-end. See `PLAN-native-cloudflare-deploy.md`.
 - **Backend selection** — R2 for `Storage`, D1/libsql for `sql`; both already
   exist behind the trait seams.
 
