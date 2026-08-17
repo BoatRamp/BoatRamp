@@ -77,10 +77,15 @@ For exchanging an identity-provider JWT for a boatramp token. See
 | --- | --- |
 | `BOATRAMP_CLUSTER_RATE_LIMIT` | Rate-limit cluster-wide via the shared KV instead of per-node buckets. |
 | `BOATRAMP_SHARED_CACHE_COHERENCE` | Keep local config caches coherent across frontends sharing one KV. See [Cache coherence](../explanation/cache-coherence.md). |
-| `BOATRAMP_S3_BUCKET` | Object-store bucket backing the KV (SlateDB over S3/R2). |
-| `BOATRAMP_S3_ENDPOINT` | S3-compatible endpoint URL. |
-| `BOATRAMP_S3_REGION` | Bucket region. |
-| `BOATRAMP_S3_PATH_STYLE` | Use path-style addressing (for non-AWS endpoints). |
+| `BOATRAMP_BLOBS` | Blob backend (`fs`, `s3`, `gcs`, `azure`); env form of `--blobs`. |
+| `BOATRAMP_KV` | Metadata KV backend (`slatedb`, `memory`, `cloudflare`); env form of `--kv`. |
+| `BOATRAMP_KV_S3` | Run the SlateDB control-plane KV on the S3/R2 object store (reusing the `--blobs s3` config) instead of local disk — durable metadata for a volumeless container. Env form of `--kv-s3`. |
+| `BOATRAMP_KV_S3_PREFIX` | Key prefix for the `--kv-s3` store within the bucket (default `_kv`). |
+| `BOATRAMP_S3_BUCKET` | S3/R2 bucket for `s3` blobs and (with `--kv-s3`) the SlateDB KV. |
+| `BOATRAMP_S3_ENDPOINT` | S3-compatible endpoint URL (R2: `https://<account>.r2.cloudflarestorage.com`). |
+| `BOATRAMP_S3_REGION` | Bucket region (R2 uses `auto`). |
+| `BOATRAMP_S3_PATH_STYLE` | Use path-style addressing (for non-AWS endpoints; R2 accepts it). |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Credentials for the `s3`/R2 backend (standard AWS resolution). |
 
 ## Handler backends
 

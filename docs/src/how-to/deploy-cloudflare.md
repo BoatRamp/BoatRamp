@@ -51,8 +51,9 @@ boatramp cloudflare \
 
 Then drop `--dry-run` to apply. `boatramp cloudflare` ensures the R2 bucket + D1
 database (idempotent), uploads the edge Worker (creating its Durable Object
-namespaces), and creates + rolls out the container application referencing your
-image:
+namespaces), and creates the container application referencing your image (a
+Durable-Object-backed, scale-to-zero app needs no separate rollout — the next
+request provisions an instance from the active version):
 
 ```sh
 boatramp cloudflare \

@@ -5,6 +5,40 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Added
+- **Native Cloudflare Containers deploy** (`boatramp cloudflare`). Deploys boatramp to Cloudflare
+  over the CF REST API directly — no wrangler, nothing generated for the operator to run (the same
+  one-token, env-provided model as the S3/GCS/Azure backends): it ensures the R2 bucket + D1 database,
+  uploads a self-contained edge Worker (a `BoatrampNode` container Durable Object that starts the
+  container and proxies to boatramp's HTTP port, plus a cache coordinator), and creates the container
+  application. Validated end-to-end live: `/healthz` and an authenticated control-plane read+write
+  round-trip through the edge → DO → container → `boatramp serve`. `--dry-run` previews the plan;
+  `--emit-artifacts` writes reference files. Control-plane auth is required on the container (a root
+  key is generated + printed once if `--auth-root-private-key` / `BOATRAMP_AUTH_ROOT_PRIVATE_KEY`
+  isn't set); `--container-env KEY=VALUE` passes extra env (e.g. a handler's webhook secret) to the
+  container.
+- **Durable Cloudflare state in R2.** The Cloudflare container keeps all durable state in R2 — blobs
+  over the S3-compatible API, and the control-plane metadata as a SlateDB store on the same bucket —
+  so a scale-to-zero instance keeps its state across a stop (the image's `/data` now holds only
+  ephemeral caches). The R2 S3 credentials are derived from the account API token (access-key-id =
+  token id, secret = SHA-256 of the token value), so there's no separate R2 token to provision, the
+  container never holds the raw Cloudflare token, and the token needs only its existing R2 scope (no
+  Workers KV scope).
+- **SlateDB control-plane KV on an S3/R2 object store** (`--kv-s3` / `BOATRAMP_KV_S3`, prefix via
+  `--kv-s3-prefix` / `BOATRAMP_KV_S3_PREFIX`). Runs the durable control-plane KV on the `--blobs s3`
+  bucket instead of local disk — strongly consistent (SlateDB single-writer manifest fencing), for a
+  container with no persistent volume. `--blobs` and `--kv` are now env-configurable (`BOATRAMP_BLOBS`
+  / `BOATRAMP_KV`).
+
+### Changed
+- **Cloudflare runs a single durable instance, not a multi-node cluster.** A multi-node Raft quorum
+  can't run on Cloudflare Containers (they scale to zero and have no container-to-container
+  networking, so a majority of voting peers can't stay simultaneously running and exchange low-latency
+  RPCs); `boatramp cloudflare` deploys `--quorum 1` only, and the durable single-writer (state in R2)
+  is the Cloudflare architecture. Multi-node Raft remains the self-hosted / VM / orchestrator story.
+
 ## [0.2.9] - 2026-08-16
 
 ### Added

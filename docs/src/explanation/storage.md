@@ -18,8 +18,11 @@ They compose: `CachedKv(SlateKv)`, or `RaftKv` over a per-node `SlateKv`.
 
 ### Consensus (`RaftKv`)
 Writes go to the leader, commit to the replicated log, and apply to **every**
-node's state machine; reads come from local applied state. This is cluster mode
-and Cloudflare-Containers mode.
+node's state machine; reads come from local applied state. This is multi-node
+cluster mode (self-hosted / VM / orchestrator). It does **not** apply to
+Cloudflare Containers, which run a single durable instance with a SlateDB store on
+R2 (a Raft quorum isn't possible there — see
+[Deploy on Cloudflare](../how-to/deploy-cloudflare.md)).
 
 - Each node keeps its **own** durable Raft store — **not shared** (sharing a Raft
   log breaks Raft). Only *blobs* (S3/R2) are shared.

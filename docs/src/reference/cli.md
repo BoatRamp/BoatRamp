@@ -67,7 +67,7 @@ flags unique to each command:
 | [`cert-status`](#boatramp-cert-status) | Show cluster-managed certificate status. |
 | [`completions <shell>`](#boatramp-completions-man) | Print a shell-completion script. |
 | [`man`](#boatramp-completions-man) | Render the man page to stdout. |
-| [`cloudflare`](#boatramp-cloudflare) | Generate a Cloudflare Containers deployment (`cluster` feature). |
+| [`cloudflare`](#boatramp-cloudflare) | Deploy to Cloudflare Containers natively over the REST API (`cluster` feature). |
 
 Exit status is `0` on success and non-zero on failure; see
 [Errors & exit codes](./errors.md).
@@ -84,12 +84,14 @@ cluster mode. The `cluster:` and `compute:` sections are configured in
 | --- | --- | --- | --- |
 | `--addr <host:port>` | `BOATRAMP_ADDR` | `127.0.0.1:8080` | Bind address. |
 | `--data-dir <path>` | `BOATRAMP_DATA_DIR` | `./data` | Blob + KV root for the filesystem backends. |
-| `--blobs <fs\|s3\|gcs\|azure>` | — | `fs` | Blob backend (`s3`/`gcs`/`azure` are in the default build). |
-| `--kv <slatedb\|memory\|cloudflare>` | — | `slatedb` | KV backend (`cloudflare` is in the default build). |
-| `--s3-bucket <name>` | `BOATRAMP_S3_BUCKET` | — | S3 bucket (`--blobs s3`). |
+| `--blobs <fs\|s3\|gcs\|azure>` | `BOATRAMP_BLOBS` | `fs` | Blob backend (`s3`/`gcs`/`azure` are in the default build). |
+| `--kv <slatedb\|memory\|cloudflare>` | `BOATRAMP_KV` | `slatedb` | KV backend (`cloudflare` is in the default build). |
+| `--kv-s3` | `BOATRAMP_KV_S3` | `false` | Run the SlateDB KV on the S3/R2 object store (reusing the `--blobs s3` config) instead of local disk — durable metadata for a volumeless container. |
+| `--kv-s3-prefix <prefix>` | `BOATRAMP_KV_S3_PREFIX` | `_kv` | Key prefix for the `--kv-s3` store within the bucket. |
+| `--s3-bucket <name>` | `BOATRAMP_S3_BUCKET` | — | S3/R2 bucket (`--blobs s3` and/or `--kv-s3`). |
 | `--s3-endpoint <url>` | `BOATRAMP_S3_ENDPOINT` | — | S3 endpoint (MinIO / R2). |
-| `--s3-region <region>` | `BOATRAMP_S3_REGION` | — | S3 region. |
-| `--s3-path-style` | `BOATRAMP_S3_PATH_STYLE` | `false` | Use path-style S3 addressing. |
+| `--s3-region <region>` | `BOATRAMP_S3_REGION` | — | S3 region (R2: `auto`). |
+| `--s3-path-style` | `BOATRAMP_S3_PATH_STYLE` | `false` | Use path-style S3 addressing (R2 accepts it). |
 | `--gcs-bucket <name>` | `BOATRAMP_GCS_BUCKET` | — | GCS bucket (`--blobs gcs`). Credentials via Application Default Credentials. |
 | `--gcs-endpoint <url>` | `BOATRAMP_GCS_ENDPOINT` | — | GCS endpoint (a `fake-gcs-server` emulator). |
 | `--gcs-anonymous` | `BOATRAMP_GCS_ANONYMOUS` | `false` | Skip GCS credential resolution (the emulator). |
@@ -576,6 +578,23 @@ flags.
 
 ## `boatramp cloudflare`
 
-Generate (and optionally apply) a Cloudflare Containers deployment — boatramp's
-cluster mode on CF Containers plus an edge Worker. Needs the `cluster` feature.
-See [Deploy on Cloudflare Containers](../how-to/deploy-cloudflare.md).
+Deploy boatramp to Cloudflare Containers **natively** over the CF REST API (no
+wrangler) — behind an edge Worker, as a single **durable** instance with all
+state in R2. Needs the `cluster` feature and `CLOUDFLARE_ACCOUNT_ID` +
+`CLOUDFLARE_API_TOKEN` (Workers Scripts, Containers, R2, D1 scopes). A multi-node
+Raft quorum isn't possible on the platform, so only `--quorum 1` deploys. See
+[Deploy on Cloudflare Containers](../how-to/deploy-cloudflare.md).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--region <code>` | — | CF region to run in (repeatable; on CF only one deploys). |
+| `--primary <code>` | — | The primary region (must be one of `--region`). |
+| `--quorum <n>` | `3` | Voting nodes — must be `1` on Cloudflare (single durable instance). |
+| `--image <ref>` | `boatramp:latest` | Container image (pushed to a registry CF can pull). |
+| `--domain <host>` | — | Public domain the edge Worker serves (repeatable). |
+| `--r2-bucket <name>` | `boatramp-blobs` | R2 bucket for durable blobs + the SlateDB KV. |
+| `--d1 <name>` | `boatramp-sql` | D1 database for the handler `sql` binding. |
+| `--auth-root-private-key <alg:hex>` | env `BOATRAMP_AUTH_ROOT_PRIVATE_KEY` | Control-plane root key; generated + printed once if unset. |
+| `--container-env <KEY=VALUE>` | — | Extra env for the container (repeatable) — e.g. a handler's webhook secret. |
+| `--dry-run` | `false` | Print the plan; mutate nothing. |
+| `--emit-artifacts <dir>` | — | Write reference artifacts (Dockerfile, edge Worker, node configs) instead of deploying. |

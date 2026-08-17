@@ -19,21 +19,23 @@
 > networking; the parts of this doc that describe a CF Raft quorum are the original
 > design exploration, superseded by this boundary.
 
-Cloudflare-hosted is the third deployment mode. The
-decision (superseding the earlier Durable-Object-coordinator sketch): **CF-hosted
-is boatramp's own cluster mode running on Cloudflare Containers**, fronted by a
-thin edge **Worker**. There is **no separate coordinator** — the single-writer
-coordinator is the **Raft leader** on every multi-node mode (self-hosted cluster
-*and* CF), so the behavior contract and the operator UX are **identical**, not
-forked. Containers run the native boatramp binary (tokio/axum/wasmtime) unchanged,
-so this is a *deployment/management* target, not a runtime rewrite.
+Cloudflare-hosted is the third deployment mode. The decision (superseding the
+earlier Durable-Object-coordinator sketch): **CF-hosted runs the native boatramp
+binary on Cloudflare Containers as a single durable instance**, fronted by a thin
+edge **Worker**. There is **no separate coordinator** and no Durable-Object
+coordinator fork — the container's own single writer coordinates, its state durable
+in R2 — so the behavior contract and the operator UX are **identical** to a
+self-hosted deploy, not forked. Containers run the boatramp binary
+(tokio/axum/wasmtime) unchanged, so this is a *deployment/management* target, not a
+runtime rewrite. (A multi-node Raft quorum is a self-hosted-only topology; it can't
+run on CF Containers — see §4.)
 
 > Why not a Workers/Durable-Object rewrite: it would split coordination behavior
-> (DO single-writer vs Raft leader) and force a second coordinator implementation
-> to build, test, and keep in conformance. Uniform UX + accepting single-writer
-> (libsql is single-writer anyway) makes "cluster mode, hosted on CF" the simpler
-> and more honest design. CF Containers run our real binary, so we don't need to
-> become a Worker.
+> (a bespoke DO coordinator vs the native binary) and force a second implementation
+> to build, test, and keep in conformance. Accepting a single writer (libsql is
+> single-writer anyway) + the uniform UX makes "run our real binary on CF, state in
+> R2" the simpler and more honest design. CF Containers run our real binary, so we
+> don't need to become a Worker.
 
 > Status: the cluster mechanism CF reuses is implemented and tested
 > in-process / over localhost HTTP. The CF-specific layer — deployment/management
@@ -51,39 +53,38 @@ so this is a *deployment/management* target, not a runtime rewrite.
             └───────────────┬───────────────────────────────────────────────────────────────┘
                             │ dynamic / handler requests
                  ┌──────────▼───────────────────────────────────────────────┐
-                 │ boatramp Containers (native binary) — one Raft cluster     │
-                 │   • voting quorum (3–5) in a primary region               │
-                 │   • learner instances in other regions: local reads,      │
-                 │     forward writes to the leader                          │
-                 │   coordinator = Raft leader (RaftMessaging, cron via       │
-                 │   is_leader) — identical to self-hosted cluster           │
-                 └───────┬───────────────────┬───────────────────┬──────────┘
-                         │                   │                   │
-                      R2 (blobs)       D1 / libsql (sql)    durable volume / R2
-                                                            (per-node Raft store)
+                 │ boatramp Container (native binary) — one DURABLE instance  │
+                 │   • a single scale-to-zero instance (the DO singleton)     │
+                 │   • all durable state in R2; no peer networking or voting  │
+                 │     quorum (a multi-node Raft cluster isn't possible on CF  │
+                 │     Containers). A parked/replaced container restores from  │
+                 │     R2. Coordinator = the single writer (LogMessaging).     │
+                 └───────┬───────────────────┬──────────────────────────────┘
+                         │                   │
+                    R2 (blobs over the   D1 / libsql (sql)
+                    S3 API + SlateDB KV)
 ```
 
 | Concern | CF binding | boatramp seam (reused) |
 | --- | --- | --- |
 | Blobs / `Storage` | **R2** | the `s3` backend (S3-compatible) |
-| Control-plane `KvStore` | the **replicated Raft state** (`RaftKv`) on the Containers | unchanged |
-| Messaging coordinator | the **Raft leader** (`RaftMessaging`) | unchanged — no DO |
+| Control-plane `KvStore` | a **SlateDB store on R2** (durable, single-writer) | the `slatedb` backend over an object store (`--kv-s3`) |
+| Messaging coordinator | the **single instance** (`LogMessaging`) — the DO gives one container at a time | unchanged — no DO coordinator |
 | `sql` binding | **D1** or libsql (per-site) | the engine-agnostic `SqlBackend` |
-| Per-node Raft log/state | Container **durable volume** (or R2-backed) | `persist::PersistentLogStore` |
 | Edge routing / static / cache / TLS | the **Worker** | static serving + host routing |
 
-## 2. Why this exploits multi-region (under single-writer)
+## 2. Global serving from a single durable writer
 
 - **Edge everywhere:** the Worker runs in every PoP — global routing, cache, and
   static-from-R2 with no cold start. The serving fast path is genuinely global.
-- **Local reads everywhere:** far-region Containers join as Raft **learners**
-  (replicate the log, serve reads from local applied state, don't vote), so reads
-  are fast in every region while the voting quorum stays in one low-latency
-  region. boatramp already has this (`raft::add_voter` + openraft learners +
-  `RaftKv` reads-from-local-applied).
-- **Writes** funnel to the leader — accepted, and consistent with libsql's
-  single-writer model. Writes are small, infrequent control-plane / claim ops,
-  so the occasional cross-region write hop is cheap.
+- **One durable writer:** dynamic/handler requests reach the single container
+  instance, whose control-plane state is a strongly-consistent SlateDB store on R2
+  and whose blobs are on R2 — so a scale-to-zero stop loses nothing. This matches
+  libsql's single-writer model; control-plane writes are small + infrequent.
+- **Not a multi-region Raft cluster.** The multi-region voting-quorum + learner
+  design below is the **self-hosted / VM / orchestrator** story (real peer
+  networking, always-on voters); it does not apply to Cloudflare Containers, where
+  the durable single writer above is the architecture.
 
 ## 3. What's reused vs. CF-specific
 
@@ -109,18 +110,28 @@ passes the *same* `assert_conformance` battery.
 - **Backend selection** — R2 for `Storage`, D1/libsql for `sql`; both already
   exist behind the trait seams.
 
-## 4. Platform specifics to verify (designed for, not guessed)
+## 4. Platform specifics — verified (why CF is single-instance)
 
-- **Always-on Containers** for Raft voters (no scale-to-zero for members);
-  learners may be more elastic.
-- **Inter-Container networking** for the Raft HTTP mesh. The transport is
-  abstracted (`RaftNetworkFactory` / `HttpForwarder`), so if direct
-  container-to-container HTTP isn't available, the mesh routes via CF service
-  bindings or a DO relay — a transport swap, not an architecture change.
-- **Durable per-node Raft store** — a Container persistent volume, or back
-  `PersistentLogStore` with R2/D1.
+These were the open questions for a multi-node CF cluster. Verified against
+Cloudflare's docs, they are exactly why a CF Raft quorum **isn't possible**, so
+CF is the durable single writer above:
+
+- **No always-on Containers.** CF Containers scale to zero and Cloudflare "does
+  not guarantee that any instance will run for any set period of time" — so a
+  majority of voting members can't be kept simultaneously running. A Raft quorum
+  needs that; the single durable instance doesn't.
+- **No inter-Container networking.** All ingress to a container is mediated by its
+  owning Durable Object (`getTcpPort().fetch()`); one container can't dial
+  another. Routing Raft RPCs DO→DO would add cold-start latency incompatible with
+  consensus election timeouts — Cloudflare themselves moved off Raft for their WAN
+  for this reason.
+- **Durable state is R2, not a per-node Raft log** — a SlateDB store on R2 for the
+  control plane (`--kv-s3`) + R2 blobs; a parked/replaced container restores from
+  it.
 - **Container lifecycle** is managed by a per-instance Durable Object (the CF
-  Containers model); that DO is *infrastructure*, not a boatramp coordinator.
+  Containers model); that DO is *infrastructure*, not a boatramp coordinator, and
+  its one-container-at-a-time guarantee is what makes SlateDB's single-writer
+  fencing correct.
 
 ## 5. TLS on CF
 

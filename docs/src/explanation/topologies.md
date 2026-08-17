@@ -41,12 +41,16 @@ every request. The peer mesh runs over raw-public-key mutual TLS. See
 
 ## Cloudflare Containers
 
-The same binary runs in Cloudflare Containers as a cluster, with a thin edge
-Worker in front. The Worker runs the pure `boatramp_core::route` logic compiled
-to Wasm, so the edge routes exactly as the origin does — there is no separate
-routing implementation to keep in sync, and no separate coordinator service. Blob
-and metadata durability move to R2 and D1 behind the same `Storage` / `KvStore`
-seams. See [Deploy on Cloudflare Containers](../how-to/deploy-cloudflare.md).
+The same binary runs in Cloudflare Containers as a **single durable instance**,
+with a thin edge Worker in front. The Worker runs the pure `boatramp_core::route`
+logic compiled to Wasm, so the edge routes exactly as the origin does — there is no
+separate routing implementation to keep in sync, and no separate coordinator
+service. Durability moves to R2 behind the same `Storage` / `KvStore` seams: blobs
+over the S3 API and the control-plane metadata as a SlateDB store on the same
+bucket (the handler `sql` binding uses D1/libsql). A multi-node Raft quorum isn't
+possible on the platform (CF Containers scale to zero and have no
+container-to-container networking), so the durable single writer is the Cloudflare
+topology. See [Deploy on Cloudflare Containers](../how-to/deploy-cloudflare.md).
 
 ## Choosing
 
