@@ -1,10 +1,23 @@
 # boatramp on Cloudflare — mode design
 
 > This is the **design rationale** for the Cloudflare deployment mode:
-> boatramp's cluster mode on CF Containers, fronted by a thin edge Worker, with
-> no Durable-Object coordinator fork. The `boatramp cloudflare` command deploys
-> it **natively over the Cloudflare REST API** — no wrangler, nothing generated
-> for the operator to run.
+> boatramp on CF Containers, fronted by a thin edge Worker, with no
+> Durable-Object coordinator fork. The `boatramp cloudflare` command deploys it
+> **natively over the Cloudflare REST API** — no wrangler, nothing generated for
+> the operator to run.
+
+> **Platform boundary (validated live + against CF docs):** a multi-node Raft
+> quorum is **not possible** on Cloudflare Containers — they scale to zero and
+> have no container-to-container networking (all ingress is mediated by the owning
+> Durable Object), so a majority of voting peers can't stay simultaneously running
+> and exchange low-latency RPCs. So on Cloudflare boatramp runs as a **single
+> durable instance**: a DO-singleton container with **all state in R2** (blobs
+> over S3, control-plane metadata as a SlateDB store on the same bucket — SlateDB's
+> single-writer manifest fencing matches the one-container-at-a-time DO model). A
+> parked/replaced container restores its state from R2. The multi-node Raft cluster
+> below is the **self-hosted / VM / orchestrator** story, where peers have real
+> networking; the parts of this doc that describe a CF Raft quorum are the original
+> design exploration, superseded by this boundary.
 
 Cloudflare-hosted is the third deployment mode. The
 decision (superseding the earlier Durable-Object-coordinator sketch): **CF-hosted

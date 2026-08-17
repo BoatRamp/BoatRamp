@@ -74,16 +74,17 @@ The container is **scale-to-zero**: no instance runs until the first request,
 which provisions one (a cold start pulls the image + boots — up to ~2 minutes; the
 edge Worker rides it out and retries). Subsequent requests reuse the warm instance.
 
-`--primary` hosts the voting quorum; other regions host read-only learners that
-serve local reads and forward writes to the leader. The node config is **uniform**
-([dynamic join](./deploy-cluster.md)): the founding instance sets
-`BOATRAMP_CLUSTER_INIT=1`.
-
-> The native deploy currently targets the **single-instance** footprint
-> (`--quorum 1`, one region) — enough to run the full cluster mode on Cloudflare.
-> Multi-instance founder/join coordination across fungible Container instances is
-> in progress. To inspect the reference artifacts (Dockerfile, Worker source,
-> node configs) without deploying, add `--emit-artifacts ./cloudflare`.
+On Cloudflare, boatramp runs as a **single durable instance** — deploy with
+`--quorum 1` and one `--region`. A multi-node Raft quorum is **not possible on
+the platform**: CF Containers scale to zero and have no container-to-container
+networking (every request is mediated by the container's Durable Object), so a
+majority of voting peers can't stay simultaneously running and exchange the
+low-latency RPCs consensus needs. Instead, the single instance keeps **all state
+durably in R2** (see below), which is Cloudflare's architecture for this — a
+parked or replaced container restores its state from R2. (Multi-node Raft targets
+self-hosted / VM / orchestrator deployments with real peer networking; to inspect
+what such a topology's reference artifacts look like, add `--emit-artifacts
+./cloudflare` — those are not a Cloudflare deploy.)
 
 ### Control-plane auth
 
@@ -95,17 +96,19 @@ the deploy **generates and prints** a key once; save it (mint tokens with it, an
 reuse it to redeploy with the same root — Cloudflare can't return it later). Mint an
 admin token offline with the same key: `boatramp token mint --role admin`.
 
-> **Ephemeral state.** The container writes its filesystem state (SlateDB metadata,
-> `fs` blobs) to an in-image `/data` that a scale-to-zero instance **loses when it
-> stops**. This footprint is for validation + stateless serving; R2-backed durable
-> state is a follow-up. Deploy content is still re-applied idempotently from your
-> local source via `boatramp sync`.
+> **Durable state in R2.** The deploy points the container at R2 for **all** durable
+> state: blobs go to the R2 bucket over the S3 API, and the control-plane metadata
+> (deploy manifests, the per-site `current` pointer) is a SlateDB store on the same
+> bucket. So a scale-to-zero instance keeps everything across a stop — the in-image
+> `/data` now holds only ephemeral caches (the wasmtime compile cache). The R2 S3
+> credentials are derived from your API token (no separate token to provision, and
+> the container never holds the raw Cloudflare token), so the token needs only its
+> existing R2 scope.
 
 ## 3. Publish and verify
 
-Point publishing at the deployed domain — it behaves like any boatramp server (note
-the ephemeral-state caveat above; re-run `sync` after a cold start until R2-backed
-state lands):
+Point publishing at the deployed domain — it behaves like any boatramp server, and
+deploys persist across cold starts (state is durable in R2):
 
 ```sh
 boatramp sync ./dist --site my-site --server https://example.com

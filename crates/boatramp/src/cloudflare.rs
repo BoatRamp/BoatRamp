@@ -1,7 +1,11 @@
-//! `boatramp cloudflare` — deploy boatramp's **cluster mode on CF Containers**
-//! behind an edge Worker (`docs/CLOUDFLARE.md`), **natively** over the Cloudflare
-//! REST API. No wrangler, nothing generated for the operator to run — the same
-//! one-token, env-provided UX as the S3/GCS/Azure backends.
+//! `boatramp cloudflare` — deploy boatramp on **CF Containers** behind an edge
+//! Worker (`docs/CLOUDFLARE.md`), **natively** over the Cloudflare REST API. No
+//! wrangler, nothing generated for the operator to run — the same one-token,
+//! env-provided UX as the S3/GCS/Azure backends. boatramp runs as a single
+//! **durable** instance (all state in R2): CF Containers scale to zero and have
+//! no container-to-container networking, so a multi-node Raft quorum isn't
+//! possible on the platform — the durable single-writer is the CF architecture
+//! (see [`Error::NativeMultiInstance`]).
 //!
 //! From a small set of inputs (regions, the voting-quorum region, the container
 //! image) it plans the cluster **topology** (a voting quorum in the primary
@@ -19,8 +23,8 @@
 //! `--dry-run` previews the full plan (offline, deterministic, unit-tested);
 //! `--emit-artifacts <dir>` writes reference files (Dockerfile, the Rust→Wasm edge
 //! Worker source, per-node `boatramp.cfg` fragments) for inspection — not a deploy
-//! step. The single-instance footprint is the validated target; multi-instance
-//! founder/join coordination is a live follow-up.
+//! step, and the multi-node topology it can render targets self-hosted / VM /
+//! orchestrator deployments, not Cloudflare (where only `--quorum 1` deploys).
 
 use std::path::PathBuf;
 
@@ -44,13 +48,19 @@ pub enum Error {
     /// A build/serialization step in the native deploy failed.
     #[error("native cloudflare deploy: {0}")]
     Native(String),
-    /// The native path does not yet support a multi-instance cluster (founder /
-    /// join coordination across homogeneous Container instances is a live
-    /// follow-up); use `--quorum 1` with a single region for now.
+    /// A multi-node Raft quorum can't run on Cloudflare Containers — a hard
+    /// platform boundary, not a missing feature. CF Containers scale to zero and
+    /// have no container-to-container networking (all ingress is mediated by the
+    /// owning Durable Object), so a majority of voting peers can't stay
+    /// simultaneously running and exchange low-latency RPCs. The Cloudflare
+    /// architecture is a single **durable** instance instead (state in R2).
     #[error(
-        "native deploy currently supports a single-instance footprint (got {0} nodes); \
-         use `--quorum 1` with one `--region`, or generate artifacts (drop `--native`) \
-         for a multi-node topology"
+        "Cloudflare runs boatramp as a single durable instance (got {0} nodes). CF Containers \
+         scale to zero and have no container-to-container networking, so a persistent Raft \
+         quorum of peers isn't possible on the platform. Use `--quorum 1` with one `--region`: \
+         the instance's state is durable in R2 (a parked/replaced container restores from it), \
+         which is the Cloudflare architecture. Multi-node Raft targets self-hosted / VM / \
+         container-orchestrator deployments with real peer networking."
     )]
     NativeMultiInstance(usize),
 }
