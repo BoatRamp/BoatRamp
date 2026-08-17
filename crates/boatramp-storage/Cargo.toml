@@ -43,8 +43,10 @@ azure = [
   "dep:bytes",
 ]
 cloudflare-kv = ["dep:reqwest", "dep:serde", "dep:serde_json"]
-# Durable embedded KV: transactional LSM over an object_store backend.
-slatedb = ["dep:slatedb", "dep:bytes"]
+# Durable embedded KV: transactional LSM over an object_store backend. The
+# `object_store` dep (same version slatedb uses, so the `ObjectStore` trait
+# unifies) with its `aws` feature lets the store run on S3/R2, not just local disk.
+slatedb = ["dep:slatedb", "dep:bytes", "dep:object_store"]
 # The SQL backend for the handler `sql` binding (impl `boatramp_core::sql`):
 # libsql (SQLite-compatible) — an embedded file per site (single-node) or a
 # namespace per site on a shared sqld primary (cluster, read-replicable). One
@@ -86,6 +88,7 @@ reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 slatedb = { workspace = true, optional = true }
+object_store = { version = "0.12", features = ["aws"], optional = true }
 libsql = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

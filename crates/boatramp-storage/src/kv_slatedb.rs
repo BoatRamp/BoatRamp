@@ -61,6 +61,39 @@ fn settings_with_flush(flush_interval: Duration) -> Settings {
     }
 }
 
+/// How to reach an S3-compatible object store (e.g. Cloudflare R2) for a
+/// [`SlateKv::open_s3_with_flush`]. Credentials are read from the ambient AWS
+/// environment, so only the addressing lives here.
+#[derive(Debug, Clone)]
+pub struct S3StoreConfig {
+    /// The bucket the SlateDB store lives in.
+    pub bucket: String,
+    /// Custom endpoint (R2: `https://<account>.r2.cloudflarestorage.com`).
+    pub endpoint: Option<String>,
+    /// Region (R2 uses `auto`).
+    pub region: Option<String>,
+    /// Use path-style addressing (R2 accepts it).
+    pub path_style: bool,
+}
+
+/// Build an `object_store` S3 backend from [`S3StoreConfig`] + ambient AWS
+/// credentials. SlateDB fences its manifest with conditional puts, so the store
+/// is built with ETag-based conditional put (which R2 supports).
+fn build_s3_object_store(cfg: &S3StoreConfig) -> Result<Arc<dyn ObjectStore>, KvError> {
+    use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+    let mut builder = AmazonS3Builder::from_env()
+        .with_bucket_name(&cfg.bucket)
+        .with_region(cfg.region.clone().unwrap_or_else(|| "auto".into()))
+        .with_conditional_put(S3ConditionalPut::ETagMatch);
+    if let Some(endpoint) = &cfg.endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if cfg.path_style {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+    Ok(Arc::new(builder.build().map_err(backend)?))
+}
+
 impl SlateKv {
     /// Open a store over an arbitrary `object_store` backend (rooted at `path`)
     /// using SlateDB's default settings — the throughput-oriented profile for
@@ -78,6 +111,21 @@ impl SlateKv {
         flush_interval: Duration,
     ) -> Result<Self, KvError> {
         Self::open_with(store, path, settings_with_flush(flush_interval)).await
+    }
+
+    /// Open a control-plane store over an S3-compatible object store (e.g.
+    /// Cloudflare R2), rooted at the key prefix `path`, with the low
+    /// control-plane flush interval. Credentials come from the ambient AWS
+    /// environment (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), matching the
+    /// S3 blob backend, so a container needs only R2 credentials — no Cloudflare
+    /// token. SlateDB's single-writer manifest fencing suits the DO-singleton
+    /// container; durable state then survives a scale-to-zero stop.
+    pub async fn open_s3_with_flush(
+        cfg: &S3StoreConfig,
+        path: &str,
+        flush_interval: Duration,
+    ) -> Result<Self, KvError> {
+        Self::open_with_flush(build_s3_object_store(cfg)?, path, flush_interval).await
     }
 
     async fn open_with(
@@ -473,5 +521,47 @@ mod tests {
             kv.close().await.unwrap();
         })
         .await;
+    }
+
+    /// **Live** (ignored): open a control-plane SlateKv over Cloudflare R2, write,
+    /// then close and reopen a fresh handle over the same R2 path and confirm the
+    /// data survived — the durability contract a scale-to-zero container relies
+    /// on. Needs `BR_R2_TEST_BUCKET` + `BR_R2_TEST_ENDPOINT` and ambient
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+    #[tokio::test]
+    #[ignore = "needs live R2 credentials (BR_R2_TEST_BUCKET/ENDPOINT + AWS creds)"]
+    async fn slatedb_over_r2_survives_reopen() {
+        let Ok(bucket) = std::env::var("BR_R2_TEST_BUCKET") else {
+            eprintln!("skipping: BR_R2_TEST_BUCKET not set");
+            return;
+        };
+        let cfg = S3StoreConfig {
+            bucket,
+            endpoint: std::env::var("BR_R2_TEST_ENDPOINT").ok(),
+            region: std::env::var("BR_R2_TEST_REGION").ok(),
+            path_style: true,
+        };
+        let path = "boatramp-kv-livetest";
+        let flush = Duration::from_millis(5);
+        {
+            let kv = SlateKv::open_s3_with_flush(&cfg, path, flush)
+                .await
+                .unwrap();
+            kv.put("current/site", b"deploy-42".to_vec()).await.unwrap();
+            assert_eq!(
+                kv.get("current/site").await.unwrap(),
+                Some(b"deploy-42".to_vec())
+            );
+            kv.close().await.unwrap();
+        }
+        // A fresh handle over the same R2 path must observe the persisted write.
+        let kv = SlateKv::open_s3_with_flush(&cfg, path, flush)
+            .await
+            .unwrap();
+        assert_eq!(
+            kv.get("current/site").await.unwrap(),
+            Some(b"deploy-42".to_vec())
+        );
+        kv.close().await.unwrap();
     }
 }

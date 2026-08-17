@@ -66,7 +66,9 @@ pub async fn run(args: MigrateArgs, config: &ServerConfig) -> Result<(), Error> 
         .or_else(|| config.serve.as_ref().and_then(|s| s.data_dir.clone()))
         .unwrap_or_else(|| PathBuf::from("./data"));
 
-    let kv = build_control_plane_kv(args.kv, &data_dir)
+    // The pre-0.2.0 → project-scoped re-key is a local-store migration (a fresh
+    // remote-state deploy has no layout-1 store), so open the local SlateDB.
+    let kv = build_control_plane_kv(args.kv, &data_dir, None)
         .await
         .map_err(|e| Box::new(crate::serve::Error::from(e)))?;
 

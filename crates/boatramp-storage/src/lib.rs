@@ -77,7 +77,7 @@ pub use azure::{AzureOptions, AzureStorage};
 pub use azure_notify::AzureWatchProvider;
 
 #[cfg(feature = "slatedb")]
-pub use kv_slatedb::SlateKv;
+pub use kv_slatedb::{S3StoreConfig, SlateKv};
 
 #[cfg(feature = "cloudflare-kv")]
 pub use kv_cloudflare::CloudflareKv;

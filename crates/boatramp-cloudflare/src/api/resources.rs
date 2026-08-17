@@ -4,6 +4,7 @@
 //! existing resource by name, else create it — so a redeploy is safe.
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::{ApiError, CfApi};
 
@@ -23,6 +24,28 @@ pub struct KvNamespace {
     pub id: String,
     /// The namespace title (its human name).
     pub title: String,
+}
+
+/// R2 S3-compatible credentials for this account, derived from the configured
+/// API token via Cloudflare's documented scheme: the S3 **access key id** is the
+/// token's id, and the **secret** is the hex SHA-256 of the token value. Reusing
+/// the deploy token means no separate R2 token to provision (it must carry R2
+/// read/write). The secret is one-way, so a container holding only these S3
+/// credentials can reach R2 but cannot act as the raw Cloudflare token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct R2S3Credentials {
+    /// The S3 access key id (the API token's id).
+    pub access_key_id: String,
+    /// The S3 secret access key (hex SHA-256 of the token value).
+    pub secret_access_key: String,
+    /// The R2 S3 endpoint (`https://<account>.r2.cloudflarestorage.com`).
+    pub endpoint: String,
+}
+
+/// The `GET /user/tokens/verify` result — used only for the token's id.
+#[derive(Debug, Clone, Deserialize)]
+struct TokenVerify {
+    id: String,
 }
 
 /// A Durable Object namespace (created by a Worker's DO migration). The
@@ -64,6 +87,22 @@ impl CfApi {
             Err(ApiError::Api(m)) if m.contains("already") || m.contains("10004") => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Derive R2 S3-compatible credentials for this account from the configured
+    /// API token (Cloudflare's scheme: access key id = token id, secret = hex
+    /// SHA-256 of the token value). One `GET /user/tokens/verify` for the id; the
+    /// secret is computed locally. Lets the container reach R2 (blobs + SlateDB)
+    /// without carrying the raw Cloudflare token.
+    pub async fn r2_s3_credentials(&self) -> Result<R2S3Credentials, ApiError> {
+        let verify: TokenVerify = self
+            .get(format!("{}/user/tokens/verify", super::API_BASE))
+            .await?;
+        Ok(R2S3Credentials {
+            access_key_id: verify.id,
+            secret_access_key: hex::encode(Sha256::digest(self.token().as_bytes())),
+            endpoint: format!("https://{}.r2.cloudflarestorage.com", self.account_id()),
+        })
     }
 
     /// Ensure a D1 database named `name` exists; return it (reuse-or-create).
@@ -133,6 +172,24 @@ mod tests {
         let db: D1Database = parse_envelope(body).unwrap();
         assert_eq!(db.uuid, "d1-abc");
         assert_eq!(db.name, "boatramp-sql");
+    }
+
+    #[test]
+    fn parses_token_verify_for_the_id() {
+        // Only the token id is read (the R2 S3 access key id); other fields ignored.
+        let body = br#"{"success":true,"errors":[],
+            "result":{"id":"tok-abc","status":"active","not_before":"2026-01-01"}}"#;
+        let v: TokenVerify = parse_envelope(body).unwrap();
+        assert_eq!(v.id, "tok-abc");
+    }
+
+    #[test]
+    fn r2_secret_is_a_64_hex_sha256_of_the_token() {
+        // CF's R2 scheme: secret = hex(SHA-256(token value)); deterministic, one-way.
+        let s = hex::encode(Sha256::digest(b"my-cf-token"));
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(s, hex::encode(Sha256::digest(b"my-cf-token")));
     }
 
     #[test]

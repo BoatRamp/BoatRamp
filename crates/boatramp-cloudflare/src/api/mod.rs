@@ -173,6 +173,17 @@ impl CfApi {
         ))
     }
 
+    /// The Cloudflare account id this client targets.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// The API token this client authenticates with (also the container's
+    /// Workers-KV / R2 credential source).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// `…/accounts/{account_id}`.
     fn account_base(&self) -> String {
         format!("{API_BASE}/accounts/{}", self.account_id)

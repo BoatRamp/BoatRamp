@@ -569,12 +569,31 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     let instances = nodes.len() as u32;
 
     if args.dry_run {
-        // The plan redacts the key; the real deploy fills it from the resolved
-        // root key below.
-        let plan_env = vec![(
-            "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
-            "<auth-root-key>".to_string(),
-        )];
+        // The plan redacts the secrets; the real deploy fills them from the
+        // resolved root key + provisioned R2/KV credentials below.
+        let plan_env = vec![
+            (
+                "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
+                "<auth-root-key>".to_string(),
+            ),
+            ("BOATRAMP_BLOBS".to_string(), "s3".to_string()),
+            ("BOATRAMP_S3_BUCKET".to_string(), args.r2_bucket.clone()),
+            (
+                "BOATRAMP_S3_ENDPOINT".to_string(),
+                "https://<account>.r2.cloudflarestorage.com".to_string(),
+            ),
+            ("BOATRAMP_S3_REGION".to_string(), "auto".to_string()),
+            ("BOATRAMP_S3_PATH_STYLE".to_string(), "true".to_string()),
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "<r2-access-key>".to_string(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "<r2-secret>".to_string(),
+            ),
+            ("BOATRAMP_KV_S3".to_string(), "true".to_string()),
+        ];
         return print_native_plan(args, instances, plan_env);
     }
 
@@ -597,31 +616,49 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
             key
         }
     };
-    // Deliver the root key to the container as environment (the image already sets
-    // the bind address + writable state/cache dirs). The container runs on a
-    // private network reachable only through the edge Worker, so its config env is
-    // not internet-exposed; hardening this to Cloudflare's Secrets Store is a
-    // follow-up. State under the image's `/data` is ephemeral per-instance (a
-    // scale-to-zero container loses it on stop) — R2-backed durable state is the
-    // next step the image is built for.
-    let container_env = vec![(
-        "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
-        auth_root_key.clone(),
-    )];
-
     let api = CfApi::from_env()?;
     // Fail loud early if the pinned (non-public) container API drifted or the
     // token lacks the scope, before mutating anything.
     api.probe().await?;
     println!("cloudflare: account reachable; container API responsive");
 
-    // 1. Resources (idempotent).
+    // 1. Resources (idempotent): R2 bucket (durable blobs, via the S3 API), D1
+    //    (the handler `sql` binding), and a Workers KV namespace (the durable
+    //    control-plane metadata store the container reads/writes over REST).
     api.ensure_r2_bucket(&args.r2_bucket).await?;
     let d1 = api.ensure_d1_database(&args.d1).await?;
+    let r2 = api.r2_s3_credentials().await?;
     println!(
         "cloudflare: ensured R2 bucket {:?} + D1 database {:?} ({})",
         args.r2_bucket, d1.name, d1.uuid
     );
+
+    // Deliver the container's runtime config as environment. The container runs on
+    // a private network reachable only through the edge Worker, so its config env
+    // is not internet-exposed; hardening the secrets to Cloudflare's Secrets Store
+    // is a follow-up. All durable state lives in **R2** — blobs via the S3 API, and
+    // the control-plane metadata as a SlateDB store on the same bucket (`--kv-s3`).
+    // A scale-to-zero instance keeps its state across stops; the image's `/data`
+    // now holds only ephemeral caches (the wasmtime compile cache). The container
+    // holds only the derived R2 S3 credentials (a one-way hash of the token), not
+    // the Cloudflare token itself.
+    let container_env = vec![
+        (
+            "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
+            auth_root_key.clone(),
+        ),
+        // Blobs → R2 over the S3-compatible API.
+        ("BOATRAMP_BLOBS".to_string(), "s3".to_string()),
+        ("BOATRAMP_S3_BUCKET".to_string(), args.r2_bucket.clone()),
+        ("BOATRAMP_S3_ENDPOINT".to_string(), r2.endpoint.clone()),
+        ("BOATRAMP_S3_REGION".to_string(), "auto".to_string()),
+        ("BOATRAMP_S3_PATH_STYLE".to_string(), "true".to_string()),
+        ("AWS_ACCESS_KEY_ID".to_string(), r2.access_key_id.clone()),
+        ("AWS_SECRET_ACCESS_KEY".to_string(), r2.secret_access_key),
+        // Control-plane metadata → SlateDB on the same R2 bucket (durable, strongly
+        // consistent, single-writer — the DO gives us one instance at a time).
+        ("BOATRAMP_KV_S3".to_string(), "true".to_string()),
+    ];
 
     // 2. Upload the edge Worker — the DO migration creates the BoatrampNode +
     //    CacheCoordinator namespaces the container app binds to. Only migrate on

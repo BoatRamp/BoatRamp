@@ -1620,9 +1620,11 @@ version = "0.2.9"
 dependencies = [
  "async-trait",
  "boatramp-core",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1901,6 +1903,7 @@ dependencies = [
  "libsql",
  "lru 0.16.4",
  "notify",
+ "object_store",
  "reqwest",
  "serde",
  "serde_json",

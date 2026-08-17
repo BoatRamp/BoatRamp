@@ -242,11 +242,11 @@ pub struct ServeArgs {
     data_dir: Option<PathBuf>,
 
     /// Blob storage backend.
-    #[arg(long, value_enum, default_value_t = BlobBackend::Fs)]
+    #[arg(long, value_enum, env = "BOATRAMP_BLOBS", default_value_t = BlobBackend::Fs)]
     blobs: BlobBackend,
 
     /// Metadata (KV) backend.
-    #[arg(long, value_enum, default_value_t = KvBackend::Slatedb)]
+    #[arg(long, value_enum, env = "BOATRAMP_KV", default_value_t = KvBackend::Slatedb)]
     kv: KvBackend,
 
     /// Migrate a pre-0.2.0 (layout 1) control-plane store to the project-scoped
@@ -270,6 +270,17 @@ pub struct ServeArgs {
     /// Use S3 path-style addressing (required by MinIO).
     #[arg(long, env = "BOATRAMP_S3_PATH_STYLE")]
     s3_path_style: bool,
+
+    /// Run the SlateDB control-plane KV on the S3 store (`--blobs s3` config, e.g.
+    /// R2) instead of local disk — durable, remote metadata for a container with
+    /// no persistent volume. The LSM lives under `<bucket>/<kv-s3-prefix>`.
+    #[arg(long, env = "BOATRAMP_KV_S3")]
+    kv_s3: bool,
+
+    /// Key prefix for the `--kv-s3` SlateDB store within the S3 bucket (keeps its
+    /// LSM files apart from the blobs).
+    #[arg(long, env = "BOATRAMP_KV_S3_PREFIX", default_value = "_kv")]
+    kv_s3_prefix: String,
 
     /// GCS bucket (required for `--blobs gcs`).
     #[arg(long, env = "BOATRAMP_GCS_BUCKET")]
@@ -611,7 +622,18 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         return Err(Error::NoClusterSupport);
     }
 
-    let kv_backend = boatramp_node::backends::build_kv(args.kv, &data_dir).await?;
+    // `--kv-s3` runs the SlateDB control-plane store on the S3 object store (R2),
+    // reusing the `--blobs s3` addressing (bucket/endpoint/region/path-style) +
+    // AWS-env credentials, so a volumeless container keeps durable metadata.
+    let slate_s3 = args.kv_s3.then(|| boatramp_node::backends::SlateKvS3 {
+        bucket: args.s3_bucket.clone().unwrap_or_default(),
+        endpoint: args.s3_endpoint.clone(),
+        region: args.s3_region.clone(),
+        path_style: args.s3_path_style,
+        prefix: args.kv_s3_prefix.clone(),
+    });
+    let kv_backend =
+        boatramp_node::backends::build_kv(args.kv, &data_dir, slate_s3.as_ref()).await?;
     // Shared-mode coherence: when several processes share
     // one KV, publish each write to a changelog over the *uncached* backend and
     // poll it to invalidate peer-changed keys.
