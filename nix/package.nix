@@ -25,8 +25,12 @@
   openssl,
   cmake,
   llvmPackages,
+  removeReferencesTo,
   features ? [ ],
   consoleDist ? null,
+  # The toolchain to scrub from the runtime closure (the flake passes its pinned
+  # rust-overlay toolchain). `null` (the stock `overlays.default`) skips the scrub.
+  rustToolchain ? null,
 }:
 rustPlatform.buildRustPackage {
   pname = "boatramp";
@@ -70,9 +74,21 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     pkg-config
     cmake
+    removeReferencesTo
   ];
   buildInputs = [ openssl ];
   LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages.libclang.lib ];
+
+  # The stripped release binary still carries a **dead** store-path string to the
+  # Rust toolchain (a common Rust-on-Nix wart — a leftover path survives `strip`).
+  # Nix then conservatively pins the *entire* toolchain closure (~1.6 GiB: rustc +
+  # rust-docs + gcc + std) into the runtime image, even though nothing runs it.
+  # Scrub the dead reference so the closure is just the binary + its real libs —
+  # dropping the OCI images from ~640 MB to ~150 MB. Skipped when no toolchain is
+  # passed (the stock-nixpkgs overlay path).
+  postInstall = lib.optionalString (rustToolchain != null) ''
+    remove-references-to -t ${rustToolchain} "$out/bin/boatramp"
+  '';
 
   meta = {
     description = "Self-hosted, streaming-first static site publishing platform";

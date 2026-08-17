@@ -226,7 +226,7 @@
               features ? [ ],
             }:
             pkgs.callPackage ./nix/package.nix {
-              inherit rustPlatform features;
+              inherit rustPlatform features rustToolchain;
               consoleDist = consolePackage;
             };
 

@@ -5,6 +5,16 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.11] - 2026-08-17
+
+### Changed
+- **Container images are ~4× smaller.** The stripped release binary retained a dead store-path
+  reference to the Rust toolchain, which pinned the *entire* toolchain closure (rustc, the Rust docs,
+  gcc, and the std libraries — ~1.6 GiB) into every published image even though nothing there ever
+  runs it. Scrubbing the dead reference at build time drops the toolchain from the runtime closure,
+  cutting the base and Cloudflare container images from ~640 MB to ~150 MB (compressed) — faster pulls
+  and cold starts. The shipped binary is unchanged.
+
 ## [0.2.10] - 2026-08-17
 
 ### Added
