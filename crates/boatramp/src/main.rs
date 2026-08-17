@@ -18,6 +18,25 @@
 //! - `prune`       — delete orphan deployments and unreferenced blobs.
 //! - `scrub`       — verify stored blobs still hash to their keys (integrity).
 
+// Optional non-default global allocators, selected at build time for performance
+// tuning / benchmarking. Mutually exclusive; the default build uses the system
+// allocator (glibc `malloc` on the gnu target, musl `malloc` on the musl target).
+// A fully-static musl binary in particular benefits from swapping musl's malloc
+// for jemalloc or mimalloc under concurrent, allocation-heavy load.
+#[cfg(all(feature = "jemalloc", feature = "mimalloc"))]
+compile_error!(
+    "features `jemalloc` and `mimalloc` are mutually exclusive: a binary has exactly one \
+     global allocator — pick one"
+);
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};

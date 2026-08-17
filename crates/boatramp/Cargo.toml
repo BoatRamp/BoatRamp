@@ -213,7 +213,20 @@ operator = [
 # with the operator's schemars 0.8), so this just pulls it in.
 mcp = ["dep:boatramp-mcp", "boatramp-server/mcp"]
 
+# Optional, **non-default**, mutually-exclusive global allocators for performance
+# tuning + benchmarking (main.rs installs the `#[global_allocator]`). The default
+# build keeps the system allocator (glibc/musl `malloc`); a fully-static musl
+# binary benefits most from swapping in jemalloc or mimalloc under concurrent,
+# allocation-heavy load. Enable exactly one, e.g. `--features jemalloc`.
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+# Optional non-default global allocators (behind the `jemalloc`/`mimalloc`
+# features): tikv-jemallocator is the maintained jemalloc binding. Both install a
+# `#[global_allocator]` in main.rs; neither is compiled unless its feature is set.
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc = { version = "0.1", optional = true }
 # COSE/CWT + Cedar auth is always built into the binary: the CLI
 # mints/manages tokens and serve wires the verifier.
 boatramp-core = { workspace = true, features = ["authz"] }
