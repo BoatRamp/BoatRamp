@@ -5,9 +5,23 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.2.10] - 2026-08-17
 
 ### Added
+- **Message-queue fabric — a project topic bus with durable consumer groups.** Internal function
+  flows can now be connected through a message queue instead of only direct invocation. A shared,
+  **project-scoped topic bus** (the `bus:<topic>` selector) carries events between a project's sites,
+  functions, and handlers. A consumer subscribes as either the competing-consumer **work queue** (the
+  default group — one of the site's consumers processes each message, with lease/redelivery and a
+  dead-letter after `max_attempts`) or a named **durable consumer group** (fan-out — every group
+  receives *every* message on the topic independently, with its own cursor, retry, and dead-letter).
+  Groups are declared from a consumer/trigger in config (`group` + `start`). A **verified inbound
+  webhook** (`POST /_webhooks/<name>`, HMAC-SHA256 over a host-held secret) is an external edge: a
+  verified request publishes its body onto the bus (`webhook_publish`) with no component run, or
+  invokes the function — wired through the CLI + `boatramp apply`. Consumer components are validated
+  against the `messaging-handler` world at activation (fail-closed). The fan-out is a single **offset
+  log** with compact per-group state (bounded range-scan claim), and it runs on both single-node
+  (`LogMessaging`) and the cluster (`RaftMessaging`, applied through the Raft state machine).
 - **Native Cloudflare Containers deploy** (`boatramp cloudflare`). Deploys boatramp to Cloudflare
   over the CF REST API directly — no wrangler, nothing generated for the operator to run (the same
   one-token, env-provided model as the S3/GCS/Azure backends): it ensures the R2 bucket + D1 database,
