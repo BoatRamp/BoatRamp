@@ -19,7 +19,14 @@
 //!     mapping a caller would feed to the declarative deploy.
 //!
 //! Cross-platform (an HTTP client + pure mapping); no Cloudflare creds live in
-//! the spec — they belong to the `wrangler` toolchain / `CLOUDFLARE_API_TOKEN`.
+//! the spec — they belong to the `CLOUDFLARE_API_TOKEN` in the environment.
+//!
+//! The [`api`] module is the **native** CF REST client (Workers + container API)
+//! that a wrangler-free `boatramp deploy --target cloudflare` drives — see
+//! `PLAN-native-cloudflare-deploy.md`.
+
+pub mod api;
+pub mod deploy;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
