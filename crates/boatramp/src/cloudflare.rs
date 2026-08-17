@@ -106,13 +106,19 @@ pub struct CloudflareArgs {
     mesh_port: u16,
 
     /// Control-plane root **private** key (`<alg>:<hex>`, from `boatramp auth
-    /// init`) to enable control-plane auth on the container. Stored as an encrypted
-    /// `secret_text` Worker binding and forwarded to the container at start. If
-    /// omitted, a fresh key is generated and printed once — save it to redeploy
-    /// with the same root (a lost key can't be recovered; CF secrets are
-    /// write-only).
+    /// init`) to enable control-plane auth on the container. Delivered to the
+    /// container via its app-config environment. If omitted, a fresh key is
+    /// generated and printed once — save it to mint tokens + redeploy with the
+    /// same root.
     #[arg(long, env = "BOATRAMP_AUTH_ROOT_PRIVATE_KEY")]
     auth_root_private_key: Option<String>,
+
+    /// Extra environment variable for the container (`KEY=VALUE`, repeatable) —
+    /// e.g. a secret a deployed handler/function reads (a webhook HMAC secret, a
+    /// bring-your-own-database URL). Added to the container's app-config env
+    /// alongside the managed R2/auth settings.
+    #[arg(long = "container-env", value_name = "KEY=VALUE")]
+    container_env: Vec<String>,
 
     /// Print the deploy plan (resources, image, Worker metadata, container
     /// application) and mutate nothing.
@@ -652,7 +658,7 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
     // now holds only ephemeral caches (the wasmtime compile cache). The container
     // holds only the derived R2 S3 credentials (a one-way hash of the token), not
     // the Cloudflare token itself.
-    let container_env = vec![
+    let mut container_env = vec![
         (
             "BOATRAMP_AUTH_ROOT_PRIVATE_KEY".to_string(),
             auth_root_key.clone(),
@@ -669,6 +675,14 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
         // consistent, single-writer — the DO gives us one instance at a time).
         ("BOATRAMP_KV_S3".to_string(), "true".to_string()),
     ];
+    // Operator-supplied extras (`--container-env KEY=VALUE`) — e.g. a handler's
+    // webhook secret or external-DB URL.
+    for pair in &args.container_env {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            Error::Native(format!("--container-env must be KEY=VALUE, got {pair:?}"))
+        })?;
+        container_env.push((key.to_string(), value.to_string()));
+    }
 
     // 2. Upload the edge Worker — the DO migration creates the BoatrampNode +
     //    CacheCoordinator namespaces the container app binds to. Only migrate on
@@ -818,6 +832,7 @@ mod tests {
             d1: "boatramp-sql".into(),
             mesh_port: 7000,
             auth_root_private_key: None,
+            container_env: vec![],
             dry_run: true,
             emit_artifacts: None,
         }
