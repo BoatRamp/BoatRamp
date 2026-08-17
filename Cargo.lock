@@ -1536,6 +1536,7 @@ dependencies = [
  "axum-server",
  "base64 0.22.1",
  "boatramp-acme",
+ "boatramp-cloudflare",
  "boatramp-cluster",
  "boatramp-container",
  "boatramp-core",

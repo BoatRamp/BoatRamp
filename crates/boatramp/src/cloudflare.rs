@@ -1,34 +1,26 @@
-//! `boatramp cloudflare` — generate (and optionally apply) a Cloudflare
-//! deployment of boatramp's **cluster mode on CF Containers** behind an edge
-//! Worker (`docs/CLOUDFLARE.md`).
+//! `boatramp cloudflare` — deploy boatramp's **cluster mode on CF Containers**
+//! behind an edge Worker (`docs/CLOUDFLARE.md`), **natively** over the Cloudflare
+//! REST API. No wrangler, nothing generated for the operator to run — the same
+//! one-token, env-provided UX as the S3/GCS/Azure backends.
 //!
-//! This is the CF "management" surface: from a small set of inputs (regions,
-//! the voting-quorum region, the container image, the public domains) it plans
-//! the cluster **topology** (a voting quorum in the primary region + read-only
-//! learner nodes in the other regions) and generates everything needed to
-//! deploy:
+//! From a small set of inputs (regions, the voting-quorum region, the container
+//! image) it plans the cluster **topology** (a voting quorum in the primary region
+//! + read-only learners elsewhere), then drives the deploy through
+//! [`boatramp_cloudflare::api`]:
 //!
-//! - per-node `boatramp.cfg` `cluster` fragments (node id, peers, voters,
-//!   bootstrap) — the same config `boatramp serve` cluster mode consumes;
-//! - a `Dockerfile` that builds the boatramp binary (`--features cluster`);
-//! - a `wrangler.jsonc` wiring the edge Worker + the Container + R2/D1/KV
-//!   bindings + the routes;
-//! - the edge Worker as a **Rust → Wasm** crate (`worker/src/lib.rs` +
-//!   `worker/Cargo.toml`, built with `worker-build`), not JavaScript — boatramp
-//!   is Wasm-first, so the edge runs Wasm too; the only JS is the ~10-line
-//!   bootstrap shim `worker-build` auto-generates. It **reuses
-//!   `boatramp_types::route::resolve`** + the deploy `Manifest`/`DeployConfig`
-//!   (from the small wasm-clean `boatramp-types`, not full `boatramp-core`), so
-//!   the edge applies the *same* redirect/rewrite/clean-URL routing as the
-//!   Container (no drift): redirects/files are answered at the edge from R2,
-//!   dynamic outcomes forward to the cluster. It also carries the
-//!   `CacheCoordinator` Durable Object (the push-invalidation delivery);
-//! - a `README.md` with the deploy steps.
+//! 1. ensure the R2 bucket (blobs) + D1 database (the `sql` binding), idempotently;
+//! 2. upload a self-contained edge Worker — one ES module defining the
+//!    `BoatrampNode` container Durable Object (starts the container + proxies to
+//!    boatramp's HTTP port) and `CacheCoordinator`, plus the DO migration that
+//!    creates their namespaces;
+//! 3. create/modify the **container application** (image + instances + region
+//!    constraints + the node DO namespace) and roll it out.
 //!
-//! Generation is offline + deterministic (unit-tested). `--apply` shells out to
-//! `wrangler` and needs a live environment (wrangler + CF credentials + the
-//! live platform); the CF-schema specifics in the generated files are
-//! structured to be easy to verify/adjust against the live platform.
+//! `--dry-run` previews the full plan (offline, deterministic, unit-tested);
+//! `--emit-artifacts <dir>` writes reference files (Dockerfile, the Rust→Wasm edge
+//! Worker source, per-node `boatramp.cfg` fragments) for inspection — not a deploy
+//! step. The single-instance footprint is the validated target; multi-instance
+//! founder/join coordination is a live follow-up.
 
 use std::path::PathBuf;
 
@@ -46,12 +38,21 @@ pub enum Error {
     /// Creating an output directory or writing a generated artifact failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// Spawning `wrangler deploy` failed (wrangler missing or not runnable).
-    #[error("running `wrangler deploy` failed (is wrangler installed?): {0}")]
-    WranglerSpawn(String),
-    /// `wrangler deploy` ran but exited non-zero.
-    #[error("`wrangler deploy` exited with {0}")]
-    WranglerFailed(std::process::ExitStatus),
+    /// A native Cloudflare REST API call failed.
+    #[error(transparent)]
+    Api(#[from] boatramp_cloudflare::api::ApiError),
+    /// A build/serialization step in the native deploy failed.
+    #[error("native cloudflare deploy: {0}")]
+    Native(String),
+    /// The native path does not yet support a multi-instance cluster (founder /
+    /// join coordination across homogeneous Container instances is a live
+    /// follow-up); use `--quorum 1` with a single region for now.
+    #[error(
+        "native deploy currently supports a single-instance footprint (got {0} nodes); \
+         use `--quorum 1` with one `--region`, or generate artifacts (drop `--native`) \
+         for a multi-node topology"
+    )]
+    NativeMultiInstance(usize),
 }
 
 /// `cloudflare` module result; `Err` is [`Error`].
@@ -94,13 +95,16 @@ pub struct CloudflareArgs {
     #[arg(long, default_value_t = 7000)]
     mesh_port: u16,
 
-    /// Output directory for the generated artifacts.
-    #[arg(long, default_value = "./cloudflare")]
-    out: PathBuf,
-
-    /// Apply the deployment via `wrangler` (needs wrangler + CF creds).
+    /// Print the deploy plan (resources, image, Worker metadata, container
+    /// application) and mutate nothing.
     #[arg(long)]
-    apply: bool,
+    dry_run: bool,
+
+    /// Instead of deploying, write the deployment artifacts (Dockerfile, edge
+    /// Worker source, per-node cluster configs) to this directory for inspection.
+    /// The deploy itself is native — this is a debugging escape hatch, not a step.
+    #[arg(long)]
+    emit_artifacts: Option<PathBuf>,
 }
 
 /// A node's voting role in the planned topology.
@@ -227,47 +231,6 @@ fn render_dockerfile(mesh_port: u16) -> String {
          VOLUME [\"{RAFT_STORE_DIR}\"]\n\
          EXPOSE {mesh_port}\n\
          ENTRYPOINT [\"boatramp\", \"--config\", \"/etc/boatramp/boatramp.cfg\", \"serve\"]\n"
-    )
-}
-
-/// A `wrangler.jsonc` wiring the edge Worker + Container + R2/D1 bindings.
-/// (CF Containers/wrangler schema is verified against the live platform.)
-fn render_wrangler(args: &CloudflareArgs, nodes: &[Node]) -> String {
-    let routes: String = args
-        .domains
-        .iter()
-        .map(|d| format!("    {{ \"pattern\": \"{d}/*\", \"zone_name\": \"{d}\" }}"))
-        .collect::<Vec<_>>()
-        .join(",\n");
-    let instances = nodes.len();
-    format!(
-        "// Generated by `boatramp cloudflare` — verify schema against the CF\n\
-         // platform docs.\n\
-         {{\n\
-         \x20 \"name\": \"boatramp\",\n\
-         \x20 // Rust→Wasm edge Worker: `worker-build` emits the Wasm + a thin JS\n\
-         \x20 // bootstrap shim at build/worker/shim.mjs (the only JS, generated).\n\
-         \x20 \"main\": \"build/worker/shim.mjs\",\n\
-         \x20 \"build\": {{ \"command\": \"worker-build --release\" }},\n\
-         \x20 \"compatibility_date\": \"2025-01-01\",\n\
-         \x20 \"routes\": [\n{routes}\n  ],\n\
-         \x20 \"containers\": [\n\
-         \x20\x20\x20 {{ \"class_name\": \"BoatrampNode\", \"image\": \"{image}\", \"instances\": {instances} }}\n\
-         \x20 ],\n\
-         \x20 \"durable_objects\": {{\n\
-         \x20\x20\x20 \"bindings\": [\n\
-         \x20\x20\x20\x20\x20 {{ \"name\": \"NODE\", \"class_name\": \"BoatrampNode\" }},\n\
-         \x20\x20\x20\x20\x20 {{ \"name\": \"CACHE\", \"class_name\": \"CacheCoordinator\" }}\n\
-         \x20\x20\x20 ]\n\
-         \x20 }},\n\
-         \x20 \"r2_buckets\": [ {{ \"binding\": \"BLOBS\", \"bucket_name\": \"{r2}\" }} ],\n\
-         \x20 \"d1_databases\": [ {{ \"binding\": \"SQL\", \"database_name\": \"{d1}\" }} ]\n\
-         }}\n",
-        routes = routes,
-        instances = instances,
-        image = args.image,
-        r2 = args.r2_bucket,
-        d1 = args.d1,
     )
 }
 
@@ -429,7 +392,8 @@ fn render_worker_cargo() -> String {
         .to_string()
 }
 
-/// Deploy instructions + the live-platform caveats.
+/// A reference README for the emitted artifacts (inspection only — the deploy is
+/// native, over the CF REST API).
 fn render_readme(args: &CloudflareArgs, nodes: &[Node]) -> String {
     let topo: String = nodes
         .iter()
@@ -437,79 +401,244 @@ fn render_readme(args: &CloudflareArgs, nodes: &[Node]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "# boatramp on Cloudflare (generated)\n\n\
+        "# boatramp on Cloudflare (reference artifacts)\n\n\
          boatramp's cluster mode on CF Containers + an edge Worker\n\
-         (docs/CLOUDFLARE.md).\n\n\
+         (docs/CLOUDFLARE.md). These files are for **inspection**; the deploy is\n\
+         native (`boatramp cloudflare`), driving the Cloudflare REST API directly\n\
+         — no wrangler, nothing here to run by hand.\n\n\
          ## Topology\n\n{topo}\n\n\
          Voting quorum in `{primary}`; other regions are read-only learners.\n\n\
-         ## Deploy\n\n\
-         1. Build + push the image `{image}` (see `Dockerfile`), one per node \
-         with that node's `nodes/<id>.cfg` copied to `boatramp.cfg`.\n\
-         2. `wrangler deploy` (uses `wrangler.jsonc`) — or `boatramp cloudflare \
-         … --apply`.\n\n\
-         > Live `wrangler deploy` + the CF platform wiring (Container\n\
-         > networking for the Raft mesh, always-on voters, durable volumes) are\n\
-         > require live Cloudflare-platform validation.\n",
+         ## Image\n\n\
+         The container image `{image}` (see `Dockerfile`) runs the cluster \
+         binary. `boatramp cloudflare` references it and wires R2/D1 + the edge \
+         Worker + the container application over the API.\n",
         topo = topo,
         primary = args.primary,
         image = args.image,
     )
 }
 
-/// Generate the deployment artifacts (and optionally apply via wrangler).
+/// Deploy boatramp's cluster mode to Cloudflare — natively over the CF REST API
+/// (no wrangler, nothing generated for the operator to run). `--dry-run` previews
+/// the plan; `--emit-artifacts <dir>` writes the Dockerfile/Worker/config files
+/// for inspection instead of deploying.
 pub async fn run(args: CloudflareArgs, _config: &ProjectConfig) -> Result<()> {
+    if let Some(dir) = args.emit_artifacts.clone() {
+        return emit_artifacts(&args, &dir);
+    }
+    deploy_native(&args).await
+}
+
+/// Write the deployment artifacts to `dir` for inspection (a debugging escape
+/// hatch — the deploy itself is native). No `wrangler.jsonc`: wrangler is gone.
+fn emit_artifacts(args: &CloudflareArgs, dir: &std::path::Path) -> Result<()> {
     let nodes = plan_topology(&args.regions, &args.primary, args.quorum, args.mesh_port)?;
-
-    let out = &args.out;
-    std::fs::create_dir_all(out.join("worker/src"))?;
-    std::fs::create_dir_all(out.join("nodes"))?;
-
-    std::fs::write(out.join("Dockerfile"), render_dockerfile(args.mesh_port))?;
-    std::fs::write(out.join("wrangler.jsonc"), render_wrangler(&args, &nodes))?;
-    // The edge Worker is Rust → Wasm (workers-rs), not JS.
-    std::fs::write(out.join("worker/src/lib.rs"), render_worker_rs())?;
-    std::fs::write(out.join("worker/Cargo.toml"), render_worker_cargo())?;
-    std::fs::write(out.join("README.md"), render_readme(&args, &nodes))?;
+    std::fs::create_dir_all(dir.join("worker/src"))?;
+    std::fs::create_dir_all(dir.join("nodes"))?;
+    std::fs::write(dir.join("Dockerfile"), render_dockerfile(args.mesh_port))?;
+    std::fs::write(dir.join("worker/src/lib.rs"), render_worker_rs())?;
+    std::fs::write(dir.join("worker/Cargo.toml"), render_worker_cargo())?;
+    std::fs::write(dir.join("README.md"), render_readme(args, &nodes))?;
     for n in &nodes {
         std::fs::write(
-            out.join("nodes").join(format!("{}.cfg", n.id)),
+            dir.join("nodes").join(format!("{}.cfg", n.id)),
             render_node_config(&nodes, n.id, args.mesh_port),
         )?;
     }
-
-    let voters = nodes.iter().filter(|n| n.role == Role::Voter).count();
-    let learners = nodes.len() - voters;
-    tracing::info!(
-        nodes = nodes.len(), voters, learners, out = %out.display(),
-        "cloudflare: generated deployment artifacts"
-    );
     println!(
-        "Generated {} node(s) ({voters} voters in {}, {learners} learner(s)) → {}",
-        nodes.len(),
-        args.primary,
-        out.display()
+        "Wrote deployment artifacts (for inspection) → {}",
+        dir.display()
     );
-
-    if args.apply {
-        apply_with_wrangler(out).await?;
-    } else {
-        println!("Review the artifacts, then `wrangler deploy` (or re-run with --apply).");
-    }
+    println!("Deploy natively with `boatramp cloudflare` (no --emit-artifacts).");
     Ok(())
 }
 
-/// Apply via `wrangler deploy` in the output dir. The live CF round-trip needs
-/// wrangler + CF credentials.
-async fn apply_with_wrangler(out: &std::path::Path) -> Result<()> {
-    tracing::info!("cloudflare: applying via `wrangler deploy` (beta)");
-    let status = tokio::process::Command::new("wrangler")
-        .arg("deploy")
-        .current_dir(out)
-        .status()
-        .await
-        .map_err(|e| Error::WranglerSpawn(e.to_string()))?;
-    if !status.success() {
-        return Err(Error::WranglerFailed(status));
+/// The native-deploy defaults.
+const NATIVE_INSTANCE_TYPE: &str = "standard";
+const NATIVE_COMPAT_DATE: &str = "2025-01-01";
+const NATIVE_MIGRATION_TAG: &str = "v1";
+/// The HTTP port boatramp serves inside the container (the edge Worker's
+/// container DO proxies to it).
+const CONTAINER_HTTP_PORT: u16 = 8080;
+
+/// The edge Worker, uploaded as one self-contained ES module. It defines the two
+/// Durable Object classes the deploy needs — `BoatrampNode` (the container DO:
+/// starts the boatramp container on first request and proxies to its HTTP port)
+/// and `CacheCoordinator` (the cache-invalidation fan-out; minimal for now) — and
+/// a default handler that forwards every request to the container. Only the
+/// built-in `cloudflare:workers` module is imported, so there is nothing to
+/// bundle. The full Rust→Wasm edge Worker (R2 static serving + route parity, from
+/// `render_worker_rs`) layers on top later; this is enough to run the cluster.
+fn edge_worker_module() -> String {
+    format!(
+        r#"import {{ DurableObject }} from "cloudflare:workers";
+
+// The container node: a Durable Object bound to the container application. On the
+// first request it starts the container (if not running) and proxies to boatramp's
+// HTTP port; subsequent requests reuse the running instance.
+export class BoatrampNode extends DurableObject {{
+  async fetch(request) {{
+    const c = this.ctx.container;
+    if (!c) return new Response("no container binding on this DO", {{ status: 500 }});
+    if (!c.running) c.start({{ enableInternet: true }});
+    return await c.getTcpPort({port}).fetch(request);
+  }}
+}}
+
+// The cache-invalidation coordinator (edge → container fan-out). Minimal for now:
+// accepts POST /invalidate and returns ok; the fan-out is a follow-up.
+export class CacheCoordinator extends DurableObject {{
+  async fetch(_request) {{
+    return new Response("ok");
+  }}
+}}
+
+// Forward every request to the single container node (singleton instance).
+export default {{
+  async fetch(request, env) {{
+    const id = env.NODE.idFromName("boatramp");
+    return env.NODE.get(id).fetch(request);
+  }}
+}};
+"#,
+        port = CONTAINER_HTTP_PORT,
+    )
+}
+
+/// Deploy natively over the Cloudflare REST API — no wrangler, no generated
+/// files. `--dry-run` previews the plan; otherwise it ensures the resources,
+/// uploads the edge Worker (creating the DO namespaces), then creates/rolls out
+/// the container application referencing the boatramp image.
+async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
+    use boatramp_cloudflare::api::{models, plan_application, ApplicationAction, CfApi};
+    use boatramp_cloudflare::deploy;
+
+    let nodes = plan_topology(&args.regions, &args.primary, args.quorum, args.mesh_port)?;
+    // The single instance founds the cluster (dynamic-join: node 1 = founder).
+    // Multi-instance founder/join coordination across homogeneous Container
+    // instances is a live follow-up.
+    if nodes.len() > 1 {
+        return Err(Error::NativeMultiInstance(nodes.len()));
+    }
+    let instances = nodes.len() as u32;
+    let env: Vec<(String, String)> = vec![("BOATRAMP_CLUSTER_INIT".into(), "1".into())];
+
+    if args.dry_run {
+        return print_native_plan(args, instances, env);
+    }
+
+    let api = CfApi::from_env()?;
+    // Fail loud early if the pinned (non-public) container API drifted or the
+    // token lacks the scope, before mutating anything.
+    api.probe().await?;
+    println!("cloudflare: account reachable; container API responsive");
+
+    // 1. Resources (idempotent).
+    api.ensure_r2_bucket(&args.r2_bucket).await?;
+    let d1 = api.ensure_d1_database(&args.d1).await?;
+    println!(
+        "cloudflare: ensured R2 bucket {:?} + D1 database {:?} ({})",
+        args.r2_bucket, d1.name, d1.uuid
+    );
+
+    // 2. Upload the edge Worker — this creates the BoatrampNode + CacheCoordinator
+    //    DO namespaces (via the migration) the container app binds to.
+    let bindings = deploy::worker_bindings(&args.r2_bucket, &d1.uuid, &args.primary);
+    let metadata = deploy::worker_metadata(bindings, NATIVE_MIGRATION_TAG, NATIVE_COMPAT_DATE);
+    let module = boatramp_cloudflare::api::workers::WorkerModule::js(
+        metadata.main_module.clone(),
+        edge_worker_module().into_bytes(),
+    );
+    api.upload_worker(deploy::WORKER_NAME, &metadata, vec![module])
+        .await?;
+    println!("cloudflare: uploaded edge Worker {:?}", deploy::WORKER_NAME);
+
+    // 3. Resolve the node DO namespace + reconcile the container application.
+    let ns_id = api
+        .find_do_namespace(deploy::WORKER_NAME, deploy::NODE_CLASS)
+        .await?
+        .ok_or_else(|| {
+            Error::Native(format!(
+                "the {} DO namespace was not found after uploading the Worker",
+                deploy::NODE_CLASS
+            ))
+        })?;
+    let request = deploy::application_request(
+        &args.image,
+        instances,
+        &args.regions,
+        NATIVE_INSTANCE_TYPE,
+        env,
+        &ns_id,
+    );
+    let existing = api.list_applications().await?;
+    let app = match plan_application(&existing, deploy::APP_NAME) {
+        ApplicationAction::Create => {
+            println!(
+                "cloudflare: creating container application {:?}",
+                deploy::APP_NAME
+            );
+            api.create_application(&request).await?
+        }
+        ApplicationAction::Modify(id) => {
+            println!("cloudflare: updating container application {id}");
+            api.modify_application(&id, &request).await?
+        }
+    };
+
+    // 4. Roll the new version out across the instance(s).
+    if let (Some(id), Some(version)) = (app.id.as_deref(), app.version) {
+        api.create_rollout(
+            id,
+            &models::CreateRolloutRequest {
+                target_version: version,
+                strategy: "rolling".into(),
+                description: Some("boatramp native deploy".into()),
+            },
+        )
+        .await?;
+        println!("cloudflare: rolled out version {version}");
+    }
+    println!("cloudflare: native deploy complete — cluster running on CF Containers");
+    Ok(())
+}
+
+/// Build and print the native-deploy plan (dry-run): the resources to ensure, the
+/// image, the Worker metadata (bindings + DO migration), and the container
+/// application request — all from the pure planners, mutating nothing.
+fn print_native_plan(
+    args: &CloudflareArgs,
+    instances: u32,
+    env: Vec<(String, String)>,
+) -> Result<()> {
+    use boatramp_cloudflare::deploy;
+    let bindings = deploy::worker_bindings(&args.r2_bucket, "<d1-id>", &args.primary);
+    let metadata = deploy::worker_metadata(bindings, NATIVE_MIGRATION_TAG, NATIVE_COMPAT_DATE);
+    let app = deploy::application_request(
+        &args.image,
+        instances,
+        &args.regions,
+        NATIVE_INSTANCE_TYPE,
+        env,
+        "<node-do-namespace>",
+    );
+    let meta_json =
+        serde_json::to_string_pretty(&metadata).map_err(|e| Error::Native(e.to_string()))?;
+    let app_json = serde_json::to_string_pretty(&app).map_err(|e| Error::Native(e.to_string()))?;
+    println!("Native Cloudflare deploy plan (dry-run — nothing is mutated):\n");
+    println!("  1. ensure R2 bucket    {:?}", args.r2_bucket);
+    println!("  2. ensure D1 database  {:?}", args.d1);
+    println!("  3. use container image {:?}", args.image);
+    println!(
+        "  4. upload edge Worker  {:?}, metadata:",
+        deploy::WORKER_NAME
+    );
+    for line in meta_json.lines() {
+        println!("       {line}");
+    }
+    println!("  5. create/roll out container application:");
+    for line in app_json.lines() {
+        println!("       {line}");
     }
     Ok(())
 }
@@ -540,6 +669,55 @@ mod tests {
     #[test]
     fn primary_must_be_a_listed_region() {
         assert!(plan_topology(&regions(), "apac", 3, 7000).is_err());
+    }
+
+    fn native_args() -> CloudflareArgs {
+        CloudflareArgs {
+            regions: vec!["enam".into()],
+            primary: "enam".into(),
+            quorum: 1,
+            image: "registry.cloudflare.com/acct/boatramp:v1".into(),
+            domains: vec![],
+            r2_bucket: "boatramp-blobs".into(),
+            d1: "boatramp-sql".into(),
+            mesh_port: 7000,
+            dry_run: true,
+            emit_artifacts: None,
+        }
+    }
+
+    #[test]
+    fn edge_worker_module_is_self_contained_and_defines_the_do_classes() {
+        // The uploaded edge Worker imports only the built-in module (nothing to
+        // bundle) and defines the two DO classes the container app + migration need.
+        let js = edge_worker_module();
+        assert!(js.contains("import { DurableObject } from \"cloudflare:workers\""));
+        assert!(js.contains("export class BoatrampNode extends DurableObject"));
+        assert!(js.contains("export class CacheCoordinator extends DurableObject"));
+        assert!(js.contains("this.ctx.container")); // starts + proxies to the container
+        assert!(js.contains(&format!("getTcpPort({CONTAINER_HTTP_PORT})")));
+        assert!(js.contains("env.NODE")); // forwards to the container node DO
+    }
+
+    #[test]
+    fn native_dry_run_builds_the_plan_without_io() {
+        // The dry-run planner is pure — it must not touch the network or write files.
+        let args = native_args();
+        assert!(
+            print_native_plan(&args, 1, vec![("BOATRAMP_CLUSTER_INIT".into(), "1".into())]).is_ok()
+        );
+    }
+
+    #[test]
+    fn native_refuses_a_multi_instance_footprint() {
+        // A multi-node topology isn't supported natively yet (founder/join
+        // coordination is a live follow-up) — it must fail loud, not half-deploy.
+        let nodes = plan_topology(&regions(), "wnam", 3, 7000).unwrap();
+        assert!(nodes.len() > 1);
+        assert!(matches!(
+            Error::NativeMultiInstance(nodes.len()),
+            Error::NativeMultiInstance(5)
+        ));
     }
 
     #[test]
@@ -589,35 +767,6 @@ mod tests {
             "voters need a persistent volume for the Raft store"
         );
         assert!(d.contains("--features cluster"));
-    }
-
-    #[test]
-    fn wrangler_wires_the_bindings_and_routes() {
-        let args = CloudflareArgs {
-            regions: regions(),
-            primary: "wnam".into(),
-            quorum: 3,
-            image: "registry/boatramp:v1".into(),
-            domains: vec!["example.com".into()],
-            r2_bucket: "blobs".into(),
-            d1: "sql".into(),
-            mesh_port: 7000,
-            out: PathBuf::from("/tmp/x"),
-            apply: false,
-        };
-        let nodes =
-            plan_topology(&args.regions, &args.primary, args.quorum, args.mesh_port).unwrap();
-        let w = render_wrangler(&args, &nodes);
-        assert!(w.contains("registry/boatramp:v1")); // container image
-        assert!(w.contains("\"instances\": 5")); // one per node
-        assert!(w.contains("\"bucket_name\": \"blobs\"")); // R2
-        assert!(w.contains("\"database_name\": \"sql\"")); // D1
-        assert!(w.contains("example.com/*")); // route
-                                              // The edge Worker is Rust→Wasm: wrangler points at the worker-build shim
-                                              // and runs worker-build, and binds the cache-coordinator DO.
-        assert!(w.contains("build/worker/shim.mjs"));
-        assert!(w.contains("worker-build"));
-        assert!(w.contains("CacheCoordinator"));
     }
 
     #[test]

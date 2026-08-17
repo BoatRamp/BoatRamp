@@ -8,18 +8,24 @@ Cloudflare is a deploy target, not a fork. For why the edge runs Wasm and why
 there is no separate coordinator, see
 [Deployment topologies](../explanation/topologies.md).
 
+The deploy is **native**: `boatramp cloudflare` drives the Cloudflare REST API
+directly — ensuring the R2/D1 resources, uploading the edge Worker, and creating
+the container application. There is no `wrangler`, and nothing is generated for
+you to run by hand — the same one-token, env-provided model as the S3/GCS/Azure
+backends.
+
 ## Before you start
 
-- `wrangler` installed and authenticated against your Cloudflare account.
-- A boatramp build with the `cluster` feature (in the default build; the generated
-  `Dockerfile` builds it either way, so a Docker builder is enough).
-- An R2 bucket (blobs) and a D1 database (the `sql` handler binding), created
-  ahead of time, with their credentials set as wrangler secrets.
+- `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` in your environment. The
+  token needs the Workers Scripts, Containers, R2, and D1 scopes (plus DNS for a
+  custom domain). boatramp never sees your token except through the environment.
+- **Docker**, to build the container image.
+- A Cloudflare account with the **Workers paid plan** (Containers require it).
 
-## 1. Build the container image
+## 1. Build + push the container image
 
-Build the image the Containers run, and push it to a registry Cloudflare can
-pull from:
+Build the image the Containers run and push it to a registry Cloudflare can pull
+from (its managed registry, or Docker Hub / ECR / GAR):
 
 ```sh
 docker build -t registry.example.com/boatramp:v1 .
@@ -30,52 +36,52 @@ docker push registry.example.com/boatramp:v1
 v1: digest: sha256:… size: 1573
 ```
 
-## 2. Generate the deployment
+## 2. Deploy
 
-Run `boatramp cloudflare` to plan the topology and write the deployment artifacts
-— per-node cluster configs, a `Dockerfile`, a `wrangler.jsonc`, and the edge
-Worker crate:
+Preview the plan first (`--dry-run` mutates nothing) — it prints the resources,
+image, edge-Worker metadata, and container application it will apply:
 
 ```sh
 boatramp cloudflare \
-  --region wnam --region weur --region apac \
-  --primary wnam --quorum 3 \
+  --region enam --primary enam --quorum 1 \
   --image registry.example.com/boatramp:v1 \
-  --domain example.com --r2-bucket boatramp-blobs --d1 boatramp-sql \
-  --out ./cloudflare
+  --r2-bucket boatramp-blobs --d1 boatramp-sql \
+  --dry-run
 ```
 
-```text
-Generated 5 node(s) (3 voters in wnam, 2 learner(s)) → ./cloudflare
-Review the artifacts, then `wrangler deploy` (or re-run with --apply).
-```
-
-`--primary` hosts the voting quorum; the other regions host read-only learners
-that serve local reads and forward writes to the leader. Keep `--quorum` odd.
-
-The generated config is **uniform** across nodes ([dynamic join](./deploy-cluster.md)):
-node 1 founds via `BOATRAMP_CLUSTER_INIT=1` and the rest join with a
-`BOATRAMP_CLUSTER_JOIN` ticket — no per-node id or peer map. Set those env vars in
-each instance's container config (Cloudflare Containers instances are otherwise
-fungible, so the founder is designated by env, not by a baked-in config).
-
-## 3. Deploy
-
-Review the artifacts, then push them with wrangler:
+Then drop `--dry-run` to apply. `boatramp cloudflare` ensures the R2 bucket + D1
+database (idempotent), uploads the edge Worker (creating its Durable Object
+namespaces), and creates + rolls out the container application referencing your
+image:
 
 ```sh
-cd ./cloudflare && wrangler deploy
+boatramp cloudflare \
+  --region enam --primary enam --quorum 1 \
+  --image registry.example.com/boatramp:v1 \
+  --r2-bucket boatramp-blobs --d1 boatramp-sql
 ```
 
 ```text
-Published boatramp
-  https://example.com/*
+cloudflare: account reachable; container API responsive
+cloudflare: ensured R2 bucket "boatramp-blobs" + D1 database "boatramp-sql" (…)
+cloudflare: uploaded edge Worker "boatramp"
+cloudflare: creating container application "boatramp"
+cloudflare: rolled out version 1
+cloudflare: native deploy complete — cluster running on CF Containers
 ```
 
-To generate and deploy in one step, re-run step 2 with `--apply` (it runs
-`wrangler deploy` for you and needs your Cloudflare credentials).
+`--primary` hosts the voting quorum; other regions host read-only learners that
+serve local reads and forward writes to the leader. The node config is **uniform**
+([dynamic join](./deploy-cluster.md)): the founding instance sets
+`BOATRAMP_CLUSTER_INIT=1`.
 
-## 4. Publish and verify
+> The native deploy currently targets the **single-instance** footprint
+> (`--quorum 1`, one region) — enough to run the full cluster mode on Cloudflare.
+> Multi-instance founder/join coordination across fungible Container instances is
+> in progress. To inspect the reference artifacts (Dockerfile, Worker source,
+> node configs) without deploying, add `--emit-artifacts ./cloudflare`.
+
+## 3. Publish and verify
 
 Point publishing at the deployed domain — it behaves the same as any boatramp
 server, because content is backend-durable:

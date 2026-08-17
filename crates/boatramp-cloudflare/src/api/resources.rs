@@ -25,6 +25,21 @@ pub struct KvNamespace {
     pub title: String,
 }
 
+/// A Durable Object namespace (created by a Worker's DO migration). The
+/// container application binds to the node DO namespace by **id**, resolved from
+/// this list after the Worker upload.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DoNamespace {
+    /// The namespace id (what the container app's `durable_objects` references).
+    pub id: String,
+    /// The Worker script that owns it.
+    #[serde(default)]
+    pub script: String,
+    /// The exported DO class name.
+    #[serde(default)]
+    pub class: String,
+}
+
 #[derive(serde::Serialize)]
 struct NameBody<'a> {
     name: &'a str,
@@ -83,6 +98,26 @@ impl CfApi {
             .get(format!("{}/storage/kv/namespaces", self.account_base()))
             .await?;
         Ok(nss.into_iter().find(|n| n.title == title))
+    }
+
+    /// Resolve the id of the Durable Object namespace owned by `script` for DO
+    /// `class` (created by the Worker upload's migration) — the container
+    /// application binds to it by id.
+    pub async fn find_do_namespace(
+        &self,
+        script: &str,
+        class: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let nss: Vec<DoNamespace> = self
+            .get(format!(
+                "{}/workers/durable_objects/namespaces",
+                self.account_base()
+            ))
+            .await?;
+        Ok(nss
+            .into_iter()
+            .find(|n| n.script == script && n.class == class)
+            .map(|n| n.id))
     }
 }
 

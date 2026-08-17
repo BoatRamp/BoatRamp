@@ -2,8 +2,9 @@
 
 > This is the **design rationale** for the Cloudflare deployment mode:
 > boatramp's cluster mode on CF Containers, fronted by a thin edge Worker, with
-> no Durable-Object coordinator fork. The `boatramp cloudflare` command
-> generates the deployment.
+> no Durable-Object coordinator fork. The `boatramp cloudflare` command deploys
+> it **natively over the Cloudflare REST API** — no wrangler, nothing generated
+> for the operator to run.
 
 Cloudflare-hosted is the third deployment mode. The
 decision (superseding the earlier Durable-Object-coordinator sketch): **CF-hosted
@@ -82,11 +83,14 @@ passes the *same* `assert_conformance` battery.
 **CF-specific (the build):**
 - **Edge Worker** — routing, static-from-R2, cache, TLS; proxies dynamic/handler
   requests to the Container cluster.
-- **Deployment/management** — `boatramp deploy --target cloudflare`: build the
-  container image, generate the wrangler config (Container + lifecycle DO +
-  R2/D1/KV bindings + the Worker) and the `[cluster]` topology, push, apply.
-  Uniform UX with the other deploy targets; live CF API calls are exercised
-  against the platform, and image + config generation is unit-testable in isolation.
+- **Native deployment** — `boatramp cloudflare` drives the Cloudflare REST API
+  directly (no wrangler): ensure R2/D1/KV, upload the edge Worker (its bindings +
+  the Durable-Object migration), and create + roll out the **container
+  application** over the container ("cloudchamber") API — endpoints proven from
+  wrangler's open-source client and ported into `boatramp-cloudflare::api`. Same
+  one-token, env-provided UX as the S3/GCS/Azure backends; the request shaping is
+  unit-tested offline against the exact API shapes. See
+  `PLAN-native-cloudflare-deploy.md`.
 - **Backend selection** — R2 for `Storage`, D1/libsql for `sql`; both already
   exist behind the trait seams.
 
