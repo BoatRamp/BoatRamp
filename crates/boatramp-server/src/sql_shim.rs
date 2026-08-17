@@ -205,6 +205,11 @@ pub async fn spawn_sql_shim(
     let bind = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => {
+            // TCP_NODELAY: the hrana-over-HTTP shim serves small JSON responses to
+            // the guest's `sql` binding over keep-alive; Nagle would add a ~40 ms
+            // delayed-ACK stall to each query. See `disable_nagle`.
+            use axum::serve::ListenerExt;
+            let listener = listener.tap_io(crate::disable_nagle);
             tokio::spawn(async move {
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::error!(error = %err, "compute sql-shim listener exited");

@@ -1019,6 +1019,21 @@ pub async fn serve(
     serve_with(addr, deploy, auth, handlers, ServerOptions::default()).await
 }
 
+/// Disable Nagle's algorithm on an accepted connection.
+///
+/// Without `TCP_NODELAY`, small HTTP responses on **keep-alive** connections stall
+/// on Nagle's algorithm interacting with the peer's delayed ACK — a fixed ~40 ms
+/// per request. That is boatramp's hot path in production: on Fly and Cloudflare
+/// the platform terminates TLS and forwards **plaintext** HTTP to the app over
+/// persistent connections, so the stall would hit every small response. This runs
+/// on each accepted stream via [`axum::serve::ListenerExt::tap_io`]; it is
+/// best-effort — a failure only forfeits the latency win, never the connection.
+pub(crate) fn disable_nagle(stream: &mut tokio::net::TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::debug!(%err, "failed to set TCP_NODELAY on an accepted connection");
+    }
+}
+
 /// [`serve`] with explicit [`ServerOptions`] (e.g. operational request limits).
 pub async fn serve_with(
     addr: SocketAddr,
@@ -1027,7 +1042,12 @@ pub async fn serve_with(
     handlers: HandlerRuntime,
     options: ServerOptions,
 ) -> Result<(), ServeError> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = {
+        use axum::serve::ListenerExt;
+        tokio::net::TcpListener::bind(addr)
+            .await?
+            .tap_io(disable_nagle)
+    };
     tracing::info!(%addr, auth = !auth.is_disabled(), "boatramp server listening");
     // Background scheduler: drives consumers/crons for active deployments
     // (no-op without the handlers feature/runtime). Aborted after the drain.
