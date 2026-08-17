@@ -184,6 +184,27 @@ impl CfApi {
             .map_err(|e| ApiError::Network(e.to_string()))?;
         parse_envelope(&bytes)
     }
+
+    /// Enable the `*.workers.dev` subdomain for `script` (`POST
+    /// …/workers/scripts/{name}/subdomain`). A freshly-uploaded script has it
+    /// **disabled**, so without this the Worker is unreachable on
+    /// `<name>.<account>.workers.dev` (requests get a Cloudflare 1042/404). Called
+    /// after upload when no custom domain is configured, so the deploy is reachable
+    /// out of the box.
+    pub async fn enable_workers_dev(&self, script_name: &str) -> Result<(), ApiError> {
+        #[derive(serde::Serialize)]
+        struct Enable {
+            enabled: bool,
+        }
+        let url = format!(
+            "{}/workers/scripts/{script_name}/subdomain",
+            self.account_base()
+        );
+        let _: serde_json::Value = self
+            .send(reqwest::Method::POST, url, &Enable { enabled: true })
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

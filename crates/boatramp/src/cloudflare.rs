@@ -706,6 +706,17 @@ async fn deploy_native(args: &CloudflareArgs) -> Result<()> {
         .await?;
     println!("cloudflare: uploaded edge Worker {:?}", deploy::WORKER_NAME);
 
+    // With no custom domain, enable the `*.workers.dev` subdomain so the Worker is
+    // reachable — a freshly-uploaded script has it disabled (requests would get a
+    // Cloudflare 1042/404). With `--domain`, the operator's route is the entrypoint.
+    if args.domains.is_empty() {
+        api.enable_workers_dev(deploy::WORKER_NAME).await?;
+        println!(
+            "cloudflare: enabled the workers.dev subdomain for {:?}",
+            deploy::WORKER_NAME
+        );
+    }
+
     // 3. Resolve the node DO namespace + reconcile the container application.
     let ns_id = api
         .find_do_namespace(deploy::WORKER_NAME, deploy::NODE_CLASS)
