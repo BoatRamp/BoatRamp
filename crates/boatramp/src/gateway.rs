@@ -177,6 +177,12 @@ enum UpstreamCommand {
         /// Accept a self-signed / invalid upstream TLS certificate.
         #[arg(long)]
         tls_insecure: bool,
+        /// Cap the per-connection upstream read buffer (bytes); default 32768.
+        /// Higher trades memory for fewer read syscalls (throughput on large
+        /// responses); lower trades syscalls for less memory. Matters most at high
+        /// proxy concurrency.
+        #[arg(long)]
+        read_buffer_bytes: Option<u64>,
         /// For `--lb nearest`: the request header carrying the client's region
         /// (set by the CDN/edge, e.g. `fly-region`, `cf-ipcountry`).
         #[arg(long)]
@@ -252,6 +258,7 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
             connect_timeout_ms,
             request_timeout_ms,
             tls_insecure,
+            read_buffer_bytes,
             client_region_header,
             regions,
         }) => {
@@ -306,6 +313,7 @@ pub async fn run(args: GatewayArgs, config: &ProjectConfig) -> Result<()> {
                     connect_timeout_ms,
                     request_timeout_ms,
                     tls_insecure,
+                    read_buffer_bytes,
                     regions: region_tags,
                     client_region_header,
                     ..Default::default()

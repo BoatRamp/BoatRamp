@@ -120,6 +120,14 @@ pub struct Upstream {
     /// Accept a self-signed / invalid upstream TLS cert (opt-in, logged loudly).
     #[serde(skip_serializing_if = "is_false")]
     pub tls_insecure: bool,
+    /// Cap the per-connection upstream H1 read buffer, in bytes. Each upstream
+    /// connection retains one, so at proxy fan-out this is the dominant memory
+    /// term, traded against read-syscall overhead. `None` → the 32 KiB default
+    /// (a good balance for typical API/CDN responses). Raise it for large responses
+    /// at low concurrency (fewer, larger reads); lower it for very high fan-out on a
+    /// memory-tight node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_buffer_bytes: Option<u64>,
     /// Header rewrites applied to the request before forwarding.
     #[serde(skip_serializing_if = "HeaderOps::is_empty")]
     pub header_up: HeaderOps,

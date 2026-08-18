@@ -105,6 +105,19 @@ boatramp gateway route add /app --upstream api \
   --connect-timeout-ms 2000 --request-timeout-ms 30000 --site my-site
 ```
 
+## Tune upstream memory vs throughput
+
+Each upstream connection keeps a read buffer, and a busy reverse proxy holds one per
+concurrent request — so at high fan-out that buffer is the dominant memory cost. It
+defaults to **32 KiB**, a good balance for typical API/CDN responses. Raise it for
+large responses at low concurrency (fewer, larger reads = a bit more throughput), or
+lower it to trim memory on a high-fan-out, memory-tight node:
+
+```sh
+boatramp gateway upstream add api http://10.0.0.5:8080 \
+  --read-buffer-bytes 131072 --site my-site
+```
+
 ## Private and Unix-socket upstreams
 
 Targeting a private IP or a `unix:` socket is gated by the operator

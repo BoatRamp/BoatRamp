@@ -145,6 +145,12 @@ async fn check_proxy_target(
     Ok((parsed, addr, host))
 }
 
+/// Default cap for an upstream connection's H1 read buffer. Each connection retains
+/// one, so at proxy fan-out this is the dominant proxy-path resident set; 32 KiB is
+/// the knee (profiled) — far below hyper's 400 KiB default, at a few percent read
+/// overhead. Operators can override it per upstream (`read_buffer_bytes`).
+const DEFAULT_UPSTREAM_READ_BUFFER: usize = 32 * 1024;
+
 /// Cache key for a pinned upstream client: the pinned resolution plus the
 /// per-upstream options that change the built client.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -154,6 +160,7 @@ struct UpstreamClientKey {
     connect_timeout_ms: Option<u64>,
     request_timeout_ms: Option<u64>,
     tls_insecure: bool,
+    read_buffer_bytes: Option<usize>,
 }
 
 /// Our pinned upstream connector: an `HttpConnector` whose resolver only ever
@@ -321,6 +328,7 @@ fn cached_client(
     connect_timeout_ms: Option<u64>,
     request_timeout_ms: Option<u64>,
     tls_insecure: bool,
+    read_buffer_bytes: Option<usize>,
 ) -> Result<UpstreamClient, ()> {
     let key = UpstreamClientKey {
         host: host.to_string(),
@@ -328,6 +336,7 @@ fn cached_client(
         connect_timeout_ms,
         request_timeout_ms,
         tls_insecure,
+        read_buffer_bytes,
     };
     if let Some(client) = UPSTREAM_CLIENTS.lock().unwrap().get(&key) {
         return Ok(client.clone());
@@ -363,9 +372,10 @@ fn cached_client(
         // reqwest does not expose. Each upstream connection retains this buffer, and a
         // reverse proxy holds one per concurrent request, so at fan-out it is the
         // dominant proxy-path resident set: profiling a 256-concurrency 100 KB H2 proxy
-        // showed ~500 MB, almost all in these buffers. 32 KB streams a large response in
-        // a few reads and cuts the footprint ~2.7x (to ~195 MB) for ~5% throughput.
-        .http1_max_buf_size(32 * 1024)
+        // showed ~500 MB, almost all in these buffers. The 32 KiB default streams a
+        // large response in a few reads and cuts the footprint ~2.7x for ~5% throughput;
+        // an upstream can override it (`read_buffer_bytes`) either way.
+        .http1_max_buf_size(read_buffer_bytes.unwrap_or(DEFAULT_UPSTREAM_READ_BUFFER))
         .build(https);
     let client = UpstreamClient {
         inner,
@@ -382,7 +392,7 @@ fn cached_client(
 /// A pinned client with no per-upstream overrides (the absolute-URL proxy path).
 /// Reused across requests — see [`cached_client`].
 fn pinned_client(host: &str, addr: SocketAddr) -> Result<UpstreamClient, ()> {
-    cached_client(host, addr, None, None, false)
+    cached_client(host, addr, None, None, false, None)
 }
 
 /// The cloud-metadata service address — refused even for a declared gateway
@@ -777,6 +787,7 @@ async fn proxy_upstream(
         upstream.connect_timeout_ms,
         upstream.request_timeout_ms,
         upstream.tls_insecure,
+        upstream.read_buffer_bytes.map(|n| n as usize),
     ) {
         Ok(client) => client,
         Err(_) => return (StatusCode::BAD_GATEWAY, "gateway client error\n").into_response(),
@@ -1332,7 +1343,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client = cached_client("127.0.0.1", addr, None, None, false).unwrap();
+        let client = cached_client("127.0.0.1", addr, None, None, false, None).unwrap();
         let uri = format!("http://127.0.0.1:{}/", addr.port());
         let mut worst = 0f64;
         for i in 0..30 {
