@@ -360,9 +360,12 @@ fn cached_client(
         // steady-state reuse — and throughput — is unchanged.
         .pool_idle_timeout(Duration::from_secs(20))
         // Cap the per-connection H1 read buffer (hyper's 400 KB default) — the knob
-        // reqwest does not expose. At high proxy fan-out this bounds the dominant
-        // proxy-path resident set; 128 KB still holds a typical response in one read.
-        .http1_max_buf_size(128 * 1024)
+        // reqwest does not expose. Each upstream connection retains this buffer, and a
+        // reverse proxy holds one per concurrent request, so at fan-out it is the
+        // dominant proxy-path resident set: profiling a 256-concurrency 100 KB H2 proxy
+        // showed ~500 MB, almost all in these buffers. 32 KB streams a large response in
+        // a few reads and cuts the footprint ~2.7x (to ~195 MB) for ~5% throughput.
+        .http1_max_buf_size(32 * 1024)
         .build(https);
     let client = UpstreamClient {
         inner,
