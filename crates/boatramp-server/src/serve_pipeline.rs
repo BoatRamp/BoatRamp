@@ -147,10 +147,15 @@ pub(super) async fn serve_by_host(
     let preview_policy = PreviewPolicy {
         protect: effective.protect_previews,
     };
+    // Resolve the request host from the `Host` header (HTTP/1.1) or, when that is
+    // absent, the URI authority. HTTP/2 sends the host as the `:authority`
+    // pseudo-header, which hyper places in the request URI rather than a `Host`
+    // header — so without this fallback every H2 request has no host and 404s.
     let Some(host) = request
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().host())
         .map(strip_port)
         .map(str::to_string)
     else {

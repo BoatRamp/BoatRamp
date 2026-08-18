@@ -1245,6 +1245,7 @@ async fn access_log(mut request: axum::extract::Request, next: axum::middleware:
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().host()) // HTTP/2: `:authority` lives in the URI, not a Host header
         .unwrap_or("-")
         .to_string();
     let client = request
