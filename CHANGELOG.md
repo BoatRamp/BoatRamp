@@ -5,6 +5,30 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.12] - 2026-08-18
+
+### Fixed
+- **~40 ms of latency removed from every small keep-alive response (`TCP_NODELAY`).** The server
+  never disabled Nagle's algorithm, so on keep-alive connections — essentially all real traffic —
+  small HTTP responses stalled on a fixed ~40 ms delayed-ACK each. This is the production hot path:
+  on Fly and Cloudflare the platform terminates TLS and forwards **plaintext** HTTP to the app over
+  persistent connections. Setting `TCP_NODELAY` on accepted connections (at both the main server and
+  the compute SQL shim) cut small-response latency from p50 41 ms to 2.4 ms and raised throughput
+  ~15× in a loopback benchmark (4.9k → 72k rps).
+
+### Changed
+- **The container images are now a fully-static musl binary with jemalloc** — ~49 MB compressed
+  (down from ~71 MB), with **zero** dynamic dependencies (no glibc, no loader closure — the image is
+  just the binary and CA certs). musl's own allocator scales poorly under concurrency (benchmarked
+  ~14× slower than jemalloc for a concurrent server), so the image build enables jemalloc; the result
+  matches or beats the glibc build's throughput and tail latency. The bare-host release binaries and
+  `packages.default` stay glibc.
+
+### Added
+- Opt-in, mutually-exclusive **`jemalloc` / `mimalloc` build features** that install the corresponding
+  global allocator (non-default — the default build keeps the system allocator). The static musl
+  image build uses `jemalloc`; on glibc the effect is small (~+5–6 % throughput at ~2× RSS).
+
 ## [0.2.11] - 2026-08-17
 
 ### Changed
