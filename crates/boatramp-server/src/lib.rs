@@ -508,8 +508,39 @@ impl HandlerRuntime {
             })?;
         let max_component = inner.max_component_bytes.get().copied().unwrap_or(0);
 
+        // Sync-timeout footgun: a handler/site timeout above the sync ceiling is
+        // silently clamped for connection-bearing (sync HTTP) calls, so a legit
+        // long call dies as a mysterious runtime 504. Warn loudly at deploy. The
+        // same value is valid for the async lane (`?mode=async` / triggers), clamped
+        // to the larger async ceiling — so this is a warning, not a refusal.
+        let sync_ceiling = inner.engine.sync_timeout_ms();
+        let async_ceiling = inner.engine.async_timeout_ms();
+        if let Some(ms) = site_handlers.max_timeout_ms {
+            if u64::from(ms) > sync_ceiling {
+                tracing::warn!(
+                    "site max_timeout_ms={ms} exceeds sync_max_timeout_ms={sync_ceiling}: \
+                     synchronous HTTP handlers are capped at {sync_ceiling}ms; the extra time \
+                     applies only to async calls (?mode=async / triggers), capped at \
+                     async_max_timeout_ms={async_ceiling}"
+                );
+            }
+        }
+
         // Same import/size/compile gate for every handler and consumer component.
         for handler in &manifest.config.handlers {
+            if let Some(ms) = handler.limits.as_ref().and_then(|l| l.timeout_ms) {
+                if u64::from(ms) > sync_ceiling {
+                    let route = &handler.route;
+                    tracing::warn!(
+                        "route {route:?} declares limits.timeout_ms={ms}, above \
+                         sync_max_timeout_ms={sync_ceiling}: synchronous HTTP calls to this route \
+                         are capped at {sync_ceiling}ms; the {ms}ms only applies to async calls \
+                         (?mode=async / a queue trigger / a #[consumer]), capped at \
+                         async_max_timeout_ms={async_ceiling}. If you need {ms}ms synchronously, \
+                         that isn't possible — move the work to the async lane"
+                    );
+                }
+            }
             precheck_component(
                 deploy,
                 manifest,

@@ -377,6 +377,14 @@ impl HandlerEngine {
         self
     }
 
+    /// The sync-lane wall-clock ceiling (ms): connection-bearing requests (site
+    /// handlers, synchronous invokes) are clamped to this. A deploy that declares a
+    /// larger per-handler/site timeout can inspect this to warn that sync calls will
+    /// be capped (see the activation pre-check).
+    pub fn sync_timeout_ms(&self) -> u64 {
+        self.limits.timeout_ms
+    }
+
     /// Set the ceiling on a guest's **outbound** `wasi:http` request (applied to
     /// the connect + first-byte timeouts), independent of the invocation budget.
     #[must_use]
