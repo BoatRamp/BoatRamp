@@ -147,8 +147,9 @@ mod imp {
                 }
                 Some(token) => {
                     return Err(format!(
-                        "component imports {pkg}/{iface} (the `{token}` capability) \
-                         but the deploy does not declare it"
+                        "component imports {pkg}/{iface} (the `{token}` capability) but the \
+                         deploy does not declare it. Imports are component-scoped: every route \
+                         binding this component must grant `{token}`, even routes that don't use it"
                     ))
                 }
                 None => {
@@ -214,10 +215,27 @@ mod imp {
     /// each `.wasm` relative to the deploy `dir`.
     pub fn validate_deploy(dir: &Path, config: &DeployConfig) -> Result<()> {
         for handler in &config.handlers {
-            check(dir, &handler.component, &handler.imports, Role::Handler)?;
+            // Name the offending handler (route + methods), not just the component
+            // file: one component may bind several routes, and each declares its own
+            // imports, so the error must point at *which* route is under-granted.
+            let label = format!("route {:?} [{}]", handler.route, handler.methods.join(","));
+            check(
+                dir,
+                &handler.component,
+                &handler.imports,
+                Role::Handler,
+                &label,
+            )?;
         }
         for consumer in &config.consumers {
-            check(dir, &consumer.component, &consumer.imports, Role::Consumer)?;
+            let label = format!("consumer ({})", consumer.component);
+            check(
+                dir,
+                &consumer.component,
+                &consumer.imports,
+                Role::Consumer,
+                &label,
+            )?;
         }
         let total = config.handlers.len() + config.consumers.len();
         if total > 0 {
@@ -226,7 +244,13 @@ mod imp {
         Ok(())
     }
 
-    fn check(dir: &Path, component: &str, imports: &[String], role: Role) -> Result<()> {
+    fn check(
+        dir: &Path,
+        component: &str,
+        imports: &[String],
+        role: Role,
+        label: &str,
+    ) -> Result<()> {
         let path = dir.join(component);
         let bytes = std::fs::read(&path).map_err(|err| Error::ReadComponent {
             path: path.display().to_string(),
@@ -234,7 +258,7 @@ mod imp {
         })?;
         validate_component(&bytes, imports, role).map_err(|err| Error::Validate {
             path: path.display().to_string(),
-            message: err,
+            message: format!("{label}: {err}"),
         })?;
         Ok(())
     }
