@@ -107,7 +107,47 @@ pub struct DeployStore {
     /// single node; a Raft cluster needs the same as a consensus-level
     /// conditional (noted on [`set_site_config`](Self::set_site_config)).
     domain_claim_lock: Arc<futures::lock::Mutex<()>>,
+    /// Hot-path cache of parsed site configs, keyed by the immutable
+    /// `siteconfig/<hash>` content hash (a config body never changes under its
+    /// key). The serve path resolves a config on every request; without this it
+    /// re-reads and re-parses the whole `SiteConfig` JSON each time — the dominant
+    /// per-request allocation under load (profiled). Read-mostly `RwLock` (a write
+    /// only on a cache miss / new deploy) so it doesn't add the per-request mutex
+    /// contention a plain `Mutex` would.
+    site_config_cache: Arc<std::sync::RwLock<std::collections::HashMap<String, Arc<SiteConfig>>>>,
+    /// Hot-path cache of small, content-addressed blob *bodies* (the static serve
+    /// path), keyed by the immutable content hash. A hit serves a single refcounted
+    /// `Bytes` frame — no `open`, no `ReaderStream` per-chunk allocation, no disk
+    /// read — which the profile flagged as the dominant static-path allocation.
+    /// Bounded by total bytes; large blobs are never cached (they stream). Same
+    /// read-mostly `RwLock` rationale as [`site_config_cache`].
+    blob_body_cache: Arc<std::sync::RwLock<BlobBodyCache>>,
 }
+
+/// A blob body to serve: a cached, in-memory buffer (small hot assets) or a
+/// streaming handle straight from storage (everything else).
+pub enum BlobBody {
+    /// A small blob served from the in-memory cache as one refcounted frame.
+    Cached(bytes::Bytes),
+    /// A blob streamed from storage (too large to cache, or Range/large path).
+    Stream(GetObject),
+}
+
+/// Bounded in-memory cache of small blob bodies. Keyed by content hash (immutable,
+/// so a cached body is never stale); bounded by `bytes` total with a
+/// clear-on-overflow policy (no per-entry LRU bookkeeping — the live hot set is
+/// small, and the content-hash keyspace only grows with deploy history).
+#[derive(Default)]
+struct BlobBodyCache {
+    map: std::collections::HashMap<String, bytes::Bytes>,
+    bytes: usize,
+}
+
+/// Blobs at or under this size are eligible for the in-memory body cache; larger
+/// blobs always stream from storage.
+const SMALL_BLOB_CACHE_MAX: u64 = 256 * 1024;
+/// Total byte ceiling for the small-blob body cache.
+const BLOB_BODY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 mod keys {
     //! The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]),
@@ -273,6 +313,8 @@ impl DeployStore {
             storage,
             kv,
             domain_claim_lock: Arc::new(futures::lock::Mutex::new(())),
+            site_config_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            blob_body_cache: Arc::new(std::sync::RwLock::new(BlobBodyCache::default())),
         }
     }
 
@@ -448,6 +490,43 @@ impl DeployStore {
         Ok(self.storage.get(&keys::blob(hash)).await?)
     }
 
+    /// Serve a blob body, using the in-memory small-blob cache for the static hot
+    /// path. Blobs over [`SMALL_BLOB_CACHE_MAX`] always stream
+    /// ([`BlobBody::Stream`]); small blobs are served from the content-hash cache
+    /// ([`BlobBody::Cached`]), read + cached only on a miss. A hit is a refcounted
+    /// `Bytes` clone — no `open`, no `ReaderStream` per-chunk allocation, no disk
+    /// read. The content hash is immutable, so a cached body never goes stale.
+    pub async fn open_blob_cached(&self, hash: &str, size: u64) -> Result<BlobBody, DeployError> {
+        use futures::TryStreamExt;
+        if size > SMALL_BLOB_CACHE_MAX {
+            return Ok(BlobBody::Stream(self.open_blob(hash).await?));
+        }
+        if let Some(bytes) = self.blob_body_cache.read().unwrap().map.get(hash).cloned() {
+            return Ok(BlobBody::Cached(bytes));
+        }
+        // Miss: read the whole (small) blob once into an owned, refcounted buffer —
+        // one allocation, versus `ReaderStream`'s per-chunk churn on every request.
+        let object = self.storage.get(&keys::blob(hash)).await?;
+        let mut buf = bytes::BytesMut::with_capacity(size as usize);
+        let mut body = object.body;
+        while let Some(chunk) = body.try_next().await? {
+            buf.extend_from_slice(&chunk);
+        }
+        let bytes = buf.freeze();
+        {
+            let mut cache = self.blob_body_cache.write().unwrap();
+            // Clear-on-overflow keeps the byte bound without per-entry LRU bookkeeping.
+            if cache.bytes.saturating_add(bytes.len()) > BLOB_BODY_CACHE_MAX_BYTES {
+                cache.map.clear();
+                cache.bytes = 0;
+            }
+            if cache.map.insert(hash.to_string(), bytes.clone()).is_none() {
+                cache.bytes = cache.bytes.saturating_add(bytes.len());
+            }
+        }
+        Ok(BlobBody::Cached(bytes))
+    }
+
     /// Open a byte range of a blob for streaming reads (HTTP `Range`).
     pub async fn open_blob_range(
         &self,
@@ -477,6 +556,41 @@ impl DeployStore {
             // A dangling pointer (body GC'd out from under it) reads as unset.
             None => Ok(None),
         }
+    }
+
+    /// Like [`get_site_config`](Self::get_site_config) but returns a shared,
+    /// **cached** parse for the hot serve path. Reads the mutable `site/<site>`
+    /// pointer (small) to learn the current content hash, then serves the parsed
+    /// `Arc<SiteConfig>` from the content-hash cache — reading + parsing the body
+    /// only on a miss (a first request or a fresh deploy). The owned
+    /// [`get_site_config`](Self::get_site_config) stays for mutations/admin/tests.
+    pub async fn get_site_config_cached(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<Option<Arc<SiteConfig>>, DeployError> {
+        let Some(hash) = self.kv.get(&keys::site_pointer(project, site)).await? else {
+            return Ok(None);
+        };
+        let hash = String::from_utf8_lossy(&hash).into_owned();
+        if let Some(cfg) = self.site_config_cache.read().unwrap().get(&hash).cloned() {
+            return Ok(Some(cfg));
+        }
+        let Some(bytes) = self.kv.get(&keys::site_config_blob(&hash)).await? else {
+            return Ok(None); // dangling pointer (body GC'd) — treat as unset
+        };
+        let cfg = Arc::new(SiteConfig::from_json(&bytes)?);
+        {
+            let mut cache = self.site_config_cache.write().unwrap();
+            // The content-hash keyspace grows with deploy history; the live working
+            // set is tiny (one hash per served site), so a simple cap + clear bounds
+            // memory without an LRU's per-request bookkeeping.
+            if cache.len() >= 512 {
+                cache.clear();
+            }
+            cache.insert(hash, Arc::clone(&cfg));
+        }
+        Ok(Some(cfg))
     }
 
     /// Store a site's [`SiteConfig`] and rebuild its host → site index entries
@@ -4974,5 +5088,70 @@ mod tests {
             store.delete_project("default").await,
             Err(DeployError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn open_blob_cached_caches_small_and_streams_large() {
+        use crate::kv::MemoryKv;
+        let store = DeployStore::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
+
+        // A small blob is served from the in-memory cache, byte-for-byte, and lands
+        // resident so the next read is a hit (no re-open of storage).
+        let small = b"hello, static hot path";
+        let small_hash = sha256_hex(small);
+        store
+            .put_blob(&small_hash, once_bytes(small))
+            .await
+            .unwrap();
+        match store
+            .open_blob_cached(&small_hash, small.len() as u64)
+            .await
+            .unwrap()
+        {
+            BlobBody::Cached(bytes) => assert_eq!(&bytes[..], small),
+            BlobBody::Stream(_) => panic!("small blob should be cached, not streamed"),
+        }
+        {
+            let cache = store.blob_body_cache.read().unwrap();
+            assert!(cache.map.contains_key(&small_hash));
+            assert_eq!(cache.bytes, small.len());
+        }
+        assert!(matches!(
+            store
+                .open_blob_cached(&small_hash, small.len() as u64)
+                .await
+                .unwrap(),
+            BlobBody::Cached(_)
+        ));
+
+        // A blob over the threshold always streams and is never cached.
+        let large = vec![7u8; SMALL_BLOB_CACHE_MAX as usize + 1];
+        let large_hash = sha256_hex(&large);
+        let put_body = {
+            let large = large.clone();
+            futures::stream::once(async move { Ok(bytes::Bytes::from(large)) }).boxed()
+        };
+        store.put_blob(&large_hash, put_body).await.unwrap();
+        match store
+            .open_blob_cached(&large_hash, large.len() as u64)
+            .await
+            .unwrap()
+        {
+            BlobBody::Stream(object) => {
+                let mut body = object.body;
+                let mut got = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    got.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(got, large);
+            }
+            BlobBody::Cached(_) => panic!("large blob must stream, not cache"),
+        }
+        assert!(!store
+            .blob_body_cache
+            .read()
+            .unwrap()
+            .map
+            .contains_key(&large_hash));
     }
 }

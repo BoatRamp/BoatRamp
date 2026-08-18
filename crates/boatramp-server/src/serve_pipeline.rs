@@ -347,8 +347,9 @@ async fn serve_request(
     host_routed: bool,
 ) -> Response {
     let project_ref = ProjectRef::new(project);
-    // Load the site config once (for access policy + client-IP resolution).
-    let site_config = match deploy.get_site_config(project_ref, site).await {
+    // Load the site config once (for access policy + client-IP resolution). Cached
+    // by content hash — the hot path skips the body read + JSON parse per request.
+    let site_config = match deploy.get_site_config_cached(project_ref, site).await {
         Ok(config) => config,
         Err(err) => return deploy_error_response(err),
     };
@@ -474,7 +475,7 @@ async fn serve_request(
         client_ip,
         Some(project),
         Some(site),
-        site_config.as_ref(),
+        site_config.as_deref(),
         handlers,
         None,
     )
@@ -1262,13 +1263,19 @@ async fn serve_entry(
         }
     }
 
-    // Full body (identity or negotiated variant).
-    let object = match deploy.open_blob(blob_hash).await {
-        Ok(object) => object,
-        Err(err) => return deploy_error_response(err),
-    };
+    // Full body (identity or negotiated variant). Small blobs are served from the
+    // in-memory body cache as one refcounted frame (no open/ReaderStream/disk read);
+    // larger blobs stream straight from storage.
     let mut headers = response_headers(config, request_path, served_path, entry, &etag);
     set_header(&mut headers, header::CONTENT_LENGTH, &blob_size.to_string());
     set_content_encoding(&mut headers, encoding);
-    (base_status, headers, Body::from_stream(object.body)).into_response()
+    match deploy.open_blob_cached(blob_hash, blob_size).await {
+        Ok(boatramp_core::deploy::BlobBody::Cached(bytes)) => {
+            (base_status, headers, Body::from(bytes)).into_response()
+        }
+        Ok(boatramp_core::deploy::BlobBody::Stream(object)) => {
+            (base_status, headers, Body::from_stream(object.body)).into_response()
+        }
+        Err(err) => deploy_error_response(err),
+    }
 }
