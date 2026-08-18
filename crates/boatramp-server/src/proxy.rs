@@ -125,10 +125,71 @@ async fn check_proxy_target(
     Ok((parsed, addr, host))
 }
 
-/// Build a one-off client that resolves `host` to the pre-verified `addr`,
-/// closing the SSRF DNS-rebinding window (the kernel never re-resolves).
+/// Cache key for a pinned upstream client: the pinned resolution plus the
+/// per-upstream options that change the built client.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct UpstreamClientKey {
+    host: String,
+    addr: SocketAddr,
+    connect_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    tls_insecure: bool,
+}
+
+/// Process-wide cache of pinned upstream `reqwest::Client`s. A `Client` owns a
+/// connection pool and builds its TLS `ClientConfig` (parsing the system CA trust
+/// store) at construction, so it MUST be reused across requests: building one per
+/// request forfeits all connection pooling AND re-parses the trust store every
+/// time (~100x slower under load). Clients are cheap to clone (`Arc` inside).
+static UPSTREAM_CLIENTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<UpstreamClientKey, reqwest::Client>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// A pinned upstream client, reused across requests. `host` resolves to the
+/// pre-verified `addr` (closing the SSRF DNS-rebinding window — the kernel never
+/// re-resolves). Built once per distinct upstream key, then served from the cache.
+fn cached_client(
+    host: &str,
+    addr: SocketAddr,
+    connect_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    tls_insecure: bool,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let key = UpstreamClientKey {
+        host: host.to_string(),
+        addr,
+        connect_timeout_ms,
+        request_timeout_ms,
+        tls_insecure,
+    };
+    if let Some(client) = UPSTREAM_CLIENTS.lock().unwrap().get(&key) {
+        return Ok(client.clone());
+    }
+    // Build outside the lock (it parses the trust store); a rare race just
+    // rebuilds once and `or_insert` keeps whichever landed first.
+    let mut builder = reqwest::Client::builder().resolve(host, addr);
+    if let Some(ms) = connect_timeout_ms {
+        builder = builder.connect_timeout(Duration::from_millis(ms));
+    }
+    if let Some(ms) = request_timeout_ms {
+        builder = builder.timeout(Duration::from_millis(ms));
+    }
+    if tls_insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    let client = builder.build()?;
+    Ok(UPSTREAM_CLIENTS
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert(client)
+        .clone())
+}
+
+/// A pinned client with no per-upstream overrides (the absolute-URL proxy path).
+/// Reused across requests — see [`cached_client`].
 fn pinned_client(host: &str, addr: SocketAddr) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().resolve(host, addr).build()
+    cached_client(host, addr, None, None, false)
 }
 
 /// The cloud-metadata service address — refused even for a declared gateway
@@ -512,19 +573,18 @@ async fn proxy_upstream(
     let (mut parts, body) = request.into_parts();
     target.set_query(parts.uri.query());
 
-    // A client pinned to the resolved address, with the upstream's TLS + timeouts.
-    let mut builder = reqwest::Client::builder().resolve(&host, addr);
-    if let Some(ms) = upstream.connect_timeout_ms {
-        builder = builder.connect_timeout(Duration::from_millis(ms));
-    }
-    if let Some(ms) = upstream.request_timeout_ms {
-        builder = builder.timeout(Duration::from_millis(ms));
-    }
+    // A client pinned to the resolved address, with the upstream's TLS + timeouts —
+    // reused across requests via the cache, NOT rebuilt per request.
     if upstream.tls_insecure {
         tracing::warn!(%host, "gateway upstream TLS verification disabled (tls_insecure)");
-        builder = builder.danger_accept_invalid_certs(true);
     }
-    let client = match builder.build() {
+    let client = match cached_client(
+        &host,
+        addr,
+        upstream.connect_timeout_ms,
+        upstream.request_timeout_ms,
+        upstream.tls_insecure,
+    ) {
         Ok(client) => client,
         Err(_) => return (StatusCode::BAD_GATEWAY, "gateway client error\n").into_response(),
     };
