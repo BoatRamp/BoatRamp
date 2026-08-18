@@ -179,11 +179,23 @@ boatramp-handlers = { workspace = true, optional = true }
 # handler/gateway body plumbing.
 bytes.workspace = true
 # hyper (client+http1) + hyper-util + http-body-util back the gateway's
-# unix-socket upstreams and the handler body plumbing. Already
-# in the tree via reqwest, so exposing them directly is cheap.
+# unix-socket upstreams, the reverse-proxy data plane (hyper-util's pooled
+# `legacy::Client` — raw hyper, no reqwest — over a pinned rustls connector),
+# and the handler body plumbing. Already in the tree via reqwest, so exposing
+# them directly is cheap.
 hyper = { workspace = true, features = ["client", "http1"] }
-hyper-util.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 http-body-util.workspace = true
+# TLS for the proxy upstream leg: hyper-rustls wraps our pinned `HttpConnector`
+# with a rustls `ClientConfig` we build ourselves (webpki roots, or an
+# accept-anything verifier for `tls_insecure`). Already in the tree via reqwest.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "ring",
+] }
+# The `Service` trait for the proxy connector's fixed-address resolver (the SSRF
+# pin). Trait-only crate, already in the tree via hyper-util.
+tower-service = "0.3"
 # Wall-clock decomposition for the cron scheduler (already in the tree).
 chrono = { version = "0.4", default-features = false, features = [
   "clock",

@@ -1802,9 +1802,11 @@ async fn serve_cluster_acme_dns(
     } else {
         app
     };
-    axum_server::bind(addr)
+    let mut server = axum_server::bind(addr)
         .acceptor(nodelay_rustls(tls))
-        .handle(handle)
+        .handle(handle);
+    tune_h2(&mut server);
+    server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
@@ -1983,9 +1985,11 @@ async fn serve_acme_dns(
     } else {
         app
     };
-    axum_server::bind(addr)
+    let mut server = axum_server::bind(addr)
         .acceptor(nodelay_rustls(tls))
-        .handle(handle)
+        .handle(handle);
+    tune_h2(&mut server);
+    server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
@@ -2086,6 +2090,24 @@ fn nodelay_rustls(
         .acceptor(axum_server::accept::NoDelayAcceptor::new())
 }
 
+/// Cap inbound HTTP/2 concurrent streams per connection: bounds worst-case
+/// per-connection memory and is the standard HTTP/2 rapid-reset / CVE-2023-44487
+/// mitigation. 256 is well above any legitimate multiplexing need, so normal
+/// traffic is unaffected. Applied to every `axum_server` HTTPS listener — HTTP/2
+/// is negotiated over TLS/ALPN, so this is the only path where it takes effect
+/// (the plaintext `axum::serve` path is HTTP/1 behind Fly/Cloudflare).
+///
+/// We deliberately leave `max_send_buf_size` at hyper's 400 KB default: trimming it
+/// bought no memory (the proxy-path resident set is the *upstream* leg, capped via
+/// the client's `http1_max_buf_size`), and a smaller send buffer throttles *streamed*
+/// proxy responses over H2 — back-pressuring the upstream pull in small increments.
+/// The flow-control windows likewise stay at the 1 MB default (a credit counter, not
+/// a preallocation) so WAN download throughput is unaffected.
+#[cfg(feature = "tls")]
+fn tune_h2<Acc>(server: &mut axum_server::Server<SocketAddr, Acc>) {
+    server.http_builder().http2().max_concurrent_streams(256u32);
+}
+
 #[cfg(feature = "tls")]
 async fn serve_custom(
     args: &ServeArgs,
@@ -2126,9 +2148,11 @@ async fn serve_custom(
         app
     };
 
-    axum_server::bind(addr)
+    let mut server = axum_server::bind(addr)
         .acceptor(nodelay_rustls(config))
-        .handle(handle)
+        .handle(handle);
+    tune_h2(&mut server);
+    server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
@@ -2206,9 +2230,11 @@ async fn serve_rpk(
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
     let handle = spawn_tls_shutdown();
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
-    axum_server::bind(addr)
+    let mut server = axum_server::bind(addr)
         .acceptor(nodelay_rustls(config))
-        .handle(handle)
+        .handle(handle);
+    tune_h2(&mut server);
+    server
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
@@ -2281,9 +2307,9 @@ async fn serve_acme(
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
     let handle = spawn_tls_shutdown();
-    axum_server::bind(addr)
-        .handle(handle)
-        .acceptor(acceptor)
+    let mut server = axum_server::bind(addr).handle(handle).acceptor(acceptor);
+    tune_h2(&mut server);
+    server
         .serve(
             boatramp_server::router_with(deploy, auth, handlers, options)
                 .into_make_service_with_connect_info::<SocketAddr>(),

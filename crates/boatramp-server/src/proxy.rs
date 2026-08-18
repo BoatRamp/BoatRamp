@@ -40,26 +40,44 @@ pub(super) async fn proxy(
         .unwrap_or("http")
         .to_string();
 
-    let mut upstream = client.request(parts.method, parsed);
-    // Forward request headers minus hop-by-hop and Host (reqwest sets Host).
+    // Build the upstream request against the pinned absolute URI. hyper sets Host
+    // from the URI authority (the real upstream host), so we drop the client's Host.
+    let uri: axum::http::Uri = match parsed.as_str().parse() {
+        Ok(uri) => uri,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "proxy client error\n").into_response(),
+    };
+    let mut builder = Request::builder().method(parts.method).uri(uri);
+    let out_headers = builder
+        .headers_mut()
+        .expect("fresh request builder has no error");
+    // Forward request headers minus hop-by-hop and Host. `append` mirrors reqwest's
+    // header semantics (preserves any inbound X-Forwarded-* chain).
     for (name, value) in &parts.headers {
         if name == header::HOST || is_hop_by_hop(name) {
             continue;
         }
-        upstream = upstream.header(name, value);
+        out_headers.append(name.clone(), value.clone());
     }
-    upstream = upstream
-        .header("x-forwarded-for", client_ip.to_string())
-        .header("x-forwarded-proto", scheme);
+    if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
+        out_headers.append(HeaderName::from_static("x-forwarded-for"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&scheme) {
+        out_headers.append(HeaderName::from_static("x-forwarded-proto"), v);
+    }
     if let Some(host_header) = parts.headers.get(header::HOST) {
-        upstream = upstream.header("x-forwarded-host", host_header);
+        out_headers.append(
+            HeaderName::from_static("x-forwarded-host"),
+            host_header.clone(),
+        );
     }
-    upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let req = match builder.body(body) {
+        Ok(req) => req,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "proxy client error\n").into_response(),
+    };
 
-    match upstream.send().await {
+    match client.send(req).await {
         Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = resp.status();
             // Pass response headers through, minus hop-by-hop + content-length
             // (we re-stream, so let the framing be recomputed).
             let mut headers = HeaderMap::new();
@@ -69,12 +87,14 @@ pub(super) async fn proxy(
                 }
                 headers.insert(name.clone(), value.clone());
             }
-            (status, headers, Body::from_stream(resp.bytes_stream())).into_response()
+            // Stream `hyper::body::Incoming` straight to the client — no copy.
+            (status, headers, Body::new(resp.into_body())).into_response()
         }
-        Err(err) => {
-            tracing::warn!(%url, error = %err, "proxy request failed");
-            (StatusCode::BAD_GATEWAY, "upstream error\n").into_response()
+        Err(UpstreamError::Timeout) => {
+            tracing::warn!(%url, "proxy request timed out");
+            (StatusCode::GATEWAY_TIMEOUT, "upstream timeout\n").into_response()
         }
+        Err(UpstreamError::Failed) => (StatusCode::BAD_GATEWAY, "upstream error\n").into_response(),
     }
 }
 
@@ -136,13 +156,160 @@ struct UpstreamClientKey {
     tls_insecure: bool,
 }
 
-/// Process-wide cache of pinned upstream `reqwest::Client`s. A `Client` owns a
-/// connection pool and builds its TLS `ClientConfig` (parsing the system CA trust
-/// store) at construction, so it MUST be reused across requests: building one per
-/// request forfeits all connection pooling AND re-parses the trust store every
-/// time (~100x slower under load). Clients are cheap to clone (`Arc` inside).
+/// Our pinned upstream connector: an `HttpConnector` whose resolver only ever
+/// returns the pre-verified `addr` (so a reconnect can never reach a different,
+/// internal host — the SSRF pin holds), wrapped by hyper-rustls for TLS.
+type PinnedConnector = hyper_rustls::HttpsConnector<
+    hyper_util::client::legacy::connect::HttpConnector<PinnedResolver>,
+>;
+
+/// The raw-hyper (no reqwest) pooled client backing the reverse-proxy data plane.
+/// hyper-util's `legacy::Client` exposes the knob reqwest hides —
+/// `http1_max_buf_size`, which caps the per-connection H1 read buffer — and lets us
+/// stream `hyper::body::Incoming` straight through with no intermediate copy. It has
+/// no redirect layer, so a reverse proxy hands upstream 3xx back to the client by
+/// construction (reqwest's `Policy::limited(10)` default would instead chase them,
+/// un-pinned, past our SSRF allow-list).
+type HyperClient = hyper_util::client::legacy::Client<PinnedConnector, Body>;
+
+/// A pinned upstream client plus its total-request timeout. hyper-util's client has
+/// no built-in per-request deadline (unlike reqwest's `.timeout()`), so we carry it
+/// and enforce it in [`UpstreamClient::send`]. Cheap to clone (`Arc` inside).
+#[derive(Clone)]
+struct UpstreamClient {
+    inner: HyperClient,
+    request_timeout: Option<Duration>,
+}
+
+/// How an upstream request failed, mapped to a client-visible status.
+#[derive(Debug)]
+enum UpstreamError {
+    /// The total-request deadline elapsed → `504 Gateway Timeout`.
+    Timeout,
+    /// Connect / handshake / protocol failure → `502 Bad Gateway`.
+    Failed,
+}
+
+impl UpstreamClient {
+    /// Send `req` upstream and return the response with its body streamed back.
+    /// Enforces the per-upstream total-request timeout (to first byte) if set.
+    async fn send(
+        &self,
+        req: Request<Body>,
+    ) -> Result<Response<hyper::body::Incoming>, UpstreamError> {
+        let fut = self.inner.request(req);
+        let result = match self.request_timeout {
+            Some(dur) => match tokio::time::timeout(dur, fut).await {
+                Ok(result) => result,
+                Err(_) => return Err(UpstreamError::Timeout),
+            },
+            None => fut.await,
+        };
+        result.map_err(|err| {
+            tracing::warn!(error = %err, "upstream request failed");
+            UpstreamError::Failed
+        })
+    }
+}
+
+/// A DNS resolver pinned to one pre-verified address. `HttpConnector` calls this to
+/// "resolve" the upstream host; we always hand back the single address
+/// `check_proxy_target` verified as public, so the connection can never be steered
+/// to a different (internal) host on connect or reconnect. This *is* the SSRF pin,
+/// enforced structurally in the connector.
+#[derive(Clone)]
+struct PinnedResolver(SocketAddr);
+
+impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for PinnedResolver {
+    type Response = std::iter::Once<SocketAddr>;
+    type Error = std::convert::Infallible;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
+        std::future::ready(Ok(std::iter::once(self.0)))
+    }
+}
+
+/// A rustls client config for the upstream leg: webpki roots by default, or an
+/// accept-anything verifier when the upstream is declared `tls_insecure`. ALPN is
+/// pinned to HTTP/1.1 (the only protocol the connector enables).
+fn upstream_tls_config(tls_insecure: bool) -> Result<rustls::ClientConfig, ()> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|_| ())?;
+    // NB: do NOT set `alpn_protocols` here — hyper-rustls' `with_tls_config` asserts
+    // it is empty and sets ALPN itself from `.enable_http1()`/`.enable_http2()`.
+    // Pre-setting it panics on every client build.
+    let config = if tls_insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(config)
+}
+
+/// The `tls_insecure` verifier — accepts any certificate and signature. Wired in
+/// only when an operator explicitly declares an upstream `tls_insecure` (mirrors
+/// reqwest's `danger_accept_invalid_certs`); never on the default path.
+#[derive(Debug)]
+struct NoCertVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Process-wide cache of pinned upstream clients. A client owns a connection pool
+/// and builds its rustls `ClientConfig` at construction, so it MUST be reused across
+/// requests: building one per request forfeits pooling AND rebuilds the trust store
+/// every time. Cheap to clone (`Arc` inside).
 static UPSTREAM_CLIENTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<UpstreamClientKey, reqwest::Client>>,
+    std::sync::Mutex<std::collections::HashMap<UpstreamClientKey, UpstreamClient>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// A pinned upstream client, reused across requests. `host` resolves to the
@@ -154,7 +321,7 @@ fn cached_client(
     connect_timeout_ms: Option<u64>,
     request_timeout_ms: Option<u64>,
     tls_insecure: bool,
-) -> Result<reqwest::Client, reqwest::Error> {
+) -> Result<UpstreamClient, ()> {
     let key = UpstreamClientKey {
         host: host.to_string(),
         addr,
@@ -165,19 +332,42 @@ fn cached_client(
     if let Some(client) = UPSTREAM_CLIENTS.lock().unwrap().get(&key) {
         return Ok(client.clone());
     }
-    // Build outside the lock (it parses the trust store); a rare race just
-    // rebuilds once and `or_insert` keeps whichever landed first.
-    let mut builder = reqwest::Client::builder().resolve(host, addr);
+    // Build outside the lock; a rare race just rebuilds once and `or_insert` keeps
+    // whichever landed first.
+    let tls = upstream_tls_config(tls_insecure)?;
+    let mut http =
+        hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(PinnedResolver(addr));
+    http.enforce_http(false); // allow https upstreams — the address pin still holds
+                              // Disable Nagle on the upstream leg too: a proxied request would otherwise pay
+                              // the same ~40 ms delayed-ACK stall the inbound path already avoids.
+    http.set_nodelay(true);
     if let Some(ms) = connect_timeout_ms {
-        builder = builder.connect_timeout(Duration::from_millis(ms));
+        http.set_connect_timeout(Some(Duration::from_millis(ms)));
     }
-    if let Some(ms) = request_timeout_ms {
-        builder = builder.timeout(Duration::from_millis(ms));
-    }
-    if tls_insecure {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-    let client = builder.build()?;
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+    let inner = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        // A timer is required for `pool_idle_timeout` to reap idle connections in the
+        // background; without it, expired connections are only dropped lazily on the
+        // next checkout. Reuse of live connections works either way — this makes the
+        // 20 s idle bound actually fire.
+        .pool_timer(hyper_util::rt::TokioTimer::new())
+        // Return upstream connection memory promptly after a spike drains (reqwest's
+        // default holds idle connections 90 s). In-use connections are unaffected, so
+        // steady-state reuse — and throughput — is unchanged.
+        .pool_idle_timeout(Duration::from_secs(20))
+        // Cap the per-connection H1 read buffer (hyper's 400 KB default) — the knob
+        // reqwest does not expose. At high proxy fan-out this bounds the dominant
+        // proxy-path resident set; 128 KB still holds a typical response in one read.
+        .http1_max_buf_size(128 * 1024)
+        .build(https);
+    let client = UpstreamClient {
+        inner,
+        request_timeout: request_timeout_ms.map(Duration::from_millis),
+    };
     Ok(UPSTREAM_CLIENTS
         .lock()
         .unwrap()
@@ -188,7 +378,7 @@ fn cached_client(
 
 /// A pinned client with no per-upstream overrides (the absolute-URL proxy path).
 /// Reused across requests — see [`cached_client`].
-fn pinned_client(host: &str, addr: SocketAddr) -> Result<reqwest::Client, reqwest::Error> {
+fn pinned_client(host: &str, addr: SocketAddr) -> Result<UpstreamClient, ()> {
     cached_client(host, addr, None, None, false)
 }
 
@@ -597,10 +787,17 @@ async fn proxy_upstream(
         .to_string();
     let requested_host = parts.headers.get(header::HOST).cloned();
 
-    let mut up = client.request(parts.method.clone(), target);
+    let uri: axum::http::Uri = match target.as_str().parse() {
+        Ok(uri) => uri,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "gateway client error\n").into_response(),
+    };
+    let mut builder = Request::builder().method(parts.method.clone()).uri(uri);
+    let out_headers = builder
+        .headers_mut()
+        .expect("fresh request builder has no error");
     for (name, value) in &parts.headers {
-        // reqwest sets Host from the URL (or our override below); drop the
-        // client Host + hop-by-hop, and any header the upstream removes.
+        // hyper sets Host from the URI (or our override below); drop the client Host
+        // + hop-by-hop, and any header the upstream removes.
         if name == header::HOST
             || is_hop_by_hop(name)
             || upstream
@@ -611,29 +808,43 @@ async fn proxy_upstream(
         {
             continue;
         }
-        up = up.header(name, value);
+        out_headers.append(name.clone(), value.clone());
     }
-    up = up
-        .header("x-forwarded-for", client_ip.to_string())
-        .header("x-forwarded-proto", scheme);
+    if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
+        out_headers.append(HeaderName::from_static("x-forwarded-for"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&scheme) {
+        out_headers.append(HeaderName::from_static("x-forwarded-proto"), v);
+    }
     if let Some(h) = &requested_host {
-        up = up.header("x-forwarded-host", h);
+        out_headers.append(HeaderName::from_static("x-forwarded-host"), h.clone());
     }
-    // Host header: explicit override, else the upstream's own host.
+    // Host header: explicit override, else (no Host set) the upstream's own host,
+    // which hyper fills from the URI authority.
     if let Some(hh) = &upstream.host_header {
-        up = up.header(header::HOST, hh);
+        if let Ok(v) = HeaderValue::from_str(hh) {
+            out_headers.insert(header::HOST, v);
+        }
     }
-    // Request header set/overrides.
+    // Request header set/overrides (skip any that are malformed rather than
+    // failing the whole request).
     for (name, value) in &upstream.header_up.set {
-        up = up.header(name, value);
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::from_str(value),
+        ) {
+            out_headers.append(n, v);
+        }
     }
-    up = up.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     parts.headers.clear(); // release; not used past here
+    let req = match builder.body(body) {
+        Ok(req) => req,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "gateway client error\n").into_response(),
+    };
 
-    match up.send().await {
+    match client.send(req).await {
         Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = resp.status();
             let mut headers = HeaderMap::new();
             for (name, value) in resp.headers() {
                 if is_hop_by_hop(name)
@@ -652,12 +863,13 @@ async fn proxy_upstream(
             for (name, value) in &upstream.header_down.set {
                 set_header_str(&mut headers, name, value);
             }
-            (status, headers, Body::from_stream(resp.bytes_stream())).into_response()
+            (status, headers, Body::new(resp.into_body())).into_response()
         }
-        Err(err) => {
-            tracing::warn!(%host, error = %err, "gateway upstream request failed");
-            (StatusCode::BAD_GATEWAY, "upstream error\n").into_response()
+        Err(UpstreamError::Timeout) => {
+            tracing::warn!(%host, "gateway upstream request timed out");
+            (StatusCode::GATEWAY_TIMEOUT, "upstream timeout\n").into_response()
         }
+        Err(UpstreamError::Failed) => (StatusCode::BAD_GATEWAY, "upstream error\n").into_response(),
     }
 }
 
@@ -1092,7 +1304,60 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::upgrade_transport;
+    use super::*;
+
+    /// Repro for the proxy small-response stall: drive `cached_client` against a
+    /// local keep-alive upstream (TCP_NODELAY on, so any stall is on *our* client
+    /// leg) and measure warm per-request latency. A Nagle / delayed-ACK / flush
+    /// stall shows as tens of ms; healthy loopback is well under 10 ms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upstream_client_small_request_is_prompt() {
+        use axum::serve::ListenerExt;
+        use std::time::Instant;
+
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { axum::body::Bytes::from(vec![7u8; 1024]) }),
+        );
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = raw.local_addr().unwrap();
+        let listener = raw.tap_io(|s| {
+            let _ = s.set_nodelay(true);
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = cached_client("127.0.0.1", addr, None, None, false).unwrap();
+        let uri = format!("http://127.0.0.1:{}/", addr.port());
+        let mut worst = 0f64;
+        for i in 0..30 {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap();
+            let start = Instant::now();
+            let resp = match client.send(req).await {
+                Ok(resp) => resp,
+                Err(err) => panic!("send failed at iter {i}: {err:?}"),
+            };
+            let body = axum::body::to_bytes(Body::new(resp.into_body()), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(body.len(), 1024);
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("iter {i}: {ms:.2}ms");
+            if i > 1 {
+                worst = worst.max(ms); // skip the first couple (cold connect)
+            }
+        }
+        assert!(
+            worst < 15.0,
+            "warm upstream request latency {worst:.1}ms — Nagle/flush stall on the raw-hyper client"
+        );
+    }
 
     #[test]
     fn upgrade_transport_maps_scheme_to_tls() {
