@@ -446,6 +446,12 @@
           # `boatramp cloudflare`'s generated recipe; these are the single-instance
           # bases.
           // lib.optionalAttrs pkgs.stdenv.isLinux {
+            # The fully-static musl + jemalloc binary that backs the OCI images,
+            # exposed on its own (`nix build .#boatramp-static`) so it can be used
+            # directly — e.g. the benchmark harness runs it head-to-head with the
+            # glibc `default` binary and the field.
+            boatramp-static = boatrampMuslBin;
+
             # Base image: runs as root so it can own a mounted state volume (e.g. a
             # fly.io volume) when using the fs/SlateDB backends. Ships the static
             # musl + jemalloc binary — no glibc/loader closure, and jemalloc keeps
