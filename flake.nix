@@ -236,6 +236,15 @@
           # cloudflare`'s generated recipe — that path is separate from this flake.)
           boatrampBin = mkBoatramp { };
 
+          # The fully-static musl + jemalloc build that backs the OCI images (see
+          # ./nix/package-musl.nix). Lazily evaluated — only the Linux-only
+          # `container*` packages force it, so it never builds on macOS. Built with
+          # cargo-zigbuild, so `pkgs.cargo-zigbuild` + `pkgs.zig` are passed in.
+          boatrampMuslBin = pkgs.callPackage ./nix/package-musl.nix {
+            inherit rustPlatform rustToolchain;
+            consoleDist = consolePackage;
+          };
+
           # Shared builder for the reproducible, Nix-first OCI images. Both targets
           # ship the *same* batteries-included binary and differ only in runtime
           # posture: the base `container` runs as root so it can own a mounted state
@@ -438,12 +447,15 @@
           # bases.
           // lib.optionalAttrs pkgs.stdenv.isLinux {
             # Base image: runs as root so it can own a mounted state volume (e.g. a
-            # fly.io volume) when using the fs/SlateDB backends.
-            container = mkImage { pkg = boatrampBin; };
-            # Cloudflare image: the same binary, configured for remote state (R2 + KV)
-            # at runtime, so it needs no volume and stays hardened as non-root.
+            # fly.io volume) when using the fs/SlateDB backends. Ships the static
+            # musl + jemalloc binary — no glibc/loader closure, and jemalloc keeps
+            # the concurrency throughput musl's own malloc would throw away.
+            container = mkImage { pkg = boatrampMuslBin; };
+            # Cloudflare image: the same static binary, configured for remote state
+            # (R2 + KV) at runtime, so it needs no volume and stays hardened as
+            # non-root.
             container-cloudflare = mkImage {
-              pkg = boatrampBin;
+              pkg = boatrampMuslBin;
               user = "65534:65534";
             };
           };
