@@ -1447,7 +1447,8 @@ async fn run_cluster(
         "cluster: serving peer mesh (mutual TLS)"
     );
     tokio::spawn(async move {
-        if let Err(err) = axum_server::bind_rustls(listen, mesh_config)
+        if let Err(err) = axum_server::bind(listen)
+            .acceptor(nodelay_rustls(mesh_config))
             .serve(mesh_router.into_make_service())
             .await
         {
@@ -1801,7 +1802,8 @@ async fn serve_cluster_acme_dns(
     } else {
         app
     };
-    axum_server::bind_rustls(addr, tls)
+    axum_server::bind(addr)
+        .acceptor(nodelay_rustls(tls))
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
@@ -1981,7 +1983,8 @@ async fn serve_acme_dns(
     } else {
         app
     };
-    axum_server::bind_rustls(addr, tls)
+    axum_server::bind(addr)
+        .acceptor(nodelay_rustls(tls))
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
@@ -2069,6 +2072,20 @@ async fn configure_oidc(
     Ok(())
 }
 
+/// A rustls TLS acceptor that sets `TCP_NODELAY` on the accepted TCP stream before
+/// the handshake. `axum_server`'s default acceptor leaves Nagle's algorithm on,
+/// which stalls small responses on keep-alive TLS connections ~40 ms via delayed
+/// ACKs (measurably: ~6k rps / p50 42 ms vs ~84k / 2.5 ms with it off). The
+/// plaintext `axum::serve` path avoids this via `tap_io`; this is its TLS analogue,
+/// used by every `axum_server` HTTPS listener below.
+#[cfg(feature = "tls")]
+fn nodelay_rustls(
+    config: axum_server::tls_rustls::RustlsConfig,
+) -> axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor> {
+    axum_server::tls_rustls::RustlsAcceptor::new(config)
+        .acceptor(axum_server::accept::NoDelayAcceptor::new())
+}
+
 #[cfg(feature = "tls")]
 async fn serve_custom(
     args: &ServeArgs,
@@ -2109,7 +2126,8 @@ async fn serve_custom(
         app
     };
 
-    axum_server::bind_rustls(addr, config)
+    axum_server::bind(addr)
+        .acceptor(nodelay_rustls(config))
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
@@ -2188,7 +2206,8 @@ async fn serve_rpk(
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
     let handle = spawn_tls_shutdown();
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
-    axum_server::bind_rustls(addr, config)
+    axum_server::bind(addr)
+        .acceptor(nodelay_rustls(config))
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
