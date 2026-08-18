@@ -1264,14 +1264,21 @@ impl Drop for AccessLog {
 /// response bytes, and duration. The line is emitted once the body has fully
 /// streamed (or the connection drops), counting bytes as they pass through.
 async fn access_log(mut request: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
-    // Assign the correlation id and make it readable downstream (handler dispatch tags
-    // captured guest logs with it) before running the request.
+    // Assign the correlation id and make it readable downstream (handler dispatch
+    // tags captured guest logs with it) before running the request — unconditional.
     let request_id = request_id_for(request.headers());
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
+    // If the `boatramp::access` line would be filtered out (access logging off),
+    // skip everything below: ~4 per-request string allocations plus a response-body
+    // stream wrapper, all purely to build a line nobody will read. The correlation
+    // id above is still assigned. Matches how nginx/Envoy run with `access_log off`.
+    if !tracing::enabled!(target: "boatramp::access", tracing::Level::INFO) {
+        return next.run(request).await;
+    }
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let host = request
         .headers()
         .get(header::HOST)
