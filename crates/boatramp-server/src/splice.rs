@@ -441,6 +441,10 @@ async fn splice_conn(
             Some(v) => v,
             None => return fall_back(head, leftover, client, peer, router).await,
         };
+        // Honor a client `Connection: close`: serve this one request, then close
+        // (HTTP/1.1 defaults to keep-alive otherwise).
+        let client_close = header(&headers, "connection")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("close"));
         let path = path_only(&target_path);
         if plan
             .upstream_route(&ctx, &plan.project, &plan.site, path)
@@ -467,7 +471,7 @@ async fn splice_conn(
             client.write_all(&body_prefix).await?;
         }
         if head_only {
-            if close {
+            if close || client_close {
                 return Ok(());
             }
             continue;
@@ -486,7 +490,7 @@ async fn splice_conn(
                 return Ok(());
             }
         }
-        if close {
+        if close || client_close {
             return Ok(());
         }
     }
@@ -937,6 +941,138 @@ mod tests {
     fn head_end_index() {
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\nBODY"), Some(18));
         assert_eq!(find_head_end(b"partial\r\nno end"), None);
+    }
+
+    /// End-to-end over real sockets: the serve loop reverse-proxies a gateway route
+    /// (spliced on Linux, userspace-proxied elsewhere — same bytes) and defers a
+    /// reserved control-plane route to the app router. Exercises `serve`,
+    /// `peek_classify`, `classify`, `splice_conn`/`splice_body`, and `serve_fallback`.
+    #[tokio::test]
+    async fn serve_loop_proxies_gateway_and_defers_reserved_routes() {
+        use boatramp_core::config::{DomainConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, Manifest};
+        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::security::SecurityProfile;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A tiny keep-alive upstream returning a fixed Content-Length body.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => {}
+                        }
+                        let body = b"hello-from-upstream";
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        if s.write_all(head.as_bytes()).await.is_err()
+                            || s.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        // A deploy store with a deployed gateway site `www` (host test.local, `/**`).
+        // Blob storage is unused on the gateway path (an empty manifest); an FsStorage
+        // under the temp dir is a convenient no-touch backend.
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let cfg = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("test.local".into()),
+                ..Default::default()
+            },
+            gateway: Some(GatewayConfig {
+                upstreams: std::iter::once((
+                    "backend".to_string(),
+                    Upstream {
+                        target: format!("http://{up_addr}"),
+                        ..Default::default()
+                    },
+                ))
+                .collect(),
+                routes: vec![GatewayRoute {
+                    matches: "/**".into(),
+                    upstream: "backend".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        deploy
+            .set_site_config(ProjectRef::DEFAULT, "www", &cfg)
+            .await
+            .unwrap();
+        let id = deploy.put_manifest(&Manifest::default()).await.unwrap();
+        deploy
+            .activate(ProjectRef::DEFAULT, "www", &id)
+            .await
+            .unwrap();
+
+        let posture = SecurityProfile::Dev.preset();
+        // The dev posture must be on the router too, so the userspace fallback path
+        // (used off Linux, where splice is unavailable) also permits the loopback
+        // upstream — the test then exercises the same routing on every target.
+        let router = crate::router_with(
+            deploy.clone(),
+            crate::Auth::disabled(),
+            crate::HandlerRuntime::disabled(),
+            crate::ServerOptions {
+                posture,
+                ..Default::default()
+            },
+        );
+        let ctx = SpliceCtx {
+            deploy,
+            posture,
+            daemon: None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, ctx, router, std::future::pending::<()>()).await;
+        });
+
+        async fn req(addr: SocketAddr, raw: &str) -> String {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(raw.as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            c.read_to_end(&mut out).await.unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        // A gateway-routed GET is reverse-proxied — the upstream body reaches the client.
+        let resp = req(
+            addr,
+            "GET /anything HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("hello-from-upstream"),
+            "proxy body missing: {resp}"
+        );
+        // A reserved control-plane route is served by the app router, not proxied.
+        let hz = req(
+            addr,
+            "GET /healthz HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            hz.starts_with("HTTP/1.1 200") && hz.to_ascii_lowercase().contains("ok"),
+            "healthz fallback: {hz}"
+        );
     }
 
     // ---- property-based fuzzing of the hand-written parsers -----------------
