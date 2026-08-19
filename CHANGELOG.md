@@ -8,9 +8,9 @@ versions.
 ## [Unreleased]
 
 ### Changed
-- **Reverse-proxy per-request CPU cut sharply by caching what doesn't change per request.**
+- **Reverse-proxy per-request overhead cut sharply — small-response proxy throughput now leads Envoy.**
   Profiling the proxy hot path under load (256-concurrency, core-pinned, on a real Linux release
-  build) found three costs a bare proxy like Envoy never pays, and eliminated each:
+  build) found four per-request costs a bare proxy does not pay, and eliminated each:
   - Resolving the request `Host` to a site walked the KV domain index on **every request**, and the
     negative lookups — a `Host` with no custom domain that falls through to the default site, the
     common case — were never cached, so each request re-read the LSM store up the whole label chain
@@ -22,11 +22,16 @@ versions.
     address gate still re-checks the pinned address on every request, so caching never relaxes it.
   - The per-request store handle (`State<DeployStore>`) cloned one atomic refcount per field; it is
     now a single `Arc`.
+  - The router layered every request extension on the whole app, so the serving route axum clones on
+    each request carried all of them; the control-plane-only extensions now sit on the API sub-router
+    and stay off the hot serving route, shortening that per-request clone.
 
-  Together these lift reverse-proxy throughput **~23–28 % on the small-response TLS cells** — where
-  fixed per-request cost dominates (e.g. HTTPS/1.1 1 KB at concurrency 256: 97k→124k req/s;
-  HTTP/2 1 KB: 84k→104k) — with no behaviour change. Large-response cells, bounded by body copying
-  rather than per-request overhead, improve modestly.
+  Together, on the fair 5-way benchmark (vs nginx / Caddy / Traefik / Envoy, core-pinned, musl +
+  jemalloc build) these lift small-response reverse-proxy throughput **~33–47 %** and put BoatRamp
+  **ahead of Envoy on every 1 KB proxy cell** at concurrency 256 — HTTP/1.1 107k→157k req/s (Envoy
+  153k), HTTPS/1.1 99k→139k (Envoy 131k), HTTP/2-over-TLS 88k→117k (Envoy 111k) — behind only nginx.
+  Large-response (100 KB) cells, bounded by body copying rather than per-request overhead, improve
+  ~6–16 % and trail Envoy by under ~10 %. No behaviour change.
 
 ## [0.2.13] - 2026-08-19
 
