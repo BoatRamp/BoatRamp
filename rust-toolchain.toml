@@ -4,11 +4,14 @@ components = ["rustfmt", "clippy", "rust-src"]
 # wasm32-wasip2 lets us build WebAssembly component guests (the `handlers`
 # engine's fixtures + examples). wasm32-unknown-unknown is the Cloudflare edge
 # Worker target (workers-rs), which reuses `boatramp-types` (routing/config).
-# x86_64-unknown-linux-musl is the fully-static target for the OCI images (built
-# with cargo-zigbuild + jemalloc; musl's own malloc scales poorly under load).
+# The *-unknown-linux-musl targets are the fully-static builds for the OCI images
+# and the Linux release binaries (built with cargo-zigbuild + jemalloc; musl's own
+# malloc scales poorly under load). Both arches are listed so each Linux builder has
+# its own musl std — the aarch64 runner produces the aarch64 binary (Graviton/Ampere).
 # All additive — the default native build is unaffected.
 targets = [
   "wasm32-wasip2",
   "wasm32-unknown-unknown",
   "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
 ]
