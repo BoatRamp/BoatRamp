@@ -303,6 +303,21 @@ pub fn router_with(
             cors,
         ))
     };
+    // Extensions only the control-plane API reads are layered on the `api`
+    // sub-router here — before the merge below — so they wrap only the API routes,
+    // not the `serve_by_host` fallback whose matched route axum clones on every
+    // served request. Keeping these off the hot-path route shortens that
+    // per-request boxed-service clone (profiled at a few percent of proxy CPU under
+    // load). The extensions the serving / well-known / webhook routes actually read
+    // stay app-level, added after the merge.
+    let api = api
+        .layer(Extension(issuer))
+        .layer(Extension(bootstrap))
+        .layer(Extension(mesh_control))
+        .layer(Extension(probe))
+        .layer(Extension(upload_guard));
+    #[cfg(feature = "oidc")]
+    let api = api.layer(Extension(oidc_state));
 
     // Public routes (never authenticated by token): health + serving +
     // immutable deploy-by-id previews. A deployment id is a SHA-256 of content,
@@ -346,12 +361,6 @@ pub fn router_with(
         // both the public serving routes and the control-plane API (activation
         // runs the handler compile-gate). An empty runtime means handlers off.
         .layer(Extension(Arc::new(handlers)))
-        // The domain-ownership probe (HTTP fetch / DNS resolve), used by the
-        // verification check endpoint. Injectable for tests.
-        .layer(Extension(probe))
-        // Operational upload limits (size / idle / concurrency), enforced in the
-        // blob-upload handler. Unlimited by default.
-        .layer(Extension(upload_guard))
         // Whether an unmatched host may resolve implicitly (first-label / sole
         // site); gated to dev/single-tenant/loopback by `serve`.
         .layer(Extension(implicit_routing))
@@ -359,16 +368,9 @@ pub fn router_with(
         // when previews are token-gated.
         .layer(Extension(preview_policy))
         .layer(Extension(preview_auth));
-    // The token issuing signer (token-create + OIDC exchange). Layered after the
-    // merge so the API handlers can read it. (`whoami` reads the `Auth` extension
-    // directly for full token validation.)
-    let app = app.layer(Extension(issuer));
-    // The first-token bootstrap gate, for `POST /api/tokens/bootstrap`.
-    let app = app.layer(Extension(bootstrap));
-    // The mesh join admitter (cluster mode), for the join handler.
-    let app = app.layer(Extension(mesh_control));
-    #[cfg(feature = "oidc")]
-    let app = app.layer(Extension(oidc_state));
+    // (`issuer`, `bootstrap`, `mesh_control`, and `oidc_state` are control-plane
+    // only; they are layered on the `api` sub-router above so they stay off the
+    // hot-path serving route. `whoami` reads the `Auth` extension directly.)
     // The resolved security posture, for the gateway / proxy / domain-verify /
     // upload paths to consult (the findings read it via `Extension`).
     let app = app.layer(Extension(posture));
