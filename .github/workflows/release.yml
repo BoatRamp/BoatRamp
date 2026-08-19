@@ -27,11 +27,11 @@ permissions:
   attestations: write
 
 env:
-  # Full set on Linux (incl. the cfg-gated Linux compute backends + the in-binary
-  # Kubernetes `operator`, so the same image both serves cluster pods and runs the
-  # controller); the portable core on macOS/Windows (compute *execution* +
-  # operator are Linux-only).
-  LINUX_FEATURES: "tls,handlers,cluster,operator,s3,cloudflare-kv,compression,http3,acme-dns,bundler,oidc"
+  # The Linux release binary is the fully-static **musl + jemalloc** build — the same
+  # artifact that backs the OCI images (`nix build .#boatramp-static`, default
+  # features), so no glibc/loader closure and the concurrency throughput musl's own
+  # malloc would throw away. macOS/Windows build the portable core via cargo (compute
+  # *execution* + the Kubernetes `operator` are Linux-only).
   PORTABLE_FEATURES: "tls,handlers,cluster,s3,cloudflare-kv,compression,bundler,oidc"
 
 jobs:
@@ -69,8 +69,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, kind: linux }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, kind: linux }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, kind: linux }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, kind: linux }
           - { os: macos-15-intel, target: x86_64-apple-darwin, kind: unix }
           - { os: macos-14, target: aarch64-apple-darwin, kind: unix }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, kind: windows }
@@ -101,13 +101,25 @@ jobs:
         if: matrix.kind == 'windows'
         uses: ilammy/setup-nasm@v1
 
+      # The Linux binary is the reproducible static musl + jemalloc artifact from the
+      # flake (`nix build .#boatramp-static`, native arch on each Linux runner), staged
+      # where the archive + .deb/.rpm steps expect it. macOS/Windows build the portable
+      # core via cargo.
+      - name: Install Nix (Linux)
+        if: matrix.kind == 'linux'
+        uses: DeterminateSystems/nix-installer-action@main
       - name: Build
         shell: bash
         run: |
-          features="${PORTABLE_FEATURES}"
-          [ "${{ matrix.kind }}" = "linux" ] && features="${LINUX_FEATURES}"
-          cargo build -p boatramp --release --locked \
-            --target ${{ matrix.target }} --features "$features"
+          set -euo pipefail
+          if [ "${{ matrix.kind }}" = "linux" ]; then
+            nix build .#boatramp-static --print-build-logs --out-link result-bin
+            mkdir -p "target/${{ matrix.target }}/release"
+            install -m755 result-bin/bin/boatramp "target/${{ matrix.target }}/release/boatramp"
+          else
+            cargo build -p boatramp --release --locked \
+              --target ${{ matrix.target }} --features "${PORTABLE_FEATURES}"
+          fi
 
       # The shipped macOS binary embeds the (non-optional) `boatramp-vz` compute
       # backend, which boots VMs via Apple's Virtualization.framework. VZVirtualMachine
