@@ -1,6 +1,6 @@
-# A **fully-static** `x86_64-unknown-linux-musl` build of the batteries-included
+# A **fully-static** `<host-arch>-unknown-linux-musl` build of the batteries-included
 # `boatramp` binary, with **jemalloc** as the global allocator — the artifact that
-# backs the OCI images.
+# backs the OCI images and (via `.#boatramp-static`) the Linux release binaries.
 #
 # Why musl + jemalloc, not glibc:
 # - musl links statically, so the image is just the binary (no glibc/loader
@@ -21,6 +21,7 @@
 # binary used for `packages.default` / the bare-host release binaries).
 {
   lib,
+  stdenv,
   rustPlatform,
   rustToolchain,
   cargo-zigbuild,
@@ -32,7 +33,9 @@
   consoleDist ? null,
 }:
 let
-  target = "x86_64-unknown-linux-musl";
+  # Follow the host arch: x86_64 on an x86_64 builder, aarch64 on aarch64 (Graviton/
+  # Ampere). The OCI images build on x86_64, so their binary is unchanged.
+  target = "${stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-musl";
 in
 rustPlatform.buildRustPackage {
   pname = "boatramp";
