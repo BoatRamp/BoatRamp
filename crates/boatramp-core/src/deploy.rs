@@ -96,8 +96,24 @@ fn is_blob_key(key: &str) -> bool {
 
 /// Ties a blob [`Storage`] to a metadata [`KvStore`] to provide
 /// content-addressed deployments and atomic activation.
+/// A cheaply-cloneable handle to the deploy store. Held per Axum request as
+/// `State<DeployStore>`, so it is **cloned on every request** — a single `Arc`
+/// makes that one atomic bump rather than one per field (the multi-`Arc` clone/drop
+/// was a measurable per-request cost under proxy load). All state lives in
+/// [`DeployStoreInner`]; `Deref` exposes its fields, so methods read `self.kv`
+/// etc. unchanged.
 #[derive(Clone)]
-pub struct DeployStore {
+pub struct DeployStore(Arc<DeployStoreInner>);
+
+impl std::ops::Deref for DeployStore {
+    type Target = DeployStoreInner;
+    fn deref(&self) -> &DeployStoreInner {
+        &self.0
+    }
+}
+
+/// The shared inner state behind [`DeployStore`] (one `Arc`, cloned per request).
+pub struct DeployStoreInner {
     storage: Arc<dyn Storage>,
     kv: Arc<dyn KvStore>,
     /// Serializes host-claim read-modify-writes on the domain routing index
@@ -122,6 +138,28 @@ pub struct DeployStore {
     /// Bounded by total bytes; large blobs are never cached (they stream). Same
     /// read-mostly `RwLock` rationale as [`site_config_cache`].
     blob_body_cache: Arc<std::sync::RwLock<BlobBodyCache>>,
+    /// Hot-path cache of `Host` → resolved `(project, site)` domain routing, so the
+    /// serve path skips the per-request `domain/<host>` (+ wildcard-suffix walk) KV
+    /// gets. Crucially it caches **misses** too: [`CachedKv`](crate::kv::CachedKv)
+    /// never caches a negative lookup, and the common case — a `Host` with no custom
+    /// domain that falls through to the default site — is all misses, so without this
+    /// every request re-hits the KV up the label chain (profiled as the single
+    /// dominant per-request read under proxy load). Invalidated by `domain_epoch`.
+    domain_cache: Arc<std::sync::RwLock<DomainResolveCache>>,
+    /// Monotonic generation for `domain_cache`, bumped on every domain-index write
+    /// (`set_site_config` / `delete_site`). A resolution cached under an older
+    /// generation is discarded, so a re-pointed or removed host is never served from
+    /// a stale entry — keeping the host-hijack guard exact. Domain changes are rare,
+    /// so a coarse whole-cache epoch beats per-key tracking.
+    domain_epoch: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Backing store for [`DeployStore::domain_cache`]: the generation the map was built
+/// under, plus the memoized `Host` → owner resolutions (hits *and* misses).
+#[derive(Default)]
+struct DomainResolveCache {
+    epoch: u64,
+    map: std::collections::HashMap<String, Option<DomainOwner>>,
 }
 
 /// A blob body to serve: a cached, in-memory buffer (small hot assets) or a
@@ -309,13 +347,15 @@ mod keys {
 impl DeployStore {
     /// Build a deploy store over a blob `storage` and a metadata `kv`.
     pub fn new(storage: Arc<dyn Storage>, kv: Arc<dyn KvStore>) -> Self {
-        Self {
+        Self(Arc::new(DeployStoreInner {
             storage,
             kv,
             domain_claim_lock: Arc::new(futures::lock::Mutex::new(())),
             site_config_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             blob_body_cache: Arc::new(std::sync::RwLock::new(BlobBodyCache::default())),
-        }
+            domain_cache: Arc::new(std::sync::RwLock::new(DomainResolveCache::default())),
+            domain_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }))
     }
 
     /// The underlying metadata store, for control-plane features that keep their own
@@ -681,6 +721,9 @@ impl DeployStore {
             }
         }
         self.kv.write_batch(ops).await?;
+        // The domain index changed — drop cached `Host` resolutions built against the
+        // old generation so the new/removed mappings take effect on the next request.
+        self.bump_domain_epoch();
         Ok(())
     }
 
@@ -719,6 +762,49 @@ impl DeployStore {
         // key written by `set_site_config` regardless of case / trailing dot.
         let host = canon_host(host);
         let host = host.as_str();
+        // Fast path: a resolution cached under the current domain generation. Covers
+        // both hits and misses, so a default-site host (no custom domain) is served
+        // without re-walking the label chain in the KV on every request.
+        let epoch = self.domain_epoch.load(std::sync::atomic::Ordering::Acquire);
+        {
+            let cache = self.domain_cache.read().unwrap();
+            if cache.epoch == epoch {
+                if let Some(owner) = cache.map.get(host) {
+                    return Ok(owner.clone());
+                }
+            }
+        }
+        let resolved = self.resolve_site_by_host_uncached(host).await?;
+        // Cache the resolution — but only if no domain-index write raced our KV reads
+        // (else it may be stale). Reset the map when we observe a newer generation so
+        // it never serves entries built against a superseded index.
+        {
+            let mut cache = self.domain_cache.write().unwrap();
+            let current = self.domain_epoch.load(std::sync::atomic::Ordering::Acquire);
+            if cache.epoch != current {
+                cache.epoch = current;
+                cache.map.clear();
+            }
+            if current == epoch {
+                // A large flood of distinct `Host` values (e.g. probing) would grow the
+                // map unbounded; a simple cap + clear bounds memory without per-entry
+                // LRU bookkeeping, mirroring `site_config_cache`.
+                if cache.map.len() >= 4096 {
+                    cache.map.clear();
+                }
+                cache.map.insert(host.to_string(), resolved.clone());
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// The uncached `Host` → owner resolution: exact `domain/<host>`, then each
+    /// wildcard suffix up the label chain. The KV source of truth behind
+    /// [`resolve_site_by_host`](Self::resolve_site_by_host)'s cache.
+    async fn resolve_site_by_host_uncached(
+        &self,
+        host: &str,
+    ) -> Result<Option<DomainOwner>, DeployError> {
         if let Some(bytes) = self.kv.get(&keys::domain(host)).await? {
             return Ok(Some(DomainOwner::from_bytes(&bytes)));
         }
@@ -730,6 +816,13 @@ impl DeployStore {
             rest = parent;
         }
         Ok(None)
+    }
+
+    /// Invalidate [`Self::domain_cache`] after a domain-index mutation by advancing
+    /// the generation. The next resolve sees the bump and rebuilds from the KV.
+    fn bump_domain_epoch(&self) {
+        self.domain_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Every known site name in `project`, sorted and de-duplicated. A site is
@@ -2760,6 +2853,8 @@ impl DeployStore {
             batch.push(WriteOp::Delete(key));
         }
         self.kv.write_batch(batch).await?;
+        // Freed hosts must stop resolving to this site — invalidate the resolve cache.
+        self.bump_domain_epoch();
         Ok(())
     }
 
@@ -3646,6 +3741,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved("example.com").await, None);
+    }
+
+    /// The hot-path resolve cache memoizes **misses** as well as hits; a domain
+    /// added *after* a host was first resolved (and cached as unmapped) must take
+    /// effect — the domain-index write invalidates the negative entry. Guards the
+    /// generation bump against serving a stale "not found" for a freshly-claimed host.
+    #[tokio::test]
+    async fn resolve_cache_invalidates_negative_entry_on_domain_add() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        // Prime the negative cache: this host maps to nothing yet.
+        assert_eq!(
+            store.resolve_site_by_host("shop.example").await.unwrap(),
+            None
+        );
+        // Claim it for a site.
+        store
+            .set_site_config(
+                ProjectRef::DEFAULT,
+                "shop",
+                &SiteConfig {
+                    domains: DomainConfig {
+                        primary: Some("shop.example".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The stale "not found" must not be served — the write bumped the generation.
+        assert_eq!(
+            store
+                .resolve_site_by_host("shop.example")
+                .await
+                .unwrap()
+                .map(|o| o.site)
+                .as_deref(),
+            Some("shop")
+        );
+        // Removing the site frees the host again (delete_site also invalidates).
+        store
+            .delete_site(ProjectRef::DEFAULT, "shop")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.resolve_site_by_host("shop.example").await.unwrap(),
+            None
+        );
     }
 
     /// Multi-tenant wildcard-vhost precedence (regression pin). In ONE project, a **wildcard**
