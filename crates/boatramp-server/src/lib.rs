@@ -134,6 +134,7 @@ pub(crate) use proxy::{
     await_warm, compute_endpoint_regions, compute_endpoints, dispatch_gateway, has_parked_replica,
     proxy, COMPUTE_WAKE_TIMEOUT,
 };
+mod splice;
 // Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
 #[cfg(feature = "handlers")]
 pub(crate) use proxy::is_upgrade_request;
@@ -1073,13 +1074,18 @@ pub async fn serve_with(
     handlers: HandlerRuntime,
     options: ServerOptions,
 ) -> Result<(), ServeError> {
-    let listener = {
-        use axum::serve::ListenerExt;
-        tokio::net::TcpListener::bind(addr)
-            .await?
-            .tap_io(disable_nagle)
-    };
+    let tcp = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, auth = !auth.is_disabled(), "boatramp server listening");
+    // Context for the Linux `splice()` reverse-proxy fast-path: the store, the
+    // resolved posture (SSRF gate), and a live read of the catch-all `default_site`
+    // (so host resolution matches the serving pipeline). The daemon runtime is the
+    // one `serve` supplies (shared with the router); absent it, the fast-path just
+    // falls back for default-site hosts.
+    let splice_ctx = splice::SpliceCtx {
+        deploy: deploy.clone(),
+        posture: options.posture,
+        daemon: options.daemon_runtime.clone(),
+    };
     // Background scheduler: drives consumers/crons for active deployments
     // (no-op without the handlers feature/runtime). Aborted after the drain.
     #[cfg(feature = "handlers")]
@@ -1090,14 +1096,16 @@ pub async fn serve_with(
     let gateway_prober = gateway::spawn_active_health_prober();
     // Connect-info make-service so handlers can see the peer address (for IP
     // rules / rate limiting / access logs).
-    let app = router_with(deploy, auth, handlers, options)
-        .into_make_service_with_connect_info::<SocketAddr>();
+    let router = router_with(deploy, auth, handlers, options);
 
     // The graceful drain begins when the OS signal fires; `signalled` flips at
     // that instant so the drain deadline is measured from the signal, not from
     // server start.
     let (signalled_tx, signalled_rx) = tokio::sync::watch::channel(false);
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    // The splice serve loop intercepts eligible plaintext reverse-proxy
+    // connections (Linux) and serves everything else with `router` over hyper —
+    // identical behaviour to `axum::serve`.
+    let server = splice::serve(tcp, splice_ctx, router, async move {
         shutdown_signal().await;
         let _ = signalled_tx.send(true);
     });

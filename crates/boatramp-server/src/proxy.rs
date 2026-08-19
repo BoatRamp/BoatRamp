@@ -400,15 +400,15 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<UpstreamClient, ()> {
 /// path skips the per-request `Url::parse` + DNS `lookup_host` (profiled as a few
 /// percent of proxy CPU on top of the address-pin re-check that stays per request).
 #[derive(Clone)]
-struct ResolvedTarget {
+pub(crate) struct ResolvedTarget {
     /// The parsed target URL. Cloned + re-pathed per request (cheap) instead of
     /// re-parsed (the expensive `url::parser` pass the cache removes).
-    parsed: reqwest::Url,
+    pub(crate) parsed: reqwest::Url,
     /// The upstream host (for TLS SNI / the pinned client key / logs).
-    host: String,
+    pub(crate) host: String,
     /// The pre-verified pinned address. Re-checked against the (per-request)
     /// security posture on every use, so caching never relaxes the SSRF address gate.
-    addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     /// When this resolution was computed — re-resolved after [`RESOLVE_TTL`] so a
     /// DNS change (or a rebind attempt) is picked up on new connections.
     resolved_at: std::time::Instant,
@@ -428,7 +428,7 @@ static RESOLVED_TARGETS: std::sync::LazyLock<
 /// entry exists, else by parsing + resolving + SSRF-validating every resolved
 /// address (so a hostname can't DNS-rebind to an internal target). `Err` is a
 /// ready-to-return error response.
-async fn resolve_target(
+pub(crate) async fn resolve_target(
     target: &str,
     posture: &boatramp_core::security::SecurityPosture,
 ) -> Result<ResolvedTarget, Response> {

@@ -183,9 +183,14 @@ bytes.workspace = true
 # `legacy::Client` — raw hyper, no reqwest — over a pinned rustls connector),
 # and the handler body plumbing. Already in the tree via reqwest, so exposing
 # them directly is cheap.
-hyper = { workspace = true, features = ["client", "http1"] }
+# `server` powers the splice fast-path's fallback (`serve_connection`) for the
+# plaintext listener; `client`+`http1` back the reverse-proxy upstream leg.
+hyper = { workspace = true, features = ["client", "http1", "server"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 http-body-util.workspace = true
+# The Linux `splice()` reverse-proxy fast-path (crates/boatramp-server/src/splice.rs)
+# calls `splice`/`pipe2` directly; only used under `cfg(target_os = "linux")`.
+libc = "0.2"
 # TLS for the proxy upstream leg: hyper-rustls wraps our pinned `HttpConnector`
 # with a rustls `ClientConfig` we build ourselves (webpki roots, or an
 # accept-anything verifier for `tls_insecure`). Already in the tree via reqwest.
@@ -203,6 +208,10 @@ chrono = { version = "0.4", default-features = false, features = [
 
 [dev-dependencies]
 boatramp-core = { workspace = true }
+# Property-based fuzzing of the splice fast-path's hand-written HTTP/1 head parsers
+# (crates/boatramp-server/src/splice.rs): arbitrary bytes must never panic, and the
+# Content-Length + Transfer-Encoding desync case must never classify as splice-able.
+proptest = "1"
 # The full async-graphql runtime, dev-only (the shipped binary uses just the parser).
 # Emits federation SDL exactly as a live subgraph's `_service { sdl }` does, so the
 # composer is tested against real federation-v2 SDL — not only synthetic fixtures.

@@ -7,6 +7,22 @@ versions.
 
 ## [Unreleased]
 
+### Added
+- **Kernel `splice()` fast-path for plaintext HTTP/1.1 reverse-proxy responses (Linux).** When both
+  legs are plaintext HTTP/1.1 and the response is passed through unchanged, the proxy now moves the
+  body **kernel-to-kernel** (socket → pipe → socket) with no userspace copy — the technique
+  nginx/HAProxy use for the large-body proxy path. On the fair 5-way benchmark this takes the 100 KB
+  plaintext reverse-proxy cell from ~61k to **~85k req/s at concurrency 256 — ahead of both Envoy
+  (~68k) and nginx (~71k)**, i.e. 1st in the field. It is **on by default and transparent**: each new
+  connection is peeked (non-consuming) and only intercepted when the normal serving pipeline would
+  reverse-proxy it to a single plaintext-HTTP gateway upstream — the decision reuses the pipeline's
+  own routing functions, so it can't diverge. Anything else (TLS, HTTP/2, redirects, handlers, SSE,
+  static files, control-plane/API routes, sites with access rules or trusted proxies, multi-backend /
+  compute / HTTPS upstreams, non-GET/HEAD, request bodies) is served by the unchanged path, and a
+  keep-alive connection that later carries a non-spliceable request hands off cleanly (nothing is
+  dropped). Upstream faults fail safe: a truncated body or reset closes the client connection instead
+  of hanging (regression-tested under network fault injection), and the SSRF address pin still applies.
+
 ### Changed
 - **Reverse-proxy per-request overhead cut sharply — small-response proxy throughput now leads Envoy.**
   Profiling the proxy hot path under load (256-concurrency, core-pinned, on a real Linux release

@@ -110,6 +110,18 @@ pub fn path_under(mount: &str, req_path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Whether the [`intercept`] middleware would serve `(host, path)` from the console
+/// for the given effective config — so the splice fast-path can defer to the router
+/// (which runs the console middleware) instead of proxying a console request.
+pub(crate) fn would_intercept(
+    eff: &boatramp_core::daemon_config::EffectiveConfig,
+    host: &str,
+    path: &str,
+) -> bool {
+    ConsoleMount::from_effective(eff)
+        .is_some_and(|m| host_matches(&m.host, host) && path_under(&m.path, path))
+}
+
 /// Rewrite the built `index.html` for serving under `base` (the mount path, e.g.
 /// `/_console`; empty for a root mount): prefix each embedded asset's absolute
 /// `/name` reference with `base`, and inject a `<base href>` + a
