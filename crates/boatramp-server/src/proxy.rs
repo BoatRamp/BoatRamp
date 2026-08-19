@@ -395,6 +395,110 @@ fn pinned_client(host: &str, addr: SocketAddr) -> Result<UpstreamClient, ()> {
     cached_client(host, addr, None, None, false, None)
 }
 
+/// The request-independent resolution of a gateway upstream `target`: its parsed
+/// URL prefix + base path, the pinned address, and the host. Memoized so the hot
+/// path skips the per-request `Url::parse` + DNS `lookup_host` (profiled as a few
+/// percent of proxy CPU on top of the address-pin re-check that stays per request).
+#[derive(Clone)]
+struct ResolvedTarget {
+    /// The parsed target URL. Cloned + re-pathed per request (cheap) instead of
+    /// re-parsed (the expensive `url::parser` pass the cache removes).
+    parsed: reqwest::Url,
+    /// The upstream host (for TLS SNI / the pinned client key / logs).
+    host: String,
+    /// The pre-verified pinned address. Re-checked against the (per-request)
+    /// security posture on every use, so caching never relaxes the SSRF address gate.
+    addr: SocketAddr,
+    /// When this resolution was computed — re-resolved after [`RESOLVE_TTL`] so a
+    /// DNS change (or a rebind attempt) is picked up on new connections.
+    resolved_at: std::time::Instant,
+}
+
+/// How long a [`ResolvedTarget`] (its DNS resolution) is reused before a fresh
+/// `lookup_host`. Bounds the DNS-change / rebind-detection window; connections are
+/// pinned to the resolved address for their lifetime regardless.
+const RESOLVE_TTL: Duration = Duration::from_secs(15);
+
+/// Cache of resolved gateway targets, keyed by the upstream target string.
+static RESOLVED_TARGETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ResolvedTarget>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Resolve a gateway `target` to a [`ResolvedTarget`], from the cache when a fresh
+/// entry exists, else by parsing + resolving + SSRF-validating every resolved
+/// address (so a hostname can't DNS-rebind to an internal target). `Err` is a
+/// ready-to-return error response.
+async fn resolve_target(
+    target: &str,
+    posture: &boatramp_core::security::SecurityPosture,
+) -> Result<ResolvedTarget, Response> {
+    if let Some(hit) = RESOLVED_TARGETS.lock().unwrap().get(target) {
+        if hit.resolved_at.elapsed() < RESOLVE_TTL {
+            return Ok(hit.clone());
+        }
+    }
+    let parsed = reqwest::Url::parse(target).map_err(|_| {
+        tracing::warn!(target = %target, "gateway upstream target unparsable");
+        (StatusCode::BAD_GATEWAY, "bad gateway upstream\n").into_response()
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "gateway upstream scheme not http(s)\n",
+            )
+                .into_response())
+        }
+    }
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        return Err((StatusCode::BAD_GATEWAY, "gateway upstream missing host\n").into_response());
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let mut chosen = None;
+    for addr in tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .into_iter()
+        .flatten()
+    {
+        // Refuse cloud-metadata always, and (unless the operator opts in) any
+        // non-global address — checked post-resolution so a hostname can't
+        // DNS-rebind to an internal target.
+        if !gateway_addr_allowed(addr.ip(), posture) {
+            tracing::warn!(
+                %host, ip = %addr.ip(),
+                "gateway upstream refused: address not permitted by security posture"
+            );
+            return Err((StatusCode::FORBIDDEN, "gateway upstream not allowed\n").into_response());
+        }
+        chosen.get_or_insert(addr);
+    }
+    let Some(addr) = chosen else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "gateway upstream did not resolve\n",
+        )
+            .into_response());
+    };
+    let resolved = ResolvedTarget {
+        parsed,
+        host,
+        addr,
+        resolved_at: std::time::Instant::now(),
+    };
+    {
+        let mut cache = RESOLVED_TARGETS.lock().unwrap();
+        // Keyed by operator-configured target strings (a bounded set), but cap + clear
+        // anyway so a long-lived process that churns upstream URLs can't grow it without
+        // bound.
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(target.to_string(), resolved.clone());
+    }
+    Ok(resolved)
+}
+
 /// The cloud-metadata service address — refused even for a declared gateway
 /// upstream (defense in depth).
 pub(super) const CLOUD_METADATA_IPV4: std::net::Ipv4Addr =
@@ -716,60 +820,27 @@ async fn proxy_upstream(
                 .into_response();
         }
     }
-    // Resolve + pin the declared target (private allowed; metadata refused).
-    let parsed = match reqwest::Url::parse(target) {
-        Ok(url) => url,
-        Err(_) => {
-            tracing::warn!(target = %target, "gateway upstream target unparsable");
-            return (StatusCode::BAD_GATEWAY, "bad gateway upstream\n").into_response();
-        }
+    // Resolve + pin the declared target (parse + DNS), served from the cache when a
+    // fresh entry exists — the parse and `lookup_host` are request-independent.
+    let resolved = match resolve_target(target, &posture).await {
+        Ok(resolved) => resolved,
+        Err(resp) => return resp,
     };
-    match parsed.scheme() {
-        "http" | "https" => {}
-        _ => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                "gateway upstream scheme not http(s)\n",
-            )
-                .into_response()
-        }
+    // Re-apply the SSRF address gate on every request against the pinned address —
+    // caching the resolution never relaxes it (posture is per-request).
+    if !gateway_addr_allowed(resolved.addr.ip(), &posture) {
+        tracing::warn!(
+            host = %resolved.host, ip = %resolved.addr.ip(),
+            "gateway upstream refused: address not permitted by security posture"
+        );
+        return (StatusCode::FORBIDDEN, "gateway upstream not allowed\n").into_response();
     }
-    let Some(host) = parsed.host_str().map(str::to_string) else {
-        return (StatusCode::BAD_GATEWAY, "gateway upstream missing host\n").into_response();
-    };
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let pinned = match tokio::net::lookup_host((host.as_str(), port)).await {
-        Ok(addrs) => {
-            let mut chosen = None;
-            for addr in addrs {
-                // Refuse cloud-metadata always, and (unless the operator opts in)
-                // any non-global address — checked post-resolution so a hostname
-                // can't DNS-rebind to an internal target.
-                if !gateway_addr_allowed(addr.ip(), &posture) {
-                    tracing::warn!(
-                        %host, ip = %addr.ip(),
-                        "gateway upstream refused: address not permitted by security posture"
-                    );
-                    return (StatusCode::FORBIDDEN, "gateway upstream not allowed\n")
-                        .into_response();
-                }
-                chosen.get_or_insert(addr);
-            }
-            chosen
-        }
-        Err(_) => None,
-    };
-    let Some(addr) = pinned else {
-        return (
-            StatusCode::BAD_GATEWAY,
-            "gateway upstream did not resolve\n",
-        )
-            .into_response();
-    };
+    let host = resolved.host.as_str();
+    let addr = resolved.addr;
 
     // Build the upstream URL: target base path + forwarded (strip-prefixed) path
-    // + the original query.
-    let mut target = parsed.clone();
+    // + the original query — cloning the cached parse rather than re-parsing.
+    let mut target = resolved.parsed.clone();
     let base = target.path().trim_end_matches('/').to_string();
     let forwarded = upstream.forward_path(request_path);
     target.set_path(&format!("{base}{forwarded}"));
@@ -782,7 +853,7 @@ async fn proxy_upstream(
         tracing::warn!(%host, "gateway upstream TLS verification disabled (tls_insecure)");
     }
     let client = match cached_client(
-        &host,
+        host,
         addr,
         upstream.connect_timeout_ms,
         upstream.request_timeout_ms,

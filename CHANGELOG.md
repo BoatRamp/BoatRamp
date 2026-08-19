@@ -5,6 +5,29 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [Unreleased]
+
+### Changed
+- **Reverse-proxy per-request CPU cut sharply by caching what doesn't change per request.**
+  Profiling the proxy hot path under load (256-concurrency, core-pinned, on a real Linux release
+  build) found three costs a bare proxy like Envoy never pays, and eliminated each:
+  - Resolving the request `Host` to a site walked the KV domain index on **every request**, and the
+    negative lookups — a `Host` with no custom domain that falls through to the default site, the
+    common case — were never cached, so each request re-read the LSM store up the whole label chain
+    (~14 % of on-CPU time under proxy load). `Host`→site resolution is now memoized (hits *and*
+    misses) behind a generation the domain index bumps on any change, so a re-pointed or removed host
+    is never served from a stale entry (the host-hijack guard stays exact).
+  - Each gateway-proxied request re-parsed the upstream URL and re-resolved its address. The parsed
+    URL and pinned address are now cached per upstream target (15 s re-resolution TTL); the SSRF
+    address gate still re-checks the pinned address on every request, so caching never relaxes it.
+  - The per-request store handle (`State<DeployStore>`) cloned one atomic refcount per field; it is
+    now a single `Arc`.
+
+  Together these lift reverse-proxy throughput **~23–28 % on the small-response TLS cells** — where
+  fixed per-request cost dominates (e.g. HTTPS/1.1 1 KB at concurrency 256: 97k→124k req/s;
+  HTTP/2 1 KB: 84k→104k) — with no behaviour change. Large-response cells, bounded by body copying
+  rather than per-request overhead, improve modestly.
+
 ## [0.2.13] - 2026-08-19
 
 ### Changed
