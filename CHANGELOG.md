@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.2.13] - 2026-08-19
+
+### Changed
+- **The reverse-proxy data plane is rebuilt on raw hyper (`hyper-util`) instead of reqwest.** This
+  exposes tuning reqwest hides and streams the upstream response straight through with no intermediate
+  copy: large-response proxying is **2–3× faster**, and proxy-path memory drops sharply. Capping the
+  per-connection upstream read buffer — the dominant proxy-path allocation, profiled at ~500 MB on a
+  256-concurrency 100 KB HTTP/2-over-TLS proxy — to 32 KiB took that cell from **~429 MB to ~177 MB
+  resident (2.4×) with throughput unchanged**. Behaviour is preserved (connect/request timeouts,
+  `tls_insecure` opt-in, and all forwarded-header handling); the proxy no longer follows upstream
+  redirects (see Security).
+- **Static and hot-path serving allocate far less per request.** The parsed `SiteConfig` and small
+  static blob bodies are now served from immutable content-hash caches instead of being re-parsed and
+  re-streamed off disk on every request, and the access-log middleware skips its per-request string
+  formatting and body-counting when the access log is filtered out. Small-object static throughput
+  rose ~90 %.
+
+### Added
+- **Per-upstream `read_buffer_bytes` gateway override** (`gateway upstream add --read-buffer-bytes`).
+  Tunes the upstream read buffer's memory-versus-throughput tradeoff per upstream (default 32 KiB):
+  raise it for large responses at low concurrency, lower it for high fan-out on a memory-tight node.
+
+### Security
+- **The reverse proxy no longer follows upstream redirects.** The previous reqwest-based client
+  followed up to 10 redirects by default, and a redirect to a different host was resolved *without*
+  the SSRF checks that validate and address-pin the initial target — so an upstream could redirect the
+  proxy to an internal address. The proxy now hands the upstream's 3xx back to the client unchanged,
+  and the pinned connector can only ever dial the pre-verified address.
+
 ## [0.2.12] - 2026-08-18
 
 ### Fixed
