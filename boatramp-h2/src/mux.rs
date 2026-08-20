@@ -467,6 +467,21 @@ where
     H: Handler,
 {
     let headers = hpack.decode(&rs.header_buf)?;
+    // A second header block on a stream whose request is already parsed is trailers
+    // (§8.1.2.3): it MUST carry END_STREAM and MUST NOT contain pseudo-header fields.
+    // Deliver the stashed request + accumulated body to the handler.
+    if let Some(req) = rs.requests.remove(&sid) {
+        if !end_stream || headers.iter().any(|(n, _)| n.first() == Some(&b':')) {
+            rs.requests.insert(sid, req);
+            return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+        }
+        let body = rs.bodies.remove(&sid).unwrap_or_default();
+        if rs.content_len.get(&sid).copied().flatten().is_some_and(|c| c != body.len() as u64) {
+            return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+        }
+        spawn_request(shared, notify, handler, sid, Some(req), body);
+        return Ok(());
+    }
     let req = http::request_from_headers(sid, headers)?;
     let cl = req
         .headers

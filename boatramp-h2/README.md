@@ -125,10 +125,10 @@ if it clears Envoy" gate, the splice path is **not** promoted to the default.
 
 ## Status
 
-M0-M4c complete. Two drivers: the serial `conn.rs` (h2spec 143/143, the conformance
-reference) and the concurrent multiplexed `mux.rs` (`serve_connection_mux`). The mux
-driver over userspace rustls + a pooled upstream **beats Envoy** on tls-proxy-h2-100k
-at every concurrency (table above), which retires the crate's original splice/kTLS
-premise. 26 tests green (18 unit + 3 interop + 4 mux incl. a concurrency-interleave
-proof + 1 smoke). Next: run h2spec against the mux driver (conformance parity with
-the serial driver), then M5 fuzzing + DoS hardening, then M6 wiring into BoatRamp.
+M0-M4c complete. Two drivers, **both h2spec 143/143** (0 failed, 2 skipped): the
+serial `conn.rs` and the concurrent multiplexed `mux.rs` (`serve_connection_mux`).
+The mux driver over userspace rustls + a pooled upstream **beats Envoy** on
+tls-proxy-h2-100k at every concurrency (table above), which retires the crate's
+original splice/kTLS premise. 27 tests green (18 unit + 3 interop + 5 mux incl. a
+concurrency-interleave proof + trailers + 1 smoke). Next: M5 fuzzing + DoS hardening,
+then M6 wiring the mux driver into BoatRamp.

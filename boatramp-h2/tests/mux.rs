@@ -111,6 +111,25 @@ async fn request_body_is_delivered_to_the_handler() {
     assert_eq!(read_body(response.into_body()).await, b"hello body");
 }
 
+#[tokio::test]
+async fn post_with_trailers_is_accepted() {
+    let mut client = connect().await;
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://x/echo")
+        .body(())
+        .unwrap();
+    let (response, mut send) = client.send_request(request, false).unwrap();
+    send.send_data(Bytes::from_static(b"body"), false).unwrap();
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-checksum", "abc".parse().unwrap());
+    send.send_trailers(trailers).unwrap();
+    // A trailers block (a second HEADERS after the body) must be accepted, not reset.
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(read_body(response.into_body()).await, b"body");
+}
+
 /// The concurrency proof. `/first`'s handler parks on a gate; `/second`'s handler
 /// opens it. If the driver serialized streams (ran `/first`'s handler to completion
 /// before reading `/second`), `/first` would park forever and this would time out.
