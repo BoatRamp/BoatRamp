@@ -42,8 +42,8 @@ struct Stream {
     body_len: u64,
     /// Unsent response body + how far we've sent. When `out_active`, a window
     /// increase (WINDOW_UPDATE / SETTINGS) resumes sending from `out_off` (§6.9).
-    /// The M4 splice path swaps `out_body` for a spliced upstream source.
-    out_body: Vec<u8>,
+    /// A `Body::Splice` is streamed kernel-to-kernel (see `flush_stream`).
+    out: http::Body,
     out_off: usize,
     out_active: bool,
 }
@@ -61,7 +61,7 @@ impl Stream {
             content_length: None,
             body: Vec::new(),
             body_len: 0,
-            out_body: Vec::new(),
+            out: http::Body::Bytes(Vec::new()),
             out_off: 0,
             out_active: false,
         }
@@ -563,7 +563,7 @@ where
 
     if let Some(s) = conn.streams.get_mut(&sid) {
         if has_body {
-            s.out_body = resp.body;
+            s.out = resp.body;
             s.out_off = 0;
             s.out_active = true;
         } else {
@@ -592,7 +592,7 @@ where
 {
     loop {
         let remaining = match conn.streams.get(&sid) {
-            Some(s) if s.out_active => s.out_body.len() - s.out_off,
+            Some(s) if s.out_active => s.out.len() - s.out_off,
             _ => return Ok(()),
         };
         let swin = conn.streams.get(&sid).map_or(0, |s| s.send_window.max(0));
@@ -605,19 +605,38 @@ where
         let chunk = remaining.min(win);
         let is_last = chunk == remaining;
         let off = conn.streams.get(&sid).unwrap().out_off;
-        let mut out = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
-        out.extend_from_slice(&frame::data_header(sid, chunk as u32, is_last));
-        out.extend_from_slice(&conn.streams.get(&sid).unwrap().out_body[off..off + chunk]);
-        io.write_all(&out)
-            .await
-            .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+        let mut buf = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
+        buf.extend_from_slice(&frame::data_header(sid, chunk as u32, is_last));
+        match &mut conn.streams.get_mut(&sid).unwrap().out {
+            http::Body::Bytes(b) => {
+                buf.extend_from_slice(&b[off..off + chunk]);
+                io.write_all(&buf)
+                    .await
+                    .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+            }
+            #[cfg(target_os = "linux")]
+            http::Body::Splice { upstream, .. } => {
+                // M4a: stream `chunk` bytes from the upstream in userspace. M4b
+                // replaces this with splice(upstream -> pipe -> kTLS fd) so the body
+                // is never copied and the kernel encrypts on TX.
+                let start = buf.len();
+                buf.resize(start + chunk, 0);
+                upstream
+                    .read_exact(&mut buf[start..])
+                    .await
+                    .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+                io.write_all(&buf)
+                    .await
+                    .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+            }
+        }
         conn.conn_send_window -= chunk as i64;
         let s = conn.streams.get_mut(&sid).unwrap();
         s.out_off += chunk;
         s.send_window -= chunk as i64;
         if is_last {
             s.out_active = false;
-            s.out_body = Vec::new();
+            s.out = http::Body::Bytes(Vec::new());
             s.state = if s.state == StreamState::HalfClosedRemote {
                 StreamState::Closed
             } else {
@@ -626,6 +645,17 @@ where
             return Ok(());
         }
     }
+}
+
+/// Serve one HTTP/2 connection over a TCP socket (h2c). M4a routes `Body::Splice`
+/// through the userspace streaming path in `flush_stream`; M4b adds the kTLS
+/// handoff and kernel `splice()` into this socket's fd for the zero-copy body.
+#[cfg(target_os = "linux")]
+pub async fn serve_connection_tcp<H>(tcp: tokio::net::TcpStream, handler: H) -> std::io::Result<()>
+where
+    H: Handler,
+{
+    serve_connection(tcp, handler).await
 }
 
 /// Resume every stream with a pending response (after a connection-level window

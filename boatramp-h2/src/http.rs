@@ -18,13 +18,48 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
-/// A response to send. In M1 the body is buffered; the M4 splice seam replaces the
-/// body-send path with a zero-copy `splice()` writer for the large-body proxy case.
-#[derive(Clone, Debug)]
+/// A response body: either buffered bytes, or — the reason this crate exists — a
+/// stream `splice()`d directly from an upstream socket into the (kTLS) client
+/// socket, so the payload is never copied through userspace (Linux). The upstream
+/// is owned here so it outlives the splice.
+pub enum Body {
+    Bytes(Vec<u8>),
+    #[cfg(target_os = "linux")]
+    Splice {
+        upstream: tokio::net::TcpStream,
+        len: usize,
+    },
+}
+
+impl Body {
+    pub fn len(&self) -> usize {
+        match self {
+            Body::Bytes(b) => b.len(),
+            #[cfg(target_os = "linux")]
+            Body::Splice { len, .. } => *len,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(v: Vec<u8>) -> Self {
+        Body::Bytes(v)
+    }
+}
+impl From<&[u8]> for Body {
+    fn from(v: &[u8]) -> Self {
+        Body::Bytes(v.to_vec())
+    }
+}
+
+/// A response to send.
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    pub body: Vec<u8>,
+    pub body: Body,
 }
 
 impl Response {
@@ -32,10 +67,10 @@ impl Response {
         Response {
             status,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Body::Bytes(Vec::new()),
         }
     }
-    pub fn with_body(status: u16, body: impl Into<Vec<u8>>) -> Self {
+    pub fn with_body(status: u16, body: impl Into<Body>) -> Self {
         Response {
             status,
             headers: Vec::new(),

@@ -58,9 +58,9 @@ splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port f
 - [x] **M2 HPACK conformance** — h2spec §4/§8 (HPACK, header field validation) green.
 - [x] **M3 server API** — `accept` + request/response over any `AsyncRead+AsyncWrite`;
       differential test vs `hyper`/`h2` byte-identical.
-- [ ] **M4 splice body** — port the spike's `splice()`/kTLS DATA writer behind the
-      server's body seam; benchmark `tls-proxy-h2-100k` vs Envoy on the integrated
-      path; keep only if it clears Envoy after the integration tax.
+- [~] **M4 splice body** — M4a: `Body::Splice` seam + streaming validated in h2c
+      (proxy: body md5 == direct); M4b: kTLS handoff + kernel splice + benchmark
+      vs Envoy on the integrated path.
 - [ ] **M5 fuzzing + hardening** — cargo-fuzz frame/HPACK; CONTINUATION-flood and
       RST-flood (Rapid Reset) mitigations.
 - [ ] **M6 BoatRamp integration** — wire behind the serve eligibility gate as an

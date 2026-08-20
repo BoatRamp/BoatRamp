@@ -38,9 +38,11 @@ pub mod settings;
 pub mod stream;
 
 pub use conn::serve_connection;
+#[cfg(target_os = "linux")]
+pub use conn::serve_connection_tcp;
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
-pub use http::{Handler, Request, Response};
+pub use http::{Body, Handler, Request, Response};
 pub use settings::Settings;
 pub use stream::StreamState;
 
