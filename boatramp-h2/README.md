@@ -52,10 +52,10 @@ splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port f
 ## Roadmap (each step ends green on its harness)
 
 - [x] **M0 foundation** — frame / error / settings, unit-tested, pure `std`.
-- [ ] **M1 conformant core** — hpack + stream + conn; drive h2spec §3–§6 green
+- [x] **M1 conformant core** — hpack + stream + conn; drive h2spec §3–§6 green
       (framing, SETTINGS, PING, GOAWAY, WINDOW_UPDATE, stream states, error codes,
       frame-size + flow-control enforcement). No body optimization yet.
-- [ ] **M2 HPACK conformance** — h2spec §4/§8 (HPACK, header field validation) green.
+- [x] **M2 HPACK conformance** — h2spec §4/§8 (HPACK, header field validation) green.
 - [ ] **M3 server API** — `accept` + request/response over any `AsyncRead+AsyncWrite`;
       differential test vs `hyper`/`h2` byte-identical.
 - [ ] **M4 splice body** — port the spike's `splice()`/kTLS DATA writer behind the
@@ -68,4 +68,4 @@ splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port f
 
 ## Status
 
-M0 complete and tested. Not yet a working server.
+M0-M2 complete: a runnable, RFC 7540 + RFC 7541 conformant h2c server — h2spec 143/143 (0 failed, 2 skipped), 18 unit + 1 e2e tests. Next: M3 differential oracle, then M4 TLS + splice body path.
