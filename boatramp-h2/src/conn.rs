@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncReadExt;
+use tokio_stream::StreamExt as _;
 
 use crate::error::{ErrorCode, H2Error};
 use crate::frame::{self, flag, FrameHeader, FrameType};
@@ -578,9 +579,9 @@ where
     // The serial driver can't interleave a streamed body, so drain it to bytes here
     // (the mux driver streams it natively). Done before content-length is derived.
     let body = match body {
-        http::Body::Stream(mut rx) => {
+        http::Body::Stream(mut stream) => {
             let mut buf = Vec::new();
-            while let Some(chunk) = rx.recv().await {
+            while let Some(chunk) = stream.next().await {
                 buf.extend_from_slice(&chunk);
             }
             http::Body::Bytes(buf)

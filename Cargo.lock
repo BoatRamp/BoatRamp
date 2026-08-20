@@ -1763,6 +1763,7 @@ dependencies = [
  "rustls-pemfile",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-stream",
 ]
 
 [[package]]

@@ -110,9 +110,10 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
     struct Streamer;
     impl Handler for Streamer {
         async fn handle(&self, _req: Request) -> Response {
-            // 200 KiB across 200 chunks fed over a bounded channel — bigger than the
-            // 64 KiB flow-control window, so the writer must stream + resume on
-            // WINDOW_UPDATE without ever holding the whole body.
+            // 200 KiB across 200 chunks streamed over a bounded channel — bigger than
+            // the 64 KiB flow-control window, so the writer must stream + resume on
+            // WINDOW_UPDATE without ever holding the whole body. The channel is wrapped
+            // as a pull `Stream` the driver polls directly.
             let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
             tokio::spawn(async move {
                 for i in 0..200u32 {
@@ -122,7 +123,7 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
                     }
                 }
             });
-            response(200, Body::Stream(rx))
+            response(200, Body::stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
         }
     }
     let mut client = connect_with(Streamer).await;

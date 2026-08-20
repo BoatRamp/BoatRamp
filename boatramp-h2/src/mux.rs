@@ -23,6 +23,7 @@ use bytes::Bytes;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
+use tokio_stream::StreamExt as _;
 
 use crate::error::{ErrorCode, H2Error};
 use crate::frame::{self, flag, FrameHeader, FrameType};
@@ -576,14 +577,16 @@ fn spawn_request<H>(
 async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Response) {
     let (parts, body) = resp.into_parts();
     match body {
-        http::Body::Stream(mut rx) => {
+        http::Body::Stream(mut stream) => {
             // HEADERS carry the response's own headers verbatim — any content-length is
             // the producer's (we don't re-derive one for a streamed body).
             let fields = response_fields(&parts, None);
             if !push_out(shared, notify, sid, OutFrame::Headers { fields, end_stream: false }) {
                 return;
             }
-            while let Some(chunk) = rx.recv().await {
+            // Poll the stream directly in this per-stream task — no channel, no
+            // producer task; the writer frames each chunk as it arrives.
+            while let Some(chunk) = stream.next().await {
                 if chunk.is_empty() {
                     continue;
                 }
@@ -689,9 +692,9 @@ async fn body_bytes(body: http::Body) -> Vec<u8> {
         }
         // `emit_response` streams a `Body::Stream` directly and never routes it here;
         // buffer it if it ever does, so this stays correct.
-        http::Body::Stream(mut rx) => {
+        http::Body::Stream(mut stream) => {
             let mut buf = Vec::new();
-            while let Some(chunk) = rx.recv().await {
+            while let Some(chunk) = stream.next().await {
                 buf.extend_from_slice(&chunk);
             }
             buf

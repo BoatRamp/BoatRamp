@@ -20,11 +20,15 @@ pub type Request = http::Request<Bytes>;
 pub type Response = http::Response<Body>;
 
 /// A response body: buffered bytes; a stream `splice()`d directly from an upstream
-/// socket into the (kTLS) client socket (Linux zero-copy); or a channel of `Bytes`
-/// chunks forwarded as DATA frames as they arrive (a reverse proxy streaming an
-/// upstream response without buffering or copying it — the channel closing ends the
-/// stream). The concurrent [`crate::mux`] driver streams the last two natively; the
-/// serial [`crate::conn`] driver buffers a `Stream` (it can't interleave).
+/// socket into the (kTLS) client socket (Linux zero-copy); or a pull [`Stream`] of
+/// `Bytes` chunks forwarded as DATA frames as they arrive (a reverse proxy streaming
+/// an upstream response without buffering or copying it — the stream ending closes the
+/// h2 stream). The driver **polls the stream directly** in the per-stream task, so a
+/// bridge hands its upstream body straight in with no intermediate channel or producer
+/// task. The concurrent [`crate::mux`] driver streams the last two natively; the serial
+/// [`crate::conn`] driver buffers a `Stream` (it can't interleave).
+///
+/// [`Stream`]: tokio_stream::Stream
 pub enum Body {
     Bytes(Vec<u8>),
     #[cfg(target_os = "linux")]
@@ -32,10 +36,17 @@ pub enum Body {
         upstream: tokio::net::TcpStream,
         len: usize,
     },
-    Stream(tokio::sync::mpsc::Receiver<Bytes>),
+    Stream(std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send>>),
 }
 
 impl Body {
+    /// A streamed body from any pull [`Stream`](tokio_stream::Stream) of `Bytes`
+    /// chunks — the driver polls it directly (no channel/task hop). Empty chunks are
+    /// skipped; the stream ending signals END_STREAM.
+    pub fn stream(chunks: impl tokio_stream::Stream<Item = Bytes> + Send + 'static) -> Self {
+        Body::Stream(Box::pin(chunks))
+    }
+
     /// The body length if known ahead of time. A [`Body::Stream`] has no known length
     /// (`0`) — HTTP/2 delimits it with END_STREAM, so callers must use [`is_empty`]
     /// rather than `len() == 0` to decide whether a body is present.

@@ -12,6 +12,9 @@ publish = false # flip once the API stabilizes and h2spec is green
 # (M4) adds libc. See README roadmap.
 [dependencies]
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
+# A response body can be a pull `Stream` of `Bytes` the driver polls directly — a
+# reverse-proxy bridge hands the upstream body straight in with no channel/task hop.
+tokio-stream = "0.1"
 fluke-hpack = "0.3"
 # Ref-counted byte buffers for the response-body path: streamed/proxied bodies flow
 # as `Bytes` (cheap clones, no copy) instead of `Vec<u8>` — a profile showed body
