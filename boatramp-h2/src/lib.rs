@@ -34,11 +34,13 @@ pub mod error;
 pub mod frame;
 pub mod hpack;
 pub mod http;
+pub mod mux;
 pub mod settings;
 pub mod stream;
 mod wire;
 
 pub use conn::serve_connection;
+pub use mux::serve_connection_mux;
 #[cfg(target_os = "linux")]
 pub use conn::{serve_connection_ktls, serve_connection_tcp};
 pub use error::{ErrorCode, H2Error};

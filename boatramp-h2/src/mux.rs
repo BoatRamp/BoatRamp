@@ -1,0 +1,742 @@
+//! The **concurrent multiplexed** connection driver (M4c). Unlike the serial
+//! [`crate::conn`] driver — which reads one frame, runs the handler to completion,
+//! and flushes the whole body before reading the next frame (a ~340 req/s
+//! per-connection ceiling) — this driver only ever *moves bytes*, exactly like the
+//! `h2` crate:
+//!
+//! - a **reader** half drains inbound frames, routing them to per-stream state and
+//!   spawning a handler task per request (never running a handler inline);
+//! - each **handler** task produces its response into the stream's outbox and wakes
+//!   the writer;
+//! - a **writer** half drains ready streams' outboxes into one batched write,
+//!   respecting two-tier (connection + per-stream) flow control.
+//!
+//! Reads never block on handler progress and handlers never touch the socket, so one
+//! connection multiplexes all its streams concurrently. HPACK decode lives in the
+//! reader and encode in the writer — HTTP/2 uses independent compression contexts
+//! per direction, so these are two separate, unsynchronized tables.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
+
+use crate::error::{ErrorCode, H2Error};
+use crate::frame::{self, flag, FrameHeader, FrameType};
+use crate::hpack::Hpack;
+use crate::http::{self, Handler, Response};
+use crate::settings::{self, Settings};
+use crate::stream::StreamState;
+use crate::CLIENT_PREFACE;
+
+const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
+/// Cap on a single emitted DATA frame (keeps batches bounded; well above the usual
+/// 16 KiB negotiated max-frame).
+const MAX_OUT_FRAME: usize = 128 * 1024;
+/// Soft target for one batched socket write: keep draining ready streams into the
+/// buffer until it reaches this, then write and start a fresh batch.
+const WRITE_BATCH_TARGET: usize = 64 * 1024;
+
+/// A response frame a handler has produced, awaiting the writer + flow control.
+enum OutFrame {
+    Headers {
+        fields: Vec<(Vec<u8>, Vec<u8>)>,
+        end_stream: bool,
+    },
+    Data {
+        bytes: Vec<u8>,
+        off: usize,
+        end_stream: bool,
+    },
+}
+
+struct MuxStream {
+    state: StreamState,
+    send_window: i64,
+    outbox: VecDeque<OutFrame>,
+    /// Whether this stream is currently in the ready queue (dedup guard).
+    queued: bool,
+    /// Reset by the peer or a local stream error — drop its pending output.
+    reset: bool,
+}
+
+impl MuxStream {
+    fn new(peer_initial_window: i64) -> Self {
+        MuxStream {
+            state: StreamState::Idle,
+            send_window: peer_initial_window,
+            outbox: VecDeque::new(),
+            queued: false,
+            reset: false,
+        }
+    }
+}
+
+/// State shared between the reader, the writer, and the per-stream handler tasks.
+struct Shared {
+    streams: HashMap<u32, MuxStream>,
+    /// Streams that have a frame ready *and* window to send it.
+    ready: VecDeque<u32>,
+    conn_send_window: i64,
+    peer: Settings,
+    /// Pre-encoded control frames (SETTINGS ack, PING ack, WINDOW_UPDATE, RST_STREAM,
+    /// GOAWAY) the writer flushes ahead of stream data.
+    ctrl: Vec<u8>,
+    /// Handler tasks still running — the writer must not exit until this hits 0.
+    active_handlers: u32,
+    /// The reader has stopped (client EOF, GOAWAY, or a connection error).
+    reader_done: bool,
+}
+
+impl Shared {
+    /// Enqueue a stream for the writer if it has sendable output and isn't already
+    /// queued or reset.
+    fn mark_ready(&mut self, id: u32) {
+        if let Some(s) = self.streams.get_mut(&id) {
+            if !s.queued && !s.reset && !s.outbox.is_empty() {
+                s.queued = true;
+                self.ready.push_back(id);
+            }
+        }
+    }
+}
+
+type Conn = Arc<Mutex<Shared>>;
+
+/// Serve one HTTP/2 connection with the concurrent multiplexed driver.
+pub async fn serve_connection_mux<IO, H>(io: IO, handler: H) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    H: Handler,
+{
+    let (rd, wr) = tokio::io::split(io);
+    let shared: Conn = Arc::new(Mutex::new(Shared {
+        streams: HashMap::new(),
+        ready: VecDeque::new(),
+        conn_send_window: settings::DEFAULT_CONNECTION_WINDOW,
+        peer: Settings::default(),
+        ctrl: Vec::new(),
+        active_handlers: 0,
+        reader_done: false,
+    }));
+    let notify = Arc::new(Notify::new());
+    let handler = Arc::new(handler);
+
+    let reader = reader_loop(rd, shared.clone(), notify.clone(), handler);
+    let writer = writer_loop(wr, shared.clone(), notify.clone());
+    let (_r, w) = tokio::join!(reader, writer);
+    w
+}
+
+// ------------------------------------------------------------------ reader ----
+
+async fn reader_loop<R, H>(mut rd: R, shared: Conn, notify: Arc<Notify>, handler: Arc<H>)
+where
+    R: AsyncRead + Unpin,
+    H: Handler,
+{
+    let _ = read_and_dispatch(&mut rd, &shared, &notify, &handler).await;
+    {
+        let mut s = shared.lock().unwrap();
+        s.reader_done = true;
+    }
+    notify.notify_one();
+}
+
+/// Per-request reader-local state accumulated between HEADERS and END_STREAM.
+#[derive(Default)]
+struct ReaderState {
+    /// In-progress header block awaiting END_HEADERS (HEADERS + CONTINUATION).
+    header_buf: Vec<u8>,
+    header_sid: u32,
+    header_end_stream: bool,
+    expecting_continuation: bool,
+    last_client_id: u32,
+    /// Header-complete requests awaiting their body's END_STREAM.
+    requests: HashMap<u32, http::Request>,
+    bodies: HashMap<u32, Vec<u8>>,
+    content_len: HashMap<u32, Option<u64>>,
+}
+
+async fn read_and_dispatch<R, H>(
+    rd: &mut R,
+    shared: &Conn,
+    notify: &Arc<Notify>,
+    handler: &Arc<H>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    H: Handler,
+{
+    let mut preface = [0u8; 24];
+    rd.read_exact(&mut preface).await?;
+    if preface != CLIENT_PREFACE {
+        return Ok(());
+    }
+    // Our initial SETTINGS (empty = defaults).
+    push_ctrl(shared, notify, |out| {
+        frame::write_frame(out, FrameType::Settings, 0, 0, &[])
+    });
+
+    let mut hpack = Hpack::new();
+    let mut rs = ReaderState::default();
+
+    loop {
+        let mut hdr = [0u8; frame::FRAME_HEADER_LEN];
+        if rd.read_exact(&mut hdr).await.is_err() {
+            return Ok(()); // client closed
+        }
+        let header = FrameHeader::parse(&hdr);
+        if header.length > OUR_MAX_FRAME_SIZE {
+            goaway(shared, notify, rs.last_client_id, ErrorCode::FrameSizeError);
+            return Ok(());
+        }
+        let mut payload = vec![0u8; header.length as usize];
+        if header.length > 0 && rd.read_exact(&mut payload).await.is_err() {
+            return Ok(());
+        }
+        if rs.expecting_continuation
+            && (header.kind != FrameType::Continuation || header.stream_id != rs.header_sid)
+        {
+            goaway(shared, notify, rs.last_client_id, ErrorCode::ProtocolError);
+            return Ok(());
+        }
+
+        match dispatch(shared, notify, handler, &mut hpack, &mut rs, header, payload) {
+            Ok(true) => {}
+            Ok(false) => return Ok(()), // GOAWAY received
+            Err(H2Error::Connection(code)) => {
+                goaway(shared, notify, rs.last_client_id, code);
+                return Ok(());
+            }
+            Err(H2Error::Stream { id, code }) => {
+                {
+                    let mut s = shared.lock().unwrap();
+                    if let Some(st) = s.streams.get_mut(&id) {
+                        st.state = StreamState::Closed;
+                        st.reset = true;
+                    }
+                }
+                push_ctrl(shared, notify, |out| {
+                    out.extend_from_slice(&frame::rst_stream(id, code))
+                });
+            }
+        }
+    }
+}
+
+fn dispatch<H>(
+    shared: &Conn,
+    notify: &Arc<Notify>,
+    handler: &Arc<H>,
+    hpack: &mut Hpack,
+    rs: &mut ReaderState,
+    header: FrameHeader,
+    payload: Vec<u8>,
+) -> Result<bool, H2Error>
+where
+    H: Handler,
+{
+    match header.kind {
+        FrameType::Settings => {
+            if header.stream_id != 0 {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            if header.has_flag(flag::ACK) {
+                if !payload.is_empty() {
+                    return Err(H2Error::conn(ErrorCode::FrameSizeError));
+                }
+                return Ok(true);
+            }
+            let mut s = shared.lock().unwrap();
+            let old_iws = s.peer.initial_window_size;
+            for (id, value) in frame::parse_settings(&payload)? {
+                s.peer.apply(id, value)?;
+            }
+            let new_iws = s.peer.initial_window_size;
+            if new_iws != old_iws {
+                let delta = i64::from(new_iws) - i64::from(old_iws);
+                let ids: Vec<u32> = s.streams.keys().copied().collect();
+                for id in &ids {
+                    if let Some(st) = s.streams.get_mut(id) {
+                        st.send_window += delta;
+                        if st.send_window > i64::from(settings::MAX_WINDOW_SIZE) {
+                            return Err(H2Error::conn(ErrorCode::FlowControlError));
+                        }
+                    }
+                }
+                for id in ids {
+                    s.mark_ready(id);
+                }
+            }
+            let mut ack = Vec::new();
+            frame::write_frame(&mut ack, FrameType::Settings, flag::ACK, 0, &[]);
+            s.ctrl.extend_from_slice(&ack);
+            drop(s);
+            notify.notify_one();
+            Ok(true)
+        }
+        FrameType::Ping => {
+            if header.stream_id != 0 {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            let data = frame::parse_ping(&payload)?;
+            if !header.has_flag(flag::ACK) {
+                push_ctrl(shared, notify, |out| {
+                    frame::write_frame(out, FrameType::Ping, flag::ACK, 0, &data)
+                });
+            }
+            Ok(true)
+        }
+        FrameType::GoAway => {
+            frame::parse_goaway(&payload)?;
+            Ok(false)
+        }
+        FrameType::WindowUpdate => {
+            let inc = frame::parse_window_update(&payload)?;
+            let mut s = shared.lock().unwrap();
+            if header.stream_id == 0 {
+                if inc == 0 {
+                    return Err(H2Error::conn(ErrorCode::ProtocolError));
+                }
+                s.conn_send_window += i64::from(inc);
+                if s.conn_send_window > i64::from(settings::MAX_WINDOW_SIZE) {
+                    return Err(H2Error::conn(ErrorCode::FlowControlError));
+                }
+                let ids: Vec<u32> = s.streams.keys().copied().collect();
+                for id in ids {
+                    s.mark_ready(id);
+                }
+            } else {
+                if !s.streams.contains_key(&header.stream_id)
+                    && header.stream_id > rs.last_client_id
+                {
+                    return Err(H2Error::conn(ErrorCode::ProtocolError));
+                }
+                if inc == 0 {
+                    return Err(H2Error::stream(header.stream_id, ErrorCode::ProtocolError));
+                }
+                if let Some(st) = s.streams.get_mut(&header.stream_id) {
+                    st.send_window += i64::from(inc);
+                    if st.send_window > i64::from(settings::MAX_WINDOW_SIZE) {
+                        return Err(H2Error::stream(header.stream_id, ErrorCode::FlowControlError));
+                    }
+                }
+                s.mark_ready(header.stream_id);
+            }
+            drop(s);
+            notify.notify_one();
+            Ok(true)
+        }
+        FrameType::RstStream => {
+            if header.stream_id == 0 {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            let _ = frame::parse_rst_stream(&payload)?;
+            let mut s = shared.lock().unwrap();
+            if !s.streams.contains_key(&header.stream_id) && header.stream_id > rs.last_client_id {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            if let Some(st) = s.streams.get_mut(&header.stream_id) {
+                st.state = StreamState::Closed;
+                st.reset = true;
+            }
+            Ok(true)
+        }
+        FrameType::Priority => {
+            if header.stream_id == 0 {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            let prio = frame::parse_priority(&payload)?;
+            if prio.dependency == header.stream_id {
+                return Err(H2Error::stream(header.stream_id, ErrorCode::ProtocolError));
+            }
+            Ok(true)
+        }
+        FrameType::Headers => {
+            let sid = header.stream_id;
+            if sid == 0 || sid % 2 == 0 {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            let mut block = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
+            if header.has_flag(flag::PRIORITY) {
+                if block.len() < 5 {
+                    return Err(H2Error::conn(ErrorCode::FrameSizeError));
+                }
+                let prio = frame::parse_priority(&block[..5])?;
+                if prio.dependency == sid {
+                    return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+                }
+                block = &block[5..];
+            }
+            let end_stream = header.has_flag(flag::END_STREAM);
+            {
+                let mut s = shared.lock().unwrap();
+                let new_stream = !s.streams.contains_key(&sid);
+                if new_stream && sid <= rs.last_client_id {
+                    return Err(H2Error::conn(ErrorCode::ProtocolError));
+                }
+                if s.streams.get(&sid).is_some_and(|x| x.state == StreamState::Closed) {
+                    return Err(H2Error::conn(ErrorCode::StreamClosed));
+                }
+                if new_stream {
+                    rs.last_client_id = sid;
+                    let iw = i64::from(s.peer.initial_window_size);
+                    s.streams.insert(sid, MuxStream::new(iw));
+                }
+                let cur = s.streams.get(&sid).unwrap().state;
+                let next = cur.on_recv(sid, FrameType::Headers, end_stream)?;
+                s.streams.get_mut(&sid).unwrap().state = next;
+            }
+            rs.header_buf.clear();
+            rs.header_buf.extend_from_slice(block);
+            rs.header_sid = sid;
+            rs.header_end_stream = end_stream;
+            if header.has_flag(flag::END_HEADERS) {
+                finish_headers(shared, notify, handler, hpack, rs, sid, end_stream)?;
+            } else {
+                rs.expecting_continuation = true;
+            }
+            Ok(true)
+        }
+        FrameType::Continuation => {
+            let sid = header.stream_id;
+            if !rs.expecting_continuation || sid != rs.header_sid {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            rs.header_buf.extend_from_slice(&payload);
+            if header.has_flag(flag::END_HEADERS) {
+                rs.expecting_continuation = false;
+                let end = rs.header_end_stream;
+                finish_headers(shared, notify, handler, hpack, rs, sid, end)?;
+            }
+            Ok(true)
+        }
+        FrameType::Data => {
+            let sid = header.stream_id;
+            if sid == 0 {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            let end_stream = header.has_flag(flag::END_STREAM);
+            {
+                let mut s = shared.lock().unwrap();
+                let cur = s
+                    .streams
+                    .get(&sid)
+                    .ok_or_else(|| H2Error::conn(ErrorCode::ProtocolError))?
+                    .state;
+                let next = cur.on_recv(sid, FrameType::Data, end_stream)?;
+                s.streams.get_mut(&sid).unwrap().state = next;
+            }
+            let data = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
+            rs.bodies.entry(sid).or_default().extend_from_slice(data);
+            let n = payload.len() as u32;
+            if n > 0 {
+                push_ctrl(shared, notify, |out| {
+                    frame::write_frame(out, FrameType::WindowUpdate, 0, 0, &n.to_be_bytes());
+                    frame::write_frame(out, FrameType::WindowUpdate, 0, sid, &n.to_be_bytes());
+                });
+            }
+            if end_stream {
+                let cl = rs.content_len.get(&sid).copied().flatten();
+                let body = rs.bodies.remove(&sid).unwrap_or_default();
+                if cl.is_some_and(|c| c != body.len() as u64) {
+                    return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+                }
+                let req = rs.requests.remove(&sid);
+                spawn_request(shared, notify, handler, sid, req, body);
+            }
+            Ok(true)
+        }
+        FrameType::PushPromise => Err(H2Error::conn(ErrorCode::ProtocolError)),
+        FrameType::Unknown(_) => Ok(true),
+    }
+}
+
+fn finish_headers<H>(
+    shared: &Conn,
+    notify: &Arc<Notify>,
+    handler: &Arc<H>,
+    hpack: &mut Hpack,
+    rs: &mut ReaderState,
+    sid: u32,
+    end_stream: bool,
+) -> Result<(), H2Error>
+where
+    H: Handler,
+{
+    let headers = hpack.decode(&rs.header_buf)?;
+    let req = http::request_from_headers(sid, headers)?;
+    let cl = req
+        .headers
+        .iter()
+        .find(|(n, _)| n == b"content-length")
+        .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u64>().ok());
+    rs.content_len.insert(sid, cl);
+    if end_stream {
+        let body = rs.bodies.remove(&sid).unwrap_or_default();
+        if cl.is_some_and(|c| c != body.len() as u64) {
+            return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+        }
+        spawn_request(shared, notify, handler, sid, Some(req), body);
+    } else {
+        rs.requests.insert(sid, req);
+    }
+    Ok(())
+}
+
+fn spawn_request<H>(
+    shared: &Conn,
+    notify: &Arc<Notify>,
+    handler: &Arc<H>,
+    sid: u32,
+    req: Option<http::Request>,
+    body: Vec<u8>,
+) where
+    H: Handler,
+{
+    let Some(mut req) = req else { return };
+    req.body = body;
+    {
+        let mut s = shared.lock().unwrap();
+        s.active_handlers += 1;
+    }
+    let shared = shared.clone();
+    let notify = notify.clone();
+    let handler = handler.clone();
+    tokio::spawn(async move {
+        let resp = handler.handle(req).await;
+        let frames = response_to_frames(resp).await;
+        {
+            let mut s = shared.lock().unwrap();
+            if let Some(st) = s.streams.get_mut(&sid) {
+                if !st.reset {
+                    st.outbox = frames;
+                }
+            }
+            s.mark_ready(sid);
+            s.active_handlers -= 1;
+        }
+        notify.notify_one();
+    });
+}
+
+/// Turn a [`Response`] into queued HEADERS (+ DATA) frames. A `Body::Splice` is read
+/// into memory here (userspace-first); the writer-side kernel splice is a later step.
+async fn response_to_frames(resp: Response) -> VecDeque<OutFrame> {
+    let mut fields: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(resp.headers.len() + 2);
+    fields.push((b":status".to_vec(), resp.status.to_string().into_bytes()));
+    for (n, v) in resp.headers {
+        fields.push((n, v));
+    }
+    let body = body_bytes(resp.body).await;
+    let has_body = !body.is_empty();
+    if has_body {
+        fields.push((b"content-length".to_vec(), body.len().to_string().into_bytes()));
+    }
+    let mut out = VecDeque::new();
+    out.push_back(OutFrame::Headers {
+        fields,
+        end_stream: !has_body,
+    });
+    if has_body {
+        out.push_back(OutFrame::Data {
+            bytes: body,
+            off: 0,
+            end_stream: true,
+        });
+    }
+    out
+}
+
+async fn body_bytes(body: http::Body) -> Vec<u8> {
+    match body {
+        http::Body::Bytes(b) => b,
+        #[cfg(target_os = "linux")]
+        http::Body::Splice { mut upstream, len } => {
+            let mut buf = vec![0u8; len];
+            if upstream.read_exact(&mut buf).await.is_err() {
+                buf.clear();
+            }
+            buf
+        }
+    }
+}
+
+// ------------------------------------------------------------------ writer ----
+
+async fn writer_loop<W>(mut wr: W, shared: Conn, notify: Arc<Notify>) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut hpack = Hpack::new();
+    loop {
+        loop {
+            let batch = build_batch(&shared, &mut hpack);
+            if batch.is_empty() {
+                break;
+            }
+            wr.write_all(&batch).await?;
+        }
+        {
+            let s = shared.lock().unwrap();
+            if s.reader_done
+                && s.active_handlers == 0
+                && s.ready.is_empty()
+                && s.ctrl.is_empty()
+            {
+                break;
+            }
+        }
+        notify.notified().await;
+    }
+    let _ = wr.shutdown().await;
+    Ok(())
+}
+
+/// Build one batched write: all pending control frames, then a fair round-robin of
+/// ready streams' frames — HEADERS are free, each DATA clamped by connection +
+/// stream windows and the negotiated max-frame, one DATA frame per stream visit.
+/// Returns an empty vec when nothing is currently sendable (every ready stream is
+/// window-blocked, or the queues are empty).
+fn build_batch(shared: &Conn, hpack: &mut Hpack) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut s = shared.lock().unwrap();
+
+    if !s.ctrl.is_empty() {
+        out.append(&mut s.ctrl);
+    }
+
+    let max_frame = i64::from(s.peer.max_frame_size).min(MAX_OUT_FRAME as i64);
+    let ready_len = s.ready.len();
+    let mut visited = 0usize;
+    while out.len() < WRITE_BATCH_TARGET && visited < ready_len {
+        let Some(id) = s.ready.pop_front() else { break };
+        visited += 1;
+        if let Some(st) = s.streams.get_mut(&id) {
+            st.queued = false;
+        }
+        if s.streams.get(&id).is_none_or(|st| st.reset) {
+            continue;
+        }
+        // Peek the front frame's kind, releasing the borrow before we mutate.
+        let is_headers = matches!(
+            s.streams.get(&id).and_then(|st| st.outbox.front()),
+            Some(OutFrame::Headers { .. })
+        );
+        if s.streams.get(&id).is_none_or(|st| st.outbox.is_empty()) {
+            continue;
+        }
+
+        if is_headers {
+            let Some(OutFrame::Headers { fields, end_stream }) =
+                s.streams.get_mut(&id).unwrap().outbox.pop_front()
+            else {
+                continue;
+            };
+            let refs: Vec<(&[u8], &[u8])> =
+                fields.iter().map(|(n, v)| (n.as_slice(), v.as_slice())).collect();
+            let block = hpack.encode(&refs);
+            let mut hflags = flag::END_HEADERS;
+            if end_stream {
+                hflags |= flag::END_STREAM;
+                close_local(&mut s, id);
+            }
+            frame::write_frame(&mut out, FrameType::Headers, hflags, id, &block);
+        } else {
+            // DATA frame — read off/len/end without holding a mutable borrow.
+            let (off, total, end_stream) = match s.streams.get(&id).unwrap().outbox.front() {
+                Some(OutFrame::Data { bytes, off, end_stream }) => (*off, bytes.len(), *end_stream),
+                _ => continue,
+            };
+            let remaining = total - off;
+            let swin = s.streams.get(&id).map_or(0, |st| st.send_window.max(0));
+            let win = swin.min(s.conn_send_window.max(0)).min(max_frame) as usize;
+            if win == 0 {
+                // Window-blocked: leave in outbox; reader requeues on WINDOW_UPDATE.
+                continue;
+            }
+            let chunk = remaining.min(win);
+            let is_last = chunk == remaining;
+            out.extend_from_slice(&frame::data_header(id, chunk as u32, is_last && end_stream));
+            if let Some(OutFrame::Data { bytes, .. }) = s.streams.get(&id).unwrap().outbox.front() {
+                out.extend_from_slice(&bytes[off..off + chunk]);
+            }
+            s.conn_send_window -= chunk as i64;
+            {
+                let st = s.streams.get_mut(&id).unwrap();
+                st.send_window -= chunk as i64;
+                if let Some(OutFrame::Data { off, .. }) = st.outbox.front_mut() {
+                    *off += chunk;
+                }
+                if is_last {
+                    st.outbox.pop_front();
+                }
+            }
+            if is_last && end_stream {
+                close_local(&mut s, id);
+            }
+        }
+
+        // Requeue if the stream has more to send and can make progress now: the next
+        // frame is HEADERS (never flow-controlled) or DATA with an open window. Only
+        // one DATA frame is emitted per visit, so requeuing gives round-robin fairness
+        // across streams; a window-blocked stream drops out of `ready` and is
+        // re-readied on WINDOW_UPDATE.
+        let next_headers = matches!(
+            s.streams.get(&id).and_then(|st| st.outbox.front()),
+            Some(OutFrame::Headers { .. })
+        );
+        let has_win = {
+            let st = s.streams.get(&id);
+            st.is_some_and(|st| st.send_window > 0) && s.conn_send_window > 0
+        };
+        let more = s.streams.get(&id).is_some_and(|st| !st.outbox.is_empty());
+        if more && (next_headers || has_win) {
+            if let Some(st) = s.streams.get_mut(&id) {
+                st.queued = true;
+            }
+            s.ready.push_back(id);
+        }
+
+        // Drop a fully-finished stream so the map can't grow unbounded across a
+        // long-lived connection.
+        if s.streams.get(&id).is_some_and(|st| {
+            st.state == StreamState::Closed && st.outbox.is_empty()
+        }) {
+            s.streams.remove(&id);
+        }
+    }
+    out
+}
+
+/// Advance a stream's state when we send END_STREAM.
+fn close_local(s: &mut Shared, id: u32) {
+    if let Some(st) = s.streams.get_mut(&id) {
+        st.state = if st.state == StreamState::HalfClosedRemote {
+            StreamState::Closed
+        } else {
+            StreamState::HalfClosedLocal
+        };
+    }
+}
+
+// ------------------------------------------------------------------ util ----
+
+/// Append control-frame bytes under the lock and wake the writer.
+fn push_ctrl<F: FnOnce(&mut Vec<u8>)>(shared: &Conn, notify: &Arc<Notify>, build: F) {
+    let mut buf = Vec::new();
+    build(&mut buf);
+    {
+        let mut s = shared.lock().unwrap();
+        s.ctrl.extend_from_slice(&buf);
+    }
+    notify.notify_one();
+}
+
+fn goaway(shared: &Conn, notify: &Arc<Notify>, last: u32, code: ErrorCode) {
+    push_ctrl(shared, notify, |out| out.extend_from_slice(&frame::goaway(last, code, &[])));
+    let mut s = shared.lock().unwrap();
+    s.reader_done = true;
+}
