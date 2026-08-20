@@ -129,20 +129,19 @@ c64 in good runs) — no longer slower. The mux *driver* itself still beats hype
 *standalone* (42k vs 33k at c256); the remaining few % looked like the router
 middleware both paths run.
 
-### Router-bypass fast-path — implemented + proven safe, but **no throughput gain**
+### Router-bypass fast-path — tried, proven safe, **no gain → reverted**
 
 The last lever tried was a **router-bypass fast-path**: for a request that is an
 *unambiguous pure gateway proxy*, call `dispatch_gateway` directly and skip the axum
-middleware. To guarantee it can never skip a site's access rules, the h1 splice
-path's exact eligibility check was factored out of `splice.rs::classify` into a
-shared `classify_gateway` oracle that **both** fast-paths call (zero drift: whatever
-the splice path refuses — access rules, redirects, handlers, streams — the mux bypass
-refuses too, falling through to the full router). Behind the `h2-mux` feature +
-`BOATRAMP_H2_MUX` env; A/B-toggled with `BOATRAMP_H2_MUX_BYPASS=0`.
+middleware. To guarantee it could never skip a site's access rules, the h1 splice
+path's exact eligibility check was factored into a shared `classify_gateway` oracle
+that **both** fast-paths called (zero drift: whatever the splice path refuses — access
+rules, redirects, handlers, streams — the mux bypass refused too, falling through to
+the full router). It was correct and confirmed *active* (its responses came straight
+from `dispatch_gateway` — e.g. no `content-length`, vs the router path's).
 
-Measured on lighthouse (100 KiB TLS h2 proxy, cores 0-7, oha `--http2`), the bypass
-is confirmed *active* (its responses come straight from `dispatch_gateway` — e.g. no
-`content-length`, vs the router path's) yet moves throughput **not at all**:
+But it moved throughput **not at all** (lighthouse, 100 KiB TLS h2 proxy, cores 0-7,
+oha `--http2`):
 
 | concurrency | hyper | mux (bypass on) | mux (router only) |
 | ---: | ---: | ---: | ---: |
@@ -155,11 +154,13 @@ structural: **the bypass only fires on the lightest sites.** A site with any acc
 rule (basic-auth / rate-limit / IP / WAF) — the ones whose middleware actually costs
 something — is refused by the oracle and served by the full router. On the pure-proxy
 sites the oracle *does* bypass, the axum stack is already near-free, so skipping it
-saves nothing. The residual gap to hyper is therefore **not** the middleware; it is
-diffuse per-request cost inside the mux driver + serving (framing, flow control, the
-per-response streaming-channel hop). (Run-to-run the absolute gap swings widely with
-shared-host load — this run had load ~5; earlier quiet runs measured near-parity — but
-the *controlled* bypass-vs-router delta is stable at ~0 %.)
+saves nothing. So the earlier "the remaining few % is the middleware" hypothesis was
+**wrong**: the residual gap to hyper is **not** the router — it is diffuse per-request
+cost inside the mux driver + serving (framing, flow control, the per-response
+streaming-channel hop). The bypass was reverted (no benefit, extra surface); the
+shared eligibility oracle went with it. (Absolute gaps swing widely with shared-host
+load — this run had load ~5; quiet runs measured near-parity — but the *controlled*
+bypass-vs-router delta is stably ~0 %.)
 
 Streaming is kept regardless (bounded memory + TTFB). hyper stays default.
 

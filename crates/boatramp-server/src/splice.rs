@@ -258,43 +258,30 @@ async fn peek_classify(io: &TcpStream, ctx: &SpliceCtx) -> Option<SplicePlan> {
     }
 }
 
-/// A resolved *pure gateway-proxy* match: the normal serving pipeline would
-/// reverse-proxy this request to the site's gateway upstream, with **nothing**
-/// preempting it — no site access rules (basic-auth / rate-limit / IP / WAF),
-/// no transport (HTTPS/canonical) redirect, no handlers, no manifest routing
-/// (redirect/rewrite/proxy), no matching handler route, no SSE stream. The
-/// matched upstream is returned for the caller to forward to.
-///
-/// This is the single eligibility oracle shared by **both** proxy fast-paths —
-/// the h1 kernel-splice path ([`classify`]) and the h2 mux router-bypass path
-/// (`mux_serve`) — so a site's access rules are honored identically on either
-/// transport and the two checks can never drift. It is deliberately conservative:
-/// any uncertainty returns `None`, and the caller falls back to the full router.
-pub(crate) struct GatewayMatch {
-    pub project: String,
-    pub site: String,
-    /// The matched upstream's name (its key in `gateway.upstreams`), needed to
-    /// key passive-health state on the userspace dispatch path.
-    pub upstream_name: String,
-    pub upstream: Upstream,
-}
-
-/// Shared host→site→config→eligibility→matched-upstream resolution — the common
-/// core of both proxy fast-paths (see [`GatewayMatch`]). `scheme` is the request's
-/// transport (`"http"` for the plaintext splice path, `"https"` for the TLS mux
-/// path) so the transport-redirect check is evaluated exactly as the pipeline
-/// would. Returns `Some` only for an unambiguous pure gateway proxy; the backend
-/// *shape* (single/plaintext vs compute/multi/HTTPS) is left to the caller — the
-/// splice path can only move a single plaintext backend, while `dispatch_gateway`
-/// handles the rest.
-pub(crate) async fn classify_gateway(
-    method: &str,
-    scheme: &str,
-    host: &str,
-    path: &str,
-    target_path: &str,
-    ctx: &SpliceCtx,
-) -> Option<GatewayMatch> {
+/// Decide whether the pipeline would reverse-proxy this request to a single
+/// plaintext-HTTP gateway upstream — and, if so, resolve+pin it. Conservative by
+/// construction: any uncertainty or advanced feature returns `None` (fall back).
+async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
+    // No kernel splice off Linux → never intercept; everything serves as before.
+    if !splice_supported() {
+        return None;
+    }
+    let (method, target_path, headers) = parse_request_head(head)?;
+    // Only idempotent, body-less requests: a request body would need forwarding
+    // (and splicing) upstream too, and non-GET/HEAD may not be safe to retry.
+    if !matches!(method.as_str(), "GET" | "HEAD") {
+        return None;
+    }
+    // A declared request body or an upgrade is out of scope for the fast-path.
+    if header(&headers, "content-length").is_some()
+        || header(&headers, "transfer-encoding").is_some()
+        || header(&headers, "upgrade").is_some()
+        || header(&headers, "expect").is_some()
+    {
+        return None;
+    }
+    let host = header(&headers, "host").map(strip_port).unwrap_or("");
+    let path = path_only(&target_path);
     // Reserved control-plane / system routes are matched by the app router *before*
     // the `serve_by_host` fallback where the gateway lives — so a site's catch-all
     // (`/**`) never actually handles them. Never intercept these; the router must.
@@ -333,9 +320,8 @@ pub(crate) async fn classify_gateway(
 
     // Front-of-pipeline preconditions that would preempt the gateway. Be
     // conservative: fall back if any is even possibly in play.
-    // 1. Site access rules (WAF/IP/rate/basic-auth) run before content — bypassing
-    //    the router would skip them entirely (a security hole), and re-running them
-    //    here would double-count rate limits, so we fall back.
+    // 1. Site access rules (WAF/IP/rate/basic-auth) run before content — and
+    //    re-running them here would double-count rate limits, so we fall back.
     let a = &cfg.access;
     // `trusted_proxies` changes how the client IP (and thus X-Forwarded-For) is
     // resolved; the fast-path forwards the raw peer, so fall back when it's set.
@@ -348,14 +334,14 @@ pub(crate) async fn classify_gateway(
     if !permissive {
         return None;
     }
-    // 2. Transport (HTTPS) / canonical-host redirect: a request the pipeline would
-    //    redirect is not proxied.
+    // 2. Transport (HTTPS) redirect: a plaintext request to an https-only site is
+    //    redirected, not proxied.
     if boatramp_core::config::transport_redirect(
         &cfg.security,
         &cfg.domains,
-        scheme,
+        "http",
         host,
-        target_path,
+        &target_path,
     )
     .is_some()
     {
@@ -384,7 +370,7 @@ pub(crate) async fn classify_gateway(
         // File (static) / NotFound are fine: the gateway wins over static files.
         Outcome::File { .. } | Outcome::NotFound { .. } => {}
     }
-    if route::match_handler(&manifest.config.handlers, method, path).is_some() {
+    if route::match_handler(&manifest.config.handlers, &method, path).is_some() {
         return None;
     }
     // A site declaring SSE stream routes is not a pure proxy (a stream can preempt
@@ -397,46 +383,9 @@ pub(crate) async fn classify_gateway(
     let gw = cfg.gateway.as_ref().filter(|g| g.is_enabled())?;
     let route_match = gw.match_route(path)?;
     let upstream = gw.upstreams.get(&route_match.upstream)?;
-    Some(GatewayMatch {
-        project,
-        site,
-        upstream_name: route_match.upstream.clone(),
-        upstream: upstream.clone(),
-    })
-}
-
-/// Decide whether the pipeline would reverse-proxy this request to a single
-/// plaintext-HTTP gateway upstream — and, if so, resolve+pin it. Conservative by
-/// construction: any uncertainty or advanced feature returns `None` (fall back).
-async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
-    // No kernel splice off Linux → never intercept; everything serves as before.
-    if !splice_supported() {
-        return None;
-    }
-    let (method, target_path, headers) = parse_request_head(head)?;
-    // Only idempotent, body-less requests: a request body would need forwarding
-    // (and splicing) upstream too, and non-GET/HEAD may not be safe to retry.
-    if !matches!(method.as_str(), "GET" | "HEAD") {
-        return None;
-    }
-    // A declared request body or an upgrade is out of scope for the fast-path.
-    if header(&headers, "content-length").is_some()
-        || header(&headers, "transfer-encoding").is_some()
-        || header(&headers, "upgrade").is_some()
-        || header(&headers, "expect").is_some()
-    {
-        return None;
-    }
-    let host = header(&headers, "host").map(strip_port).unwrap_or("");
-    let path = path_only(&target_path);
-    // Shared eligibility (host→site→config→access→redirect→handlers→manifest→
-    // gateway). The h1 splice path is always plaintext, so `scheme` is `"http"`.
-    let m = classify_gateway(&method, "http", host, path, &target_path, ctx).await?;
-    let upstream = m.upstream;
-    // Splice-only: a single, static, plaintext-HTTP backend — no compute wake, no
-    // LB across backends, no HTTPS (can't splice ciphertext), no unix socket, no
-    // DNS discovery/active-health rerouting. (`dispatch_gateway` handles those on
-    // the userspace path; here the kernel moves raw plaintext bytes.)
+    // Only a single, static, plaintext-HTTP backend: no compute wake, no LB across
+    // backends, no HTTPS (can't splice ciphertext), no unix socket, no DNS
+    // discovery/active-health rerouting.
     if upstream.compute.is_some() || upstream.discover.is_some() || upstream.active_health.is_some()
     {
         return None;
@@ -456,9 +405,9 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
     }
     Some(SplicePlan {
         resolved: resolved_target,
-        upstream,
-        site: m.site,
-        project: m.project,
+        upstream: upstream.clone(),
+        site,
+        project,
     })
 }
 
@@ -870,7 +819,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-pub(crate) fn strip_port(host: &str) -> &str {
+fn strip_port(host: &str) -> &str {
     host.rsplit_once(':')
         .filter(|(h, _)| !h.contains(':') || h.starts_with('['))
         .map(|(h, _)| h)
@@ -1057,98 +1006,6 @@ mod tests {
         assert!(
             hz.starts_with("HTTP/1.1 200") && hz.to_ascii_lowercase().contains("ok"),
             "healthz fallback: {hz}"
-        );
-    }
-
-    /// The shared eligibility oracle [`classify_gateway`] — the single check used
-    /// by BOTH the h1 splice path and the h2 mux router-bypass path — matches a
-    /// pure gateway proxy and returns its upstream, but **refuses** a site that has
-    /// access rules, so neither fast-path can ever skip basic-auth / rate-limit /
-    /// IP / WAF. This is the security-critical invariant of the factored-out check.
-    #[tokio::test]
-    async fn classify_gateway_matches_pure_proxy_and_honors_access_rules() {
-        use boatramp_core::access::{AccessConfig, BasicAuth};
-        use boatramp_core::config::{DomainConfig, SiteConfig};
-        use boatramp_core::deploy::{DeployStore, Manifest};
-        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
-        use boatramp_core::kv::MemoryKv;
-        use boatramp_core::project::ProjectRef;
-        use boatramp_core::security::SecurityProfile;
-
-        // Deploy a gateway site `www` (host `proxy.local`, route `/**`) with the given
-        // access config. `classify_gateway` never dials the upstream (that is the
-        // splice tail's job), so a placeholder target address is fine.
-        async fn ctx_for(access: AccessConfig, up_addr: SocketAddr) -> SpliceCtx {
-            let deploy = DeployStore::new(
-                Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
-                Arc::new(MemoryKv::new()),
-            );
-            let cfg = SiteConfig {
-                domains: DomainConfig {
-                    primary: Some("proxy.local".into()),
-                    ..Default::default()
-                },
-                access,
-                gateway: Some(GatewayConfig {
-                    upstreams: std::iter::once((
-                        "backend".to_string(),
-                        Upstream {
-                            target: format!("http://{up_addr}"),
-                            ..Default::default()
-                        },
-                    ))
-                    .collect(),
-                    routes: vec![GatewayRoute {
-                        matches: "/**".into(),
-                        upstream: "backend".into(),
-                    }],
-                }),
-                ..Default::default()
-            };
-            deploy
-                .set_site_config(ProjectRef::DEFAULT, "www", &cfg)
-                .await
-                .unwrap();
-            let id = deploy.put_manifest(&Manifest::default()).await.unwrap();
-            deploy
-                .activate(ProjectRef::DEFAULT, "www", &id)
-                .await
-                .unwrap();
-            SpliceCtx {
-                deploy,
-                posture: SecurityProfile::Dev.preset(),
-                daemon: None,
-            }
-        }
-
-        let up_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-
-        // A permissive pure-proxy site classifies (over the https mux scheme) as a
-        // gateway match with the resolved site + upstream name.
-        let ctx = ctx_for(AccessConfig::default(), up_addr).await;
-        let m = classify_gateway("GET", "https", "proxy.local", "/x", "/x", &ctx)
-            .await
-            .expect("a permissive gateway site must classify as a pure proxy");
-        assert_eq!(m.site, "www");
-        assert_eq!(m.upstream_name, "backend");
-        assert_eq!(m.project, ProjectRef::DEFAULT.as_str());
-
-        // The SAME site with an access rule (basic-auth) must NOT be eligible — the
-        // oracle returns `None`, so both fast-paths defer to the full router that
-        // runs the access checks. This is the invariant that makes the bypass safe.
-        let locked = AccessConfig {
-            basic_auth: Some(BasicAuth {
-                realm: "r".into(),
-                users: Default::default(),
-            }),
-            ..Default::default()
-        };
-        let ctx = ctx_for(locked, up_addr).await;
-        assert!(
-            classify_gateway("GET", "https", "proxy.local", "/x", "/x", &ctx)
-                .await
-                .is_none(),
-            "a site with access rules must never be eligible for either fast-path"
         );
     }
 
