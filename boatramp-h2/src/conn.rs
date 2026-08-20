@@ -71,8 +71,12 @@ where
 {
     // Client connection preface (RFC 7540 §3.5).
     let mut preface = [0u8; 24];
-    if io.read_exact(&mut preface).await.is_err() || preface != CLIENT_PREFACE {
-        // A bad preface is a connection error; there is no framing to GOAWAY into.
+    if io.read_exact(&mut preface).await.is_err() {
+        return Ok(());
+    }
+    if preface != CLIENT_PREFACE {
+        // An invalid preface is a connection error of type PROTOCOL_ERROR (§3.5).
+        let _ = io.write_all(&frame::goaway(0, ErrorCode::ProtocolError, &[])).await;
         return Ok(());
     }
     // Our SETTINGS (empty = all defaults), then run the loop.
@@ -157,8 +161,22 @@ where
                 }
                 return Ok(true);
             }
+            let old_iws = conn.peer.initial_window_size;
             for (id, value) in frame::parse_settings(&payload)? {
                 conn.peer.apply(id, value)?;
+            }
+            // A change to SETTINGS_INITIAL_WINDOW_SIZE shifts every open stream's
+            // send window by the delta (§6.9.2); an overflow past 2^31-1 is a
+            // connection error of type FLOW_CONTROL_ERROR.
+            let new_iws = conn.peer.initial_window_size;
+            if new_iws != old_iws {
+                let delta = i64::from(new_iws) - i64::from(old_iws);
+                for s in conn.streams.values_mut() {
+                    s.send_window += delta;
+                    if s.send_window > i64::from(settings::MAX_WINDOW_SIZE) {
+                        return Err(H2Error::conn(ErrorCode::FlowControlError));
+                    }
+                }
             }
             io.write_all(&settings_ack())
                 .await
@@ -197,6 +215,13 @@ where
                     return Err(H2Error::conn(ErrorCode::FlowControlError));
                 }
             } else {
+                // WINDOW_UPDATE on an idle (never-opened) stream is a connection
+                // error of type PROTOCOL_ERROR (§5.1 idle).
+                if !conn.streams.contains_key(&header.stream_id)
+                    && header.stream_id > conn.last_client_id
+                {
+                    return Err(H2Error::conn(ErrorCode::ProtocolError));
+                }
                 if inc == 0 {
                     return Err(H2Error::stream(header.stream_id, ErrorCode::ProtocolError));
                 }
@@ -231,7 +256,11 @@ where
             if header.stream_id == 0 {
                 return Err(H2Error::conn(ErrorCode::ProtocolError));
             }
-            let _ = frame::parse_priority(&payload)?;
+            let prio = frame::parse_priority(&payload)?;
+            // A stream cannot depend on itself (§5.3.1) — stream PROTOCOL_ERROR.
+            if prio.dependency == header.stream_id {
+                return Err(H2Error::stream(header.stream_id, ErrorCode::ProtocolError));
+            }
             Ok(true)
         }
 
@@ -240,8 +269,12 @@ where
         }
 
         FrameType::Continuation => {
-            // Ordering is enforced in the loop; append + maybe finish.
+            // A CONTINUATION MUST be preceded by a HEADERS/CONTINUATION without
+            // END_HEADERS (§6.10); otherwise a connection PROTOCOL_ERROR.
             let sid = header.stream_id;
+            if conn.expecting_continuation != Some(sid) {
+                return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
             if let Some(s) = conn.streams.get_mut(&sid) {
                 s.header_buf.extend_from_slice(&payload);
             }
@@ -281,12 +314,26 @@ where
     if new_stream && sid <= conn.last_client_id {
         return Err(H2Error::conn(ErrorCode::ProtocolError));
     }
+    // HEADERS on a stream already closed (by END_STREAM) is a connection error of
+    // type STREAM_CLOSED (§5.1 closed).
+    if conn
+        .streams
+        .get(&sid)
+        .is_some_and(|s| s.state == StreamState::Closed)
+    {
+        return Err(H2Error::conn(ErrorCode::StreamClosed));
+    }
 
     // Strip padding, then the optional priority section (§6.2).
     let mut block = frame::strip_padding(&payload, header.has_flag(flag::PADDED))?;
     if header.has_flag(flag::PRIORITY) {
         if block.len() < 5 {
             return Err(H2Error::conn(ErrorCode::FrameSizeError));
+        }
+        let prio = frame::parse_priority(&block[..5])?;
+        // A stream cannot depend on itself (§5.3.1).
+        if prio.dependency == sid {
+            return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
         block = &block[5..];
     }
@@ -328,10 +375,13 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
 {
-    let block = std::mem::take(&mut conn.streams.get_mut(&sid).unwrap().header_buf);
+    let block = match conn.streams.get_mut(&sid) {
+        Some(s) => std::mem::take(&mut s.header_buf),
+        None => return Err(H2Error::conn(ErrorCode::ProtocolError)),
+    };
     let headers = conn.hpack.decode(&block)?; // COMPRESSION_ERROR is a connection error
     let req = http::request_from_headers(sid, headers)?;
-    let end = conn.streams.get(&sid).unwrap().end_stream;
+    let end = conn.streams.get(&sid).is_some_and(|s| s.end_stream);
     if end {
         respond(conn, io, sid, handler, req).await?;
     }
@@ -428,16 +478,26 @@ where
     }
     let block = conn.hpack.encode(&fields);
 
-    let end_stream = resp.body.is_empty();
-    let flags = flag::END_HEADERS | if end_stream { flag::END_STREAM } else { 0 };
+    let has_body = !resp.body.is_empty();
+    let mut hflags = flag::END_HEADERS;
+    if !has_body {
+        hflags |= flag::END_STREAM;
+    }
     let mut out = Vec::new();
-    frame::write_frame(&mut out, FrameType::Headers, flags, sid, &block);
-    if !resp.body.is_empty() {
-        // One DATA frame. M1 targets h2spec, whose response bodies are tiny (well
-        // under both max_frame_size and the initial window); the large-body,
-        // flow-controlled, spliced path is the M4 seam.
-        let chunk = resp.body.len().min(conn.peer.max_frame_size as usize);
-        out.extend_from_slice(&frame::data_header(sid, chunk as u32, true));
+    frame::write_frame(&mut out, FrameType::Headers, hflags, sid, &block);
+    let mut sent_end = !has_body;
+    if has_body {
+        // Never exceed the stream or connection send window (§6.9). If the body
+        // doesn't fit, send what fits WITHOUT END_STREAM — completing a
+        // window-limited body is the M4 flow-controlled, spliced path.
+        let win = conn
+            .streams
+            .get(&sid)
+            .map_or(0, |s| s.send_window.max(0))
+            .min(conn.conn_send_window.max(0)) as usize;
+        let chunk = resp.body.len().min(conn.peer.max_frame_size as usize).min(win);
+        sent_end = chunk == resp.body.len();
+        out.extend_from_slice(&frame::data_header(sid, chunk as u32, sent_end));
         out.extend_from_slice(&resp.body[..chunk]);
         if let Some(s) = conn.streams.get_mut(&sid) {
             s.send_window -= chunk as i64;
@@ -447,12 +507,14 @@ where
     io.write_all(&out)
         .await
         .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-    if let Some(s) = conn.streams.get_mut(&sid) {
-        s.state = if s.state == StreamState::HalfClosedRemote {
-            StreamState::Closed
-        } else {
-            StreamState::HalfClosedLocal
-        };
+    if sent_end {
+        if let Some(s) = conn.streams.get_mut(&sid) {
+            s.state = if s.state == StreamState::HalfClosedRemote {
+                StreamState::Closed
+            } else {
+                StreamState::HalfClosedLocal
+            };
+        }
     }
     let _ = OUR_INITIAL_WINDOW;
     Ok(())
