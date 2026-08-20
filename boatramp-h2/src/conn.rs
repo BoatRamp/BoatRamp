@@ -461,10 +461,9 @@ where
     } else {
         let req = http::request_from_headers(sid, headers)?;
         let cl = req
-            .headers
-            .iter()
-            .find(|(n, _)| n == b"content-length")
-            .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u64>().ok());
+            .headers()
+            .get(::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
         let s = conn.streams.get_mut(&sid).unwrap();
         s.content_length = cl;
         s.request = Some(req);
@@ -503,7 +502,7 @@ where
         (s.request.take(), std::mem::take(&mut s.body))
     };
     if let Some(mut req) = req {
-        req.body = body;
+        *req.body_mut() = bytes::Bytes::from(body);
         respond(conn, wire, sid, handler, req).await?;
     }
     Ok(())
@@ -574,10 +573,11 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
 {
-    let mut resp: Response = handler.handle(req).await;
+    let resp: Response = handler.handle(req).await;
+    let (parts, body) = resp.into_parts();
     // The serial driver can't interleave a streamed body, so drain it to bytes here
     // (the mux driver streams it natively). Done before content-length is derived.
-    resp.body = match resp.body {
+    let body = match body {
         http::Body::Stream(mut rx) => {
             let mut buf = Vec::new();
             while let Some(chunk) = rx.recv().await {
@@ -587,19 +587,19 @@ where
         }
         other => other,
     };
-    let status = resp.status.to_string();
+    let status = parts.status.as_u16().to_string();
     let mut fields: Vec<(&[u8], &[u8])> = vec![(b":status", status.as_bytes())];
-    for (n, v) in &resp.headers {
-        fields.push((n, v));
+    for (n, v) in parts.headers.iter() {
+        fields.push((n.as_str().as_bytes(), v.as_bytes()));
     }
     let clen;
-    if !resp.body.is_empty() {
-        clen = resp.body.len().to_string();
+    let has_body = !body.is_empty();
+    if has_body {
+        clen = body.len().to_string();
         fields.push((b"content-length", clen.as_bytes()));
     }
     let block = conn.hpack.encode(&fields);
 
-    let has_body = !resp.body.is_empty();
     let mut hflags = flag::END_HEADERS;
     if !has_body {
         hflags |= flag::END_STREAM;
@@ -612,7 +612,7 @@ where
 
     if let Some(s) = conn.streams.get_mut(&sid) {
         if has_body {
-            s.out = resp.body;
+            s.out = body;
             s.out_off = 0;
             s.out_active = true;
         } else {

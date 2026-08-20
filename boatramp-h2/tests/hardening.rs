@@ -6,7 +6,7 @@
 use boatramp_h2::error::ErrorCode;
 use boatramp_h2::frame::{self, FrameHeader, FrameType};
 use boatramp_h2::hpack::Hpack;
-use boatramp_h2::{serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE};
+use boatramp_h2::{response, serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const END_STREAM: u8 = 0x1;
@@ -15,7 +15,7 @@ const END_HEADERS: u8 = 0x4;
 struct Ok200;
 impl Handler for Ok200 {
     async fn handle(&self, _req: Request) -> Response {
-        Response::with_body(200, b"ok".to_vec())
+        response(200, b"ok".to_vec())
     }
 }
 

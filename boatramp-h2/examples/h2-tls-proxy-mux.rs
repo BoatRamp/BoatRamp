@@ -25,7 +25,7 @@ mod linux {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    use boatramp_h2::{serve_connection_mux, Handler, Request, Response};
+    use boatramp_h2::{response, serve_connection_mux, Handler, Request, Response};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -77,23 +77,23 @@ mod linux {
                         c.set_nodelay(true).ok();
                         c
                     }
-                    Err(_) => return Response::with_body(502, b"bad gateway".to_vec()),
+                    Err(_) => return response(502, b"bad gateway".to_vec()),
                 },
             };
             // HTTP/1.1 defaults to keep-alive, so the connection returns to the pool.
             let get = format!(
                 "GET {} HTTP/1.1\r\nHost: b\r\n\r\n",
-                String::from_utf8_lossy(&req.path)
+                req.uri()
             );
             if up.write_all(get.as_bytes()).await.is_err() {
-                return Response::with_body(502, b"bad gateway".to_vec());
+                return response(502, b"bad gateway".to_vec());
             }
             match read_response(&mut up).await {
                 Some((status, body)) => {
                     self.pool.put(up); // clean boundary → reuse
-                    Response::with_body(status, body)
+                    response(status, body)
                 }
-                None => Response::with_body(502, b"bad gateway".to_vec()),
+                None => response(502, b"bad gateway".to_vec()),
             }
         }
     }

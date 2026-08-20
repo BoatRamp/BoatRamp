@@ -27,7 +27,7 @@ mod linux {
     use std::io;
     use std::sync::Arc;
 
-    use boatramp_h2::{serve_connection_ktls, Body, Handler, Request, Response};
+    use boatramp_h2::{response, serve_connection_ktls, Body, Handler, Request, Response};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -58,15 +58,15 @@ mod linux {
         async fn handle(&self, req: Request) -> Response {
             let mut up = match TcpStream::connect(upstream()).await {
                 Ok(u) => u,
-                Err(_) => return Response::with_body(502, b"bad gateway".to_vec()),
+                Err(_) => return response(502, b"bad gateway".to_vec()),
             };
             up.set_nodelay(true).ok();
             let get = format!(
                 "GET {} HTTP/1.1\r\nHost: b\r\nConnection: close\r\n\r\n",
-                String::from_utf8_lossy(&req.path)
+                req.uri()
             );
             if up.write_all(get.as_bytes()).await.is_err() {
-                return Response::with_body(502, b"bad gateway".to_vec());
+                return response(502, b"bad gateway".to_vec());
             }
             // Read the head one byte at a time so we never consume any body — the body
             // is then exactly `content-length` bytes still on the socket, which the
@@ -74,14 +74,7 @@ mod linux {
             let head = read_head(&mut up).await;
             let status = parse_status(&head).unwrap_or(502);
             let clen = content_length(&head).unwrap_or(0);
-            Response {
-                status,
-                headers: Vec::new(),
-                body: Body::Splice {
-                    upstream: up,
-                    len: clen,
-                },
-            }
+            response(status, Body::Splice { upstream: up, len: clen })
         }
     }
 

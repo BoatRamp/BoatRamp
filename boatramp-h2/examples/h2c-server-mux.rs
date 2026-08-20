@@ -1,14 +1,14 @@
 //! A plaintext (h2c, prior-knowledge) server on the **concurrent multiplexed**
 //! driver, for running h2spec against `serve_connection_mux`:
 //!   cargo run --example h2c-server-mux   # then: h2spec -h 127.0.0.1 -p 8080
-use boatramp_h2::{serve_connection_mux, Handler, Request, Response};
+use boatramp_h2::{response, serve_connection_mux, Handler, Request, Response};
 use tokio::net::TcpListener;
 
 struct Ok200;
 
 impl Handler for Ok200 {
     async fn handle(&self, _req: Request) -> Response {
-        Response::with_body(200, b"ok".to_vec())
+        response(200, b"ok".to_vec())
     }
 }
 

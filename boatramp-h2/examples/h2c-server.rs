@@ -1,13 +1,13 @@
 //! A plaintext (h2c, prior-knowledge) server for conformance testing:
 //!   cargo run --example h2c-server   # then: h2spec -h 127.0.0.1 -p 8080
-use boatramp_h2::{serve_connection, Handler, Request, Response};
+use boatramp_h2::{response, serve_connection, Handler, Request, Response};
 use tokio::net::TcpListener;
 
 struct Ok200;
 
 impl Handler for Ok200 {
     async fn handle(&self, _req: Request) -> Response {
-        Response::with_body(200, b"ok".to_vec())
+        response(200, b"ok".to_vec())
     }
 }
 

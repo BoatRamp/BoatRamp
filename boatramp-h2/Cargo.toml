@@ -17,6 +17,10 @@ fluke-hpack = "0.3"
 # as `Bytes` (cheap clones, no copy) instead of `Vec<u8>` — a profile showed body
 # copying (`memmove`) was the top cost once allocation was handled.
 bytes = "1"
+# Requests/responses are the standard `http` crate types (`http::Request`/`Response`
+# + `HeaderMap`), so the driver decodes straight into them and an embedder / reverse
+# proxy hands them to a tower/hyper service with no per-request re-marshaling.
+http = "1"
 
 # The zero-copy splice body path + kTLS handoff are Linux-only, so their deps are
 # target-gated — the crate (and its tests) still build everywhere on the buffered

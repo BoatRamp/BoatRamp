@@ -523,10 +523,9 @@ where
     }
     let req = http::request_from_headers(sid, headers)?;
     let cl = req
-        .headers
-        .iter()
-        .find(|(n, _)| n == b"content-length")
-        .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u64>().ok());
+        .headers()
+        .get(::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     rs.content_len.insert(sid, cl);
     if end_stream {
         let body = rs.bodies.remove(&sid).unwrap_or_default();
@@ -551,7 +550,7 @@ fn spawn_request<H>(
     H: Handler,
 {
     let Some(mut req) = req else { return };
-    req.body = body;
+    *req.body_mut() = Bytes::from(body);
     {
         let mut s = shared.lock().unwrap();
         s.active_handlers += 1;
@@ -575,14 +574,12 @@ fn spawn_request<H>(
 /// by chunk over time and forwarded as DATA frames — so the writer streams it without
 /// the whole body ever being held (the reverse-proxy fast-path).
 async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Response) {
-    let Response { status, headers, body } = resp;
+    let (parts, body) = resp.into_parts();
     match body {
         http::Body::Stream(mut rx) => {
             // HEADERS carry the response's own headers verbatim — any content-length is
             // the producer's (we don't re-derive one for a streamed body).
-            let mut fields = Vec::with_capacity(headers.len() + 1);
-            fields.push((b":status".to_vec(), status.to_string().into_bytes()));
-            fields.extend(headers);
+            let fields = response_fields(&parts, None);
             if !push_out(shared, notify, sid, OutFrame::Headers { fields, end_stream: false }) {
                 return;
             }
@@ -608,7 +605,7 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
             );
         }
         other => {
-            let frames = response_to_frames(Response { status, headers, body: other }).await;
+            let frames = response_to_frames(parts, other).await;
             {
                 let mut s = shared.lock().unwrap();
                 if let Some(st) = s.streams.get_mut(&sid) {
@@ -621,6 +618,26 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
             notify.notify_one();
         }
     }
+}
+
+/// Build the h2 response header list (`:status` first, then the response's headers) as
+/// `(name, value)` byte pairs for HPACK. `content_length`, when given, is appended
+/// only if the response doesn't already carry one.
+fn response_fields(
+    parts: &::http::response::Parts,
+    content_length: Option<usize>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut fields = Vec::with_capacity(parts.headers.len() + 2);
+    fields.push((b":status".to_vec(), parts.status.as_u16().to_string().into_bytes()));
+    for (name, value) in parts.headers.iter() {
+        fields.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
+    }
+    if let Some(len) = content_length {
+        if !parts.headers.contains_key(::http::header::CONTENT_LENGTH) {
+            fields.push((b"content-length".to_vec(), len.to_string().into_bytes()));
+        }
+    }
+    fields
 }
 
 /// Append one frame to a stream's outbox, mark it ready, and wake the writer. Returns
@@ -640,17 +657,10 @@ fn push_out(shared: &Conn, notify: &Arc<Notify>, sid: u32, frame: OutFrame) -> b
 
 /// Turn a [`Response`] into queued HEADERS (+ DATA) frames. A `Body::Splice` is read
 /// into memory here (userspace-first); the writer-side kernel splice is a later step.
-async fn response_to_frames(resp: Response) -> VecDeque<OutFrame> {
-    let mut fields: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(resp.headers.len() + 2);
-    fields.push((b":status".to_vec(), resp.status.to_string().into_bytes()));
-    for (n, v) in resp.headers {
-        fields.push((n, v));
-    }
-    let body = body_bytes(resp.body).await;
+async fn response_to_frames(parts: ::http::response::Parts, body: http::Body) -> VecDeque<OutFrame> {
+    let body = body_bytes(body).await;
     let has_body = !body.is_empty();
-    if has_body {
-        fields.push((b"content-length".to_vec(), body.len().to_string().into_bytes()));
-    }
+    let fields = response_fields(&parts, has_body.then_some(body.len()));
     let mut out = VecDeque::new();
     out.push_back(OutFrame::Headers {
         fields,

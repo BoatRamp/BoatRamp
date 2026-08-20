@@ -5,24 +5,17 @@
 //! reference `h2` client, so the responses are validated against a real peer.
 
 use bytes::Bytes;
-use boatramp_h2::{serve_connection, Handler, Request, Response};
+use boatramp_h2::{response, serve_connection, Handler, Request, Response};
 
 struct App;
 
 impl Handler for App {
     async fn handle(&self, req: Request) -> Response {
-        match req.path.as_slice() {
-            b"/big" => Response::with_body(200, vec![b'x'; 100_000]),
-            b"/echo" => Response::with_body(200, req.body),
-            p => Response::with_body(
-                200,
-                format!(
-                    "{} {}",
-                    String::from_utf8_lossy(&req.method),
-                    String::from_utf8_lossy(p)
-                )
-                .into_bytes(),
-            ),
+        let path = req.uri().path().to_owned();
+        match path.as_str() {
+            "/big" => response(200, vec![b'x'; 100_000]),
+            "/echo" => response(200, req.into_body().to_vec()),
+            p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
     }
 }

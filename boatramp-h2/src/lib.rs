@@ -45,7 +45,7 @@ pub use mux::serve_connection_mux;
 pub use conn::{serve_connection_ktls, serve_connection_tcp};
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
-pub use http::{Body, Handler, Request, Response};
+pub use http::{response, Body, Handler, Request, Response};
 pub use settings::Settings;
 pub use stream::StreamState;
 

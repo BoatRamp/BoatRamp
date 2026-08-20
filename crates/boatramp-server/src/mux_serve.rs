@@ -23,18 +23,18 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// Hop-by-hop response headers, which are illegal in HTTP/2 and must be stripped.
-/// `content-length` is deliberately kept: the body is streamed (not re-derived), so a
-/// fixed-length upstream response passes its `content-length` straight through.
-fn hop_by_hop_response_header(name: &[u8]) -> bool {
-    name.eq_ignore_ascii_case(b"connection")
-        || name.eq_ignore_ascii_case(b"keep-alive")
-        || name.eq_ignore_ascii_case(b"transfer-encoding")
-        || name.eq_ignore_ascii_case(b"upgrade")
-}
+/// Hop-by-hop response headers, illegal in HTTP/2, stripped before framing.
+/// `content-length` is deliberately kept — the body is streamed, so a fixed-length
+/// upstream response passes its `content-length` straight through.
+const HOP_BY_HOP: &[http::HeaderName] = &[
+    http::header::CONNECTION,
+    http::header::TRANSFER_ENCODING,
+    http::header::UPGRADE,
+];
 
-/// Bridges the mux driver's simple request/response to the axum [`Router`] (a tower
-/// `Service`). Cloned per connection; `Router` is cheap to clone.
+/// Bridges the mux driver to the axum [`Router`] (a tower `Service`). The driver
+/// produces native `http::Request`/`Response`, so the bridge just swaps body types
+/// and reuses the parts — no per-request header re-marshaling. Cloned per connection.
 struct RouterHandler {
     router: Router,
     peer: SocketAddr,
@@ -42,26 +42,11 @@ struct RouterHandler {
 
 impl Handler for RouterHandler {
     async fn handle(&self, req: MuxRequest) -> MuxResponse {
-        // Rebuild an http::Request the router can route: method + path + h2 headers,
-        // with the :authority carried as Host (the gateway resolves upstreams by it)
-        // and the peer as ConnectInfo (IP rules / rate limiting / access logs).
-        let method = http::Method::from_bytes(&req.method).unwrap_or(http::Method::GET);
-        let path = String::from_utf8_lossy(&req.path).into_owned();
-        let mut builder = http::Request::builder()
-            .method(method)
-            .uri(path)
-            .version(http::Version::HTTP_2);
-        for (n, v) in &req.headers {
-            builder = builder.header(n.as_slice(), v.as_slice());
-        }
-        if let Some(authority) = &req.authority {
-            builder = builder.header(http::header::HOST, authority.as_slice());
-        }
-        let body = axum::body::Body::from(Bytes::from(req.body));
-        let mut request = match builder.body(body) {
-            Ok(r) => r,
-            Err(_) => return MuxResponse::with_body(400, b"bad request".to_vec()),
-        };
+        // The request is already an `http::Request`; just wrap its `Bytes` body as an
+        // axum body (cheap, ref-counted) and attach the peer as `ConnectInfo` (IP
+        // rules / rate limiting / access logs). Method / URI / headers pass through
+        // untouched — no rebuild.
+        let mut request = req.map(|body| axum::body::Body::from(body));
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(self.peer));
@@ -71,35 +56,29 @@ impl Handler for RouterHandler {
         let mut router = self.router.clone();
         let resp = match router.call(request).await {
             Ok(r) => r,
-            Err(_) => return MuxResponse::with_body(502, b"bad gateway".to_vec()),
+            Err(_) => return boatramp_h2::response(502, b"bad gateway".to_vec()),
         };
-        let (parts, mut body) = resp.into_parts();
+        let (mut parts, mut body) = resp.into_parts();
+        for name in HOP_BY_HOP {
+            parts.headers.remove(name);
+        }
+        parts.headers.remove("keep-alive");
         // Stream the router's response body into the mux driver over a bounded channel
-        // — no buffering. The channel capacity backpressures the upstream body pull;
-        // the channel closing signals END_STREAM.
-        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        // — no buffering, no copy. The channel capacity backpressures the upstream
+        // pull; the channel closing signals END_STREAM.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
         tokio::spawn(async move {
             while let Some(frame) = body.frame().await {
                 let Ok(frame) = frame else { break };
                 if let Ok(data) = frame.into_data() {
-                    // `data` is ref-counted `Bytes`; forward it without copying.
                     if !data.is_empty() && tx.send(data).await.is_err() {
                         break; // the h2 stream was reset — stop pulling
                     }
                 }
             }
         });
-        let headers = parts
-            .headers
-            .iter()
-            .filter(|(n, _)| !hop_by_hop_response_header(n.as_str().as_bytes()))
-            .map(|(n, v)| (n.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
-            .collect();
-        MuxResponse {
-            status: parts.status.as_u16(),
-            headers,
-            body: MuxBody::Stream(rx),
-        }
+        // Reuse the response parts (status + headers) verbatim with the streamed body.
+        http::Response::from_parts(parts, MuxBody::Stream(rx))
     }
 }
 

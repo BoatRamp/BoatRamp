@@ -1,27 +1,30 @@
-//! Request/response types, the [`Handler`] trait, and RFC 7540 §8.1.2 request
-//! validation (the "malformed request" rules the benchmark prototype skipped:
-//! pseudo-header ordering, mandatory pseudo-headers, connection-specific headers).
+//! Request/response types (the standard `http` crate), the [`Handler`] trait, and
+//! RFC 7540 §8.1.2 request validation. Requests are decoded **straight into
+//! `http::Request`** (a real `HeaderMap`, not an intermediate list), so an embedder —
+//! or a reverse-proxy bridge handing the request to a tower/hyper service — pays no
+//! per-request re-marshaling. The response is an `http::Response` whose body is a
+//! [`Body`] (buffered, spliced, or streamed).
 
 use std::future::Future;
 
+use bytes::Bytes;
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
+
 use crate::error::{ErrorCode, H2Error};
 
-/// A received HTTP/2 request. Regular headers exclude the pseudo-headers, which are
-/// hoisted into their own fields.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Request {
-    pub method: Vec<u8>,
-    pub scheme: Vec<u8>,
-    pub authority: Option<Vec<u8>>,
-    pub path: Vec<u8>,
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    pub body: Vec<u8>,
-}
+/// A received HTTP/2 request: an `http::Request` whose (buffered) body is `Bytes`.
+/// The h2 pseudo-headers are hoisted into the method / URI (path) / `Host` header.
+pub type Request = http::Request<Bytes>;
 
-/// A response body: either buffered bytes, or — the reason this crate exists — a
-/// stream `splice()`d directly from an upstream socket into the (kTLS) client
-/// socket, so the payload is never copied through userspace (Linux). The upstream
-/// is owned here so it outlives the splice.
+/// A response to send: an `http::Response` whose body is a [`Body`].
+pub type Response = http::Response<Body>;
+
+/// A response body: buffered bytes; a stream `splice()`d directly from an upstream
+/// socket into the (kTLS) client socket (Linux zero-copy); or a channel of `Bytes`
+/// chunks forwarded as DATA frames as they arrive (a reverse proxy streaming an
+/// upstream response without buffering or copying it — the channel closing ends the
+/// stream). The concurrent [`crate::mux`] driver streams the last two natively; the
+/// serial [`crate::conn`] driver buffers a `Stream` (it can't interleave).
 pub enum Body {
     Bytes(Vec<u8>),
     #[cfg(target_os = "linux")]
@@ -29,13 +32,7 @@ pub enum Body {
         upstream: tokio::net::TcpStream,
         len: usize,
     },
-    /// A **streamed** body: DATA frames are produced from this channel of `Bytes`
-    /// chunks as they arrive (the channel closing = END_STREAM), so the whole body is
-    /// never held in memory. Chunks are ref-counted `Bytes` (cheap clones, no copy) —
-    /// this is how a reverse proxy forwards an upstream response without buffering *or*
-    /// copying it. The concurrent [`crate::mux`] driver streams it natively; the serial
-    /// [`crate::conn`] driver buffers it (it can't interleave).
-    Stream(tokio::sync::mpsc::Receiver<bytes::Bytes>),
+    Stream(tokio::sync::mpsc::Receiver<Bytes>),
 }
 
 impl Body {
@@ -57,10 +54,14 @@ impl Body {
             Body::Bytes(b) => b.is_empty(),
             #[cfg(target_os = "linux")]
             Body::Splice { len, .. } => *len == 0,
-            // A stream always represents a present body (possibly zero-length, ended
-            // by the channel closing) — never treat it as "no body".
             Body::Stream(_) => false,
         }
+    }
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Body::Bytes(Vec::new())
     }
 }
 
@@ -75,32 +76,12 @@ impl From<&[u8]> for Body {
     }
 }
 
-/// A response to send.
-pub struct Response {
-    pub status: u16,
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    pub body: Body,
-}
-
-impl Response {
-    pub fn new(status: u16) -> Self {
-        Response {
-            status,
-            headers: Vec::new(),
-            body: Body::Bytes(Vec::new()),
-        }
-    }
-    pub fn with_body(status: u16, body: impl Into<Body>) -> Self {
-        Response {
-            status,
-            headers: Vec::new(),
-            body: body.into(),
-        }
-    }
-    pub fn header(mut self, name: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
-        self.headers.push((name.into(), value.into()));
-        self
-    }
+/// Build a [`Response`] with a status and body and no extra headers — a small
+/// convenience over `http::Response::builder()` for handlers.
+pub fn response(status: u16, body: impl Into<Body>) -> Response {
+    let mut resp = http::Response::new(body.into());
+    *resp.status_mut() = http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::OK);
+    resp
 }
 
 /// A request handler. The connection driver calls this once per request stream.
@@ -117,17 +98,21 @@ const FORBIDDEN: &[&[u8]] = &[
     b"upgrade",
 ];
 
-/// Build a validated [`Request`] from a decoded header list. Malformed requests are
-/// a **stream** error of type PROTOCOL_ERROR (RFC 7540 §8.1.2.6) so one bad request
-/// resets its stream without killing the connection.
+/// Build a validated [`Request`] from a decoded header list. Malformed requests are a
+/// **stream** error of type PROTOCOL_ERROR (RFC 7540 §8.1.2.6) so one bad request
+/// resets its stream without killing the connection. The body is set separately once
+/// the request's DATA has arrived.
 pub(crate) fn request_from_headers(
     id: u32,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<Request, H2Error> {
     let bad = || H2Error::stream(id, ErrorCode::ProtocolError);
-    let mut req = Request::default();
-    let (mut method, mut scheme, mut path) = (false, false, false);
+    let mut method: Option<Vec<u8>> = None;
+    let mut path: Option<Vec<u8>> = None;
+    let mut authority: Option<Vec<u8>> = None;
+    let mut scheme = false;
     let mut seen_regular = false;
+    let mut hdrs = HeaderMap::new();
 
     for (name, value) in headers {
         if name.is_empty() {
@@ -143,19 +128,10 @@ pub(crate) fn request_from_headers(
                 return Err(bad());
             }
             match name.as_slice() {
-                b":method" if !method => {
-                    method = true;
-                    req.method = value;
-                }
-                b":scheme" if !scheme => {
-                    scheme = true;
-                    req.scheme = value;
-                }
-                b":path" if !path => {
-                    path = true;
-                    req.path = value;
-                }
-                b":authority" if req.authority.is_none() => req.authority = Some(value),
+                b":method" if method.is_none() => method = Some(value),
+                b":scheme" if !scheme => scheme = true,
+                b":path" if path.is_none() => path = Some(value),
+                b":authority" if authority.is_none() => authority = Some(value),
                 // Duplicate or unknown pseudo-header → malformed.
                 _ => return Err(bad()),
             }
@@ -168,14 +144,33 @@ pub(crate) fn request_from_headers(
             if name == b"te" && value != b"trailers" {
                 return Err(bad());
             }
-            req.headers.push((name, value));
+            let hn = HeaderName::from_bytes(&name).map_err(|_| bad())?;
+            let hv = HeaderValue::from_bytes(&value).map_err(|_| bad())?;
+            hdrs.append(hn, hv);
         }
     }
 
     // :method, :scheme, :path are mandatory for non-CONNECT requests (§8.1.2.3).
-    if !(method && scheme && path) || req.path.is_empty() {
+    let (Some(method), true, Some(path)) = (method, scheme, path) else {
+        return Err(bad());
+    };
+    if path.is_empty() {
         return Err(bad());
     }
+    let method = Method::from_bytes(&method).map_err(|_| bad())?;
+    // The :path is origin-form (e.g. `/x?y`); the URI carries just that. The
+    // :authority rides as `Host`, which is what a gateway routes on.
+    let uri = Uri::try_from(path.as_slice()).map_err(|_| bad())?;
+    if let Some(auth) = authority {
+        let hv = HeaderValue::from_bytes(&auth).map_err(|_| bad())?;
+        hdrs.insert(header::HOST, hv);
+    }
+
+    let mut req = http::Request::new(Bytes::new());
+    *req.method_mut() = method;
+    *req.uri_mut() = uri;
+    *req.version_mut() = Version::HTTP_2;
+    *req.headers_mut() = hdrs;
     Ok(req)
 }
 
@@ -200,46 +195,37 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(req.method, b"GET");
-        assert_eq!(req.path, b"/x");
-        assert_eq!(req.headers, h(&[(b"accept", b"*/*")]));
+        assert_eq!(req.method(), Method::GET);
+        assert_eq!(req.uri().path(), "/x");
+        assert_eq!(req.headers().get("accept").unwrap(), "*/*");
+        assert_eq!(req.headers().get(header::HOST).unwrap(), "h");
     }
 
     #[test]
     fn malformed_requests_are_stream_protocol_errors() {
         let bad = H2Error::stream(1, ErrorCode::ProtocolError);
+        // `http::Request` isn't `PartialEq`, so assert on the error (a stream reset).
+        let err = |pairs: &[(&[u8], &[u8])]| request_from_headers(1, h(pairs)).unwrap_err();
         // uppercase header name
-        assert_eq!(request_from_headers(1, h(&[(b":Method", b"GET")])), Err(bad));
+        assert_eq!(err(&[(b":Method", b"GET")]), bad);
         // pseudo after regular
-        assert_eq!(
-            request_from_headers(1, h(&[(b"accept", b"x"), (b":method", b"GET")])),
-            Err(bad)
-        );
+        assert_eq!(err(&[(b"accept", b"x"), (b":method", b"GET")]), bad);
         // missing :path
-        assert_eq!(
-            request_from_headers(1, h(&[(b":method", b"GET"), (b":scheme", b"https")])),
-            Err(bad)
-        );
+        assert_eq!(err(&[(b":method", b"GET"), (b":scheme", b"https")]), bad);
         // connection-specific header
         assert_eq!(
-            request_from_headers(
-                1,
-                h(&[
-                    (b":method", b"GET"),
-                    (b":scheme", b"https"),
-                    (b":path", b"/"),
-                    (b"connection", b"keep-alive"),
-                ])
-            ),
-            Err(bad)
+            err(&[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b"connection", b"keep-alive"),
+            ]),
+            bad
         );
         // unknown pseudo-header
         assert_eq!(
-            request_from_headers(
-                1,
-                h(&[(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/"), (b":bogus", b"x")])
-            ),
-            Err(bad)
+            err(&[(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/"), (b":bogus", b"x")]),
+            bad
         );
     }
 }

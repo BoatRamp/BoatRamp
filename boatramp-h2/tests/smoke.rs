@@ -1,19 +1,18 @@
 //! End-to-end smoke test: drive the server with the reference `h2` client over an
 //! in-memory duplex. This is also the seed of the M3 differential oracle.
 
-use boatramp_h2::{serve_connection, Handler, Request, Response};
+use boatramp_h2::{response, serve_connection, Handler, Request, Response};
 
 struct Echo;
 
 impl Handler for Echo {
     async fn handle(&self, req: Request) -> Response {
         // Echo the method + path so we can assert the request was parsed.
-        let body = format!(
-            "{} {}",
-            String::from_utf8_lossy(&req.method),
-            String::from_utf8_lossy(&req.path)
-        );
-        Response::with_body(200, body.into_bytes()).header(b"x-served-by".to_vec(), b"boatramp-h2".to_vec())
+        let body = format!("{} {}", req.method(), req.uri().path());
+        let mut resp = response(200, body.into_bytes());
+        resp.headers_mut()
+            .insert("x-served-by", "boatramp-h2".parse().unwrap());
+        resp
     }
 }
 

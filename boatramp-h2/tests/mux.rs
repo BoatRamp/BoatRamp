@@ -9,25 +9,18 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use boatramp_h2::{serve_connection_mux, Handler, Request, Response};
+use boatramp_h2::{response, serve_connection_mux, Handler, Request, Response};
 use tokio::sync::Notify;
 
 struct App;
 
 impl Handler for App {
     async fn handle(&self, req: Request) -> Response {
-        match req.path.as_slice() {
-            b"/big" => Response::with_body(200, vec![b'x'; 100_000]),
-            b"/echo" => Response::with_body(200, req.body),
-            p => Response::with_body(
-                200,
-                format!(
-                    "{} {}",
-                    String::from_utf8_lossy(&req.method),
-                    String::from_utf8_lossy(p)
-                )
-                .into_bytes(),
-            ),
+        let path = req.uri().path().to_owned();
+        match path.as_str() {
+            "/big" => response(200, vec![b'x'; 100_000]),
+            "/echo" => response(200, req.into_body().to_vec()),
+            p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
     }
 }
@@ -129,11 +122,7 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
                     }
                 }
             });
-            Response {
-                status: 200,
-                headers: Vec::new(),
-                body: Body::Stream(rx),
-            }
+            response(200, Body::Stream(rx))
         }
     }
     let mut client = connect_with(Streamer).await;
@@ -177,16 +166,16 @@ async fn concurrent_streams_interleave() {
     }
     impl Handler for Gated {
         async fn handle(&self, req: Request) -> Response {
-            match req.path.as_slice() {
-                b"/first" => {
+            match req.uri().path() {
+                "/first" => {
                     self.gate.notified().await;
-                    Response::with_body(200, b"first".to_vec())
+                    response(200, b"first".to_vec())
                 }
-                b"/second" => {
+                "/second" => {
                     self.gate.notify_one();
-                    Response::with_body(200, b"second".to_vec())
+                    response(200, b"second".to_vec())
                 }
-                _ => Response::new(404),
+                _ => response(404, Vec::new()),
             }
         }
     }
