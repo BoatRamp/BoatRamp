@@ -701,14 +701,80 @@ async fn body_bytes(body: http::Body) -> Vec<u8> {
 
 // ------------------------------------------------------------------ writer ----
 
+/// One write segment. Frame headers + control frames live in the batch's `scratch`
+/// buffer; DATA payloads are the response's own ref-counted `Bytes` (never copied),
+/// referenced in place. The writer turns the segments into `IoSlice`s and does one
+/// vectored write — so a 100 KiB body is handed straight to rustls without a copy
+/// through our buffer (a profile showed that copy, `memmove`, was the top cost).
+enum Seg {
+    Scratch(usize, usize),
+    Body(Bytes),
+}
+
+/// A batched write: `scratch` holds all the small owned bytes (frame headers, control
+/// frames), `segs` is the ordered segment list, `len` the total wire bytes.
+struct Batch {
+    scratch: Vec<u8>,
+    segs: Vec<Seg>,
+    len: usize,
+}
+
+impl Batch {
+    fn new() -> Self {
+        Batch {
+            scratch: Vec::with_capacity(16 * 1024),
+            segs: Vec::with_capacity(64),
+            len: 0,
+        }
+    }
+    fn clear(&mut self) {
+        self.scratch.clear();
+        self.segs.clear();
+        self.len = 0;
+    }
+    fn is_empty(&self) -> bool {
+        self.segs.is_empty()
+    }
+    /// Copy owned bytes (a control frame) into scratch as one segment.
+    fn push_owned(&mut self, bytes: &[u8]) {
+        let start = self.scratch.len();
+        self.scratch.extend_from_slice(bytes);
+        self.segs.push(Seg::Scratch(start, bytes.len()));
+        self.len += bytes.len();
+    }
+    /// Record everything appended to `scratch` since `start` as one segment (a frame
+    /// header block written in place).
+    fn seal(&mut self, start: usize) {
+        let len = self.scratch.len() - start;
+        self.segs.push(Seg::Scratch(start, len));
+        self.len += len;
+    }
+    /// Reference a ref-counted body slice in place (no copy).
+    fn push_body(&mut self, body: Bytes) {
+        self.len += body.len();
+        self.segs.push(Seg::Body(body));
+    }
+    fn io_slices(&self) -> Vec<std::io::IoSlice<'_>> {
+        self.segs
+            .iter()
+            .map(|seg| match seg {
+                Seg::Scratch(start, len) => {
+                    std::io::IoSlice::new(&self.scratch[*start..*start + *len])
+                }
+                Seg::Body(b) => std::io::IoSlice::new(&b[..]),
+            })
+            .collect()
+    }
+}
+
 async fn writer_loop<W>(mut wr: W, shared: Conn, notify: Arc<Notify>) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut hpack = Hpack::new();
-    // One reused batch buffer for the whole connection — building a fresh Vec per
-    // write was a top allocation source in the profile.
-    let mut batch = Vec::with_capacity(WRITE_BATCH_TARGET + 8 * 1024);
+    // One reused batch for the whole connection — allocating per write was a top
+    // allocation source in the profile.
+    let mut batch = Batch::new();
     loop {
         loop {
             batch.clear();
@@ -716,7 +782,7 @@ where
             if batch.is_empty() {
                 break;
             }
-            wr.write_all(&batch).await?;
+            write_all_vectored(&mut wr, &batch).await?;
         }
         {
             let s = shared.lock().unwrap();
@@ -734,16 +800,36 @@ where
     Ok(())
 }
 
-/// Build one batched write: all pending control frames, then a fair round-robin of
-/// ready streams' frames — HEADERS are free, each DATA clamped by connection +
-/// stream windows and the negotiated max-frame, one DATA frame per stream visit.
-/// Returns an empty vec when nothing is currently sendable (every ready stream is
-/// window-blocked, or the queues are empty).
-fn build_batch(shared: &Conn, hpack: &mut Hpack, out: &mut Vec<u8>) {
+/// Write every segment with vectored I/O, handling partial writes.
+async fn write_all_vectored<W>(wr: &mut W, batch: &Batch) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut owned = batch.io_slices();
+    let mut slices: &mut [std::io::IoSlice] = &mut owned;
+    while !slices.is_empty() {
+        let n = wr.write_vectored(slices).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write returned zero",
+            ));
+        }
+        std::io::IoSlice::advance_slices(&mut slices, n);
+    }
+    Ok(())
+}
+
+/// Build one batched (vectored) write: all pending control frames, then a fair
+/// round-robin of ready streams' frames — HEADERS free, each DATA clamped by
+/// connection + stream windows and the negotiated max-frame, one DATA frame per stream
+/// visit. Leaves `batch` empty when nothing is currently sendable.
+fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
     let mut s = shared.lock().unwrap();
 
     if !s.ctrl.is_empty() {
-        out.append(&mut s.ctrl);
+        batch.push_owned(&s.ctrl);
+        s.ctrl.clear();
     }
 
     let max_frame = i64::from(s.peer.max_frame_size).min(MAX_OUT_FRAME as i64);
@@ -751,7 +837,7 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, out: &mut Vec<u8>) {
     // or no stream can make progress. Coalescing many frames into a single `write_all`
     // is the whole game: a profile showed the writer was syscall-bound (`writev`), and
     // the previous one-frame-per-pass cap turned a 100 KiB response into ~7 writes.
-    while out.len() < WRITE_BATCH_TARGET {
+    while batch.len < WRITE_BATCH_TARGET {
         let Some(id) = s.ready.pop_front() else { break };
         if let Some(st) = s.streams.get_mut(&id) {
             st.queued = false;
@@ -782,7 +868,9 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, out: &mut Vec<u8>) {
                 hflags |= flag::END_STREAM;
                 close_local(&mut s, id);
             }
-            frame::write_frame(out, FrameType::Headers, hflags, id, &block);
+            let start = batch.scratch.len();
+            frame::write_frame(&mut batch.scratch, FrameType::Headers, hflags, id, &block);
+            batch.seal(start);
         } else {
             // DATA frame — read off/len/end without holding a mutable borrow.
             let (off, total, end_stream) = match s.streams.get(&id).unwrap().outbox.front() {
@@ -805,9 +893,10 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, out: &mut Vec<u8>) {
                 remaining.min(win)
             };
             let is_last = chunk == remaining;
-            out.extend_from_slice(&frame::data_header(id, chunk as u32, is_last && end_stream));
+            batch.push_owned(&frame::data_header(id, chunk as u32, is_last && end_stream));
             if let Some(OutFrame::Data { bytes, .. }) = s.streams.get(&id).unwrap().outbox.front() {
-                out.extend_from_slice(&bytes[off..off + chunk]);
+                // Reference the body slice in place — no copy into the write buffer.
+                batch.push_body(bytes.slice(off..off + chunk));
             }
             s.conn_send_window -= chunk as i64;
             {
