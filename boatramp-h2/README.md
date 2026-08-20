@@ -63,11 +63,36 @@ splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port f
       kernel `splice(upstream → pipe → kTLS fd)` with the DATA header coalesced into
       the body's TLS record. Correct (md5 == direct over kTLS, HTTP/2), but **it does
       not clear Envoy** on the integrated path — see the benchmark verdict below.
+- [x] **M4c concurrent multiplexed driver** — `serve_connection_mux`: decouple the
+      handler from the socket (reader task + per-stream handler tasks + writer task,
+      two-tier flow control) so one connection multiplexes streams, plus a pooled
+      HTTP/1.1 upstream. **This clears Envoy** — see below. The kTLS/splice premise
+      was a red herring: userspace rustls + a userspace body copy already win.
 - [ ] **M5 fuzzing + hardening** — cargo-fuzz frame/HPACK; CONTINUATION-flood and
       RST-flood (Rapid Reset) mitigations.
-- [ ] **M6 BoatRamp integration** — wire behind the serve eligibility gate as an
-      opt-in fast-path with graceful fallback to hyper for anything non-eligible.
-      Given the M4b verdict, hyper stays the default; the splice path is opt-in only.
+- [ ] **M6 BoatRamp integration** — wire the mux driver behind the serve eligibility
+      gate as the fast-path with graceful fallback to hyper for anything non-eligible.
+
+## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
+
+The concurrent multiplexed driver with **userspace rustls (no kTLS) + a pooled
+HTTP/1.1 upstream** beats Envoy at every concurrency — and the M4b kTLS+splice serial
+driver at ~2x:
+
+| concurrency | M4b kTLS+splice (serial) | **M4c mux + rustls + pool** | Envoy |
+| ---: | ---: | ---: | ---: |
+| c64  | 24,800 | **54,942** | 51,492 |
+| c128 | 21,800 | **43,722** | 42,062 |
+| c256 | livelock (~56) | **42,127** | 37,869 |
+
+Correct (md5 == direct, HTTP/2, 100 KiB, 100% 2xx) and no livelock. This confirms the
+competitive study (reading `h2`'s source + Envoy's architecture): the gap to Envoy was
+**stream multiplexing + upstream connection pooling + flow control**, *not* the
+userspace body copy or the TLS implementation. Envoy itself uses userspace BoringSSL
++ stock nghttp2 and rejected kTLS (~5% regression). So the crate's original premise —
+hand-roll h2 + splice/kTLS to beat the "userspace-copy ceiling" — was wrong; the
+ceiling was the serial driver, and once that's fixed, splice/kTLS is unnecessary (and
+was in fact slower). See `DESIGN-mux.md`.
 
 ## M4b benchmark verdict (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
@@ -100,8 +125,10 @@ if it clears Envoy" gate, the splice path is **not** promoted to the default.
 
 ## Status
 
-M0-M4 complete: a runnable, RFC 7540 + RFC 7541 conformant HTTP/2 server over both
-plaintext (buffered) and kTLS (splice) transports — h2spec 143/143 (0 failed, 2
-skipped), 18 unit + 4 e2e/interop tests, body integrity validated over kTLS. The
-kTLS+splice fast-path is correct but does not beat Envoy (verdict above); it stays an
-opt-in path behind hyper. Next: M5 fuzzing + DoS hardening, then M6 opt-in wiring.
+M0-M4c complete. Two drivers: the serial `conn.rs` (h2spec 143/143, the conformance
+reference) and the concurrent multiplexed `mux.rs` (`serve_connection_mux`). The mux
+driver over userspace rustls + a pooled upstream **beats Envoy** on tls-proxy-h2-100k
+at every concurrency (table above), which retires the crate's original splice/kTLS
+premise. 26 tests green (18 unit + 3 interop + 4 mux incl. a concurrency-interleave
+proof + 1 smoke). Next: run h2spec against the mux driver (conformance parity with
+the serial driver), then M5 fuzzing + DoS hardening, then M6 wiring into BoatRamp.
