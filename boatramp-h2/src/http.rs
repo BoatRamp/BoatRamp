@@ -29,12 +29,13 @@ pub enum Body {
         upstream: tokio::net::TcpStream,
         len: usize,
     },
-    /// A **streamed** body: DATA frames are produced from this channel of chunks as
-    /// they arrive (the channel closing = END_STREAM), so the whole body is never
-    /// held in memory. This is how a reverse proxy forwards an upstream response
-    /// without buffering. The concurrent [`crate::mux`] driver streams it natively;
-    /// the serial [`crate::conn`] driver buffers it (it can't interleave).
-    Stream(tokio::sync::mpsc::Receiver<Vec<u8>>),
+    /// A **streamed** body: DATA frames are produced from this channel of `Bytes`
+    /// chunks as they arrive (the channel closing = END_STREAM), so the whole body is
+    /// never held in memory. Chunks are ref-counted `Bytes` (cheap clones, no copy) —
+    /// this is how a reverse proxy forwards an upstream response without buffering *or*
+    /// copying it. The concurrent [`crate::mux`] driver streams it natively; the serial
+    /// [`crate::conn`] driver buffers it (it can't interleave).
+    Stream(tokio::sync::mpsc::Receiver<bytes::Bytes>),
 }
 
 impl Body {

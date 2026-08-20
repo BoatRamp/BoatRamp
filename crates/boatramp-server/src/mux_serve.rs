@@ -77,12 +77,13 @@ impl Handler for RouterHandler {
         // Stream the router's response body into the mux driver over a bounded channel
         // — no buffering. The channel capacity backpressures the upstream body pull;
         // the channel closing signals END_STREAM.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         tokio::spawn(async move {
             while let Some(frame) = body.frame().await {
                 let Ok(frame) = frame else { break };
                 if let Ok(data) = frame.into_data() {
-                    if !data.is_empty() && tx.send(data.to_vec()).await.is_err() {
+                    // `data` is ref-counted `Bytes`; forward it without copying.
+                    if !data.is_empty() && tx.send(data).await.is_err() {
                         break; // the h2 stream was reset — stop pulling
                     }
                 }

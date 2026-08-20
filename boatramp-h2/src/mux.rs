@@ -19,6 +19,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
@@ -56,7 +58,7 @@ enum OutFrame {
         end_stream: bool,
     },
     Data {
-        bytes: Vec<u8>,
+        bytes: Bytes,
         off: usize,
         end_stream: bool,
     },
@@ -602,7 +604,7 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
                 shared,
                 notify,
                 sid,
-                OutFrame::Data { bytes: Vec::new(), off: 0, end_stream: true },
+                OutFrame::Data { bytes: Bytes::new(), off: 0, end_stream: true },
             );
         }
         other => {
@@ -656,7 +658,7 @@ async fn response_to_frames(resp: Response) -> VecDeque<OutFrame> {
     });
     if has_body {
         out.push_back(OutFrame::Data {
-            bytes: body,
+            bytes: Bytes::from(body),
             off: 0,
             end_stream: true,
         });

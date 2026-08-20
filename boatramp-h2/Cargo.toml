@@ -13,6 +13,10 @@ publish = false # flip once the API stabilizes and h2spec is green
 [dependencies]
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
 fluke-hpack = "0.3"
+# Ref-counted byte buffers for the response-body path: streamed/proxied bodies flow
+# as `Bytes` (cheap clones, no copy) instead of `Vec<u8>` — a profile showed body
+# copying (`memmove`) was the top cost once allocation was handled.
+bytes = "1"
 
 # The zero-copy splice body path + kTLS handoff are Linux-only, so their deps are
 # target-gated — the crate (and its tests) still build everywhere on the buffered

@@ -120,11 +120,11 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
             // 200 KiB across 200 chunks fed over a bounded channel — bigger than the
             // 64 KiB flow-control window, so the writer must stream + resume on
             // WINDOW_UPDATE without ever holding the whole body.
-            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
             tokio::spawn(async move {
                 for i in 0..200u32 {
                     let byte = b'a' + (i % 26) as u8;
-                    if tx.send(vec![byte; 1024]).await.is_err() {
+                    if tx.send(Bytes::from(vec![byte; 1024])).await.is_err() {
                         break;
                     }
                 }
