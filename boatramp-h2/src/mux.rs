@@ -694,9 +694,13 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut hpack = Hpack::new();
+    // One reused batch buffer for the whole connection — building a fresh Vec per
+    // write was a top allocation source in the profile.
+    let mut batch = Vec::with_capacity(WRITE_BATCH_TARGET + 8 * 1024);
     loop {
         loop {
-            let batch = build_batch(&shared, &mut hpack);
+            batch.clear();
+            build_batch(&shared, &mut hpack, &mut batch);
             if batch.is_empty() {
                 break;
             }
@@ -723,8 +727,7 @@ where
 /// stream windows and the negotiated max-frame, one DATA frame per stream visit.
 /// Returns an empty vec when nothing is currently sendable (every ready stream is
 /// window-blocked, or the queues are empty).
-fn build_batch(shared: &Conn, hpack: &mut Hpack) -> Vec<u8> {
-    let mut out = Vec::new();
+fn build_batch(shared: &Conn, hpack: &mut Hpack, out: &mut Vec<u8>) {
     let mut s = shared.lock().unwrap();
 
     if !s.ctrl.is_empty() {
@@ -732,11 +735,12 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack) -> Vec<u8> {
     }
 
     let max_frame = i64::from(s.peer.max_frame_size).min(MAX_OUT_FRAME as i64);
-    let ready_len = s.ready.len();
-    let mut visited = 0usize;
-    while out.len() < WRITE_BATCH_TARGET && visited < ready_len {
+    // Drain ready streams round-robin into ONE batch until it reaches the target size
+    // or no stream can make progress. Coalescing many frames into a single `write_all`
+    // is the whole game: a profile showed the writer was syscall-bound (`writev`), and
+    // the previous one-frame-per-pass cap turned a 100 KiB response into ~7 writes.
+    while out.len() < WRITE_BATCH_TARGET {
         let Some(id) = s.ready.pop_front() else { break };
-        visited += 1;
         if let Some(st) = s.streams.get_mut(&id) {
             st.queued = false;
         }
@@ -766,7 +770,7 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack) -> Vec<u8> {
                 hflags |= flag::END_STREAM;
                 close_local(&mut s, id);
             }
-            frame::write_frame(&mut out, FrameType::Headers, hflags, id, &block);
+            frame::write_frame(out, FrameType::Headers, hflags, id, &block);
         } else {
             // DATA frame — read off/len/end without holding a mutable borrow.
             let (off, total, end_stream) = match s.streams.get(&id).unwrap().outbox.front() {
@@ -838,7 +842,6 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack) -> Vec<u8> {
             s.streams.remove(&id);
         }
     }
-    out
 }
 
 /// Advance a stream's state when we send END_STREAM.
