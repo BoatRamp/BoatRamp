@@ -1754,7 +1754,9 @@ dependencies = [
 name = "boatramp-h2"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "fluke-hpack",
+ "http 1.4.2",
  "ktls",
  "libc",
  "rustls 0.23.40",

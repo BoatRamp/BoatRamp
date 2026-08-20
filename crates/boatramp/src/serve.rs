@@ -2129,6 +2129,12 @@ async fn serve_custom(
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
     let handle = spawn_tls_shutdown();
+    // Capture the classifier inputs the h2-mux router-bypass fast-path needs (store,
+    // posture, daemon runtime) before `router_with` consumes `deploy` + `options`.
+    #[cfg(feature = "h2-mux")]
+    let mux_ctx = std::env::var_os("BOATRAMP_H2_MUX")
+        .is_some()
+        .then(|| (deploy.clone(), options.posture, options.daemon_runtime.clone()));
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
 
     // Optionally serve HTTP/3 on the same UDP port, feeding the same router, and
@@ -2152,9 +2158,19 @@ async fn serve_custom(
     // multiplexed driver (beats hyper/Envoy on tls-proxy-h2), h1 falls back to hyper.
     // Experimental; enabled per-listener by BOATRAMP_H2_MUX at runtime.
     #[cfg(feature = "h2-mux")]
-    if std::env::var_os("BOATRAMP_H2_MUX").is_some() {
+    if let Some((deploy, posture, daemon)) = mux_ctx {
         let (certs, private_key) = load_cert_chain_and_key(&cert, &key)?;
-        boatramp_server::serve_tls_mux(addr, certs, private_key, app, shutdown_signal()).await?;
+        boatramp_server::serve_tls_mux(
+            addr,
+            certs,
+            private_key,
+            app,
+            deploy,
+            posture,
+            daemon,
+            shutdown_signal(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2269,8 +2285,9 @@ async fn serve_rpk(
     Ok(())
 }
 
-/// Load a PEM cert chain + private key as DER, for the HTTP/3 (quinn) listener.
-#[cfg(feature = "http3")]
+/// Load a PEM cert chain + private key as DER, for the HTTP/3 (quinn) listener and
+/// the h2-mux TLS fast-path.
+#[cfg(any(feature = "http3", feature = "h2-mux"))]
 fn load_cert_chain_and_key(
     cert: &Path,
     key: &Path,
