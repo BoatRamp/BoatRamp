@@ -68,10 +68,37 @@ splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port f
       two-tier flow control) so one connection multiplexes streams, plus a pooled
       HTTP/1.1 upstream. **This clears Envoy** — see below. The kTLS/splice premise
       was a red herring: userspace rustls + a userspace body copy already win.
-- [ ] **M5 fuzzing + hardening** — cargo-fuzz frame/HPACK; CONTINUATION-flood and
-      RST-flood (Rapid Reset) mitigations.
-- [ ] **M6 BoatRamp integration** — wire the mux driver behind the serve eligibility
-      gate as the fast-path with graceful fallback to hyper for anything non-eligible.
+- [x] **M5 fuzzing + hardening** — cargo-fuzz frame/HPACK (found + fixed a real HPACK
+      decoder panic); CONTINUATION-flood + Rapid-Reset mitigations. Both drivers still
+      h2spec 143/143.
+- [~] **M6 BoatRamp integration** — wired the mux driver into BoatRamp's TLS serve
+      behind the `h2-mux` feature + `BOATRAMP_H2_MUX` env gate (h2 → mux, h1 → hyper;
+      hyper stays default). Compiles + serves correctly + the mux path is confirmed
+      live, but the standalone win does **not** survive the buffered router-bridge —
+      see the M6 verdict below.
+
+## M6 integration verdict (live on lighthouse, boatramp gateway → upstream)
+
+The mux driver bridged into BoatRamp's full axum Router (with a **buffered** response
+body) is *slightly slower* than the existing hyper path, despite the standalone mux
+proxy beating Envoy:
+
+| concurrency | integrated mux (via router) | integrated hyper | standalone mux example |
+| ---: | ---: | ---: | ---: |
+| c64  | 34,535 | 35,365 | 54,942 |
+| c128 | 27,759 | 33,214 | 43,722 |
+| c256 | 26,556 | 30,068 | 42,127 |
+
+Correct (md5 == direct, HTTP/2, 100 KiB) and the mux path is confirmed active (server
+sends an empty SETTINGS frame vs hyper's `MAX_CONCURRENT_STREAMS=256`). The win
+evaporates for two reasons: (1) the bridge **buffers** the whole response body
+(`collect().await`) where hyper streams; (2) every request pays BoatRamp's **full
+router pipeline** (auth, routing, gateway resolution) — the mux driver's
+downstream-concurrency edge is a small fraction of that, which the standalone 54k
+avoided by proxying directly. Recovering the win needs a **streaming bridge** (a
+streaming `Body` in the mux driver) and/or an **eligibility gate that bypasses the
+router for pure gateway-proxy connections** (the `splice.rs` pattern, for TLS h2).
+Both are follow-ups; hyper stays the default.
 
 ## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
