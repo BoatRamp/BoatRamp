@@ -102,15 +102,35 @@ it (`collect()`). Same rig, mux path confirmed active:
 | c128 | 25,459 | 32,536 |
 | c256 | 22,375 | 29,804 |
 
-Still ~slower than hyper, both streaming and buffered. So **buffering was not the
-bottleneck** — the dominant cost is BoatRamp's **full router pipeline** (auth, routing,
-gateway resolution), which mux and hyper pay *equally*, so the mux driver's
-downstream-concurrency edge never surfaces. The standalone 54k avoided all of it by
-proxying directly. The remaining lever is an **eligibility gate that bypasses the
-router for pure gateway-proxy connections** (the `splice.rs` peek-classify pattern, for
-TLS h2). Streaming is kept regardless — it's the correct behavior for large/streaming
-responses (bounded memory + time-to-first-byte), where buffering would be a real
-problem. hyper stays the default.
+Still ~slower than hyper, both streaming and buffered — but **buffering was not the
+bottleneck** and neither was the router (mux + hyper pay it equally). A `perf`-driven
+optimization pass closed the gap.
+
+### Perf campaign — near-parity with hyper on the router-served path
+
+The gap was purely mux-serving vs hyper's native h2 serving of the *same* router
+(axum is on both sides). `perf` found and fixed, in order: **`writev` at 27%**
+(`build_batch` emitted one frame per `write_all` → coalesce into one write);
+**glibc `malloc` at 13%** (jemalloc build + reused per-connection write buffer);
+**`memmove` at ~10%** (bodies flow as ref-counted `Bytes`, and **vectored writes** hand
+the body slices straight to rustls with no copy through our buffer). Native
+`http::Request`/`Response` in the driver removed the bridge's per-request re-marshaling.
+`perf stat` confirmed it's **not** scheduling — mux has 6× *fewer* context switches than
+hyper at identical CPU utilization; the residual was diffuse per-request CPU.
+
+| concurrency | mux (optimized) | hyper | mux / hyper |
+| ---: | ---: | ---: | ---: |
+| c64  | 38,100 (47.4k warmup) | 39,100 | **~97%** (ahead in warmup) |
+| c128 | 34,100 | 36,800 | ~93% |
+| c256 | 30,300 | 33,300 | ~91% |
+
+So on the router-served path the integrated mux is **near-parity** (91–97%, ahead at
+c64 in good runs) — no longer slower. The mux *driver* itself still beats hyper
+*standalone* (42k vs 33k at c256); the remaining few % is the router middleware both
+paths run. Closing that fully is the **router-bypass fast-path**: for a pure
+gateway-proxy connection, reuse `splice.rs`'s conservative eligibility check and call
+`dispatch_gateway` directly (skipping the axum middleware), falling back to the router
+on any doubt. Streaming is kept regardless (bounded memory + TTFB). hyper stays default.
 
 ## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
