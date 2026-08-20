@@ -164,6 +164,35 @@ bypass-vs-router delta is stably ~0 %.)
 
 Streaming is kept regardless (bounded memory + TTFB). hyper stays default.
 
+### Direct-poll stream body — the real win (+9–16 %, matches/beats hyper)
+
+The router-bypass pointed at the true residual: **the per-response streaming-channel
+hop.** The bridge wrapped *every* response in a `tokio::spawn` + `mpsc(8)` channel to
+pump the router's body into the driver — a task-create + channel round-trip on the
+hot path of each request. Two fixes were measured:
+
+- **Lever A — collect to `Bytes`:** buffer a bounded (≤1 MiB) known-length response
+  once and hand the driver a single `Bytes` body (no spawn, no channel). Helped at
+  high concurrency (+5 % c128, +10 % c256, hyper parity at c256) but nothing at c64,
+  and it buffers.
+- **Lever B — direct-poll stream:** make `Body::Stream` a pull `Stream` the driver
+  polls **directly** in its existing per-stream task; the bridge hands axum's body
+  straight in (`BodyStream::new(body)`). No producer task, no channel, no buffering
+  (unbounded bodies still stream). This **dominates** Lever A everywhere and is the
+  shipped default.
+
+Stable across rounds (100 KiB TLS h2 proxy, cores 0-7, oha `--http2`):
+
+| concurrency | baseline (channel+spawn) | **direct (Lever B)** | hyper |
+| ---: | ---: | ---: | ---: |
+| c64  | 37.8–38.1k | **41.5k** (+9 %)  | 39–48k (load-noisy) |
+| c128 | 34.0k      | **38.6k** (+13 %) | 36.7k |
+| c256 | 30.2k      | **34.9k** (+15 %) | 33.2k |
+
+So the integrated mux now **matches or beats hyper at every concurrency** (it was
+79–91 % before), with `direct` rock-stable run-to-run while hyper's c64 swings with
+shared-host load. hyper stays default (this is the opt-in `h2-mux` path).
+
 ## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
 The concurrent multiplexed driver with **userspace rustls (no kTLS) + a pooled
