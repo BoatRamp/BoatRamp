@@ -1,0 +1,31 @@
+# Coverage-guided fuzz targets for the frame + HPACK parsers (the attacker-controlled
+# byte parsers). Run with a nightly toolchain:  cargo +nightly fuzz run fuzz_frame
+# The stable regression net lives in ../tests/fuzz_smoke.rs.
+[package]
+name = "boatramp-h2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+boatramp-h2 = { path = ".." }
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hpack"
+path = "fuzz_targets/fuzz_hpack.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

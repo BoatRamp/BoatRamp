@@ -29,6 +29,12 @@ const OUR_INITIAL_WINDOW: i32 = settings::DEFAULT_INITIAL_WINDOW_SIZE as i32;
 /// (grown to 256 KiB) never overflows. Well above the usual 16 KiB negotiated
 /// SETTINGS_MAX_FRAME_SIZE, so it only bites a client that raises the limit.
 const MAX_OUT_FRAME: usize = 128 * 1024;
+/// Bound on a single request's accumulated header block (HEADERS + CONTINUATION) and
+/// on the number of CONTINUATION frames per block — a CONTINUATION flood guard
+/// (CVE-2024-27316): unbounded/empty CONTINUATION frames would otherwise grow memory
+/// or burn CPU without ever completing a header block.
+const MAX_HEADER_BLOCK: usize = 64 * 1024;
+const MAX_CONTINUATION_FRAMES: u32 = 64;
 
 struct Stream {
     state: StreamState,
@@ -87,6 +93,8 @@ struct Conn {
     expecting_continuation: Option<u32>,
     /// END_STREAM already latched on the pending header block.
     pending_end_stream: bool,
+    /// CONTINUATION frames seen for the in-progress header block (flood guard).
+    continuation_count: u32,
 }
 
 /// Serve one HTTP/2 connection to completion over any `AsyncRead + AsyncWrite`
@@ -133,6 +141,7 @@ where
         last_client_id: 0,
         expecting_continuation: None,
         pending_end_stream: false,
+        continuation_count: 0,
     };
 
     loop {
@@ -324,7 +333,14 @@ where
             if conn.expecting_continuation != Some(sid) {
                 return Err(H2Error::conn(ErrorCode::ProtocolError));
             }
+            conn.continuation_count += 1;
+            if conn.continuation_count > MAX_CONTINUATION_FRAMES {
+                return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
+            }
             if let Some(s) = conn.streams.get_mut(&sid) {
+                if s.header_buf.len() + payload.len() > MAX_HEADER_BLOCK {
+                    return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
+                }
                 s.header_buf.extend_from_slice(&payload);
             }
             if header.has_flag(flag::END_HEADERS) {
@@ -398,6 +414,10 @@ where
         let s = conn.streams.get(&sid).unwrap();
         s.state.on_recv(sid, FrameType::Headers, end_stream)?
     };
+    if block.len() > MAX_HEADER_BLOCK {
+        return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
+    }
+    conn.continuation_count = 0;
     let s = conn.streams.get_mut(&sid).unwrap();
     s.state = st;
     s.end_stream = end_stream;

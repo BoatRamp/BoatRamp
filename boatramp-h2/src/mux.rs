@@ -34,6 +34,17 @@ const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
 /// Cap on a single emitted DATA frame (keeps batches bounded; well above the usual
 /// 16 KiB negotiated max-frame).
 const MAX_OUT_FRAME: usize = 128 * 1024;
+/// Bound on a single request's accumulated header block (HEADERS + CONTINUATION), to
+/// cap memory against a CONTINUATION flood (CVE-2024-27316).
+const MAX_HEADER_BLOCK: usize = 64 * 1024;
+/// Bound on CONTINUATION frames per header block, to cap CPU against a flood of
+/// *empty* CONTINUATION frames (which add no bytes but force frame parsing).
+const MAX_CONTINUATION_FRAMES: u32 = 64;
+/// A connection may reset this many streams "for free"; past it, resetting more than
+/// half of all opened streams is treated as a Rapid Reset flood (CVE-2023-44487) and
+/// the connection is closed with ENHANCE_YOUR_CALM. Legitimate clients reset a small
+/// fraction of their streams; a rapid-reset attacker resets ~all of them.
+const RAPID_RESET_MIN: u64 = 100;
 /// Soft target for one batched socket write: keep draining ready streams into the
 /// buffer until it reaches this, then write and start a fresh batch.
 const WRITE_BATCH_TARGET: usize = 64 * 1024;
@@ -87,6 +98,9 @@ struct Shared {
     active_handlers: u32,
     /// The reader has stopped (client EOF, GOAWAY, or a connection error).
     reader_done: bool,
+    /// Streams opened + streams reset by the peer, for Rapid Reset detection.
+    opened: u64,
+    resets: u64,
 }
 
 impl Shared {
@@ -119,6 +133,8 @@ where
         ctrl: Vec::new(),
         active_handlers: 0,
         reader_done: false,
+        opened: 0,
+        resets: 0,
     }));
     let notify = Arc::new(Notify::new());
     let handler = Arc::new(handler);
@@ -152,6 +168,8 @@ struct ReaderState {
     header_sid: u32,
     header_end_stream: bool,
     expecting_continuation: bool,
+    /// CONTINUATION frames seen for the current header block (flood guard).
+    continuation_count: u32,
     last_client_id: u32,
     /// Header-complete requests awaiting their body's END_STREAM.
     requests: HashMap<u32, http::Request>,
@@ -342,6 +360,14 @@ where
                 st.state = StreamState::Closed;
                 st.reset = true;
             }
+            // Rapid Reset (CVE-2023-44487): a stream reset by the peer frees its
+            // concurrency slot, so a flood of open-then-reset lets an attacker force
+            // unbounded work under one connection. Once past a free allowance, if the
+            // peer has reset more than half the streams it opened, close the connection.
+            s.resets += 1;
+            if s.resets >= RAPID_RESET_MIN && s.resets.saturating_mul(2) > s.opened {
+                return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
+            }
             Ok(true)
         }
         FrameType::Priority => {
@@ -382,6 +408,7 @@ where
                 }
                 if new_stream {
                     rs.last_client_id = sid;
+                    s.opened += 1;
                     let iw = i64::from(s.peer.initial_window_size);
                     s.streams.insert(sid, MuxStream::new(iw));
                 }
@@ -390,6 +417,10 @@ where
                 s.streams.get_mut(&sid).unwrap().state = next;
             }
             rs.header_buf.clear();
+            rs.continuation_count = 0;
+            if block.len() > MAX_HEADER_BLOCK {
+                return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
+            }
             rs.header_buf.extend_from_slice(block);
             rs.header_sid = sid;
             rs.header_end_stream = end_stream;
@@ -404,6 +435,12 @@ where
             let sid = header.stream_id;
             if !rs.expecting_continuation || sid != rs.header_sid {
                 return Err(H2Error::conn(ErrorCode::ProtocolError));
+            }
+            rs.continuation_count += 1;
+            if rs.continuation_count > MAX_CONTINUATION_FRAMES
+                || rs.header_buf.len() + payload.len() > MAX_HEADER_BLOCK
+            {
+                return Err(H2Error::conn(ErrorCode::EnhanceYourCalm));
             }
             rs.header_buf.extend_from_slice(&payload);
             if header.has_flag(flag::END_HEADERS) {
