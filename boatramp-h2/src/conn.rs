@@ -32,7 +32,20 @@ struct Stream {
     header_buf: Vec<u8>,
     /// True once END_STREAM has been seen from the client for this stream.
     end_stream: bool,
+    /// The parsed request, held from when the initial header block completes until
+    /// END_STREAM (so a second HEADERS is trailers, not a new request).
+    request: Option<http::Request>,
+    headers_done: bool,
+    /// Declared `content-length`, validated against the DATA total at END_STREAM.
+    content_length: Option<u64>,
     body: Vec<u8>,
+    body_len: u64,
+    /// Unsent response body + how far we've sent. When `out_active`, a window
+    /// increase (WINDOW_UPDATE / SETTINGS) resumes sending from `out_off` (§6.9).
+    /// The M4 splice path swaps `out_body` for a spliced upstream source.
+    out_body: Vec<u8>,
+    out_off: usize,
+    out_active: bool,
 }
 
 impl Stream {
@@ -43,7 +56,14 @@ impl Stream {
             recv_window: settings::DEFAULT_INITIAL_WINDOW_SIZE as i64,
             header_buf: Vec::new(),
             end_stream: false,
+            request: None,
+            headers_done: false,
+            content_length: None,
             body: Vec::new(),
+            body_len: 0,
+            out_body: Vec::new(),
+            out_off: 0,
+            out_active: false,
         }
     }
 }
@@ -75,8 +95,10 @@ where
         return Ok(());
     }
     if preface != CLIENT_PREFACE {
-        // An invalid preface is a connection error of type PROTOCOL_ERROR (§3.5).
-        let _ = io.write_all(&frame::goaway(0, ErrorCode::ProtocolError, &[])).await;
+        // Invalid preface (§3.5): terminate the connection. §3.5 allows omitting
+        // GOAWAY, and sending one races the drop into a RST; a graceful write-side
+        // shutdown FINs cleanly, which is what conformance expects.
+        let _ = io.shutdown().await;
         return Ok(());
     }
     // Our SETTINGS (empty = all defaults), then run the loop.
@@ -121,8 +143,10 @@ where
         match dispatch(&mut conn, &mut io, header, payload, &handler).await {
             Ok(true) => {} // continue
             Ok(false) => {
-                // Graceful shutdown requested (GOAWAY received).
-                return goaway(&mut io, conn.last_client_id, ErrorCode::NoError).await;
+                // The peer sent GOAWAY: finish and close cleanly with a FIN (a
+                // GOAWAY-then-drop races into a RST, which conformance rejects).
+                let _ = io.shutdown().await;
+                return Ok(());
             }
             Err(H2Error::Connection(code)) => {
                 return goaway(&mut io, conn.last_client_id, code).await;
@@ -181,6 +205,8 @@ where
             io.write_all(&settings_ack())
                 .await
                 .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+            // A larger SETTINGS_INITIAL_WINDOW_SIZE may unblock stalled bodies.
+            flush_all(conn, io).await?;
             Ok(true)
         }
 
@@ -231,6 +257,12 @@ where
                         return Err(H2Error::stream(header.stream_id, ErrorCode::FlowControlError));
                     }
                 }
+            }
+            // A window increase may unblock a stalled response body (§6.9).
+            if header.stream_id == 0 {
+                flush_all(conn, io).await?;
+            } else {
+                flush_stream(conn, io, header.stream_id).await?;
             }
             Ok(true)
         }
@@ -375,14 +407,66 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
 {
-    let block = match conn.streams.get_mut(&sid) {
-        Some(s) => std::mem::take(&mut s.header_buf),
+    let (block, headers_done) = match conn.streams.get_mut(&sid) {
+        Some(s) => (std::mem::take(&mut s.header_buf), s.headers_done),
         None => return Err(H2Error::conn(ErrorCode::ProtocolError)),
     };
     let headers = conn.hpack.decode(&block)?; // COMPRESSION_ERROR is a connection error
-    let req = http::request_from_headers(sid, headers)?;
-    let end = conn.streams.get(&sid).is_some_and(|s| s.end_stream);
-    if end {
+    if headers_done {
+        // A second header block is trailers (§8.1.2.3): they MUST carry END_STREAM
+        // and MUST NOT contain pseudo-header fields. M1 doesn't surface the fields.
+        if !conn.streams.get(&sid).is_some_and(|s| s.end_stream) {
+            return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+        }
+        if headers.iter().any(|(n, _)| n.first() == Some(&b':')) {
+            return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+        }
+    } else {
+        let req = http::request_from_headers(sid, headers)?;
+        let cl = req
+            .headers
+            .iter()
+            .find(|(n, _)| n == b"content-length")
+            .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u64>().ok());
+        let s = conn.streams.get_mut(&sid).unwrap();
+        s.content_length = cl;
+        s.request = Some(req);
+        s.headers_done = true;
+    }
+    if conn.streams.get(&sid).is_some_and(|s| s.end_stream) {
+        maybe_respond(conn, io, sid, handler).await?;
+    }
+    Ok(())
+}
+
+/// On END_STREAM: validate the declared content-length against the DATA total
+/// (§8.1.2.6) and run the handler with the stored request.
+async fn maybe_respond<IO, H>(
+    conn: &mut Conn,
+    io: &mut IO,
+    sid: u32,
+    handler: &H,
+) -> Result<(), H2Error>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    H: Handler,
+{
+    let (cl, body_len) = {
+        let s = conn
+            .streams
+            .get(&sid)
+            .ok_or_else(|| H2Error::conn(ErrorCode::ProtocolError))?;
+        (s.content_length, s.body_len)
+    };
+    if cl.is_some_and(|cl| cl != body_len) {
+        return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
+    }
+    let (req, body) = {
+        let s = conn.streams.get_mut(&sid).unwrap();
+        (s.request.take(), std::mem::take(&mut s.body))
+    };
+    if let Some(mut req) = req {
+        req.body = body;
         respond(conn, io, sid, handler, req).await?;
     }
     Ok(())
@@ -419,6 +503,7 @@ where
     let s = conn.streams.get_mut(&sid).unwrap();
     s.state = next;
     s.body.extend_from_slice(data);
+    s.body_len += data.len() as u64;
     s.end_stream = end_stream;
     let _ = s.recv_window; // full flow-control accounting lands with the M4 body path
 
@@ -433,20 +518,7 @@ where
     }
 
     if end_stream {
-        let body = std::mem::take(&mut conn.streams.get_mut(&sid).unwrap().body);
-        // Rebuild the request from the (already-decoded) pseudo-headers is out of
-        // scope for M1's DATA path; the common benchmark shape is bodyless GET, so
-        // we reconstruct a minimal request. Full request-body plumbing is M3.
-        let mut req = http::Request {
-            method: b"POST".to_vec(),
-            scheme: b"https".to_vec(),
-            path: b"/".to_vec(),
-            authority: None,
-            headers: Vec::new(),
-            body,
-        };
-        req.body = std::mem::take(&mut req.body);
-        respond(conn, io, sid, handler, req).await?;
+        maybe_respond(conn, io, sid, handler).await?;
     }
     Ok(true)
 }
@@ -485,30 +557,17 @@ where
     }
     let mut out = Vec::new();
     frame::write_frame(&mut out, FrameType::Headers, hflags, sid, &block);
-    let mut sent_end = !has_body;
-    if has_body {
-        // Never exceed the stream or connection send window (§6.9). If the body
-        // doesn't fit, send what fits WITHOUT END_STREAM — completing a
-        // window-limited body is the M4 flow-controlled, spliced path.
-        let win = conn
-            .streams
-            .get(&sid)
-            .map_or(0, |s| s.send_window.max(0))
-            .min(conn.conn_send_window.max(0)) as usize;
-        let chunk = resp.body.len().min(conn.peer.max_frame_size as usize).min(win);
-        sent_end = chunk == resp.body.len();
-        out.extend_from_slice(&frame::data_header(sid, chunk as u32, sent_end));
-        out.extend_from_slice(&resp.body[..chunk]);
-        if let Some(s) = conn.streams.get_mut(&sid) {
-            s.send_window -= chunk as i64;
-        }
-        conn.conn_send_window -= chunk as i64;
-    }
     io.write_all(&out)
         .await
         .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-    if sent_end {
-        if let Some(s) = conn.streams.get_mut(&sid) {
+
+    if let Some(s) = conn.streams.get_mut(&sid) {
+        if has_body {
+            s.out_body = resp.body;
+            s.out_off = 0;
+            s.out_active = true;
+        } else {
+            // Bodyless response: HEADERS carried END_STREAM.
             s.state = if s.state == StreamState::HalfClosedRemote {
                 StreamState::Closed
             } else {
@@ -516,7 +575,74 @@ where
             };
         }
     }
+    if has_body {
+        flush_stream(conn, io, sid).await?;
+    }
     let _ = OUR_INITIAL_WINDOW;
+    Ok(())
+}
+
+/// Send as much of a stream's pending response body as the stream + connection send
+/// windows allow, END_STREAM on the final DATA frame. Called when the response is
+/// queued and again whenever a window increase (WINDOW_UPDATE / SETTINGS) reopens
+/// capacity (§6.9). This is the flow-control loop the M4 splice path reuses.
+async fn flush_stream<IO>(conn: &mut Conn, io: &mut IO, sid: u32) -> Result<(), H2Error>
+where
+    IO: AsyncWrite + Unpin,
+{
+    loop {
+        let remaining = match conn.streams.get(&sid) {
+            Some(s) if s.out_active => s.out_body.len() - s.out_off,
+            _ => return Ok(()),
+        };
+        let swin = conn.streams.get(&sid).map_or(0, |s| s.send_window.max(0));
+        let win = swin
+            .min(conn.conn_send_window.max(0))
+            .min(i64::from(conn.peer.max_frame_size)) as usize;
+        if win == 0 {
+            return Ok(()); // window exhausted; resume on the next WINDOW_UPDATE
+        }
+        let chunk = remaining.min(win);
+        let is_last = chunk == remaining;
+        let off = conn.streams.get(&sid).unwrap().out_off;
+        let mut out = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
+        out.extend_from_slice(&frame::data_header(sid, chunk as u32, is_last));
+        out.extend_from_slice(&conn.streams.get(&sid).unwrap().out_body[off..off + chunk]);
+        io.write_all(&out)
+            .await
+            .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+        conn.conn_send_window -= chunk as i64;
+        let s = conn.streams.get_mut(&sid).unwrap();
+        s.out_off += chunk;
+        s.send_window -= chunk as i64;
+        if is_last {
+            s.out_active = false;
+            s.out_body = Vec::new();
+            s.state = if s.state == StreamState::HalfClosedRemote {
+                StreamState::Closed
+            } else {
+                StreamState::HalfClosedLocal
+            };
+            return Ok(());
+        }
+    }
+}
+
+/// Resume every stream with a pending response (after a connection-level window
+/// increase or a SETTINGS_INITIAL_WINDOW_SIZE bump).
+async fn flush_all<IO>(conn: &mut Conn, io: &mut IO) -> Result<(), H2Error>
+where
+    IO: AsyncWrite + Unpin,
+{
+    let ids: Vec<u32> = conn
+        .streams
+        .iter()
+        .filter(|(_, s)| s.out_active)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        flush_stream(conn, io, id).await?;
+    }
     Ok(())
 }
 
