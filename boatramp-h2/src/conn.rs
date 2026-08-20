@@ -1,12 +1,15 @@
 //! The HTTP/2 connection driver: preface, SETTINGS negotiation, and the
 //! read/dispatch loop that enforces framing, stream state (via [`crate::stream`]),
-//! flow control, and the connection-vs-stream error split. Single-task and
-//! plaintext (h2c) — enough to be driven to conformance against h2spec; TLS and the
-//! zero-copy splice body path layer on top (M4).
+//! flow control, and the connection-vs-stream error split. Single-task; the driver
+//! talks only to [`crate::wire::Wire`], so it is identical whether the transport is a
+//! plain buffered stream (tests, plaintext h2c) or a splice-capable kTLS socket
+//! (`serve_connection_ktls`) where the response body is moved kernel-to-kernel.
 
 use std::collections::HashMap;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncReadExt;
 
 use crate::error::{ErrorCode, H2Error};
 use crate::frame::{self, flag, FrameHeader, FrameType};
@@ -14,6 +17,7 @@ use crate::hpack::Hpack;
 use crate::http::{self, Handler, Response};
 use crate::settings::{self, Settings};
 use crate::stream::StreamState;
+use crate::wire::Wire;
 use crate::CLIENT_PREFACE;
 
 /// Our advertised SETTINGS_MAX_FRAME_SIZE. 16 KiB (the default + minimum) keeps
@@ -21,6 +25,10 @@ use crate::CLIENT_PREFACE;
 const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
 /// Our advertised SETTINGS_INITIAL_WINDOW_SIZE for streams the client opens.
 const OUR_INITIAL_WINDOW: i32 = settings::DEFAULT_INITIAL_WINDOW_SIZE as i32;
+/// Ceiling on a single emitted DATA frame, so the splice path's coalescing pipe
+/// (grown to 256 KiB) never overflows. Well above the usual 16 KiB negotiated
+/// SETTINGS_MAX_FRAME_SIZE, so it only bites a client that raises the limit.
+const MAX_OUT_FRAME: usize = 128 * 1024;
 
 struct Stream {
     state: StreamState,
@@ -81,30 +89,41 @@ struct Conn {
     pending_end_stream: bool,
 }
 
-/// Serve one HTTP/2 connection to completion. Returns `Ok(())` on a clean close
-/// (client EOF or GOAWAY exchange); framing/protocol violations are turned into a
-/// `GOAWAY` and also return `Ok(())` — the connection is done either way.
-pub async fn serve_connection<IO, H>(mut io: IO, handler: H) -> std::io::Result<()>
+/// Serve one HTTP/2 connection to completion over any `AsyncRead + AsyncWrite`
+/// transport (buffered path: tests, plaintext h2c). Returns `Ok(())` on a clean
+/// close (client EOF or GOAWAY exchange); framing/protocol violations are turned
+/// into a `GOAWAY` and also return `Ok(())` — the connection is done either way.
+pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    H: Handler,
+{
+    let mut wire = Wire::Buffered(io);
+    serve_connection_wire(&mut wire, handler).await
+}
+
+/// The transport-agnostic connection loop: everything reads/writes through `wire`.
+async fn serve_connection_wire<IO, H>(wire: &mut Wire<IO>, handler: H) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
 {
     // Client connection preface (RFC 7540 §3.5).
     let mut preface = [0u8; 24];
-    if io.read_exact(&mut preface).await.is_err() {
+    if wire.read_exact(&mut preface).await.is_err() {
         return Ok(());
     }
     if preface != CLIENT_PREFACE {
         // Invalid preface (§3.5): terminate the connection. §3.5 allows omitting
         // GOAWAY, and sending one races the drop into a RST; a graceful write-side
         // shutdown FINs cleanly, which is what conformance expects.
-        let _ = io.shutdown().await;
+        let _ = wire.shutdown().await;
         return Ok(());
     }
     // Our SETTINGS (empty = all defaults), then run the loop.
     let mut out = Vec::new();
     frame::write_frame(&mut out, FrameType::Settings, 0, 0, &[]);
-    io.write_all(&out).await?;
+    wire.write_all(&out).await?;
 
     let mut conn = Conn {
         peer: Settings::default(),
@@ -119,43 +138,43 @@ where
     loop {
         // Read one frame header.
         let mut hdr = [0u8; frame::FRAME_HEADER_LEN];
-        if io.read_exact(&mut hdr).await.is_err() {
+        if wire.read_exact(&mut hdr).await.is_err() {
             return Ok(()); // client closed
         }
         let header = FrameHeader::parse(&hdr);
 
         // Frame size limit (§4.2): oversize is a connection FRAME_SIZE_ERROR.
         if header.length > OUR_MAX_FRAME_SIZE {
-            return goaway(&mut io, conn.last_client_id, ErrorCode::FrameSizeError).await;
+            return goaway(wire, conn.last_client_id, ErrorCode::FrameSizeError).await;
         }
         let mut payload = vec![0u8; header.length as usize];
-        if header.length > 0 && io.read_exact(&mut payload).await.is_err() {
+        if header.length > 0 && wire.read_exact(&mut payload).await.is_err() {
             return Ok(());
         }
 
         // While mid-header-block, only a CONTINUATION on the same stream is legal (§6.2).
         if let Some(sid) = conn.expecting_continuation {
             if header.kind != FrameType::Continuation || header.stream_id != sid {
-                return goaway(&mut io, conn.last_client_id, ErrorCode::ProtocolError).await;
+                return goaway(wire, conn.last_client_id, ErrorCode::ProtocolError).await;
             }
         }
 
-        match dispatch(&mut conn, &mut io, header, payload, &handler).await {
+        match dispatch(&mut conn, wire, header, payload, &handler).await {
             Ok(true) => {} // continue
             Ok(false) => {
                 // The peer sent GOAWAY: finish and close cleanly with a FIN (a
                 // GOAWAY-then-drop races into a RST, which conformance rejects).
-                let _ = io.shutdown().await;
+                let _ = wire.shutdown().await;
                 return Ok(());
             }
             Err(H2Error::Connection(code)) => {
-                return goaway(&mut io, conn.last_client_id, code).await;
+                return goaway(wire, conn.last_client_id, code).await;
             }
             Err(H2Error::Stream { id, code }) => {
                 if let Some(s) = conn.streams.get_mut(&id) {
                     s.state = StreamState::Closed;
                 }
-                io.write_all(&frame::rst_stream(id, code)).await?;
+                wire.write_all(&frame::rst_stream(id, code)).await?;
             }
         }
     }
@@ -165,7 +184,7 @@ where
 /// scoped [`H2Error`].
 async fn dispatch<IO, H>(
     conn: &mut Conn,
-    io: &mut IO,
+    wire: &mut Wire<IO>,
     header: FrameHeader,
     payload: Vec<u8>,
     handler: &H,
@@ -202,11 +221,11 @@ where
                     }
                 }
             }
-            io.write_all(&settings_ack())
+            wire.write_all(&settings_ack())
                 .await
                 .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
             // A larger SETTINGS_INITIAL_WINDOW_SIZE may unblock stalled bodies.
-            flush_all(conn, io).await?;
+            flush_all(conn, wire).await?;
             Ok(true)
         }
 
@@ -218,7 +237,7 @@ where
             if !header.has_flag(flag::ACK) {
                 let mut out = Vec::with_capacity(frame::FRAME_HEADER_LEN + 8);
                 frame::write_frame(&mut out, FrameType::Ping, flag::ACK, 0, &data);
-                io.write_all(&out)
+                wire.write_all(&out)
                     .await
                     .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
             }
@@ -260,9 +279,9 @@ where
             }
             // A window increase may unblock a stalled response body (§6.9).
             if header.stream_id == 0 {
-                flush_all(conn, io).await?;
+                flush_all(conn, wire).await?;
             } else {
-                flush_stream(conn, io, header.stream_id).await?;
+                flush_stream(conn, wire, header.stream_id).await?;
             }
             Ok(true)
         }
@@ -296,9 +315,7 @@ where
             Ok(true)
         }
 
-        FrameType::Headers => {
-            headers_frame(conn, io, header, payload, handler).await
-        }
+        FrameType::Headers => headers_frame(conn, wire, header, payload, handler).await,
 
         FrameType::Continuation => {
             // A CONTINUATION MUST be preceded by a HEADERS/CONTINUATION without
@@ -312,12 +329,12 @@ where
             }
             if header.has_flag(flag::END_HEADERS) {
                 conn.expecting_continuation = None;
-                finish_headers(conn, io, sid, handler).await?;
+                finish_headers(conn, wire, sid, handler).await?;
             }
             Ok(true)
         }
 
-        FrameType::Data => data_frame(conn, io, header, payload, handler).await,
+        FrameType::Data => data_frame(conn, wire, header, payload, handler).await,
 
         // SETTINGS/PING/GOAWAY on non-zero streams were handled above; PUSH_PROMISE
         // from a client is illegal; unknown types are ignored (§4.1, §5.5).
@@ -328,7 +345,7 @@ where
 
 async fn headers_frame<IO, H>(
     conn: &mut Conn,
-    io: &mut IO,
+    wire: &mut Wire<IO>,
     header: FrameHeader,
     payload: Vec<u8>,
     handler: &H,
@@ -387,7 +404,7 @@ where
     s.header_buf.extend_from_slice(block);
 
     if header.has_flag(flag::END_HEADERS) {
-        finish_headers(conn, io, sid, handler).await?;
+        finish_headers(conn, wire, sid, handler).await?;
     } else {
         conn.expecting_continuation = Some(sid);
         conn.pending_end_stream = end_stream;
@@ -399,7 +416,7 @@ where
 /// arrived — run the handler and send the response.
 async fn finish_headers<IO, H>(
     conn: &mut Conn,
-    io: &mut IO,
+    wire: &mut Wire<IO>,
     sid: u32,
     handler: &H,
 ) -> Result<(), H2Error>
@@ -434,7 +451,7 @@ where
         s.headers_done = true;
     }
     if conn.streams.get(&sid).is_some_and(|s| s.end_stream) {
-        maybe_respond(conn, io, sid, handler).await?;
+        maybe_respond(conn, wire, sid, handler).await?;
     }
     Ok(())
 }
@@ -443,7 +460,7 @@ where
 /// (§8.1.2.6) and run the handler with the stored request.
 async fn maybe_respond<IO, H>(
     conn: &mut Conn,
-    io: &mut IO,
+    wire: &mut Wire<IO>,
     sid: u32,
     handler: &H,
 ) -> Result<(), H2Error>
@@ -467,14 +484,14 @@ where
     };
     if let Some(mut req) = req {
         req.body = body;
-        respond(conn, io, sid, handler, req).await?;
+        respond(conn, wire, sid, handler, req).await?;
     }
     Ok(())
 }
 
 async fn data_frame<IO, H>(
     conn: &mut Conn,
-    io: &mut IO,
+    wire: &mut Wire<IO>,
     header: FrameHeader,
     payload: Vec<u8>,
     handler: &H,
@@ -512,13 +529,13 @@ where
         let mut out = Vec::new();
         frame::write_frame(&mut out, FrameType::WindowUpdate, 0, 0, &(n as u32).to_be_bytes());
         frame::write_frame(&mut out, FrameType::WindowUpdate, 0, sid, &(n as u32).to_be_bytes());
-        io.write_all(&out)
+        wire.write_all(&out)
             .await
             .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
     }
 
     if end_stream {
-        maybe_respond(conn, io, sid, handler).await?;
+        maybe_respond(conn, wire, sid, handler).await?;
     }
     Ok(true)
 }
@@ -528,7 +545,7 @@ where
 /// is the M4 splice seam.
 async fn respond<IO, H>(
     conn: &mut Conn,
-    io: &mut IO,
+    wire: &mut Wire<IO>,
     sid: u32,
     handler: &H,
     req: http::Request,
@@ -557,7 +574,7 @@ where
     }
     let mut out = Vec::new();
     frame::write_frame(&mut out, FrameType::Headers, hflags, sid, &block);
-    io.write_all(&out)
+    wire.write_all(&out)
         .await
         .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
 
@@ -576,7 +593,7 @@ where
         }
     }
     if has_body {
-        flush_stream(conn, io, sid).await?;
+        flush_stream(conn, wire, sid).await?;
     }
     let _ = OUR_INITIAL_WINDOW;
     Ok(())
@@ -585,10 +602,16 @@ where
 /// Send as much of a stream's pending response body as the stream + connection send
 /// windows allow, END_STREAM on the final DATA frame. Called when the response is
 /// queued and again whenever a window increase (WINDOW_UPDATE / SETTINGS) reopens
-/// capacity (§6.9). This is the flow-control loop the M4 splice path reuses.
-async fn flush_stream<IO>(conn: &mut Conn, io: &mut IO, sid: u32) -> Result<(), H2Error>
+/// capacity (§6.9).
+///
+/// A `Body::Bytes` is copied into the frame in userspace. A `Body::Splice` on a
+/// splice-capable wire (kTLS socket) is moved kernel-to-kernel — the DATA header and
+/// the upstream body drain through one pipe into the connection fd with `splice()`,
+/// the kernel encrypting on TX — with only the 9-byte header touching userspace; on a
+/// buffered wire (plaintext h2c) it degrades to a userspace read+write.
+async fn flush_stream<IO>(conn: &mut Conn, wire: &mut Wire<IO>, sid: u32) -> Result<(), H2Error>
 where
-    IO: AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
         let remaining = match conn.streams.get(&sid) {
@@ -598,36 +621,49 @@ where
         let swin = conn.streams.get(&sid).map_or(0, |s| s.send_window.max(0));
         let win = swin
             .min(conn.conn_send_window.max(0))
-            .min(i64::from(conn.peer.max_frame_size)) as usize;
+            .min(i64::from(conn.peer.max_frame_size))
+            .min(MAX_OUT_FRAME as i64) as usize;
         if win == 0 {
             return Ok(()); // window exhausted; resume on the next WINDOW_UPDATE
         }
         let chunk = remaining.min(win);
         let is_last = chunk == remaining;
         let off = conn.streams.get(&sid).unwrap().out_off;
-        let mut buf = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
-        buf.extend_from_slice(&frame::data_header(sid, chunk as u32, is_last));
+        let hdr = frame::data_header(sid, chunk as u32, is_last);
+        #[cfg(target_os = "linux")]
+        let can_splice = wire.can_splice();
         match &mut conn.streams.get_mut(&sid).unwrap().out {
             http::Body::Bytes(b) => {
+                let mut buf = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
+                buf.extend_from_slice(&hdr);
                 buf.extend_from_slice(&b[off..off + chunk]);
-                io.write_all(&buf)
+                wire.write_all(&buf)
                     .await
                     .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
             }
             #[cfg(target_os = "linux")]
             http::Body::Splice { upstream, .. } => {
-                // M4a: stream `chunk` bytes from the upstream in userspace. M4b
-                // replaces this with splice(upstream -> pipe -> kTLS fd) so the body
-                // is never copied and the kernel encrypts on TX.
-                let start = buf.len();
-                buf.resize(start + chunk, 0);
-                upstream
-                    .read_exact(&mut buf[start..])
-                    .await
-                    .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-                io.write_all(&buf)
-                    .await
-                    .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+                if can_splice {
+                    // Zero-copy: splice(upstream -> pipe -> connection fd); the DATA
+                    // header rides in the same TLS record as the body.
+                    wire.splice_data_frame(upstream, &hdr, chunk)
+                        .await
+                        .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+                } else {
+                    // Buffered wire (plaintext h2c): stream `chunk` bytes from the
+                    // upstream through userspace.
+                    let mut buf = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
+                    buf.extend_from_slice(&hdr);
+                    let start = buf.len();
+                    buf.resize(start + chunk, 0);
+                    upstream
+                        .read_exact(&mut buf[start..])
+                        .await
+                        .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+                    wire.write_all(&buf)
+                        .await
+                        .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
+                }
             }
         }
         conn.conn_send_window -= chunk as i64;
@@ -647,9 +683,9 @@ where
     }
 }
 
-/// Serve one HTTP/2 connection over a TCP socket (h2c). M4a routes `Body::Splice`
-/// through the userspace streaming path in `flush_stream`; M4b adds the kTLS
-/// handoff and kernel `splice()` into this socket's fd for the zero-copy body.
+/// Serve one HTTP/2 connection over a plaintext TCP socket (h2c). `Body::Splice`
+/// routes through the userspace streaming path in `flush_stream`; the kernel splice +
+/// kTLS zero-copy body is `serve_connection_ktls`.
 #[cfg(target_os = "linux")]
 pub async fn serve_connection_tcp<H>(tcp: tokio::net::TcpStream, handler: H) -> std::io::Result<()>
 where
@@ -658,11 +694,41 @@ where
     serve_connection(tcp, handler).await
 }
 
+/// Serve one HTTP/2 connection over **kTLS**: perform the rustls handshake, hand the
+/// socket off to the kernel TLS state machine, then drive the h2 loop over the raw fd
+/// — so a `Body::Splice` response is moved upstream→pipe→socket with `splice()` and
+/// the kernel encrypts on TX. The `ServerConfig` behind `acceptor` MUST have
+/// `enable_secret_extraction = true` and advertise ALPN `h2`.
+#[cfg(target_os = "linux")]
+pub async fn serve_connection_ktls<H>(
+    tcp: tokio::net::TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
+    handler: H,
+) -> std::io::Result<()>
+where
+    H: Handler,
+{
+    tcp.set_nodelay(true).ok();
+    // CorkStream makes rustls read one TLS record at a time so the handshake ends on
+    // a record boundary — a prerequisite for the kTLS handoff.
+    let tls = acceptor.accept(ktls::CorkStream::new(tcp)).await?;
+    let kstream = ktls::config_ktls_server(tls)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("ktls: {e}")))?;
+    // Reclaim the owned TcpStream + any plaintext rustls drained before kTLS took over
+    // the socket (a raw recv() would otherwise miss those bytes). `config_ktls_server`
+    // unwraps the CorkStream, so `into_raw` yields the bare TcpStream.
+    let (drained, sock) = kstream.into_raw();
+    let sock = crate::wire::Socket::new(sock, drained.unwrap_or_default())?;
+    let mut wire: Wire<tokio::net::TcpStream> = Wire::Socket(sock);
+    serve_connection_wire(&mut wire, handler).await
+}
+
 /// Resume every stream with a pending response (after a connection-level window
 /// increase or a SETTINGS_INITIAL_WINDOW_SIZE bump).
-async fn flush_all<IO>(conn: &mut Conn, io: &mut IO) -> Result<(), H2Error>
+async fn flush_all<IO>(conn: &mut Conn, wire: &mut Wire<IO>) -> Result<(), H2Error>
 where
-    IO: AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
     let ids: Vec<u32> = conn
         .streams
@@ -671,7 +737,7 @@ where
         .map(|(id, _)| *id)
         .collect();
     for id in ids {
-        flush_stream(conn, io, id).await?;
+        flush_stream(conn, wire, id).await?;
     }
     Ok(())
 }
@@ -682,10 +748,10 @@ fn settings_ack() -> Vec<u8> {
     out
 }
 
-async fn goaway<IO>(io: &mut IO, last: u32, code: ErrorCode) -> std::io::Result<()>
+async fn goaway<IO>(wire: &mut Wire<IO>, last: u32, code: ErrorCode) -> std::io::Result<()>
 where
-    IO: AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
-    io.write_all(&frame::goaway(last, code, &[])).await?;
+    wire.write_all(&frame::goaway(last, code, &[])).await?;
     Ok(())
 }

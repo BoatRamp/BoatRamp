@@ -36,10 +36,11 @@ pub mod hpack;
 pub mod http;
 pub mod settings;
 pub mod stream;
+mod wire;
 
 pub use conn::serve_connection;
 #[cfg(target_os = "linux")]
-pub use conn::serve_connection_tcp;
+pub use conn::{serve_connection_ktls, serve_connection_tcp};
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
 pub use http::{Body, Handler, Request, Response};
