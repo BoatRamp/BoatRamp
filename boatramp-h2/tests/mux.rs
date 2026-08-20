@@ -136,6 +136,154 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
     assert!(body[1024..2048].iter().all(|&b| b == b'b'));
 }
 
+/// Backpressure: a client that opens a stream but never reads it (its flow-control
+/// window stays closed) must NOT cause the driver to pull an unbounded streamed body
+/// into memory. The driver must stop polling the source once its per-stream send
+/// buffer fills, and resume only as the client releases capacity. Without
+/// backpressure the driver drains all 10 000 chunks (10 MB) into the outbox.
+#[tokio::test]
+async fn slow_client_backpressures_a_large_streamed_body() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_stream::StreamExt as _;
+    use boatramp_h2::Body;
+
+    struct Streamer(Arc<AtomicUsize>);
+    impl Handler for Streamer {
+        async fn handle(&self, _req: Request) -> Response {
+            let pulled = self.0.clone();
+            // 10 000 × 1 KiB = 10 MB, far larger than any window + backpressure bound.
+            let src = tokio_stream::iter(0..10_000u32).map(move |_| {
+                pulled.fetch_add(1, Ordering::SeqCst);
+                Bytes::from(vec![b'y'; 1024])
+            });
+            response(200, Body::stream(src))
+        }
+    }
+
+    let pulled = Arc::new(AtomicUsize::new(0));
+    let mut client = connect_with(Streamer(pulled.clone())).await;
+    let _response = get(&mut client, "/firehose").await.unwrap();
+    assert_eq!(_response.status(), 200);
+    // Do NOT read the body: the stream window stays closed. Give the handler task
+    // ample time to drain the source if it's going to. `_response` is held so the
+    // stream is not reset (backpressure, not cancellation, is what must stop it).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let n = pulled.load(Ordering::SeqCst);
+    assert!(
+        n < 3000,
+        "no backpressure: driver pulled {n}/10000 chunks into memory with a closed window"
+    );
+}
+
+/// A client that resets a stream mid-body (here by abandoning it) must not wedge the
+/// driver: a producer parked on backpressure is woken and stops, and the connection
+/// keeps serving. Exercises the reset-while-a-producer-is-parked path.
+#[tokio::test]
+async fn client_reset_midstream_does_not_wedge_the_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio_stream::StreamExt as _;
+    use boatramp_h2::Body;
+
+    struct Mixed(Arc<AtomicUsize>);
+    impl Handler for Mixed {
+        async fn handle(&self, req: Request) -> Response {
+            if req.uri().path() == "/ping" {
+                return response(200, b"pong".to_vec());
+            }
+            let pulled = self.0.clone();
+            let src = tokio_stream::iter(0..1_000_000u32).map(move |_| {
+                pulled.fetch_add(1, Ordering::SeqCst);
+                Bytes::from(vec![b'z'; 1024])
+            });
+            response(200, Body::stream(src))
+        }
+    }
+
+    let pulled = Arc::new(AtomicUsize::new(0));
+    let mut client = connect_with(Mixed(pulled.clone())).await;
+    let resp = get(&mut client, "/stream").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    // Read a few chunks (releasing capacity so the producer runs), then abandon the
+    // stream → the client sends RST_STREAM, waking + stopping the producer.
+    for _ in 0..5 {
+        if let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+    }
+    drop(body);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let a = pulled.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let b = pulled.load(Ordering::SeqCst);
+    assert!(b <= a + 2, "producer kept pulling after the client reset: {a} -> {b}");
+
+    // The connection is not wedged: a fresh request on it still round-trips.
+    client = client.ready().await.unwrap();
+    let ping = get(&mut client, "/ping").await.unwrap();
+    assert_eq!(ping.status(), 200);
+    assert_eq!(read_body(ping.into_body()).await, b"pong");
+}
+
+/// A streamed body whose source fails mid-stream must RST_STREAM the client, so a
+/// truncated body is never framed as a clean end — which, with no `content-length`,
+/// the client couldn't otherwise tell apart from success (silent corruption). The
+/// error surfaces either as a failed response future (if it hits before HEADERS flush)
+/// or as a reset partway through the body; both are "the client sees an error", which
+/// is the property that matters. The source flushes two chunks first (realistic proxy
+/// timing) so the common 200-then-reset path is exercised.
+#[tokio::test]
+async fn upstream_error_midstream_resets_the_client_not_a_clean_end() {
+    use std::time::Duration;
+    use boatramp_h2::{Body, BodyChunk, BodyError};
+
+    struct Failing;
+    impl Handler for Failing {
+        async fn handle(&self, _req: Request) -> Response {
+            let (tx, rx) = tokio::sync::mpsc::channel::<BodyChunk>(1);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(Bytes::from_static(b"aaaa"))).await;
+                let _ = tx.send(Ok(Bytes::from_static(b"bbbb"))).await;
+                // Let the writer flush HEADERS + the two DATA frames before failing.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let _ = tx.send(Err(BodyError)).await;
+            });
+            response(200, Body::try_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        }
+    }
+
+    let mut client = connect_with(Failing).await;
+    let mut saw_error = false;
+    let mut got = Vec::new();
+    match get(&mut client, "/dies").await {
+        // Reset before HEADERS were delivered — the client still sees an error.
+        Err(_) => saw_error = true,
+        Ok(resp) => {
+            assert_eq!(resp.status(), 200);
+            let mut body = resp.into_body();
+            while let Some(chunk) = body.data().await {
+                match chunk {
+                    Ok(c) => {
+                        let _ = body.flow_control().release_capacity(c.len());
+                        got.extend_from_slice(&c);
+                    }
+                    Err(_) => {
+                        saw_error = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        saw_error,
+        "mid-stream failure was framed as a clean end (silent truncation); got {} bytes",
+        got.len()
+    );
+}
+
 #[tokio::test]
 async fn post_with_trailers_is_accepted() {
     let mut client = connect().await;

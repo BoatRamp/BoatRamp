@@ -581,8 +581,11 @@ where
     let body = match body {
         http::Body::Stream(mut stream) => {
             let mut buf = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                buf.extend_from_slice(&chunk);
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => buf.extend_from_slice(&chunk),
+                    Err(_) => break, // upstream failed mid-stream; serve what we have
+                }
             }
             http::Body::Bytes(buf)
         }

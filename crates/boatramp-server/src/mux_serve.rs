@@ -19,7 +19,10 @@ use std::sync::Arc;
 
 use axum::http;
 use axum::Router;
-use boatramp_h2::{serve_connection_mux, Body as MuxBody, Handler, Request as MuxRequest, Response as MuxResponse};
+use boatramp_h2::{
+    serve_connection_mux, Body as MuxBody, BodyError as MuxBodyError, Handler,
+    Request as MuxRequest, Response as MuxResponse,
+};
 use futures::StreamExt as _;
 use http_body_util::BodyStream;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -68,16 +71,20 @@ impl Handler for RouterHandler {
         parts.headers.remove("keep-alive");
         // Hand the router's body to the driver as a pull `Stream` it polls itself —
         // no producer task, no channel, no buffering (so unbounded bodies stream too).
-        // Data frames only; empty frames are dropped (trailers aren't framed here).
+        // Data frames pass through; a body error (an upstream that dropped mid-stream)
+        // becomes a `BodyError` so the driver RST_STREAMs the client instead of framing
+        // a truncated body as complete; trailer/empty frames are dropped.
         let chunks = BodyStream::new(body).filter_map(|frame| {
-            std::future::ready(
-                frame
+            std::future::ready(match frame {
+                Ok(f) => f
+                    .into_data()
                     .ok()
-                    .and_then(|f| f.into_data().ok())
-                    .filter(|b| !b.is_empty()),
-            )
+                    .filter(|b| !b.is_empty())
+                    .map(Ok),
+                Err(_) => Some(Err(MuxBodyError)),
+            })
         });
-        http::Response::from_parts(parts, MuxBody::stream(chunks))
+        http::Response::from_parts(parts, MuxBody::try_stream(chunks))
     }
 }
 

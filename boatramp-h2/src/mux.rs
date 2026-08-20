@@ -51,6 +51,15 @@ const RAPID_RESET_MIN: u64 = 100;
 /// Soft target for one batched socket write: keep draining ready streams into the
 /// buffer until it reaches this, then write and start a fresh batch.
 const WRITE_BATCH_TARGET: usize = 64 * 1024;
+/// A streaming producer stops pulling its source once this many response bytes are
+/// queued-but-unsent for its stream (the writer is behind — usually a flow-control
+/// window the slow client hasn't opened). Bounds per-stream memory regardless of body
+/// size; large enough to keep the writer fed across a batch + a window.
+const STREAM_HIGH_WATER: usize = 256 * 1024;
+/// A parked streaming producer resumes once the writer drains the per-stream buffer
+/// back below this. The gap to [`STREAM_HIGH_WATER`] gives hysteresis so a producer
+/// isn't woken for every frame the writer sends.
+const STREAM_LOW_WATER: usize = 128 * 1024;
 
 /// A response frame a handler has produced, awaiting the writer + flow control.
 enum OutFrame {
@@ -73,6 +82,14 @@ struct MuxStream {
     queued: bool,
     /// Reset by the peer or a local stream error — drop its pending output.
     reset: bool,
+    /// Bytes of DATA queued in `outbox` but not yet written — the per-stream send
+    /// buffer depth. A streaming producer pauses when this crosses [`STREAM_HIGH_WATER`]
+    /// and resumes (via [`MuxStream::drain`]) once the writer drains it below
+    /// [`STREAM_LOW_WATER`], so a slow client can't force the whole body into memory.
+    unsent: usize,
+    /// Woken by the writer when `unsent` falls below the low-water mark, to resume a
+    /// producer parked on backpressure.
+    drain: Arc<Notify>,
 }
 
 impl MuxStream {
@@ -83,6 +100,8 @@ impl MuxStream {
             outbox: VecDeque::new(),
             queued: false,
             reset: false,
+            unsent: 0,
+            drain: Arc::new(Notify::new()),
         }
     }
 }
@@ -159,6 +178,12 @@ where
     {
         let mut s = shared.lock().unwrap();
         s.reader_done = true;
+        // Wake any producers parked on backpressure so they observe the teardown and
+        // stop (a window-blocked stream can no longer make progress once the client is
+        // gone), rather than parking forever.
+        for st in s.streams.values() {
+            st.drain.notify_one();
+        }
     }
     notify.notify_one();
 }
@@ -237,6 +262,7 @@ where
                     if let Some(st) = s.streams.get_mut(&id) {
                         st.state = StreamState::Closed;
                         st.reset = true;
+                        st.drain.notify_one(); // wake a producer parked on backpressure
                     }
                 }
                 push_ctrl(shared, notify, |out| {
@@ -362,6 +388,7 @@ where
             if let Some(st) = s.streams.get_mut(&header.stream_id) {
                 st.state = StreamState::Closed;
                 st.reset = true;
+                st.drain.notify_one(); // wake a producer parked on backpressure
             }
             // Rapid Reset (CVE-2023-44487): a stream reset by the peer frees its
             // concurrency slot, so a flood of open-then-reset lets an attacker force
@@ -584,9 +611,23 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
             if !push_out(shared, notify, sid, OutFrame::Headers { fields, end_stream: false }) {
                 return;
             }
+            // The per-stream drain signal the writer uses to wake us off backpressure.
+            let drain = match shared.lock().unwrap().streams.get(&sid) {
+                Some(st) if !st.reset => st.drain.clone(),
+                _ => return,
+            };
             // Poll the stream directly in this per-stream task — no channel, no
             // producer task; the writer frames each chunk as it arrives.
-            while let Some(chunk) = stream.next().await {
+            while let Some(item) = stream.next().await {
+                let chunk = match item {
+                    Ok(chunk) => chunk,
+                    // The source failed mid-stream (e.g. a proxy upstream dropped): reset
+                    // the client stream so a truncated body is never framed as complete.
+                    Err(_) => {
+                        reset_local(shared, notify, sid, ErrorCode::InternalError);
+                        return;
+                    }
+                };
                 if chunk.is_empty() {
                     continue;
                 }
@@ -598,8 +639,35 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
                 ) {
                     return; // the stream was reset — stop pulling from the producer
                 }
+                // Backpressure: once the per-stream send buffer crosses the high-water
+                // mark (the writer is behind — usually a flow-control window the slow
+                // client hasn't opened), stop pulling the source until the writer
+                // drains it below the low-water mark. Bounds per-stream memory to
+                // ~STREAM_HIGH_WATER regardless of body size.
+                loop {
+                    let over = {
+                        let s = shared.lock().unwrap();
+                        match s.streams.get(&sid) {
+                            // A reset/gone stream, or a torn-down connection whose window
+                            // can no longer reopen, means we stop producing.
+                            Some(st) if st.reset => return,
+                            Some(st) if st.unsent > STREAM_HIGH_WATER => {
+                                if s.reader_done {
+                                    return;
+                                }
+                                true
+                            }
+                            Some(_) => false,
+                            None => return,
+                        }
+                    };
+                    if !over {
+                        break;
+                    }
+                    drain.notified().await;
+                }
             }
-            // The channel closed: end the stream with an empty END_STREAM DATA frame.
+            // The source ended: close the stream with an empty END_STREAM DATA frame.
             push_out(
                 shared,
                 notify,
@@ -609,10 +677,20 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
         }
         other => {
             let frames = response_to_frames(parts, other).await;
+            // Seed the backpressure counter with this response's unsent DATA bytes so
+            // the writer's accounting stays balanced (a buffered body never parks).
+            let unsent: usize = frames
+                .iter()
+                .map(|f| match f {
+                    OutFrame::Data { bytes, off, .. } => bytes.len() - off,
+                    _ => 0,
+                })
+                .sum();
             {
                 let mut s = shared.lock().unwrap();
                 if let Some(st) = s.streams.get_mut(&sid) {
                     if !st.reset {
+                        st.unsent = unsent;
                         st.outbox = frames;
                     }
                 }
@@ -644,18 +722,43 @@ fn response_fields(
 }
 
 /// Append one frame to a stream's outbox, mark it ready, and wake the writer. Returns
-/// `false` if the stream was reset or gone (the caller should stop producing).
+/// `false` if the stream was reset or gone (the caller should stop producing). DATA
+/// bytes are added to the stream's `unsent` depth for backpressure accounting.
 fn push_out(shared: &Conn, notify: &Arc<Notify>, sid: u32, frame: OutFrame) -> bool {
     {
         let mut s = shared.lock().unwrap();
         match s.streams.get_mut(&sid) {
-            Some(st) if !st.reset => st.outbox.push_back(frame),
+            Some(st) if !st.reset => {
+                if let OutFrame::Data { bytes, off, .. } = &frame {
+                    st.unsent += bytes.len() - off;
+                }
+                st.outbox.push_back(frame);
+            }
             _ => return false,
         }
         s.mark_ready(sid);
     }
     notify.notify_one();
     true
+}
+
+/// Reset a stream locally: mark it reset (so the writer drops its pending output) and
+/// queue an RST_STREAM to the client. Used when a streamed body's source fails
+/// mid-stream — the client then sees an aborted response, not a silently truncated one.
+fn reset_local(shared: &Conn, notify: &Arc<Notify>, sid: u32, code: ErrorCode) {
+    {
+        let mut s = shared.lock().unwrap();
+        match s.streams.get_mut(&sid) {
+            Some(st) if !st.reset => {
+                st.reset = true;
+                st.state = StreamState::Closed;
+            }
+            _ => return, // already reset or gone
+        }
+    }
+    push_ctrl(shared, notify, |out| {
+        out.extend_from_slice(&frame::rst_stream(sid, code))
+    });
 }
 
 /// Turn a [`Response`] into queued HEADERS (+ DATA) frames. A `Body::Splice` is read
@@ -691,11 +794,16 @@ async fn body_bytes(body: http::Body) -> Vec<u8> {
             buf
         }
         // `emit_response` streams a `Body::Stream` directly and never routes it here;
-        // buffer it if it ever does, so this stays correct.
+        // buffer it if it ever does, so this stays correct. A mid-stream error ends the
+        // drain (best-effort — this fallback is only reached if a stream is ever routed
+        // through the buffered path).
         http::Body::Stream(mut stream) => {
             let mut buf = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                buf.extend_from_slice(&chunk);
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => buf.extend_from_slice(&chunk),
+                    Err(_) => break,
+                }
             }
             buf
         }
@@ -902,7 +1010,7 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
                 batch.push_body(bytes.slice(off..off + chunk));
             }
             s.conn_send_window -= chunk as i64;
-            {
+            let wake = {
                 let st = s.streams.get_mut(&id).unwrap();
                 st.send_window -= chunk as i64;
                 if let Some(OutFrame::Data { off, .. }) = st.outbox.front_mut() {
@@ -911,6 +1019,15 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
                 if is_last {
                     st.outbox.pop_front();
                 }
+                // Backpressure release: if draining this chunk brought the per-stream
+                // send buffer below the low-water mark, wake a producer parked on it.
+                let before = st.unsent;
+                st.unsent = st.unsent.saturating_sub(chunk);
+                (before > STREAM_LOW_WATER && st.unsent <= STREAM_LOW_WATER)
+                    .then(|| st.drain.clone())
+            };
+            if let Some(drain) = wake {
+                drain.notify_one();
             }
             if is_last && end_stream {
                 close_local(&mut s, id);

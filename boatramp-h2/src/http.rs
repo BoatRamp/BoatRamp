@@ -9,6 +9,7 @@ use std::future::Future;
 
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
+use tokio_stream::StreamExt as _;
 
 use crate::error::{ErrorCode, H2Error};
 
@@ -19,14 +20,26 @@ pub type Request = http::Request<Bytes>;
 /// A response to send: an `http::Response` whose body is a [`Body`].
 pub type Response = http::Response<Body>;
 
+/// A streamed body's source failed mid-stream (e.g. a reverse-proxy upstream dropped
+/// the connection before delivering the whole body). Yielding this from a body
+/// [`Stream`](tokio_stream::Stream) tells the driver to **RST_STREAM** the client
+/// rather than close the stream cleanly — so a truncated body is never framed as
+/// complete (which, for a response with no `content-length`, the client can't detect).
+#[derive(Debug, Clone, Default)]
+pub struct BodyError;
+
+/// A single streamed body chunk, or a mid-stream source failure ([`BodyError`]).
+pub type BodyChunk = Result<Bytes, BodyError>;
+
 /// A response body: buffered bytes; a stream `splice()`d directly from an upstream
 /// socket into the (kTLS) client socket (Linux zero-copy); or a pull [`Stream`] of
-/// `Bytes` chunks forwarded as DATA frames as they arrive (a reverse proxy streaming
-/// an upstream response without buffering or copying it — the stream ending closes the
-/// h2 stream). The driver **polls the stream directly** in the per-stream task, so a
-/// bridge hands its upstream body straight in with no intermediate channel or producer
-/// task. The concurrent [`crate::mux`] driver streams the last two natively; the serial
-/// [`crate::conn`] driver buffers a `Stream` (it can't interleave).
+/// [`BodyChunk`]s forwarded as DATA frames as they arrive (a reverse proxy streaming
+/// an upstream response without buffering or copying it — the stream ending signals
+/// END_STREAM; a [`BodyError`] item resets the h2 stream). The driver **polls the
+/// stream directly** in the per-stream task, so a bridge hands its upstream body
+/// straight in with no intermediate channel or producer task. The concurrent
+/// [`crate::mux`] driver streams the last two natively; the serial [`crate::conn`]
+/// driver buffers a `Stream` (it can't interleave).
 ///
 /// [`Stream`]: tokio_stream::Stream
 pub enum Body {
@@ -36,14 +49,24 @@ pub enum Body {
         upstream: tokio::net::TcpStream,
         len: usize,
     },
-    Stream(std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send>>),
+    Stream(std::pin::Pin<Box<dyn tokio_stream::Stream<Item = BodyChunk> + Send>>),
 }
 
 impl Body {
-    /// A streamed body from any pull [`Stream`](tokio_stream::Stream) of `Bytes`
-    /// chunks — the driver polls it directly (no channel/task hop). Empty chunks are
-    /// skipped; the stream ending signals END_STREAM.
+    /// A streamed body from an **infallible** pull [`Stream`](tokio_stream::Stream) of
+    /// `Bytes` chunks — the driver polls it directly (no channel/task hop). Empty
+    /// chunks are skipped; the stream ending signals END_STREAM.
     pub fn stream(chunks: impl tokio_stream::Stream<Item = Bytes> + Send + 'static) -> Self {
+        Body::Stream(Box::pin(chunks.map(Ok)))
+    }
+
+    /// A streamed body from a **fallible** pull [`Stream`](tokio_stream::Stream) — a
+    /// [`BodyError`] item mid-stream resets the client stream (see [`BodyError`]).
+    /// A reverse-proxy bridge uses this so an upstream failure isn't framed as a
+    /// clean end.
+    pub fn try_stream(
+        chunks: impl tokio_stream::Stream<Item = BodyChunk> + Send + 'static,
+    ) -> Self {
         Body::Stream(Box::pin(chunks))
     }
 
