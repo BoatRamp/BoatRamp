@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-08-20
+
 ### Added
 - **Kernel `splice()` fast-path for plaintext HTTP/1.1 reverse-proxy responses (Linux).** When both
   legs are plaintext HTTP/1.1 and the response is passed through unchanged, the proxy now moves the
