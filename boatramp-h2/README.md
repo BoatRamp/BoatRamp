@@ -56,7 +56,7 @@ splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port f
       (framing, SETTINGS, PING, GOAWAY, WINDOW_UPDATE, stream states, error codes,
       frame-size + flow-control enforcement). No body optimization yet.
 - [x] **M2 HPACK conformance** — h2spec §4/§8 (HPACK, header field validation) green.
-- [ ] **M3 server API** — `accept` + request/response over any `AsyncRead+AsyncWrite`;
+- [x] **M3 server API** — `accept` + request/response over any `AsyncRead+AsyncWrite`;
       differential test vs `hyper`/`h2` byte-identical.
 - [ ] **M4 splice body** — port the spike's `splice()`/kTLS DATA writer behind the
       server's body seam; benchmark `tls-proxy-h2-100k` vs Envoy on the integrated
