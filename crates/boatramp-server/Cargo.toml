@@ -14,6 +14,11 @@ repository.workspace = true
 description = "boatramp HTTP server + API library (streaming static-site publishing)"
 
 [features]
+# Opt-in HTTP/2 serve fast-path: drive h2 connections with boatramp-h2's concurrent
+# multiplexed driver (which beats hyper/envoy on tls-proxy-h2) instead of hyper.
+# Off by default; enabling it only takes effect when the operator also turns on the
+# `[serve].h2_mux` config knob, and hyper still serves h1 + is the fallback.
+h2-mux = ["dep:boatramp-h2"]
 # WebAssembly handler dispatch in the serving pipeline. Heavy
 # (pulls the wasmtime engine via boatramp-handlers); off by default so the
 # static server stays lean. The CLI enables it through its own `handlers` flag.
@@ -89,6 +94,10 @@ rmcp = { version = "1.2", features = [
 # for the server (it is the native binary's auth; `boatramp-core` keeps it opt-in
 # for library/wasm cleanliness).
 boatramp-core = { workspace = true, features = ["authz"] }
+# The concurrent multiplexed HTTP/2 driver (feature `h2-mux`): an opt-in serve
+# fast-path that drives h2 connections via boatramp-h2's mux driver instead of
+# hyper. Off by default; hyper remains the fallback (h1) and the default (h2).
+boatramp-h2 = { path = "../../boatramp-h2", optional = true }
 # `time` + `sync` (beyond the workspace defaults) for the bounded shutdown drain
 # in `serve` (in-flight requests finish under a deadline).
 tokio = { workspace = true, features = ["time", "sync"] }

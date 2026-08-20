@@ -91,6 +91,12 @@ tls = [
   "dep:rustls-pemfile",
   "boatramp-node/tls",
 ]
+# Experimental HTTP/2 serve fast-path: drive h2 connections with boatramp-h2's
+# concurrent multiplexed driver (beats hyper/Envoy on tls-proxy-h2) instead of hyper,
+# h1 falling back to hyper. Requires TLS (h2 is negotiated over TLS/ALPN) and is a
+# no-op unless the operator also sets BOATRAMP_H2_MUX at runtime. Off by default
+# (experimental); build with `--features h2-mux`.
+h2-mux = ["tls", "boatramp-server/h2-mux"]
 # DNS-TXT domain-ownership verification (`domain add --method dns`): resolve the
 # `_boatramp-verify.<host>` TXT over public DNS. Needed to verify a host that
 # points at this same instance (e.g. a self-hosted domain behind fly/Cloudflare,

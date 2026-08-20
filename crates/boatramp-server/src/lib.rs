@@ -135,6 +135,11 @@ pub(crate) use proxy::{
     proxy, COMPUTE_WAKE_TIMEOUT,
 };
 mod splice;
+// Opt-in HTTP/2 serve fast-path via boatramp-h2's mux driver (feature `h2-mux`).
+#[cfg(feature = "h2-mux")]
+mod mux_serve;
+#[cfg(feature = "h2-mux")]
+pub use mux_serve::serve_tls_mux;
 // Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
 #[cfg(feature = "handlers")]
 pub(crate) use proxy::is_upgrade_request;

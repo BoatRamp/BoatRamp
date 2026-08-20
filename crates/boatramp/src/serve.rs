@@ -2148,6 +2148,16 @@ async fn serve_custom(
         app
     };
 
+    // Opt-in HTTP/2 fast-path: serve h2 connections with boatramp-h2's concurrent
+    // multiplexed driver (beats hyper/Envoy on tls-proxy-h2), h1 falls back to hyper.
+    // Experimental; enabled per-listener by BOATRAMP_H2_MUX at runtime.
+    #[cfg(feature = "h2-mux")]
+    if std::env::var_os("BOATRAMP_H2_MUX").is_some() {
+        let (certs, private_key) = load_cert_chain_and_key(&cert, &key)?;
+        boatramp_server::serve_tls_mux(addr, certs, private_key, app, shutdown_signal()).await?;
+        return Ok(());
+    }
+
     let mut server = axum_server::bind(addr)
         .acceptor(nodelay_rustls(config))
         .handle(handle);
@@ -2156,6 +2166,25 @@ async fn serve_custom(
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
+}
+
+/// A shutdown future for the manual `h2-mux` serve loop: resolves on SIGINT or
+/// (unix) SIGTERM.
+#[cfg(feature = "h2-mux")]
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Serve the control-plane over **RFC 7250 raw-public-key TLS** (`--tls rpk`):
