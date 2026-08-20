@@ -23,15 +23,14 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// Response headers that must not (or need not) be copied onto the h2 response: hop-by
-/// hop headers are illegal in HTTP/2, and `content-length` is re-derived by the mux
-/// driver from the buffered body.
-fn droppable_response_header(name: &[u8]) -> bool {
+/// Hop-by-hop response headers, which are illegal in HTTP/2 and must be stripped.
+/// `content-length` is deliberately kept: the body is streamed (not re-derived), so a
+/// fixed-length upstream response passes its `content-length` straight through.
+fn hop_by_hop_response_header(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"connection")
         || name.eq_ignore_ascii_case(b"keep-alive")
         || name.eq_ignore_ascii_case(b"transfer-encoding")
         || name.eq_ignore_ascii_case(b"upgrade")
-        || name.eq_ignore_ascii_case(b"content-length")
 }
 
 /// Bridges the mux driver's simple request/response to the axum [`Router`] (a tower
@@ -74,22 +73,31 @@ impl Handler for RouterHandler {
             Ok(r) => r,
             Err(_) => return MuxResponse::with_body(502, b"bad gateway".to_vec()),
         };
-        let (parts, body) = resp.into_parts();
-        // Buffer the body (streaming is a follow-up).
-        let bytes = match body.collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(_) => return MuxResponse::with_body(502, b"bad gateway".to_vec()),
-        };
+        let (parts, mut body) = resp.into_parts();
+        // Stream the router's response body into the mux driver over a bounded channel
+        // — no buffering. The channel capacity backpressures the upstream body pull;
+        // the channel closing signals END_STREAM.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        tokio::spawn(async move {
+            while let Some(frame) = body.frame().await {
+                let Ok(frame) = frame else { break };
+                if let Ok(data) = frame.into_data() {
+                    if !data.is_empty() && tx.send(data.to_vec()).await.is_err() {
+                        break; // the h2 stream was reset — stop pulling
+                    }
+                }
+            }
+        });
         let headers = parts
             .headers
             .iter()
-            .filter(|(n, _)| !droppable_response_header(n.as_str().as_bytes()))
+            .filter(|(n, _)| !hop_by_hop_response_header(n.as_str().as_bytes()))
             .map(|(n, v)| (n.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()))
             .collect();
         MuxResponse {
             status: parts.status.as_u16(),
             headers,
-            body: MuxBody::Bytes(bytes.to_vec()),
+            body: MuxBody::Stream(rx),
         }
     }
 }

@@ -29,18 +29,37 @@ pub enum Body {
         upstream: tokio::net::TcpStream,
         len: usize,
     },
+    /// A **streamed** body: DATA frames are produced from this channel of chunks as
+    /// they arrive (the channel closing = END_STREAM), so the whole body is never
+    /// held in memory. This is how a reverse proxy forwards an upstream response
+    /// without buffering. The concurrent [`crate::mux`] driver streams it natively;
+    /// the serial [`crate::conn`] driver buffers it (it can't interleave).
+    Stream(tokio::sync::mpsc::Receiver<Vec<u8>>),
 }
 
 impl Body {
+    /// The body length if known ahead of time. A [`Body::Stream`] has no known length
+    /// (`0`) — HTTP/2 delimits it with END_STREAM, so callers must use [`is_empty`]
+    /// rather than `len() == 0` to decide whether a body is present.
+    ///
+    /// [`is_empty`]: Body::is_empty
     pub fn len(&self) -> usize {
         match self {
             Body::Bytes(b) => b.len(),
             #[cfg(target_os = "linux")]
             Body::Splice { len, .. } => *len,
+            Body::Stream(_) => 0,
         }
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match self {
+            Body::Bytes(b) => b.is_empty(),
+            #[cfg(target_os = "linux")]
+            Body::Splice { len, .. } => *len == 0,
+            // A stream always represents a present body (possibly zero-length, ended
+            // by the channel closing) — never treat it as "no body".
+            Body::Stream(_) => false,
+        }
     }
 }
 

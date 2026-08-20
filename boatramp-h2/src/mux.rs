@@ -559,19 +559,81 @@ fn spawn_request<H>(
     let handler = handler.clone();
     tokio::spawn(async move {
         let resp = handler.handle(req).await;
-        let frames = response_to_frames(resp).await;
+        emit_response(&shared, &notify, sid, resp).await;
         {
             let mut s = shared.lock().unwrap();
-            if let Some(st) = s.streams.get_mut(&sid) {
-                if !st.reset {
-                    st.outbox = frames;
-                }
-            }
-            s.mark_ready(sid);
             s.active_handlers -= 1;
         }
         notify.notify_one();
     });
+}
+
+/// Queue a response onto its stream's outbox, waking the writer. A buffered body
+/// (`Bytes`/`Splice`) is queued all at once; a [`http::Body::Stream`] is drained chunk
+/// by chunk over time and forwarded as DATA frames — so the writer streams it without
+/// the whole body ever being held (the reverse-proxy fast-path).
+async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Response) {
+    let Response { status, headers, body } = resp;
+    match body {
+        http::Body::Stream(mut rx) => {
+            // HEADERS carry the response's own headers verbatim — any content-length is
+            // the producer's (we don't re-derive one for a streamed body).
+            let mut fields = Vec::with_capacity(headers.len() + 1);
+            fields.push((b":status".to_vec(), status.to_string().into_bytes()));
+            fields.extend(headers);
+            if !push_out(shared, notify, sid, OutFrame::Headers { fields, end_stream: false }) {
+                return;
+            }
+            while let Some(chunk) = rx.recv().await {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if !push_out(
+                    shared,
+                    notify,
+                    sid,
+                    OutFrame::Data { bytes: chunk, off: 0, end_stream: false },
+                ) {
+                    return; // the stream was reset — stop pulling from the producer
+                }
+            }
+            // The channel closed: end the stream with an empty END_STREAM DATA frame.
+            push_out(
+                shared,
+                notify,
+                sid,
+                OutFrame::Data { bytes: Vec::new(), off: 0, end_stream: true },
+            );
+        }
+        other => {
+            let frames = response_to_frames(Response { status, headers, body: other }).await;
+            {
+                let mut s = shared.lock().unwrap();
+                if let Some(st) = s.streams.get_mut(&sid) {
+                    if !st.reset {
+                        st.outbox = frames;
+                    }
+                }
+                s.mark_ready(sid);
+            }
+            notify.notify_one();
+        }
+    }
+}
+
+/// Append one frame to a stream's outbox, mark it ready, and wake the writer. Returns
+/// `false` if the stream was reset or gone (the caller should stop producing).
+fn push_out(shared: &Conn, notify: &Arc<Notify>, sid: u32, frame: OutFrame) -> bool {
+    {
+        let mut s = shared.lock().unwrap();
+        match s.streams.get_mut(&sid) {
+            Some(st) if !st.reset => st.outbox.push_back(frame),
+            _ => return false,
+        }
+        s.mark_ready(sid);
+    }
+    notify.notify_one();
+    true
 }
 
 /// Turn a [`Response`] into queued HEADERS (+ DATA) frames. A `Body::Splice` is read
@@ -610,6 +672,15 @@ async fn body_bytes(body: http::Body) -> Vec<u8> {
             let mut buf = vec![0u8; len];
             if upstream.read_exact(&mut buf).await.is_err() {
                 buf.clear();
+            }
+            buf
+        }
+        // `emit_response` streams a `Body::Stream` directly and never routes it here;
+        // buffer it if it ever does, so this stays correct.
+        http::Body::Stream(mut rx) => {
+            let mut buf = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                buf.extend_from_slice(&chunk);
             }
             buf
         }
@@ -703,13 +774,20 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack) -> Vec<u8> {
                 _ => continue,
             };
             let remaining = total - off;
-            let swin = s.streams.get(&id).map_or(0, |st| st.send_window.max(0));
-            let win = swin.min(s.conn_send_window.max(0)).min(max_frame) as usize;
-            if win == 0 {
-                // Window-blocked: leave in outbox; reader requeues on WINDOW_UPDATE.
-                continue;
-            }
-            let chunk = remaining.min(win);
+            // An empty DATA frame (a streamed body's trailing END_STREAM marker)
+            // carries no bytes, so it isn't flow-controlled and goes out even with the
+            // window exhausted. A non-empty frame is clamped by both windows + max-frame.
+            let chunk = if remaining == 0 {
+                0
+            } else {
+                let swin = s.streams.get(&id).map_or(0, |st| st.send_window.max(0));
+                let win = swin.min(s.conn_send_window.max(0)).min(max_frame) as usize;
+                if win == 0 {
+                    // Window-blocked: leave in outbox; reader requeues on WINDOW_UPDATE.
+                    continue;
+                }
+                remaining.min(win)
+            };
             let is_last = chunk == remaining;
             out.extend_from_slice(&frame::data_header(id, chunk as u32, is_last && end_stream));
             if let Some(OutFrame::Data { bytes, .. }) = s.streams.get(&id).unwrap().outbox.front() {

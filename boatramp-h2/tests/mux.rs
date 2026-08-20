@@ -112,6 +112,41 @@ async fn request_body_is_delivered_to_the_handler() {
 }
 
 #[tokio::test]
+async fn streamed_body_is_forwarded_chunk_by_chunk() {
+    use boatramp_h2::Body;
+    struct Streamer;
+    impl Handler for Streamer {
+        async fn handle(&self, _req: Request) -> Response {
+            // 200 KiB across 200 chunks fed over a bounded channel — bigger than the
+            // 64 KiB flow-control window, so the writer must stream + resume on
+            // WINDOW_UPDATE without ever holding the whole body.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            tokio::spawn(async move {
+                for i in 0..200u32 {
+                    let byte = b'a' + (i % 26) as u8;
+                    if tx.send(vec![byte; 1024]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Response {
+                status: 200,
+                headers: Vec::new(),
+                body: Body::Stream(rx),
+            }
+        }
+    }
+    let mut client = connect_with(Streamer).await;
+    let response = get(&mut client, "/stream").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body = read_body(response.into_body()).await;
+    assert_eq!(body.len(), 200 * 1024);
+    // Spot-check the content survived the framing/streaming intact.
+    assert!(body[..1024].iter().all(|&b| b == b'a'));
+    assert!(body[1024..2048].iter().all(|&b| b == b'b'));
+}
+
+#[tokio::test]
 async fn post_with_trailers_is_accepted() {
     let mut client = connect().await;
     let request = http::Request::builder()

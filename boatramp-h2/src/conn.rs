@@ -574,7 +574,19 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
 {
-    let resp: Response = handler.handle(req).await;
+    let mut resp: Response = handler.handle(req).await;
+    // The serial driver can't interleave a streamed body, so drain it to bytes here
+    // (the mux driver streams it natively). Done before content-length is derived.
+    resp.body = match resp.body {
+        http::Body::Stream(mut rx) => {
+            let mut buf = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                buf.extend_from_slice(&chunk);
+            }
+            http::Body::Bytes(buf)
+        }
+        other => other,
+    };
     let status = resp.status.to_string();
     let mut fields: Vec<(&[u8], &[u8])> = vec![(b":status", status.as_bytes())];
     for (n, v) in &resp.headers {
@@ -684,6 +696,11 @@ where
                         .await
                         .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
                 }
+            }
+            // `respond` drains a streamed body to `Bytes` before it is ever queued, so
+            // the serial driver never flushes a `Stream`.
+            http::Body::Stream(_) => {
+                unreachable!("serial driver buffers stream bodies in respond")
             }
         }
         conn.conn_send_window -= chunk as i64;
