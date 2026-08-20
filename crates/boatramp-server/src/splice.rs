@@ -949,12 +949,6 @@ mod tests {
     /// `peek_classify`, `classify`, `splice_conn`/`splice_body`, and `serve_fallback`.
     #[tokio::test]
     async fn serve_loop_proxies_gateway_and_defers_reserved_routes() {
-        use boatramp_core::config::{DomainConfig, SiteConfig};
-        use boatramp_core::deploy::{DeployStore, Manifest};
-        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
-        use boatramp_core::kv::MemoryKv;
-        use boatramp_core::project::ProjectRef;
-        use boatramp_core::security::SecurityProfile;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // A tiny keep-alive upstream returning a fixed Content-Length body.
@@ -983,9 +977,51 @@ mod tests {
             }
         });
 
-        // A deploy store with a deployed gateway site `www` (host test.local, `/**`).
-        // Blob storage is unused on the gateway path (an empty manifest); an FsStorage
-        // under the temp dir is a convenient no-touch backend.
+        let addr = spawn_gateway_serve(up_addr).await;
+
+        async fn req(addr: SocketAddr, raw: &str) -> String {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(raw.as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            c.read_to_end(&mut out).await.unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        // A gateway-routed GET is reverse-proxied — the upstream body reaches the client.
+        let resp = req(
+            addr,
+            "GET /anything HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("hello-from-upstream"),
+            "proxy body missing: {resp}"
+        );
+        // A reserved control-plane route is served by the app router, not proxied.
+        let hz = req(
+            addr,
+            "GET /healthz HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            hz.starts_with("HTTP/1.1 200") && hz.to_ascii_lowercase().contains("ok"),
+            "healthz fallback: {hz}"
+        );
+    }
+
+    /// Stand up a `serve` loop in front of a deployed gateway site `www` (host
+    /// `test.local`, route `/**`) that reverse-proxies to `up_addr`. Returns the
+    /// client-facing address. Shared by the serve-loop tests below.
+    async fn spawn_gateway_serve(up_addr: SocketAddr) -> SocketAddr {
+        use boatramp_core::config::{DomainConfig, SiteConfig};
+        use boatramp_core::deploy::{DeployStore, Manifest};
+        use boatramp_core::gateway::{GatewayConfig, GatewayRoute, Upstream};
+        use boatramp_core::kv::MemoryKv;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::security::SecurityProfile;
+
+        // Blob storage is unused on the gateway path (an empty manifest); an
+        // FsStorage under the temp dir is a convenient no-touch backend.
         let deploy = DeployStore::new(
             Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
             Arc::new(MemoryKv::new()),
@@ -1024,7 +1060,7 @@ mod tests {
         let posture = SecurityProfile::Dev.preset();
         // The dev posture must be on the router too, so the userspace fallback path
         // (used off Linux, where splice is unavailable) also permits the loopback
-        // upstream — the test then exercises the same routing on every target.
+        // upstream — the tests then exercise the same routing on every target.
         let router = crate::router_with(
             deploy.clone(),
             crate::Auth::disabled(),
@@ -1044,34 +1080,164 @@ mod tests {
         tokio::spawn(async move {
             let _ = serve(listener, ctx, router, std::future::pending::<()>()).await;
         });
+        addr
+    }
 
-        async fn req(addr: SocketAddr, raw: &str) -> String {
-            let mut c = TcpStream::connect(addr).await.unwrap();
-            c.write_all(raw.as_bytes()).await.unwrap();
-            let mut out = Vec::new();
-            c.read_to_end(&mut out).await.unwrap();
-            String::from_utf8_lossy(&out).into_owned()
+    /// Read exactly one HTTP/1.1 response (head + `Content-Length` body) off `c`,
+    /// so a keep-alive connection can carry a follow-up request without the reader
+    /// blocking forever on a socket that stays open.
+    async fn read_one_response(c: &mut TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let head_end = loop {
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break p + 4;
+            }
+            let n = c.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                return String::from_utf8_lossy(&buf).into_owned();
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+        let content_length = String::from_utf8_lossy(&buf[..head_end])
+            .to_ascii_lowercase()
+            .split("\r\n")
+            .find_map(|l| l.strip_prefix("content-length:").map(str::to_owned))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + content_length {
+            let n = c.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
         }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 
-        // A gateway-routed GET is reverse-proxied — the upstream body reaches the client.
-        let resp = req(
-            addr,
-            "GET /anything HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n",
-        )
-        .await;
+    /// Regression (chaos): if the upstream announces a `Content-Length` then closes
+    /// before delivering it, the client connection must be *closed* — signalling the
+    /// truncation — never left blocked waiting for bytes that will never arrive. A
+    /// fault-injection run once hung the client here for 5s; this guards the
+    /// `splice_body` early-EOF fix on Linux and the userspace fallback elsewhere.
+    #[tokio::test]
+    async fn upstream_dying_mid_body_closes_the_client_instead_of_hanging() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        // Upstream: promise 1 MiB, deliver 16 bytes, then vanish.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => break,
+                        }
+                    }
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\ntruncated-body!!",
+                        )
+                        .await;
+                    // Drop `s`: the upstream closes still owing 1 MiB - 16 bytes.
+                });
+            }
+        });
+
+        let addr = spawn_gateway_serve(up_addr).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"GET /anything HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        // The property under test: this completes (peer closed); it must NOT hang.
+        let read = timeout(Duration::from_secs(5), c.read_to_end(&mut out)).await;
         assert!(
-            resp.contains("hello-from-upstream"),
-            "proxy body missing: {resp}"
+            read.is_ok(),
+            "client was left hanging after the upstream truncated the body"
         );
-        // A reserved control-plane route is served by the app router, not proxied.
-        let hz = req(
-            addr,
-            "GET /healthz HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n",
-        )
-        .await;
+        // On the splice path the partial bytes are deterministically relayed before
+        // the close (the fallback may reset without flushing, so gate this to Linux).
+        #[cfg(target_os = "linux")]
+        {
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                text.contains("truncated-body!!"),
+                "splice path must relay the partial body before closing: {text}"
+            );
+        }
+    }
+
+    /// Regression (chaos): after a GET is served on the fast path, a follow-up
+    /// request on the same keep-alive connection that is *not* splice-eligible (a
+    /// POST) must not be dropped — the connection rewinds into the userspace
+    /// fallback and the request still gets a real HTTP response. Guards the
+    /// mid-connection `Rewind` handoff.
+    #[tokio::test]
+    async fn non_eligible_request_after_spliced_get_falls_back_not_dropped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        // Keep-alive upstream returning a fixed-length body for every request.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = up.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) if !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => continue,
+                            Ok(_) => {}
+                        }
+                        let body = b"ok";
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        if s.write_all(head.as_bytes()).await.is_err()
+                            || s.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let addr = spawn_gateway_serve(up_addr).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+
+        // 1) A splice-eligible GET (keep-alive: no Connection: close).
+        c.write_all(b"GET /anything HTTP/1.1\r\nHost: test.local\r\n\r\n")
+            .await
+            .unwrap();
+        let first = read_one_response(&mut c).await;
         assert!(
-            hz.starts_with("HTTP/1.1 200") && hz.to_ascii_lowercase().contains("ok"),
-            "healthz fallback: {hz}"
+            first.starts_with("HTTP/1.1 200"),
+            "GET not proxied: {first}"
+        );
+
+        // 2) A POST on the SAME connection is not splice-eligible → it must fall
+        //    back, not be silently dropped. Require *a* status line back in bound.
+        c.write_all(b"POST /anything HTTP/1.1\r\nHost: test.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        let read = timeout(Duration::from_secs(5), c.read_to_end(&mut rest)).await;
+        assert!(
+            read.is_ok(),
+            "POST after a spliced GET was dropped (client hung)"
+        );
+        let text = String::from_utf8_lossy(&rest);
+        assert!(
+            text.starts_with("HTTP/1.1 "),
+            "POST after a spliced GET got no HTTP response: {text}"
         );
     }
 
