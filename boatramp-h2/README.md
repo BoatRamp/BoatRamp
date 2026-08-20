@@ -90,15 +90,27 @@ proxy beating Envoy:
 | c256 | 26,556 | 30,068 | 42,127 |
 
 Correct (md5 == direct, HTTP/2, 100 KiB) and the mux path is confirmed active (server
-sends an empty SETTINGS frame vs hyper's `MAX_CONCURRENT_STREAMS=256`). The win
-evaporates for two reasons: (1) the bridge **buffers** the whole response body
-(`collect().await`) where hyper streams; (2) every request pays BoatRamp's **full
-router pipeline** (auth, routing, gateway resolution) — the mux driver's
-downstream-concurrency edge is a small fraction of that, which the standalone 54k
-avoided by proxying directly. Recovering the win needs a **streaming bridge** (a
-streaming `Body` in the mux driver) and/or an **eligibility gate that bypasses the
-router for pure gateway-proxy connections** (the `splice.rs` pattern, for TLS h2).
-Both are follow-ups; hyper stays the default.
+sends an empty SETTINGS frame vs hyper's `MAX_CONCURRENT_STREAMS=256`).
+
+**Streaming was added and did not recover the win.** The bridge now streams the router
+response body through the mux driver (a `Body::Stream` variant) instead of buffering
+it (`collect()`). Same rig, mux path confirmed active:
+
+| concurrency | streaming mux | hyper |
+| ---: | ---: | ---: |
+| c64  | 30,728 | 33,897 |
+| c128 | 25,459 | 32,536 |
+| c256 | 22,375 | 29,804 |
+
+Still ~slower than hyper, both streaming and buffered. So **buffering was not the
+bottleneck** — the dominant cost is BoatRamp's **full router pipeline** (auth, routing,
+gateway resolution), which mux and hyper pay *equally*, so the mux driver's
+downstream-concurrency edge never surfaces. The standalone 54k avoided all of it by
+proxying directly. The remaining lever is an **eligibility gate that bypasses the
+router for pure gateway-proxy connections** (the `splice.rs` peek-classify pattern, for
+TLS h2). Streaming is kept regardless — it's the correct behavior for large/streaming
+responses (bounded memory + time-to-first-byte), where buffering would be a real
+problem. hyper stays the default.
 
 ## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
