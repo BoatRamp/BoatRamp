@@ -741,7 +741,7 @@ async fn splice_body(src: &TcpStream, dst: &TcpStream, mut n: usize) -> io::Resu
     let (pr, pw) = (fds[0], fds[1]);
     let src_fd = src.as_raw_fd();
     let dst_fd = dst.as_raw_fd();
-    let flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
+    let flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
     let result = async {
         while n > 0 {
             let want = n.min(1 << 16);
