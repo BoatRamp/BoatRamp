@@ -193,6 +193,37 @@ So the integrated mux now **matches or beats hyper at every concurrency** (it wa
 79–91 % before), with `direct` rock-stable run-to-run while hyper's c64 swings with
 shared-host load. hyper stays default (this is the opt-in `h2-mux` path).
 
+### Integrated mux vs Envoy — the honest gate
+
+The crate's promotion gate is "clears Envoy." Earlier that was measured on the
+*standalone* mux proxy example (54.9k/43.7k/42.1k, beating Envoy's 51.5k/42.1k/37.9k).
+But the **integrated** path — the mux driver bridged into BoatRamp's full router +
+gateway machinery — had never been run against Envoy in the same rig. So it was, on
+the fair 5-way benchmark (`boatramp-benchmarks`, tls-proxy-h2-100k, same cores /
+upstream / certs, contestants launched **interleaved per concurrency** so shared-host
+load hits them equally), with the *same binary* serving as both `hyper` (h2 default)
+and `mux` (`BOATRAMP_H2_MUX=1`):
+
+| concurrency | Envoy | **integrated mux** | hyper | mux ÷ Envoy |
+| ---: | ---: | ---: | ---: | ---: |
+| c64  | 52.3k / 43.2k | **42.0k / 41.7k** | 39.4k / 39.3k | 80 % → 96 % |
+| c128 | 41.8k / 41.7k | **39.0k / 38.9k** | 36.9k / 36.9k | 93 % |
+| c256 | 37.5k / 37.6k | **34.9k / 35.0k** | 33.4k / 33.2k | 93 % |
+
+(Two interleaved rounds; the c64 spread is Envoy's, not mux's — mux is rock-stable
+41.7–42.0k while Envoy swings 43–52k with load; at c128/c256 both are steady.)
+
+**Verdict: the integrated path does *not* clear Envoy — it runs at ~93 % (c128/c256)
+and 80–96 % (c64), while consistently beating hyper by +5–7 %.** The mux *driver*
+itself is Envoy-class (the standalone example proves it); the ~7 % residual is
+BoatRamp's **per-request integration cost** — the axum router, the bridge, and the
+gateway's `dispatch_gateway` machinery (SSRF re-check, pooled-client lookup, passive
+health, header rewrites) — work Envoy-the-bare-proxy doesn't do. The reverted
+router-bypass already showed skipping the *router* alone doesn't recover it, so the
+residual is the gateway dispatch path, not the middleware. Notably mux is far more
+**load-robust** than Envoy at low concurrency (Envoy's c64 collapses under contention;
+mux doesn't).
+
 ## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
 The concurrent multiplexed driver with **userspace rustls (no kTLS) + a pooled
