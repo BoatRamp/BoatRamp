@@ -32,10 +32,12 @@
 pub mod error;
 pub mod frame;
 pub mod settings;
+pub mod stream;
 
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
 pub use settings::Settings;
+pub use stream::StreamState;
 
 /// The HTTP/2 connection preface a client sends first (RFC 7540 §3.5).
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
