@@ -1,0 +1,15 @@
+[package]
+name = "boatramp-h2"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A minimal, conformance-gated HTTP/2 server with a kernel zero-copy (splice/kTLS) response-body fast-path."
+repository = "https://github.com/BoatRamp/BoatRamp"
+publish = false # flip once the API stabilizes and h2spec is green
+
+# The foundation (frame/error/settings) is pure std and builds anywhere. The
+# connection driver, HPACK, server API, and the Linux-only splice body path add
+# their dependencies as they land (see README roadmap).
+[dependencies]
+
+[dev-dependencies]
