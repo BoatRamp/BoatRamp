@@ -7,9 +7,17 @@ description = "A minimal, conformance-gated HTTP/2 server with a kernel zero-cop
 repository = "https://github.com/BoatRamp/BoatRamp"
 publish = false # flip once the API stabilizes and h2spec is green
 
-# The foundation (frame/error/settings) is pure std and builds anywhere. The
-# connection driver, HPACK, server API, and the Linux-only splice body path add
-# their dependencies as they land (see README roadmap).
+# The frame/error/settings/stream foundation is pure std. The connection driver +
+# HPACK + server API add tokio + an HPACK codec; the Linux-only splice body path
+# (M4) adds libc. See README roadmap.
 [dependencies]
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
+fluke-hpack = "0.3"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+# The reference HTTP/2 implementation, used as an in-process client to smoke-test
+# the server and (M3) as the differential oracle.
+h2 = "0.4"
+http = "1"
+bytes = "1"

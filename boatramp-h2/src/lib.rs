@@ -29,13 +29,18 @@
 //! integration, server API, and the splice body seam are the next milestones — see
 //! `README.md`.
 
+pub mod conn;
 pub mod error;
 pub mod frame;
+pub mod hpack;
+pub mod http;
 pub mod settings;
 pub mod stream;
 
+pub use conn::serve_connection;
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
+pub use http::{Handler, Request, Response};
 pub use settings::Settings;
 pub use stream::StreamState;
 
