@@ -24,9 +24,9 @@ fn out(buf: &[u8]) -> Out {
 const CASES: &[(&str, &[u8], Out)] = &[
     ("empty body (0-chunk only)", b"0\r\n\r\n", Out::Complete(5)),
     ("one data chunk", b"5\r\nhello\r\n0\r\n\r\n", Out::Complete(15)),
-    ("hex size lowercase (a=10)", b"a\r\n0123456789\r\n0\r\n\r\n", Out::Complete(21)),
-    ("hex size uppercase (A=10)", b"A\r\n0123456789\r\n0\r\n\r\n", Out::Complete(21)),
-    ("chunk extension ignored", b"5;ext=1\r\nhello\r\n0\r\n\r\n", Out::Complete(20)),
+    ("hex size lowercase (a=10)", b"a\r\n0123456789\r\n0\r\n\r\n", Out::Complete(20)),
+    ("hex size uppercase (A=10)", b"A\r\n0123456789\r\n0\r\n\r\n", Out::Complete(20)),
+    ("chunk extension ignored", b"5;ext=1\r\nhello\r\n0\r\n\r\n", Out::Complete(21)),
     ("trailer field", b"0\r\nX-Trailer: v\r\n\r\n", Out::Complete(19)),
     // incomplete
     ("missing terminating chunk", b"5\r\nhello\r\n", Out::Incomplete),
