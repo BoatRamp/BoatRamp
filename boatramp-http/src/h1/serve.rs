@@ -28,7 +28,7 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`serve_connection_with`].
 pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
 where
-    IO: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
     serve_connection_with(io, handler, DEFAULT_READ_TIMEOUT).await
@@ -51,7 +51,7 @@ pub async fn serve_connection_with<IO, H>(
     read_timeout: Duration,
 ) -> std::io::Result<()>
 where
-    IO: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
     // Split the connection so the response can be written WHILE the request body is still
@@ -87,6 +87,7 @@ where
         let version = head.version;
         let framing = head.framing.clone();
         let client_close = wants_close(&head.headers, version);
+        let is_upgrade = crate::upgrade::is_upgrade_request(&head.headers);
         let expect_continue = head
             .headers
             .get_all(header::EXPECT)
@@ -95,6 +96,40 @@ where
 
         // Consume the head; `buf` now starts at the request body (or the next request).
         buf.drain(..head_len);
+
+        // --- HTTP upgrade (WebSocket / `Connection: upgrade`) -------------------
+        // The request is handed to the handler with a pending-upgrade handle in its
+        // extensions; if the handler returns `101` and took the handle, the raw
+        // connection (plus any bytes already sent past the handshake) is handed off and
+        // this loop stops. Upgrade requests carry no body, so there is no pump.
+        if is_upgrade {
+            let mut req = http::Request::new(ReqBody::empty());
+            *req.method_mut() = head.method;
+            *req.uri_mut() = head.uri;
+            *req.version_mut() = head.version;
+            *req.headers_mut() = head.headers;
+            let (up_tx, up_rx) = tokio::sync::oneshot::channel();
+            req.extensions_mut().insert(crate::upgrade::Pending::new(up_rx));
+
+            let resp = handler.handle(req).await;
+            if resp.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+                // Build the 101 head (borrows `resp` synchronously — not across an await,
+                // so the serve future stays `Send`), write it, then reunite + hand off.
+                let head = build_upgrade_head(&resp);
+                drop(resp);
+                if write_all(&mut wr, &head).await.is_err() {
+                    return Ok(());
+                }
+                let io = rd.unsplit(wr);
+                let prefix = Bytes::from(std::mem::take(&mut buf));
+                let _ = up_tx.send(crate::upgrade::Upgraded::new(io, prefix));
+                return Ok(()); // the connection now belongs to the upgrade consumer
+            }
+            // The handler declined the upgrade: send its response and close (a rejected
+            // upgrade never keeps the connection alive).
+            let _ = write_response(&mut wr, resp, &method, version, true).await;
+            return Ok(());
+        }
 
         // A body carries an interim 100-continue if the client asked for one.
         if !matches!(framing, BodyFraming::Empty)
@@ -368,4 +403,20 @@ where
     IO: AsyncWrite + Unpin,
 {
     io.write_all(bytes).await
+}
+
+/// Build a `101 Switching Protocols` head: the status line + the handler's response
+/// headers verbatim (`Upgrade`, `Connection: upgrade`, any `Sec-WebSocket-Accept`) + the
+/// terminating CRLF. No body framing — the connection becomes the upgraded protocol's
+/// stream immediately after. Synchronous so the borrow of `resp` never crosses an await.
+fn build_upgrade_head(resp: &crate::Response) -> Vec<u8> {
+    let mut head = b"HTTP/1.1 101 Switching Protocols\r\n".to_vec();
+    for (name, value) in resp.headers() {
+        head.extend_from_slice(name.as_str().as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    head
 }

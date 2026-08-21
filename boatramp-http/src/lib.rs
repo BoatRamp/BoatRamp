@@ -26,6 +26,11 @@ pub use serve::{serve_connection, serve_connection_with, Config};
 mod serving;
 pub use serving::{response, Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response};
 
+// HTTP/1.1 connection upgrade (WebSocket + generic `Connection: upgrade`) — replaces
+// `hyper::upgrade` so the serving path owns upgrades.
+pub mod upgrade;
+pub use upgrade::{is_upgrade_request, on_upgrade, OnUpgrade, Upgraded};
+
 // The verification kit (corpus + normalized-verdict model + combinatorial generators)
 // shared by the h1 gate, the differential-vs-hyper driver, and the fuzz targets — one
 // canonical, per-aspect-grouped source so coverage is auditable and reused across all
