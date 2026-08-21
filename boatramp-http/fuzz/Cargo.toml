@@ -1,0 +1,46 @@
+# Coverage-guided fuzz targets for the h1 request parser (the attacker-controlled byte
+# surface). Run with a nightly toolchain:  cargo +nightly fuzz run fuzz_parse
+# The stable regression net lives in ../tests/fuzz_smoke.rs.
+[package]
+name = "boatramp-http-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+boatramp-http = { path = ".." }
+
+# fuzz_differential also drives hyper, to catch any input boatramp accepts more
+# permissively than hyper (a smuggling desync) that the curated corpus misses.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "io-util", "sync", "time", "macros"] }
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_differential"
+path = "fuzz_targets/fuzz_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_chunked"
+path = "fuzz_targets/fuzz_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

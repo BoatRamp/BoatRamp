@@ -97,10 +97,50 @@ pub fn parse_request_head(buf: &[u8]) -> ParseResult {
     ParseResult::Incomplete
 }
 
-/// Chunked-transfer decoding — the other smuggling surface (chunk-size lines, extensions,
-/// trailers). Used by the harness to compute a chunked message's end (and thus the next
-/// pipelined request's start).
+// ---- response framing (the sender side — boatramp's own output) --------------
+
+/// How a *response* body is delimited on the wire (RFC 9112 §6, sender side). Unlike a
+/// request, a response body may be **close-delimited** (framed by connection close).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseFraming {
+    /// No body is sent regardless of headers — a `HEAD` response, a `1xx`/`204`/`304`
+    /// status, or a `CONNECT` 2xx (RFC 9110 §6.4.1 / RFC 9112 §6.3).
+    None,
+    /// A fixed-length body (`Content-Length`).
+    Length(u64),
+    /// A chunked-transfer-coded body.
+    Chunked,
+    /// Framed by connection close (HTTP/1.0-style; forces `Connection: close`).
+    CloseDelimited,
+}
+
+/// Decide how a response body is framed, encoding the no-body rules: a `HEAD` request,
+/// or a `1xx`/`204`/`304` status, has no body no matter what `Content-Length`/
+/// `Transfer-Encoding` say. Otherwise `Transfer-Encoding: chunked` → chunked, else a
+/// `Content-Length` → that length, else close-delimited.
+pub fn response_framing(
+    status: u16,
+    request_method: &Method,
+    headers: &HeaderMap,
+) -> ResponseFraming {
+    // STUB — the harness (tests/response_framing.rs) is red until implemented.
+    let _ = (status, request_method, headers);
+    ResponseFraming::None
+}
+
+/// Encode a response head — status line (`HTTP/1.1 <code> <reason>`) + header fields +
+/// the terminating CRLFCRLF. The reason phrase is the registered one for the status.
+pub fn encode_response_head(status: u16, headers: &HeaderMap) -> Vec<u8> {
+    // STUB — see above.
+    let _ = (status, headers);
+    Vec::new()
+}
+
+/// Chunked-transfer coding — decode (the request-side smuggling surface: chunk-size
+/// lines, extensions, trailers) and encode (response-side body framing).
 pub mod chunked {
+    use http::HeaderMap;
+
     /// The outcome of scanning a chunked body for its end.
     #[derive(Debug)]
     pub enum ChunkScan {
@@ -114,11 +154,26 @@ pub mod chunked {
     }
 
     /// Scan a chunked message body starting at the front of `buf`, returning where it
-    /// ends. Rejects a non-hex/overflowing chunk size, bad chunk terminators, or an
-    /// oversized chunk-size line.
+    /// ends. Rejects a non-hex/overflowing chunk size, bad chunk terminators, an
+    /// oversized chunk-size line, or a forbidden trailer field.
     pub fn scan(buf: &[u8]) -> ChunkScan {
         // STUB — see `parse_request_head`. Harness is red until implemented.
         let _ = buf;
         ChunkScan::Incomplete
+    }
+
+    /// Encode one non-terminal chunk: `<hex-size>CRLF<data>CRLF`. `data` must be
+    /// non-empty (an empty chunk is the terminator — use [`encode_last`]).
+    pub fn encode(data: &[u8]) -> Vec<u8> {
+        // STUB.
+        let _ = data;
+        Vec::new()
+    }
+
+    /// Encode the terminating chunk: `0CRLF` + the trailer section + the final CRLF.
+    pub fn encode_last(trailers: &HeaderMap) -> Vec<u8> {
+        // STUB.
+        let _ = trailers;
+        Vec::new()
     }
 }

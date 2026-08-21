@@ -15,3 +15,9 @@
 //! codec is folded in; for now only the h1 codec + its safety gate are present.
 
 pub mod h1;
+
+// The verification kit (corpus + normalized-verdict model + combinatorial generators)
+// shared by the h1 gate, the differential-vs-hyper driver, and the fuzz targets — one
+// canonical, per-aspect-grouped source so coverage is auditable and reused across all
+// three layers. Data-only + dev-oriented; it ships in this (publish=false) spike crate.
+pub mod testkit;
