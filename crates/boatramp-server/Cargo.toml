@@ -104,6 +104,11 @@ tokio = { workspace = true, features = ["time", "sync"] }
 # endpoint (WebSocket fan-out).
 axum = { workspace = true, features = ["ws"] }
 futures.workspace = true
+# WebSocket framing over an already-upgraded connection (handler `websocket` stream
+# routes): `from_raw_socket`, server role, no client/TLS/handshake features. The opening
+# handshake's accept key is computed directly (sha1 + base64, both already in the tree).
+tokio-tungstenite = { version = "0.24", default-features = false }
+sha1 = "0.10"
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
