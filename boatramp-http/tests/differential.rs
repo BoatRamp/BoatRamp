@@ -192,3 +192,129 @@ async fn boatramp_is_never_more_permissive_than_hyper() {
         violations.join("\n")
     );
 }
+
+// ---- stable randomized differential (the volume layer) ----------------------
+// cargo-fuzz needs nightly + a sancov toolchain that doesn't build on our NixOS hosts,
+// so — exactly as the h2 codec does with tests/fuzz_smoke.rs — the real volume comes
+// from a STABLE, deterministic, seeded generator over an HTTP grammar. For each generated
+// request, if boatramp accepts the head, hyper must accept the same method+path (the
+// never-more-permissive / fail-closed property). Iterations scale via BOATRAMP_H1_FUZZ_N
+// (default modest for CI; set high on a fuzzing host). Deterministic seed → reproducible.
+
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[(self.next() % xs.len() as u64) as usize]
+    }
+    fn chance(&mut self, n: u64) -> bool {
+        self.next() % n == 0
+    }
+}
+
+/// Build one request head from the grammar, biased toward WELL-FORMED (so the accept
+/// path is actually exercised) with occasional injection of the framing / whitespace /
+/// terminator edges where smuggling lives.
+fn gen_request(r: &mut XorShift) -> Vec<u8> {
+    let good_methods: &[&str] = &["GET", "POST", "PUT", "HEAD", "OPTIONS"];
+    let weird_methods: &[&str] = &["CONNECT", "get", "PURGE", "", "BAD METHOD"];
+    let good_targets: &[&str] = &["/", "/a", "/a?b=1"];
+    let bad_targets: &[&str] = &["*", "http://h/p", "a:80", "/a b", "/a#f", "/a\x01"];
+    let good_versions: &[&str] = &["HTTP/1.1", "HTTP/1.0"];
+    let bad_versions: &[&str] = &["HTTP/2.0", "HTTP/1", "HTTP/1.1 ", "http/1.1"];
+    let cls: &[&str] = &["", "0", "5", "007", "+5", "5 6", "5,5", "5, 6", "0x5", "six"];
+    let tes: &[&str] = &["", "chunked", "gzip", "chunked, gzip", "gzip, chunked", "Chunked", "chunkedX"];
+
+    // A separator: usually one SP, occasionally a smuggling-edge whitespace.
+    fn sep(r: &mut XorShift) -> &'static str {
+        if r.chance(8) { ["  ", "\t", " \t"][(r.next() % 3) as usize] } else { " " }
+    }
+    // A line terminator: usually CRLF, occasionally a bare LF / CR.
+    fn term(r: &mut XorShift) -> &'static str {
+        if r.chance(10) { ["\n", "\r"][(r.next() % 2) as usize] } else { "\r\n" }
+    }
+
+    let mut s: Vec<u8> = Vec::new();
+    let ln = |s: &mut Vec<u8>, t: &str| s.extend_from_slice(t.as_bytes());
+
+    // request line — mostly good tokens, sometimes one weird slot.
+    ln(&mut s, if r.chance(6) { r.pick(weird_methods) } else { r.pick(good_methods) });
+    ln(&mut s, sep(r));
+    ln(&mut s, if r.chance(6) { r.pick(bad_targets) } else { r.pick(good_targets) });
+    ln(&mut s, sep(r));
+    ln(&mut s, if r.chance(6) { r.pick(bad_versions) } else { r.pick(good_versions) });
+    ln(&mut s, term(r));
+
+    // Host (usually present)
+    if !r.chance(8) {
+        ln(&mut s, "Host: x");
+        ln(&mut s, term(r));
+    }
+    // optional Content-Length (occasionally duplicated)
+    let cl = r.pick(cls);
+    if !cl.is_empty() {
+        for _ in 0..(1 + r.chance(4) as u64) {
+            ln(&mut s, &format!("Content-Length: {cl}"));
+            ln(&mut s, term(r));
+        }
+    }
+    // optional Transfer-Encoding (occasionally duplicated header lines)
+    let te = r.pick(tes);
+    if !te.is_empty() {
+        for _ in 0..(1 + r.chance(4) as u64) {
+            ln(&mut s, &format!("Transfer-Encoding: {te}"));
+            ln(&mut s, term(r));
+        }
+    }
+    // an occasional adversarial header
+    if r.chance(4) {
+        let name = ["X-Foo", "Host ", "X\tBad", "X Bad", ":bad", "Trailer"][(r.next() % 6) as usize];
+        ln(&mut s, &format!("{name}: v"));
+        ln(&mut s, term(r));
+    }
+    // terminating empty line
+    ln(&mut s, term(r));
+    s
+}
+
+#[test]
+fn randomized_differential_never_more_permissive() {
+    let n: u64 = std::env::var("BOATRAMP_H1_FUZZ_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut r = XorShift(0x9E3779B97F4A7C15);
+    let mut checked = 0u64;
+    for i in 0..n {
+        let input = gen_request(&mut r);
+        if let Verdict::Accept { method, path, .. } = verdict(&input) {
+            checked += 1;
+            let hyper = rt.block_on(hyper_accepts_head(input.clone()));
+            let ok = hyper.as_ref().is_some_and(|(m, p)| *m == method && *p == path);
+            assert!(
+                ok,
+                "iter {i}: boatramp accepted where hyper did not (MORE PERMISSIVE)\n  input: {:?}\n  boatramp: ({method:?},{path:?})  hyper: {hyper:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+    // Sanity: the generator must actually exercise the accept path (not be all rejects),
+    // so the never-more-permissive check isn't vacuous. A modest absolute floor — the
+    // grammar is deliberately edge-heavy, so most inputs reject.
+    assert!(
+        checked >= 100 && checked >= n / 500,
+        "generator produced too few accepted requests: {checked}/{n}"
+    );
+    eprintln!("randomized differential: {n} inputs, {checked} accepted+cross-checked vs hyper");
+}

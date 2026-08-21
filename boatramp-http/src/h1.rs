@@ -206,7 +206,7 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
         return Err(Reject::BadHeader);
     }
 
-    let framing = resolve_framing(&cl_tokens, &te_values)?;
+    let framing = resolve_framing(&cl_tokens, &te_values, is_11)?;
     Ok(Some((RequestHead { method, uri, version, headers, framing }, pos)))
 }
 
@@ -284,7 +284,11 @@ fn split_header(line: &[u8]) -> Result<(&[u8], &[u8]), Reject> {
 
 /// Resolve request body framing from the gathered Content-Length tokens + Transfer-
 /// Encoding field values (RFC 9112 §6.3). Fail-closed on every ambiguity.
-fn resolve_framing(cl_tokens: &[Vec<u8>], te_values: &[Vec<u8>]) -> Result<BodyFraming, Reject> {
+fn resolve_framing(
+    cl_tokens: &[Vec<u8>],
+    te_values: &[Vec<u8>],
+    is_11: bool,
+) -> Result<BodyFraming, Reject> {
     let cl_present = !cl_tokens.is_empty();
     let te_present = !te_values.is_empty();
     // Both framing headers present is the CL/TE desync surface — never reconcile it.
@@ -292,6 +296,12 @@ fn resolve_framing(cl_tokens: &[Vec<u8>], te_values: &[Vec<u8>]) -> Result<BodyF
         return Err(Reject::ConflictingFraming);
     }
     if te_present {
+        // Transfer-Encoding is an HTTP/1.1 feature; a 1.0 request can't carry chunked (a
+        // 1.0 intermediary wouldn't understand it), so TE on a 1.0 request is a desync
+        // setup — reject it (RFC 9112 §6.1).
+        if !is_11 {
+            return Err(Reject::BadTransferEncoding);
+        }
         // Multiple Transfer-Encoding *header fields* (as opposed to one comma-list) is a
         // TE.TE desync vector — servers disagree on first-vs-last — so reject it outright
         // rather than combine. A single field carrying a comma-list is still fine.

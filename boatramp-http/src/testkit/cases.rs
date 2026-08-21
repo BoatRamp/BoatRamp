@@ -105,6 +105,9 @@ pub const TRANSFER_ENCODING: &[Case] = &[
     c(TransferEncoding, "double chunked in one value", b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", Reject),
     c(TransferEncoding, "chunked with junk suffix", b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunkedX\r\n\r\n", Reject),
     c(TransferEncoding, "empty list element", b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: ,chunked\r\n\r\n", Reject),
+    // TE on an HTTP/1.0 request — chunked is 1.1-only, so this is a desync setup
+    // (found by the randomized differential vs hyper).
+    c(TransferEncoding, "chunked on HTTP/1.0", b"POST / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", Reject),
 ];
 
 // ---- C. The CL×TE framing matrix (a few anchors; gen.rs does the full grid) --
