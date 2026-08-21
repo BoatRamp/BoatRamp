@@ -216,13 +216,39 @@ and `mux` (`BOATRAMP_H2_MUX=1`):
 **Verdict: the integrated path does *not* clear Envoy — it runs at ~93 % (c128/c256)
 and 80–96 % (c64), while consistently beating hyper by +5–7 %.** The mux *driver*
 itself is Envoy-class (the standalone example proves it); the ~7 % residual is
-BoatRamp's **per-request integration cost** — the axum router, the bridge, and the
-gateway's `dispatch_gateway` machinery (SSRF re-check, pooled-client lookup, passive
-health, header rewrites) — work Envoy-the-bare-proxy doesn't do. The reverted
-router-bypass already showed skipping the *router* alone doesn't recover it, so the
-residual is the gateway dispatch path, not the middleware. Notably mux is far more
-**load-robust** than Envoy at low concurrency (Envoy's c64 collapses under contention;
-mux doesn't).
+BoatRamp's per-request cost — but a profile was needed to find *where*, and the guess
+above ("the gateway dispatch path") turned out to be **wrong**.
+
+### Closing the gap — the HPACK Huffman-table fix (integrated mux now clears Envoy)
+
+A symbol-resolved `perf` profile (a debuginfo build; the earlier one was stripped)
+overturned the assumption. The gateway machinery is **cheap** — `proxy_upstream`
+0.42 %, `cached_client` 0.09 %, `resolve_target`/`url` parse 0.07 %. The AES-GCM
+encrypt (13.5 %) and TLS-write syscalls are real but *shared with Envoy*. The top
+**addressable** userspace cost was **HPACK**: `fluke_hpack`'s decoder called
+`HuffmanDecoder::new()` for every Huffman-encoded request-header string, and `new()`
+rebuilds a **257-symbol nested `HashMap`** decode table each time (1.55 % self, plus
+much more in the allocator + cache pressure it caused).
+
+The fix: vendor `fluke-hpack` with one change — share a single process-wide
+`HuffmanDecoder` via `OnceLock` (the table is immutable; `decode` is `&self`). Decode
+logic is byte-identical, so h2spec stays 143/143. `HuffmanDecoder::new` vanished from
+the profile and c128 rps rose **42.0k → 45.8k (+8.9 %)**.
+
+That closed the gap. On the fair interleaved Envoy duel (two rounds), the integrated
+mux now **matches or beats Envoy at every concurrency**:
+
+| concurrency | Envoy (r1 / r2) | **integrated mux** | hyper | verdict |
+| ---: | ---: | ---: | ---: | :--- |
+| c64  | 50.0k / 43.3k | **47.5k / 47.2k** | 39.6k | 95 % clean; **beats** a load-stressed Envoy |
+| c128 | 42.0k / 41.7k | **43.1k / 43.1k** | 37.0k | **beats Envoy** (both rounds) |
+| c256 | 37.8k / 37.9k | **37.6k / 37.6k** | 33.5k | parity (99 %) |
+
+mux is rock-stable across load; Envoy's c64 swings 43–50k with contention. So on the
+*integrated* path — not just the standalone example — BoatRamp now **clears the founding
+"beat Envoy on tls-proxy-h2-100k" gate**, and is *more* load-robust than Envoy. The
+lesson: profile before optimizing — the win was a third-party HPACK table rebuild, not
+the gateway code everyone (including this README) assumed.
 
 ## M4c benchmark result (tls-proxy-h2-100k, lighthouse, cores 0-7, oha --http2)
 
