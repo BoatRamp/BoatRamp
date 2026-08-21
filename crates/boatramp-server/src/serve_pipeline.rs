@@ -987,34 +987,22 @@ async fn serve_resolved(
                             .filter(|h| h.enabled),
                     ) {
                         // A `websocket` stream upgraded by the client is served
-                        // bidirectionally (WebSocket fan-out);
-                        // otherwise it's SSE. Build the upgrade from the request
-                        // parts (consuming the body, which isn't `Sync`, so it is
-                        // never held across the dispatch await).
+                        // bidirectionally (WebSocket fan-out); otherwise it's SSE.
+                        // serve_ws_stream does the RFC 6455 handshake + takes over the
+                        // connection via boatramp-http's upgrade seam (the request body
+                        // isn't held across an await — WS carries none).
                         if stream.websocket && is_upgrade_request(request.headers()) {
-                            use axum::extract::FromRequestParts;
-                            let (mut parts, _body) = request.into_parts();
                             return apply_vary(
-                                match axum::extract::ws::WebSocketUpgrade::from_request_parts(
-                                    &mut parts,
-                                    &(),
+                                serve_ws_stream(
+                                    inner,
+                                    site,
+                                    site_handlers,
+                                    stream,
+                                    request,
+                                    client_ip,
+                                    preview,
                                 )
-                                .await
-                                {
-                                    Ok(ws) => {
-                                        serve_ws_stream(
-                                            inner,
-                                            site,
-                                            site_handlers,
-                                            stream,
-                                            ws,
-                                            client_ip,
-                                            preview,
-                                        )
-                                        .await
-                                    }
-                                    Err(rejection) => rejection.into_response(),
-                                },
+                                .await,
                                 &vary,
                             );
                         }

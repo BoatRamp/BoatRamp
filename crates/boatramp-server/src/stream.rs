@@ -351,6 +351,18 @@ mod tests {
     }
 }
 
+/// The `Sec-WebSocket-Accept` response token (RFC 6455 §1.3): base64 of the SHA-1 of the
+/// client's `Sec-WebSocket-Key` concatenated with the WebSocket GUID.
+#[cfg(feature = "handlers")]
+fn ws_accept_key(key: &[u8]) -> String {
+    use base64::Engine;
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(key);
+    h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(h.finalize())
+}
+
 /// Serve a configured stream as a **WebSocket**: the same scope-namespaced
 /// `topics` fan out to the client
 /// (server→client, as binary frames), and — bidirectionally — frames the client
@@ -366,11 +378,31 @@ pub(super) async fn serve_ws_stream(
     site: &str,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     stream: &boatramp_core::config::StreamConfig,
-    ws: axum::extract::ws::WebSocketUpgrade,
+    mut request: Request,
     client_ip: IpAddr,
     preview: Option<&str>,
 ) -> Response {
     use futures::StreamExt;
+
+    // WebSocket opening handshake (RFC 6455 §4.2.1): require version 13 + a key, derive
+    // the accept token, and take over the connection via boatramp-http's upgrade seam
+    // (the inbound connection is served by serve_connection, not hyper).
+    let version_ok = request
+        .headers()
+        .get("sec-websocket-version")
+        .is_some_and(|v| v.as_bytes() == b"13");
+    let accept_key = request
+        .headers()
+        .get("sec-websocket-key")
+        .map(|k| ws_accept_key(k.as_bytes()));
+    let (Some(accept), true) = (accept_key, version_ok) else {
+        return (StatusCode::BAD_REQUEST, "invalid websocket handshake\n").into_response();
+    };
+    let on_upgrade = match boatramp_http::on_upgrade(&mut request) {
+        Some(u) => u,
+        None => return (StatusCode::BAD_REQUEST, "no upgrade handle\n").into_response(),
+    };
+    drop(request); // the WS handshake carries no body; release it before any await
 
     let Some(messaging) = inner.messaging.clone() else {
         return not_found();
@@ -417,9 +449,20 @@ pub(super) async fn serve_ws_stream(
         .as_ref()
         .map(|topic| format!("{scope}/{topic}"));
 
-    ws.on_upgrade(move |socket| async move {
-        use axum::extract::ws::Message;
+    // The fan-out runs once the serve loop hands us the upgraded connection (after it
+    // writes our 101). tungstenite drives the WebSocket framing over the raw stream.
+    tokio::spawn(async move {
         use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let Ok(upgraded) = on_upgrade.await else { return };
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            upgraded,
+            Role::Server,
+            None,
+        )
+        .await;
         // Holding the permits for the socket's lifetime caps concurrent streams;
         // they drop (releasing the slot) when this task ends.
         let _permits = (site_permit, ip_guard);
@@ -429,8 +472,7 @@ pub(super) async fn serve_ws_stream(
                 // Forward a subscription payload to the client (binary frame).
                 event = downstream.next() => match event {
                     Some(payload) => {
-                        // axum 0.8's `Message::Binary` carries `Bytes` (was `Vec<u8>`).
-                        if sink.send(Message::Binary(payload.into())).await.is_err() {
+                        if sink.send(Message::Binary(payload)).await.is_err() {
                             break; // client gone
                         }
                     }
@@ -448,13 +490,27 @@ pub(super) async fn serve_ws_stream(
                             let _ = messaging.publish(topic, &bytes).await;
                         }
                     }
-                    // Ping/Pong are handled by axum; ignore them here.
+                    // Ping/Pong/Close: tungstenite auto-answers pings; ignore the rest.
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => {}
-                    Some(Err(_)) | None => break, // closed / errored
                 },
             }
         }
-    })
+    });
+
+    // The 101 that triggers the serve loop's upgrade handoff. `Connection`/`Upgrade` are
+    // required by the client to complete the handshake — the serve bridge must NOT strip
+    // them from a 101 response.
+    (
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::CONNECTION, "upgrade"),
+            (header::UPGRADE, "websocket"),
+            (header::SEC_WEBSOCKET_ACCEPT, accept.as_str()),
+        ],
+        axum::body::Body::empty(),
+    )
+        .into_response()
 }
 
 /// Render one messaging payload as an SSE event. A UTF-8 (CR-free) payload is

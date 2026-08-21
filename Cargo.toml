@@ -37,6 +37,7 @@ exclude = [
   "examples/compose/edge",
   "examples/compose/plugin",
   "crates/boatramp-console",
+  "boatramp-http",
 ]
 
 [workspace.package]
@@ -144,7 +145,10 @@ tar = "0.4"
 
 # TLS (compiled only with the `tls` feature).
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-rustls-acme = { version = "0.15", features = ["axum", "tokio"] }
+# The `axum` feature (which pulls axum-server) is deliberately omitted: ACME is
+# served through boatramp's own TLS accept loop off the state's cert resolver, not
+# rustls-acme's axum acceptor.
+rustls-acme = { version = "0.15", features = ["tokio"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 reqwest = { version = "0.12", default-features = false, features = [
@@ -265,3 +269,10 @@ serde_yaml = "0.9"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Vendored fluke-hpack (via the `boatramp-http` serving stack): its HPACK decoder
+# rebuilt a 257-symbol Huffman decode table for every Huffman-encoded header string
+# — the top per-request userspace cost on the h2 proxy path. The vendored copy
+# shares one process-wide decoder; decode logic is otherwise identical.
+[patch.crates-io]
+fluke-hpack = { path = "boatramp-http/vendor/fluke-hpack" }

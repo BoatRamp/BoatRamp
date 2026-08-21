@@ -89,6 +89,9 @@ rmcp = { version = "1.2", features = [
 # for the server (it is the native binary's auth; `boatramp-core` keeps it opt-in
 # for library/wasm cleanliness).
 boatramp-core = { workspace = true, features = ["authz"] }
+# The hand-rolled HTTP serving stack (h1 loop + h2 mux driver + connection upgrade):
+# becoming *the* serving path, replacing hyper/axum_server. Non-optional.
+boatramp-http = { path = "../../boatramp-http" }
 # `time` + `sync` (beyond the workspace defaults) for the bounded shutdown drain
 # in `serve` (in-flight requests finish under a deadline).
 tokio = { workspace = true, features = ["time", "sync"] }
@@ -96,6 +99,11 @@ tokio = { workspace = true, features = ["time", "sync"] }
 # endpoint (WebSocket fan-out).
 axum = { workspace = true, features = ["ws"] }
 futures.workspace = true
+# WebSocket framing over an already-upgraded connection (handler `websocket` stream
+# routes): `from_raw_socket`, server role, no client/TLS/handshake features. The opening
+# handshake's accept key is computed directly (sha1 + base64, both already in the tree).
+tokio-tungstenite = { version = "0.24", default-features = false }
+sha1 = "0.10"
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -145,6 +153,9 @@ h3-quinn = { version = "0.0.10", optional = true }
 # it is already compiled in the base build via reqwest, so this adds negligible weight.
 # The `http3` feature reuses it for the QUIC crypto config.
 rustls = { version = "0.23", features = ["ring"] }
+# Lock-free hot-swap of the served rustls `ServerConfig` (ACME cert renewal swaps
+# the cert live under the TLS accept loop — the same primitive axum_server used).
+arc-swap = "1"
 # TLS client for the gateway's `wss`/`https` WebSocket-upgrade upstreams (HS-2).
 tokio-rustls = { version = "0.26", default-features = false, features = [
   "ring",

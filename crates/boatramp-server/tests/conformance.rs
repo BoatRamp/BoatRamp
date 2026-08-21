@@ -865,7 +865,8 @@ async fn spawn_ws_echo_upstream() -> u16 {
 
 /// Gateway: a WebSocket upgrade is forwarded to the upstream and, on `101`,
 /// the two connections are bridged both ways. Served over a real listener
-/// (upgrades need a live connection, not `oneshot`).
+/// (upgrades need a live connection, not `oneshot`). The inbound upgrade is taken
+/// from boatramp-http's `on_upgrade`, fulfilled by the unified `serve_connection`.
 #[tokio::test]
 async fn gateway_bridges_websocket_upgrade() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -900,8 +901,9 @@ async fn gateway_bridges_websocket_upgrade() {
         .await
         .unwrap();
 
-    // Serve boatramp over a real TCP listener (axum::serve enables upgrades).
-    // Single-tenant posture so the loopback ws upstream is permitted.
+    // Serve boatramp over a real TCP listener through the unified serve stack
+    // (`serve_connection` owns HTTP upgrades). Single-tenant posture so the loopback
+    // ws upstream is permitted.
     let gw_options = ServerOptions {
         posture: boatramp_core::security::SecurityProfile::SingleTenant.preset(),
         ..Default::default()
@@ -911,12 +913,17 @@ async fn gateway_bridges_websocket_upgrade() {
         Auth::disabled(),
         HandlerRuntime::disabled(),
         gw_options,
-    )
-    .into_make_service_with_connect_info::<SocketAddr>();
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            tokio::spawn(boatramp_server::serve_router_conn(tcp, peer, app.clone()));
+        }
     });
 
     // Raw upgrade handshake through boatramp.
@@ -4328,7 +4335,9 @@ async fn stream_per_site_connection_cap_returns_503() {
 /// WebSocket fan-out: a `websocket` stream route bridges both
 /// ways — a publish to its topic reaches the client, and a message the client
 /// sends is published to the configured `publish_topic`. Served over a real
-/// listener (the upgrade needs a live connection, not `oneshot`).
+/// listener (the upgrade needs a live connection, not `oneshot`). Handler
+/// WebSocket routes take over the connection via boatramp-http's `on_upgrade`,
+/// fulfilled by the unified `serve_connection`.
 #[cfg(feature = "handlers")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_stream_fans_out_and_publishes() {
@@ -4382,12 +4391,17 @@ async fn websocket_stream_fans_out_and_publishes() {
     let messaging: Arc<dyn Messaging> = log.clone();
     let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
     let runtime = HandlerRuntime::new(engine, kv, storage, None, Some(messaging));
-    let app = router(deploy, Auth::disabled(), runtime)
-        .into_make_service_with_connect_info::<SocketAddr>();
+    let app = router(deploy, Auth::disabled(), runtime);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            tokio::spawn(boatramp_server::serve_router_conn(tcp, peer, app.clone()));
+        }
     });
 
     // Subscribe to the publish topic up front so the client→server direction is

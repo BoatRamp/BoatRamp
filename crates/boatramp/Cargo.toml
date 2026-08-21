@@ -85,7 +85,6 @@ sql-mysql = [
 slatedb = ["boatramp-storage/slatedb", "boatramp-node/slatedb"]
 # HTTPS: `--tls custom` (operator cert) and `--tls acme` (automatic certs).
 tls = [
-  "dep:axum-server",
   "dep:rustls-acme",
   "dep:rustls",
   "dep:rustls-pemfile",
@@ -186,8 +185,6 @@ cluster = [
   "dep:boatramp-cluster",
   "boatramp-cluster/http",
   "dep:axum",
-  # The peer mesh is served over mutual TLS, independent of `--tls`.
-  "dep:axum-server",
   # The `MeshAdmitter` impl bridging the join route to `ClusterNode::admit`.
   "dep:async-trait",
 ]
@@ -302,7 +299,6 @@ base64.workspace = true
 brotli.workspace = true
 flate2.workspace = true
 
-axum-server = { workspace = true, optional = true }
 rustls-acme = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }

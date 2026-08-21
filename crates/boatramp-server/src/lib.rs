@@ -135,6 +135,13 @@ pub(crate) use proxy::{
     proxy, COMPUTE_WAKE_TIMEOUT,
 };
 mod splice;
+// The unified serving front door: TLS + plaintext accept loops that drive every
+// connection through boatramp-http's own h1+h2 stack (replaced hyper/axum_server).
+mod http_serve;
+pub use http_serve::{
+    alpn_h1_h2, serve_plaintext, serve_plaintext_listener, serve_router_conn, serve_tls,
+    serve_tls_listener, ReloadableTls,
+};
 // Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
 #[cfg(feature = "handlers")]
 pub(crate) use proxy::is_upgrade_request;
