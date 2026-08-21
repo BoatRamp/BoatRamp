@@ -28,7 +28,7 @@ use boatramp_http::{Body as HttpBody, BodyError, Handler, Request as HttpRequest
 use futures::StreamExt as _;
 use http_body_util::BodyStream;
 use rustls::ServerConfig;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 /// The ALPN identifier for the ACME TLS-ALPN-01 challenge (RFC 8737). A challenge
@@ -105,6 +105,36 @@ where
 {
     if let Err(err) = boatramp_http::serve_connection(io, RouterHandler::new(router, peer)).await {
         tracing::debug!(%peer, %err, "connection served with error");
+    }
+}
+
+/// Serve one TLS-terminated connection, routing on the **negotiated ALPN** rather
+/// than re-sniffing the stream: ALPN already told us the protocol, so we hand the
+/// decrypted stream straight to the h2 mux driver or the h1 loop with no preface
+/// sniff and no [`Rewind`] wrapper (that wrapper would otherwise sit on the write
+/// path and break the h2 writer's vectored `IoSlice` fast-path). A completed
+/// `acme-tls/1` challenge handshake carries no request and is dropped. A connection
+/// that negotiated no ALPN falls back to the sniffing dispatcher.
+async fn serve_tls_stream(
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    peer: SocketAddr,
+    router: Router,
+) {
+    let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    let handler = RouterHandler::new(router, peer);
+    let result = match alpn.as_deref() {
+        // The challenge handshake alone satisfies the CA — nothing to serve.
+        Some(p) if p == ACME_TLS_ALPN => {
+            tracing::debug!(%peer, "completed an ACME tls-alpn-01 challenge");
+            return;
+        }
+        Some(b"h2") => boatramp_http::h2::serve_connection_mux(stream, handler).await,
+        Some(b"http/1.1") => boatramp_http::h1::serve_connection(stream, handler).await,
+        // No ALPN negotiated (a bare TLS client): let the dispatcher sniff h2c-vs-h1.
+        _ => boatramp_http::serve_connection(stream, handler).await,
+    };
+    if let Err(err) = result {
+        tracing::debug!(%peer, %err, "TLS connection served with error");
     }
 }
 
@@ -196,15 +226,7 @@ where
                 inflight.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     match acceptor.accept(tcp).await {
-                        Ok(stream) => {
-                            // An ACME TLS-ALPN-01 challenge negotiates `acme-tls/1`; the
-                            // handshake alone satisfies the CA, so there is nothing to serve.
-                            if stream.get_ref().1.alpn_protocol() == Some(ACME_TLS_ALPN) {
-                                tracing::debug!(%peer, "completed an ACME tls-alpn-01 challenge");
-                            } else {
-                                serve_router_conn(stream, peer, router).await;
-                            }
-                        }
+                        Ok(stream) => serve_tls_stream(stream, peer, router).await,
                         Err(err) => tracing::debug!(%peer, %err, "TLS handshake failed"),
                     }
                     inflight.fetch_sub(1, Ordering::SeqCst);

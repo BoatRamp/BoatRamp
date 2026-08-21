@@ -598,15 +598,21 @@ where
     // pushes the active count past the advertised cap, refuse it with
     // RST_STREAM(REFUSED_STREAM) — the client may retry on a new connection. The
     // header block was decoded above, so the shared HPACK context stays consistent.
-    // Active = open or half-closed (closed/reset streams don't count, per §5.1.2).
-    let active = {
+    // Fast path: total map entries ≤ cap ⇒ certainly under it (active ≤ total), so
+    // skip the precise scan — the writer reaps closed streams, so on the hot path the
+    // map stays small and this stays O(1) under the lock. Only when the map exceeds
+    // the cap do we pay the active-only count (open/half-closed; closed & reset don't
+    // count, per §5.1.2, and may linger until reaped).
+    let over_cap = {
         let s = shared.lock().unwrap();
-        s.streams
-            .values()
-            .filter(|st| st.state != StreamState::Closed && !st.reset)
-            .count()
+        s.streams.len() > MAX_CONCURRENT_STREAMS as usize
+            && s.streams
+                .values()
+                .filter(|st| st.state != StreamState::Closed && !st.reset)
+                .count()
+                > MAX_CONCURRENT_STREAMS as usize
     };
-    if active > MAX_CONCURRENT_STREAMS as usize {
+    if over_cap {
         rs.content_len.remove(&sid);
         rs.bodies.remove(&sid);
         reset_local(shared, notify, sid, ErrorCode::RefusedStream);

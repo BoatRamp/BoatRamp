@@ -37,7 +37,6 @@ exclude = [
   "examples/compose/edge",
   "examples/compose/plugin",
   "crates/boatramp-console",
-  "boatramp-h2",
   "boatramp-http",
 ]
 

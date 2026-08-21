@@ -140,6 +140,20 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Rewind<IO> {
     ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+    // Forward vectored writes to the inner stream — the h2 mux writer hands the
+    // response header + body `Bytes` as separate `IoSlice`s so (k)TLS copies them
+    // straight out with no intermediate buffer. The default `AsyncWrite` impl would
+    // collapse that to a single first-slice `poll_write`, defeating the fast-path.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
