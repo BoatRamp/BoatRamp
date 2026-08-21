@@ -19,8 +19,9 @@
 //! unambiguous gateway proxy. Anything else — redirects, handlers, SSE, static,
 //! access rules, HTTPS-redirect, multi-backend/compute/HTTPS upstreams, non-GET,
 //! request bodies — yields `None` and the connection is handed back to the
-//! untouched [`axum::serve`], byte-for-byte as today. The peek is off the accept
-//! path (a spawned task), so a silent or slow client can never stall the loop.
+//! untouched serving stack (boatramp-http's `serve_connection`), byte-for-byte as
+//! before. The peek is off the accept path (a spawned task), so a silent or slow
+//! client can never stall the loop.
 //!
 //! Non-Linux targets compile the module but [`splice_body`] is unavailable, so
 //! every connection classifies as fallback and behaviour is identical to before.
@@ -83,7 +84,7 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The plaintext serve loop: accept connections and, off the accept path, peek
 /// each one's first request. Splice-eligible connections are handled by
 /// [`splice_conn`]; every other connection is served by the normal axum `router`
-/// via hyper — byte-for-byte as `axum::serve` would. Returns when `shutdown`
+/// through boatramp-http's `serve_connection` dispatcher. Returns when `shutdown`
 /// resolves (in-flight connections are dropped by the caller's drain deadline).
 pub async fn serve<S>(
     tcp: TcpListener,
@@ -123,7 +124,7 @@ where
                                 tracing::debug!(%peer, %err, "splice connection ended");
                             }
                         }
-                        // The peek did not consume, so hyper reads the full request.
+                        // The peek did not consume, so the fallback reads the full request.
                         None => serve_fallback(io, peer, router).await,
                     }
                 });
@@ -134,8 +135,8 @@ where
 
 /// A reader that replays a buffered prefix (bytes already read off the socket)
 /// before yielding the underlying stream — so a request head consumed by the
-/// splice loop can be handed intact to the hyper fallback. Writes pass straight
-/// through.
+/// splice loop can be handed intact to the fallback serve loop. Writes pass
+/// straight through.
 struct Rewind {
     pre: Vec<u8>,
     pos: usize,
@@ -223,7 +224,7 @@ async fn peek_classify(io: &TcpStream, ctx: &SpliceCtx) -> Option<SplicePlan> {
     loop {
         io.readable().await.ok()?;
         // Peek without consuming so a fallback connection still reads the full
-        // request through axum::serve.
+        // request through the fallback serve loop.
         let n = match io.peek(&mut buf).await {
             Ok(0) => return None, // client closed
             Ok(n) => n,
@@ -398,7 +399,8 @@ async fn classify(head: &[u8], ctx: &SpliceCtx) -> Option<SplicePlan> {
 /// splice the response body upstream→client. A subsequent request on the same
 /// keep-alive connection that is no longer splice-eligible (a POST, an API path, a
 /// different route) is not dropped — the already-read head is replayed and the
-/// whole connection is handed to the normal hyper `router` from that point on.
+/// whole connection is handed to the normal `router` (boatramp-http's serve loop)
+/// from that point on.
 async fn splice_conn(
     mut client: TcpStream,
     peer: SocketAddr,

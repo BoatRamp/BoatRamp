@@ -196,9 +196,9 @@ bytes.workspace = true
 # `legacy::Client` — raw hyper, no reqwest — over a pinned rustls connector),
 # and the handler body plumbing. Already in the tree via reqwest, so exposing
 # them directly is cheap.
-# `server` powers the splice fast-path's fallback (`serve_connection`) for the
-# plaintext listener; `client`+`http1` back the reverse-proxy upstream leg.
-hyper = { workspace = true, features = ["client", "http1", "server"] }
+# `client`+`http1` back the reverse-proxy upstream leg (the data plane dials
+# upstreams over hyper). Serving is boatramp-http's now, so no `server` feature.
+hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 http-body-util.workspace = true
 # The Linux `splice()` reverse-proxy fast-path (crates/boatramp-server/src/splice.rs)
