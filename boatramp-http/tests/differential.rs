@@ -211,8 +211,10 @@ impl XorShift {
         self.0 = x;
         x
     }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        &xs[(self.next() % xs.len() as u64) as usize]
+    // Returns the element by value (`T: Copy`, e.g. `&str`) — not `&T` — so inference is
+    // unambiguous across rustc versions (an `&T` return let older rustc infer `T = str`).
+    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+        xs[(self.next() % xs.len() as u64) as usize]
     }
     fn chance(&mut self, n: u64) -> bool {
         self.next() % n == 0
