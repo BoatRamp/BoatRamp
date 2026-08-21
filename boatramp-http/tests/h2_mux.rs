@@ -19,7 +19,7 @@ impl Handler for App {
         let path = req.uri().path().to_owned();
         match path.as_str() {
             "/big" => response(200, vec![b'x'; 100_000]),
-            "/echo" => response(200, req.into_body().to_vec()),
+            "/echo" => response(200, req.into_body().collect().await.unwrap_or_default().to_vec()),
             p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
     }

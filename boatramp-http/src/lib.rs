@@ -24,7 +24,7 @@ pub use serve::serve_connection;
 // The shared serving abstraction (`Request`/`Response`/`Body`/`Handler`) — homed at the
 // crate root, the surface both codecs produce/consume.
 mod serving;
-pub use serving::{response, Body, BodyChunk, BodyError, Handler, Request, Response};
+pub use serving::{response, Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response};
 
 // The verification kit (corpus + normalized-verdict model + combinatorial generators)
 // shared by the h1 gate, the differential-vs-hyper driver, and the fuzz targets — one

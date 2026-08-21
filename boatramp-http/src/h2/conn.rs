@@ -503,7 +503,7 @@ where
         (s.request.take(), std::mem::take(&mut s.body))
     };
     if let Some(mut req) = req {
-        *req.body_mut() = bytes::Bytes::from(body);
+        *req.body_mut() = crate::ReqBody::from_bytes(bytes::Bytes::from(body));
         respond(conn, wire, sid, handler, req).await?;
     }
     Ok(())

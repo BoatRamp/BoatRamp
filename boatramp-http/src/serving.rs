@@ -5,13 +5,112 @@
 //! — pays no per-request re-marshaling.
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio_stream::StreamExt as _;
+use tokio_stream::{Stream, StreamExt as _};
 
-/// A received request: an `http::Request` whose (buffered) body is `Bytes`. For h2 the
-/// pseudo-headers are hoisted into the method / URI (path) / `Host` header.
-pub type Request = http::Request<Bytes>;
+/// A received request: an `http::Request` whose body is a streamed [`ReqBody`]. The
+/// pseudo-headers (h2) / request line (h1) are hoisted into the method / URI (path) /
+/// `Host` header.
+pub type Request = http::Request<ReqBody>;
+
+/// A streamed request body. Its chunks are delivered as they arrive off the connection
+/// (no whole-body buffering), so a reverse-proxy handler streams a large upload straight
+/// through to the upstream. Implements [`http_body::Body`] so an axum/tower service
+/// consumes it directly; [`collect`](ReqBody::collect) buffers it when a handler wants
+/// the whole thing.
+pub struct ReqBody(ReqBodyInner);
+
+enum ReqBodyInner {
+    /// No body.
+    Empty,
+    /// A single already-buffered chunk (an empty `Option` once yielded). Used by the h2
+    /// driver, which accumulates DATA frames before dispatch, and for unit tests.
+    Full(Option<Bytes>),
+    /// A pull stream of body chunks (the h1 loop feeds this from the connection).
+    Stream(Pin<Box<dyn Stream<Item = Result<Bytes, BodyError>> + Send>>),
+}
+
+impl ReqBody {
+    /// An empty request body.
+    pub fn empty() -> Self {
+        ReqBody(ReqBodyInner::Empty)
+    }
+
+    /// A request body that is already fully buffered in memory.
+    pub fn from_bytes(bytes: Bytes) -> Self {
+        if bytes.is_empty() {
+            ReqBody(ReqBodyInner::Empty)
+        } else {
+            ReqBody(ReqBodyInner::Full(Some(bytes)))
+        }
+    }
+
+    /// A request body streamed from a pull [`Stream`] of chunks — the driver feeds this
+    /// from the connection as bytes arrive. A [`BodyError`] item aborts the body.
+    pub fn from_stream(
+        chunks: impl Stream<Item = Result<Bytes, BodyError>> + Send + 'static,
+    ) -> Self {
+        ReqBody(ReqBodyInner::Stream(Box::pin(chunks)))
+    }
+
+    /// Buffer the whole body into `Bytes` (for a handler that wants it all at once, or a
+    /// test). `Err` if the source failed mid-stream.
+    pub async fn collect(self) -> Result<Bytes, BodyError> {
+        match self.0 {
+            ReqBodyInner::Empty => Ok(Bytes::new()),
+            ReqBodyInner::Full(b) => Ok(b.unwrap_or_default()),
+            ReqBodyInner::Stream(mut s) => {
+                let mut buf = bytes::BytesMut::new();
+                while let Some(item) = s.next().await {
+                    buf.extend_from_slice(&item?);
+                }
+                Ok(buf.freeze())
+            }
+        }
+    }
+}
+
+impl Default for ReqBody {
+    fn default() -> Self {
+        ReqBody::empty()
+    }
+}
+
+impl std::fmt::Debug for ReqBody {
+    // The stream variant holds a boxed trait object (not `Debug`); report the shape only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.0 {
+            ReqBodyInner::Empty => "Empty",
+            ReqBodyInner::Full(_) => "Full",
+            ReqBodyInner::Stream(_) => "Stream",
+        };
+        write!(f, "ReqBody({kind})")
+    }
+}
+
+impl http_body::Body for ReqBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, BodyError>>> {
+        match &mut self.0 {
+            ReqBodyInner::Empty => Poll::Ready(None),
+            ReqBodyInner::Full(b) => Poll::Ready(b.take().map(|b| Ok(http_body::Frame::data(b)))),
+            ReqBodyInner::Stream(s) => match s.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(http_body::Frame::data(chunk)))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
 
 /// A response to send: an `http::Response` whose body is a [`Body`].
 pub type Response = http::Response<Body>;

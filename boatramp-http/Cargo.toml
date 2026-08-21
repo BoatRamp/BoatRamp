@@ -22,6 +22,10 @@ bytes = "1"
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
 tokio-stream = "0.1"
 fluke-hpack = "0.3"
+# A streamed request body (`ReqBody`) implements `http_body::Body`, so a reverse-proxy
+# bridge hands it to a tower/hyper service (the axum Router) — and on to the upstream —
+# without buffering the whole body.
+http-body = "1"
 
 # The h2 zero-copy splice body path + kTLS handoff are Linux-only, so their deps are
 # target-gated — the crate (and its tests) still build everywhere on the buffered path.
@@ -37,7 +41,7 @@ ktls = "6"
 # hyper's HTTP/1 server is the DIFFERENTIAL ORACLE for the h1 codec: identical raw byte
 # streams are fed to boatramp-http and to hyper, and the two must agree on how the stream
 # splits into messages (or both reject) — a boundary disagreement is a smuggling bug.
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }

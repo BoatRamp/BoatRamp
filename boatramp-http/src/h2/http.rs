@@ -5,12 +5,13 @@
 //! [`Handler`]) live at the crate root ([`crate::serving`]) and are re-exported here for
 //! the h2 driver's internal use.
 
-use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Uri, Version};
 
 use crate::h2::error::{ErrorCode, H2Error};
 
-pub use crate::serving::{response, Body, BodyChunk, BodyError, Handler, Request, Response};
+pub use crate::serving::{
+    response, Body, BodyChunk, BodyError, Handler, ReqBody, Request, Response,
+};
 
 /// Connection-specific header field names forbidden in HTTP/2 (RFC 7540 §8.1.2.2).
 const FORBIDDEN: &[&[u8]] = &[
@@ -89,7 +90,7 @@ pub(crate) fn request_from_headers(
         hdrs.insert(header::HOST, hv);
     }
 
-    let mut req = http::Request::new(Bytes::new());
+    let mut req = http::Request::new(ReqBody::empty());
     *req.method_mut() = method;
     *req.uri_mut() = uri;
     *req.version_mut() = Version::HTTP_2;

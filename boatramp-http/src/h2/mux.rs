@@ -578,7 +578,7 @@ fn spawn_request<H>(
     H: Handler,
 {
     let Some(mut req) = req else { return };
-    *req.body_mut() = Bytes::from(body);
+    *req.body_mut() = crate::ReqBody::from_bytes(Bytes::from(body));
     {
         let mut s = shared.lock().unwrap();
         s.active_handlers += 1;

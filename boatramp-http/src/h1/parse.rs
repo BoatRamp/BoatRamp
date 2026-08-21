@@ -1,4 +1,5 @@
-//! The HTTP/1.1 codec.
+//! The HTTP/1.1 request parser + response framing (the codec's byte layer; the
+//! connection loop that drives it lives in [`super::serve`]).
 //!
 //! The request-head parser here is the security-critical surface of a reverse proxy:
 //! HTTP/1.1's Content-Length vs Transfer-Encoding ambiguity is *the* classic
@@ -472,18 +473,42 @@ pub mod chunked {
         )
     }
 
+    /// The outcome of decoding a chunked body: the collected payload + where it ended.
+    #[derive(Debug)]
+    pub enum ChunkDecode {
+        /// The full chunked body decoded to `data`, ending at byte offset `end`.
+        Complete { data: Vec<u8>, end: usize },
+        /// More bytes are needed to reach the terminating chunk.
+        Incomplete,
+        /// Malformed chunk framing — reject (fail closed).
+        Reject(super::Reject),
+    }
+
     /// Scan a chunked message body starting at the front of `buf`, returning where it
     /// ends. Rejects a non-hex/overflowing chunk size, bad chunk terminators, an
     /// oversized chunk-size line, or a forbidden trailer field.
     pub fn scan(buf: &[u8]) -> ChunkScan {
-        match scan_inner(buf) {
-            Ok(Some(end)) => ChunkScan::Complete { end },
+        match walk(buf, None) {
+            Ok(Some((_, end))) => ChunkScan::Complete { end },
             Ok(None) => ChunkScan::Incomplete,
             Err(r) => ChunkScan::Reject(r),
         }
     }
 
-    fn scan_inner(buf: &[u8]) -> Result<Option<usize>, Reject> {
+    /// Decode a chunked message body starting at the front of `buf`: same framing checks
+    /// as [`scan`], but also collects the decoded payload (the serve loop needs the body,
+    /// not just its end).
+    pub fn decode(buf: &[u8]) -> ChunkDecode {
+        match walk(buf, Some(Vec::new())) {
+            Ok(Some((data, end))) => ChunkDecode::Complete { data: data.unwrap_or_default(), end },
+            Ok(None) => ChunkDecode::Incomplete,
+            Err(r) => ChunkDecode::Reject(r),
+        }
+    }
+
+    /// Walk a chunked body once, enforcing framing. When `collect` is `Some`, the chunk
+    /// data is appended to it; returns `(collected, end_offset)`. `scan` passes `None`.
+    fn walk(buf: &[u8], mut collect: Option<Vec<u8>>) -> Result<Option<(Option<Vec<u8>>, usize)>, Reject> {
         let mut pos = 0usize;
         loop {
             // chunk-size line: `<hex>[;chunk-ext]CRLF`.
@@ -510,7 +535,7 @@ pub mod chunked {
                     };
                     pos = tnext;
                     if tline.is_empty() {
-                        return Ok(Some(pos)); // end of the chunked body
+                        return Ok(Some((collect, pos))); // end of the chunked body
                     }
                     // A trailer is a header field; reject framing-sensitive ones.
                     if tline[0] == b' ' || tline[0] == b'\t' {
@@ -530,6 +555,9 @@ pub mod chunked {
             }
             if &buf[data_end..crlf_end] != b"\r\n" {
                 return Err(Reject::BadChunk);
+            }
+            if let Some(acc) = collect.as_mut() {
+                acc.extend_from_slice(&buf[pos..data_end]);
             }
             pos = crlf_end;
         }
