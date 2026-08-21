@@ -81,10 +81,7 @@ mod linux {
                 },
             };
             // HTTP/1.1 defaults to keep-alive, so the connection returns to the pool.
-            let get = format!(
-                "GET {} HTTP/1.1\r\nHost: b\r\n\r\n",
-                req.uri()
-            );
+            let get = format!("GET {} HTTP/1.1\r\nHost: b\r\n\r\n", req.uri());
             if up.write_all(get.as_bytes()).await.is_err() {
                 return response(502, b"bad gateway".to_vec());
             }

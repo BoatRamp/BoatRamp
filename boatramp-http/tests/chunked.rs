@@ -23,24 +23,64 @@ fn out(buf: &[u8]) -> Out {
 /// `(name, body, expected)` — `Complete(n)` means the chunked body ends at offset `n`.
 const CASES: &[(&str, &[u8], Out)] = &[
     ("empty body (0-chunk only)", b"0\r\n\r\n", Out::Complete(5)),
-    ("one data chunk", b"5\r\nhello\r\n0\r\n\r\n", Out::Complete(15)),
-    ("hex size lowercase (a=10)", b"a\r\n0123456789\r\n0\r\n\r\n", Out::Complete(20)),
-    ("hex size uppercase (A=10)", b"A\r\n0123456789\r\n0\r\n\r\n", Out::Complete(20)),
-    ("chunk extension ignored", b"5;ext=1\r\nhello\r\n0\r\n\r\n", Out::Complete(21)),
-    ("trailer field", b"0\r\nX-Trailer: v\r\n\r\n", Out::Complete(19)),
+    (
+        "one data chunk",
+        b"5\r\nhello\r\n0\r\n\r\n",
+        Out::Complete(15),
+    ),
+    (
+        "hex size lowercase (a=10)",
+        b"a\r\n0123456789\r\n0\r\n\r\n",
+        Out::Complete(20),
+    ),
+    (
+        "hex size uppercase (A=10)",
+        b"A\r\n0123456789\r\n0\r\n\r\n",
+        Out::Complete(20),
+    ),
+    (
+        "chunk extension ignored",
+        b"5;ext=1\r\nhello\r\n0\r\n\r\n",
+        Out::Complete(21),
+    ),
+    (
+        "trailer field",
+        b"0\r\nX-Trailer: v\r\n\r\n",
+        Out::Complete(19),
+    ),
     // incomplete
-    ("missing terminating chunk", b"5\r\nhello\r\n", Out::Incomplete),
+    (
+        "missing terminating chunk",
+        b"5\r\nhello\r\n",
+        Out::Incomplete,
+    ),
     ("partial chunk data", b"5\r\nhel", Out::Incomplete),
     ("size line without CRLF yet", b"5", Out::Incomplete),
     // rejects (fail closed)
     ("non-hex size", b"z\r\nhello\r\n0\r\n\r\n", Out::Reject),
     ("0x-prefixed size", b"0x5\r\nhello\r\n", Out::Reject),
     ("negative size", b"-5\r\nhello\r\n", Out::Reject),
-    ("size overflow (17 hex digits)", b"1ffffffffffffffff\r\nx\r\n", Out::Reject),
-    ("data not followed by CRLF", b"5\r\nhelloX0\r\n\r\n", Out::Reject),
+    (
+        "size overflow (17 hex digits)",
+        b"1ffffffffffffffff\r\nx\r\n",
+        Out::Reject,
+    ),
+    (
+        "data not followed by CRLF",
+        b"5\r\nhelloX0\r\n\r\n",
+        Out::Reject,
+    ),
     ("bare-LF chunk framing", b"5\nhello\n0\n\n", Out::Reject),
-    ("forbidden trailer field (Content-Length)", b"0\r\nContent-Length: 5\r\n\r\n", Out::Reject),
-    ("forbidden trailer field (Transfer-Encoding)", b"0\r\nTransfer-Encoding: chunked\r\n\r\n", Out::Reject),
+    (
+        "forbidden trailer field (Content-Length)",
+        b"0\r\nContent-Length: 5\r\n\r\n",
+        Out::Reject,
+    ),
+    (
+        "forbidden trailer field (Transfer-Encoding)",
+        b"0\r\nTransfer-Encoding: chunked\r\n\r\n",
+        Out::Reject,
+    ),
 ];
 
 #[test]

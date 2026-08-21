@@ -109,7 +109,8 @@ where
             *req.version_mut() = head.version;
             *req.headers_mut() = head.headers;
             let (up_tx, up_rx) = tokio::sync::oneshot::channel();
-            req.extensions_mut().insert(crate::upgrade::Pending::new(up_rx));
+            req.extensions_mut()
+                .insert(crate::upgrade::Pending::new(up_rx));
 
             let resp = handler.handle(req).await;
             if resp.status() == http::StatusCode::SWITCHING_PROTOCOLS {
@@ -134,7 +135,9 @@ where
         // A body carries an interim 100-continue if the client asked for one.
         if !matches!(framing, BodyFraming::Empty)
             && expect_continue
-            && write_all(&mut wr, b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
+            && write_all(&mut wr, b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .is_err()
         {
             return Ok(());
         }
@@ -155,8 +158,10 @@ where
             let resp = handler.handle(req).await;
             write_response(&mut wr, resp, &method, version, client_close).await
         };
-        let ((result, resp_close), pump) =
-            tokio::join!(respond, pump_body(&mut rd, &mut buf, framing, tx, read_timeout));
+        let ((result, resp_close), pump) = tokio::join!(
+            respond,
+            pump_body(&mut rd, &mut buf, framing, tx, read_timeout)
+        );
 
         if result.is_err() {
             return Ok(()); // client went away mid-response
@@ -221,7 +226,11 @@ where
         }
         BodyFraming::Chunked => loop {
             match chunked::next_chunk(buf) {
-                chunked::ChunkStep::Data { data_start, data_end, next } => {
+                chunked::ChunkStep::Data {
+                    data_start,
+                    data_end,
+                    next,
+                } => {
                     let chunk = Bytes::copy_from_slice(&buf[data_start..data_end]);
                     buf.drain(..next);
                     if sending && tx.send(Ok(chunk)).await.is_err() {
@@ -293,10 +302,8 @@ where
 {
     let (mut parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
-    let no_body = *method == Method::HEAD
-        || (100..200).contains(&status)
-        || status == 204
-        || status == 304;
+    let no_body =
+        *method == Method::HEAD || (100..200).contains(&status) || status == 204 || status == 304;
 
     // We own framing: drop any handler-set framing/hop-by-hop headers and set our own.
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -305,7 +312,11 @@ where
         .headers
         .get(header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase().split(',').any(|t| t.trim() == "close"))
+        .map(|v| {
+            v.to_ascii_lowercase()
+                .split(',')
+                .any(|t| t.trim() == "close")
+        })
         .unwrap_or(false);
     parts.headers.remove(header::CONNECTION);
 
@@ -328,9 +339,10 @@ where
                 .insert(header::CONTENT_LENGTH, HeaderValue::from(*len as u64));
         }
         Framing::Chunked => {
-            parts
-                .headers
-                .insert(header::TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+            parts.headers.insert(
+                header::TRANSFER_ENCODING,
+                HeaderValue::from_static("chunked"),
+            );
         }
     }
     let will_close = client_close || resp_close;

@@ -124,7 +124,12 @@ impl Socket {
                 .sock
                 .async_io(Interest::READABLE, || {
                     let r = unsafe {
-                        libc::recv(fd, buf[n..].as_mut_ptr() as *mut libc::c_void, buf.len() - n, 0)
+                        libc::recv(
+                            fd,
+                            buf[n..].as_mut_ptr() as *mut libc::c_void,
+                            buf.len() - n,
+                            0,
+                        )
                     };
                     if r < 0 {
                         Err(io::Error::last_os_error())
@@ -149,7 +154,12 @@ impl Socket {
                 .sock
                 .async_io(Interest::WRITABLE, || {
                     let r = unsafe {
-                        libc::send(fd, buf[n..].as_ptr() as *const libc::c_void, buf.len() - n, 0)
+                        libc::send(
+                            fd,
+                            buf[n..].as_ptr() as *const libc::c_void,
+                            buf.len() - n,
+                            0,
+                        )
                     };
                     if r < 0 {
                         Err(io::Error::last_os_error())

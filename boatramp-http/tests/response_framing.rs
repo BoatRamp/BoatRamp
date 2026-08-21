@@ -21,14 +21,56 @@ fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
 fn body_framing_selection() {
     use ResponseFraming::*;
     let cases: &[(&str, u16, Method, HeaderMap, ResponseFraming)] = &[
-        ("200 + Content-Length", 200, Method::GET, hdr(&[("content-length", "5")]), Length(5)),
-        ("200 + TE: chunked", 200, Method::GET, hdr(&[("transfer-encoding", "chunked")]), Chunked),
-        ("200 no framing headers → close", 200, Method::GET, hdr(&[]), CloseDelimited),
-        ("HEAD suppresses the body", 200, Method::HEAD, hdr(&[("content-length", "5")]), None),
-        ("204 has no body", 204, Method::GET, hdr(&[("content-length", "5")]), None),
-        ("304 has no body", 304, Method::GET, hdr(&[("content-length", "5")]), None),
+        (
+            "200 + Content-Length",
+            200,
+            Method::GET,
+            hdr(&[("content-length", "5")]),
+            Length(5),
+        ),
+        (
+            "200 + TE: chunked",
+            200,
+            Method::GET,
+            hdr(&[("transfer-encoding", "chunked")]),
+            Chunked,
+        ),
+        (
+            "200 no framing headers → close",
+            200,
+            Method::GET,
+            hdr(&[]),
+            CloseDelimited,
+        ),
+        (
+            "HEAD suppresses the body",
+            200,
+            Method::HEAD,
+            hdr(&[("content-length", "5")]),
+            None,
+        ),
+        (
+            "204 has no body",
+            204,
+            Method::GET,
+            hdr(&[("content-length", "5")]),
+            None,
+        ),
+        (
+            "304 has no body",
+            304,
+            Method::GET,
+            hdr(&[("content-length", "5")]),
+            None,
+        ),
         ("1xx has no body", 100, Method::GET, hdr(&[]), None),
-        ("CONNECT 2xx has no body", 200, Method::CONNECT, hdr(&[("content-length", "5")]), None),
+        (
+            "CONNECT 2xx has no body",
+            200,
+            Method::CONNECT,
+            hdr(&[("content-length", "5")]),
+            None,
+        ),
     ];
     let failures: Vec<String> = cases
         .iter()
@@ -50,9 +92,17 @@ fn body_framing_selection() {
 fn response_head_encodes_status_line_and_reason() {
     let out = encode_response_head(200, &hdr(&[("content-type", "text/plain")]));
     let text = String::from_utf8_lossy(&out);
-    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {text:?}");
-    assert!(text.to_ascii_lowercase().contains("content-type: text/plain\r\n"));
-    assert!(text.ends_with("\r\n\r\n"), "must end with CRLFCRLF: {text:?}");
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK\r\n"),
+        "status line: {text:?}"
+    );
+    assert!(text
+        .to_ascii_lowercase()
+        .contains("content-type: text/plain\r\n"));
+    assert!(
+        text.ends_with("\r\n\r\n"),
+        "must end with CRLFCRLF: {text:?}"
+    );
 
     let nf = encode_response_head(404, &HeaderMap::new());
     assert!(String::from_utf8_lossy(&nf).starts_with("HTTP/1.1 404 Not Found\r\n"));

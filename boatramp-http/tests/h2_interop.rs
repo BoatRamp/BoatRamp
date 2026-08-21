@@ -4,8 +4,8 @@
 //! window makes the server stall and resume on WINDOW_UPDATE). Driven by the
 //! reference `h2` client, so the responses are validated against a real peer.
 
-use bytes::Bytes;
 use boatramp_http::h2::{response, serve_connection, Handler, Request, Response};
+use bytes::Bytes;
 
 struct App;
 
@@ -14,7 +14,10 @@ impl Handler for App {
         let path = req.uri().path().to_owned();
         match path.as_str() {
             "/big" => response(200, vec![b'x'; 100_000]),
-            "/echo" => response(200, req.into_body().collect().await.unwrap_or_default().to_vec()),
+            "/echo" => response(
+                200,
+                req.into_body().collect().await.unwrap_or_default().to_vec(),
+            ),
             p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
     }
@@ -59,7 +62,10 @@ async fn multiplexed_concurrent_streams() {
     for (i, response) in pending {
         let response = response.await.unwrap();
         assert_eq!(response.status(), 200);
-        assert_eq!(read_body(response.into_body()).await, format!("GET /s{i}").into_bytes());
+        assert_eq!(
+            read_body(response.into_body()).await,
+            format!("GET /s{i}").into_bytes()
+        );
     }
 }
 
@@ -90,7 +96,8 @@ async fn request_body_is_delivered_to_the_handler() {
         .body(())
         .unwrap();
     let (response, mut send) = client.send_request(request, false).unwrap();
-    send.send_data(Bytes::from_static(b"hello body"), true).unwrap();
+    send.send_data(Bytes::from_static(b"hello body"), true)
+        .unwrap();
     let response = response.await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(read_body(response.into_body()).await, b"hello body");

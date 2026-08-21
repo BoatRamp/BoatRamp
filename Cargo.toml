@@ -70,6 +70,12 @@ explicit_iter_loop = "warn"
 explicit_into_iter_loop = "warn"
 manual_string_new = "warn"
 semicolon_if_nothing_returned = "warn"
+# The control-plane HTTP layer deliberately returns `Result<T, axum::Response>` —
+# the error variant *is* a ready-to-send response, which is large by design;
+# boxing it would just push a `Box<Response>` onto every caller for no benefit.
+# A specific allow overrides CI's `-D warnings`. (Newer clippy flags this
+# `result_large_err` where 1.96/1.97 did not.)
+result_large_err = "allow"
 
 [workspace.dependencies]
 boatramp-types = { path = "crates/boatramp-types", version = "0.2.14" }

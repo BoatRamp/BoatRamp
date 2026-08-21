@@ -99,8 +99,7 @@ pub struct Case {
 pub fn satisfies(v: &Verdict, e: Expect) -> bool {
     matches!(
         (v, e),
-        (Verdict::Reject, Expect::Reject)
-            | (Verdict::Incomplete, Expect::Incomplete)
+        (Verdict::Reject, Expect::Reject) | (Verdict::Incomplete, Expect::Incomplete)
     ) || matches!((v, e), (Verdict::Accept { framing, .. }, Expect::Accept(f)) if *framing == f)
 }
 

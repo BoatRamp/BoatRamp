@@ -4,9 +4,9 @@
 //! 400, and hyper-client interop. Framing is asserted on the raw wire bytes; interop is
 //! asserted by driving the server with a real hyper client.
 
-use bytes::Bytes;
 use boatramp_http::h1::serve_connection;
 use boatramp_http::{response, Body, Handler, Request, Response};
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The test application: exercises every response shape the loop must frame.
@@ -19,16 +19,17 @@ impl Handler for App {
             ("GET", "/") => response(200, b"hello".to_vec()),
             ("HEAD", "/") => response(200, b"hello".to_vec()), // loop suppresses the body
             ("GET", "/big") => response(200, vec![b'x'; 100_000]),
-            ("POST", "/echo") => response(200, req.into_body().collect().await.unwrap_or_default().to_vec()),
+            ("POST", "/echo") => response(
+                200,
+                req.into_body().collect().await.unwrap_or_default().to_vec(),
+            ),
             // Stream the request body straight back — the response streams chunk-by-chunk
             // as the request body arrives, WITHOUT buffering the whole thing.
             ("POST", "/echo-stream") => {
                 response(200, Body::try_stream(req.into_body().into_data_stream()))
             }
             ("GET", "/stream") => {
-                let chunks = tokio_stream::iter(
-                    (0..3u8).map(|i| Bytes::from(vec![b'a' + i; 4])),
-                );
+                let chunks = tokio_stream::iter((0..3u8).map(|i| Bytes::from(vec![b'a' + i; 4])));
                 response(200, Body::stream(chunks))
             }
             ("GET", "/stream-err") => {
@@ -74,7 +75,10 @@ async fn get_is_content_length_framed() {
     assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
     assert!(lower(&r).contains("content-length: 5\r\n"), "{text}");
     assert!(text.ends_with("hello"), "{text}");
-    assert!(!lower(&r).contains("transfer-encoding"), "GET must be CL-framed: {text}");
+    assert!(
+        !lower(&r).contains("transfer-encoding"),
+        "GET must be CL-framed: {text}"
+    );
 }
 
 #[tokio::test]
@@ -103,7 +107,11 @@ async fn post_content_length_body_reaches_the_handler() {
         b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
     )
     .await;
-    assert!(String::from_utf8_lossy(&r).ends_with("hello"), "echo failed: {:?}", lower(&r));
+    assert!(
+        String::from_utf8_lossy(&r).ends_with("hello"),
+        "echo failed: {:?}",
+        lower(&r)
+    );
     assert!(lower(&r).contains("content-length: 5\r\n"));
 }
 
@@ -115,7 +123,11 @@ async fn post_chunked_body_is_decoded_for_the_handler() {
     )
     .await;
     // The handler echoes the DECODED body ("hello world"), buffered → Content-Length: 11.
-    assert!(String::from_utf8_lossy(&r).ends_with("hello world"), "{:?}", lower(&r));
+    assert!(
+        String::from_utf8_lossy(&r).ends_with("hello world"),
+        "{:?}",
+        lower(&r)
+    );
     assert!(lower(&r).contains("content-length: 11\r\n"));
 }
 
@@ -127,17 +139,24 @@ async fn streamed_response_is_chunked_on_the_wire() {
     // Three 4-byte chunks then the terminating 0-chunk.
     let body_start = r.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let body = String::from_utf8_lossy(&r[body_start..]);
-    assert_eq!(body, "4\r\naaaa\r\n4\r\nbbbb\r\n4\r\ncccc\r\n0\r\n\r\n", "chunk framing: {body:?}");
+    assert_eq!(
+        body, "4\r\naaaa\r\n4\r\nbbbb\r\n4\r\ncccc\r\n0\r\n\r\n",
+        "chunk framing: {body:?}"
+    );
 }
 
 #[tokio::test]
 async fn streamed_body_error_truncates_without_a_clean_terminator() {
     // A source that fails mid-stream must NOT emit the terminating 0-chunk — the client
     // sees an incomplete chunked body (an error), never a clean end (silent truncation).
-    let r = roundtrip_close(b"GET /stream-err HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+    let r =
+        roundtrip_close(b"GET /stream-err HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
     let text = lower(&r);
     assert!(text.contains("transfer-encoding: chunked\r\n"), "{text}");
-    assert!(String::from_utf8_lossy(&r).contains("aaaa"), "first chunk should arrive: {text}");
+    assert!(
+        String::from_utf8_lossy(&r).contains("aaaa"),
+        "first chunk should arrive: {text}"
+    );
     assert!(
         !r.ends_with(b"0\r\n\r\n"),
         "a mid-stream error must not frame a clean end (silent truncation): {text}"
@@ -170,7 +189,11 @@ async fn request_body_streams_through_before_it_is_complete() {
             break; // first chunk streamed back before we sent the terminator
         }
     }
-    assert!(lower(&got).contains("transfer-encoding: chunked\r\n"), "{:?}", lower(&got));
+    assert!(
+        lower(&got).contains("transfer-encoding: chunked\r\n"),
+        "{:?}",
+        lower(&got)
+    );
 
     // Now finish the request; the echo completes + closes.
     c.write_all(b"6\r\n world\r\n0\r\n\r\n").await.unwrap();
@@ -189,7 +212,8 @@ fn decode_chunked(mut buf: &[u8]) -> Vec<u8> {
     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
         let size_line = &buf[..nl];
         let hex: String = String::from_utf8_lossy(size_line).trim().to_string();
-        let size = usize::from_str_radix(hex.split(';').next().unwrap_or("0").trim(), 16).unwrap_or(0);
+        let size =
+            usize::from_str_radix(hex.split(';').next().unwrap_or("0").trim(), 16).unwrap_or(0);
         buf = &buf[nl + 1..];
         if size == 0 {
             break;
@@ -204,7 +228,11 @@ fn decode_chunked(mut buf: &[u8]) -> Vec<u8> {
 async fn malformed_request_gets_400_and_close() {
     // Space before the colon — a header the parser rejects.
     let r = roundtrip_close(b"GET / HTTP/1.1\r\nHost : x\r\n\r\n").await;
-    assert!(String::from_utf8_lossy(&r).starts_with("HTTP/1.1 400"), "{:?}", lower(&r));
+    assert!(
+        String::from_utf8_lossy(&r).starts_with("HTTP/1.1 400"),
+        "{:?}",
+        lower(&r)
+    );
 }
 
 #[tokio::test]
@@ -222,7 +250,12 @@ async fn keep_alive_serves_multiple_requests_then_pipelined() {
     c.read_to_end(&mut out).await.unwrap();
     let text = String::from_utf8_lossy(&out);
     // Exactly three responses, in order.
-    assert_eq!(text.matches("HTTP/1.1 200 OK").count(), 3, "want 3 responses: {}", out.len());
+    assert_eq!(
+        text.matches("HTTP/1.1 200 OK").count(),
+        3,
+        "want 3 responses: {}",
+        out.len()
+    );
     // The middle one is the 100000-byte body; the last ends with "hello".
     assert!(lower(&out).contains("content-length: 100000\r\n"));
     assert!(text.ends_with("hello"));
@@ -240,13 +273,25 @@ async fn expect_100_continue_gets_an_interim_response_before_the_body() {
     .unwrap();
     // The server must answer 100 Continue before we send the body.
     let mut interim = [0u8; 25];
-    let n = timeout(Duration::from_secs(2), c.read(&mut interim)).await.unwrap().unwrap();
-    assert_eq!(&interim[..n], b"HTTP/1.1 100 Continue\r\n\r\n", "expected interim 100: {:?}", &interim[..n]);
+    let n = timeout(Duration::from_secs(2), c.read(&mut interim))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &interim[..n],
+        b"HTTP/1.1 100 Continue\r\n\r\n",
+        "expected interim 100: {:?}",
+        &interim[..n]
+    );
     // Now send the body and read the final response.
     c.write_all(b"hello").await.unwrap();
     let mut rest = Vec::new();
     c.read_to_end(&mut rest).await.unwrap();
-    assert!(String::from_utf8_lossy(&rest).ends_with("hello"), "{:?}", lower(&rest));
+    assert!(
+        String::from_utf8_lossy(&rest).ends_with("hello"),
+        "{:?}",
+        lower(&rest)
+    );
 }
 
 #[tokio::test]
@@ -258,8 +303,9 @@ async fn hyper_client_interop_over_keep_alive() {
         let _ = serve_connection(server, App).await;
     });
     let io = hyper_util::rt::TokioIo::new(client);
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake::<_, Full<Bytes>>(io).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Full<Bytes>>(io)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -267,7 +313,11 @@ async fn hyper_client_interop_over_keep_alive() {
     // Two requests on the same connection (keep-alive), via a real hyper client.
     for (path, expect) in [("/", "hello"), ("/echo?ignored=1", "")] {
         let req = hyper::Request::builder()
-            .method(if path.starts_with("/echo") { "POST" } else { "GET" })
+            .method(if path.starts_with("/echo") {
+                "POST"
+            } else {
+                "GET"
+            })
             .uri(format!("http://x{path}"))
             .header("host", "x")
             .body(Full::new(Bytes::from_static(b"")))

@@ -50,11 +50,7 @@ where
 
 /// Serve one accepted connection with explicit [`Config`] timeouts: HTTP/2 (preface
 /// present) via the mux driver, else HTTP/1.1.
-pub async fn serve_connection_with<IO, H>(
-    io: IO,
-    handler: H,
-    config: Config,
-) -> std::io::Result<()>
+pub async fn serve_connection_with<IO, H>(io: IO, handler: H, config: Config) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
@@ -111,7 +107,11 @@ pub struct Rewind<IO> {
 
 impl<IO> Rewind<IO> {
     fn new(prefix: Vec<u8>, inner: IO) -> Self {
-        Rewind { prefix, pos: 0, inner }
+        Rewind {
+            prefix,
+            pos: 0,
+            inner,
+        }
     }
 }
 

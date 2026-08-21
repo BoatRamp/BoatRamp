@@ -22,9 +22,10 @@ impl Handler for App {
         match (method.as_str(), path.as_str()) {
             ("GET", "/") => response(200, b"ok".to_vec()),
             ("GET", "/big") => response(200, vec![b'x'; 1_000_000]), // 1 MB fixed response
-            ("POST", "/echo") => {
-                response(200, req.into_body().collect().await.unwrap_or_default().to_vec())
-            }
+            ("POST", "/echo") => response(
+                200,
+                req.into_body().collect().await.unwrap_or_default().to_vec(),
+            ),
             // Streams the request body straight back (no buffering).
             ("POST", "/echo-stream") => {
                 response(200, Body::try_stream(req.into_body().into_data_stream()))
@@ -50,7 +51,10 @@ async fn spawn_server(config: Config) -> SocketAddr {
 }
 
 // --- an h1 client over a real TCP socket (via hyper) -------------------------
-async fn h1_get(sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>, path: &str) -> (u16, Vec<u8>) {
+async fn h1_get(
+    sender: &mut hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>,
+    path: &str,
+) -> (u16, Vec<u8>) {
     use http_body_util::{BodyExt, Full};
     let req = hyper::Request::builder()
         .method("GET")
@@ -60,7 +64,13 @@ async fn h1_get(sender: &mut hyper::client::conn::http1::SendRequest<http_body_u
         .unwrap();
     let resp = sender.send_request(req).await.unwrap();
     let status = resp.status().as_u16();
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, body)
 }
 
@@ -139,7 +149,10 @@ async fn slowloris_head_is_dropped_by_the_read_timeout() {
     let addr = spawn_server(cfg).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     // A partial request head, then stall forever.
-    stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
     // The server must close the connection (read → EOF) within a couple of timeouts.
     let mut buf = [0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))

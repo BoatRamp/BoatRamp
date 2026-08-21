@@ -118,7 +118,10 @@ mod tests {
             );
         }
         // But flow-control / reset frames are still accepted.
-        assert_eq!(HalfClosedRemote.on_recv(3, WindowUpdate, false), Ok(HalfClosedRemote));
+        assert_eq!(
+            HalfClosedRemote.on_recv(3, WindowUpdate, false),
+            Ok(HalfClosedRemote)
+        );
         assert_eq!(HalfClosedRemote.on_recv(3, RstStream, false), Ok(Closed));
     }
 

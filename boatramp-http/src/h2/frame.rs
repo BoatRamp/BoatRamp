@@ -135,7 +135,9 @@ pub fn strip_padding(payload: &[u8], padded: bool) -> Result<&[u8], H2Error> {
     if !padded {
         return Ok(payload);
     }
-    let (&pad_len, rest) = payload.split_first().ok_or_else(|| conn(ErrorCode::ProtocolError))?;
+    let (&pad_len, rest) = payload
+        .split_first()
+        .ok_or_else(|| conn(ErrorCode::ProtocolError))?;
     let pad = usize::from(pad_len);
     if pad > rest.len() {
         // "If the length of the padding is the length of the frame payload or
@@ -256,7 +258,13 @@ pub fn goaway(last_stream_id: u32, code: ErrorCode, debug: &[u8]) -> Vec<u8> {
 /// RST_STREAM frame bytes (RFC 7540 §6.4).
 pub fn rst_stream(stream_id: u32, code: ErrorCode) -> Vec<u8> {
     let mut out = Vec::with_capacity(FRAME_HEADER_LEN + 4);
-    write_frame(&mut out, FrameType::RstStream, 0, stream_id, &code.code().to_be_bytes());
+    write_frame(
+        &mut out,
+        FrameType::RstStream,
+        0,
+        stream_id,
+        &code.code().to_be_bytes(),
+    );
     out
 }
 
@@ -292,7 +300,10 @@ mod tests {
         assert!(parse_window_update(&[0, 0, 0]).is_err());
         assert_eq!(parse_window_update(&[0x80, 0, 0, 5]).unwrap(), 5); // reserved bit masked
         assert!(parse_ping(&[0; 7]).is_err());
-        assert_eq!(parse_ping(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            parse_ping(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert!(parse_priority(&[0; 4]).is_err());
         assert!(parse_rst_stream(&[0; 3]).is_err());
         assert_eq!(parse_rst_stream(&[0, 0, 0, 8]).unwrap(), ErrorCode::Cancel);
@@ -315,7 +326,10 @@ mod tests {
         let h = FrameHeader::parse(&g[..FRAME_HEADER_LEN]);
         assert_eq!(h.kind, FrameType::GoAway);
         let (last, code, debug) = parse_goaway(&g[FRAME_HEADER_LEN..]).unwrap();
-        assert_eq!((last, code, debug), (7, ErrorCode::ProtocolError, &b"bad"[..]));
+        assert_eq!(
+            (last, code, debug),
+            (7, ErrorCode::ProtocolError, &b"bad"[..])
+        );
         let r = rst_stream(3, ErrorCode::Cancel);
         let rh = FrameHeader::parse(&r[..FRAME_HEADER_LEN]);
         assert_eq!((rh.kind, rh.stream_id), (FrameType::RstStream, 3));

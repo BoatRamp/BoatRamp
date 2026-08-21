@@ -96,12 +96,12 @@ pub enum Error {
     #[cfg(feature = "tls")]
     #[error("--tls-key is required for --tls custom")]
     TlsKeyRequired,
-    /// The `--tls-cert` PEM held no certificates (HTTP/3 cert loading).
-    #[cfg(feature = "http3")]
+    /// The `--tls-cert` PEM held no certificates (custom-cert / HTTP/3 loading).
+    #[cfg(feature = "tls")]
     #[error("no certificates in {0}")]
     NoCert(String),
-    /// The `--tls-key` PEM held no private key (HTTP/3 cert loading).
-    #[cfg(feature = "http3")]
+    /// The `--tls-key` PEM held no private key (custom-cert / HTTP/3 loading).
+    #[cfg(feature = "tls")]
     #[error("no private key in {0}")]
     NoPrivateKey(String),
     /// `--tls acme` with no `--acme-domain`.
@@ -2110,13 +2110,8 @@ async fn serve_custom(
         app
     };
 
-    boatramp_server::serve_tls(
-        addr,
-        config.into(),
-        app,
-        boatramp_server::shutdown_signal(),
-    )
-    .await?;
+    boatramp_server::serve_tls(addr, config.into(), app, boatramp_server::shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -2192,13 +2187,8 @@ async fn serve_rpk(
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
-    boatramp_server::serve_tls(
-        addr,
-        config.into(),
-        app,
-        boatramp_server::shutdown_signal(),
-    )
-    .await?;
+    boatramp_server::serve_tls(addr, config.into(), app, boatramp_server::shutdown_signal())
+        .await?;
     Ok(())
 }
 

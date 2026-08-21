@@ -6,7 +6,9 @@
 use boatramp_http::h2::error::ErrorCode;
 use boatramp_http::h2::frame::{self, FrameHeader, FrameType};
 use boatramp_http::h2::hpack::Hpack;
-use boatramp_http::h2::{response, serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE};
+use boatramp_http::h2::{
+    response, serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const END_STREAM: u8 = 0x1;
@@ -135,7 +137,11 @@ async fn a_few_resets_are_tolerated() {
 
     // The server should keep serving (respond to the non-reset streams), not GOAWAY.
     // Expect NOT to see a GOAWAY within a short window.
-    let got = tokio::time::timeout(std::time::Duration::from_millis(500), wait_for_goaway(&mut c)).await;
+    let got = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        wait_for_goaway(&mut c),
+    )
+    .await;
     assert!(
         got.is_err() || got.unwrap().is_none(),
         "a low reset ratio must not trip the rapid-reset guard"

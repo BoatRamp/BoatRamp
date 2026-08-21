@@ -29,9 +29,7 @@ const FORBIDDEN: &[&[u8]] = &[
 /// / `Transfer-Encoding`, so the *codec* (not the shared bridge) owns this rule.
 /// Case-insensitive; `name` need not already be lowercase.
 pub(crate) fn is_connection_specific(name: &[u8]) -> bool {
-    FORBIDDEN
-        .iter()
-        .any(|f| name.eq_ignore_ascii_case(f))
+    FORBIDDEN.iter().any(|f| name.eq_ignore_ascii_case(f))
 }
 
 /// Build a validated [`Request`] from a decoded header list. Malformed requests are a
@@ -115,7 +113,10 @@ mod tests {
     use super::*;
 
     fn h(pairs: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        pairs.iter().map(|(n, v)| (n.to_vec(), v.to_vec())).collect()
+        pairs
+            .iter()
+            .map(|(n, v)| (n.to_vec(), v.to_vec()))
+            .collect()
     }
 
     #[test]
@@ -160,7 +161,12 @@ mod tests {
         );
         // unknown pseudo-header
         assert_eq!(
-            err(&[(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/"), (b":bogus", b"x")]),
+            err(&[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":bogus", b"x")
+            ]),
             bad
         );
     }
@@ -177,7 +183,12 @@ mod tests {
         ] {
             assert!(is_connection_specific(name), "{name:?} is h2-forbidden");
         }
-        for name in [b"content-length".as_slice(), b"content-type", b"host", b"te"] {
+        for name in [
+            b"content-length".as_slice(),
+            b"content-type",
+            b"host",
+            b"te",
+        ] {
             assert!(!is_connection_specific(name), "{name:?} is not forbidden");
         }
     }

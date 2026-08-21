@@ -3,7 +3,9 @@
 //! the upgrade returns `101` and takes over the raw connection via `on_upgrade`; the loop
 //! hands it the reunited socket (with any bytes sent past the handshake replayed).
 
-use boatramp_http::{is_upgrade_request, on_upgrade, response, serve_connection, Handler, Request, Response};
+use boatramp_http::{
+    is_upgrade_request, on_upgrade, response, serve_connection, Handler, Request, Response,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A handler that upgrades `Connection: upgrade` requests and echoes bytes over the
@@ -33,8 +35,10 @@ impl Handler for EchoUpgrade {
         });
         // Accept the upgrade: 101 + the switch headers.
         let mut resp = response(101, Vec::new());
-        resp.headers_mut().insert("upgrade", "echo".parse().unwrap());
-        resp.headers_mut().insert("connection", "upgrade".parse().unwrap());
+        resp.headers_mut()
+            .insert("upgrade", "echo".parse().unwrap());
+        resp.headers_mut()
+            .insert("connection", "upgrade".parse().unwrap());
         resp
     }
 }
@@ -71,8 +75,14 @@ async fn upgrade_switches_protocols_and_bytes_flow_both_ways() {
         .unwrap();
     let (head, leftover) = read_head(&mut c).await;
     let text = String::from_utf8_lossy(&head);
-    assert!(text.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{text}");
-    assert!(text.to_ascii_lowercase().contains("upgrade: echo\r\n"), "{text}");
+    assert!(
+        text.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "{text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("upgrade: echo\r\n"),
+        "{text}"
+    );
     assert!(leftover.is_empty(), "no upgraded bytes were sent yet");
 
     // Post-upgrade: the connection is now the echo protocol. Bytes round-trip both ways.

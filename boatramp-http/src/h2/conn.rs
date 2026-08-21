@@ -7,9 +7,9 @@
 
 use std::collections::HashMap;
 
-use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::StreamExt as _;
 
 use crate::h2::error::{ErrorCode, H2Error};
@@ -283,7 +283,10 @@ where
                 if let Some(s) = conn.streams.get_mut(&header.stream_id) {
                     s.send_window += i64::from(inc);
                     if s.send_window > i64::from(settings::MAX_WINDOW_SIZE) {
-                        return Err(H2Error::stream(header.stream_id, ErrorCode::FlowControlError));
+                        return Err(H2Error::stream(
+                            header.stream_id,
+                            ErrorCode::FlowControlError,
+                        ));
                     }
                 }
             }
@@ -547,8 +550,20 @@ where
     if n > 0 {
         // WINDOW_UPDATE for the connection and the stream, keeping the window open.
         let mut out = Vec::new();
-        frame::write_frame(&mut out, FrameType::WindowUpdate, 0, 0, &(n as u32).to_be_bytes());
-        frame::write_frame(&mut out, FrameType::WindowUpdate, 0, sid, &(n as u32).to_be_bytes());
+        frame::write_frame(
+            &mut out,
+            FrameType::WindowUpdate,
+            0,
+            0,
+            &(n as u32).to_be_bytes(),
+        );
+        frame::write_frame(
+            &mut out,
+            FrameType::WindowUpdate,
+            0,
+            sid,
+            &(n as u32).to_be_bytes(),
+        );
         wire.write_all(&out)
             .await
             .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;

@@ -23,7 +23,10 @@ pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
     let connection_upgrade = headers
         .get(header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .map(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
         .unwrap_or(false);
     connection_upgrade && headers.contains_key(header::UPGRADE)
 }
@@ -42,11 +45,12 @@ trait Io: AsyncRead + AsyncWrite + Send {}
 impl<T: AsyncRead + AsyncWrite + Send> Io for T {}
 
 impl Upgraded {
-    pub(crate) fn new(
-        io: impl AsyncRead + AsyncWrite + Send + 'static,
-        prefix: Bytes,
-    ) -> Self {
-        Upgraded { inner: Box::pin(io), prefix, pos: 0 }
+    pub(crate) fn new(io: impl AsyncRead + AsyncWrite + Send + 'static, prefix: Bytes) -> Self {
+        Upgraded {
+            inner: Box::pin(io),
+            prefix,
+            pos: 0,
+        }
     }
 }
 
@@ -78,10 +82,7 @@ impl AsyncWrite for Upgraded {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.inner.as_mut().poll_flush(cx)
     }
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.inner.as_mut().poll_shutdown(cx)
     }
 }
@@ -105,7 +106,9 @@ impl std::error::Error for UpgradeError {}
 impl std::future::Future for OnUpgrade {
     type Output = Result<Upgraded, UpgradeError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map(|r| r.map_err(|_| UpgradeError))
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|r| r.map_err(|_| UpgradeError))
     }
 }
 

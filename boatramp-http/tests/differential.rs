@@ -40,9 +40,11 @@ async fn hyper_parse(bytes: Vec<u8>) -> Vec<Req> {
             let path = req.uri().path().to_string();
             let _ = req.into_body().collect().await;
             let _ = tx.send((method, path));
-            Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                http_body_util::Full::<bytes::Bytes>::new(bytes::Bytes::new()),
-            ))
+            Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::<
+                bytes::Bytes,
+            >::new(
+                bytes::Bytes::new()
+            )))
         }
     });
 
@@ -84,9 +86,13 @@ async fn hyper_accepts_head(bytes: Vec<u8>) -> Option<Req> {
         let tx = tx.clone();
         // Dispatch on the head alone — do NOT touch the body.
         let _ = tx.send((req.method().to_string(), req.uri().path().to_string()));
-        async move { Ok::<_, std::convert::Infallible>(hyper::Response::new(
-            http_body_util::Full::<bytes::Bytes>::new(bytes::Bytes::new()),
-        )) }
+        async move {
+            Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::<
+                bytes::Bytes,
+            >::new(
+                bytes::Bytes::new()
+            )))
+        }
     });
     let io = hyper_util::rt::TokioIo::new(server);
     let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
@@ -231,27 +237,66 @@ fn gen_request(r: &mut XorShift) -> Vec<u8> {
     let bad_targets: &[&str] = &["*", "http://h/p", "a:80", "/a b", "/a#f", "/a\x01"];
     let good_versions: &[&str] = &["HTTP/1.1", "HTTP/1.0"];
     let bad_versions: &[&str] = &["HTTP/2.0", "HTTP/1", "HTTP/1.1 ", "http/1.1"];
-    let cls: &[&str] = &["", "0", "5", "007", "+5", "5 6", "5,5", "5, 6", "0x5", "six"];
-    let tes: &[&str] = &["", "chunked", "gzip", "chunked, gzip", "gzip, chunked", "Chunked", "chunkedX"];
+    let cls: &[&str] = &[
+        "", "0", "5", "007", "+5", "5 6", "5,5", "5, 6", "0x5", "six",
+    ];
+    let tes: &[&str] = &[
+        "",
+        "chunked",
+        "gzip",
+        "chunked, gzip",
+        "gzip, chunked",
+        "Chunked",
+        "chunkedX",
+    ];
 
     // A separator: usually one SP, occasionally a smuggling-edge whitespace.
     fn sep(r: &mut XorShift) -> &'static str {
-        if r.chance(8) { ["  ", "\t", " \t"][(r.next() % 3) as usize] } else { " " }
+        if r.chance(8) {
+            ["  ", "\t", " \t"][(r.next() % 3) as usize]
+        } else {
+            " "
+        }
     }
     // A line terminator: usually CRLF, occasionally a bare LF / CR.
     fn term(r: &mut XorShift) -> &'static str {
-        if r.chance(10) { ["\n", "\r"][(r.next() % 2) as usize] } else { "\r\n" }
+        if r.chance(10) {
+            ["\n", "\r"][(r.next() % 2) as usize]
+        } else {
+            "\r\n"
+        }
     }
 
     let mut s: Vec<u8> = Vec::new();
     let ln = |s: &mut Vec<u8>, t: &str| s.extend_from_slice(t.as_bytes());
 
     // request line — mostly good tokens, sometimes one weird slot.
-    ln(&mut s, if r.chance(6) { r.pick(weird_methods) } else { r.pick(good_methods) });
+    ln(
+        &mut s,
+        if r.chance(6) {
+            r.pick(weird_methods)
+        } else {
+            r.pick(good_methods)
+        },
+    );
     ln(&mut s, sep(r));
-    ln(&mut s, if r.chance(6) { r.pick(bad_targets) } else { r.pick(good_targets) });
+    ln(
+        &mut s,
+        if r.chance(6) {
+            r.pick(bad_targets)
+        } else {
+            r.pick(good_targets)
+        },
+    );
     ln(&mut s, sep(r));
-    ln(&mut s, if r.chance(6) { r.pick(bad_versions) } else { r.pick(good_versions) });
+    ln(
+        &mut s,
+        if r.chance(6) {
+            r.pick(bad_versions)
+        } else {
+            r.pick(good_versions)
+        },
+    );
     ln(&mut s, term(r));
 
     // Host (usually present)
@@ -277,7 +322,8 @@ fn gen_request(r: &mut XorShift) -> Vec<u8> {
     }
     // an occasional adversarial header
     if r.chance(4) {
-        let name = ["X-Foo", "Host ", "X\tBad", "X Bad", ":bad", "Trailer"][(r.next() % 6) as usize];
+        let name =
+            ["X-Foo", "Host ", "X\tBad", "X Bad", ":bad", "Trailer"][(r.next() % 6) as usize];
         ln(&mut s, &format!("{name}: v"));
         ln(&mut s, term(r));
     }
@@ -303,7 +349,9 @@ fn randomized_differential_never_more_permissive() {
         if let Verdict::Accept { method, path, .. } = verdict(&input) {
             checked += 1;
             let hyper = rt.block_on(hyper_accepts_head(input.clone()));
-            let ok = hyper.as_ref().is_some_and(|(m, p)| *m == method && *p == path);
+            let ok = hyper
+                .as_ref()
+                .is_some_and(|(m, p)| *m == method && *p == path);
             assert!(
                 ok,
                 "iter {i}: boatramp accepted where hyper did not (MORE PERMISSIVE)\n  input: {:?}\n  boatramp: ({method:?},{path:?})  hyper: {hyper:?}",

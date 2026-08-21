@@ -36,11 +36,11 @@ mod wire;
 pub mod http;
 
 pub use conn::serve_connection;
-pub use mux::serve_connection_mux;
 #[cfg(target_os = "linux")]
 pub use conn::{serve_connection_ktls, serve_connection_tcp};
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
+pub use mux::serve_connection_mux;
 pub use settings::Settings;
 pub use stream::StreamState;
 // Re-export the shared serving types so `h2` is a self-contained facade (the h2 driver's

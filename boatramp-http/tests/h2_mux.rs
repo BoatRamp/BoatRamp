@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use boatramp_http::h2::{response, serve_connection_mux, Handler, Request, Response};
+use bytes::Bytes;
 use tokio::sync::Notify;
 
 struct App;
@@ -19,7 +19,10 @@ impl Handler for App {
         let path = req.uri().path().to_owned();
         match path.as_str() {
             "/big" => response(200, vec![b'x'; 100_000]),
-            "/echo" => response(200, req.into_body().collect().await.unwrap_or_default().to_vec()),
+            "/echo" => response(
+                200,
+                req.into_body().collect().await.unwrap_or_default().to_vec(),
+            ),
             p => response(200, format!("{} {}", req.method(), p).into_bytes()),
         }
     }
@@ -73,7 +76,10 @@ async fn multiplexed_concurrent_streams() {
     for (i, response) in pending {
         let response = response.await.unwrap();
         assert_eq!(response.status(), 200);
-        assert_eq!(read_body(response.into_body()).await, format!("GET /s{i}").into_bytes());
+        assert_eq!(
+            read_body(response.into_body()).await,
+            format!("GET /s{i}").into_bytes()
+        );
     }
 }
 
@@ -98,7 +104,8 @@ async fn request_body_is_delivered_to_the_handler() {
         .body(())
         .unwrap();
     let (response, mut send) = client.send_request(request, false).unwrap();
-    send.send_data(Bytes::from_static(b"hello body"), true).unwrap();
+    send.send_data(Bytes::from_static(b"hello body"), true)
+        .unwrap();
     let response = response.await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(read_body(response.into_body()).await, b"hello body");
@@ -123,7 +130,10 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
                     }
                 }
             });
-            response(200, Body::stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            response(
+                200,
+                Body::stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            )
         }
     }
     let mut client = connect_with(Streamer).await;
@@ -143,9 +153,9 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
 /// backpressure the driver drains all 10 000 chunks (10 MB) into the outbox.
 #[tokio::test]
 async fn slow_client_backpressures_a_large_streamed_body() {
+    use boatramp_http::h2::Body;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_stream::StreamExt as _;
-    use boatramp_http::h2::Body;
 
     struct Streamer(Arc<AtomicUsize>);
     impl Handler for Streamer {
@@ -180,10 +190,10 @@ async fn slow_client_backpressures_a_large_streamed_body() {
 /// keeps serving. Exercises the reset-while-a-producer-is-parked path.
 #[tokio::test]
 async fn client_reset_midstream_does_not_wedge_the_connection() {
+    use boatramp_http::h2::Body;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio_stream::StreamExt as _;
-    use boatramp_http::h2::Body;
 
     struct Mixed(Arc<AtomicUsize>);
     impl Handler for Mixed {
@@ -218,7 +228,10 @@ async fn client_reset_midstream_does_not_wedge_the_connection() {
     let a = pulled.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(120)).await;
     let b = pulled.load(Ordering::SeqCst);
-    assert!(b <= a + 2, "producer kept pulling after the client reset: {a} -> {b}");
+    assert!(
+        b <= a + 2,
+        "producer kept pulling after the client reset: {a} -> {b}"
+    );
 
     // The connection is not wedged: a fresh request on it still round-trips.
     client = client.ready().await.unwrap();
@@ -236,8 +249,8 @@ async fn client_reset_midstream_does_not_wedge_the_connection() {
 /// timing) so the common 200-then-reset path is exercised.
 #[tokio::test]
 async fn upstream_error_midstream_resets_the_client_not_a_clean_end() {
-    use std::time::Duration;
     use boatramp_http::h2::{Body, BodyChunk, BodyError};
+    use std::time::Duration;
 
     struct Failing;
     impl Handler for Failing {
@@ -250,7 +263,10 @@ async fn upstream_error_midstream_resets_the_client_not_a_clean_end() {
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 let _ = tx.send(Err(BodyError)).await;
             });
-            response(200, Body::try_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            response(
+                200,
+                Body::try_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            )
         }
     }
 

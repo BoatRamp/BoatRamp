@@ -170,7 +170,7 @@ mod tests {
         // Updates within the limit pass validation.
         assert!(validate_block(&[0x20], 4096).is_ok()); // -> 0
         assert!(validate_block(&[0x3f, 0x45], 4096).is_ok()); // -> 31 + 69 = 100
-        // A non-update block (0x82 = indexed field ":method: GET") passes.
+                                                              // A non-update block (0x82 = indexed field ":method: GET") passes.
         assert!(validate_block(&[0x82], 4096).is_ok());
     }
 
@@ -178,8 +178,8 @@ mod tests {
     fn hpack_integer_matches_fluke_rules() {
         assert_eq!(hpack_int(&[0x0a], 0, 5), Some((10, 1))); // < prefix mask
         assert_eq!(hpack_int(&[0x3f, 0x45], 0, 5), Some((100, 2))); // 31 + 69
-        // Truncated continuation → None (fluke: NotEnoughOctets, would panic on a
-        // size update).
+                                                                    // Truncated continuation → None (fluke: NotEnoughOctets, would panic on a
+                                                                    // size update).
         assert_eq!(hpack_int(&[0x1f, 0x80], 0, 5), None);
         // Too many octets (>5 total) → None (fluke: TooManyOctets).
         assert_eq!(hpack_int(&[0x1f, 0x80, 0x80, 0x80, 0x80, 0x80], 0, 5), None);

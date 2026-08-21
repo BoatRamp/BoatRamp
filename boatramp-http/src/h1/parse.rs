@@ -143,7 +143,11 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
 
     let (method, uri, version) = match next_line(buf, pos)? {
         Line::Incomplete => {
-            return if buf.len() > MAX_HEAD { Err(Reject::TooLarge) } else { Ok(None) };
+            return if buf.len() > MAX_HEAD {
+                Err(Reject::TooLarge)
+            } else {
+                Ok(None)
+            };
         }
         Line::Got(line, next) => {
             pos = next;
@@ -165,7 +169,11 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
         }
         match next_line(buf, pos)? {
             Line::Incomplete => {
-                return if buf.len() > MAX_HEAD { Err(Reject::TooLarge) } else { Ok(None) };
+                return if buf.len() > MAX_HEAD {
+                    Err(Reject::TooLarge)
+                } else {
+                    Ok(None)
+                };
             }
             Line::Got(line, next) => {
                 pos = next;
@@ -189,10 +197,10 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
                     host_count += 1;
                     host_empty = trim_ows(value).is_empty();
                 }
-                let hn = http::header::HeaderName::from_bytes(name)
-                    .map_err(|_| Reject::BadHeader)?;
-                let hv = http::header::HeaderValue::from_bytes(value)
-                    .map_err(|_| Reject::BadHeader)?;
+                let hn =
+                    http::header::HeaderName::from_bytes(name).map_err(|_| Reject::BadHeader)?;
+                let hv =
+                    http::header::HeaderValue::from_bytes(value).map_err(|_| Reject::BadHeader)?;
                 headers.append(hn, hv);
             }
         }
@@ -208,7 +216,16 @@ fn parse_head_inner(buf: &[u8]) -> Result<Option<(RequestHead, usize)>, Reject> 
     }
 
     let framing = resolve_framing(&cl_tokens, &te_values, is_11)?;
-    Ok(Some((RequestHead { method, uri, version, headers, framing }, pos)))
+    Ok(Some((
+        RequestHead {
+            method,
+            uri,
+            version,
+            headers,
+            framing,
+        },
+        pos,
+    )))
 }
 
 /// Parse the request line into `(method, uri, version)`, enforcing exactly one SP
@@ -239,11 +256,7 @@ fn parse_request_line(line: &[u8]) -> Result<(Method, Uri, Version), Reject> {
 /// and a fragment; `*` is only valid for OPTIONS; otherwise origin-form (`/...`),
 /// absolute-form (`scheme://...`), or CONNECT authority-form.
 fn parse_target(method: &Method, target: &[u8]) -> Result<Uri, Reject> {
-    if target.is_empty()
-        || target
-            .iter()
-            .any(|&b| b <= 0x20 || b == 0x7f || b == b'#')
-    {
+    if target.is_empty() || target.iter().any(|&b| b <= 0x20 || b == 0x7f || b == b'#') {
         return Err(Reject::BadRequestLine);
     }
     let is_asterisk = target == b"*";
@@ -267,17 +280,17 @@ fn parse_target(method: &Method, target: &[u8]) -> Result<Uri, Reject> {
 /// be all-`tchar`, so whitespace before the colon is a reject); the value is OWS-trimmed
 /// and must contain no CTL other than HTAB.
 fn split_header(line: &[u8]) -> Result<(&[u8], &[u8]), Reject> {
-    let colon = line.iter().position(|&b| b == b':').ok_or(Reject::BadHeader)?;
+    let colon = line
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or(Reject::BadHeader)?;
     let name = &line[..colon];
     if name.is_empty() || !name.iter().all(|&b| is_tchar(b)) {
         return Err(Reject::BadHeader);
     }
     let value = trim_ows(&line[colon + 1..]);
     // field-content: VCHAR / obs-text / SP / HTAB — reject CTL (except HTAB) and DEL.
-    if value
-        .iter()
-        .any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
-    {
+    if value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
         return Err(Reject::BadHeader);
     }
     Ok((name, value))
@@ -320,8 +333,14 @@ fn resolve_framing(
         if codings.iter().any(|c| c.is_empty()) {
             return Err(Reject::BadTransferEncoding);
         }
-        let chunked_count = codings.iter().filter(|c| c.as_slice() == b"chunked").count();
-        let last_is_chunked = codings.last().map(|c| c.as_slice() == b"chunked").unwrap_or(false);
+        let chunked_count = codings
+            .iter()
+            .filter(|c| c.as_slice() == b"chunked")
+            .count();
+        let last_is_chunked = codings
+            .last()
+            .map(|c| c.as_slice() == b"chunked")
+            .unwrap_or(false);
         if chunked_count != 1 || !last_is_chunked {
             return Err(Reject::BadTransferEncoding);
         }
@@ -500,7 +519,10 @@ pub mod chunked {
     /// not just its end).
     pub fn decode(buf: &[u8]) -> ChunkDecode {
         match walk(buf, Some(Vec::new())) {
-            Ok(Some((data, end))) => ChunkDecode::Complete { data: data.unwrap_or_default(), end },
+            Ok(Some((data, end))) => ChunkDecode::Complete {
+                data: data.unwrap_or_default(),
+                end,
+            },
             Ok(None) => ChunkDecode::Incomplete,
             Err(r) => ChunkDecode::Reject(r),
         }
@@ -508,7 +530,10 @@ pub mod chunked {
 
     /// Walk a chunked body once, enforcing framing. When `collect` is `Some`, the chunk
     /// data is appended to it; returns `(collected, end_offset)`. `scan` passes `None`.
-    fn walk(buf: &[u8], mut collect: Option<Vec<u8>>) -> Result<Option<(Option<Vec<u8>>, usize)>, Reject> {
+    fn walk(
+        buf: &[u8],
+        mut collect: Option<Vec<u8>>,
+    ) -> Result<Option<(Option<Vec<u8>>, usize)>, Reject> {
         let mut pos = 0usize;
         loop {
             // chunk-size line: `<hex>[;chunk-ext]CRLF`.
@@ -570,7 +595,11 @@ pub mod chunked {
     pub enum ChunkStep {
         /// A data chunk: `buf[data_start..data_end]` is the payload; the next chunk starts
         /// at `next`.
-        Data { data_start: usize, data_end: usize, next: usize },
+        Data {
+            data_start: usize,
+            data_end: usize,
+            next: usize,
+        },
         /// The terminating 0-chunk (+ trailers) ends the body at offset `end`.
         Last { end: usize },
         /// More bytes are needed to complete the current chunk.
@@ -629,7 +658,11 @@ pub mod chunked {
         if &buf[data_end..crlf_end] != b"\r\n" {
             return Err(Reject::BadChunk);
         }
-        Ok(ChunkStep::Data { data_start: next, data_end, next: crlf_end })
+        Ok(ChunkStep::Data {
+            data_start: next,
+            data_end,
+            next: crlf_end,
+        })
     }
 
     /// Parse a chunk size: 1..=16 hex digits, no sign / `0x` prefix / other bytes.

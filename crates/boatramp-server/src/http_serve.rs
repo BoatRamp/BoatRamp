@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::Router;
-use boatramp_http::{Body as HttpBody, BodyError, Handler, Request as HttpRequest, Response as HttpResponse};
+use boatramp_http::{
+    Body as HttpBody, BodyError, Handler, Request as HttpRequest, Response as HttpResponse,
+};
 use futures::StreamExt as _;
 use http_body_util::BodyStream;
 use rustls::ServerConfig;

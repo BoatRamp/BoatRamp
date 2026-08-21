@@ -1120,7 +1120,10 @@ async fn proxy_upgrade(
     // is moved. Absent only if the request lacked upgrade intent (shouldn't happen — the
     // caller gated on `is_upgrade_request`).
     let Some(client_on_upgrade) = boatramp_http::on_upgrade(&mut request) else {
-        return (StatusCode::BAD_GATEWAY, "gateway upgrade: no client upgrade handle\n")
+        return (
+            StatusCode::BAD_GATEWAY,
+            "gateway upgrade: no client upgrade handle\n",
+        )
             .into_response();
     };
     let method = request.method().clone();

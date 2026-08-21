@@ -59,9 +59,7 @@ impl ReqBody {
     /// Consume the body as a pull [`Stream`] of chunks — a reverse-proxy handler forwards
     /// this straight to the upstream without buffering (the mirror of [`Body::try_stream`]
     /// on the response side).
-    pub fn into_data_stream(
-        self,
-    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, BodyError>> + Send>> {
+    pub fn into_data_stream(self) -> Pin<Box<dyn Stream<Item = Result<Bytes, BodyError>> + Send>> {
         match self.0 {
             ReqBodyInner::Empty | ReqBodyInner::Full(None) => Box::pin(tokio_stream::empty()),
             ReqBodyInner::Full(Some(b)) => Box::pin(tokio_stream::once(Ok(b))),
@@ -116,7 +114,9 @@ impl http_body::Body for ReqBody {
             ReqBodyInner::Empty => Poll::Ready(None),
             ReqBodyInner::Full(b) => Poll::Ready(b.take().map(|b| Ok(http_body::Frame::data(b)))),
             ReqBodyInner::Stream(s) => match s.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(http_body::Frame::data(chunk)))),
+                Poll::Ready(Some(Ok(chunk))) => {
+                    Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+                }
                 Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,

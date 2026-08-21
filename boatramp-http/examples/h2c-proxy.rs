@@ -48,7 +48,13 @@ mod linux {
             let head = read_head(&mut up).await;
             let status = parse_status(&head).unwrap_or(502);
             let clen = content_length(&head).unwrap_or(0);
-            response(status, Body::Splice { upstream: up, len: clen })
+            response(
+                status,
+                Body::Splice {
+                    upstream: up,
+                    len: clen,
+                },
+            )
         }
     }
 

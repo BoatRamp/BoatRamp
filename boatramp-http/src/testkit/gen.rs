@@ -22,18 +22,42 @@ pub fn framing_matrix() -> Vec<GenCase> {
     // CL variants: (label, lines, verdict-if-alone)
     let cls: &[(&str, &str, Expect)] = &[
         ("no-CL", "", Expect::Accept(Framing::Empty)),
-        ("CL=6", "Content-Length: 6\r\n", Expect::Accept(Framing::Length(6))),
-        ("CL-dup-same", "Content-Length: 6\r\nContent-Length: 6\r\n", Expect::Reject),
-        ("CL-dup-diff", "Content-Length: 6\r\nContent-Length: 7\r\n", Expect::Reject),
+        (
+            "CL=6",
+            "Content-Length: 6\r\n",
+            Expect::Accept(Framing::Length(6)),
+        ),
+        (
+            "CL-dup-same",
+            "Content-Length: 6\r\nContent-Length: 6\r\n",
+            Expect::Reject,
+        ),
+        (
+            "CL-dup-diff",
+            "Content-Length: 6\r\nContent-Length: 7\r\n",
+            Expect::Reject,
+        ),
         ("CL-bad", "Content-Length: six\r\n", Expect::Reject),
     ];
     // TE variants: (label, lines, verdict-if-alone)
     let tes: &[(&str, &str, Expect)] = &[
         ("no-TE", "", Expect::Accept(Framing::Empty)),
-        ("TE-chunked", "Transfer-Encoding: chunked\r\n", Expect::Accept(Framing::Chunked)),
+        (
+            "TE-chunked",
+            "Transfer-Encoding: chunked\r\n",
+            Expect::Accept(Framing::Chunked),
+        ),
         ("TE-gzip", "Transfer-Encoding: gzip\r\n", Expect::Reject),
-        ("TE-chunked-not-final", "Transfer-Encoding: chunked, gzip\r\n", Expect::Reject),
-        ("TE-dup", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", Expect::Reject),
+        (
+            "TE-chunked-not-final",
+            "Transfer-Encoding: chunked, gzip\r\n",
+            Expect::Reject,
+        ),
+        (
+            "TE-dup",
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+            Expect::Reject,
+        ),
     ];
 
     let mut out = Vec::new();
@@ -76,7 +100,11 @@ pub fn whitespace() -> Vec<GenCase> {
         out.push(GenCase {
             name: format!("req-line-sep[{name}]"),
             input: format!("{line}\r\nHost: x\r\n\r\n").into_bytes(),
-            expect: if *ok { Expect::Accept(Framing::Empty) } else { Expect::Reject },
+            expect: if *ok {
+                Expect::Accept(Framing::Empty)
+            } else {
+                Expect::Reject
+            },
         });
     }
     out
@@ -105,7 +133,11 @@ pub fn versions() -> Vec<GenCase> {
         out.push(GenCase {
             name: format!("version[{v}]"),
             input: format!("GET / {v}\r\nHost: x\r\n\r\n").into_bytes(),
-            expect: if *ok { Expect::Accept(Framing::Empty) } else { Expect::Reject },
+            expect: if *ok {
+                Expect::Accept(Framing::Empty)
+            } else {
+                Expect::Reject
+            },
         });
     }
     out

@@ -456,13 +456,11 @@ pub(super) async fn serve_ws_stream(
         use tokio_tungstenite::tungstenite::protocol::Role;
         use tokio_tungstenite::tungstenite::Message;
 
-        let Ok(upgraded) = on_upgrade.await else { return };
-        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            upgraded,
-            Role::Server,
-            None,
-        )
-        .await;
+        let Ok(upgraded) = on_upgrade.await else {
+            return;
+        };
+        let socket =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
         // Holding the permits for the socket's lifetime caps concurrent streams;
         // they drop (releasing the slot) when this task ends.
         let _permits = (site_permit, ip_guard);

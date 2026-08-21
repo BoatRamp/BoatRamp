@@ -294,7 +294,9 @@ where
             return Ok(());
         }
 
-        match dispatch(shared, notify, handler, &mut hpack, &mut rs, header, payload) {
+        match dispatch(
+            shared, notify, handler, &mut hpack, &mut rs, header, payload,
+        ) {
             Ok(true) => {}
             Ok(false) => return Ok(()), // GOAWAY received
             Err(H2Error::Connection(code)) => {
@@ -412,7 +414,10 @@ where
                 if let Some(st) = s.streams.get_mut(&header.stream_id) {
                     st.send_window += i64::from(inc);
                     if st.send_window > i64::from(settings::MAX_WINDOW_SIZE) {
-                        return Err(H2Error::stream(header.stream_id, ErrorCode::FlowControlError));
+                        return Err(H2Error::stream(
+                            header.stream_id,
+                            ErrorCode::FlowControlError,
+                        ));
                     }
                 }
                 s.mark_ready(header.stream_id);
@@ -478,7 +483,10 @@ where
                 if new_stream && sid <= rs.last_client_id {
                     return Err(H2Error::conn(ErrorCode::ProtocolError));
                 }
-                if s.streams.get(&sid).is_some_and(|x| x.state == StreamState::Closed) {
+                if s.streams
+                    .get(&sid)
+                    .is_some_and(|x| x.state == StreamState::Closed)
+                {
                     return Err(H2Error::conn(ErrorCode::StreamClosed));
                 }
                 if new_stream {
@@ -588,7 +596,13 @@ where
             return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
         let body = rs.bodies.remove(&sid).unwrap_or_default();
-        if rs.content_len.get(&sid).copied().flatten().is_some_and(|c| c != body.len() as u64) {
+        if rs
+            .content_len
+            .get(&sid)
+            .copied()
+            .flatten()
+            .is_some_and(|c| c != body.len() as u64)
+        {
             return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
         spawn_request(shared, notify, handler, sid, Some(req), body);
@@ -677,7 +691,15 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
             // HEADERS carry the response's own headers verbatim — any content-length is
             // the producer's (we don't re-derive one for a streamed body).
             let fields = response_fields(&parts, None);
-            if !push_out(shared, notify, sid, OutFrame::Headers { fields, end_stream: false }) {
+            if !push_out(
+                shared,
+                notify,
+                sid,
+                OutFrame::Headers {
+                    fields,
+                    end_stream: false,
+                },
+            ) {
                 return;
             }
             // The per-stream drain signal the writer uses to wake us off backpressure.
@@ -704,7 +726,11 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
                     shared,
                     notify,
                     sid,
-                    OutFrame::Data { bytes: chunk, off: 0, end_stream: false },
+                    OutFrame::Data {
+                        bytes: chunk,
+                        off: 0,
+                        end_stream: false,
+                    },
                 ) {
                     return; // the stream was reset — stop pulling from the producer
                 }
@@ -741,7 +767,11 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
                 shared,
                 notify,
                 sid,
-                OutFrame::Data { bytes: Bytes::new(), off: 0, end_stream: true },
+                OutFrame::Data {
+                    bytes: Bytes::new(),
+                    off: 0,
+                    end_stream: true,
+                },
             );
         }
         other => {
@@ -778,7 +808,10 @@ fn response_fields(
     content_length: Option<usize>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut fields = Vec::with_capacity(parts.headers.len() + 2);
-    fields.push((b":status".to_vec(), parts.status.as_u16().to_string().into_bytes()));
+    fields.push((
+        b":status".to_vec(),
+        parts.status.as_u16().to_string().into_bytes(),
+    ));
     for (name, value) in parts.headers.iter() {
         // Drop connection-specific headers HTTP/2 forbids (§8.1.2.2): the shared
         // handler also serves h1, where an upstream `Connection`/`Transfer-Encoding`
@@ -838,7 +871,10 @@ fn reset_local(shared: &Conn, notify: &Arc<Notify>, sid: u32, code: ErrorCode) {
 
 /// Turn a [`Response`] into queued HEADERS (+ DATA) frames. A `Body::Splice` is read
 /// into memory here (userspace-first); the writer-side kernel splice is a later step.
-async fn response_to_frames(parts: ::http::response::Parts, body: http::Body) -> VecDeque<OutFrame> {
+async fn response_to_frames(
+    parts: ::http::response::Parts,
+    body: http::Body,
+) -> VecDeque<OutFrame> {
     let body = body_bytes(body).await;
     let has_body = !body.is_empty();
     let fields = response_fields(&parts, has_body.then_some(body.len()));
@@ -972,11 +1008,7 @@ where
         }
         {
             let s = shared.lock().unwrap();
-            if s.reader_done
-                && s.active_handlers == 0
-                && s.ready.is_empty()
-                && s.ctrl.is_empty()
-            {
+            if s.reader_done && s.active_handlers == 0 && s.ready.is_empty() && s.ctrl.is_empty() {
                 break;
             }
         }
@@ -1046,8 +1078,10 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
             else {
                 continue;
             };
-            let refs: Vec<(&[u8], &[u8])> =
-                fields.iter().map(|(n, v)| (n.as_slice(), v.as_slice())).collect();
+            let refs: Vec<(&[u8], &[u8])> = fields
+                .iter()
+                .map(|(n, v)| (n.as_slice(), v.as_slice()))
+                .collect();
             let block = hpack.encode(&refs);
             let mut hflags = flag::END_HEADERS;
             if end_stream {
@@ -1060,7 +1094,11 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
         } else {
             // DATA frame — read off/len/end without holding a mutable borrow.
             let (off, total, end_stream) = match s.streams.get(&id).unwrap().outbox.front() {
-                Some(OutFrame::Data { bytes, off, end_stream }) => (*off, bytes.len(), *end_stream),
+                Some(OutFrame::Data {
+                    bytes,
+                    off,
+                    end_stream,
+                }) => (*off, bytes.len(), *end_stream),
                 _ => continue,
             };
             let remaining = total - off;
@@ -1132,9 +1170,10 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
 
         // Drop a fully-finished stream so the map can't grow unbounded across a
         // long-lived connection.
-        if s.streams.get(&id).is_some_and(|st| {
-            st.state == StreamState::Closed && st.outbox.is_empty()
-        }) {
+        if s.streams
+            .get(&id)
+            .is_some_and(|st| st.state == StreamState::Closed && st.outbox.is_empty())
+        {
             s.streams.remove(&id);
         }
     }
@@ -1165,7 +1204,9 @@ fn push_ctrl<F: FnOnce(&mut Vec<u8>)>(shared: &Conn, notify: &Arc<Notify>, build
 }
 
 fn goaway(shared: &Conn, notify: &Arc<Notify>, last: u32, code: ErrorCode) {
-    push_ctrl(shared, notify, |out| out.extend_from_slice(&frame::goaway(last, code, &[])));
+    push_ctrl(shared, notify, |out| {
+        out.extend_from_slice(&frame::goaway(last, code, &[]))
+    });
     let mut s = shared.lock().unwrap();
     s.reader_done = true;
 }
