@@ -137,10 +137,17 @@ a clean fall-through to the userspace h1 path.
 0. **h2 graduation onto the interim seam is *paused*** in favor of landing on this base.
 1. **Fold** the current `boatramp-h2` code into `boatramp_http::h2` and lift the shared
    `Request`/`Response`/`Body` types to the crate root. Pure refactor, h2spec still 143/143.
-2. **Build the `boatramp_http::h1` userspace codec + the full safety gate** (differential +
-   smuggling + fuzz). No kTLS yet. **The harness lands first and stays red until the codec
-   is green** (done: `boatramp-http/tests/{conformance,smuggling,differential,fuzz_smoke}.rs`).
-   It does *not* serve production traffic until the gate is green.
+2. **Build the `boatramp_http::h1` userspace codec + the full safety gate** — **DONE.**
+   The harness landed first (red), then the codec turned it green:
+   - `src/testkit/{cases,gen}.rs` — the curated per-aspect corpus (91 head cases) + the
+     combinatorial generators (CL×TE grid, whitespace/version/byte-class sweeps).
+   - `tests/gate.rs` (12 aspect+generator fns), `tests/chunked.rs`, `tests/response_framing.rs`.
+   - `tests/differential.rs` — vs hyper: sequence agreement + never-more-permissive over
+     the corpus **and** a stable seeded randomized differential (`BOATRAMP_H1_FUZZ_N`,
+     ran 5M/50M, 0 violations). `tests/fuzz_smoke.rs` + `fuzz/` (cargo-fuzz, for a
+     nightly host). All green; clippy clean.
+   The differential earned its keep (found TE-on-HTTP/1.0 desync; fixed + pinned). No
+   kTLS yet. It does *not* serve production traffic until wired in Stage 3.
 3. **Unified `serve_connection`** (ALPN + h2c sniff → h1/h2), fold `splice.rs` in-loop,
    and route every TLS mode (custom / ACME / ACME-DNS / RPK) **and** the plaintext path
    through it. Remove the `h2-mux` feature + `BOATRAMP_H2_MUX` env gate — one codec set,
