@@ -56,6 +56,19 @@ impl ReqBody {
         ReqBody(ReqBodyInner::Stream(Box::pin(chunks)))
     }
 
+    /// Consume the body as a pull [`Stream`] of chunks — a reverse-proxy handler forwards
+    /// this straight to the upstream without buffering (the mirror of [`Body::try_stream`]
+    /// on the response side).
+    pub fn into_data_stream(
+        self,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, BodyError>> + Send>> {
+        match self.0 {
+            ReqBodyInner::Empty | ReqBodyInner::Full(None) => Box::pin(tokio_stream::empty()),
+            ReqBodyInner::Full(Some(b)) => Box::pin(tokio_stream::once(Ok(b))),
+            ReqBodyInner::Stream(s) => s,
+        }
+    }
+
     /// Buffer the whole body into `Bytes` (for a handler that wants it all at once, or a
     /// test). `Err` if the source failed mid-stream.
     pub async fn collect(self) -> Result<Bytes, BodyError> {

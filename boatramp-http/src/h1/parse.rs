@@ -563,6 +563,75 @@ pub mod chunked {
         }
     }
 
+    /// One step of an **incremental** chunked decode from the front of a buffer — for the
+    /// serve loop, which streams each chunk to the handler as it completes rather than
+    /// buffering the whole body.
+    #[derive(Debug)]
+    pub enum ChunkStep {
+        /// A data chunk: `buf[data_start..data_end]` is the payload; the next chunk starts
+        /// at `next`.
+        Data { data_start: usize, data_end: usize, next: usize },
+        /// The terminating 0-chunk (+ trailers) ends the body at offset `end`.
+        Last { end: usize },
+        /// More bytes are needed to complete the current chunk.
+        Incomplete,
+        /// Malformed chunk framing — reject (fail closed).
+        Reject(super::Reject),
+    }
+
+    /// Parse a single chunk from the front of `buf` (see [`ChunkStep`]).
+    pub fn next_chunk(buf: &[u8]) -> ChunkStep {
+        match next_chunk_inner(buf) {
+            Ok(step) => step,
+            Err(r) => ChunkStep::Reject(r),
+        }
+    }
+
+    fn next_chunk_inner(buf: &[u8]) -> Result<ChunkStep, Reject> {
+        let (line, next) = match next_line(buf, 0)? {
+            Line::Got(l, n) => (l, n),
+            Line::Incomplete => return Ok(ChunkStep::Incomplete),
+        };
+        if line.len() > MAX_CHUNK_SIZE_LINE {
+            return Err(Reject::TooLarge);
+        }
+        let size_bytes = match line.iter().position(|&b| b == b';') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let size = parse_chunk_size(size_bytes)?;
+        if size == 0 {
+            // last-chunk: consume the trailer section up to the terminating empty line.
+            let mut pos = next;
+            loop {
+                let (tline, tnext) = match next_line(buf, pos)? {
+                    Line::Got(l, n) => (l, n),
+                    Line::Incomplete => return Ok(ChunkStep::Incomplete),
+                };
+                pos = tnext;
+                if tline.is_empty() {
+                    return Ok(ChunkStep::Last { end: pos });
+                }
+                if tline[0] == b' ' || tline[0] == b'\t' {
+                    return Err(Reject::ObsFold);
+                }
+                let (name, _value) = split_header(tline)?;
+                if forbidden_trailer(name) {
+                    return Err(Reject::BadChunk);
+                }
+            }
+        }
+        let data_end = next.checked_add(size as usize).ok_or(Reject::BadChunk)?;
+        let crlf_end = data_end.checked_add(2).ok_or(Reject::BadChunk)?;
+        if crlf_end > buf.len() {
+            return Ok(ChunkStep::Incomplete);
+        }
+        if &buf[data_end..crlf_end] != b"\r\n" {
+            return Err(Reject::BadChunk);
+        }
+        Ok(ChunkStep::Data { data_start: next, data_end, next: crlf_end })
+    }
+
     /// Parse a chunk size: 1..=16 hex digits, no sign / `0x` prefix / other bytes.
     fn parse_chunk_size(bytes: &[u8]) -> Result<u64, Reject> {
         let bytes = trim_ows(bytes); // tolerate trailing OWS before the CRLF

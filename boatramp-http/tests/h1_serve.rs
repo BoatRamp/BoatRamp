@@ -20,6 +20,11 @@ impl Handler for App {
             ("HEAD", "/") => response(200, b"hello".to_vec()), // loop suppresses the body
             ("GET", "/big") => response(200, vec![b'x'; 100_000]),
             ("POST", "/echo") => response(200, req.into_body().collect().await.unwrap_or_default().to_vec()),
+            // Stream the request body straight back — the response streams chunk-by-chunk
+            // as the request body arrives, WITHOUT buffering the whole thing.
+            ("POST", "/echo-stream") => {
+                response(200, Body::try_stream(req.into_body().into_data_stream()))
+            }
             ("GET", "/stream") => {
                 let chunks = tokio_stream::iter(
                     (0..3u8).map(|i| Bytes::from(vec![b'a' + i; 4])),
@@ -137,6 +142,62 @@ async fn streamed_body_error_truncates_without_a_clean_terminator() {
         !r.ends_with(b"0\r\n\r\n"),
         "a mid-stream error must not frame a clean end (silent truncation): {text}"
     );
+}
+
+#[tokio::test]
+async fn request_body_streams_through_before_it_is_complete() {
+    use tokio::time::{timeout, Duration};
+    // Prove the request body is NOT buffered: with a chunked echo-stream, the first
+    // request chunk must come back in the response *before* we send the rest of the body.
+    let mut c = spawn();
+    c.write_all(
+        b"POST /echo-stream HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    // Send only the first data chunk (not the terminator).
+    c.write_all(b"5\r\nhello\r\n").await.unwrap();
+
+    // The response head + the first echoed chunk must arrive though the request body is
+    // still open — impossible if the server buffered the whole body first.
+    let mut got = Vec::new();
+    let deadline = Duration::from_secs(2);
+    loop {
+        let mut tmp = [0u8; 512];
+        let n = timeout(deadline, c.read(&mut tmp)).await.unwrap().unwrap();
+        got.extend_from_slice(&tmp[..n]);
+        if String::from_utf8_lossy(&got).contains("hello") {
+            break; // first chunk streamed back before we sent the terminator
+        }
+    }
+    assert!(lower(&got).contains("transfer-encoding: chunked\r\n"), "{:?}", lower(&got));
+
+    // Now finish the request; the echo completes + closes.
+    c.write_all(b"6\r\n world\r\n0\r\n\r\n").await.unwrap();
+    let mut rest = Vec::new();
+    c.read_to_end(&mut rest).await.unwrap();
+    got.extend_from_slice(&rest);
+    // The full echoed payload ("hello world") appears across the streamed chunks.
+    let body_start = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let decoded = decode_chunked(&got[body_start..]);
+    assert_eq!(decoded, b"hello world");
+}
+
+/// Minimal chunked-decoder for the test side (collect a chunked response body).
+fn decode_chunked(mut buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let size_line = &buf[..nl];
+        let hex: String = String::from_utf8_lossy(size_line).trim().to_string();
+        let size = usize::from_str_radix(hex.split(';').next().unwrap_or("0").trim(), 16).unwrap_or(0);
+        buf = &buf[nl + 1..];
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..size]);
+        buf = &buf[size + 2..]; // skip data + CRLF
+    }
+    out
 }
 
 #[tokio::test]

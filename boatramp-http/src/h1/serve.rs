@@ -13,27 +13,39 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Method, Version};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
 use super::parse::{chunked, parse_request_head, BodyFraming, ParseResult};
-use crate::{Body, Handler};
+use crate::{Body, BodyError, Handler, ReqBody};
 
 /// Slowloris bound: how long we wait for a client to deliver a complete request head or
 /// the next byte of its body before closing the connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Cap on a buffered request body (a DoS bound; a streaming request body is future work).
-const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// Serve one HTTP/1.1 connection: drive `handler` over each request until the connection
 /// closes. Returns `Ok(())` on a clean close (client EOF, `Connection: close`, or a
 /// write failure) and `Err` only on an unexpected local IO error.
-pub async fn serve_connection<IO, H>(mut io: IO, handler: H) -> std::io::Result<()>
+///
+/// The request body **streams** to the handler: for each request the handler runs
+/// concurrently with a body pump that feeds the request's [`ReqBody`] channel from the
+/// connection as bytes arrive — so a large upload flows client → boatramp → upstream
+/// without being buffered whole. Because HTTP/1.1 is one-request-at-a-time, the pump and
+/// the handler share this task via [`tokio::join!`]; the pump owns the reader while the
+/// handler owns only the channel, so the response write reclaims the connection after.
+pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
 {
-    // One growable buffer holds unconsumed bytes; each served request drains its head +
-    // body from the front, leaving any pipelined bytes for the next iteration.
+    // Split the connection so the response can be written WHILE the request body is still
+    // being read (a streaming reverse proxy: request body → upstream, upstream response →
+    // client, both in flight). The pump owns the read half; the response write owns the
+    // write half; the two run concurrently via `join!`.
+    let (mut rd, mut wr) = tokio::io::split(io);
+    // Unconsumed bytes; each request drains its head from the front, the pump drains the
+    // body, leaving any pipelined bytes for the next iteration.
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
 
     loop {
@@ -43,26 +55,22 @@ where
                 ParseResult::Complete { head, consumed } => break (head, consumed),
                 ParseResult::Reject(_) => {
                     // Malformed / ambiguous head → 400 and close (never resync).
-                    let _ = write_status(&mut io, 400, true).await;
+                    let _ = write_status(&mut wr, 400, true).await;
                     return Ok(());
                 }
                 ParseResult::Incomplete => {
-                    match tokio::time::timeout(READ_TIMEOUT, io.read_buf(&mut buf)).await {
-                        Ok(Ok(0)) => {
-                            // EOF: clean only if it lands on a request boundary.
-                            return Ok(());
-                        }
+                    match tokio::time::timeout(READ_TIMEOUT, rd.read_buf(&mut buf)).await {
+                        Ok(Ok(0)) => return Ok(()), // EOF on a request boundary → clean close
                         Ok(Ok(_)) => continue,
-                        // Read error or slowloris timeout → drop the connection.
-                        _ => return Ok(()),
+                        _ => return Ok(()), // read error / slowloris timeout → drop
                     }
                 }
             }
         };
 
-        // Keep-alive intent + method are decided from the request before it is consumed.
         let method = head.method.clone();
         let version = head.version;
+        let framing = head.framing.clone();
         let client_close = wants_close(&head.headers, version);
         let expect_continue = head
             .headers
@@ -70,82 +78,119 @@ where
             .iter()
             .any(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
 
-        // --- read + decode the request body per framing -------------------------
-        let (body, body_consumed) = match head.framing {
-            BodyFraming::Empty => (Bytes::new(), 0usize),
-            BodyFraming::Length(n) => {
-                let n = n as usize;
-                if n > MAX_BODY {
-                    let _ = write_status(&mut io, 413, true).await;
-                    return Ok(());
-                }
-                if expect_continue
-                    && write_all(&mut io, b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
-                {
-                    return Ok(());
-                }
-                // Ensure head_len + n bytes are buffered.
-                while buf.len() < head_len + n {
-                    match tokio::time::timeout(READ_TIMEOUT, io.read_buf(&mut buf)).await {
-                        Ok(Ok(0)) => return Ok(()), // truncated body → drop
-                        Ok(Ok(_)) => {}
-                        _ => return Ok(()),
-                    }
-                }
-                (Bytes::copy_from_slice(&buf[head_len..head_len + n]), n)
-            }
-            BodyFraming::Chunked => {
-                if expect_continue
-                    && write_all(&mut io, b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
-                {
-                    return Ok(());
-                }
-                loop {
-                    match chunked::decode(&buf[head_len..]) {
-                        chunked::ChunkDecode::Complete { data, end } => {
-                            if data.len() > MAX_BODY {
-                                let _ = write_status(&mut io, 413, true).await;
-                                return Ok(());
-                            }
-                            break (Bytes::from(data), end);
-                        }
-                        chunked::ChunkDecode::Reject(_) => {
-                            let _ = write_status(&mut io, 400, true).await;
-                            return Ok(());
-                        }
-                        chunked::ChunkDecode::Incomplete => {
-                            match tokio::time::timeout(READ_TIMEOUT, io.read_buf(&mut buf)).await {
-                                Ok(Ok(0)) => return Ok(()),
-                                Ok(Ok(_)) => {}
-                                _ => return Ok(()),
-                            }
-                        }
-                    }
-                }
-            }
-        };
+        // Consume the head; `buf` now starts at the request body (or the next request).
+        buf.drain(..head_len);
 
-        // --- build the request + run the handler --------------------------------
-        // (The body is buffered here; true request-body streaming is the next step.)
-        let mut req = http::Request::new(crate::ReqBody::from_bytes(body));
+        // A body carries an interim 100-continue if the client asked for one.
+        if !matches!(framing, BodyFraming::Empty)
+            && expect_continue
+            && write_all(&mut wr, b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
+        {
+            return Ok(());
+        }
+
+        // A bounded channel backs the request's ReqBody stream; the pump feeds it from the
+        // connection (backpressured by the channel capacity) and closes it at the body's
+        // end so the handler's body stream terminates.
+        let (tx, rx) = mpsc::channel::<Result<Bytes, BodyError>>(4);
+        let mut req = http::Request::new(ReqBody::from_stream(ReceiverStream::new(rx)));
         *req.method_mut() = head.method;
         *req.uri_mut() = head.uri;
         *req.version_mut() = head.version;
         *req.headers_mut() = head.headers;
-        let resp = handler.handle(req).await;
 
-        // --- frame + write the response -----------------------------------------
-        let (result, must_close) =
-            write_response(&mut io, resp, &method, version, client_close).await;
+        // Run { handler → write its response } concurrently with the body pump, so the
+        // response streams out while the request body is still coming in.
+        let respond = async {
+            let resp = handler.handle(req).await;
+            write_response(&mut wr, resp, &method, version, client_close).await
+        };
+        let ((result, resp_close), pump) =
+            tokio::join!(respond, pump_body(&mut rd, &mut buf, framing, tx));
+
         if result.is_err() {
             return Ok(()); // client went away mid-response
         }
-        if must_close {
+        // Close after this request if either side asked, or the request body framing was
+        // bad/truncated (the connection boundary can no longer be trusted).
+        if resp_close || pump.is_err() {
             return Ok(());
         }
+    }
+}
 
-        // Drop the consumed head+body; keep any pipelined bytes for the next request.
-        buf.drain(..head_len + body_consumed);
+/// Stream the request body from the connection into `tx` (backpressured by the channel),
+/// draining consumed bytes from `buf` so it ends at the next request. `Err(())` when the
+/// body framing is malformed or the connection truncates mid-body (the caller then
+/// closes); if the handler stops reading (its `ReqBody` was dropped), the rest is
+/// discarded to the framing boundary so the connection can still be reused (`Ok`).
+async fn pump_body<IO>(
+    io: &mut IO,
+    buf: &mut Vec<u8>,
+    framing: BodyFraming,
+    tx: mpsc::Sender<Result<Bytes, BodyError>>,
+) -> Result<(), ()>
+where
+    IO: AsyncRead + Unpin,
+{
+    // Once the receiver is gone we stop sending but keep consuming, to preserve the
+    // connection boundary for the next pipelined request.
+    let mut sending = true;
+    // Report a truncated / malformed body to the handler (if still listening) and fail.
+    macro_rules! fail {
+        () => {{
+            if sending {
+                let _ = tx.send(Err(BodyError)).await;
+            }
+            return Err(());
+        }};
+    }
+
+    match framing {
+        BodyFraming::Empty => Ok(()),
+        BodyFraming::Length(n) => {
+            let mut remaining = n as usize;
+            while remaining > 0 {
+                if buf.is_empty() {
+                    match tokio::time::timeout(READ_TIMEOUT, io.read_buf(buf)).await {
+                        Ok(Ok(0)) => fail!(), // truncated body
+                        Ok(Ok(_)) => {}
+                        _ => fail!(),
+                    }
+                }
+                let take = remaining.min(buf.len());
+                let chunk = Bytes::copy_from_slice(&buf[..take]);
+                buf.drain(..take);
+                remaining -= take;
+                if sending && tx.send(Ok(chunk)).await.is_err() {
+                    sending = false;
+                }
+            }
+            Ok(())
+        }
+        BodyFraming::Chunked => loop {
+            match chunked::next_chunk(buf) {
+                chunked::ChunkStep::Data { data_start, data_end, next } => {
+                    let chunk = Bytes::copy_from_slice(&buf[data_start..data_end]);
+                    buf.drain(..next);
+                    if sending && tx.send(Ok(chunk)).await.is_err() {
+                        sending = false;
+                    }
+                }
+                chunked::ChunkStep::Last { end } => {
+                    buf.drain(..end);
+                    return Ok(());
+                }
+                chunked::ChunkStep::Incomplete => {
+                    match tokio::time::timeout(READ_TIMEOUT, io.read_buf(buf)).await {
+                        Ok(Ok(0)) => fail!(),
+                        Ok(Ok(_)) => {}
+                        _ => fail!(),
+                    }
+                }
+                chunked::ChunkStep::Reject(_) => fail!(),
+            }
+        },
     }
 }
 
