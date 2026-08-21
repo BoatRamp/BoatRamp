@@ -15,32 +15,63 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
+use std::time::Duration;
+
 use crate::Handler;
 
-/// How long to wait for enough bytes to classify a connection (h2 preface vs h1) before
-/// giving up — a slowloris bound on the pre-request phase.
-const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Serving timeouts (a slowloris defense at each blocking phase). Defaults suit a
+/// public listener; an operator can tune them per deployment.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// How long to wait for enough opening bytes to classify a connection (h2 vs h1).
+    pub sniff_timeout: Duration,
+    /// How long the h1 loop waits on a stalled request head/body before dropping.
+    pub read_timeout: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            sniff_timeout: Duration::from_secs(10),
+            read_timeout: crate::h1::DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
 
 /// Serve one accepted connection (plaintext or already-TLS-decrypted) with the codec its
-/// opening bytes select: HTTP/2 (preface present) via the mux driver, else HTTP/1.1.
+/// opening bytes select — with default [`Config`] timeouts. See [`serve_connection_with`].
 pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
-    let (prefix, io, is_h2) = classify(io).await?;
+    serve_connection_with(io, handler, Config::default()).await
+}
+
+/// Serve one accepted connection with explicit [`Config`] timeouts: HTTP/2 (preface
+/// present) via the mux driver, else HTTP/1.1.
+pub async fn serve_connection_with<IO, H>(
+    io: IO,
+    handler: H,
+    config: Config,
+) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: Handler,
+{
+    let (prefix, io, is_h2) = classify(io, config.sniff_timeout).await?;
     let rewound = Rewind::new(prefix, io);
     if is_h2 {
         crate::h2::serve_connection_mux(rewound, handler).await
     } else {
-        crate::h1::serve_connection(rewound, handler).await
+        crate::h1::serve_connection_with(rewound, handler, config.read_timeout).await
     }
 }
 
 /// Read just enough leading bytes to decide h2-vs-h1. Stops as soon as the accumulated
 /// prefix diverges from the preface (→ h1) or matches it fully (→ h2). Returns the read
 /// bytes (to replay), the stream, and the verdict.
-async fn classify<IO>(mut io: IO) -> std::io::Result<(Vec<u8>, IO, bool)>
+async fn classify<IO>(mut io: IO, sniff_timeout: Duration) -> std::io::Result<(Vec<u8>, IO, bool)>
 where
     IO: AsyncRead + Unpin,
 {
@@ -56,7 +87,7 @@ where
             return Ok((prefix, io, true));
         }
         let mut byte = [0u8; 1];
-        match tokio::time::timeout(SNIFF_TIMEOUT, io.read(&mut byte)).await {
+        match tokio::time::timeout(sniff_timeout, io.read(&mut byte)).await {
             Ok(Ok(0)) => {
                 // EOF before a decision: an empty/short connection — classify as h1 so
                 // the h1 loop closes it cleanly (an empty buffer is a clean close there).

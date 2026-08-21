@@ -20,13 +20,24 @@ use tokio_stream::StreamExt as _;
 use super::parse::{chunked, parse_request_head, BodyFraming, ParseResult};
 use crate::{Body, BodyError, Handler, ReqBody};
 
-/// Slowloris bound: how long we wait for a client to deliver a complete request head or
-/// the next byte of its body before closing the connection.
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default slowloris bound: how long we wait for a client to deliver a complete request
+/// head or the next byte of its body before closing the connection.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Serve one HTTP/1.1 connection with the default read timeout — see
+/// [`serve_connection_with`].
+pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    H: Handler,
+{
+    serve_connection_with(io, handler, DEFAULT_READ_TIMEOUT).await
+}
 
 /// Serve one HTTP/1.1 connection: drive `handler` over each request until the connection
 /// closes. Returns `Ok(())` on a clean close (client EOF, `Connection: close`, or a
-/// write failure) and `Err` only on an unexpected local IO error.
+/// write failure) and `Err` only on an unexpected local IO error. `read_timeout` bounds
+/// how long a stalled client (partial head/body) is held before the connection is dropped.
 ///
 /// The request body **streams** to the handler: for each request the handler runs
 /// concurrently with a body pump that feeds the request's [`ReqBody`] channel from the
@@ -34,7 +45,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// without being buffered whole. Because HTTP/1.1 is one-request-at-a-time, the pump and
 /// the handler share this task via [`tokio::join!`]; the pump owns the reader while the
 /// handler owns only the channel, so the response write reclaims the connection after.
-pub async fn serve_connection<IO, H>(io: IO, handler: H) -> std::io::Result<()>
+pub async fn serve_connection_with<IO, H>(
+    io: IO,
+    handler: H,
+    read_timeout: Duration,
+) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
     H: Handler,
@@ -59,7 +74,7 @@ where
                     return Ok(());
                 }
                 ParseResult::Incomplete => {
-                    match tokio::time::timeout(READ_TIMEOUT, rd.read_buf(&mut buf)).await {
+                    match tokio::time::timeout(read_timeout, rd.read_buf(&mut buf)).await {
                         Ok(Ok(0)) => return Ok(()), // EOF on a request boundary → clean close
                         Ok(Ok(_)) => continue,
                         _ => return Ok(()), // read error / slowloris timeout → drop
@@ -106,7 +121,7 @@ where
             write_response(&mut wr, resp, &method, version, client_close).await
         };
         let ((result, resp_close), pump) =
-            tokio::join!(respond, pump_body(&mut rd, &mut buf, framing, tx));
+            tokio::join!(respond, pump_body(&mut rd, &mut buf, framing, tx, read_timeout));
 
         if result.is_err() {
             return Ok(()); // client went away mid-response
@@ -129,6 +144,7 @@ async fn pump_body<IO>(
     buf: &mut Vec<u8>,
     framing: BodyFraming,
     tx: mpsc::Sender<Result<Bytes, BodyError>>,
+    read_timeout: Duration,
 ) -> Result<(), ()>
 where
     IO: AsyncRead + Unpin,
@@ -152,7 +168,7 @@ where
             let mut remaining = n as usize;
             while remaining > 0 {
                 if buf.is_empty() {
-                    match tokio::time::timeout(READ_TIMEOUT, io.read_buf(buf)).await {
+                    match tokio::time::timeout(read_timeout, io.read_buf(buf)).await {
                         Ok(Ok(0)) => fail!(), // truncated body
                         Ok(Ok(_)) => {}
                         _ => fail!(),
@@ -182,7 +198,7 @@ where
                     return Ok(());
                 }
                 chunked::ChunkStep::Incomplete => {
-                    match tokio::time::timeout(READ_TIMEOUT, io.read_buf(buf)).await {
+                    match tokio::time::timeout(read_timeout, io.read_buf(buf)).await {
                         Ok(Ok(0)) => fail!(),
                         Ok(Ok(_)) => {}
                         _ => fail!(),

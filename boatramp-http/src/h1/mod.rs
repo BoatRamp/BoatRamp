@@ -12,4 +12,4 @@ pub use parse::{
     ParseResult, Reject, RequestHead, ResponseFraming,
 };
 
-pub use serve::serve_connection;
+pub use serve::{serve_connection, serve_connection_with, DEFAULT_READ_TIMEOUT};
