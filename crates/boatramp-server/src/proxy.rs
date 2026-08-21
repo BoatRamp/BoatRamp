@@ -1115,8 +1115,14 @@ async fn proxy_upgrade(
     client_ip: IpAddr,
     posture: boatramp_core::security::SecurityPosture,
 ) -> Response {
-    // Register interest in the client-side upgrade before the request is moved.
-    let client_on_upgrade = hyper::upgrade::on(&mut request);
+    // Register interest in the client-side upgrade (our own mechanism — the inbound
+    // connection is served by boatramp-http's serve loop, not hyper) before the request
+    // is moved. Absent only if the request lacked upgrade intent (shouldn't happen — the
+    // caller gated on `is_upgrade_request`).
+    let Some(client_on_upgrade) = boatramp_http::on_upgrade(&mut request) else {
+        return (StatusCode::BAD_GATEWAY, "gateway upgrade: no client upgrade handle\n")
+            .into_response();
+    };
     let method = request.method().clone();
     let req_headers = request.headers().clone();
     let query = request.uri().query().map(str::to_string);
@@ -1308,7 +1314,7 @@ async fn upgrade_over<I>(
     host: String,
     upstream: &boatramp_core::gateway::Upstream,
     client_ip: IpAddr,
-    client_on_upgrade: hyper::upgrade::OnUpgrade,
+    client_on_upgrade: boatramp_http::OnUpgrade,
 ) -> Response
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -1355,13 +1361,14 @@ where
     };
 
     if upstream_resp.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
-        // Bridge the two upgraded connections once both sides flip.
+        // Bridge the two upgraded connections once both sides flip. The client side is
+        // our own `Upgraded` (already a tokio stream, delivered by the serve loop after it
+        // writes our 101); the upstream side is hyper's (the upstream *client* stays hyper).
         let upstream_on_upgrade = hyper::upgrade::on(&mut upstream_resp);
         tokio::spawn(async move {
-            if let (Ok(client_io), Ok(upstream_io)) =
+            if let (Ok(mut client_io), Ok(upstream_io)) =
                 (client_on_upgrade.await, upstream_on_upgrade.await)
             {
-                let mut client_io = hyper_util::rt::TokioIo::new(client_io);
                 let mut upstream_io = hyper_util::rt::TokioIo::new(upstream_io);
                 let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await;
             }
