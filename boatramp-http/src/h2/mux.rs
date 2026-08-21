@@ -48,6 +48,13 @@ const MAX_CONTINUATION_FRAMES: u32 = 64;
 /// the connection is closed with ENHANCE_YOUR_CALM. Legitimate clients reset a small
 /// fraction of their streams; a rapid-reset attacker resets ~all of them.
 const RAPID_RESET_MIN: u64 = 100;
+/// The `SETTINGS_MAX_CONCURRENT_STREAMS` we advertise and enforce (§5.1.2): a hard
+/// cap on a connection's simultaneously-active streams, bounding per-connection
+/// memory and a further mitigation for stream-concurrency floods (CVE-2023-44487).
+/// 256 is well above any legitimate multiplexing need; the (limit + 1)th concurrent
+/// stream is refused with `RST_STREAM(REFUSED_STREAM)`, which a client may retry on a
+/// new connection. Matches the cap the previous hyper serving path advertised.
+const MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Soft target for one batched socket write: keep draining ready streams into the
 /// buffer until it reaches this, then write and start a fresh batch.
 const WRITE_BATCH_TARGET: usize = 64 * 1024;
@@ -60,6 +67,11 @@ const STREAM_HIGH_WATER: usize = 256 * 1024;
 /// back below this. The gap to [`STREAM_HIGH_WATER`] gives hysteresis so a producer
 /// isn't woken for every frame the writer sends.
 const STREAM_LOW_WATER: usize = 128 * 1024;
+/// How long the reader keeps draining inbound bytes after we've decided to close,
+/// before giving up and letting the socket drop. Bounds a graceful close against a
+/// peer that never closes its side; a well-behaved peer closes as soon as it sees
+/// our GOAWAY/FIN, so this rarely elapses.
+const GRACEFUL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A response frame a handler has produced, awaiting the writer + flow control.
 enum OutFrame {
@@ -186,6 +198,35 @@ where
         }
     }
     notify.notify_one();
+    // Graceful close: once we've stopped reading meaningful frames (client EOF, a
+    // GOAWAY, an invalid preface, or a connection error), keep draining and discarding
+    // inbound bytes until the peer closes (EOF) or the drain times out. Closing a
+    // socket that still has unread data in its receive buffer makes the kernel send
+    // RST instead of FIN (RFC 1122 §4.2.2.13) — a peer that pipelined bytes we won't
+    // process (a SETTINGS after a bad preface, a PING after its GOAWAY) would then see
+    // "connection reset" instead of the clean close h2spec (§3.5, §3.8) requires. The
+    // writer sends our GOAWAY + FIN concurrently, so a well-behaved peer closes at once
+    // and this returns immediately.
+    drain_to_eof(&mut rd).await;
+}
+
+/// Read and discard from `rd` until the peer closes (EOF), a read error, or
+/// [`GRACEFUL_DRAIN_TIMEOUT`] — so the socket's receive buffer is empty when it drops
+/// and the kernel sends a clean FIN rather than a RST. See [`reader_loop`].
+async fn drain_to_eof<R>(rd: &mut R)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut scratch = [0u8; 4096];
+    let _ = tokio::time::timeout(GRACEFUL_DRAIN_TIMEOUT, async {
+        loop {
+            match rd.read(&mut scratch).await {
+                Ok(0) | Err(_) => break, // peer closed (EOF) or errored → done
+                Ok(_) => {}              // discard and keep draining
+            }
+        }
+    })
+    .await;
 }
 
 /// Per-request reader-local state accumulated between HEADERS and END_STREAM.
@@ -220,9 +261,13 @@ where
     if preface != CLIENT_PREFACE {
         return Ok(());
     }
-    // Our initial SETTINGS (empty = defaults).
+    // Our initial SETTINGS: advertise the concurrent-stream cap (§5.1.2); the rest
+    // stay at their spec defaults.
     push_ctrl(shared, notify, |out| {
-        frame::write_frame(out, FrameType::Settings, 0, 0, &[])
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&0x3u16.to_be_bytes()); // SETTINGS_MAX_CONCURRENT_STREAMS
+        payload.extend_from_slice(&MAX_CONCURRENT_STREAMS.to_be_bytes());
+        frame::write_frame(out, FrameType::Settings, 0, 0, &payload)
     });
 
     let mut hpack = Hpack::new();
@@ -547,6 +592,24 @@ where
             return Err(H2Error::stream(sid, ErrorCode::ProtocolError));
         }
         spawn_request(shared, notify, handler, sid, Some(req), body);
+        return Ok(());
+    }
+    // Enforce SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2): if this freshly-opened stream
+    // pushes the active count past the advertised cap, refuse it with
+    // RST_STREAM(REFUSED_STREAM) — the client may retry on a new connection. The
+    // header block was decoded above, so the shared HPACK context stays consistent.
+    // Active = open or half-closed (closed/reset streams don't count, per §5.1.2).
+    let active = {
+        let s = shared.lock().unwrap();
+        s.streams
+            .values()
+            .filter(|st| st.state != StreamState::Closed && !st.reset)
+            .count()
+    };
+    if active > MAX_CONCURRENT_STREAMS as usize {
+        rs.content_len.remove(&sid);
+        rs.bodies.remove(&sid);
+        reset_local(shared, notify, sid, ErrorCode::RefusedStream);
         return Ok(());
     }
     let req = http::request_from_headers(sid, headers)?;

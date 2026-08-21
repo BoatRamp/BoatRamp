@@ -349,3 +349,42 @@ async fn concurrent_streams_interleave() {
         .await
         .expect("interdependent streams must interleave — serial driver would deadlock");
 }
+
+/// The driver's initial SETTINGS advertises `SETTINGS_MAX_CONCURRENT_STREAMS = 256`
+/// (§5.1.2) — the concurrency cap it also enforces (h2spec exercises the refusal;
+/// this pins the advertisement so it can't silently drop back to "unlimited"). Read
+/// as raw frames so it tests the wire bytes, not a client's interpretation.
+#[tokio::test]
+async fn advertises_max_concurrent_streams_setting() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let _ = serve_connection_mux(server, App).await;
+    });
+    // Client connection preface — the server sends its SETTINGS in response.
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+
+    // The server's first frame MUST be SETTINGS (type 0x4, stream 0).
+    let mut hdr = [0u8; 9];
+    client.read_exact(&mut hdr).await.unwrap();
+    let len = u32::from_be_bytes([0, hdr[0], hdr[1], hdr[2]]) as usize;
+    assert_eq!(hdr[3], 0x4, "first server frame is SETTINGS");
+    assert_eq!(len % 6, 0, "SETTINGS length is a multiple of 6");
+    let mut payload = vec![0u8; len];
+    client.read_exact(&mut payload).await.unwrap();
+
+    // Find SETTINGS_MAX_CONCURRENT_STREAMS (identifier 0x3).
+    let max = payload.chunks(6).find_map(|e| {
+        (u16::from_be_bytes([e[0], e[1]]) == 0x3)
+            .then(|| u32::from_be_bytes([e[2], e[3], e[4], e[5]]))
+    });
+    assert_eq!(
+        max,
+        Some(256),
+        "must advertise SETTINGS_MAX_CONCURRENT_STREAMS=256"
+    );
+}
