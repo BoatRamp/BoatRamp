@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "BoatRamp's owned HTTP serving stack: one accept loop over hand-rolled h1 + h2 codecs, with kTLS/splice reverse-proxy body fast-paths hyper can't do."
 repository = "https://github.com/BoatRamp/BoatRamp"
-publish = false # flip once the h1 safety gate (differential + smuggling + fuzz) is green
+publish = false                                                                                                                                                      # flip once the h1 safety gate (differential + smuggling + fuzz) is green
 
 # The unified stack: shared serving types (`Request`/`Response`/`Body`/`Handler`) at the
 # crate root, protocol codecs as `h1` and `h2` modules (the `h2` mux driver was the
@@ -19,7 +19,14 @@ http = "1"
 bytes = "1"
 # The h2 codec: tokio IO + a pull `Stream` response body the driver polls directly, and
 # `fluke-hpack` (vendored, see [patch]) for HPACK.
-tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
+tokio = { version = "1", features = [
+  "io-util",
+  "net",
+  "rt",
+  "macros",
+  "time",
+  "sync",
+] }
 tokio-stream = "0.1"
 fluke-hpack = "0.3"
 # A streamed request body (`ReqBody`) implements `http_body::Body`, so a reverse-proxy
@@ -44,7 +51,13 @@ ktls = "6"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "io-util",
+  "net",
+  "time",
+] }
 # The reference HTTP/2 implementation: an in-process client for the h2 smoke + the
 # differential oracle.
 h2 = "0.4"

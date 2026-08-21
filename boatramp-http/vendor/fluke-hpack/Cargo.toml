@@ -14,19 +14,14 @@ edition = "2021"
 name = "fluke-hpack"
 version = "0.3.1"
 authors = [
-    "Marko Lalic <marko.lalic@gmail.com>",
-    "Amos Wenger <amos@bearcove.net>",
+  "Marko Lalic <marko.lalic@gmail.com>",
+  "Amos Wenger <amos@bearcove.net>",
 ]
 exclude = ["fixtures/*"]
 description = "A library implementing HPACK coding, for the fluke project"
 documentation = "https://docs.rs/fluke-hpack"
 readme = "README.md"
-keywords = [
-    "hpack",
-    "http2",
-    "encoding",
-    "decoding",
-]
+keywords = ["hpack", "http2", "encoding", "decoding"]
 license = "MIT"
 repository = "https://github.com/bearcove/fluke"
 
