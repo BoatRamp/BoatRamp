@@ -48,6 +48,16 @@ versions.
   the fork is preserved directly: the Huffman decode table is a flat trie built **once** via
   `OnceLock` and shared process-wide, instead of rebuilt per header string; the owned codec holds
   the ~9% HPACK throughput win to within benchmark noise.
+- **First-party kTLS handoff (Linux), replacing the `ktls` crate.** The kernel-TLS setup for the
+  zero-copy `splice()` reverse-proxy body path is now boatramp's own code (`h2::ktls`): drain the
+  rustls handshake at a record boundary, extract the negotiated traffic secrets, and `setsockopt`
+  the kernel TLS ULP (TX+RX) for the AES-GCM / ChaCha20-Poly1305 suites. The `ktls` crate could not
+  build for the musl static images (it constructs `cmsghdr`/`msghdr` with struct literals that omit
+  musl's private fields); the first-party handoff is plain `#[repr(C)]` structs + `setsockopt` and
+  compiles identically on glibc and musl — and needs no control-message read path, since boatramp
+  reads kTLS records with a plain `recv()`. Production TLS serving continues to use the userspace
+  multiplexed driver (which leads Envoy on the benchmark); kTLS+`splice` is retained as a validated,
+  owned primitive whose most favorable case (HTTP/1.1 large-body TLS proxying) is future work.
 
 ## [0.2.14] - 2026-08-20
 

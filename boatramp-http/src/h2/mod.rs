@@ -30,6 +30,11 @@ pub mod settings;
 pub mod stream;
 mod wire;
 
+// First-party kTLS handoff (Linux) — replaces the `ktls` crate, which cannot build on
+// musl. Only reachable through `serve_connection_ktls`, so it is Linux-gated with it.
+#[cfg(target_os = "linux")]
+mod ktls;
+
 // The serving types (`Body`/`Handler`/`Request`/`Response`) live at the crate root now
 // (shared with the h1 codec); the h2 driver's `http` module re-exports them plus its
 // own request-decode helper.

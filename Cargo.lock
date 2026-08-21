@@ -1781,7 +1781,6 @@ dependencies = [
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
- "ktls",
  "libc",
  "proptest",
  "rustls 0.23.40",
@@ -5704,33 +5703,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ktls"
-version = "6.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5b79b6ec9c9d56656298df28f92dbaf2e83816be6d12c5b896461087e52d701"
-dependencies = [
- "futures-util",
- "ktls-sys",
- "libc",
- "memoffset",
- "nix 0.29.0",
- "num_enum",
- "pin-project-lite",
- "rustls 0.23.40",
- "smallvec",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls 0.26.4",
- "tracing",
-]
-
-[[package]]
-name = "ktls-sys"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed84c81d133bc00e291085cff51c15cb07d3cede0aade1f2d82dd33df82d7e7"
-
-[[package]]
 name = "kube"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6542,7 +6514,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]
@@ -6707,28 +6678,6 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
-]
-
-[[package]]
-name = "num_enum"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
-dependencies = [
- "num_enum_derive",
- "rustversion",
-]
-
-[[package]]
-name = "num_enum_derive"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

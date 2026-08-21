@@ -117,6 +117,15 @@ jobs:
       - name: Flake check
         run: nix flake check --print-build-logs --max-jobs 1 --cores 2
 
+      # Build the exact Linux release artifact — the fully-static musl + jemalloc
+      # binary the release ships. The per-push CI compiles glibc only, so a
+      # musl-only breakage (e.g. a dependency that constructs `cmsghdr`/`msghdr`
+      # with struct literals that omit musl's private fields) sails through every
+      # green gate and only surfaces at release time. Building it here — before the
+      # release tag — closes that gap. Cached via the shared closure above.
+      - name: Build static musl release artifact
+        run: nix build .#boatramp-static --print-build-logs --max-jobs 1 --cores 2
+
   k8s-e2e:
     name: operator e2e (kind)
     runs-on: ubuntu-latest

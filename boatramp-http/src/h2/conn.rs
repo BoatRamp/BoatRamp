@@ -771,16 +771,14 @@ where
 {
     tcp.set_nodelay(true).ok();
     // CorkStream makes rustls read one TLS record at a time so the handshake ends on
-    // a record boundary — a prerequisite for the kTLS handoff.
-    let tls = acceptor.accept(ktls::CorkStream::new(tcp)).await?;
-    let kstream = ktls::config_ktls_server(tls)
-        .await
-        .map_err(|e| std::io::Error::other(format!("ktls: {e}")))?;
-    // Reclaim the owned TcpStream + any plaintext rustls drained before kTLS took over
-    // the socket (a raw recv() would otherwise miss those bytes). `config_ktls_server`
-    // unwraps the CorkStream, so `into_raw` yields the bare TcpStream.
-    let (drained, sock) = kstream.into_raw();
-    let sock = crate::h2::wire::Socket::new(sock, drained.unwrap_or_default())?;
+    // a record boundary — a prerequisite for the kTLS handoff (first-party, musl-safe).
+    let tls = acceptor
+        .accept(crate::h2::ktls::CorkStream::new(tcp))
+        .await?;
+    // Reclaim the owned TcpStream (now a kTLS socket) + any plaintext rustls drained
+    // before the handoff — a raw recv() would otherwise miss those bytes.
+    let (sock, drained) = crate::h2::ktls::config_ktls_server(tls).await?;
+    let sock = crate::h2::wire::Socket::new(sock, drained)?;
     let mut wire: Wire<tokio::net::TcpStream> = Wire::Socket(sock);
     serve_connection_wire(&mut wire, handler).await
 }
