@@ -53,7 +53,7 @@ impl Handler for RouterHandler {
         // axum body (cheap, ref-counted) and attach the peer as `ConnectInfo` (IP
         // rules / rate limiting / access logs). Method / URI / headers pass through
         // untouched — no rebuild.
-        let mut request = req.map(axum::body::Body::from);
+        let mut request = req.map(axum::body::Body::new);
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(self.peer));

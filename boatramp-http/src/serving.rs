@@ -136,6 +136,17 @@ pub type Response = http::Response<Body>;
 #[derive(Debug, Clone, Default)]
 pub struct BodyError;
 
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request/response body source failed mid-stream")
+    }
+}
+
+// `std::error::Error` (with the `Display` above) lets `ReqBody` satisfy `http_body::Body`
+// consumers that require `Error: Into<Box<dyn Error>>` — e.g. `axum::body::Body::new`,
+// which the router bridge uses to hand a streamed request body to the axum Router.
+impl std::error::Error for BodyError {}
+
 /// A single streamed body chunk, or a mid-stream source failure ([`BodyError`]).
 pub type BodyChunk = Result<Bytes, BodyError>;
 
