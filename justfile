@@ -249,6 +249,9 @@ bump-version version:
     # The internal path-dep pins, anchored on the boatramp path so no external dep
     # is touched.
     perl -i -pe 's/(boatramp-[a-z]+ = \{ path = "crates\/boatramp-[a-z]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
+    # boatramp-http lives at the repo root (not under crates/), so it needs its own
+    # pin substitution — the crates/-anchored line above skips it.
+    perl -i -pe 's/(boatramp-http = \{ path = "boatramp-http", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
     # The workspace-excluded console crate (its own manifest + lockfile).
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' crates/boatramp-console/Cargo.toml
     # Refresh the lockfiles' workspace-member versions.

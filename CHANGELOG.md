@@ -7,6 +7,48 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-08-21
+
+### Changed
+- **The HTTP serving path is now boatramp's own stack (`boatramp-http`); hyper leaves the
+  serving side.** Every listener — plaintext, TLS, cluster, ACME `acme-tls/1` — now serves each
+  accepted connection through `boatramp_http::serve_connection`, a unified dispatcher that sniffs
+  the connection preface and routes it to a hand-rolled **HTTP/1.1 codec** or a concurrent,
+  multiplexed **HTTP/2 driver** (reader + per-stream handler + writer tasks, two-tier flow
+  control). HTTP/1.1 `Upgrade` (including WebSocket) and HTTP/2 are handled natively; hyper is no
+  longer in the accept path. It stays as the reverse-proxy **client**, the wasi outbound client,
+  and the local function-invoke server. The motivation is control the framework hid — vectored
+  writes to rustls, a kernel-`splice()` body seam, and per-request allocation — not a rewrite for
+  its own sake, and the cutover is behaviour-preserving: the same routing, TLS (ALPN-based
+  h2/h1 selection), and control-plane surface as before.
+- **Conformance is a hard gate, not a hope.** The HTTP/2 driver is built red→green against
+  **h2spec** (RFC 7540 + RFC 7541), a **differential oracle** (identical request streams replayed
+  through this server and a reference `hyper`/`h2` server, asserting byte-identical responses), and
+  **`cargo-fuzz`** on the frame + HPACK parsers (panic-free, hang-free, no desync). The production
+  (mux) driver runs h2spec at **144 passed / 1 skipped / 0 failed** — the lone skip (driving a
+  stream's flow-control window negative via SETTINGS) is a case h2spec declines to run against a
+  server that completes responses promptly. Building this surfaced and fixed real bugs: a graceful
+  connection close (clean `FIN`, never a `RST` that h2spec §3.5/§3.8 rejects), advertising and
+  enforcing the 256 `SETTINGS_MAX_CONCURRENT_STREAMS` cap, dropping connection-specific response
+  headers at the codec (§8.1.2.2), and CONTINUATION-flood / Rapid-Reset mitigations.
+- **On the fair 5-way benchmark the own-stack proxy matches or beats Envoy on HTTP/2-over-TLS.**
+  Core-pinned on the Linux rig, the 100 KB TLS reverse-proxy cell (`tls-proxy-h2-100k`) runs at
+  **~47k req/s c64, ~43k c128, ~37k c256 — level with Envoy at c64, ahead at c128, level at c256**,
+  with byte-identical response bodies (md5-checked against the upstream). A regression found during
+  the cutover — `Rewind` broke vectored writes on the TLS path, costing ~25–30% — was fixed by
+  routing TLS by ALPN and bypassing the sniff.
+
+### Added
+- **`boatramp-http` is now a published workspace crate with its own first-party HPACK codec
+  (RFC 7541).** The HTTP serving stack ships as a real crate on crates.io rather than an internal
+  path dependency. Its HPACK implementation — static + dynamic tables, Huffman coding,
+  integer/string coding, fail-closed decoding (any malformed field is a connection
+  `COMPRESSION_ERROR`) — is boatramp's own code with **no external HPACK dependency and no
+  `[patch]`**, replacing the earlier forked `fluke-hpack`. The performance property that motivated
+  the fork is preserved directly: the Huffman decode table is a flat trie built **once** via
+  `OnceLock` and shared process-wide, instead of rebuilt per header string; the owned codec holds
+  the ~9% HPACK throughput win to within benchmark noise.
+
 ## [0.2.14] - 2026-08-20
 
 ### Added
