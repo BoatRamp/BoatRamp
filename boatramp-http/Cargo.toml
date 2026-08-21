@@ -1,0 +1,31 @@
+[package]
+name = "boatramp-http"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "BoatRamp's owned HTTP serving stack: one accept loop over hand-rolled h1 + h2 codecs, with kTLS/splice reverse-proxy body fast-paths hyper can't do."
+repository = "https://github.com/BoatRamp/BoatRamp"
+publish = false # flip once the h1 safety gate (differential + smuggling + fuzz) is green
+
+# The unified stack: shared serving types at the crate root, protocol codecs as `h1`
+# and `h2` modules (the existing boatramp-h2 mux driver folds into `h2`), and a `serve`
+# dispatcher (ALPN / h2c sniff). The h1 request parser is the smuggling-critical
+# surface, so it is built TEST-FIRST: the `tests/` harness — differential-vs-hyper, a
+# smuggling corpus, RFC 9112 conformance, fuzzing — lands and is wired BEFORE the parser,
+# which is only promoted once the harness is green. See ../boatramp-h2/DESIGN-serving.md.
+[dependencies]
+# Requests/responses are the standard `http` crate types (Method/Uri/HeaderMap).
+http = "1"
+bytes = "1"
+
+[dev-dependencies]
+# hyper's HTTP/1 server is the DIFFERENTIAL ORACLE for the h1 codec: identical raw byte
+# streams are fed to boatramp-http and to hyper, and the two must agree on how the stream
+# splits into messages (or both reject) — a boundary disagreement is a smuggling bug.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+# Randomized parser fuzzing (panic-free + never-desync), the stable-CI analogue of the
+# cargo-fuzz target that caught a real HPACK panic in the h2 codec.
+proptest = "1"

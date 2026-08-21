@@ -72,18 +72,21 @@ fold-in to the h2 graduation.
   chunked/CL decoding. Large POST/upload bodies must *stream* to the upstream, not
   buffer — mirror the response-side backpressure.
 
-### Service abstraction — **recommend: native `tower::Service`**
+### Service abstraction — **LOCKED: native `tower::Service`**
 The current mux `Handler` trait + `RouterHandler` bridge exists only because the driver
-predates this unification. Recommend the codecs invoke a
+predates this unification. The codecs invoke a
 `tower::Service<http::Request<ReqBody>, Response = http::Response<Body>>` directly, so
 the **axum Router plugs in with no bridge** (hyper's exact shape). One adapter deleted,
-one fewer request/response copy. `Handler` can remain as a thin convenience for embedders.
+one fewer request/response copy. `Handler` may remain as a thin convenience for embedders.
 
-### Crate layout — **recommend: `boatramp-http` (types + serve) + `boatramp-h1` + keep the h2 codec**
-- `boatramp-http`: the common `Request`/`Response`/`Body`/`ReqBody`/limits + the
+### Crate layout — **LOCKED: one `boatramp-http` crate; protocols are modules**
+No separate `boatramp-h1`/`boatramp-h2` codec crates — that would re-create the split we
+are removing, with no upside (nobody depends on one protocol codec in isolation; the
+*serving* is the product). One crate:
+- `boatramp-http` (root): shared `Request`/`Response`/`Body`/`ReqBody`/limits + the
   `serve_connection` dispatcher + the splice/kTLS wire helpers.
-- The existing h2 mux driver + the new h1 codec are codecs over `boatramp-http`.
-- `boatramp-h2` (workspace-excluded spike) folds into this on graduation.
+- `boatramp_http::h1` — the HTTP/1.1 codec (built here, test-first).
+- `boatramp_http::h2` — the current `boatramp-h2` mux driver, folded in (Stage 1).
 
 ## The h1 codec + its safety gate (the crux)
 
@@ -132,11 +135,12 @@ a clean fall-through to the userspace h1 path.
 ## Migration (each stage independently green + gated; behavior-preserving until flipped)
 
 0. **h2 graduation onto the interim seam is *paused*** in favor of landing on this base.
-1. **Extract** the common types into `boatramp-http`; the h2 mux driver depends on it.
-   Pure refactor, h2spec still 143/143.
-2. **Build `boatramp-h1` userspace codec + the full safety gate** (differential +
-   smuggling + fuzz). No kTLS yet. It does *not* serve production traffic until the gate
-   is green.
+1. **Fold** the current `boatramp-h2` code into `boatramp_http::h2` and lift the shared
+   `Request`/`Response`/`Body` types to the crate root. Pure refactor, h2spec still 143/143.
+2. **Build the `boatramp_http::h1` userspace codec + the full safety gate** (differential +
+   smuggling + fuzz). No kTLS yet. **The harness lands first and stays red until the codec
+   is green** (done: `boatramp-http/tests/{conformance,smuggling,differential,fuzz_smoke}.rs`).
+   It does *not* serve production traffic until the gate is green.
 3. **Unified `serve_connection`** (ALPN + h2c sniff → h1/h2), fold `splice.rs` in-loop,
    and route every TLS mode (custom / ACME / ACME-DNS / RPK) **and** the plaintext path
    through it. Remove the `h2-mux` feature + `BOATRAMP_H2_MUX` env gate — one codec set,
@@ -156,13 +160,14 @@ breaks. Verify against a Pebble test CA before flipping the ACME mode.
 4. **Maintenance** — a second forever-owned codec.
 5. **Scope** — multi-session; larger than the h2 graduation it replaces.
 
-## Open decisions (need a call before Stage 1)
-1. **Service abstraction:** native `tower::Service` (recommended, deletes the bridge) vs
-   keep the `Handler` trait + adapter?
-2. **Crate layout:** `boatramp-http` + `boatramp-h1` + fold in the h2 codec
-   (recommended) vs keep `boatramp-h2` standalone + a thin serving crate?
-3. **kTLS timing:** design/land the userspace unified codec first (Stages 1-3), kTLS as
-   Stage 4 (recommended) vs bring kTLS forward?
-4. **Safety bar for promotion:** is "differential-vs-hyper green + smuggling corpus green
-   + fuzz clean" sufficient to let boatramp-h1 serve production, or do you want a soak /
-   staged rollout behind a per-site opt-in first?
+## Decisions (locked)
+1. **Service abstraction:** native `tower::Service` — the axum Router plugs in with no
+   bridge.
+2. **Crate layout:** one `boatramp-http` crate; `h1`/`h2` are modules (no separate codec
+   crates).
+3. **kTLS timing:** userspace unified codec first (Stages 1–3); kTLS is Stage 4.
+4. **Promotion → production, no side-by-side.** Once the safety gate is green
+   (differential-vs-hyper + smuggling corpus + fuzz), boatramp-http becomes *the* serving
+   path directly — no feature/env toggle, no per-site opt-in, no soak period. Which makes
+   the gate the whole ballgame: it must be strong enough that green ⇒ production-ready.
+   That is why the harness is built and reviewed first.

@@ -38,6 +38,7 @@ exclude = [
   "examples/compose/plugin",
   "crates/boatramp-console",
   "boatramp-h2",
+  "boatramp-http",
 ]
 
 [workspace.package]
