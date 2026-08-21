@@ -1,6 +1,7 @@
-//! End-to-end check of the `--tls rpk` **client** pinning path: a real
-//! `axum_server` listener presenting an RFC 7250 raw-public-key identity, reached
-//! by a `reqwest` client configured exactly like `client::http_client` does when
+//! End-to-end check of the `--tls rpk` **client** pinning path: a real listener —
+//! served through boatramp's own TLS stack (`serve_tls_listener`) exactly as
+//! `--tls rpk` does — presenting an RFC 7250 raw-public-key identity, reached by a
+//! `reqwest` client configured exactly like `client::http_client` does when
 //! `BOATRAMP_SERVER_PUBKEY` is set — `use_preconfigured_tls(client_config_server_auth(pin))`.
 //! Confirms the correct pin connects and a wrong pin fails the handshake.
 #![cfg(feature = "tls")]
@@ -17,20 +18,23 @@ async fn spawn_rpk_server() -> (std::net::SocketAddr, Vec<u8>) {
     let identity = RpkIdentity::generate().unwrap();
     let spki = identity.public_key().to_vec();
     let rpk = RpkTls::new(Arc::new(identity), TrustSet::default());
-    let config =
-        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rpk.server_auth().unwrap()));
+    let mut config = rpk.server_auth().unwrap();
+    config.alpn_protocols = boatramp_server::alpn_h1_h2();
 
     let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }));
-    let handle = axum_server::Handle::new();
-    let serve_handle = handle.clone();
+    // Bind first so the ephemeral port is known, then serve through the same stack
+    // `serve_rpk` uses (no hyper / axum_server on the serving path).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
-            .handle(serve_handle)
-            .serve(app.into_make_service())
-            .await;
+        let _ = boatramp_server::serve_tls_listener(
+            listener,
+            config.into(),
+            app,
+            std::future::pending::<()>(),
+        )
+        .await;
     });
-    // `listening()` resolves once the socket is bound — no sleep race.
-    let addr = handle.listening().await.expect("server bound");
     (addr, spki)
 }
 

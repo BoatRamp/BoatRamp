@@ -14,11 +14,6 @@ repository.workspace = true
 description = "boatramp HTTP server + API library (streaming static-site publishing)"
 
 [features]
-# Transitional: boatramp-http (the hand-rolled h1+h2 serving stack) is now a
-# non-optional dependency — it is becoming *the* serving path, replacing hyper/axum_server.
-# This feature is being removed; it currently only gates the old mux_serve bridge while
-# the cutover lands.
-h2-mux = []
 # WebAssembly handler dispatch in the serving pipeline. Heavy
 # (pulls the wasmtime engine via boatramp-handlers); off by default so the
 # static server stays lean. The CLI enables it through its own `handlers` flag.
@@ -158,6 +153,9 @@ h3-quinn = { version = "0.0.10", optional = true }
 # it is already compiled in the base build via reqwest, so this adds negligible weight.
 # The `http3` feature reuses it for the QUIC crypto config.
 rustls = { version = "0.23", features = ["ring"] }
+# Lock-free hot-swap of the served rustls `ServerConfig` (ACME cert renewal swaps
+# the cert live under the TLS accept loop — the same primitive axum_server used).
+arc-swap = "1"
 # TLS client for the gateway's `wss`/`https` WebSocket-upgrade upstreams (HS-2).
 tokio-rustls = { version = "0.26", default-features = false, features = [
   "ring",

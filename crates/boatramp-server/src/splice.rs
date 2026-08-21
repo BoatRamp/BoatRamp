@@ -181,34 +181,17 @@ impl tokio::io::AsyncWrite for Rewind {
     }
 }
 
-/// Serve one non-spliced connection with the normal axum `router` over hyper HTTP/1
-/// — the same primitive `axum::serve` uses — injecting the peer as
-/// `ConnectInfo<SocketAddr>` (which handlers read for IP rules / rate limiting /
-/// access logs) and enabling upgrades (WebSocket handler routes). Generic over the
-/// IO so a [`Rewind`] (mid-connection fallback) serves identically to a raw socket.
+/// Serve one non-spliced connection with the normal axum `router` through the
+/// unified [`boatramp_http`] dispatcher (h1, or h2c via the preface sniff) —
+/// injecting the peer as `ConnectInfo<SocketAddr>` (which handlers read for IP
+/// rules / rate limiting / access logs) and owning HTTP upgrades (WebSocket handler
+/// routes). Generic over the IO so a [`Rewind`] (mid-connection fallback) serves
+/// identically to a raw socket.
 async fn serve_fallback<IO>(io: IO, peer: SocketAddr, router: axum::Router)
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let io = hyper_util::rt::TokioIo::new(io);
-    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-        req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(peer));
-        let mut router = router.clone();
-        async move {
-            // Call the router as a tower service. axum's Router is always ready, so
-            // no `poll_ready` gate is needed; `call` disambiguates via the request type.
-            use tower_service::Service as _;
-            router.call(req).await
-        }
-    });
-    if let Err(err) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc)
-        .with_upgrades()
-        .await
-    {
-        tracing::debug!(%peer, %err, "connection served with error");
-    }
+    crate::http_serve::serve_router_conn(io, peer, router).await;
 }
 
 /// Replay `head` + `leftover` (already consumed off `client`) and serve the rest of

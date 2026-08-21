@@ -133,7 +133,7 @@ pub enum Error {
     /// The HTTP server exited with an error.
     #[error(transparent)]
     Serve(#[from] boatramp_server::ServeError),
-    /// A listener-bind / filesystem / axum-server I/O error on the serve path.
+    /// A listener-bind / filesystem / TLS-accept I/O error on the serve path.
     #[cfg(any(feature = "tls", feature = "cluster"))]
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -853,8 +853,8 @@ fn spawn_sighup_reload(
 /// domain-ownership challenge, which it serves directly so an unattached host
 /// can verify itself over plain `:80` before it has a cert. Fire and forget: it
 /// dies with the process; bind failures are logged, not fatal, so a missing
-/// privilege on `:80` doesn't take down the HTTPS server. Uses `axum_server`
-/// (the same plain/TLS server stack the TLS modes use).
+/// privilege on `:80` doesn't take down the HTTPS server. Served through the same
+/// unified `boatramp-http` stack the TLS modes use (no hyper/`axum_server`).
 #[cfg(feature = "tls")]
 fn spawn_http_redirect(
     addr: SocketAddr,
@@ -863,8 +863,10 @@ fn spawn_http_redirect(
 ) {
     tokio::spawn(async move {
         tracing::info!(%addr, "serving HTTP→HTTPS redirect listener");
-        let service = boatramp_server::http_redirect_router(deploy, posture).into_make_service();
-        if let Err(err) = axum_server::bind(addr).serve(service).await {
+        let router = boatramp_server::http_redirect_router(deploy, posture);
+        if let Err(err) =
+            boatramp_server::serve_plaintext(addr, router, boatramp_server::shutdown_signal()).await
+        {
             tracing::error!(%addr, %err, "HTTP redirect listener failed");
         }
     });
@@ -1439,18 +1441,21 @@ async fn run_cluster(
         >(Some(authz))),
         None => node.router.clone(),
     };
-    let mesh_config =
-        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(mesh_tls.server()?));
+    let mut mesh_config = mesh_tls.server()?;
+    mesh_config.alpn_protocols = boatramp_server::alpn_h1_h2();
     let listen = cluster_cfg.listen;
     tracing::info!(
         node_id, %listen,
         "cluster: serving peer mesh (mutual TLS)"
     );
     tokio::spawn(async move {
-        if let Err(err) = axum_server::bind(listen)
-            .acceptor(nodelay_rustls(mesh_config))
-            .serve(mesh_router.into_make_service())
-            .await
+        if let Err(err) = boatramp_server::serve_tls(
+            listen,
+            mesh_config.into(),
+            mesh_router,
+            boatramp_server::shutdown_signal(),
+        )
+        .await
         {
             tracing::error!(%err, "cluster: peer mesh server exited");
         }
@@ -1716,7 +1721,7 @@ async fn serve_cluster_acme_dns(
     };
     #[cfg(not(feature = "http3"))]
     let config = crate::acme_dns::build_server_config(entries)?;
-    let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+    let tls = boatramp_server::ReloadableTls::new(config);
 
     // Background renewal: re-run the leader-gated pass and hot-swap (TCP + h3).
     {
@@ -1749,7 +1754,7 @@ async fn serve_cluster_acme_dns(
                         if let Some(endpoint) = &h3_renew {
                             match crate::acme_dns::build_server_configs(entries) {
                                 Ok((tcp, h3)) => {
-                                    tls.reload_from_config(Arc::new(tcp));
+                                    tls.reload(tcp);
                                     match boatramp_server::quinn_server_config(h3) {
                                         Ok(qc) => endpoint.set_server_config(Some(qc)),
                                         Err(err) => {
@@ -1763,7 +1768,7 @@ async fn serve_cluster_acme_dns(
                             }
                         } else {
                             match crate::acme_dns::build_server_config(entries) {
-                                Ok(config) => tls.reload_from_config(Arc::new(config)),
+                                Ok(config) => tls.reload(config),
                                 Err(err) => {
                                     tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
                                 }
@@ -1771,7 +1776,7 @@ async fn serve_cluster_acme_dns(
                         }
                         #[cfg(not(feature = "http3"))]
                         match crate::acme_dns::build_server_config(entries) {
-                            Ok(config) => tls.reload_from_config(Arc::new(config)),
+                            Ok(config) => tls.reload(config),
                             Err(err) => {
                                 tracing::error!(%err, "cluster acme-dns: rebuilding TLS config failed");
                             }
@@ -1787,7 +1792,6 @@ async fn serve_cluster_acme_dns(
     tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let handle = spawn_tls_shutdown();
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
     // Serve h3 over the QUIC endpoint + advertise it on the HTTPS responses.
     #[cfg(feature = "http3")]
@@ -1802,13 +1806,7 @@ async fn serve_cluster_acme_dns(
     } else {
         app
     };
-    let mut server = axum_server::bind(addr)
-        .acceptor(nodelay_rustls(tls))
-        .handle(handle);
-    tune_h2(&mut server);
-    server
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    boatramp_server::serve_tls(addr, tls, app, boatramp_server::shutdown_signal()).await?;
     Ok(())
 }
 
@@ -1912,7 +1910,7 @@ async fn serve_acme_dns(
     };
     #[cfg(not(feature = "http3"))]
     let config = crate::acme_dns::build_server_config(entries)?;
-    let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+    let tls = boatramp_server::ReloadableTls::new(config);
 
     // Background renewal: re-load (reissuing any near-expiry cert) and hot-swap
     // the served config (TCP + h3), so the process never needs a restart to renew.
@@ -1931,7 +1929,7 @@ async fn serve_acme_dns(
                         if let Some(endpoint) = &h3_renew {
                             match crate::acme_dns::build_server_configs(entries) {
                                 Ok((tcp, h3)) => {
-                                    tls.reload_from_config(Arc::new(tcp));
+                                    tls.reload(tcp);
                                     match boatramp_server::quinn_server_config(h3) {
                                         Ok(qc) => endpoint.set_server_config(Some(qc)),
                                         Err(err) => {
@@ -1945,7 +1943,7 @@ async fn serve_acme_dns(
                             }
                         } else {
                             match crate::acme_dns::build_server_config(entries) {
-                                Ok(config) => tls.reload_from_config(Arc::new(config)),
+                                Ok(config) => tls.reload(config),
                                 Err(err) => {
                                     tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                                 }
@@ -1953,7 +1951,7 @@ async fn serve_acme_dns(
                         }
                         #[cfg(not(feature = "http3"))]
                         match crate::acme_dns::build_server_config(entries) {
-                            Ok(config) => tls.reload_from_config(Arc::new(config)),
+                            Ok(config) => tls.reload(config),
                             Err(err) => {
                                 tracing::error!(%err, "acme-dns: rebuilding TLS config failed");
                             }
@@ -1971,7 +1969,6 @@ async fn serve_acme_dns(
     // handle detaches for the server's lifetime.
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let handle = spawn_tls_shutdown();
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
     #[cfg(feature = "http3")]
     let app = if let Some(endpoint) = h3_endpoint {
@@ -1985,13 +1982,7 @@ async fn serve_acme_dns(
     } else {
         app
     };
-    let mut server = axum_server::bind(addr)
-        .acceptor(nodelay_rustls(tls))
-        .handle(handle);
-    tune_h2(&mut server);
-    server
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    boatramp_server::serve_tls(addr, tls, app, boatramp_server::shutdown_signal()).await?;
     Ok(())
 }
 
@@ -2076,38 +2067,6 @@ async fn configure_oidc(
     Ok(())
 }
 
-/// A rustls TLS acceptor that sets `TCP_NODELAY` on the accepted TCP stream before
-/// the handshake. `axum_server`'s default acceptor leaves Nagle's algorithm on,
-/// which stalls small responses on keep-alive TLS connections ~40 ms via delayed
-/// ACKs (measurably: ~6k rps / p50 42 ms vs ~84k / 2.5 ms with it off). The
-/// plaintext `axum::serve` path avoids this via `tap_io`; this is its TLS analogue,
-/// used by every `axum_server` HTTPS listener below.
-#[cfg(feature = "tls")]
-fn nodelay_rustls(
-    config: axum_server::tls_rustls::RustlsConfig,
-) -> axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor> {
-    axum_server::tls_rustls::RustlsAcceptor::new(config)
-        .acceptor(axum_server::accept::NoDelayAcceptor::new())
-}
-
-/// Cap inbound HTTP/2 concurrent streams per connection: bounds worst-case
-/// per-connection memory and is the standard HTTP/2 rapid-reset / CVE-2023-44487
-/// mitigation. 256 is well above any legitimate multiplexing need, so normal
-/// traffic is unaffected. Applied to every `axum_server` HTTPS listener — HTTP/2
-/// is negotiated over TLS/ALPN, so this is the only path where it takes effect
-/// (the plaintext `axum::serve` path is HTTP/1 behind Fly/Cloudflare).
-///
-/// We deliberately leave `max_send_buf_size` at hyper's 400 KB default: trimming it
-/// bought no memory (the proxy-path resident set is the *upstream* leg, capped via
-/// the client's `http1_max_buf_size`), and a smaller send buffer throttles *streamed*
-/// proxy responses over H2 — back-pressuring the upstream pull in small increments.
-/// The flow-control windows likewise stay at the 1 MB default (a credit counter, not
-/// a preallocation) so WAN download throughput is unaffected.
-#[cfg(feature = "tls")]
-fn tune_h2<Acc>(server: &mut axum_server::Server<SocketAddr, Acc>) {
-    server.http_builder().http2().max_concurrent_streams(256u32);
-}
-
 #[cfg(feature = "tls")]
 async fn serve_custom(
     args: &ServeArgs,
@@ -2121,14 +2080,17 @@ async fn serve_custom(
     let cert = args.tls_cert.clone().ok_or(Error::TlsCertRequired)?;
     let key = args.tls_key.clone().ok_or(Error::TlsKeyRequired)?;
 
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
+    let (certs, private_key) = load_cert_chain_and_key(&cert, &key)?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)?;
+    config.alpn_protocols = boatramp_server::alpn_h1_h2();
     tracing::info!(%addr, "serving HTTPS (custom certificate)");
     // Background scheduler (consumers/crons) — must run under TLS too, not only
     // `--tls off`; in cluster mode its cron tick is gated on `is_leader`. The
     // handle detaches for the server's lifetime.
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let handle = spawn_tls_shutdown();
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
 
     // Optionally serve HTTP/3 on the same UDP port, feeding the same router, and
@@ -2148,43 +2110,14 @@ async fn serve_custom(
         app
     };
 
-    // Opt-in HTTP/2 fast-path: serve h2 connections with boatramp-http's h2 concurrent
-    // multiplexed driver (beats hyper/Envoy on tls-proxy-h2), h1 falls back to hyper.
-    // Experimental; enabled per-listener by BOATRAMP_H2_MUX at runtime.
-    #[cfg(feature = "h2-mux")]
-    if std::env::var_os("BOATRAMP_H2_MUX").is_some() {
-        let (certs, private_key) = load_cert_chain_and_key(&cert, &key)?;
-        boatramp_server::serve_tls_mux(addr, certs, private_key, app, shutdown_signal()).await?;
-        return Ok(());
-    }
-
-    let mut server = axum_server::bind(addr)
-        .acceptor(nodelay_rustls(config))
-        .handle(handle);
-    tune_h2(&mut server);
-    server
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    boatramp_server::serve_tls(
+        addr,
+        config.into(),
+        app,
+        boatramp_server::shutdown_signal(),
+    )
+    .await?;
     Ok(())
-}
-
-/// A shutdown future for the manual `h2-mux` serve loop: resolves on SIGINT or
-/// (unix) SIGTERM.
-#[cfg(feature = "h2-mux")]
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 /// Serve the control-plane over **RFC 7250 raw-public-key TLS** (`--tls rpk`):
@@ -2246,7 +2179,8 @@ async fn serve_rpk(
     // a client cert (that is the mutual-`cnf` binding of a later stage).
     let rpk =
         boatramp_rpktls::RpkTls::new(Arc::new(identity), boatramp_rpktls::TrustSet::default());
-    let config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(rpk.server_auth()?));
+    let mut config = rpk.server_auth()?;
+    config.alpn_protocols = boatramp_server::alpn_h1_h2();
 
     tracing::info!(%addr, pubkey = %fingerprint, "serving HTTPS (RPK bootstrap TLS)");
     // The identity is public (not a secret); print it so the operator can copy it
@@ -2257,20 +2191,20 @@ async fn serve_rpk(
 
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let handle = spawn_tls_shutdown();
     let app = boatramp_server::router_with(deploy, auth, handlers, options);
-    let mut server = axum_server::bind(addr)
-        .acceptor(nodelay_rustls(config))
-        .handle(handle);
-    tune_h2(&mut server);
-    server
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    boatramp_server::serve_tls(
+        addr,
+        config.into(),
+        app,
+        boatramp_server::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
-/// Load a PEM cert chain + private key as DER, for the HTTP/3 (quinn) listener.
-#[cfg(feature = "http3")]
+/// Load a PEM cert chain + private key as DER — for the rustls `ServerConfig`
+/// built by the custom-cert listener and (when enabled) the HTTP/3 (quinn) one.
+#[cfg(feature = "tls")]
 fn load_cert_chain_and_key(
     cert: &Path,
     key: &Path,
@@ -2318,7 +2252,17 @@ async fn serve_acme(
     }
 
     let mut state = config.state();
-    let acceptor = state.axum_acceptor(state.default_rustls_config());
+    // Build one rustls config off the ACME state's cert resolver, advertising both
+    // the serving ALPN (`h2`/`http/1.1`) and `acme-tls/1`. The resolver internally
+    // detects a TLS-ALPN-01 challenge ClientHello and serves the challenge cert;
+    // `serve_tls` recognizes the negotiated `acme-tls/1` and completes-then-drops
+    // that handshake, serving everything else as HTTP. One config, no separate
+    // acceptor — and no hyper.
+    let mut rustls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(state.resolver());
+    rustls_config.alpn_protocols = boatramp_server::alpn_h1_h2();
+    rustls_config.alpn_protocols.push(b"acme-tls/1".to_vec());
     tokio::spawn(async move {
         loop {
             match state.next().await {
@@ -2335,15 +2279,14 @@ async fn serve_acme(
     // handle detaches for the server's lifetime.
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let handle = spawn_tls_shutdown();
-    let mut server = axum_server::bind(addr).handle(handle).acceptor(acceptor);
-    tune_h2(&mut server);
-    server
-        .serve(
-            boatramp_server::router_with(deploy, auth, handlers, options)
-                .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
+    let app = boatramp_server::router_with(deploy, auth, handlers, options);
+    boatramp_server::serve_tls(
+        addr,
+        rustls_config.into(),
+        app,
+        boatramp_server::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2352,19 +2295,6 @@ async fn serve_acme(
 #[cfg(feature = "tls")]
 fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-}
-
-/// An `axum_server::Handle` that triggers graceful shutdown (10s drain) when a
-/// Ctrl-C / SIGTERM signal arrives, matching the plain-HTTP listener.
-#[cfg(feature = "tls")]
-fn spawn_tls_shutdown() -> axum_server::Handle<SocketAddr> {
-    let handle = axum_server::Handle::new();
-    let trigger = handle.clone();
-    tokio::spawn(async move {
-        boatramp_server::shutdown_signal().await;
-        trigger.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-    });
-    handle
 }
 
 /// Build a rustls client config that trusts an extra root CA (for a test ACME

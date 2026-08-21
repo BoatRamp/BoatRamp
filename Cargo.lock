@@ -1533,7 +1533,6 @@ version = "0.2.14"
 dependencies = [
  "async-trait",
  "axum",
- "axum-server",
  "base64 0.22.1",
  "boatramp-acme",
  "boatramp-cloudflare",
@@ -1848,6 +1847,7 @@ dependencies = [
 name = "boatramp-server"
 version = "0.2.14"
 dependencies = [
+ "arc-swap",
  "async-compression",
  "async-graphql",
  "async-graphql-parser",
@@ -9400,7 +9400,6 @@ dependencies = [
  "async-trait",
  "async-web-client",
  "aws-lc-rs",
- "axum-server",
  "base64 0.22.1",
  "blocking",
  "chrono",
@@ -9415,7 +9414,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "tower-service",
  "webpki-roots 1.0.7",
  "x509-parser",
 ]

@@ -363,11 +363,15 @@ fn sni_resolver(entries: Vec<(String, IssuedCert)>) -> Result<Arc<SniCertResolve
 }
 
 /// Build a rustls [`ServerConfig`](rustls::ServerConfig) that serves
-/// `entries` (`(SNI-pattern, cert)`) by SNI.
+/// `entries` (`(SNI-pattern, cert)`) by SNI, advertising ALPN `h2`/`http/1.1` so
+/// the serving stack negotiates HTTP/2 (the renewal path rebuilds through here, so
+/// a hot-swapped config keeps the same ALPN).
 pub fn build_server_config(entries: Vec<(String, IssuedCert)>) -> Result<rustls::ServerConfig> {
-    Ok(rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(sni_resolver(entries)?))
+        .with_cert_resolver(sni_resolver(entries)?);
+    config.alpn_protocols = boatramp_server::alpn_h1_h2();
+    Ok(config)
 }
 
 /// Build both the TCP rustls config **and** an HTTP/3-ready one (ALPN `h3`) from
@@ -382,9 +386,10 @@ pub fn build_server_configs(
     entries: Vec<(String, IssuedCert)>,
 ) -> Result<(rustls::ServerConfig, rustls::ServerConfig)> {
     let resolver = sni_resolver(entries)?;
-    let tcp = rustls::ServerConfig::builder()
+    let mut tcp = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver.clone());
+    tcp.alpn_protocols = boatramp_server::alpn_h1_h2();
     let mut h3 = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
@@ -403,9 +408,14 @@ mod tests {
         // (production installs it in `serve`); idempotent here.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // Empty entries → empty SNI resolver; we only assert the ALPN wiring (the
-        // h3 listener must advertise `h3`, the TCP one must not force it).
+        // TCP listener advertises h2+http/1.1 for the serve stack; the h3 listener
+        // advertises `h3`).
         let (tcp, h3) = build_server_configs(Vec::new()).unwrap();
-        assert!(tcp.alpn_protocols.is_empty(), "TCP config forces no ALPN");
+        assert_eq!(
+            tcp.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "TCP config advertises the serving ALPN"
+        );
         assert_eq!(
             h3.alpn_protocols,
             vec![b"h3".to_vec()],
