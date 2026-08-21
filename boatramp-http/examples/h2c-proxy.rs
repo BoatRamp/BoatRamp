@@ -8,7 +8,7 @@
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() {
-    linux::run().await
+    linux::run().await;
 }
 
 #[cfg(not(target_os = "linux"))]

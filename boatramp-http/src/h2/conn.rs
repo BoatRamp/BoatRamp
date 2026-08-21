@@ -775,7 +775,7 @@ where
     let tls = acceptor.accept(ktls::CorkStream::new(tcp)).await?;
     let kstream = ktls::config_ktls_server(tls)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("ktls: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("ktls: {e}")))?;
     // Reclaim the owned TcpStream + any plaintext rustls drained before kTLS took over
     // the socket (a raw recv() would otherwise miss those bytes). `config_ktls_server`
     // unwraps the CorkStream, so `into_raw` yields the bare TcpStream.

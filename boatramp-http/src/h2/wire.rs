@@ -31,7 +31,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
         match self {
             Self::Buffered(io) => io.read_exact(buf).await.map(|_| ()),
             #[cfg(target_os = "linux")]
-            Wire::Socket(s) => s.read_exact(buf).await,
+            Self::Socket(s) => s.read_exact(buf).await,
         }
     }
 
@@ -39,7 +39,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
         match self {
             Self::Buffered(io) => io.write_all(buf).await,
             #[cfg(target_os = "linux")]
-            Wire::Socket(s) => s.write_all(buf).await,
+            Self::Socket(s) => s.write_all(buf).await,
         }
     }
 
@@ -47,14 +47,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
         match self {
             Self::Buffered(io) => io.shutdown().await,
             #[cfg(target_os = "linux")]
-            Wire::Socket(s) => s.sock.shutdown().await,
+            Self::Socket(s) => s.sock.shutdown().await,
         }
     }
 
     /// Whether this connection can take the kernel splice body path.
     #[cfg(target_os = "linux")]
     pub fn can_splice(&self) -> bool {
-        matches!(self, Wire::Socket(_))
+        matches!(self, Self::Socket(_))
     }
 
     /// Send one DATA frame — `header` (its 9-byte frame header) plus `n` payload
@@ -72,8 +72,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
         n: usize,
     ) -> io::Result<()> {
         match self {
-            Wire::Socket(s) => s.splice_data_frame(upstream, header, n).await,
-            Wire::Buffered(_) => Err(io::Error::new(
+            Self::Socket(s) => s.splice_data_frame(upstream, header, n).await,
+            Self::Buffered(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "buffered wire cannot splice",
             )),
@@ -102,7 +102,7 @@ pub(crate) struct Socket {
 #[cfg(target_os = "linux")]
 impl Socket {
     pub fn new(sock: TcpStream, leftover: Vec<u8>) -> io::Result<Self> {
-        Ok(Socket {
+        Ok(Self {
             sock,
             leftover,
             lpos: 0,
@@ -270,7 +270,7 @@ impl Pipe {
         // (the default is 64 KiB). Best-effort: if the resize is refused the frame
         // ceiling still keeps us under the default, so we ignore the result.
         unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, PIPE_CAPACITY) };
-        Ok(Pipe {
+        Ok(Self {
             r: fds[0],
             w: fds[1],
         })

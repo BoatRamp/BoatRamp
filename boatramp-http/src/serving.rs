@@ -197,7 +197,7 @@ impl Body {
         match self {
             Self::Bytes(b) => b.len(),
             #[cfg(target_os = "linux")]
-            Body::Splice { len, .. } => *len,
+            Self::Splice { len, .. } => *len,
             Self::Stream(_) => 0,
         }
     }
@@ -205,7 +205,7 @@ impl Body {
         match self {
             Self::Bytes(b) => b.is_empty(),
             #[cfg(target_os = "linux")]
-            Body::Splice { len, .. } => *len == 0,
+            Self::Splice { len, .. } => *len == 0,
             Self::Stream(_) => false,
         }
     }
