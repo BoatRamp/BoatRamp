@@ -40,9 +40,9 @@ pub enum Framing {
 impl From<&BodyFraming> for Framing {
     fn from(f: &BodyFraming) -> Self {
         match f {
-            BodyFraming::Empty => Framing::Empty,
-            BodyFraming::Length(n) => Framing::Length(*n),
-            BodyFraming::Chunked => Framing::Chunked,
+            BodyFraming::Empty => Self::Empty,
+            BodyFraming::Length(n) => Self::Length(*n),
+            BodyFraming::Chunked => Self::Chunked,
         }
     }
 }

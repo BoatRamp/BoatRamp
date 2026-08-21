@@ -1,11 +1,11 @@
 [package]
 name = "boatramp-http"
-version = "0.0.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "BoatRamp's owned HTTP serving stack: one accept loop over hand-rolled h1 + h2 codecs, with kTLS/splice reverse-proxy body fast-paths hyper can't do."
 repository = "https://github.com/BoatRamp/BoatRamp"
-publish = false                                                                                                                                                      # flip once the h1 safety gate (differential + smuggling + fuzz) is green
 
 # The unified stack: shared serving types (`Request`/`Response`/`Body`/`Handler`) at the
 # crate root, protocol codecs as `h1` and `h2` modules (the `h2` mux driver was the
@@ -13,12 +13,15 @@ publish = false                                                                 
 # The h1 request parser is the smuggling-critical surface, built TEST-FIRST: its `tests/`
 # harness (differential-vs-hyper, a smuggling corpus, RFC 9112 conformance, fuzzing) landed
 # and is wired BEFORE the parser. See DESIGN-serving.md.
+[lints]
+workspace = true
+
 [dependencies]
 # Requests/responses are the standard `http` crate types (Method/Uri/HeaderMap).
 http = "1"
 bytes = "1"
-# The h2 codec: tokio IO + a pull `Stream` response body the driver polls directly, and
-# `fluke-hpack` (vendored, see [patch]) for HPACK.
+# The h2 codec: tokio IO + a pull `Stream` response body the driver polls directly.
+# HPACK (RFC 7541) is first-party — see `src/h2/hpack/`.
 tokio = { version = "1", features = [
   "io-util",
   "net",
@@ -28,7 +31,6 @@ tokio = { version = "1", features = [
   "sync",
 ] }
 tokio-stream = "0.1"
-fluke-hpack = "0.3"
 # A streamed request body (`ReqBody`) implements `http_body::Body`, so a reverse-proxy
 # bridge hands it to a tower/hyper service (the axum Router) — and on to the upstream —
 # without buffering the whole body.
@@ -64,11 +66,3 @@ h2 = "0.4"
 # Randomized parser fuzzing (panic-free + never-desync), the stable-CI analogue of the
 # cargo-fuzz targets.
 proptest = "1"
-
-# Vendored fluke-hpack with one fix: its HPACK decoder rebuilt a 257-symbol Huffman decode
-# table (a nested HashMap) for *every* Huffman-encoded header string, which profiled as the
-# top per-request userspace cost on the h2 proxy path. The vendored copy shares one
-# process-wide decoder (the table is immutable). Decode logic is otherwise identical, so
-# h2spec conformance is unchanged.
-[patch.crates-io]
-fluke-hpack = { path = "vendor/fluke-hpack" }

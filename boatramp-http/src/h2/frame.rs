@@ -27,17 +27,17 @@ pub enum FrameType {
 impl FrameType {
     pub fn as_u8(self) -> u8 {
         match self {
-            FrameType::Data => 0x0,
-            FrameType::Headers => 0x1,
-            FrameType::Priority => 0x2,
-            FrameType::RstStream => 0x3,
-            FrameType::Settings => 0x4,
-            FrameType::PushPromise => 0x5,
-            FrameType::Ping => 0x6,
-            FrameType::GoAway => 0x7,
-            FrameType::WindowUpdate => 0x8,
-            FrameType::Continuation => 0x9,
-            FrameType::Unknown(t) => t,
+            Self::Data => 0x0,
+            Self::Headers => 0x1,
+            Self::Priority => 0x2,
+            Self::RstStream => 0x3,
+            Self::Settings => 0x4,
+            Self::PushPromise => 0x5,
+            Self::Ping => 0x6,
+            Self::GoAway => 0x7,
+            Self::WindowUpdate => 0x8,
+            Self::Continuation => 0x9,
+            Self::Unknown(t) => t,
         }
     }
 }
@@ -45,17 +45,17 @@ impl FrameType {
 impl From<u8> for FrameType {
     fn from(t: u8) -> Self {
         match t {
-            0x0 => FrameType::Data,
-            0x1 => FrameType::Headers,
-            0x2 => FrameType::Priority,
-            0x3 => FrameType::RstStream,
-            0x4 => FrameType::Settings,
-            0x5 => FrameType::PushPromise,
-            0x6 => FrameType::Ping,
-            0x7 => FrameType::GoAway,
-            0x8 => FrameType::WindowUpdate,
-            0x9 => FrameType::Continuation,
-            other => FrameType::Unknown(other),
+            0x0 => Self::Data,
+            0x1 => Self::Headers,
+            0x2 => Self::Priority,
+            0x3 => Self::RstStream,
+            0x4 => Self::Settings,
+            0x5 => Self::PushPromise,
+            0x6 => Self::Ping,
+            0x7 => Self::GoAway,
+            0x8 => Self::WindowUpdate,
+            0x9 => Self::Continuation,
+            other => Self::Unknown(other),
         }
     }
 }
@@ -82,8 +82,8 @@ pub struct FrameHeader {
 impl FrameHeader {
     /// Parse the 9-byte header. Panics if `b.len() < 9` — callers read exactly
     /// [`FRAME_HEADER_LEN`] first.
-    pub fn parse(b: &[u8]) -> FrameHeader {
-        FrameHeader {
+    pub fn parse(b: &[u8]) -> Self {
+        Self {
             length: (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]),
             kind: FrameType::from(b[3]),
             flags: b[4],
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn header_roundtrips_and_masks_reserved_bit() {
         let h = FrameHeader {
-            length: 0x0123_45,
+            length: 0x01_23_45,
             kind: FrameType::Headers,
             flags: flag::END_HEADERS | flag::END_STREAM,
             stream_id: 0x0102_0304,

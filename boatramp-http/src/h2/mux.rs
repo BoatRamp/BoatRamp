@@ -106,7 +106,7 @@ struct MuxStream {
 
 impl MuxStream {
     fn new(peer_initial_window: i64) -> Self {
-        MuxStream {
+        Self {
             state: StreamState::Idle,
             send_window: peer_initial_window,
             outbox: VecDeque::new(),
@@ -267,7 +267,7 @@ where
         let mut payload = Vec::with_capacity(6);
         payload.extend_from_slice(&0x3u16.to_be_bytes()); // SETTINGS_MAX_CONCURRENT_STREAMS
         payload.extend_from_slice(&MAX_CONCURRENT_STREAMS.to_be_bytes());
-        frame::write_frame(out, FrameType::Settings, 0, 0, &payload)
+        frame::write_frame(out, FrameType::Settings, 0, 0, &payload);
     });
 
     let mut hpack = Hpack::new();
@@ -313,7 +313,7 @@ where
                     }
                 }
                 push_ctrl(shared, notify, |out| {
-                    out.extend_from_slice(&frame::rst_stream(id, code))
+                    out.extend_from_slice(&frame::rst_stream(id, code));
                 });
             }
         }
@@ -378,7 +378,7 @@ where
             let data = frame::parse_ping(&payload)?;
             if !header.has_flag(flag::ACK) {
                 push_ctrl(shared, notify, |out| {
-                    frame::write_frame(out, FrameType::Ping, flag::ACK, 0, &data)
+                    frame::write_frame(out, FrameType::Ping, flag::ACK, 0, &data);
                 });
             }
             Ok(true)
@@ -812,7 +812,7 @@ fn response_fields(
         b":status".to_vec(),
         parts.status.as_u16().to_string().into_bytes(),
     ));
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         // Drop connection-specific headers HTTP/2 forbids (§8.1.2.2): the shared
         // handler also serves h1, where an upstream `Connection`/`Transfer-Encoding`
         // is legal — framing them here would make an invalid h2 response.
@@ -865,7 +865,7 @@ fn reset_local(shared: &Conn, notify: &Arc<Notify>, sid: u32, code: ErrorCode) {
         }
     }
     push_ctrl(shared, notify, |out| {
-        out.extend_from_slice(&frame::rst_stream(sid, code))
+        out.extend_from_slice(&frame::rst_stream(sid, code));
     });
 }
 
@@ -943,7 +943,7 @@ struct Batch {
 
 impl Batch {
     fn new() -> Self {
-        Batch {
+        Self {
             scratch: Vec::with_capacity(16 * 1024),
             segs: Vec::with_capacity(64),
             len: 0,
@@ -1205,7 +1205,7 @@ fn push_ctrl<F: FnOnce(&mut Vec<u8>)>(shared: &Conn, notify: &Arc<Notify>, build
 
 fn goaway(shared: &Conn, notify: &Arc<Notify>, last: u32, code: ErrorCode) {
     push_ctrl(shared, notify, |out| {
-        out.extend_from_slice(&frame::goaway(last, code, &[]))
+        out.extend_from_slice(&frame::goaway(last, code, &[]));
     });
     let mut s = shared.lock().unwrap();
     s.reader_done = true;

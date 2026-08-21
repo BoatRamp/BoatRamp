@@ -28,7 +28,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
+        Self {
             header_table_size: DEFAULT_HEADER_TABLE_SIZE,
             enable_push: true,
             max_concurrent_streams: None,

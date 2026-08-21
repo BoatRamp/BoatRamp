@@ -29,7 +29,7 @@ pub(crate) enum Wire<IO> {
 impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         match self {
-            Wire::Buffered(io) => io.read_exact(buf).await.map(|_| ()),
+            Self::Buffered(io) => io.read_exact(buf).await.map(|_| ()),
             #[cfg(target_os = "linux")]
             Wire::Socket(s) => s.read_exact(buf).await,
         }
@@ -37,7 +37,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
 
     pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
-            Wire::Buffered(io) => io.write_all(buf).await,
+            Self::Buffered(io) => io.write_all(buf).await,
             #[cfg(target_os = "linux")]
             Wire::Socket(s) => s.write_all(buf).await,
         }
@@ -45,7 +45,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Wire<IO> {
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
         match self {
-            Wire::Buffered(io) => io.shutdown().await,
+            Self::Buffered(io) => io.shutdown().await,
             #[cfg(target_os = "linux")]
             Wire::Socket(s) => s.sock.shutdown().await,
         }

@@ -40,7 +40,10 @@ async fn get_roundtrips_through_the_reference_client() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(
-        response.headers().get("x-served-by").map(|v| v.as_bytes()),
+        response
+            .headers()
+            .get("x-served-by")
+            .map(http::HeaderValue::as_bytes),
         Some(&b"boatramp-h2"[..])
     );
 

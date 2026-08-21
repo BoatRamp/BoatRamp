@@ -330,7 +330,7 @@ fn resolve_framing(
                 codings.push(trim_ows(tok).to_ascii_lowercase());
             }
         }
-        if codings.iter().any(|c| c.is_empty()) {
+        if codings.iter().any(std::vec::Vec::is_empty) {
             return Err(Reject::BadTransferEncoding);
         }
         let chunked_count = codings
@@ -443,7 +443,7 @@ pub fn encode_response_head(status: u16, headers: &HeaderMap) -> Vec<u8> {
         .and_then(|s| s.canonical_reason())
         .unwrap_or("");
     let mut out = format!("HTTP/1.1 {status} {reason}\r\n").into_bytes();
-    for (name, value) in headers.iter() {
+    for (name, value) in headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value.as_bytes());
@@ -530,6 +530,9 @@ pub mod chunked {
 
     /// Walk a chunked body once, enforcing framing. When `collect` is `Some`, the chunk
     /// data is appended to it; returns `(collected, end_offset)`. `scan` passes `None`.
+    // The nested `Option` return is inherent: outer `None` = "need more bytes",
+    // inner `Option<Vec>` = "collecting vs scanning". A type alias would obscure it.
+    #[allow(clippy::type_complexity)]
     fn walk(
         buf: &[u8],
         mut collect: Option<Vec<u8>>,
@@ -668,7 +671,7 @@ pub mod chunked {
     /// Parse a chunk size: 1..=16 hex digits, no sign / `0x` prefix / other bytes.
     fn parse_chunk_size(bytes: &[u8]) -> Result<u64, Reject> {
         let bytes = trim_ows(bytes); // tolerate trailing OWS before the CRLF
-        if bytes.is_empty() || bytes.len() > 16 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+        if bytes.is_empty() || bytes.len() > 16 || !bytes.iter().all(u8::is_ascii_hexdigit) {
             return Err(Reject::BadChunk);
         }
         let s = std::str::from_utf8(bytes).map_err(|_| Reject::BadChunk)?;
@@ -687,7 +690,7 @@ pub mod chunked {
     /// Encode the terminating chunk: `0CRLF` + the trailer section + the final CRLF.
     pub fn encode_last(trailers: &HeaderMap) -> Vec<u8> {
         let mut out = b"0\r\n".to_vec();
-        for (name, value) in trailers.iter() {
+        for (name, value) in trailers {
             out.extend_from_slice(name.as_str().as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(value.as_bytes());

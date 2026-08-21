@@ -1772,14 +1772,18 @@ dependencies = [
 
 [[package]]
 name = "boatramp-http"
-version = "0.0.0"
+version = "0.2.14"
 dependencies = [
  "bytes",
- "fluke-hpack",
+ "h2 0.4.14",
  "http 1.4.2",
  "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
  "ktls",
  "libc",
+ "proptest",
  "rustls 0.23.40",
  "rustls-pemfile",
  "tokio",
@@ -3841,13 +3845,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "fluke-hpack"
-version = "0.3.1"
-dependencies = [
- "tracing",
 ]
 
 [[package]]

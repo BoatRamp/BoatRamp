@@ -27,21 +27,21 @@ impl ErrorCode {
     /// The wire value.
     pub fn code(self) -> u32 {
         match self {
-            ErrorCode::NoError => 0x0,
-            ErrorCode::ProtocolError => 0x1,
-            ErrorCode::InternalError => 0x2,
-            ErrorCode::FlowControlError => 0x3,
-            ErrorCode::SettingsTimeout => 0x4,
-            ErrorCode::StreamClosed => 0x5,
-            ErrorCode::FrameSizeError => 0x6,
-            ErrorCode::RefusedStream => 0x7,
-            ErrorCode::Cancel => 0x8,
-            ErrorCode::CompressionError => 0x9,
-            ErrorCode::ConnectError => 0xa,
-            ErrorCode::EnhanceYourCalm => 0xb,
-            ErrorCode::InadequateSecurity => 0xc,
-            ErrorCode::Http11Required => 0xd,
-            ErrorCode::Unknown(c) => c,
+            Self::NoError => 0x0,
+            Self::ProtocolError => 0x1,
+            Self::InternalError => 0x2,
+            Self::FlowControlError => 0x3,
+            Self::SettingsTimeout => 0x4,
+            Self::StreamClosed => 0x5,
+            Self::FrameSizeError => 0x6,
+            Self::RefusedStream => 0x7,
+            Self::Cancel => 0x8,
+            Self::CompressionError => 0x9,
+            Self::ConnectError => 0xa,
+            Self::EnhanceYourCalm => 0xb,
+            Self::InadequateSecurity => 0xc,
+            Self::Http11Required => 0xd,
+            Self::Unknown(c) => c,
         }
     }
 }
@@ -49,21 +49,21 @@ impl ErrorCode {
 impl From<u32> for ErrorCode {
     fn from(c: u32) -> Self {
         match c {
-            0x0 => ErrorCode::NoError,
-            0x1 => ErrorCode::ProtocolError,
-            0x2 => ErrorCode::InternalError,
-            0x3 => ErrorCode::FlowControlError,
-            0x4 => ErrorCode::SettingsTimeout,
-            0x5 => ErrorCode::StreamClosed,
-            0x6 => ErrorCode::FrameSizeError,
-            0x7 => ErrorCode::RefusedStream,
-            0x8 => ErrorCode::Cancel,
-            0x9 => ErrorCode::CompressionError,
-            0xa => ErrorCode::ConnectError,
-            0xb => ErrorCode::EnhanceYourCalm,
-            0xc => ErrorCode::InadequateSecurity,
-            0xd => ErrorCode::Http11Required,
-            other => ErrorCode::Unknown(other),
+            0x0 => Self::NoError,
+            0x1 => Self::ProtocolError,
+            0x2 => Self::InternalError,
+            0x3 => Self::FlowControlError,
+            0x4 => Self::SettingsTimeout,
+            0x5 => Self::StreamClosed,
+            0x6 => Self::FrameSizeError,
+            0x7 => Self::RefusedStream,
+            0x8 => Self::Cancel,
+            0x9 => Self::CompressionError,
+            0xa => Self::ConnectError,
+            0xb => Self::EnhanceYourCalm,
+            0xc => Self::InadequateSecurity,
+            0xd => Self::Http11Required,
+            other => Self::Unknown(other),
         }
     }
 }
@@ -81,10 +81,10 @@ pub enum H2Error {
 
 impl H2Error {
     pub fn conn(code: ErrorCode) -> Self {
-        H2Error::Connection(code)
+        Self::Connection(code)
     }
     pub fn stream(id: u32, code: ErrorCode) -> Self {
-        H2Error::Stream { id, code }
+        Self::Stream { id, code }
     }
 }
 

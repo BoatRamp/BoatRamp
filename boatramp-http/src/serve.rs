@@ -31,7 +31,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config {
+        Self {
             sniff_timeout: Duration::from_secs(10),
             read_timeout: crate::h1::DEFAULT_READ_TIMEOUT,
         }
@@ -107,7 +107,7 @@ pub struct Rewind<IO> {
 
 impl<IO> Rewind<IO> {
     fn new(prefix: Vec<u8>, inner: IO) -> Self {
-        Rewind {
+        Self {
             prefix,
             pos: 0,
             inner,

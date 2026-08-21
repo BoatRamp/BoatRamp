@@ -65,7 +65,7 @@ struct Stream {
 
 impl Stream {
     fn new(peer_initial_window: i64) -> Self {
-        Stream {
+        Self {
             state: StreamState::Idle,
             send_window: peer_initial_window,
             recv_window: settings::DEFAULT_INITIAL_WINDOW_SIZE as i64,
@@ -608,7 +608,7 @@ where
     };
     let status = parts.status.as_u16().to_string();
     let mut fields: Vec<(&[u8], &[u8])> = vec![(b":status", status.as_bytes())];
-    for (n, v) in parts.headers.iter() {
+    for (n, v) in &parts.headers {
         // Drop connection-specific headers HTTP/2 forbids (§8.1.2.2); the shared
         // handler also serves h1, where these are legal (see `is_connection_specific`).
         if crate::h2::http::is_connection_specific(n.as_str().as_bytes()) {

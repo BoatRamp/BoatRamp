@@ -36,15 +36,15 @@ enum ReqBodyInner {
 impl ReqBody {
     /// An empty request body.
     pub fn empty() -> Self {
-        ReqBody(ReqBodyInner::Empty)
+        Self(ReqBodyInner::Empty)
     }
 
     /// A request body that is already fully buffered in memory.
     pub fn from_bytes(bytes: Bytes) -> Self {
         if bytes.is_empty() {
-            ReqBody(ReqBodyInner::Empty)
+            Self(ReqBodyInner::Empty)
         } else {
-            ReqBody(ReqBodyInner::Full(Some(bytes)))
+            Self(ReqBodyInner::Full(Some(bytes)))
         }
     }
 
@@ -53,7 +53,7 @@ impl ReqBody {
     pub fn from_stream(
         chunks: impl Stream<Item = Result<Bytes, BodyError>> + Send + 'static,
     ) -> Self {
-        ReqBody(ReqBodyInner::Stream(Box::pin(chunks)))
+        Self(ReqBodyInner::Stream(Box::pin(chunks)))
     }
 
     /// Consume the body as a pull [`Stream`] of chunks — a reverse-proxy handler forwards
@@ -86,7 +86,7 @@ impl ReqBody {
 
 impl Default for ReqBody {
     fn default() -> Self {
-        ReqBody::empty()
+        Self::empty()
     }
 }
 
@@ -175,7 +175,7 @@ impl Body {
     /// `Bytes` chunks — the driver polls it directly (no channel/task hop). Empty
     /// chunks are skipped; the stream ending signals end-of-body.
     pub fn stream(chunks: impl tokio_stream::Stream<Item = Bytes> + Send + 'static) -> Self {
-        Body::Stream(Box::pin(chunks.map(Ok)))
+        Self::Stream(Box::pin(chunks.map(Ok)))
     }
 
     /// A streamed body from a **fallible** pull [`Stream`](tokio_stream::Stream) — a
@@ -185,7 +185,7 @@ impl Body {
     pub fn try_stream(
         chunks: impl tokio_stream::Stream<Item = BodyChunk> + Send + 'static,
     ) -> Self {
-        Body::Stream(Box::pin(chunks))
+        Self::Stream(Box::pin(chunks))
     }
 
     /// The body length if known ahead of time. A [`Body::Stream`] has no known length
@@ -195,36 +195,36 @@ impl Body {
     /// [`is_empty`]: Body::is_empty
     pub fn len(&self) -> usize {
         match self {
-            Body::Bytes(b) => b.len(),
+            Self::Bytes(b) => b.len(),
             #[cfg(target_os = "linux")]
             Body::Splice { len, .. } => *len,
-            Body::Stream(_) => 0,
+            Self::Stream(_) => 0,
         }
     }
     pub fn is_empty(&self) -> bool {
         match self {
-            Body::Bytes(b) => b.is_empty(),
+            Self::Bytes(b) => b.is_empty(),
             #[cfg(target_os = "linux")]
             Body::Splice { len, .. } => *len == 0,
-            Body::Stream(_) => false,
+            Self::Stream(_) => false,
         }
     }
 }
 
 impl Default for Body {
     fn default() -> Self {
-        Body::Bytes(Vec::new())
+        Self::Bytes(Vec::new())
     }
 }
 
 impl From<Vec<u8>> for Body {
     fn from(v: Vec<u8>) -> Self {
-        Body::Bytes(v)
+        Self::Bytes(v)
     }
 }
 impl From<&[u8]> for Body {
     fn from(v: &[u8]) -> Self {
-        Body::Bytes(v.to_vec())
+        Self::Bytes(v.to_vec())
     }
 }
 

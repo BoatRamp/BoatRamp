@@ -29,13 +29,10 @@ clen = "clen"
 
 [files]
 # Lockfiles and vendored third-party WIT (upstream WASI definitions, copied
-# verbatim — their spelling is not ours to "fix") + the vendored fluke-hpack
-# HPACK crate (a third-party copy with a Huffman-table fix; its upstream comment
-# spellings are not ours to correct).
+# verbatim — their spelling is not ours to "fix").
 extend-exclude = [
   "Cargo.lock",
   "flake.lock",
   "examples/handlers/*/wit/**",
   "crates/boatramp/templates/*/wit/**",
-  "boatramp-http/vendor/**",
 ]

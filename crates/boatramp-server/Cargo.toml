@@ -90,10 +90,9 @@ rmcp = { version = "1.2", features = [
 # for library/wasm cleanliness).
 boatramp-core = { workspace = true, features = ["authz"] }
 # The hand-rolled HTTP serving stack (h1 loop + h2 mux driver + connection upgrade):
-# *the* serving path, replacing hyper/axum_server. Non-optional. The explicit
-# version (matching boatramp-http's own) keeps it a non-wildcard dependency, which
-# cargo-deny requires of a published crate (crates.io disallows bare path deps).
-boatramp-http = { path = "../../boatramp-http", version = "0.0.0" }
+# *the* serving path, replacing hyper/axum_server. Non-optional. A first-party,
+# published workspace member (its HPACK codec is our own — no external HPACK crate).
+boatramp-http = { workspace = true }
 # `time` + `sync` (beyond the workspace defaults) for the bounded shutdown drain
 # in `serve` (in-flight requests finish under a deadline).
 tokio = { workspace = true, features = ["time", "sync"] }

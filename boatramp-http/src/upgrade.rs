@@ -46,7 +46,7 @@ impl<T: AsyncRead + AsyncWrite + Send> Io for T {}
 
 impl Upgraded {
     pub(crate) fn new(io: impl AsyncRead + AsyncWrite + Send + 'static, prefix: Bytes) -> Self {
-        Upgraded {
+        Self {
             inner: Box::pin(io),
             prefix,
             pos: 0,
@@ -123,7 +123,7 @@ pub(crate) struct Pending(
 
 impl Pending {
     pub(crate) fn new(rx: oneshot::Receiver<Upgraded>) -> Self {
-        Pending(std::sync::Arc::new(std::sync::Mutex::new(Some(rx))))
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(rx))))
     }
 }
 
