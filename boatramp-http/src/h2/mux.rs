@@ -711,6 +711,12 @@ fn response_fields(
     let mut fields = Vec::with_capacity(parts.headers.len() + 2);
     fields.push((b":status".to_vec(), parts.status.as_u16().to_string().into_bytes()));
     for (name, value) in parts.headers.iter() {
+        // Drop connection-specific headers HTTP/2 forbids (§8.1.2.2): the shared
+        // handler also serves h1, where an upstream `Connection`/`Transfer-Encoding`
+        // is legal — framing them here would make an invalid h2 response.
+        if crate::h2::http::is_connection_specific(name.as_str().as_bytes()) {
+            continue;
+        }
         fields.push((name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()));
     }
     if let Some(len) = content_length {

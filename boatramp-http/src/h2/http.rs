@@ -22,6 +22,18 @@ const FORBIDDEN: &[&[u8]] = &[
     b"upgrade",
 ];
 
+/// Whether `name` is a connection-specific header field HTTP/2 forbids
+/// (§8.1.2.2). On the request side these are a PROTOCOL_ERROR; on the response
+/// side the codec must **drop** them before framing — the same [`Handler`] feeds
+/// both the h1 and h2 codecs, and an h1 handler may legitimately set `Connection`
+/// / `Transfer-Encoding`, so the *codec* (not the shared bridge) owns this rule.
+/// Case-insensitive; `name` need not already be lowercase.
+pub(crate) fn is_connection_specific(name: &[u8]) -> bool {
+    FORBIDDEN
+        .iter()
+        .any(|f| name.eq_ignore_ascii_case(f))
+}
+
 /// Build a validated [`Request`] from a decoded header list. Malformed requests are a
 /// **stream** error of type PROTOCOL_ERROR (RFC 7540 §8.1.2.6) so one bad request
 /// resets its stream without killing the connection. The body is set separately once
@@ -151,5 +163,22 @@ mod tests {
             err(&[(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/"), (b":bogus", b"x")]),
             bad
         );
+    }
+
+    #[test]
+    fn connection_specific_headers_are_recognized_case_insensitively() {
+        for name in [
+            b"connection".as_slice(),
+            b"Connection",
+            b"KEEP-ALIVE",
+            b"proxy-connection",
+            b"Transfer-Encoding",
+            b"upgrade",
+        ] {
+            assert!(is_connection_specific(name), "{name:?} is h2-forbidden");
+        }
+        for name in [b"content-length".as_slice(), b"content-type", b"host", b"te"] {
+            assert!(!is_connection_specific(name), "{name:?} is not forbidden");
+        }
     }
 }
