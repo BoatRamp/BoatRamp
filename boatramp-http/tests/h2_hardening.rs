@@ -3,10 +3,10 @@
 //! GOAWAY(ENHANCE_YOUR_CALM) instead of doing unbounded work. Uses raw h2 frames — a
 //! well-behaved client library won't misbehave — so it drives the bytes directly.
 
-use boatramp_h2::error::ErrorCode;
-use boatramp_h2::frame::{self, FrameHeader, FrameType};
-use boatramp_h2::hpack::Hpack;
-use boatramp_h2::{response, serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE};
+use boatramp_http::h2::error::ErrorCode;
+use boatramp_http::h2::frame::{self, FrameHeader, FrameType};
+use boatramp_http::h2::hpack::Hpack;
+use boatramp_http::h2::{response, serve_connection_mux, Handler, Request, Response, CLIENT_PREFACE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const END_STREAM: u8 = 0x1;

@@ -1,6 +1,6 @@
 #![no_main]
 //! Fuzz the frame parsers: attacker-controlled bytes must never panic the parser.
-use boatramp_h2::frame::{self, FrameHeader};
+use boatramp_http::h2::frame::{self, FrameHeader};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -7,7 +7,7 @@
 //! harness — a differential oracle against `hyper`, a curated smuggling corpus, RFC 9112
 //! conformance cases, and a randomized fuzz smoke — is written and wired *before* the
 //! parser, and [`parse_request_head`] is only promoted from the stub below once that
-//! harness is green. See `../boatramp-h2/DESIGN-serving.md`.
+//! harness is green. See `DESIGN-serving.md`.
 //!
 //! The design invariant the harness enforces: **fail closed.** Any framing ambiguity is
 //! a [`Reject`], never a guess — so nothing a downstream could interpret differently is

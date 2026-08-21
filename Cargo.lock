@@ -1751,22 +1751,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boatramp-h2"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "fluke-hpack",
- "http 1.4.2",
- "ktls",
- "libc",
- "rustls 0.23.40",
- "rustls-pemfile",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-stream",
-]
-
-[[package]]
 name = "boatramp-handlers"
 version = "0.2.14"
 dependencies = [
@@ -1785,6 +1769,22 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wasmtime-wasi-io",
+]
+
+[[package]]
+name = "boatramp-http"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fluke-hpack",
+ "http 1.4.2",
+ "ktls",
+ "libc",
+ "rustls 0.23.40",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -1858,8 +1858,8 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "boatramp-core",
- "boatramp-h2",
  "boatramp-handlers",
+ "boatramp-http",
  "boatramp-mcp",
  "boatramp-storage",
  "bytes",

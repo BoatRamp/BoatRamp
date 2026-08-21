@@ -7,16 +7,31 @@ description = "BoatRamp's owned HTTP serving stack: one accept loop over hand-ro
 repository = "https://github.com/BoatRamp/BoatRamp"
 publish = false # flip once the h1 safety gate (differential + smuggling + fuzz) is green
 
-# The unified stack: shared serving types at the crate root, protocol codecs as `h1`
-# and `h2` modules (the existing boatramp-h2 mux driver folds into `h2`), and a `serve`
-# dispatcher (ALPN / h2c sniff). The h1 request parser is the smuggling-critical
-# surface, so it is built TEST-FIRST: the `tests/` harness — differential-vs-hyper, a
-# smuggling corpus, RFC 9112 conformance, fuzzing — lands and is wired BEFORE the parser,
-# which is only promoted once the harness is green. See ../boatramp-h2/DESIGN-serving.md.
+# The unified stack: shared serving types (`Request`/`Response`/`Body`/`Handler`) at the
+# crate root, protocol codecs as `h1` and `h2` modules (the `h2` mux driver was the
+# `boatramp-h2` crate, folded in), and — Stage 3 — a `serve` dispatcher (ALPN / h2c sniff).
+# The h1 request parser is the smuggling-critical surface, built TEST-FIRST: its `tests/`
+# harness (differential-vs-hyper, a smuggling corpus, RFC 9112 conformance, fuzzing) landed
+# and is wired BEFORE the parser. See DESIGN-serving.md.
 [dependencies]
 # Requests/responses are the standard `http` crate types (Method/Uri/HeaderMap).
 http = "1"
 bytes = "1"
+# The h2 codec: tokio IO + a pull `Stream` response body the driver polls directly, and
+# `fluke-hpack` (vendored, see [patch]) for HPACK.
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
+tokio-stream = "0.1"
+fluke-hpack = "0.3"
+
+# The h2 zero-copy splice body path + kTLS handoff are Linux-only, so their deps are
+# target-gated — the crate (and its tests) still build everywhere on the buffered path.
+# `libc` for splice()/pipe2; rustls+ktls for the TLS handshake→kTLS handoff.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustls = { version = "0.23", default-features = true }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+ktls = "6"
 
 [dev-dependencies]
 # hyper's HTTP/1 server is the DIFFERENTIAL ORACLE for the h1 codec: identical raw byte
@@ -25,7 +40,18 @@ bytes = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http-body-util = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+# The reference HTTP/2 implementation: an in-process client for the h2 smoke + the
+# differential oracle.
+h2 = "0.4"
 # Randomized parser fuzzing (panic-free + never-desync), the stable-CI analogue of the
-# cargo-fuzz target that caught a real HPACK panic in the h2 codec.
+# cargo-fuzz targets.
 proptest = "1"
+
+# Vendored fluke-hpack with one fix: its HPACK decoder rebuilt a 257-symbol Huffman decode
+# table (a nested HashMap) for *every* Huffman-encoded header string, which profiled as the
+# top per-request userspace cost on the h2 proxy path. The vendored copy shares one
+# process-wide decoder (the table is immutable). Decode logic is otherwise identical, so
+# h2spec conformance is unchanged.
+[patch.crates-io]
+fluke-hpack = { path = "vendor/fluke-hpack" }

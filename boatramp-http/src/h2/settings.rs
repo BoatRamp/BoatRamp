@@ -1,6 +1,6 @@
 //! HTTP/2 SETTINGS parameters (RFC 7540 §6.5.2) with spec defaults + validation.
 
-use crate::error::{ErrorCode, H2Error};
+use crate::h2::error::{ErrorCode, H2Error};
 
 /// The connection flow-control window is fixed at 65535 initially (RFC 7540
 /// §6.9.2) and is NOT governed by `SETTINGS_INITIAL_WINDOW_SIZE` (that only sets

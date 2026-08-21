@@ -2148,7 +2148,7 @@ async fn serve_custom(
         app
     };
 
-    // Opt-in HTTP/2 fast-path: serve h2 connections with boatramp-h2's concurrent
+    // Opt-in HTTP/2 fast-path: serve h2 connections with boatramp-http's h2 concurrent
     // multiplexed driver (beats hyper/Envoy on tls-proxy-h2), h1 falls back to hyper.
     // Experimental; enabled per-listener by BOATRAMP_H2_MUX at runtime.
     #[cfg(feature = "h2-mux")]

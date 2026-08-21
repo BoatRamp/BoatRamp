@@ -1,5 +1,5 @@
 //! The **concurrent multiplexed** connection driver (M4c). Unlike the serial
-//! [`crate::conn`] driver — which reads one frame, runs the handler to completion,
+//! [`crate::h2::conn`] driver — which reads one frame, runs the handler to completion,
 //! and flushes the whole body before reading the next frame (a ~340 req/s
 //! per-connection ceiling) — this driver only ever *moves bytes*, exactly like the
 //! `h2` crate:
@@ -25,13 +25,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt as _;
 
-use crate::error::{ErrorCode, H2Error};
-use crate::frame::{self, flag, FrameHeader, FrameType};
-use crate::hpack::Hpack;
-use crate::http::{self, Handler, Response};
-use crate::settings::{self, Settings};
-use crate::stream::StreamState;
-use crate::CLIENT_PREFACE;
+use crate::h2::error::{ErrorCode, H2Error};
+use crate::h2::frame::{self, flag, FrameHeader, FrameType};
+use crate::h2::hpack::Hpack;
+use crate::h2::http::{self, Handler, Response};
+use crate::h2::settings::{self, Settings};
+use crate::h2::stream::StreamState;
+use crate::h2::CLIENT_PREFACE;
 
 const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
 /// Cap on a single emitted DATA frame (keeps batches bounded; well above the usual

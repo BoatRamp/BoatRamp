@@ -5,7 +5,7 @@
 //! reference `h2` client, so the responses are validated against a real peer.
 
 use bytes::Bytes;
-use boatramp_h2::{response, serve_connection, Handler, Request, Response};
+use boatramp_http::h2::{response, serve_connection, Handler, Request, Response};
 
 struct App;
 

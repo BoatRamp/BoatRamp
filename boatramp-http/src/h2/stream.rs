@@ -4,8 +4,8 @@
 //! in isolation. The connection driver drives it and turns the returned [`H2Error`]
 //! into a `RST_STREAM` (stream scope) or `GOAWAY` (connection scope).
 
-use crate::error::{ErrorCode, H2Error};
-use crate::frame::FrameType;
+use crate::h2::error::{ErrorCode, H2Error};
+use crate::h2::frame::FrameType;
 
 /// Stream states from a **server's** point of view (RFC 7540 §5.1). We never send
 /// PUSH_PROMISE, and clients cannot reserve, so the reserved states never arise;
@@ -83,8 +83,8 @@ impl StreamState {
 mod tests {
     use super::StreamState::*;
     use super::*;
-    use crate::error::ErrorCode;
-    use crate::frame::FrameType::*;
+    use crate::h2::error::ErrorCode;
+    use crate::h2::frame::FrameType::*;
 
     #[test]
     fn headers_opens_and_end_stream_half_closes() {

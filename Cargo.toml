@@ -268,9 +268,9 @@ serde_yaml = "0.9"
 lto = "thin"
 strip = true
 
-# Vendored fluke-hpack (via the `boatramp-h2` path dep, feature `h2-mux`): its HPACK
+# Vendored fluke-hpack (via the `boatramp-http` path dep, feature `h2-mux`): its HPACK
 # decoder rebuilt a 257-symbol Huffman decode table for every Huffman-encoded header
 # string — the top per-request userspace cost on the h2 proxy path. The vendored copy
 # shares one process-wide decoder; decode logic is otherwise identical.
 [patch.crates-io]
-fluke-hpack = { path = "boatramp-h2/vendor/fluke-hpack" }
+fluke-hpack = { path = "boatramp-http/vendor/fluke-hpack" }

@@ -2,7 +2,7 @@
 //! and validated parse/encode for the fixed-layout frames. Higher-level rules
 //! (stream state, ordering, connection vs stream error scope) live in `conn`.
 
-use crate::error::{ErrorCode, H2Error};
+use crate::h2::error::{ErrorCode, H2Error};
 
 /// Length of the fixed frame header (RFC 7540 §4.1).
 pub const FRAME_HEADER_LEN: usize = 9;

@@ -2,7 +2,7 @@
 //! Fuzz HPACK decode: the connection driver feeds it attacker-controlled header
 //! blocks, so a malformed block must return an error, never panic (the underlying
 //! codec asserts on over-limit dynamic-table-size updates — screened by `Hpack`).
-use boatramp_h2::hpack::Hpack;
+use boatramp_http::h2::hpack::Hpack;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

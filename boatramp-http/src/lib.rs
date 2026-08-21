@@ -6,15 +6,23 @@
 //!
 //! - [`h1`] — the HTTP/1.1 codec (built here, **test-first**: see its module docs and
 //!   the `tests/` harness).
-//! - `h2` — the concurrent multiplexed HTTP/2 driver (the current `boatramp-h2` crate,
-//!   folded in as Stage 1 of `../boatramp-h2/DESIGN-serving.md`).
+//! - [`h2`] — the concurrent multiplexed HTTP/2 driver (formerly the `boatramp-h2`
+//!   crate, folded in — Stage 1 of `DESIGN-serving.md`).
 //! - `serve` — the unified accept-loop dispatcher (TLS ALPN / plaintext h2c-preface
-//!   sniff → h1 vs h2), replacing the `boatramp-server` mux-serve bridge + `splice.rs`.
+//!   sniff → h1 vs h2), replacing the `boatramp-server` mux-serve bridge + `splice.rs`
+//!   (Stage 3, not yet built).
 //!
-//! Shared request/response/body/limit types will live at the crate root once the h2
-//! codec is folded in; for now only the h1 codec + its safety gate are present.
+//! The shared serving types ([`Body`], [`Handler`], [`Request`], [`Response`]) are
+//! re-exported at the crate root — the surface both codecs produce/consume and the
+//! serve dispatcher will hand to a `tower::Service` (the axum Router).
 
 pub mod h1;
+pub mod h2;
+
+// The shared serving abstraction (`Request`/`Response`/`Body`/`Handler`) — homed at the
+// crate root, the surface both codecs produce/consume.
+mod serving;
+pub use serving::{response, Body, BodyChunk, BodyError, Handler, Request, Response};
 
 // The verification kit (corpus + normalized-verdict model + combinatorial generators)
 // shared by the h1 gate, the differential-vs-hyper driver, and the fuzz targets — one

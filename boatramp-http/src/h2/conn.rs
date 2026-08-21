@@ -1,7 +1,7 @@
 //! The HTTP/2 connection driver: preface, SETTINGS negotiation, and the
-//! read/dispatch loop that enforces framing, stream state (via [`crate::stream`]),
+//! read/dispatch loop that enforces framing, stream state (via [`crate::h2::stream`]),
 //! flow control, and the connection-vs-stream error split. Single-task; the driver
-//! talks only to [`crate::wire::Wire`], so it is identical whether the transport is a
+//! talks only to [`crate::h2::wire::Wire`], so it is identical whether the transport is a
 //! plain buffered stream (tests, plaintext h2c) or a splice-capable kTLS socket
 //! (`serve_connection_ktls`) where the response body is moved kernel-to-kernel.
 
@@ -12,14 +12,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::AsyncReadExt;
 use tokio_stream::StreamExt as _;
 
-use crate::error::{ErrorCode, H2Error};
-use crate::frame::{self, flag, FrameHeader, FrameType};
-use crate::hpack::Hpack;
-use crate::http::{self, Handler, Response};
-use crate::settings::{self, Settings};
-use crate::stream::StreamState;
-use crate::wire::Wire;
-use crate::CLIENT_PREFACE;
+use crate::h2::error::{ErrorCode, H2Error};
+use crate::h2::frame::{self, flag, FrameHeader, FrameType};
+use crate::h2::hpack::Hpack;
+use crate::h2::http::{self, Handler, Response};
+use crate::h2::settings::{self, Settings};
+use crate::h2::stream::StreamState;
+use crate::h2::wire::Wire;
+use crate::h2::CLIENT_PREFACE;
 
 /// Our advertised SETTINGS_MAX_FRAME_SIZE. 16 KiB (the default + minimum) keeps
 /// the frame-size checks simple and matches what the proxy body path wants anyway.
@@ -760,7 +760,7 @@ where
     // the socket (a raw recv() would otherwise miss those bytes). `config_ktls_server`
     // unwraps the CorkStream, so `into_raw` yields the bare TcpStream.
     let (drained, sock) = kstream.into_raw();
-    let sock = crate::wire::Socket::new(sock, drained.unwrap_or_default())?;
+    let sock = crate::h2::wire::Socket::new(sock, drained.unwrap_or_default())?;
     let mut wire: Wire<tokio::net::TcpStream> = Wire::Socket(sock);
     serve_connection_wire(&mut wire, handler).await
 }

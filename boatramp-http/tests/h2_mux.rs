@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use boatramp_h2::{response, serve_connection_mux, Handler, Request, Response};
+use boatramp_http::h2::{response, serve_connection_mux, Handler, Request, Response};
 use tokio::sync::Notify;
 
 struct App;
@@ -106,7 +106,7 @@ async fn request_body_is_delivered_to_the_handler() {
 
 #[tokio::test]
 async fn streamed_body_is_forwarded_chunk_by_chunk() {
-    use boatramp_h2::Body;
+    use boatramp_http::h2::Body;
     struct Streamer;
     impl Handler for Streamer {
         async fn handle(&self, _req: Request) -> Response {
@@ -145,7 +145,7 @@ async fn streamed_body_is_forwarded_chunk_by_chunk() {
 async fn slow_client_backpressures_a_large_streamed_body() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_stream::StreamExt as _;
-    use boatramp_h2::Body;
+    use boatramp_http::h2::Body;
 
     struct Streamer(Arc<AtomicUsize>);
     impl Handler for Streamer {
@@ -183,7 +183,7 @@ async fn client_reset_midstream_does_not_wedge_the_connection() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio_stream::StreamExt as _;
-    use boatramp_h2::Body;
+    use boatramp_http::h2::Body;
 
     struct Mixed(Arc<AtomicUsize>);
     impl Handler for Mixed {
@@ -237,7 +237,7 @@ async fn client_reset_midstream_does_not_wedge_the_connection() {
 #[tokio::test]
 async fn upstream_error_midstream_resets_the_client_not_a_clean_end() {
     use std::time::Duration;
-    use boatramp_h2::{Body, BodyChunk, BodyError};
+    use boatramp_http::h2::{Body, BodyChunk, BodyError};
 
     struct Failing;
     impl Handler for Failing {

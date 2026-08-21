@@ -1,7 +1,7 @@
 //! End-to-end smoke test: drive the server with the reference `h2` client over an
 //! in-memory duplex. This is also the seed of the M3 differential oracle.
 
-use boatramp_h2::{response, serve_connection, Handler, Request, Response};
+use boatramp_http::h2::{response, serve_connection, Handler, Request, Response};
 
 struct Echo;
 

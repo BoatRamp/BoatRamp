@@ -18,7 +18,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use boatramp_h2::{response, serve_connection_tcp, Body, Handler, Request, Response};
+    use boatramp_http::h2::{response, serve_connection_tcp, Body, Handler, Request, Response};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 

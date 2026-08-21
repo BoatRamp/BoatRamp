@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use axum::http;
 use axum::Router;
-use boatramp_h2::{
-    serve_connection_mux, Body as MuxBody, BodyError as MuxBodyError, Handler,
-    Request as MuxRequest, Response as MuxResponse,
+use boatramp_http::h2::serve_connection_mux;
+use boatramp_http::{
+    Body as MuxBody, BodyError as MuxBodyError, Handler, Request as MuxRequest,
+    Response as MuxResponse,
 };
 use futures::StreamExt as _;
 use http_body_util::BodyStream;
@@ -62,7 +63,7 @@ impl Handler for RouterHandler {
         let mut router = self.router.clone();
         let resp = match router.call(request).await {
             Ok(r) => r,
-            Err(_) => return boatramp_h2::response(502, b"bad gateway".to_vec()),
+            Err(_) => return boatramp_http::response(502, b"bad gateway".to_vec()),
         };
         let (mut parts, body) = resp.into_parts();
         for name in HOP_BY_HOP {

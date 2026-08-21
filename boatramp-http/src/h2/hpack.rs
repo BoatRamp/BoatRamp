@@ -1,8 +1,8 @@
 //! HPACK (RFC 7541) codec state, wrapping the maintained `fluke-hpack`. The dynamic
 //! table is stateful across a connection, so one [`Hpack`] lives per connection.
 
-use crate::error::{ErrorCode, H2Error};
-use crate::settings::DEFAULT_HEADER_TABLE_SIZE;
+use crate::h2::error::{ErrorCode, H2Error};
+use crate::h2::settings::DEFAULT_HEADER_TABLE_SIZE;
 use fluke_hpack::{Decoder, Encoder};
 
 pub struct Hpack {

@@ -135,7 +135,7 @@ pub(crate) use proxy::{
     proxy, COMPUTE_WAKE_TIMEOUT,
 };
 mod splice;
-// Opt-in HTTP/2 serve fast-path via boatramp-h2's mux driver (feature `h2-mux`).
+// Opt-in HTTP/2 serve fast-path via boatramp-http's h2 mux driver (feature `h2-mux`).
 #[cfg(feature = "h2-mux")]
 mod mux_serve;
 #[cfg(feature = "h2-mux")]

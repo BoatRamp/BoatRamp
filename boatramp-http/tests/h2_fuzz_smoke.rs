@@ -5,8 +5,8 @@
 //! a DoS vector (the connection driver hands it attacker-controlled bytes), so
 //! "never panics" is the invariant.
 
-use boatramp_h2::frame::{self, FrameHeader};
-use boatramp_h2::hpack::Hpack;
+use boatramp_http::h2::frame::{self, FrameHeader};
+use boatramp_http::h2::hpack::Hpack;
 
 /// xorshift64* — a tiny deterministic PRNG (no external deps, reproducible seed).
 struct Rng(u64);
