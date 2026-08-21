@@ -18,6 +18,8 @@
 
 pub mod h1;
 pub mod h2;
+pub mod serve;
+pub use serve::serve_connection;
 
 // The shared serving abstraction (`Request`/`Response`/`Body`/`Handler`) — homed at the
 // crate root, the surface both codecs produce/consume.
