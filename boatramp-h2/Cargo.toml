@@ -42,3 +42,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 h2 = "0.4"
 http = "1"
 bytes = "1"
+
+# Vendored fluke-hpack with one fix: its HPACK decoder rebuilt a 257-symbol Huffman
+# decode table (a nested HashMap) for *every* Huffman-encoded header string, which
+# profiled as the top per-request userspace cost on the h2 proxy path. The vendored
+# copy shares one process-wide decoder (the table is immutable). Decode logic is
+# otherwise identical, so h2spec conformance is unchanged.
+[patch.crates-io]
+fluke-hpack = { path = "vendor/fluke-hpack" }

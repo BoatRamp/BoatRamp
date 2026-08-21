@@ -120,8 +120,6 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 [[package]]
 name = "fluke-hpack"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60608dc8ab0a0af790a360b85c3e80a7b50022cd0fc5637a288e25c73e20bd8e"
 dependencies = [
  "tracing",
 ]
