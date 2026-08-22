@@ -3,8 +3,14 @@ name: Nightly
 # The heavy, comprehensive sweep, split out of per-push CI because on a stock
 # runner these take ~80 min (all-features) and ~175 min (nix) — too slow to gate
 # every push. Runs daily, or on demand (Run workflow ▸).
-#   • lint · test (all features) — clippy + test across every cargo feature
-#   • nix flake check            — reproducible workspace clippy + NixOS-service VM
+#   • test (all features)  — runs the whole feature matrix's test suite (a network-
+#                            capable runner, which the nix sandbox can't provide)
+#   • nix flake check      — reproducible checks incl. `musl-clippy` (all-features
+#                            workspace clippy for the SHIPPED musl target, cachix-cached)
+#                            + the NixOS-service VM + the static musl release artifact
+# all-features *compile* coverage on musl lives in the nix `musl-clippy` check; the
+# per-push fast CI compiles + tests the shipped surface on musl. So the only thing left
+# on the host toolchain here is this all-features test *run* (target-agnostic logic).
 on:
   schedule:
     - cron: "0 4 * * *" # 04:00 UTC daily
@@ -21,8 +27,8 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  lint-test:
-    name: lint · test (all features)
+  test:
+    name: test (all features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -62,14 +68,12 @@ jobs:
           fi
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
+      # all-features *clippy* is now the nix `checks.musl-clippy` derivation (compiled for
+      # the shipped musl target, cachix-cached). This lane runs the all-features test
+      # *suite* on a network-capable runner (the nix sandbox can't host it).
       - name: Test (all features)
         run: cargo test --workspace --all-features
 
