@@ -121,15 +121,15 @@ pub enum Expr {
     /// `*`, valid only as the argument of `count(*)`.
     Star,
     /// An aggregate over an inner expression (use [`Expr::Star`] for `count(*)`).
-    Aggregate(Agg, Box<Expr>),
+    Aggregate(Agg, Box<Self>),
     /// A parenthesized binary arithmetic expression.
-    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Binary(BinOp, Box<Self>, Box<Self>),
     /// An allow-listed function call.
-    Func(Func, Vec<Expr>),
+    Func(Func, Vec<Self>),
     /// Extract a text value from a JSON column by a key path (e.g. `["a", "b"]` ⇒ `$.a.b`).
     /// Rendered per-dialect (SQLite/MySQL `json_extract`, Postgres `#>>`); each key is
     /// validated as an identifier so the built path can't inject.
-    JsonExtract(Box<Expr>, Vec<String>),
+    JsonExtract(Box<Self>, Vec<String>),
 }
 
 impl Expr {
@@ -173,11 +173,11 @@ impl CmpOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
     /// `AND` of all children (an empty list is the always-true identity `1 = 1`).
-    And(Vec<Predicate>),
+    And(Vec<Self>),
     /// `OR` of all children (an empty list is the always-false identity `1 = 0`).
-    Or(Vec<Predicate>),
+    Or(Vec<Self>),
     /// Negation.
-    Not(Box<Predicate>),
+    Not(Box<Self>),
     /// `<left> <op> <right>`.
     Cmp { left: Expr, op: CmpOp, right: Expr },
     /// `<expr> [NOT] BETWEEN <low> AND <high>`.
@@ -557,6 +557,9 @@ fn render_where(
     if let Some(s) = scope {
         ident(&s.column)?;
     }
+    // An empty `AND` filter is a no-op (always true) — drop it so it never adds a spurious
+    // `AND 1 = 1`. (An empty `OR` means "match nothing" and is kept.)
+    let filter = filter.filter(|f| !matches!(f, Predicate::And(v) if v.is_empty()));
     // A lone clause renders directly (no wrapping `AND`, so a top-level `AND`/`OR` filter
     // isn't spuriously parenthesized); scope + filter conjoin as `scope AND (filter)`.
     let combined = match (scope, filter) {
@@ -799,6 +802,16 @@ impl Update {
     pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
         if self.set.is_empty() {
             return Err(OrmError::Empty("update has no assignments"));
+        }
+        // Guard against an effectively-unbounded update: an empty `AND`/`OR` filter renders to
+        // a tautology, so with no tenant scope it would touch every row. Refuse it. (A scope
+        // keeps the update bounded, so an empty filter + scope is allowed.)
+        let empty_filter =
+            matches!(&self.filter, Predicate::And(v) | Predicate::Or(v) if v.is_empty());
+        if empty_filter && self.scope.is_none() {
+            return Err(OrmError::Empty(
+                "update has an empty filter (unbounded update refused)",
+            ));
         }
         let table = ident(&self.table)?;
         let mut params = Params::default();
@@ -1229,13 +1242,32 @@ mod tests {
             scope: None,
             returning: vec![],
         };
-        // An empty AND renders `1 = 1`, which IS a WHERE — so this is NOT refused; the
-        // guard is against a *missing* filter, which the type system already prevents
-        // (filter is non-Option). Assert it compiles to the explicit always-true form so
-        // the behavior is at least visible + intentional.
+        // An empty filter with no scope is an effectively-unbounded update → refused.
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::Empty(_))
+        ));
+    }
+
+    #[test]
+    fn empty_filter_with_scope_is_allowed() {
+        // A scope keeps it bounded, so an empty filter + scope compiles.
+        let q = Update {
+            table: "t".into(),
+            set: vec![Assignment {
+                column: "x".into(),
+                value: Expr::val(SqlValue::Integer(1)),
+            }],
+            filter: Predicate::And(vec![]),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+            }),
+            returning: vec![],
+        };
         assert_eq!(
             q.compile(Dialect::Sqlite).unwrap().0,
-            "UPDATE t SET x = ?1 WHERE 1 = 1"
+            "UPDATE t SET x = ?1 WHERE tenant_id = ?2"
         );
     }
 

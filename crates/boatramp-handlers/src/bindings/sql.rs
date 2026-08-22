@@ -74,6 +74,16 @@ impl SqlSession {
         self.backends.contains_key(name)
     }
 
+    /// The SQL dialect of the backend named `name` (SQLite-family if not granted — an
+    /// ungranted name is caught by the grant check before this matters). `pub(super)` so the
+    /// `orm` binding can compile dialect-correct SQL for the target engine.
+    pub(super) fn dialect(&self, name: &str) -> boatramp_core::sql::Dialect {
+        self.backends
+            .get(name)
+            .map(|b| b.dialect())
+            .unwrap_or_default()
+    }
+
     /// The open transaction for `(name, read_only)`, beginning one on first use.
     /// A read-only transaction is begun via [`SqlBackend::begin_read_only`], so a
     /// replica-configured backend can route it to the replica. Returns the **core**

@@ -101,88 +101,106 @@ world sql-host {
 interface orm {
   use sql-types.{value, row, query-result, error};
 
-  /// A comparison of a column against a bound value, or a null/list test.
-  variant compare {
-    eq(value),
-    ne(value),
-    lt(value),
-    le(value),
-    gt(value),
-    ge(value),
-    like(string),          // SQL LIKE pattern (bound as a parameter)
-    in-list(list<value>),  // IN (…) — each value bound; empty list matches nothing
-    is-null,
-    is-not-null,
-  }
-  /// A predicate on one column.
-  record column-predicate { column: string, test: compare }
-  /// A flat boolean combination (nested trees stay on raw SQL).
-  variant predicate {
-    all(list<column-predicate>),   // AND
-    any(list<column-predicate>),   // OR
-  }
-
   enum agg { count, sum, avg, min, max }
-  /// A SELECT-list entry: a plain column, or an aggregate over a column ("*" for count(*)).
-  variant projection {
-    column(string),
-    aggregate(tuple<agg, string>),
-  }
-
+  enum bin-op { add, sub, mul, div, modulo }
+  // (`lower`/`upper` are spelled `*-case` to avoid colliding with wasmtime's ComponentType
+  // `Lower` associated item in the generated bindings.)
+  enum scalar-func { lower-case, upper-case, length, trim, abs, round, coalesce, now }
+  enum cmp-op { eq, ne, lt, le, gt, ge }
   enum join-kind { inner, left-join }
-  /// `<kind> JOIN <table> ON <left-column> = <table>.<right-column>`.
-  record join {
-    kind: join-kind,
-    table: string,
-    left-column: string,
-    right-column: string,
+  enum direction { asc, desc }
+
+  // ---- expression arena ----------------------------------------------------
+  // Recursive scalar expressions cross the WIT boundary as a flat arena: an `expr-node`'s
+  // children are indices into the query's `exprs` list. A child index is ALWAYS strictly
+  // less than its parent's, so the arena is acyclic + bounds-checkable and the host rebuilds
+  // the tree without trusting the guest (an out-of-range or forward index is rejected).
+  record agg-node { agg: agg, arg: u32 }
+  record binary-node { op: bin-op, left: u32, right: u32 }
+  record call-node { which: scalar-func, args: list<u32> }
+  record json-node { base: u32, path: list<string> }   // path keys => `$.a.b` / `#>>'{a,b}'`
+  variant expr-node {
+    column(string),
+    literal(value),
+    star,                       // valid only as the count(*) argument
+    aggregate(agg-node),
+    binary(binary-node),
+    call(call-node),
+    json-extract(json-node),
   }
 
-  enum direction { asc, desc }
-  record order-by { column: string, dir: direction }
+  // ---- predicate arena -----------------------------------------------------
+  // Boolean predicates are a second arena. `conj`/`disj`/`negate` reference `preds` by index
+  // (again strictly-lower => acyclic); the scalar fields reference `exprs`.
+  record compare-node { left: u32, op: cmp-op, right: u32 }
+  record between-node { expr: u32, low: u32, high: u32, negated: bool }
+  record in-node { expr: u32, values: list<u32>, negated: bool }
+  record like-node { expr: u32, pattern: string, insensitive: bool, negated: bool }
+  record null-node { expr: u32, negated: bool }
+  variant pred-node {
+    conj(list<u32>),            // AND
+    disj(list<u32>),            // OR
+    negate(u32),                // NOT
+    compare(compare-node),
+    between(between-node),
+    within(in-node),            // IN
+    matches(like-node),         // LIKE
+    is-null(null-node),
+  }
 
+  record select-item { expr: u32, alias: option<string> }
+  record order-term { expr: u32, dir: direction }
+  /// `<kind> JOIN <table>[ AS <alias>] ON <preds[on]>`.
+  record join { kind: join-kind, table: string, alias: option<string>, on: u32 }
   /// An optional in-site row-tenancy scope: `column = value` (conjoined on read/update,
   /// forced on insert). The project/database boundary is separate (the opened database).
   record scope { column: string, value: value }
 
-  record select {
+  record select-query {
+    exprs: list<expr-node>,
+    preds: list<pred-node>,
     table: string,
-    columns: list<projection>,   // empty => SELECT *
+    table-alias: option<string>,
+    columns: list<select-item>,   // empty => SELECT *
     joins: list<join>,
-    filter: option<predicate>,
+    filter: option<u32>,          // pred index
     scope: option<scope>,
+    group-by: list<u32>,          // expr indices
+    having: option<u32>,          // pred index
     distinct: bool,
-    order: list<order-by>,
+    order: list<order-term>,
     limit: option<u32>,
     offset: option<u32>,
   }
 
-  record assignment { column: string, value: value }
+  record assignment { column: string, value: u32 }   // value = expr index
   record row-values { cells: list<assignment> }
   /// ON CONFLICT (<conflict-columns>) DO UPDATE SET <update> (empty update => DO NOTHING).
-  record on-conflict {
-    conflict-columns: list<string>,
-    update: list<assignment>,
-  }
-  record insert {
+  record on-conflict { conflict-columns: list<string>, update: list<assignment> }
+  record insert-query {
+    exprs: list<expr-node>,       // insert has no predicates, only cell/upsert expressions
     table: string,
     rows: list<row-values>,
     conflict: option<on-conflict>,
     scope: option<scope>,
+    returning: list<select-item>,
   }
   /// `filter` is required — an unbounded update is refused.
-  record update {
+  record update-query {
+    exprs: list<expr-node>,
+    preds: list<pred-node>,
     table: string,
     set: list<assignment>,
-    filter: predicate,
+    filter: u32,                  // pred index
     scope: option<scope>,
+    returning: list<select-item>,
   }
 
   /// A handle to one of the site's named databases (same model as `sql-query`).
   resource database {
-    select: func(q: select) -> result<query-result, error>;
-    insert: func(q: insert) -> result<u64, error>;
-    update: func(q: update) -> result<u64, error>;
+    select: func(q: select-query) -> result<query-result, error>;
+    insert: func(q: insert-query) -> result<u64, error>;
+    update: func(q: update-query) -> result<u64, error>;
   }
 
   open: func(name: string) -> result<database, error>;
