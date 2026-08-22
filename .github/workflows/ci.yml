@@ -102,33 +102,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # A transitive TLS backend (aws-lc-rs) can want cmake/nasm. Both are
-      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
-      # unless they're genuinely missing.
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
+      # Lint the SHIPPED musl target via cargo-zigbuild's clippy subcommand (it owns the
+      # C-dep cross-compile + arg translation). A lean fs+SlateDB slice for fast feedback;
+      # the full default set is clippy'd nightly, the serve union in `feature-clippy`.
+      - uses: ./.github/actions/setup-musl
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: clippy
+          key: clippy-musl
 
-      # Clippy is a (largely) target-agnostic LINT, so it runs on the host glibc for
-      # speed; the *musl compilation* of the same code is covered by the `test` lanes,
-      # which build via cargo-zigbuild for x86_64-musl. (cargo-zigbuild has no clippy
-      # subcommand, and plain `cargo clippy --target musl` can't cross-compile the C
-      # deps — aws-lc-sys/ring — cleanly.) A lean fs+SlateDB slice for fast feedback;
-      # the full default set is clippy'd nightly, the serve union in `feature-clippy`.
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --no-default-features --features boatramp/fs,boatramp/slatedb -- -D warnings
+      - name: Clippy (musl)
+        run: cargo-zigbuild clippy --target x86_64-unknown-linux-musl --workspace --all-targets --no-default-features --features boatramp/fs,boatramp/slatedb -- -D warnings
 
   feature-clippy:
     name: clippy (serve feature union)
@@ -136,22 +122,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # `tls` pulls aws-lc-rs (cmake/nasm); both are preinstalled on the runner.
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: feature-clippy
+          key: feature-clippy-musl
 
       # The CLI's `serve` dispatch is cfg-gated per TLS/cluster feature — the
       # `match args.tls` arms and the `serve::Error` `#[from]` variants differ by
@@ -162,26 +139,27 @@ jobs:
       # to catch it in the PR gate. This is a light slice — no wasmtime/handlers, no
       # cloud-signer SDKs, no s3/compute — so it stays quick; the full
       # `--all-features` clippy + test remains the nightly backstop.
-      - name: Clippy (cluster + tls + acme-dns)
-        run: cargo clippy -p boatramp --no-default-features --features cluster,tls,acme-dns --all-targets -- -D warnings
+      - name: Clippy (cluster + tls + acme-dns, musl)
+        run: cargo-zigbuild clippy --target x86_64-unknown-linux-musl -p boatramp --no-default-features --features cluster,tls,acme-dns --all-targets -- -D warnings
 
   helm-chart:
     name: operator Helm chart (lint + CRD drift)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          key: helm-chart
+          key: helm-chart-musl
       - uses: azure/setup-helm@v4
 
       # The chart's `crds/` are single-sourced from the Rust CRD types. Fail if the
       # checked-in copy has drifted from what the binary emits (regenerate with
       # `boatramp operator crds > charts/boatramp-operator/crds/boatramp-crds.yaml`).
+      # Built + run on the shipped musl target (the static binary runs natively).
       - name: CRDs match the Rust types
         run: |
-          cargo run -p boatramp --no-default-features --features operator -- operator crds > /tmp/crds.yaml
+          cargo-zigbuild run --target x86_64-unknown-linux-musl -p boatramp --no-default-features --features operator -- operator crds > /tmp/crds.yaml
           diff -u charts/boatramp-operator/crds/boatramp-crds.yaml /tmp/crds.yaml
 
       # The operator unit tests (CRD drift guard + the least-privilege ClusterRole pin)
@@ -189,7 +167,7 @@ jobs:
       # chart-vs-types drift must fail a push, not a nightly. Reuses the build above.
       - name: operator unit tests
         run: |
-          cargo test -p boatramp --no-default-features --features operator operator::
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp --no-default-features --features operator operator::
 
       - name: Lint + render the chart
         run: |
@@ -300,27 +278,28 @@ jobs:
   coverage-gate:
     name: coverage ratchet (llvm-cov)
     runs-on: ubuntu-latest
+    # cargo-llvm-cov has no cargo-zigbuild subcommand, so point CC/CXX + the target
+    # linker at the `cargo-zigbuild zig cc` translating wrappers (installed by
+    # setup-musl) and run llvm-cov against the musl target. The instrumented static
+    # binaries run natively on the x86_64 runner.
+    env:
+      CC_x86_64_unknown_linux_musl: zig-musl-cc
+      CXX_x86_64_unknown_linux_musl: zig-musl-cxx
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: zig-musl-cc
     steps:
       - uses: actions/checkout@v5
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
-          key: coverage-gate
+          key: coverage-gate-musl
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Coverage must not drop below the baseline
         run: |
           baseline="$(cat .github/coverage-baseline)"
           echo "line-coverage floor: ${baseline}%"
-          cargo llvm-cov -p boatramp-server --features handlers --summary-only \
+          cargo llvm-cov --target x86_64-unknown-linux-musl -p boatramp-server --features handlers --summary-only \
             --fail-under-lines "${baseline}" | tee coverage-summary.txt
       - uses: actions/upload-artifact@v4
         if: always()

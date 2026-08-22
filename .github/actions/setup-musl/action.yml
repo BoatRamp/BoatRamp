@@ -1,14 +1,16 @@
 name: Set up cargo-zigbuild (musl target)
 description: >-
   Rust stable with the x86_64-unknown-linux-musl target plus zig + cargo-zigbuild, so a
-  lane can compile + run the *shipped* musl artifact via `cargo-zigbuild {build,test}
-  --target x86_64-unknown-linux-musl`. cargo-zigbuild owns the C-dep cross-compile
-  (aws-lc-sys, ring, sqlite) and the incompatible-arg Rust link — do NOT set CC/linker
-  env yourself, it shadows cargo-zigbuild's own wrappers. Static x86_64-musl test
-  binaries run natively on the x86_64 runner, so no emulator is needed.
+  lane can compile/lint/test/run the *shipped* musl artifact. Use the cargo-zigbuild
+  subcommands (`cargo-zigbuild {clippy,test,run,check} --target x86_64-unknown-linux-musl`)
+  — they own the C-dep cross-compile (aws-lc-sys, ring, sqlite) and the incompatible-arg
+  Rust link. For a tool without a cargo-zigbuild subcommand (cargo-llvm-cov), point CC/CXX
+  and CARGO_TARGET_*_LINKER at the /usr/local/bin/zig-musl-{cc,cxx} wrappers this action
+  installs (they wrap `cargo-zigbuild zig cc`, which does the target/arg translation).
+  Static x86_64-musl binaries run natively on the x86_64 runner — no emulator needed.
 inputs:
   components:
-    description: Extra rustup components (comma-separated), e.g. "llvm-tools-preview".
+    description: Extra rustup components (comma-separated), e.g. "clippy" or "llvm-tools-preview".
     required: false
     default: ""
 runs:
@@ -52,3 +54,22 @@ runs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-zigbuild
+
+    # Target-translating cc/c++ wrappers for tools that have NO cargo-zigbuild subcommand
+    # (cargo-llvm-cov): `cargo-zigbuild zig cc` rewrites cc-rs's rust-triple `--target`
+    # and filters the flags zig rejects — the same translation cargo-zigbuild's own
+    # subcommands do internally. Only lanes that opt in (by setting CC/linker to these)
+    # use them; the subcommand lanes are unaffected.
+    - name: Install zig-cc translating wrappers (for cargo-llvm-cov)
+      shell: bash
+      run: |
+        set -eo pipefail
+        sudo tee /usr/local/bin/zig-musl-cc >/dev/null <<'EOF'
+        #!/bin/sh
+        exec cargo-zigbuild zig cc -- -target x86_64-linux-musl "$@"
+        EOF
+        sudo tee /usr/local/bin/zig-musl-cxx >/dev/null <<'EOF'
+        #!/bin/sh
+        exec cargo-zigbuild zig c++ -- -target x86_64-linux-musl "$@"
+        EOF
+        sudo chmod +x /usr/local/bin/zig-musl-cc /usr/local/bin/zig-musl-cxx
