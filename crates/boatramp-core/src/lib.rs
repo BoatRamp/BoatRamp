@@ -40,6 +40,8 @@ pub mod migrate;
 pub mod mode;
 pub mod project;
 pub mod sql;
+/// A typed query AST + injection-safe `?N` SQL compiler backing the `orm` handler binding.
+pub mod orm;
 /// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
 pub mod time;
 

@@ -1,0 +1,117 @@
+// boatramp:handlers/orm — a typed query interface for handlers, a host-side front-end to
+// the GraphQL Data Connector's SQL compiler (crates/boatramp-server/src/graphql_data).
+//
+// DESIGN (v0 draft — see docs/DISCOVERY-orm-wit.md):
+//   - Reuses `sql-types` (value / row / query-result / error) verbatim.
+//   - The host LOWERS these typed ops onto the GDC `compile.rs` primitives, so it inherits:
+//       * always-bound parameters (injection-safe),
+//       * multi-dialect output (Postgres `$N` / MySQL `?` / libsql `?N`),
+//       * unbounded UPDATE/DELETE refused.
+//
+// ISOLATION — two levels, do NOT conflate (see plans/PLAN-orm-wit.md §3):
+//   a) project = Workspace = tenant → DATABASE-LEVEL: `open(name)` returns a database bound
+//      to the project (host-selected, per-project DB). Automatic, identical to `sql-query`;
+//      a single-tenant Workspace needs nothing more, and callers pass NO project predicate.
+//   b) in-site multi-tenancy → ROW-LEVEL, OPTIONAL: when a table DECLARES a row policy
+//      (GDC `policy.rs`), the host conjoins it onto every access, bound from the request's
+//      verified claims, fail-closed (authoring-guide M4; → Uchron RLS). Applied host-side;
+//      callers pass NO tenant predicate. NOT forced — tables without a declared policy get
+//      no row filter. This discriminates an app's own sub-tenants WITHIN one project's DB,
+//      never Workspaces/projects themselves.
+//   - Covers the ~13 must-have features from the construens-app scan; the rare 5%
+//     (correlated subqueries, DISTINCT ON, CTEs, window fns, JSONB nesting, pgvector)
+//     stay on the raw `sql-query` escape hatch.
+
+interface orm {
+  use sql-types.{value, query-result, error};
+
+  // ---- predicates (the WHERE surface) --------------------------------------
+  // A comparison against a bound value, or a null/list test. `column` is validated
+  // against the table schema at compile time (unknown column => error).
+  variant compare {
+    eq(value),
+    ne(value),
+    lt(value),
+    le(value),
+    gt(value),
+    ge(value),
+    like(string),          // SQL LIKE pattern
+    in-list(list<value>),  // IN (?, ?, …) — parameterized (fixes the app's hardcoded-IN gap)
+    is-null,
+    is-not-null,
+  }
+  record column-predicate { column: string, test: compare }
+
+  // Boolean combination. Flat AND/OR of column predicates covers every observed query;
+  // nested boolean trees are deferred to the escape hatch until a real case needs them.
+  variant predicate {
+    all(list<column-predicate>),   // AND
+    any(list<column-predicate>),   // OR
+  }
+
+  // ---- projection (the SELECT list) ----------------------------------------
+  enum agg { count, sum, avg, min, max }
+  variant projection {
+    column(string),                 // a plain column
+    aggregate(tuple<agg, string>),  // e.g. sum("cost_minor"); count uses column "*"
+  }
+
+  // ---- joins ---------------------------------------------------------------
+  enum join-kind { inner, left }
+  record join {
+    kind: join-kind,
+    table: string,
+    // ON left.<left-column> = <table>.<right-column>
+    left-column: string,
+    right-column: string,
+  }
+
+  enum direction { asc, desc }
+  record order-by { column: string, dir: direction }
+
+  // ---- SELECT --------------------------------------------------------------
+  record select {
+    table: string,
+    columns: list<projection>,      // empty => all columns
+    joins: list<join>,
+    filter: option<predicate>,      // combined with the host tenant row-filter
+    distinct: bool,
+    order: list<order-by>,
+    limit: option<u32>,
+    %offset: option<u32>,
+  }
+
+  // ---- INSERT / UPSERT -----------------------------------------------------
+  record assignment { column: string, value: value }
+  record row-values { cells: list<assignment> }
+
+  // ON CONFLICT (<conflict-columns>) DO UPDATE SET <update> (empty update => DO NOTHING).
+  record on-conflict {
+    conflict-columns: list<string>,
+    update: list<assignment>,       // uses EXCLUDED.<col> when value is `null`? — TBD in impl
+  }
+  record insert {
+    table: string,
+    rows: list<row-values>,         // single- or multi-row
+    conflict: option<on-conflict>,  // upsert
+  }
+
+  // ---- UPDATE --------------------------------------------------------------
+  // A `filter` is REQUIRED (unbounded update refused, per the GDC write policy); the host
+  // also injects the tenant row-filter.
+  record update {
+    table: string,
+    %set: list<assignment>,
+    filter: predicate,
+  }
+
+  // ---- ops -----------------------------------------------------------------
+  // A handle to one of the site's named databases (same open() model as `sql-query`).
+  resource database {
+    run-select: func(q: select) -> result<query-result, error>;
+    run-insert: func(q: insert) -> result<u64, error>;  // affected rows
+    run-update: func(q: update) -> result<u64, error>;
+  }
+
+  open: func(name: string) -> result<database, error>;
+}
