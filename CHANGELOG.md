@@ -7,6 +7,20 @@ versions.
 
 ## [Unreleased]
 
+### Added
+- **Typed ORM query interface for handlers (`boatramp:handlers/orm`).** A handler that is
+  granted `sql` can now build queries as a typed AST — `select`/`insert`/`update` with
+  columns, joins, filters, ordering, pagination, aggregates, and upserts — instead of
+  writing SQL strings. The host compiles the AST to parameterised SQL (every identifier is
+  validated, every value is bound as a placeholder — there is no string interpolation, so a
+  guest cannot construct an injection), runs it on the same per-invocation transaction as the
+  raw `sql` binding, and returns typed rows. An optional row-`scope` predicate is folded into
+  every `WHERE`/`INSERT` for in-project sub-tenant isolation, and unbounded `update`s are
+  refused. Database-per-project isolation is unchanged — `open(name)` still selects one of the
+  site's granted databases. The compiler lives in `boatramp-core` (`orm`) so it is reused
+  rather than re-deriving the GraphQL data-connector's SQL builder, which is GraphQL-AST
+  coupled and layered above handlers.
+
 ## [0.2.16] - 2026-08-22
 
 ### Removed
