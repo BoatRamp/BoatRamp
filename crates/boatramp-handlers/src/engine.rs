@@ -555,6 +555,12 @@ impl HandlerEngine {
         bindings::sql::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::sql::SqlHost::new(&mut state.table, &mut state.sql)
         })?;
+        // The typed `orm` binding shares the same per-invocation SQL session (backends +
+        // transactions) as the raw `sql` binding above.
+        #[cfg(feature = "sql")]
+        bindings::orm::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::orm::OrmHost::new(&mut state.table, &mut state.sql)
+        })?;
         #[cfg(feature = "messaging")]
         bindings::messaging::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::messaging::MessagingHost::new(state.bindings.messaging())

@@ -29,6 +29,8 @@ pub mod keyvalue;
 #[cfg(feature = "messaging")]
 pub mod messaging;
 #[cfg(feature = "sql")]
+pub mod orm;
+#[cfg(feature = "sql")]
 pub mod sql;
 pub mod wasi_logging;
 

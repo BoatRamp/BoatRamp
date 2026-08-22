@@ -68,32 +68,35 @@ impl SqlSession {
         }
     }
 
-    /// Whether a database is granted under `name`.
-    fn granted(&self, name: &str) -> bool {
+    /// Whether a database is granted under `name`. `pub(super)` so the sibling `orm`
+    /// binding (which shares this session) can perform the same grant check.
+    pub(super) fn granted(&self, name: &str) -> bool {
         self.backends.contains_key(name)
     }
 
     /// The open transaction for `(name, read_only)`, beginning one on first use.
     /// A read-only transaction is begun via [`SqlBackend::begin_read_only`], so a
-    /// replica-configured backend can route it to the replica.
-    async fn txn(
+    /// replica-configured backend can route it to the replica. Returns the **core**
+    /// [`SqlError`] (not a WIT error) so both the `sql` and `orm` bindings — which share
+    /// one session — can wrap it into their own generated `error` variant. `pub(super)`
+    /// for the same sharing reason.
+    pub(super) async fn txn(
         &mut self,
         name: &str,
         read_only: bool,
-    ) -> Result<&mut dyn SqlTransaction, sql_types::Error> {
+    ) -> Result<&mut dyn SqlTransaction, SqlError> {
         let key = (name.to_string(), read_only);
         if !self.txns.contains_key(&key) {
             let backend = self
                 .backends
                 .get(name)
-                .ok_or_else(|| not_granted(name))?
+                .ok_or_else(|| SqlError::Other(format!("sql database {name:?} not granted")))?
                 .clone();
             let txn = if read_only {
                 backend.begin_read_only().await
             } else {
                 backend.begin().await
-            }
-            .map_err(to_wit_error)?;
+            }?;
             self.txns.insert(key.clone(), txn);
         }
         Ok(self.txns.get_mut(&key).expect("inserted above").as_mut())
@@ -165,7 +168,7 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
         let params = to_values(params);
-        let txn = self.session.txn(&name, read_only).await?;
+        let txn = self.session.txn(&name, read_only).await.map_err(to_wit_error)?;
         let rows = txn.query(&statement, &params).await.map_err(to_wit_error)?;
         Ok(sql_types::QueryResult {
             columns: rows.columns,
@@ -191,7 +194,7 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
         let params = to_values(params);
-        let txn = self.session.txn(&name, read_only).await?;
+        let txn = self.session.txn(&name, read_only).await.map_err(to_wit_error)?;
         txn.execute(&statement, &params).await.map_err(to_wit_error)
     }
 

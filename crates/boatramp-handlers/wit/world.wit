@@ -94,6 +94,105 @@ world sql-host {
   import sql-query;
 }
 
+/// A typed query interface — the host compiles it to injection-safe `?N` SQL and runs it
+/// through the same per-invocation transaction as `sql-query` (so a handler may mix the two
+/// on one database). Reuses `sql-types`. Covers the common shapes; anything it can't express
+/// (correlated subqueries, DISTINCT ON, CTEs, JSON paths, …) stays on raw `sql-query`.
+interface orm {
+  use sql-types.{value, row, query-result, error};
+
+  /// A comparison of a column against a bound value, or a null/list test.
+  variant compare {
+    eq(value),
+    ne(value),
+    lt(value),
+    le(value),
+    gt(value),
+    ge(value),
+    like(string),          // SQL LIKE pattern (bound as a parameter)
+    in-list(list<value>),  // IN (…) — each value bound; empty list matches nothing
+    is-null,
+    is-not-null,
+  }
+  /// A predicate on one column.
+  record column-predicate { column: string, test: compare }
+  /// A flat boolean combination (nested trees stay on raw SQL).
+  variant predicate {
+    all(list<column-predicate>),   // AND
+    any(list<column-predicate>),   // OR
+  }
+
+  enum agg { count, sum, avg, min, max }
+  /// A SELECT-list entry: a plain column, or an aggregate over a column ("*" for count(*)).
+  variant projection {
+    column(string),
+    aggregate(tuple<agg, string>),
+  }
+
+  enum join-kind { inner, left-join }
+  /// `<kind> JOIN <table> ON <left-column> = <table>.<right-column>`.
+  record join {
+    kind: join-kind,
+    table: string,
+    left-column: string,
+    right-column: string,
+  }
+
+  enum direction { asc, desc }
+  record order-by { column: string, dir: direction }
+
+  /// An optional in-site row-tenancy scope: `column = value` (ANDed on read/update,
+  /// forced on insert). The project/database boundary is separate (the opened database).
+  record scope { column: string, value: value }
+
+  record select {
+    table: string,
+    columns: list<projection>,   // empty => SELECT *
+    joins: list<join>,
+    filter: option<predicate>,
+    scope: option<scope>,
+    distinct: bool,
+    order: list<order-by>,
+    limit: option<u32>,
+    offset: option<u32>,
+  }
+
+  record assignment { column: string, value: value }
+  record row-values { cells: list<assignment> }
+  /// ON CONFLICT (<conflict-columns>) DO UPDATE SET <update> (empty update => DO NOTHING).
+  record on-conflict {
+    conflict-columns: list<string>,
+    update: list<assignment>,
+  }
+  record insert {
+    table: string,
+    rows: list<row-values>,
+    conflict: option<on-conflict>,
+    scope: option<scope>,
+  }
+  /// `filter` is required — an unbounded update is refused.
+  record update {
+    table: string,
+    set: list<assignment>,
+    filter: predicate,
+    scope: option<scope>,
+  }
+
+  /// A handle to one of the site's named databases (same model as `sql-query`).
+  resource database {
+    select: func(q: select) -> result<query-result, error>;
+    insert: func(q: insert) -> result<u64, error>;
+    update: func(q: update) -> result<u64, error>;
+  }
+
+  open: func(name: string) -> result<database, error>;
+}
+
+/// The orm capability world.
+world orm-host {
+  import orm;
+}
+
 /// Value types for the `wasi:messaging`-shaped capability. Deliberately small:
 /// a message is a topic + opaque bytes. Topics are
 /// namespaced by the host per (site, alias) with preview isolation — a guest
