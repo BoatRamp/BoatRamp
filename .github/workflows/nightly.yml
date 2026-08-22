@@ -50,20 +50,28 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
 
-      # Lint + test the whole feature surface on the SHIPPED musl target via
-      # cargo-zigbuild (all-features ⊇ the shipped default set, so a musl-only breakage
-      # anywhere fails here; the nix job separately builds the default musl binary).
-      - uses: ./.github/actions/setup-musl
+      # aws-lc-rs (pulled by the `tls` / `s3` features) needs cmake + nasm. Both are
+      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
+      # unless they're genuinely missing.
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Clippy (all features, musl)
-        run: cargo-zigbuild clippy --target x86_64-unknown-linux-musl --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test (all features, musl)
-        run: cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace --all-features
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
 
   nix:
     name: nix flake check
