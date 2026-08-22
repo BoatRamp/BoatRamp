@@ -228,33 +228,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
+      # Compile + run this feature-gated surface on the SHIPPED musl target.
+      - uses: ./.github/actions/setup-musl
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-server-features
+          key: test-server-features-musl
 
       - name: Test (handlers + oidc + mcp + compression + dns-verify)
-        run: cargo test -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns
+        run: cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server --features handlers,oidc,mcp,compression,domain-verify-dns
 
       # Tripwire: fail if this lane's test count drops below the committed floor. A
       # `#[cfg]`/feature-gate mistake that silently drops a whole module shrinks the
       # count — which is how the GraphQL surface once went dark — so a shrink fails the
       # gate rather than passing quietly. Adding tests raises the floor (bump the file).
+      # Reuses the musl build above; `-- --list` only enumerates test names.
       - name: Test-count tripwire (no silent drop)
         run: |
           set -eo pipefail
           # shellcheck disable=SC1091
           . .github/test-count-baseline
-          live=$(cargo test -p boatramp-server \
+          live=$(cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-server \
             --features handlers,oidc,mcp,compression,domain-verify-dns \
             -- --list 2>/dev/null | grep -cE ': test$')
           echo "server-features tests: live=$live floor=$SERVER_FEATURES_MIN"
@@ -274,12 +268,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-cluster
+          key: test-cluster-musl
       - name: Test (raft + http)
-        run: cargo test -p boatramp-cluster --features raft,http
+        run: cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-cluster --features raft,http
 
   deny:
     name: cargo-deny

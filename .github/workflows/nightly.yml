@@ -50,18 +50,10 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
 
-      # aws-lc-rs (pulled by the `tls` / `s3` features) needs cmake + nasm. Both are
-      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
-      # unless they're genuinely missing.
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
+      # Set up the musl target + cargo-zigbuild (also brings cmake/nasm + the clippy
+      # component). Clippy still runs on the host glibc (target-agnostic lint, faster);
+      # the tests compile + run on the SHIPPED musl target.
+      - uses: ./.github/actions/setup-musl
         with:
           components: clippy
 
@@ -70,8 +62,10 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test (all features)
-        run: cargo test --workspace --all-features
+      # All-features ⊇ the shipped default set, so a musl-only breakage anywhere in the
+      # feature surface fails here (the nix job separately builds the default musl binary).
+      - name: Test (all features, musl)
+        run: cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace --all-features
 
   nix:
     name: nix flake check
