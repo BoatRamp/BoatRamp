@@ -9,17 +9,26 @@ versions.
 
 ### Added
 - **Typed ORM query interface for handlers (`boatramp:handlers/orm`).** A handler that is
-  granted `sql` can now build queries as a typed AST — `select`/`insert`/`update` with
-  columns, joins, filters, ordering, pagination, aggregates, and upserts — instead of
-  writing SQL strings. The host compiles the AST to parameterised SQL (every identifier is
-  validated, every value is bound as a placeholder — there is no string interpolation, so a
-  guest cannot construct an injection), runs it on the same per-invocation transaction as the
-  raw `sql` binding, and returns typed rows. An optional row-`scope` predicate is folded into
-  every `WHERE`/`INSERT` for in-project sub-tenant isolation, and unbounded `update`s are
-  refused. Database-per-project isolation is unchanged — `open(name)` still selects one of the
-  site's granted databases. The compiler lives in `boatramp-core` (`orm`) so it is reused
-  rather than re-deriving the GraphQL data-connector's SQL builder, which is GraphQL-AST
-  coupled and layered above handlers.
+  granted `sql` can build queries as a typed tree instead of writing SQL strings — and via the
+  shim, as a fluent chain (`db.query(t).select([...]).filter(and([col("x").eq(v), or([...])]))
+  .group_by([...]).having(..).order_by_desc(..).limit(n).run()`). The surface covers
+  **nested `AND`/`OR`/`NOT`** predicates, scalar **expressions** (arithmetic via `+ - * / %`, a
+  portable function set — `lower`/`upper`/`length`/`trim`/`abs`/`round`/`coalesce`/`now`, and
+  aggregates over expressions), **joins with aliases** and predicate `ON` conditions,
+  `GROUP BY`/`HAVING`, `BETWEEN`/`IN`/`NOT IN`/`LIKE`/case-insensitive `LIKE`/`IS NULL`,
+  `RETURNING`, upserts, and **JSON key-path extraction** rendered per-engine (`json_extract` on
+  SQLite/MySQL, `#>>` on Postgres). The host compiles it to parameterised SQL (every identifier
+  validated, every value bound as a placeholder, function names a closed enum — there is no
+  string interpolation, so a guest cannot construct an injection), for the target backend's
+  dialect, on the same per-invocation transaction as the raw `sql` binding. An optional row-
+  `scope` is folded into every `WHERE`/`INSERT` for in-project sub-tenant isolation, and an
+  unbounded `update` (empty filter, no scope) is refused. Database-per-project isolation is
+  unchanged — `open(name)` still selects one of the site's granted databases. The recursive
+  tree crosses the WIT boundary as a validated index-arena (a malformed/cyclic arena from the
+  guest is rejected, not trusted). The compiler lives in `boatramp-core` (`orm`) — reused
+  rather than re-deriving the GraphQL data-connector's SQL builder, which is GraphQL-AST coupled
+  and layered above handlers. Subqueries/CTEs/window functions remain on the raw `sql` escape
+  hatch.
 
 ## [0.2.16] - 2026-08-22
 
