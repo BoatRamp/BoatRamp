@@ -152,6 +152,13 @@ impl ComputeResolvedSqlBackend {
 
 #[async_trait]
 impl SqlBackend for ComputeResolvedSqlBackend {
+    fn dialect(&self) -> boatramp_core::sql::Dialect {
+        match self.kind {
+            ExternalSqlKind::Postgres => boatramp_core::sql::Dialect::Postgres,
+            ExternalSqlKind::Mysql => boatramp_core::sql::Dialect::Mysql,
+        }
+    }
+
     async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         self.pool().await?.begin().await
     }

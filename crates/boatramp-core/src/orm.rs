@@ -30,7 +30,7 @@
 //! guest-declared here (the shim's `Scoped` model); a host-enforced-from-claims variant is a
 //! later enhancement (see plans/PLAN-orm-wit.md §4).
 
-use crate::sql::SqlValue;
+use crate::sql::{Dialect, SqlValue};
 
 // ---- expressions -----------------------------------------------------------
 
@@ -126,6 +126,10 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// An allow-listed function call.
     Func(Func, Vec<Expr>),
+    /// Extract a text value from a JSON column by a key path (e.g. `["a", "b"]` ⇒ `$.a.b`).
+    /// Rendered per-dialect (SQLite/MySQL `json_extract`, Postgres `#>>`); each key is
+    /// validated as an identifier so the built path can't inject.
+    JsonExtract(Box<Expr>, Vec<String>),
 }
 
 impl Expr {
@@ -377,7 +381,7 @@ impl Params {
 }
 
 /// Render a scalar expression, binding any literals.
-fn render_expr(e: &Expr, params: &mut Params) -> Result<String, OrmError> {
+fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String, OrmError> {
     Ok(match e {
         Expr::Column(name) => ident(name)?.to_string(),
         Expr::Value(v) => params.bind(v.clone()),
@@ -390,16 +394,16 @@ fn render_expr(e: &Expr, params: &mut Params) -> Result<String, OrmError> {
             let arg = match inner.as_ref() {
                 Expr::Star if *agg == Agg::Count => "*".to_string(),
                 Expr::Star => return Err(OrmError::BadExpr("`*` is only valid as count(*)")),
-                other => render_expr(other, params)?,
+                other => render_expr(other, params, dialect)?,
             };
             format!("{}({arg})", agg.keyword())
         }
         Expr::Binary(op, l, r) => {
             format!(
                 "({} {} {})",
-                render_expr(l, params)?,
+                render_expr(l, params, dialect)?,
                 op.symbol(),
-                render_expr(r, params)?
+                render_expr(r, params, dialect)?
             )
         }
         Expr::Func(f, args) => {
@@ -411,16 +415,43 @@ fn render_expr(e: &Expr, params: &mut Params) -> Result<String, OrmError> {
                 // Nullary (`current_timestamp`) renders without parentheses (ANSI form).
                 name.to_string()
             } else {
-                let rendered: Result<Vec<String>, _> =
-                    args.iter().map(|a| render_expr(a, params)).collect();
+                let rendered: Result<Vec<String>, _> = args
+                    .iter()
+                    .map(|a| render_expr(a, params, dialect))
+                    .collect();
                 format!("{name}({})", rendered?.join(", "))
+            }
+        }
+        Expr::JsonExtract(inner, path) => {
+            if path.is_empty() {
+                return Err(OrmError::BadExpr("json extract needs at least one key"));
+            }
+            // Each key is validated as an identifier — the built path can't inject.
+            for k in path {
+                ident(k)?;
+            }
+            let base = render_expr(inner, params, dialect)?;
+            match dialect {
+                // Postgres: `(base) #>> '{a,b}'` — keys validated, safe to inline (there is
+                // no portable way to bind a `text[]` path here).
+                Dialect::Postgres => format!("({base}) #>> '{{{}}}'", path.join(",")),
+                // SQLite/MySQL: `json_extract(base, ?N)` with the `$.a.b` path bound.
+                Dialect::Sqlite | Dialect::Mysql => {
+                    let p = params.bind(SqlValue::Text(format!("$.{}", path.join("."))));
+                    format!("json_extract({base}, {p})")
+                }
             }
         }
     })
 }
 
 /// Render a predicate; `nested` parenthesizes a compound (`AND`/`OR`) so precedence is explicit.
-fn render_pred(p: &Predicate, params: &mut Params, nested: bool) -> Result<String, OrmError> {
+fn render_pred(
+    p: &Predicate,
+    params: &mut Params,
+    nested: bool,
+    dialect: Dialect,
+) -> Result<String, OrmError> {
     let compound = |body: String| {
         if nested {
             format!("({body})")
@@ -433,8 +464,10 @@ fn render_pred(p: &Predicate, params: &mut Params, nested: bool) -> Result<Strin
             if ps.is_empty() {
                 "1 = 1".to_string()
             } else {
-                let parts: Result<Vec<String>, _> =
-                    ps.iter().map(|c| render_pred(c, params, true)).collect();
+                let parts: Result<Vec<String>, _> = ps
+                    .iter()
+                    .map(|c| render_pred(c, params, true, dialect))
+                    .collect();
                 compound(parts?.join(" AND "))
             }
         }
@@ -442,17 +475,19 @@ fn render_pred(p: &Predicate, params: &mut Params, nested: bool) -> Result<Strin
             if ps.is_empty() {
                 "1 = 0".to_string()
             } else {
-                let parts: Result<Vec<String>, _> =
-                    ps.iter().map(|c| render_pred(c, params, true)).collect();
+                let parts: Result<Vec<String>, _> = ps
+                    .iter()
+                    .map(|c| render_pred(c, params, true, dialect))
+                    .collect();
                 compound(parts?.join(" OR "))
             }
         }
-        Predicate::Not(inner) => format!("NOT {}", render_pred(inner, params, true)?),
+        Predicate::Not(inner) => format!("NOT {}", render_pred(inner, params, true, dialect)?),
         Predicate::Cmp { left, op, right } => format!(
             "{} {} {}",
-            render_expr(left, params)?,
+            render_expr(left, params, dialect)?,
             op.symbol(),
-            render_expr(right, params)?
+            render_expr(right, params, dialect)?
         ),
         Predicate::Between {
             expr,
@@ -461,10 +496,10 @@ fn render_pred(p: &Predicate, params: &mut Params, nested: bool) -> Result<Strin
             negated,
         } => format!(
             "{} {}BETWEEN {} AND {}",
-            render_expr(expr, params)?,
+            render_expr(expr, params, dialect)?,
             if *negated { "NOT " } else { "" },
-            render_expr(low, params)?,
-            render_expr(high, params)?
+            render_expr(low, params, dialect)?,
+            render_expr(high, params, dialect)?
         ),
         Predicate::In {
             expr,
@@ -475,9 +510,11 @@ fn render_pred(p: &Predicate, params: &mut Params, nested: bool) -> Result<Strin
                 // `IN ()` is a syntax error; render the matching identity.
                 if *negated { "1 = 1" } else { "1 = 0" }.to_string()
             } else {
-                let lhs = render_expr(expr, params)?;
-                let ph: Result<Vec<String>, _> =
-                    values.iter().map(|v| render_expr(v, params)).collect();
+                let lhs = render_expr(expr, params, dialect)?;
+                let ph: Result<Vec<String>, _> = values
+                    .iter()
+                    .map(|v| render_expr(v, params, dialect))
+                    .collect();
                 format!(
                     "{lhs} {}IN ({})",
                     if *negated { "NOT " } else { "" },
@@ -492,20 +529,18 @@ fn render_pred(p: &Predicate, params: &mut Params, nested: bool) -> Result<Strin
             negated,
         } => {
             let neg = if *negated { "NOT " } else { "" };
+            let lhs = render_expr(expr, params, dialect)?;
+            let pat = params.bind(SqlValue::Text(pattern.clone()));
             if *insensitive {
                 // Portable case-insensitive LIKE (no dialect-specific ILIKE).
-                let lhs = render_expr(expr, params)?;
-                let pat = params.bind(SqlValue::Text(pattern.clone()));
                 format!("lower({lhs}) {neg}LIKE lower({pat})")
             } else {
-                let lhs = render_expr(expr, params)?;
-                let pat = params.bind(SqlValue::Text(pattern.clone()));
                 format!("{lhs} {neg}LIKE {pat}")
             }
         }
         Predicate::Null { expr, negated } => format!(
             "{} IS {}NULL",
-            render_expr(expr, params)?,
+            render_expr(expr, params, dialect)?,
             if *negated { "NOT " } else { "" }
         ),
     })
@@ -516,6 +551,7 @@ fn render_where(
     scope: Option<&Scope>,
     filter: Option<&Predicate>,
     params: &mut Params,
+    dialect: Dialect,
 ) -> Result<Option<String>, OrmError> {
     // Validate the scope column eagerly (its predicate is rendered below).
     if let Some(s) = scope {
@@ -529,18 +565,22 @@ fn render_where(
         (None, Some(f)) => f.clone(),
         (Some(s), Some(f)) => Predicate::And(vec![s.as_predicate(), f.clone()]),
     };
-    Ok(Some(render_pred(&combined, params, false)?))
+    Ok(Some(render_pred(&combined, params, false, dialect)?))
 }
 
 /// Render a select list (empty ⇒ `*`).
-fn render_select_items(items: &[SelectItem], params: &mut Params) -> Result<String, OrmError> {
+fn render_select_items(
+    items: &[SelectItem],
+    params: &mut Params,
+    dialect: Dialect,
+) -> Result<String, OrmError> {
     if items.is_empty() {
         return Ok("*".to_string());
     }
     let parts: Result<Vec<String>, _> = items
         .iter()
         .map(|it| {
-            let e = render_expr(&it.expr, params)?;
+            let e = render_expr(&it.expr, params, dialect)?;
             Ok::<String, OrmError>(match &it.alias {
                 Some(a) => format!("{e} AS {}", ident(a)?),
                 None => e,
@@ -551,13 +591,17 @@ fn render_select_items(items: &[SelectItem], params: &mut Params) -> Result<Stri
 }
 
 /// Render a `RETURNING` clause, if any.
-fn render_returning(items: &[SelectItem], params: &mut Params) -> Result<String, OrmError> {
+fn render_returning(
+    items: &[SelectItem],
+    params: &mut Params,
+    dialect: Dialect,
+) -> Result<String, OrmError> {
     if items.is_empty() {
         Ok(String::new())
     } else {
         Ok(format!(
             " RETURNING {}",
-            render_select_items(items, params)?
+            render_select_items(items, params, dialect)?
         ))
     }
 }
@@ -581,12 +625,12 @@ impl Select {
         }
     }
 
-    /// Compile to `?N` SQL + bound parameters.
-    pub fn compile(&self) -> Result<Compiled, OrmError> {
+    /// Compile to `?N` SQL + bound parameters for the given dialect.
+    pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
         let mut params = Params::default();
         let table = ident(&self.table)?;
 
-        let select_list = render_select_items(&self.columns, &mut params)?;
+        let select_list = render_select_items(&self.columns, &mut params, dialect)?;
         let distinct = if self.distinct { "DISTINCT " } else { "" };
         let mut sql = format!("SELECT {distinct}{select_list} FROM {table}");
         if let Some(a) = &self.table_alias {
@@ -603,10 +647,18 @@ impl Select {
             if let Some(a) = &j.alias {
                 sql.push_str(&format!(" AS {}", ident(a)?));
             }
-            sql.push_str(&format!(" ON {}", render_pred(&j.on, &mut params, false)?));
+            sql.push_str(&format!(
+                " ON {}",
+                render_pred(&j.on, &mut params, false, dialect)?
+            ));
         }
 
-        if let Some(w) = render_where(self.scope.as_ref(), self.filter.as_ref(), &mut params)? {
+        if let Some(w) = render_where(
+            self.scope.as_ref(),
+            self.filter.as_ref(),
+            &mut params,
+            dialect,
+        )? {
             sql.push_str(&format!(" WHERE {w}"));
         }
 
@@ -614,13 +666,16 @@ impl Select {
             let terms: Result<Vec<String>, _> = self
                 .group_by
                 .iter()
-                .map(|e| render_expr(e, &mut params))
+                .map(|e| render_expr(e, &mut params, dialect))
                 .collect();
             sql.push_str(&format!(" GROUP BY {}", terms?.join(", ")));
         }
 
         if let Some(h) = &self.having {
-            sql.push_str(&format!(" HAVING {}", render_pred(h, &mut params, false)?));
+            sql.push_str(&format!(
+                " HAVING {}",
+                render_pred(h, &mut params, false, dialect)?
+            ));
         }
 
         if !self.order.is_empty() {
@@ -628,7 +683,7 @@ impl Select {
                 .order
                 .iter()
                 .map(|o| {
-                    let e = render_expr(&o.expr, &mut params)?;
+                    let e = render_expr(&o.expr, &mut params, dialect)?;
                     let d = match o.dir {
                         Direction::Asc => "ASC",
                         Direction::Desc => "DESC",
@@ -651,8 +706,8 @@ impl Select {
 }
 
 impl Insert {
-    /// Compile to `?N` SQL + bound parameters.
-    pub fn compile(&self) -> Result<Compiled, OrmError> {
+    /// Compile to `?N` SQL + bound parameters for the given dialect.
+    pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
         if self.rows.is_empty() {
             return Err(OrmError::Empty("insert has no rows"));
         }
@@ -687,7 +742,7 @@ impl Insert {
                     ph.push(params.bind(self.scope.as_ref().unwrap().value.clone()));
                 } else {
                     match row.cells.iter().find(|a| &a.column == col) {
-                        Some(a) => ph.push(render_expr(&a.value, &mut params)?),
+                        Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
                         None => ph.push(params.bind(SqlValue::Null)),
                     }
                 }
@@ -721,7 +776,7 @@ impl Insert {
                         let c = ident(&a.column)?;
                         Ok::<String, OrmError>(format!(
                             "{c} = {}",
-                            render_expr(&a.value, &mut params)?
+                            render_expr(&a.value, &mut params, dialect)?
                         ))
                     })
                     .collect();
@@ -733,14 +788,15 @@ impl Insert {
             }
         }
 
-        sql.push_str(&render_returning(&self.returning, &mut params)?);
+        sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
         Ok((sql, params.0))
     }
 }
 
 impl Update {
-    /// Compile to `?N` SQL + bound parameters. An empty `filter` is refused (no unbounded update).
-    pub fn compile(&self) -> Result<Compiled, OrmError> {
+    /// Compile to `?N` SQL + bound parameters for the given dialect. An empty `filter` is
+    /// refused (no unbounded update).
+    pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
         if self.set.is_empty() {
             return Err(OrmError::Empty("update has no assignments"));
         }
@@ -753,17 +809,26 @@ impl Update {
             .iter()
             .map(|a| {
                 let c = ident(&a.column)?;
-                Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, &mut params)?))
+                Ok::<String, OrmError>(format!(
+                    "{c} = {}",
+                    render_expr(&a.value, &mut params, dialect)?
+                ))
             })
             .collect();
         let set_sql = sets?.join(", ");
 
-        let where_sql = render_where(self.scope.as_ref(), Some(&self.filter), &mut params)?.ok_or(
-            OrmError::Empty("update has an empty filter (unbounded update refused)"),
-        )?;
+        let where_sql = render_where(
+            self.scope.as_ref(),
+            Some(&self.filter),
+            &mut params,
+            dialect,
+        )?
+        .ok_or(OrmError::Empty(
+            "update has an empty filter (unbounded update refused)",
+        ))?;
 
         let mut sql = format!("UPDATE {table} SET {set_sql} WHERE {where_sql}");
-        sql.push_str(&render_returning(&self.returning, &mut params)?);
+        sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
         Ok((sql, params.0))
     }
 }
@@ -801,7 +866,7 @@ mod tests {
             limit: Some(10),
             ..Select::from("work_order")
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT id, state FROM work_order WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 10"
@@ -819,7 +884,7 @@ mod tests {
             }),
             ..Select::from("party")
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
@@ -853,7 +918,7 @@ mod tests {
             }),
             ..Select::from("order_to_network")
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT * FROM order_to_network WHERE tenant_id = ?1 AND (state IN (?2, ?3) AND (priority >= ?4 OR escalated = ?5) AND NOT archived = ?6)"
@@ -893,7 +958,7 @@ mod tests {
             }],
             ..Select::from("order_to_network")
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT network_id, sum(committed_minor) AS total FROM order_to_network GROUP BY network_id HAVING sum(committed_minor) > ?1 ORDER BY total DESC"
@@ -918,7 +983,7 @@ mod tests {
             filter: Some(cmp("order_id", CmpOp::Eq, SqlValue::Integer(7))),
             ..Select::from("order_to_network")
         };
-        let (sql, _) = q.compile().unwrap();
+        let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT count(*) FROM order_to_network JOIN element AS e ON order_to_network.element_id = e.id WHERE order_id = ?1"
@@ -949,7 +1014,7 @@ mod tests {
             ])),
             ..Select::from("invoice")
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT * FROM invoice WHERE amount BETWEEN ?1 AND ?2 AND lower(name) LIKE lower(?3) AND state NOT IN (?4)"
@@ -985,7 +1050,7 @@ mod tests {
             ],
             ..Select::from("account")
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "SELECT lower(email) AS email_lc, (qty * ?1), coalesce(nickname, ?2) FROM account"
@@ -1004,7 +1069,7 @@ mod tests {
             ..Select::from("t")
         };
         assert_eq!(
-            matches_none.compile().unwrap().0,
+            matches_none.compile(Dialect::Sqlite).unwrap().0,
             "SELECT * FROM t WHERE 1 = 0"
         );
         let matches_all = Select {
@@ -1016,7 +1081,7 @@ mod tests {
             ..Select::from("t")
         };
         assert_eq!(
-            matches_all.compile().unwrap().0,
+            matches_all.compile(Dialect::Sqlite).unwrap().0,
             "SELECT * FROM t WHERE 1 = 1"
         );
     }
@@ -1044,7 +1109,7 @@ mod tests {
             }),
             returning: vec![item(Expr::col("id"))],
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "INSERT INTO work_area (id, project_id, tenant_id) VALUES (?1, ?2, ?3) RETURNING id"
@@ -1079,13 +1144,13 @@ mod tests {
             column: "currency".into(),
             value: Expr::val(t("USD")),
         }])
-        .compile()
+        .compile(Dialect::Sqlite)
         .unwrap();
         assert_eq!(
             sql_do,
             "INSERT INTO country_pack (country, currency) VALUES (?1, ?2) ON CONFLICT (tenant_id, country) DO UPDATE SET currency = ?3"
         );
-        let (sql_nothing, _) = base(vec![]).compile().unwrap();
+        let (sql_nothing, _) = base(vec![]).compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql_nothing,
             "INSERT INTO country_pack (country, currency) VALUES (?1, ?2) ON CONFLICT (tenant_id, country) DO NOTHING"
@@ -1111,7 +1176,7 @@ mod tests {
             }),
             returning: vec![],
         };
-        let (sql, params) = q.compile().unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
             "UPDATE counter SET hits = (hits + ?1) WHERE tenant_id = ?2 AND id = ?3"
@@ -1125,7 +1190,10 @@ mod tests {
             columns: vec![item(Expr::col("id; DROP TABLE users"))],
             ..Select::from("t")
         };
-        assert!(matches!(q.compile(), Err(OrmError::InvalidIdentifier(_))));
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::InvalidIdentifier(_))
+        ));
     }
 
     #[test]
@@ -1134,7 +1202,7 @@ mod tests {
             columns: vec![item(Expr::col("t.id"))],
             ..Select::from("t")
         };
-        assert_eq!(q.compile().unwrap().0, "SELECT t.id FROM t");
+        assert_eq!(q.compile(Dialect::Sqlite).unwrap().0, "SELECT t.id FROM t");
     }
 
     #[test]
@@ -1143,7 +1211,10 @@ mod tests {
             columns: vec![item(Expr::Func(Func::Lower, vec![]))],
             ..Select::from("t")
         };
-        assert!(matches!(q.compile(), Err(OrmError::BadExpr(_))));
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
     }
 
     #[test]
@@ -1162,7 +1233,10 @@ mod tests {
         // guard is against a *missing* filter, which the type system already prevents
         // (filter is non-Option). Assert it compiles to the explicit always-true form so
         // the behavior is at least visible + intentional.
-        assert_eq!(q.compile().unwrap().0, "UPDATE t SET x = ?1 WHERE 1 = 1");
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap().0,
+            "UPDATE t SET x = ?1 WHERE 1 = 1"
+        );
     }
 
     #[test]
@@ -1171,6 +1245,64 @@ mod tests {
             columns: vec![item(Expr::Func(Func::Now, vec![]))],
             ..Select::from("t")
         };
-        assert_eq!(q.compile().unwrap().0, "SELECT current_timestamp FROM t");
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap().0,
+            "SELECT current_timestamp FROM t"
+        );
+    }
+
+    fn json_query() -> Select {
+        Select {
+            columns: vec![item(Expr::JsonExtract(
+                Box::new(Expr::col("metadata")),
+                vec!["status".into()],
+            ))],
+            filter: Some(Predicate::Cmp {
+                left: Expr::JsonExtract(
+                    Box::new(Expr::col("metadata")),
+                    vec!["a".into(), "b".into()],
+                ),
+                op: CmpOp::Eq,
+                right: Expr::val(t("x")),
+            }),
+            ..Select::from("doc")
+        }
+    }
+
+    #[test]
+    fn json_extract_sqlite_and_mysql_bind_the_path() {
+        for d in [Dialect::Sqlite, Dialect::Mysql] {
+            let (sql, params) = json_query().compile(d).unwrap();
+            assert_eq!(
+                sql,
+                "SELECT json_extract(metadata, ?1) FROM doc WHERE json_extract(metadata, ?2) = ?3"
+            );
+            assert_eq!(params, vec![t("$.status"), t("$.a.b"), t("x")]);
+        }
+    }
+
+    #[test]
+    fn json_extract_postgres_inlines_the_validated_path() {
+        let (sql, params) = json_query().compile(Dialect::Postgres).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (metadata) #>> '{status}' FROM doc WHERE (metadata) #>> '{a,b}' = ?1"
+        );
+        assert_eq!(params, vec![t("x")]);
+    }
+
+    #[test]
+    fn json_extract_key_injection_is_rejected() {
+        let q = Select {
+            columns: vec![item(Expr::JsonExtract(
+                Box::new(Expr::col("m")),
+                vec!["a'); DROP TABLE t--".into()],
+            ))],
+            ..Select::from("doc")
+        };
+        assert!(matches!(
+            q.compile(Dialect::Postgres),
+            Err(OrmError::InvalidIdentifier(_))
+        ));
     }
 }

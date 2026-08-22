@@ -388,6 +388,10 @@ mod postgres_backend {
 
     #[async_trait]
     impl SqlBackend for PgSqlBackend {
+        fn dialect(&self) -> boatramp_core::sql::Dialect {
+            boatramp_core::sql::Dialect::Postgres
+        }
+
         async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             begin_on(&self.pool, self.read_only).await
         }
@@ -617,6 +621,10 @@ mod mysql_backend {
 
     #[async_trait]
     impl SqlBackend for MySqlSqlBackend {
+        fn dialect(&self) -> boatramp_core::sql::Dialect {
+            boatramp_core::sql::Dialect::Mysql
+        }
+
         async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             begin_on(&self.pool, self.read_only).await
         }

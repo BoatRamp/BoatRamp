@@ -75,6 +75,19 @@ impl SqlError {
     }
 }
 
+/// The SQL dialect a backend speaks. The `orm` compiler is `?N`-portable for almost
+/// everything (the backend rewrites the placeholders), and only consults this for the
+/// handful of constructs whose *syntax* genuinely differs across engines — currently JSON
+/// extraction (`json_extract(...)` on SQLite/MySQL vs `#>>` on Postgres).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// SQLite family (libsql). The default.
+    #[default]
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
 /// A per-site SQL backend (libsql — a local file or a remote sqld namespace).
 ///
 /// One instance serves one site. The handler engine calls [`begin`] once per
@@ -84,6 +97,13 @@ impl SqlError {
 /// [`begin`]: SqlBackend::begin
 #[async_trait]
 pub trait SqlBackend: Send + Sync {
+    /// The SQL dialect this backend speaks — used by the `orm` compiler for the few
+    /// dialect-divergent constructs (e.g. JSON extraction). Defaults to SQLite-family
+    /// (libsql); the Postgres/MySQL backends override it.
+    fn dialect(&self) -> Dialect {
+        Dialect::Sqlite
+    }
+
     /// Open a new read-write transaction. Backends are free to draw the
     /// underlying connection from a pool, a fresh embedded connection, or a
     /// remote session. Writes always land on the primary.
