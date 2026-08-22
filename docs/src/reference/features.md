@@ -44,7 +44,7 @@ Some features imply others: `http3`/`acme-dns` imply `tls`; `cluster` implies
 | `signer-pkcs11` | yes | External token signer backed by a PKCS#11 HSM. |
 | `compression` | yes | On-the-fly response compression, opt-in per site. |
 | `bundler` | yes | The in-process JS/TS + CSS bundler for `boatramp bundle`. |
-| `handlers` | yes | The wasmtime handler engine, component validation at `sync`, and the `sql` handler binding. |
+| `handlers` | yes | The wasmtime handler engine, component validation at `sync`, and the `sql` handler binding (with the typed [`orm`](../how-to/handler-bindings.md#typed-queries-with-the-orm-builder) query builder over the same databases). |
 | `cluster` | yes | Self-hosted Raft cluster mode. Implies `handlers` and `slatedb`. |
 | `sql-postgres` | yes | External (bring-your-own) PostgreSQL for the handler `sql` binding, opened by name. Implies `handlers`. |
 | `sql-mysql` | yes | External (bring-your-own) MySQL/MariaDB for the handler `sql` binding, opened by name. Implies `handlers`. |

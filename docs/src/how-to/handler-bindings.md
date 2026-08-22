@@ -34,6 +34,9 @@ site does not permit is refused at activation.
   schema separation, so one site's tables never collide with another's. Use it
   for relational data and queries. You can also point a name at your own external
   Postgres/MySQL — see [Bring your own database](#bring-your-own-database-external-postgres--mysql).
+  For most queries you can build them with the typed
+  [`orm` builder](#typed-queries-with-the-orm-builder) instead of writing SQL
+  strings — same databases, same transaction, injection-safe.
 - **`wasi:blobstore`** — per-site blob storage over the server's `Storage`
   backend, key-prefixed per site. Use it for uploaded files and generated
   artifacts too large for the key/value store.
@@ -307,6 +310,48 @@ Two requirements make this safe and durable:
   database on first init, so the data directory must survive restarts for it to
   keep accepting the same credential. See
   [persistent volumes](./compute.md).
+
+## Typed queries with the `orm` builder
+
+The `orm` binding is a **typed, injection-safe, tenant-scoped query builder** over the
+*same* databases as `sql` — you build a query as a value instead of writing a SQL string,
+and the host compiles it to parameterised SQL for whichever engine backs the database
+(libsql, Postgres, or MySQL). It rides the **`sql` grant**: no separate import token, no
+separate backend config. A handler granted `sql` (or `sql:<name>`) opens the same database
+with `orm.open(name)` that it would with `sql.open(name)`, on the **same transaction** — so
+you can mix the two freely, and `orm.open` on an ungranted name fails closed exactly like
+`sql.open`.
+
+It covers the common shapes safely: nested `AND`/`OR`/`NOT`, joins with aliases, aggregates
+with `GROUP BY`/`HAVING`, `BETWEEN`/`IN`/`LIKE`/`IS NULL`, arithmetic + a portable function
+set, `RETURNING`, upserts, and JSON key-path extraction (rendered per engine). Every value
+is a bound parameter and every identifier is validated, so a query **cannot** construct an
+injection; an unbounded `UPDATE` (no filter, no scope) is refused. Reach for raw `sql` only
+for what the builder doesn't model — subqueries, CTEs, window functions, `DISTINCT ON`.
+
+```rust
+// Same database + transaction as `sql.open("")`; the scope is folded into every query.
+let db = orm::open("")?.scoped("tenant_id", tenant);
+
+let rows = db.query("work_order")
+    .select([col("id"), col("state")])
+    .filter(and([
+        col("project_id").eq(project_id),
+        or([col("priority").ge(3), col("escalated").eq(true)]),
+    ]))
+    .order_by_desc("created_at")
+    .limit(20)
+    .run()?;
+// SELECT id, state FROM work_order
+// WHERE tenant_id = ?1 AND (project_id = ?2 AND (priority >= ?3 OR escalated = ?4))
+// ORDER BY created_at DESC LIMIT 20
+```
+
+The builder is provided by the authoring kit (the
+[boatramp-uchron-shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim) `compat::orm`
+module) behind its off-by-default `orm` cargo feature — turn it on only against a boatramp
+that ships the `orm` interface. See that kit's authoring guide for the full surface
+(inserts, upserts, `RETURNING`, JSON, expressions).
 
 See the [boatramp.cfg schema](../reference/boatramp-cfg.md#external-sql-databases)
 for the full field list and [Cargo features](../reference/features.md) for the
