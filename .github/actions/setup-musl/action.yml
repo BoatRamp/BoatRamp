@@ -29,12 +29,22 @@ runs:
         targets: x86_64-unknown-linux-musl
         components: ${{ inputs.components }}
 
-    # Pin an established Zig release: `latest` resolved to a just-cut version whose
-    # mirrors 404/502'd, failing the job. A pinned stable release is reproducible and
-    # reliably mirrored, and is a version current cargo-zigbuild supports.
-    - uses: mlugg/setup-zig@v1
-      with:
-        version: 0.14.1
+    # Install Zig from PyPI, not the community mirrors. `mlugg/setup-zig` (and the
+    # ziglang mirror network) intermittently 404/502/503 — every mirror + the official
+    # /builds path failed a run — whereas the `ziglang` PyPI wheel bundles the toolchain
+    # and PyPI is reliable. A `zig` shim on PATH (→ `python3 -m ziglang`) then serves
+    # both cargo-zigbuild's auto-detection and the cc wrappers below.
+    - name: Install Zig (PyPI ziglang) + a `zig` shim
+      shell: bash
+      run: |
+        set -eo pipefail
+        pip3 install --break-system-packages "ziglang==0.14.1"
+        sudo tee /usr/local/bin/zig >/dev/null <<'EOF'
+        #!/bin/sh
+        exec python3 -m ziglang "$@"
+        EOF
+        sudo chmod +x /usr/local/bin/zig
+        zig version
 
     - name: Install cargo-zigbuild
       uses: taiki-e/install-action@v2
