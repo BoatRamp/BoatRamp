@@ -29,7 +29,12 @@ runs:
         targets: x86_64-unknown-linux-musl
         components: ${{ inputs.components }}
 
+    # Pin an established Zig release: `latest` resolved to a just-cut version whose
+    # mirrors 404/502'd, failing the job. A pinned stable release is reproducible and
+    # reliably mirrored, and is a version current cargo-zigbuild supports.
     - uses: mlugg/setup-zig@v1
+      with:
+        version: 0.14.1
 
     - name: Install cargo-zigbuild
       uses: taiki-e/install-action@v2
