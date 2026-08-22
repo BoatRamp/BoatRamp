@@ -1,0 +1,60 @@
+name: Set up the musl (zig) toolchain
+description: >-
+  Rust stable with the x86_64-unknown-linux-musl target, zig + cargo-zigbuild, and
+  the C-cross environment so cargo/clippy build the *shipped* musl target instead of
+  glibc. The C deps (aws-lc-sys, ring, bundled sqlite) cross-compile through a `zig cc`
+  shim; the final Rust link goes through `cargo zigbuild`. Static x86_64-musl test
+  binaries run natively on the x86_64 runner — no emulator needed.
+inputs:
+  components:
+    description: Extra rustup components (comma-separated), e.g. "clippy" or "llvm-tools-preview".
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    # aws-lc-sys (pulled by tls/s3) builds vendored C via cmake + nasm regardless of
+    # target; both are preinstalled on the runner, so skip apt unless truly missing.
+    - name: Ensure build deps (cmake + nasm)
+      shell: bash
+      run: |
+        if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+          echo "cmake + nasm already present"
+        else
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+        fi
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-musl
+        components: ${{ inputs.components }}
+
+    - uses: mlugg/setup-zig@v1
+
+    - name: Install cargo-zigbuild
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-zigbuild
+
+    - name: C-cross env (zig) + default to the musl target
+      shell: bash
+      run: |
+        set -eo pipefail
+        # cc-rs / cmake compile the vendored C (aws-lc-sys, ring, sqlite) for musl
+        # through these shims; `cargo zigbuild` handles the incompatible-arg Rust link.
+        sudo tee /usr/local/bin/musl-zig-cc >/dev/null <<'EOF'
+        #!/bin/sh
+        exec zig cc -target x86_64-linux-musl "$@"
+        EOF
+        sudo tee /usr/local/bin/musl-zig-cxx >/dev/null <<'EOF'
+        #!/bin/sh
+        exec zig c++ -target x86_64-linux-musl "$@"
+        EOF
+        sudo chmod +x /usr/local/bin/musl-zig-cc /usr/local/bin/musl-zig-cxx
+        # Every cargo/clippy invocation in the job defaults to the shipped target; the
+        # C-dep compilers point at the zig shims (final Rust link is `cargo zigbuild`).
+        {
+          echo "CARGO_BUILD_TARGET=x86_64-unknown-linux-musl"
+          echo "CC_x86_64_unknown_linux_musl=musl-zig-cc"
+          echo "CXX_x86_64_unknown_linux_musl=musl-zig-cxx"
+        } >> "$GITHUB_ENV"

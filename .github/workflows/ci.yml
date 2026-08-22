@@ -102,30 +102,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # A transitive TLS backend (aws-lc-rs) can want cmake/nasm. Both are
-      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
-      # unless they're genuinely missing.
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
+      # Build/lint the SHIPPED target (static x86_64-musl), not glibc — a musl-only
+      # break must fail the PR gate, not surface at release. Sets up zig + cargo-zigbuild
+      # and defaults cargo to the musl target.
+      - uses: ./.github/actions/setup-musl
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: clippy
+          key: clippy-musl
 
       # A lean fs+SlateDB slice for fast per-push feedback. The `default` feature
       # set is now **all** features (batteries-included), so this lane opts down
       # with `--no-default-features`; the full default set is clippy'd nightly
       # (`--all-features` == default), and the `serve`-dispatch feature union is
-      # covered by `feature-clippy` below.
+      # covered by `feature-clippy` below. Targets musl via `CARGO_BUILD_TARGET`
+      # (set by setup-musl); clippy is check-only so it needs no Rust link.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --no-default-features --features boatramp/fs,boatramp/slatedb -- -D warnings
 
@@ -201,22 +194,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Ensure build deps
-        run: |
-          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
-            echo "cmake + nasm already present"
-          else
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
+      # Compile + run the tests on the SHIPPED musl target via cargo-zigbuild; the
+      # static x86_64-musl test binaries run natively on the x86_64 runner.
+      - uses: ./.github/actions/setup-musl
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test
+          key: test-musl
 
       - name: Test
-        run: cargo test --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
+        run: cargo zigbuild test --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
 
   # The lean `test` lane above opts down to `fs,slatedb` for speed, which enables
   # NEITHER `handlers` NOR the other feature-gated surfaces — so the whole GraphQL /
