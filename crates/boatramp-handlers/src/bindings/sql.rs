@@ -168,7 +168,11 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
         let params = to_values(params);
-        let txn = self.session.txn(&name, read_only).await.map_err(to_wit_error)?;
+        let txn = self
+            .session
+            .txn(&name, read_only)
+            .await
+            .map_err(to_wit_error)?;
         let rows = txn.query(&statement, &params).await.map_err(to_wit_error)?;
         Ok(sql_types::QueryResult {
             columns: rows.columns,
@@ -194,7 +198,11 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
         let params = to_values(params);
-        let txn = self.session.txn(&name, read_only).await.map_err(to_wit_error)?;
+        let txn = self
+            .session
+            .txn(&name, read_only)
+            .await
+            .map_err(to_wit_error)?;
         txn.execute(&statement, &params).await.map_err(to_wit_error)
     }
 

@@ -147,7 +147,9 @@ fn to_core_compare(c: wit::Compare) -> core::Compare {
         wit::Compare::Gt(v) => core::Compare::Gt(to_sqlvalue(v)),
         wit::Compare::Ge(v) => core::Compare::Ge(to_sqlvalue(v)),
         wit::Compare::Like(p) => core::Compare::Like(p),
-        wit::Compare::InList(vs) => core::Compare::InList(vs.into_iter().map(to_sqlvalue).collect()),
+        wit::Compare::InList(vs) => {
+            core::Compare::InList(vs.into_iter().map(to_sqlvalue).collect())
+        }
         wit::Compare::IsNull => core::Compare::IsNull,
         wit::Compare::IsNotNull => core::Compare::IsNotNull,
     }
@@ -162,8 +164,12 @@ fn to_core_col_pred(p: wit::ColumnPredicate) -> core::ColumnPredicate {
 
 fn to_core_predicate(p: wit::Predicate) -> core::Predicate {
     match p {
-        wit::Predicate::All(v) => core::Predicate::All(v.into_iter().map(to_core_col_pred).collect()),
-        wit::Predicate::Any(v) => core::Predicate::Any(v.into_iter().map(to_core_col_pred).collect()),
+        wit::Predicate::All(v) => {
+            core::Predicate::All(v.into_iter().map(to_core_col_pred).collect())
+        }
+        wit::Predicate::Any(v) => {
+            core::Predicate::Any(v.into_iter().map(to_core_col_pred).collect())
+        }
     }
 }
 
@@ -199,7 +205,9 @@ fn to_core_select(q: wit::Select) -> core::Select {
             .into_iter()
             .map(|p| match p {
                 wit::Projection::Column(c) => core::Projection::Column(c),
-                wit::Projection::Aggregate((a, c)) => core::Projection::Aggregate(to_core_agg(a), c),
+                wit::Projection::Aggregate((a, c)) => {
+                    core::Projection::Aggregate(to_core_agg(a), c)
+                }
             })
             .collect(),
         joins: q
@@ -320,7 +328,9 @@ mod tests {
     impl SqlBackend for FakeBackend {
         async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             self.log.lock().unwrap().push("begin".into());
-            Ok(Box::new(FakeTxn { log: self.log.clone() }))
+            Ok(Box::new(FakeTxn {
+                log: self.log.clone(),
+            }))
         }
         async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             self.begin().await
@@ -330,7 +340,10 @@ mod tests {
     #[async_trait]
     impl SqlTransaction for FakeTxn {
         async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<SqlRows, SqlError> {
-            self.log.lock().unwrap().push(format!("query|{sql}|{params:?}"));
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("query|{sql}|{params:?}"));
             Ok(SqlRows {
                 columns: vec!["id".into()],
                 rows: vec![vec![SqlValue::Text("row1".into())]],
@@ -432,12 +445,11 @@ mod tests {
         assert!(log.iter().any(|l| l.starts_with(
             "query|SELECT id FROM work_order WHERE tenant_id = ?1 AND project_id = ?2 ORDER BY created_at DESC LIMIT 10|"
         )));
-        assert!(log
-            .iter()
-            .any(|l| l.starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")));
-        assert!(log
-            .iter()
-            .any(|l| l.starts_with("execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE id = ?2|")));
+        assert!(log.iter().any(
+            |l| l.starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
+        ));
+        assert!(log.iter().any(|l| l
+            .starts_with("execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE id = ?2|")));
         assert_eq!(log.last().unwrap(), "commit");
     }
 

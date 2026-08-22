@@ -38,10 +38,10 @@ pub mod messaging;
 /// Online, resumable migration of a pre-0.2.0 store to the project-scoped layout.
 pub mod migrate;
 pub mod mode;
-pub mod project;
-pub mod sql;
 /// A typed query AST + injection-safe `?N` SQL compiler backing the `orm` handler binding.
 pub mod orm;
+pub mod project;
+pub mod sql;
 /// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
 pub mod time;
 

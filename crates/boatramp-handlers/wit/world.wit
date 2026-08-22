@@ -141,7 +141,7 @@ interface orm {
   enum direction { asc, desc }
   record order-by { column: string, dir: direction }
 
-  /// An optional in-site row-tenancy scope: `column = value` (ANDed on read/update,
+  /// An optional in-site row-tenancy scope: `column = value` (conjoined on read/update,
   /// forced on insert). The project/database boundary is separate (the opened database).
   record scope { column: string, value: value }
 

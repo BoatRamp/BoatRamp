@@ -19,7 +19,7 @@
 //! # Isolation
 //! The project/database boundary is the caller's (the binding opens a per-project database).
 //! An optional per-query [`Scope`] (`column = value`) is the *in-site* row-tenancy seam: on a
-//! read/update it is ANDed into the `WHERE`; on an insert it is forced into every row. It is
+//! read/update it is conjoined into the `WHERE`; on an insert it is forced into every row. It is
 //! guest-declared here (the shim's `Scoped` model); a host-enforced-from-claims variant is a
 //! later enhancement (see plans/PLAN-orm-wit.md §4).
 
@@ -469,12 +469,11 @@ impl Update {
             .collect();
 
         let where_body = render_where(self.scope.as_ref(), Some(&self.filter), &mut params)?
-            .ok_or(OrmError::Empty("update has an empty filter (unbounded update refused)"))?;
+            .ok_or(OrmError::Empty(
+                "update has an empty filter (unbounded update refused)",
+            ))?;
 
-        let sql = format!(
-            "UPDATE {table} SET {} WHERE {where_body}",
-            sets?.join(", ")
-        );
+        let sql = format!("UPDATE {table} SET {} WHERE {where_body}", sets?.join(", "));
         Ok((sql, params.0))
     }
 }
@@ -491,7 +490,10 @@ mod tests {
     fn select_basic_where_order_limit() {
         let q = Select {
             table: "work_order".into(),
-            columns: vec![Projection::Column("id".into()), Projection::Column("state".into())],
+            columns: vec![
+                Projection::Column("id".into()),
+                Projection::Column("state".into()),
+            ],
             joins: vec![],
             filter: Some(Predicate::All(vec![ColumnPredicate {
                 column: "project_id".into(),
@@ -499,7 +501,10 @@ mod tests {
             }])),
             scope: None,
             distinct: false,
-            order: vec![OrderBy { column: "created_at".into(), dir: Direction::Desc }],
+            order: vec![OrderBy {
+                column: "created_at".into(),
+                dir: Direction::Desc,
+            }],
             limit: Some(10),
             offset: None,
         };
@@ -521,7 +526,10 @@ mod tests {
                 column: "kind".into(),
                 test: Compare::Eq(t("supplier")),
             }])),
-            scope: Some(Scope { column: "tenant_id".into(), value: t("ten_1") }),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+            }),
             distinct: false,
             order: vec![],
             limit: None,
@@ -529,7 +537,10 @@ mod tests {
         };
         let (sql, params) = q.compile().unwrap();
         // Scope binds first (?1), then the filter (?2).
-        assert_eq!(sql, "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2");
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
+        );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
     }
 
@@ -612,12 +623,21 @@ mod tests {
             table: "work_area".into(),
             rows: vec![RowValues {
                 cells: vec![
-                    Assignment { column: "id".into(), value: t("wa_1") },
-                    Assignment { column: "project_id".into(), value: t("prj_1") },
+                    Assignment {
+                        column: "id".into(),
+                        value: t("wa_1"),
+                    },
+                    Assignment {
+                        column: "project_id".into(),
+                        value: t("prj_1"),
+                    },
                 ],
             }],
             conflict: None,
-            scope: Some(Scope { column: "tenant_id".into(), value: t("ten_1") }),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+            }),
         };
         let (sql, params) = q.compile().unwrap();
         assert_eq!(
@@ -633,8 +653,14 @@ mod tests {
             table: "country_pack".into(),
             rows: vec![RowValues {
                 cells: vec![
-                    Assignment { column: "country".into(), value: t("US") },
-                    Assignment { column: "currency".into(), value: t("USD") },
+                    Assignment {
+                        column: "country".into(),
+                        value: t("US"),
+                    },
+                    Assignment {
+                        column: "currency".into(),
+                        value: t("USD"),
+                    },
                 ],
             }],
             conflict: Some(OnConflict {
@@ -643,9 +669,12 @@ mod tests {
             }),
             scope: None,
         };
-        let (sql_do, _) = base(vec![Assignment { column: "currency".into(), value: t("USD") }])
-            .compile()
-            .unwrap();
+        let (sql_do, _) = base(vec![Assignment {
+            column: "currency".into(),
+            value: t("USD"),
+        }])
+        .compile()
+        .unwrap();
         assert_eq!(
             sql_do,
             "INSERT INTO country_pack (country, currency) VALUES (?1, ?2) ON CONFLICT (tenant_id, country) DO UPDATE SET currency = ?3"
@@ -658,12 +687,18 @@ mod tests {
     fn update_requires_filter_and_binds_set_before_where() {
         let q = Update {
             table: "supplier_invoice".into(),
-            set: vec![Assignment { column: "payment_gate".into(), value: t("paid") }],
+            set: vec![Assignment {
+                column: "payment_gate".into(),
+                value: t("paid"),
+            }],
             filter: Predicate::All(vec![ColumnPredicate {
                 column: "id".into(),
                 test: Compare::Eq(t("inv_1")),
             }]),
-            scope: Some(Scope { column: "tenant_id".into(), value: t("ten_1") }),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+            }),
         };
         let (sql, params) = q.compile().unwrap();
         // SET binds ?1; then scope ?2; then filter ?3.
@@ -678,7 +713,10 @@ mod tests {
     fn update_with_empty_all_filter_is_refused() {
         let q = Update {
             table: "t".into(),
-            set: vec![Assignment { column: "x".into(), value: SqlValue::Integer(1) }],
+            set: vec![Assignment {
+                column: "x".into(),
+                value: SqlValue::Integer(1),
+            }],
             filter: Predicate::All(vec![]),
             scope: None,
         };
@@ -711,7 +749,10 @@ mod tests {
             limit: None,
             offset: None,
         };
-        assert!(matches!(bad_col.compile(), Err(OrmError::InvalidIdentifier(_))));
+        assert!(matches!(
+            bad_col.compile(),
+            Err(OrmError::InvalidIdentifier(_))
+        ));
     }
 
     #[test]
