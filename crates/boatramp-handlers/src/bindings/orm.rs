@@ -299,3 +299,176 @@ pub fn add_to_linker<T: Send + 'static>(
 ) -> wasmtime::Result<()> {
     wit::add_to_linker_get_host(linker, host)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::wit::{Host, HostDatabase};
+    use super::*;
+    use async_trait::async_trait;
+    use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction};
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<String>>>;
+    struct FakeBackend {
+        log: Log,
+    }
+    struct FakeTxn {
+        log: Log,
+    }
+
+    #[async_trait]
+    impl SqlBackend for FakeBackend {
+        async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            self.log.lock().unwrap().push("begin".into());
+            Ok(Box::new(FakeTxn { log: self.log.clone() }))
+        }
+        async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            self.begin().await
+        }
+    }
+
+    #[async_trait]
+    impl SqlTransaction for FakeTxn {
+        async fn query(&mut self, sql: &str, params: &[SqlValue]) -> Result<SqlRows, SqlError> {
+            self.log.lock().unwrap().push(format!("query|{sql}|{params:?}"));
+            Ok(SqlRows {
+                columns: vec!["id".into()],
+                rows: vec![vec![SqlValue::Text("row1".into())]],
+            })
+        }
+        async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("execute|{sql}|{params:?}"));
+            Ok(1)
+        }
+        async fn commit(self: Box<Self>) -> Result<(), SqlError> {
+            self.log.lock().unwrap().push("commit".into());
+            Ok(())
+        }
+        async fn rollback(self: Box<Self>) -> Result<(), SqlError> {
+            Ok(())
+        }
+    }
+
+    fn session(log: &Log) -> SqlSession {
+        let backend: Arc<dyn SqlBackend> = Arc::new(FakeBackend { log: log.clone() });
+        SqlSession::for_backends([(String::new(), backend)].into_iter().collect())
+    }
+
+    fn text(s: &str) -> wit::Value {
+        wit::Value::Text(s.to_string())
+    }
+
+    #[tokio::test]
+    async fn select_insert_update_compile_and_reach_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            let rep = db.rep();
+
+            let sel = wit::Select {
+                table: "work_order".into(),
+                columns: vec![wit::Projection::Column("id".into())],
+                joins: vec![],
+                filter: Some(wit::Predicate::All(vec![wit::ColumnPredicate {
+                    column: "project_id".into(),
+                    test: wit::Compare::Eq(text("prj_1")),
+                }])),
+                scope: Some(wit::Scope {
+                    column: "tenant_id".into(),
+                    value: text("ten_1"),
+                }),
+                distinct: false,
+                order: vec![wit::OrderBy {
+                    column: "created_at".into(),
+                    dir: wit::Direction::Desc,
+                }],
+                limit: Some(10),
+                offset: None,
+            };
+            let res = host.select(db, sel).await.unwrap();
+            assert_eq!(res.columns, vec!["id".to_string()]);
+            assert!(matches!(&res.rows[0].values[0], wit::Value::Text(s) if s == "row1"));
+
+            let ins = wit::Insert {
+                table: "work_area".into(),
+                rows: vec![wit::RowValues {
+                    cells: vec![wit::Assignment {
+                        column: "id".into(),
+                        value: text("wa_1"),
+                    }],
+                }],
+                conflict: None,
+                scope: Some(wit::Scope {
+                    column: "tenant_id".into(),
+                    value: text("ten_1"),
+                }),
+            };
+            assert_eq!(host.insert(Resource::new_own(rep), ins).await.unwrap(), 1);
+
+            let upd = wit::Update {
+                table: "supplier_invoice".into(),
+                set: vec![wit::Assignment {
+                    column: "payment_gate".into(),
+                    value: text("paid"),
+                }],
+                filter: wit::Predicate::All(vec![wit::ColumnPredicate {
+                    column: "id".into(),
+                    test: wit::Compare::Eq(text("inv_1")),
+                }]),
+                scope: None,
+            };
+            host.update(Resource::new_own(rep), upd).await.unwrap();
+        }
+        sess.finalize(true).await;
+
+        let log = log.lock().unwrap();
+        assert_eq!(log[0], "begin");
+        assert!(log.iter().any(|l| l.starts_with(
+            "query|SELECT id FROM work_order WHERE tenant_id = ?1 AND project_id = ?2 ORDER BY created_at DESC LIMIT 10|"
+        )));
+        assert!(log
+            .iter()
+            .any(|l| l.starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")));
+        assert!(log
+            .iter()
+            .any(|l| l.starts_with("execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE id = ?2|")));
+        assert_eq!(log.last().unwrap(), "commit");
+    }
+
+    #[tokio::test]
+    async fn unbounded_update_is_refused_before_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let upd = wit::Update {
+            table: "t".into(),
+            set: vec![wit::Assignment {
+                column: "x".into(),
+                value: wit::Value::Integer(1),
+            }],
+            filter: wit::Predicate::All(vec![]),
+            scope: None,
+        };
+        let err = host.update(db, upd).await.unwrap_err();
+        assert!(matches!(err, wit::Error::Syntax(_)));
+        // Refused at compile time — the backend was never opened.
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_unknown_database_is_not_granted() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log); // only the default "" is granted
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        assert!(host.open("nope".into()).is_err());
+    }
+}
