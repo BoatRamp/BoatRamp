@@ -150,23 +150,17 @@ impl std::error::Error for BodyError {}
 /// A single streamed body chunk, or a mid-stream source failure ([`BodyError`]).
 pub type BodyChunk = Result<Bytes, BodyError>;
 
-/// A response body: buffered bytes; a stream `splice()`d directly from an upstream
-/// socket into the (kTLS) client socket (Linux zero-copy); or a pull [`Stream`] of
-/// [`BodyChunk`]s forwarded as it arrives (a reverse proxy streaming an upstream response
-/// without buffering or copying it — the stream ending signals end-of-body; a
-/// [`BodyError`] item aborts the stream). The driver **polls the stream directly**, so a
-/// bridge hands its upstream body straight in with no intermediate channel or producer
-/// task. The concurrent [`h2::mux`](crate::h2::mux) driver streams the last two natively;
-/// the serial [`h2::conn`](crate::h2::conn) driver buffers a `Stream` (it can't interleave).
+/// A response body: buffered bytes, or a pull [`Stream`] of [`BodyChunk`]s forwarded as
+/// it arrives (a reverse proxy streaming an upstream response without buffering or copying
+/// it — the stream ending signals end-of-body; a [`BodyError`] item aborts the stream).
+/// The driver **polls the stream directly**, so a bridge hands its upstream body straight
+/// in with no intermediate channel or producer task. The concurrent
+/// [`h2::mux`](crate::h2::mux) driver streams natively; the serial
+/// [`h2::conn`](crate::h2::conn) driver buffers a `Stream` (it can't interleave).
 ///
 /// [`Stream`]: tokio_stream::Stream
 pub enum Body {
     Bytes(Vec<u8>),
-    #[cfg(target_os = "linux")]
-    Splice {
-        upstream: tokio::net::TcpStream,
-        len: usize,
-    },
     Stream(std::pin::Pin<Box<dyn tokio_stream::Stream<Item = BodyChunk> + Send>>),
 }
 
@@ -196,16 +190,12 @@ impl Body {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes(b) => b.len(),
-            #[cfg(target_os = "linux")]
-            Self::Splice { len, .. } => *len,
             Self::Stream(_) => 0,
         }
     }
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Bytes(b) => b.is_empty(),
-            #[cfg(target_os = "linux")]
-            Self::Splice { len, .. } => *len == 0,
             Self::Stream(_) => false,
         }
     }

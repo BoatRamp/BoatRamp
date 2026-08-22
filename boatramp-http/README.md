@@ -1,18 +1,26 @@
-# boatramp-h2
+# boatramp-http
 
-A minimal, **conformance-gated** HTTP/2 server with a kernel zero-copy
-(`splice()`/kTLS) response-body fast-path.
+A minimal, **conformance-gated** HTTP/1.1 + HTTP/2 server — boatramp's own serving
+stack, off `hyper` on the accept path.
 
 ## Reason to exist
 
-`h2` (via `hyper`) copies the response body through userspace to frame and
-encrypt it — the throughput ceiling for a large-body reverse proxy. `boatramp-h2`
-owns the framing so the body moves **kernel-to-kernel**: spliced from the upstream
-socket into a kTLS client socket (kernel encrypts on TX), with only the 9-byte
-DATA headers in userspace. On the fair 5-way benchmark this is the only measured
-lever that brings BoatRamp to Envoy parity on `tls-proxy-h2-100k`; every build /
-config lever (musl-vs-glibc, `target-cpu`, frame/read/send-buffer knobs, allocator)
-was measured and does nothing there — the gap is the userspace codec itself.
+`h2` (via `hyper`) leaves throughput on the table for a large-body reverse proxy.
+`boatramp-http` owns the framing so its **concurrent multiplexed** HTTP/2 driver
+([`serve_connection_mux`]) can stream response bodies to rustls with **vectored,
+copy-free writes batched across multiplexed streams** — which **matches or beats
+Envoy on `tls-proxy-h2-100k`**, and whose HTTP/1.1 sibling beats nginx on the TLS
+proxy. The win is the userspace codec (multiplexing + batching + a first-party
+zero-alloc HPACK), not the transport.
+
+> **A kernel `splice()`/kTLS zero-copy body path was built, benchmarked in both
+> HTTP/2 and HTTP/1.1, and *removed*.** In h2 it collapsed under concurrency
+> (splice can't batch across multiplexed streams the way the mux does); in h1 — its
+> most favorable case — it was the *slowest* option, below even nginx, because
+> userspace rustls (aws-lc-rs, AES-NI) encrypts faster than kernel kTLS and splice's
+> syscall + pipe-hop overhead beats a cache-friendly copy. This matches Envoy's own
+> rejection of kTLS. The userspace path wins outright; the crate is now
+> platform-uniform (no kTLS, no `splice`, no target-gated deps).
 
 ## Non-negotiable: correctness first
 
@@ -47,10 +55,10 @@ hpack     first-party RFC 7541 codec (static+dynamic table, Huffman,
 stream    per-stream state machine (idle/open/half-closed/closed) +
           per-stream flow control + illegal-transition detection        [next]
 conn      connection driver: preface, SETTINGS negotiation, read/dispatch
-          loop, connection flow control, PING/GOAWAY, error routing      [next]
-server    accept(IO) -> requests; response with a splice body seam
-          `Body::splice_from(fd, len)` for the zero-copy path            [next]
-splice    Linux splice(upstream_fd -> pipe -> kTLS_fd) DATA writer       [port from spike]
+          loop, connection flow control, PING/GOAWAY, error routing      [DONE, tested]
+mux       concurrent multiplexed driver (reader + per-stream handler +
+          writer tasks, two-tier flow control, vectored batched writes)  [DONE, tested]
+serve     unified h1/h2 dispatcher (preface sniff / TLS ALPN)            [DONE, tested]
 ```
 
 ## Roadmap (each step ends green on its harness)

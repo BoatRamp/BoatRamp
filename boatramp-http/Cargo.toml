@@ -36,18 +36,6 @@ tokio-stream = "0.1"
 # without buffering the whole body.
 http-body = "1"
 
-# The h2 zero-copy splice body path + kTLS handoff are Linux-only, so their deps are
-# target-gated — the crate (and its tests) still build everywhere on the buffered path.
-# `libc` for splice()/pipe2 + the kTLS `setsockopt`s. rustls/tokio-rustls run the TLS
-# handshake; the kTLS handoff itself (secret extraction → kernel TLS ULP) is first-party
-# in `src/h2/ktls.rs` — the `ktls` crate does not build on musl (it constructs
-# `cmsghdr`/`msghdr` with struct literals that omit musl's private fields).
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-rustls = { version = "0.23", default-features = true }
-tokio-rustls = "0.26"
-rustls-pemfile = "2"
-
 [dev-dependencies]
 # hyper's HTTP/1 server is the DIFFERENTIAL ORACLE for the h1 codec: identical raw byte
 # streams are fed to boatramp-http and to hyper, and the two must agree on how the stream
@@ -68,3 +56,9 @@ h2 = "0.4"
 # Randomized parser fuzzing (panic-free + never-desync), the stable-CI analogue of the
 # cargo-fuzz targets.
 proptest = "1"
+
+# TLS for the `h2-tls-proxy-mux` example only (a userspace-rustls HTTP/2 proxy benchmark
+# vehicle) — Linux-gated like the example. Not a library dependency.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio-rustls = "0.26"
+rustls-pemfile = "2"

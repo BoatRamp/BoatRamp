@@ -7,6 +7,25 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-08-22
+
+### Removed
+- **The kernel `splice()`/kTLS zero-copy reverse-proxy body path is removed** — after
+  building a first-party, musl-safe implementation and benchmarking it in **both** HTTP/2
+  and HTTP/1.1, it earns nothing and is retired. On `tls-proxy-h2-100k` the userspace
+  multiplexed driver runs ~56–63k req/s (beating Envoy) while the h2 kTLS+splice path
+  *collapses* under concurrency (splice serializes what the mux batches into copy-free
+  vectored writes). On `tls-proxy-h1-100k` — kTLS's *most favorable* case (one contiguous
+  body, no multiplexing) — kTLS+splice was the **slowest** contestant (~42–58k), below both
+  the userspace path (~57–69k, which itself **beats nginx** by ~20–25%) and nginx, because
+  userspace rustls (aws-lc-rs, AES-NI) encrypts faster than kernel kTLS and splice's
+  syscall + pipe-hop overhead exceeds a cache-friendly copy. This matches Envoy's own
+  rejection of kTLS. Gone with it: the first-party kTLS handoff, the `Wire::Socket` splice
+  socket, the `Body::Splice` variant, and the kTLS/splice examples. **`boatramp-http` is now
+  platform-uniform** — no kTLS, no `splice`, no target-gated dependencies — so it builds and
+  behaves identically on glibc and musl (production TLS serving was always the userspace
+  multiplexed driver; nothing user-visible changes).
+
 ## [0.2.15] - 2026-08-21
 
 ### Changed

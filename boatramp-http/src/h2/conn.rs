@@ -1,14 +1,11 @@
 //! The HTTP/2 connection driver: preface, SETTINGS negotiation, and the
 //! read/dispatch loop that enforces framing, stream state (via [`crate::h2::stream`]),
 //! flow control, and the connection-vs-stream error split. Single-task; the driver
-//! talks only to [`crate::h2::wire::Wire`], so it is identical whether the transport is a
-//! plain buffered stream (tests, plaintext h2c) or a splice-capable kTLS socket
-//! (`serve_connection_ktls`) where the response body is moved kernel-to-kernel.
+//! talks only to [`crate::h2::wire::Wire`], so it is identical across transports (a
+//! buffered stream in tests and plaintext h2c, a rustls stream once TLS-terminated).
 
 use std::collections::HashMap;
 
-#[cfg(target_os = "linux")]
-use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::StreamExt as _;
 
@@ -26,8 +23,7 @@ use crate::h2::CLIENT_PREFACE;
 const OUR_MAX_FRAME_SIZE: u32 = settings::DEFAULT_MAX_FRAME_SIZE;
 /// Our advertised SETTINGS_INITIAL_WINDOW_SIZE for streams the client opens.
 const OUR_INITIAL_WINDOW: i32 = settings::DEFAULT_INITIAL_WINDOW_SIZE as i32;
-/// Ceiling on a single emitted DATA frame, so the splice path's coalescing pipe
-/// (grown to 256 KiB) never overflows. Well above the usual 16 KiB negotiated
+/// Ceiling on a single emitted DATA frame. Well above the usual 16 KiB negotiated
 /// SETTINGS_MAX_FRAME_SIZE, so it only bites a client that raises the limit.
 const MAX_OUT_FRAME: usize = 128 * 1024;
 /// Bound on a single request's accumulated header block (HEADERS + CONTINUATION) and
@@ -57,7 +53,6 @@ struct Stream {
     body_len: u64,
     /// Unsent response body + how far we've sent. When `out_active`, a window
     /// increase (WINDOW_UPDATE / SETTINGS) resumes sending from `out_off` (§6.9).
-    /// A `Body::Splice` is streamed kernel-to-kernel (see `flush_stream`).
     out: http::Body,
     out_off: usize,
     out_active: bool,
@@ -575,9 +570,8 @@ where
     Ok(true)
 }
 
-/// Run the handler and write the response (HEADERS + DATA). M1 buffers the body and
-/// assumes it fits the send window (h2spec responses are tiny); the large-body path
-/// is the M4 splice seam.
+/// Run the handler and write the response (HEADERS + DATA). The serial driver buffers
+/// the body; the concurrent [`crate::h2::mux`] driver is the streaming/production path.
 async fn respond<IO, H>(
     conn: &mut Conn,
     wire: &mut Wire<IO>,
@@ -660,11 +654,8 @@ where
 /// queued and again whenever a window increase (WINDOW_UPDATE / SETTINGS) reopens
 /// capacity (§6.9).
 ///
-/// A `Body::Bytes` is copied into the frame in userspace. A `Body::Splice` on a
-/// splice-capable wire (kTLS socket) is moved kernel-to-kernel — the DATA header and
-/// the upstream body drain through one pipe into the connection fd with `splice()`,
-/// the kernel encrypting on TX — with only the 9-byte header touching userspace; on a
-/// buffered wire (plaintext h2c) it degrades to a userspace read+write.
+/// A `Body::Bytes` is copied into the frame in userspace. (The serial driver never
+/// flushes a `Body::Stream` — `respond` drains it to bytes before queueing.)
 async fn flush_stream<IO>(conn: &mut Conn, wire: &mut Wire<IO>, sid: u32) -> Result<(), H2Error>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -686,8 +677,6 @@ where
         let is_last = chunk == remaining;
         let off = conn.streams.get(&sid).unwrap().out_off;
         let hdr = frame::data_header(sid, chunk as u32, is_last);
-        #[cfg(target_os = "linux")]
-        let can_splice = wire.can_splice();
         match &mut conn.streams.get_mut(&sid).unwrap().out {
             http::Body::Bytes(b) => {
                 let mut buf = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
@@ -696,30 +685,6 @@ where
                 wire.write_all(&buf)
                     .await
                     .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-            }
-            #[cfg(target_os = "linux")]
-            http::Body::Splice { upstream, .. } => {
-                if can_splice {
-                    // Zero-copy: splice(upstream -> pipe -> connection fd); the DATA
-                    // header rides in the same TLS record as the body.
-                    wire.splice_data_frame(upstream, &hdr, chunk)
-                        .await
-                        .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-                } else {
-                    // Buffered wire (plaintext h2c): stream `chunk` bytes from the
-                    // upstream through userspace.
-                    let mut buf = Vec::with_capacity(frame::FRAME_HEADER_LEN + chunk);
-                    buf.extend_from_slice(&hdr);
-                    let start = buf.len();
-                    buf.resize(start + chunk, 0);
-                    upstream
-                        .read_exact(&mut buf[start..])
-                        .await
-                        .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-                    wire.write_all(&buf)
-                        .await
-                        .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
-                }
             }
             // `respond` drains a streamed body to `Bytes` before it is ever queued, so
             // the serial driver never flushes a `Stream`.
@@ -742,45 +707,6 @@ where
             return Ok(());
         }
     }
-}
-
-/// Serve one HTTP/2 connection over a plaintext TCP socket (h2c). `Body::Splice`
-/// routes through the userspace streaming path in `flush_stream`; the kernel splice +
-/// kTLS zero-copy body is `serve_connection_ktls`.
-#[cfg(target_os = "linux")]
-pub async fn serve_connection_tcp<H>(tcp: tokio::net::TcpStream, handler: H) -> std::io::Result<()>
-where
-    H: Handler,
-{
-    serve_connection(tcp, handler).await
-}
-
-/// Serve one HTTP/2 connection over **kTLS**: perform the rustls handshake, hand the
-/// socket off to the kernel TLS state machine, then drive the h2 loop over the raw fd
-/// — so a `Body::Splice` response is moved upstream→pipe→socket with `splice()` and
-/// the kernel encrypts on TX. The `ServerConfig` behind `acceptor` MUST have
-/// `enable_secret_extraction = true` and advertise ALPN `h2`.
-#[cfg(target_os = "linux")]
-pub async fn serve_connection_ktls<H>(
-    tcp: tokio::net::TcpStream,
-    acceptor: tokio_rustls::TlsAcceptor,
-    handler: H,
-) -> std::io::Result<()>
-where
-    H: Handler,
-{
-    tcp.set_nodelay(true).ok();
-    // CorkStream makes rustls read one TLS record at a time so the handshake ends on
-    // a record boundary — a prerequisite for the kTLS handoff (first-party, musl-safe).
-    let tls = acceptor
-        .accept(crate::h2::ktls::CorkStream::new(tcp))
-        .await?;
-    // Reclaim the owned TcpStream (now a kTLS socket) + any plaintext rustls drained
-    // before the handoff — a raw recv() would otherwise miss those bytes.
-    let (sock, drained) = crate::h2::ktls::config_ktls_server(tls).await?;
-    let sock = crate::h2::wire::Socket::new(sock, drained)?;
-    let mut wire: Wire<tokio::net::TcpStream> = Wire::Socket(sock);
-    serve_connection_wire(&mut wire, handler).await
 }
 
 /// Resume every stream with a pending response (after a connection-level window

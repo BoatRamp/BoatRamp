@@ -681,7 +681,7 @@ fn spawn_request<H>(
 }
 
 /// Queue a response onto its stream's outbox, waking the writer. A buffered body
-/// (`Bytes`/`Splice`) is queued all at once; a [`http::Body::Stream`] is drained chunk
+/// (`Bytes`) is queued all at once; a [`http::Body::Stream`] is drained chunk
 /// by chunk over time and forwarded as DATA frames — so the writer streams it without
 /// the whole body ever being held (the reverse-proxy fast-path).
 async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Response) {
@@ -869,8 +869,8 @@ fn reset_local(shared: &Conn, notify: &Arc<Notify>, sid: u32, code: ErrorCode) {
     });
 }
 
-/// Turn a [`Response`] into queued HEADERS (+ DATA) frames. A `Body::Splice` is read
-/// into memory here (userspace-first); the writer-side kernel splice is a later step.
+/// Turn a [`Response`] into queued HEADERS (+ DATA) frames (buffered path; a streamed
+/// body is emitted chunk-by-chunk by `emit_response`, not here).
 async fn response_to_frames(
     parts: ::http::response::Parts,
     body: http::Body,
@@ -896,14 +896,6 @@ async fn response_to_frames(
 async fn body_bytes(body: http::Body) -> Vec<u8> {
     match body {
         http::Body::Bytes(b) => b,
-        #[cfg(target_os = "linux")]
-        http::Body::Splice { mut upstream, len } => {
-            let mut buf = vec![0u8; len];
-            if upstream.read_exact(&mut buf).await.is_err() {
-                buf.clear();
-            }
-            buf
-        }
         // `emit_response` streams a `Body::Stream` directly and never routes it here;
         // buffer it if it ever does, so this stays correct. A mid-stream error ends the
         // drain (best-effort — this fallback is only reached if a stream is ever routed

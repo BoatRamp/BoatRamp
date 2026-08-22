@@ -327,8 +327,6 @@ where
     }
     let framing = match &body {
         Body::Bytes(v) => Framing::Fixed(v.len()),
-        #[cfg(target_os = "linux")]
-        Body::Splice { len, .. } => Framing::Fixed(*len),
         Body::Stream(_) => Framing::Chunked,
     };
 
@@ -366,26 +364,6 @@ where
         Body::Bytes(v) => {
             if let Err(e) = write_all(io, &v).await {
                 return (Err(e), true);
-            }
-        }
-        #[cfg(target_os = "linux")]
-        Body::Splice { mut upstream, len } => {
-            // Userspace copy for now (the kTLS/splice fast-path is Stage 4). A fixed
-            // Content-Length was already written, so copy exactly `len` bytes.
-            let mut remaining = len;
-            let mut chunk = [0u8; 32 * 1024];
-            while remaining > 0 {
-                let want = remaining.min(chunk.len());
-                match upstream.read(&mut chunk[..want]).await {
-                    Ok(0) => return (Ok(()), true), // upstream truncated → close
-                    Ok(n) => {
-                        if let Err(e) = write_all(io, &chunk[..n]).await {
-                            return (Err(e), true);
-                        }
-                        remaining -= n;
-                    }
-                    Err(_) => return (Ok(()), true),
-                }
             }
         }
         Body::Stream(mut stream) => {

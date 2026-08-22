@@ -1,15 +1,14 @@
-//! The HTTP/2 codec — a minimal, **h2spec-conformance-gated** server with a kernel
-//! zero-copy response-body fast-path (`splice()`/kTLS).
+//! The HTTP/2 codec — a minimal, **h2spec-conformance-gated** server.
 //!
 //! # Why this exists
 //!
-//! Off-the-shelf Rust HTTP/2 (`h2` via `hyper`) copies the response body through
-//! userspace to frame + encrypt it. For a large-body reverse proxy that is the
-//! throughput ceiling. This codec owns the framing so the body can be moved
-//! **kernel-to-kernel** — spliced from the upstream socket straight into a kTLS client
-//! socket, where the kernel encrypts on TX — with only the 9-byte DATA frame headers
-//! touching userspace. Its concurrent multiplexed driver ([`serve_connection_mux`])
-//! matches or beats Envoy on `tls-proxy-h2-100k` (see `../README.md`).
+//! Off-the-shelf Rust HTTP/2 (`h2` via `hyper`) leaves throughput on the table for a
+//! large-body reverse proxy. This codec owns the framing so the concurrent multiplexed
+//! driver ([`serve_connection_mux`]) can stream response bodies to rustls with vectored,
+//! copy-free writes across multiplexed streams — which **matches or beats Envoy on
+//! `tls-proxy-h2-100k`** (see `../README.md`). (A kernel `splice()`/kTLS body path was
+//! built and benchmarked, in both h2 and h1, and retired: userspace rustls + the mux's
+//! cross-stream batching win outright — see the crate README's kTLS verdict.)
 //!
 //! # Conformance is a hard gate, not an afterthought
 //!
@@ -30,19 +29,12 @@ pub mod settings;
 pub mod stream;
 mod wire;
 
-// First-party kTLS handoff (Linux) — replaces the `ktls` crate, which cannot build on
-// musl. Only reachable through `serve_connection_ktls`, so it is Linux-gated with it.
-#[cfg(target_os = "linux")]
-mod ktls;
-
 // The serving types (`Body`/`Handler`/`Request`/`Response`) live at the crate root now
 // (shared with the h1 codec); the h2 driver's `http` module re-exports them plus its
 // own request-decode helper.
 pub mod http;
 
 pub use conn::serve_connection;
-#[cfg(target_os = "linux")]
-pub use conn::{serve_connection_ktls, serve_connection_tcp};
 pub use error::{ErrorCode, H2Error};
 pub use frame::{FrameHeader, FrameType};
 pub use mux::serve_connection_mux;
