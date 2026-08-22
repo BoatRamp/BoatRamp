@@ -245,6 +245,14 @@
             consoleDist = consolePackage;
           };
 
+          # All-features workspace clippy for the shipped musl target (see
+          # ./nix/check-musl.nix). Wired into `checks` below so `nix flake check` runs it
+          # and cachix caches the compiled closure — the per-push CI can't afford this
+          # (~2.5h cross-compile, GitHub-cache-evicted), but cachix amortizes it.
+          boatrampMuslClippy = pkgs.callPackage ./nix/check-musl.nix {
+            inherit rustPlatform rustToolchain;
+          };
+
           # Shared builder for the reproducible, Nix-first OCI images. Both targets
           # ship the *same* batteries-included binary and differ only in runtime
           # posture: the base `container` runs as root so it can own a mounted state
@@ -563,6 +571,10 @@
             clippy = workspaceClippy;
           }
           // lib.optionalAttrs pkgs.stdenv.isLinux {
+            # Compile-lint the whole feature matrix for the shipped musl target — the
+            # backstop against a musl-only build break reaching a release tag.
+            musl-clippy = boatrampMuslClippy;
+
             nixos-service = pkgs.testers.runNixOSTest {
               name = "boatramp-service";
               nodes.machine =
