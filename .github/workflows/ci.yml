@@ -102,23 +102,31 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Build/lint the SHIPPED target (static x86_64-musl), not glibc — a musl-only
-      # break must fail the PR gate, not surface at release. Sets up zig + cargo-zigbuild
-      # and defaults cargo to the musl target.
-      - uses: ./.github/actions/setup-musl
+      # A transitive TLS backend (aws-lc-rs) can want cmake/nasm. Both are
+      # preinstalled on the runner, so skip apt (and its flaky third-party repos)
+      # unless they're genuinely missing.
+      - name: Ensure build deps
+        run: |
+          if command -v cmake >/dev/null && command -v nasm >/dev/null; then
+            echo "cmake + nasm already present"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: clippy-musl
+          key: clippy
 
-      # A lean fs+SlateDB slice for fast per-push feedback. The `default` feature
-      # set is now **all** features (batteries-included), so this lane opts down
-      # with `--no-default-features`; the full default set is clippy'd nightly
-      # (`--all-features` == default), and the `serve`-dispatch feature union is
-      # covered by `feature-clippy` below. Targets musl via `CARGO_BUILD_TARGET`
-      # (set by setup-musl); clippy is check-only so it needs no Rust link.
+      # Clippy is a (largely) target-agnostic LINT, so it runs on the host glibc for
+      # speed; the *musl compilation* of the same code is covered by the `test` lanes,
+      # which build via cargo-zigbuild for x86_64-musl. (cargo-zigbuild has no clippy
+      # subcommand, and plain `cargo clippy --target musl` can't cross-compile the C
+      # deps — aws-lc-sys/ring — cleanly.) A lean fs+SlateDB slice for fast feedback;
+      # the full default set is clippy'd nightly, the serve union in `feature-clippy`.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --no-default-features --features boatramp/fs,boatramp/slatedb -- -D warnings
 
@@ -195,15 +203,16 @@ jobs:
       - uses: actions/checkout@v5
 
       # Compile + run the tests on the SHIPPED musl target via cargo-zigbuild; the
-      # static x86_64-musl test binaries run natively on the x86_64 runner.
+      # static x86_64-musl test binaries run natively on the x86_64 runner. This is the
+      # gate that catches a musl-only breakage before it reaches a release tag.
       - uses: ./.github/actions/setup-musl
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-musl
 
-      - name: Test
-        run: cargo zigbuild test --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
+      - name: Test (musl)
+        run: cargo-zigbuild test --target x86_64-unknown-linux-musl --workspace --no-default-features --features boatramp/fs,boatramp/slatedb
 
   # The lean `test` lane above opts down to `fs,slatedb` for speed, which enables
   # NEITHER `handlers` NOR the other feature-gated surfaces — so the whole GraphQL /
