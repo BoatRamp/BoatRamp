@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-08-23
+
 ### Added
 - **Typed ORM query interface for handlers (`boatramp:handlers/orm`).** A handler that is
   granted `sql` can build queries as a typed tree instead of writing SQL strings — and via the
