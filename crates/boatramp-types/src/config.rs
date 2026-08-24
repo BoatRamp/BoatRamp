@@ -236,6 +236,13 @@ const KNOWN_IMPORTS: &[&str] = &[
     "wasi:logging",
 ];
 
+/// The import names a deploy may declare in a handler's `imports` (baseline WASI
+/// interfaces + boatramp capability tokens). `sql:<name>`/`sql:*` are additionally
+/// accepted for named databases (see [`is_named_sql_import`]).
+pub fn known_imports() -> &'static [&'static str] {
+    KNOWN_IMPORTS
+}
+
 /// Best-effort heuristic: does `value` look like a credential that should be a
 /// `secrets` reference rather than a static `env` string?
 /// Catches the common accidents — it is a guard, not a guarantee.

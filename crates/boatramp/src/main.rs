@@ -40,6 +40,7 @@ mod authcmd;
 mod blob;
 mod build;
 mod bundle;
+mod capabilities;
 mod client;
 #[cfg(feature = "cluster")]
 mod cloudflare;
@@ -120,6 +121,9 @@ enum Command {
     Compose(compose::ComposeArgs),
     /// Parse and check a `project.cfg` (its `routing` section).
     Validate(build::ValidateArgs),
+    /// Print the capability surface this host implements (the `boatramp:handlers`
+    /// package version + the imports a deploy may declare).
+    Capabilities(capabilities::CapabilitiesArgs),
     /// List a site's deployment history.
     Deployments(manage::DeploymentsArgs),
     /// Inspect the functions a site runs (its handlers/consumers/crons as functions).
@@ -433,6 +437,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Bundle(args) => bundle::run(args, &config).await?,
         Command::Compose(args) => compose::run(args)?,
         Command::Validate(args) => build::validate(args)?,
+        Command::Capabilities(args) => capabilities::run(args),
         Command::Deployments(args) => manage::list(args, &config).await?,
         Command::Function(args) => function::run(args, &config).await?,
         Command::Workflow(args) => workflow::run(args, &config).await?,

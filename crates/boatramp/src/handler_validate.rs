@@ -44,7 +44,28 @@ pub fn validate_deploy(_dir: &Path, _config: &DeployConfig) -> Result<()> {
 }
 
 #[cfg(feature = "handlers")]
-pub use imp::validate_deploy;
+pub use imp::{host_capabilities, validate_deploy, HostCapabilities};
+
+/// The capability surface a host advertises (`boatramp capabilities` /
+/// `/api/capabilities`): the `boatramp:handlers` package version it implements and
+/// the import tokens a deploy may grant.
+#[cfg(not(feature = "handlers"))]
+#[derive(Debug, serde::Serialize)]
+pub struct HostCapabilities {
+    pub package: &'static str,
+    pub version: String,
+    pub declarable_imports: Vec<&'static str>,
+}
+
+/// Without the `handlers` feature the host implements no handler capabilities.
+#[cfg(not(feature = "handlers"))]
+pub fn host_capabilities() -> HostCapabilities {
+    HostCapabilities {
+        package: "boatramp:handlers",
+        version: "0.0.0".to_string(),
+        declarable_imports: Vec::new(),
+    }
+}
 
 #[cfg(feature = "handlers")]
 mod imp {
@@ -126,6 +147,25 @@ mod imp {
     /// it). A guest that imports the package *unversioned* resolves as "latest" and
     /// is always accepted; only a guest that pins a version is checked against this.
     const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 2, 18);
+
+    /// The capability surface a host advertises (see the crate-level re-export).
+    #[derive(Debug, serde::Serialize)]
+    pub struct HostCapabilities {
+        pub package: &'static str,
+        pub version: String,
+        pub declarable_imports: Vec<&'static str>,
+    }
+
+    /// What this host implements: the `boatramp:handlers` package version + the
+    /// import tokens a deploy may grant.
+    pub fn host_capabilities() -> HostCapabilities {
+        let (m, n, p) = HOST_HANDLERS_VERSION;
+        HostCapabilities {
+            package: "boatramp:handlers",
+            version: format!("{m}.{n}.{p}"),
+            declarable_imports: boatramp_core::config::known_imports().to_vec(),
+        }
+    }
 
     /// §4: reject at deploy a guest that imports `boatramp:handlers@X` where X is
     /// **newer** than the host implements — with an actionable message — instead of
