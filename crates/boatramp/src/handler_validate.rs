@@ -120,6 +120,49 @@ mod imp {
         }
     }
 
+    /// The `boatramp:handlers` capability-package version this host implements —
+    /// as (major, minor, patch). **Must match the `package boatramp:handlers@x.y.z`
+    /// line in `crates/boatramp-handlers/wit/world.wit`** (a drift-guard test asserts
+    /// it). A guest that imports the package *unversioned* resolves as "latest" and
+    /// is always accepted; only a guest that pins a version is checked against this.
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 2, 18);
+
+    /// §4: reject at deploy a guest that imports `boatramp:handlers@X` where X is
+    /// **newer** than the host implements — with an actionable message — instead of
+    /// letting it fail opaquely at instantiation. Unversioned imports carry no
+    /// requirement and pass (resolved as the host's latest).
+    fn check_handlers_version(
+        resolve: &Resolve,
+        world: WorldId,
+    ) -> std::result::Result<(), String> {
+        for (_, item) in &resolve.worlds[world].imports {
+            let WorldItem::Interface { id, .. } = item else {
+                continue;
+            };
+            let iface = &resolve.interfaces[*id];
+            let Some(pkg_id) = iface.package else {
+                continue;
+            };
+            let pkg = &resolve.packages[pkg_id].name;
+            if pkg.namespace != "boatramp" || pkg.name != "handlers" {
+                continue;
+            }
+            if let Some(req) = &pkg.version {
+                let required = (req.major, req.minor, req.patch);
+                if required > HOST_HANDLERS_VERSION {
+                    let (hm, hn, hp) = HOST_HANDLERS_VERSION;
+                    let iface_name = iface.name.as_deref().unwrap_or("?");
+                    return Err(format!(
+                        "component imports boatramp:handlers/{iface_name}@{req} but this host \
+                         implements boatramp:handlers@{hm}.{hn}.{hp}. Upgrade the host to \
+                         >= {req}, or rebuild the guest against the host's capability version"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply the import/export policy to a component's interface labels. Pure —
     /// the security-relevant decision lives here and is exhaustively tested.
     fn check_interface_policy(
@@ -172,7 +215,8 @@ mod imp {
     }
 
     /// Decode a component's imported/exported interface labels as
-    /// `(package "ns:name", interface name)` pairs.
+    /// `(package "ns:name", interface name)` pairs, after checking the guest's
+    /// pinned `boatramp:handlers` version against what the host implements.
     fn decode_interfaces(bytes: &[u8]) -> std::result::Result<(Labels, Labels), String> {
         let decoded = decode(bytes).map_err(|err| format!("not a valid component: {err}"))?;
         let (resolve, world) = match &decoded {
@@ -181,6 +225,7 @@ mod imp {
                 return Err("file is a WIT package, not a component".to_string())
             }
         };
+        check_handlers_version(resolve, world)?;
         Ok((
             interfaces(resolve, world, false),
             interfaces(resolve, world, true),
@@ -278,6 +323,43 @@ mod imp {
         let mut resolve = Resolve::new();
         let pkg = resolve.push_source("fixture.wit", wit).unwrap();
         let world = resolve.select_world(&[pkg], Some(world)).unwrap();
+        let mut module =
+            wit_component::dummy_module(&resolve, world, wit_parser::ManglingAndAbi::Standard32);
+        wit_component::embed_component_metadata(
+            &mut module,
+            &resolve,
+            world,
+            wit_component::StringEncoding::UTF8,
+        )
+        .unwrap();
+        wit_component::ComponentEncoder::default()
+            .module(&module)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    /// A guest component importing `boatramp:handlers/orm@<ver>` (a pinned version),
+    /// for the deploy version-check tests.
+    #[cfg(test)]
+    fn build_handlers_guest(ver: &str) -> Vec<u8> {
+        let mut resolve = Resolve::new();
+        resolve
+            .push_source(
+                "cap.wit",
+                &format!("package boatramp:handlers@{ver};\ninterface orm {{ doit: func(); }}"),
+            )
+            .unwrap();
+        let guest = resolve
+            .push_source(
+                "guest.wit",
+                &format!(
+                    "package test:guest;\ninterface run {{ go: func(); }}\n\
+                     world h {{ import boatramp:handlers/orm@{ver}; export run; }}"
+                ),
+            )
+            .unwrap();
+        let world = resolve.select_world(&[guest], Some("h")).unwrap();
         let mut module =
             wit_component::dummy_module(&resolve, world, wit_parser::ManglingAndAbi::Standard32);
         wit_component::embed_component_metadata(
@@ -524,6 +606,33 @@ mod imp {
                 Some("1.2.3"),
                 "imported package version did not survive the metadata roundtrip"
             );
+        }
+
+        #[test]
+        fn host_handlers_version_matches_the_wit() {
+            // Drift guard: HOST_HANDLERS_VERSION must equal the package version in
+            // world.wit, or the deploy check advertises the wrong number.
+            let wit = include_str!("../../boatramp-handlers/wit/world.wit");
+            let (m, n, p) = HOST_HANDLERS_VERSION;
+            let expect = format!("package boatramp:handlers@{m}.{n}.{p};");
+            assert!(
+                wit.contains(&expect),
+                "world.wit package version != HOST_HANDLERS_VERSION (expected `{expect}`)"
+            );
+        }
+
+        #[test]
+        fn rejects_guest_pinning_a_newer_handlers_version() {
+            // A guest pinning a newer capability version than the host implements is
+            // rejected at deploy, with an actionable message — not left to fail at
+            // instantiation.
+            let newer = build_handlers_guest("0.2.19");
+            let err = decode_interfaces(&newer).unwrap_err();
+            assert!(err.contains("0.2.19"), "{err}");
+            assert!(err.contains("host implements"), "{err}");
+            // The host's own version and an older one pass the version gate.
+            assert!(decode_interfaces(&build_handlers_guest("0.2.18")).is_ok());
+            assert!(decode_interfaces(&build_handlers_guest("0.2.17")).is_ok());
         }
 
         #[test]
