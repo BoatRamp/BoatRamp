@@ -294,6 +294,9 @@ fn sql_to_json(value: &SqlValue) -> Value {
         SqlValue::Integer(i) => json!(i),
         SqlValue::Real(f) => json!(f),
         SqlValue::Text(s) => json!(s),
+        // A JSON cell surfaces as its parsed value (real nested JSON), falling back to the
+        // raw text if it somehow doesn't parse.
+        SqlValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| json!(s)),
         SqlValue::Blob(bytes) => {
             use base64::Engine;
             json!(base64::engine::general_purpose::STANDARD.encode(bytes))
