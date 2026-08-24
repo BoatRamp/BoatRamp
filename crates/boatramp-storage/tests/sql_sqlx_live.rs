@@ -52,7 +52,7 @@ async fn postgres_round_trip() {
     .unwrap();
     let affected = tx
         .execute(
-            "INSERT INTO bramp_ext_test VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO bramp_ext_test VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
                 SqlValue::Integer(1),
                 SqlValue::Text("alpha".into()),
@@ -130,6 +130,119 @@ async fn postgres_round_trip() {
         .unwrap_err();
     assert!(matches!(err, SqlError::Other(_)), "got {err:?}");
     tx.rollback().await.unwrap();
+}
+
+/// §1a regression: a bound `NULL` reaches a **non-text** column with no cast — it
+/// is sent as an unspecified-type parameter (OID 0), so Postgres infers the column
+/// type — AND a subsequent non-null bind into the same placeholder still works.
+/// Before the fix a `NULL` bound as `text`, which `bigint`/`jsonb` reject
+/// ("column \"n\" is of type bigint but expression is of type text").
+#[cfg(feature = "sql-postgres")]
+#[tokio::test]
+async fn postgres_null_binds_untyped_into_nontext_columns() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip postgres_null_binds_untyped: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    tx.execute("DROP TABLE IF EXISTS bramp_null_test", &[])
+        .await
+        .unwrap();
+    tx.execute("CREATE TABLE bramp_null_test (n BIGINT, doc JSONB)", &[])
+        .await
+        .unwrap();
+
+    // A bound NULL into `bigint` and `jsonb`, no `::cast` in the SQL.
+    tx.execute(
+        "INSERT INTO bramp_null_test (n, doc) VALUES (?1, ?2)",
+        &[SqlValue::Null, SqlValue::Null],
+    )
+    .await
+    .unwrap();
+
+    // The same placeholder then binds a real integer — the fix must not re-break
+    // the non-null path.
+    tx.execute(
+        "INSERT INTO bramp_null_test (n) VALUES (?1)",
+        &[SqlValue::Integer(42)],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    let rows = tx
+        .query("SELECT n FROM bramp_null_test ORDER BY n NULLS FIRST", &[])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(rows.rows.len(), 2);
+    assert!(
+        matches!(rows.rows[0][0], SqlValue::Null),
+        "got {:?}",
+        rows.rows[0][0]
+    );
+    assert_eq!(rows.rows[1][0], SqlValue::Integer(42));
+}
+
+/// §1b: a `SqlValue::Json` binds into a `jsonb` (and `json`) column with **no
+/// `::jsonb` cast in the query** — it goes out as Postgres `json` (raw text),
+/// which assignment-casts to `jsonb`. The `->>'a'` read proves it stored as real
+/// JSON (a text column would reject the operator / not parse), and JSON reads
+/// back as `Text`.
+#[cfg(feature = "sql-postgres")]
+#[tokio::test]
+async fn postgres_json_writes_to_jsonb_without_a_cast() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip postgres_json: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    tx.execute("DROP TABLE IF EXISTS bramp_json_test", &[])
+        .await
+        .unwrap();
+    tx.execute("CREATE TABLE bramp_json_test (doc JSONB, doc2 JSON)", &[])
+        .await
+        .unwrap();
+    tx.execute(
+        "INSERT INTO bramp_json_test (doc, doc2) VALUES (?1, ?2)",
+        &[
+            SqlValue::Json(r#"{"a":1,"b":[2,3]}"#.into()),
+            SqlValue::Json(r#"{"x":true}"#.into()),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    let rows = tx
+        .query(
+            "SELECT doc->>'a' AS a, doc2->>'x' AS x, jsonb_typeof(doc) AS t FROM bramp_json_test",
+            &[],
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        matches!(&rows.rows[0][0], SqlValue::Text(s) if s == "1"),
+        "doc->>'a' = {:?}",
+        rows.rows[0][0]
+    );
+    assert!(
+        matches!(&rows.rows[0][1], SqlValue::Text(s) if s == "true"),
+        "doc2->>'x' = {:?}",
+        rows.rows[0][1]
+    );
+    assert!(
+        matches!(&rows.rows[0][2], SqlValue::Text(s) if s == "object"),
+        "jsonb_typeof = {:?}",
+        rows.rows[0][2]
+    );
 }
 
 /// The external MySQL backend: same round-trip. MySQL has no native `BOOL`

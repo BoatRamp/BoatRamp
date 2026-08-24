@@ -45,11 +45,18 @@
 //! native `$N`/`?` in guest SQL is refused, not silently accepted.
 //!
 //! ## `NULL` parameter typing
-//! A positional `NULL` bind carries no SQL type in the vocabulary, so it is sent
-//! with text affinity. Postgres is strict about parameter types, so a `NULL`
-//! bound against a non-text column may need an explicit cast on the placeholder
-//! (e.g. `?1::int`, which becomes `$1::int`); MySQL coerces and is unaffected.
-//! Actual (non-null) values bind with their natural type.
+//! A positional `NULL` bind carries no SQL type in the vocabulary. On Postgres it
+//! is sent with an **unspecified type (OID 0)**, so the server infers the column
+//! type at `Parse` — a `NULL` into any column works with no cast (see
+//! `PgUntypedNull`). MySQL coerces a text null fine. Actual (non-null) values bind
+//! with their natural type.
+//!
+//! ## `JSON` binding
+//! A `SqlValue::Json` (JSON text) is bound so it reaches a JSON column with no
+//! `::jsonb` cast in the query: on Postgres as `json` (OID 114, whose wire format
+//! is the raw text — see `PgJson`), which lands in a `json` column directly and in
+//! a `jsonb` column via the json→jsonb assignment cast; on MySQL as text (a valid
+//! JSON string is accepted by a `JSON` column). SQLite/libsql store it as text.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -306,19 +313,24 @@ fn map_err(err: sqlx::Error) -> SqlError {
 }
 
 /// Bind the guest params onto a sqlx query in positional order. See the
-/// module-level note on `NULL` parameter typing.
+/// module-level note on `NULL` parameter typing. `$null` is the value bound for a
+/// `SqlValue::Null` — it differs per backend (Postgres wants an unspecified-type
+/// null so the server infers the column type; MySQL coerces a text null fine).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 macro_rules! bind_params {
-    ($query:expr, $params:expr) => {{
+    ($query:expr, $params:expr, $null:expr, $json:expr $(,)?) => {{
         let mut q = $query;
         for value in $params {
             q = match value {
-                ::boatramp_core::sql::SqlValue::Null => q.bind(Option::<String>::None),
+                ::boatramp_core::sql::SqlValue::Null => q.bind($null),
                 ::boatramp_core::sql::SqlValue::Boolean(b) => q.bind(*b),
                 ::boatramp_core::sql::SqlValue::Integer(i) => q.bind(*i),
                 ::boatramp_core::sql::SqlValue::Real(r) => q.bind(*r),
                 ::boatramp_core::sql::SqlValue::Text(s) => q.bind(s.as_str()),
                 ::boatramp_core::sql::SqlValue::Blob(b) => q.bind(b.as_slice()),
+                // JSON differs per engine (`$json` wraps the text with the right
+                // column type); see the module note on JSON binding.
+                ::boatramp_core::sql::SqlValue::Json(s) => q.bind($json(s.as_str())),
             };
         }
         q
@@ -338,6 +350,50 @@ mod postgres_backend {
     use sqlx::pool::PoolConnection;
     use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
     use sqlx::{Column, Executor, Postgres, Row, TypeInfo, ValueRef};
+
+    /// A `NULL` bound with an **unspecified** Postgres type (OID 0), so the server
+    /// infers the target column's type at `Parse`. Binding `None::<String>` instead
+    /// forces `text` affinity, which a strict non-text column (`bigint`, `jsonb`, …)
+    /// rejects with no cast — the latent-bug source this fixes. Non-null values are
+    /// unaffected; they still bind with their natural type.
+    struct PgUntypedNull;
+
+    impl sqlx::Type<Postgres> for PgUntypedNull {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(0))
+        }
+    }
+
+    impl<'q> sqlx::Encode<'q, Postgres> for PgUntypedNull {
+        fn encode_by_ref(
+            &self,
+            _buf: &mut sqlx::postgres::PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            Ok(sqlx::encode::IsNull::Yes)
+        }
+    }
+
+    /// A JSON document bound as Postgres `json` (OID 114) — whose binary wire
+    /// format is the raw JSON text — so it lands in a `json` column directly and in
+    /// a `jsonb` column via the built-in json→jsonb assignment cast, with no
+    /// `::jsonb` in the query. Non-JSON values are unaffected.
+    struct PgJson<'a>(&'a str);
+
+    impl sqlx::Type<Postgres> for PgJson<'_> {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(114))
+        }
+    }
+
+    impl<'q> sqlx::Encode<'q, Postgres> for PgJson<'q> {
+        fn encode_by_ref(
+            &self,
+            buf: &mut sqlx::postgres::PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            buf.extend_from_slice(self.0.as_bytes());
+            Ok(sqlx::encode::IsNull::No)
+        }
+    }
 
     /// An external PostgreSQL [`SqlBackend`] over a lazily-connecting pool.
     pub struct PgSqlBackend {
@@ -418,7 +474,12 @@ mod postgres_backend {
                 params.len(),
             )?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                PgUntypedNull,
+                PgJson,
+            );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
         }
@@ -430,7 +491,12 @@ mod postgres_backend {
                 params.len(),
             )?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                PgUntypedNull,
+                PgJson,
+            );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
         }
@@ -571,6 +637,13 @@ mod mysql_backend {
     use sqlx::pool::PoolConnection;
     use sqlx::{Column, Executor, MySql, Row, TypeInfo, ValueRef};
 
+    /// MySQL binds a JSON document as its text — a valid JSON string is accepted by
+    /// a JSON column directly, no special type. A fn item (not a closure) so it is
+    /// higher-ranked over the borrow's lifetime for `bind_params!`.
+    fn json_as_text(s: &str) -> &str {
+        s
+    }
+
     /// An external MySQL/MariaDB [`SqlBackend`] over a lazily-connecting pool.
     pub struct MySqlSqlBackend {
         pool: MySqlPool,
@@ -647,7 +720,12 @@ mod mysql_backend {
             let stmt =
                 crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                Option::<String>::None,
+                json_as_text,
+            );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
         }
@@ -656,7 +734,12 @@ mod mysql_backend {
             let stmt =
                 crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                Option::<String>::None,
+                json_as_text,
+            );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
         }

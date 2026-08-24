@@ -231,6 +231,9 @@ fn to_libsql(params: &[SqlValue]) -> Vec<LibsqlValue> {
             SqlValue::Real(f) => LibsqlValue::Real(*f),
             SqlValue::Text(s) => LibsqlValue::Text(s.clone()),
             SqlValue::Blob(b) => LibsqlValue::Blob(b.clone()),
+            // SQLite has no JSON type — store the document as text (the SQLite
+            // json1 functions operate on text). Reads come back as `Text`.
+            SqlValue::Json(s) => LibsqlValue::Text(s.clone()),
         })
         .collect()
 }

@@ -2,7 +2,13 @@
 // a standard WASI interface, vendored under `deps/` and pinned deliberately
 // (standard interfaces only). bindgen! generates the
 // host side per world; the implementations live in `src/bindings/`.
-package boatramp:handlers;
+//
+// The package is VERSIONED so a guest can pin the capability surface it needs and
+// have a mismatch caught at deploy, not at instantiation. An UNVERSIONED guest
+// import resolves as "latest" (the host's implemented version), so existing
+// guests keep working unchanged; only a guest that explicitly pins a version it
+// needs is version-checked. See `boatramp capabilities` + the deploy validator.
+package boatramp:handlers@0.2.18;
 
 /// The key/value capability: `wasi:keyvalue` store + atomics + batch, backed by
 /// boatramp's `KvStore` with a per-site key prefix.
@@ -28,6 +34,11 @@ interface sql-types {
     %float(f64),
     text(string),
     blob(list<u8>),
+    /// A JSON document (the JSON text). The host binds it with the right column
+    /// type per engine (`jsonb`/`json` on Postgres, JSON string on MySQL, text on
+    /// SQLite) — so a guest can write a `jsonb` column without a `::jsonb` cast.
+    /// Added in `boatramp:handlers@0.2.18`.
+    json(string),
   }
 
   /// One result row, column order matching `query-result.columns`.
@@ -98,6 +109,7 @@ world sql-host {
 /// through the same per-invocation transaction as `sql-query` (so a handler may mix the two
 /// on one database). Reuses `sql-types`. Covers the common shapes; anything it can't express
 /// (correlated subqueries, DISTINCT ON, CTEs, JSON paths, …) stays on raw `sql-query`.
+@since(version = 0.2.17)
 interface orm {
   use sql-types.{value, row, query-result, error};
 
@@ -109,6 +121,8 @@ interface orm {
   enum cmp-op { eq, ne, lt, le, gt, ge }
   enum join-kind { inner, left-join }
   enum direction { asc, desc }
+  // `pgvector` distance metric (Postgres-only): cosine `<=>` / L2 `<->`. @since 0.2.18.
+  enum distance-metric { cosine, l2 }
 
   // ---- expression arena ----------------------------------------------------
   // Recursive scalar expressions cross the WIT boundary as a flat arena: an `expr-node`'s
@@ -119,6 +133,13 @@ interface orm {
   record binary-node { op: bin-op, left: u32, right: u32 }
   record call-node { which: scalar-func, args: list<u32> }
   record json-node { base: u32, path: list<string> }   // path keys => `$.a.b` / `#>>'{a,b}'`
+  // `(exprs[left] <op> exprs[right])` per `metric`; Postgres-only (fails closed elsewhere).
+  record distance-node { left: u32, right: u32, metric: distance-metric }
+  // A correlated roll-up: `(SELECT agg(arg) FROM table WHERE preds[filter])`. `arg` is a column
+  // name (`none` = `*`, count-only); `filter` indexes the `preds` arena and — like every arena
+  // reference reachable from it — must stay strictly below this node so the whole thing is
+  // acyclic. Only accepted when the host has the `orm-subquery` feature. @since 0.2.18.
+  record related-aggregate-node { agg: agg, arg: option<string>, table: string, filter: u32 }
   variant expr-node {
     column(string),
     literal(value),
@@ -127,6 +148,12 @@ interface orm {
     binary(binary-node),
     call(call-node),
     json-extract(json-node),
+    // Adding cases to this param-position variant is backward-compatible (a host only ever
+    // accepts more); a guest that emits them must run on a host that understands them (pin
+    // `@0.2.18`). @since 0.2.18.
+    distance(distance-node),
+    vector-literal(string),     // a bracketed float list, bound + rendered `?N::vector`
+    related-aggregate(related-aggregate-node),
   }
 
   // ---- predicate arena -----------------------------------------------------

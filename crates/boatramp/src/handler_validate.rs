@@ -44,7 +44,28 @@ pub fn validate_deploy(_dir: &Path, _config: &DeployConfig) -> Result<()> {
 }
 
 #[cfg(feature = "handlers")]
-pub use imp::validate_deploy;
+pub use imp::{host_capabilities, validate_deploy, HostCapabilities};
+
+/// The capability surface a host advertises (`boatramp capabilities` /
+/// `/api/capabilities`): the `boatramp:handlers` package version it implements and
+/// the import tokens a deploy may grant.
+#[cfg(not(feature = "handlers"))]
+#[derive(Debug, serde::Serialize)]
+pub struct HostCapabilities {
+    pub package: &'static str,
+    pub version: String,
+    pub declarable_imports: Vec<&'static str>,
+}
+
+/// Without the `handlers` feature the host implements no handler capabilities.
+#[cfg(not(feature = "handlers"))]
+pub fn host_capabilities() -> HostCapabilities {
+    HostCapabilities {
+        package: "boatramp:handlers",
+        version: "0.0.0".to_string(),
+        declarable_imports: Vec::new(),
+    }
+}
 
 #[cfg(feature = "handlers")]
 mod imp {
@@ -102,13 +123,84 @@ mod imp {
         match (pkg, iface) {
             ("wasi:keyvalue", _) => Some("wasi:keyvalue"),
             ("wasi:blobstore", _) => Some("wasi:blobstore"),
-            ("boatramp:handlers", "sql-query" | "sql-types") => Some("sql"),
+            // `orm` is a **typed view of the same `sql` capability** — it runs on the
+            // same per-invocation SQL session/backend and `use`s `sql-types`. So it
+            // is the `sql` token: declaring `sql` grants orm (and inherits the
+            // "requires a SQL backend" activation check). Before this it mapped to
+            // None → "disallowed", so an orm-importing guest was rejected at deploy.
+            ("boatramp:handlers", "sql-query" | "sql-types" | "orm") => Some("sql"),
             ("boatramp:handlers", "messaging-producer" | "messaging-types") => {
                 Some("wasi:messaging")
             }
             ("boatramp:handlers", "invoke" | "invoke-types") => Some("invoke"),
+            // GraphQL is a distinct capability (federated subgraph access over the
+            // project's composed supergraph). Always linked, so it is gated only by
+            // declaration (there is no server-level backend to reject against).
+            ("boatramp:handlers", "graphql" | "graphql-types") => Some("graphql"),
             _ => None,
         }
+    }
+
+    /// The `boatramp:handlers` capability-package version this host implements —
+    /// as (major, minor, patch). **Must match the `package boatramp:handlers@x.y.z`
+    /// line in `crates/boatramp-handlers/wit/world.wit`** (a drift-guard test asserts
+    /// it). A guest that imports the package *unversioned* resolves as "latest" and
+    /// is always accepted; only a guest that pins a version is checked against this.
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 2, 18);
+
+    /// The capability surface a host advertises (see the crate-level re-export).
+    #[derive(Debug, serde::Serialize)]
+    pub struct HostCapabilities {
+        pub package: &'static str,
+        pub version: String,
+        pub declarable_imports: Vec<&'static str>,
+    }
+
+    /// What this host implements: the `boatramp:handlers` package version + the
+    /// import tokens a deploy may grant.
+    pub fn host_capabilities() -> HostCapabilities {
+        let (m, n, p) = HOST_HANDLERS_VERSION;
+        HostCapabilities {
+            package: "boatramp:handlers",
+            version: format!("{m}.{n}.{p}"),
+            declarable_imports: boatramp_core::config::known_imports().to_vec(),
+        }
+    }
+
+    /// §4: reject at deploy a guest that imports `boatramp:handlers@X` where X is
+    /// **newer** than the host implements — with an actionable message — instead of
+    /// letting it fail opaquely at instantiation. Unversioned imports carry no
+    /// requirement and pass (resolved as the host's latest).
+    fn check_handlers_version(
+        resolve: &Resolve,
+        world: WorldId,
+    ) -> std::result::Result<(), String> {
+        for (_, item) in &resolve.worlds[world].imports {
+            let WorldItem::Interface { id, .. } = item else {
+                continue;
+            };
+            let iface = &resolve.interfaces[*id];
+            let Some(pkg_id) = iface.package else {
+                continue;
+            };
+            let pkg = &resolve.packages[pkg_id].name;
+            if pkg.namespace != "boatramp" || pkg.name != "handlers" {
+                continue;
+            }
+            if let Some(req) = &pkg.version {
+                let required = (req.major, req.minor, req.patch);
+                if required > HOST_HANDLERS_VERSION {
+                    let (hm, hn, hp) = HOST_HANDLERS_VERSION;
+                    let iface_name = iface.name.as_deref().unwrap_or("?");
+                    return Err(format!(
+                        "component imports boatramp:handlers/{iface_name}@{req} but this host \
+                         implements boatramp:handlers@{hm}.{hn}.{hp}. Upgrade the host to \
+                         >= {req}, or rebuild the guest against the host's capability version"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply the import/export policy to a component's interface labels. Pure —
@@ -163,7 +255,8 @@ mod imp {
     }
 
     /// Decode a component's imported/exported interface labels as
-    /// `(package "ns:name", interface name)` pairs.
+    /// `(package "ns:name", interface name)` pairs, after checking the guest's
+    /// pinned `boatramp:handlers` version against what the host implements.
     fn decode_interfaces(bytes: &[u8]) -> std::result::Result<(Labels, Labels), String> {
         let decoded = decode(bytes).map_err(|err| format!("not a valid component: {err}"))?;
         let (resolve, world) = match &decoded {
@@ -172,6 +265,7 @@ mod imp {
                 return Err("file is a WIT package, not a component".to_string())
             }
         };
+        check_handlers_version(resolve, world)?;
         Ok((
             interfaces(resolve, world, false),
             interfaces(resolve, world, true),
@@ -285,6 +379,43 @@ mod imp {
             .unwrap()
     }
 
+    /// A guest component importing `boatramp:handlers/orm@<ver>` (a pinned version),
+    /// for the deploy version-check tests.
+    #[cfg(test)]
+    fn build_handlers_guest(ver: &str) -> Vec<u8> {
+        let mut resolve = Resolve::new();
+        resolve
+            .push_source(
+                "cap.wit",
+                &format!("package boatramp:handlers@{ver};\ninterface orm {{ doit: func(); }}"),
+            )
+            .unwrap();
+        let guest = resolve
+            .push_source(
+                "guest.wit",
+                &format!(
+                    "package test:guest;\ninterface run {{ go: func(); }}\n\
+                     world h {{ import boatramp:handlers/orm@{ver}; export run; }}"
+                ),
+            )
+            .unwrap();
+        let world = resolve.select_world(&[guest], Some("h")).unwrap();
+        let mut module =
+            wit_component::dummy_module(&resolve, world, wit_parser::ManglingAndAbi::Standard32);
+        wit_component::embed_component_metadata(
+            &mut module,
+            &resolve,
+            world,
+            wit_component::StringEncoding::UTF8,
+        )
+        .unwrap();
+        wit_component::ComponentEncoder::default()
+            .module(&module)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -380,6 +511,40 @@ mod imp {
         }
 
         #[test]
+        fn policy_gates_orm_as_the_sql_capability() {
+            // orm imports boatramp:handlers/orm and (via `use`) sql-types; it is the
+            // `sql` capability, so declaring `sql` satisfies it and nothing extra is
+            // needed. Before, `orm` mapped to no token and was rejected as disallowed.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let orm = [
+                lbl("boatramp:handlers", "orm"),
+                lbl("boatramp:handlers", "sql-types"),
+            ];
+            assert!(check_interface_policy(&orm, &exports, &["sql".into()], Role::Handler).is_ok());
+            assert!(
+                check_interface_policy(&orm, &exports, &["sql:*".into()], Role::Handler).is_ok()
+            );
+            let err = check_interface_policy(&orm, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`sql`"), "{err}");
+        }
+
+        #[test]
+        fn policy_gates_graphql_by_the_real_interface() {
+            // GraphQL is its own capability (host: boatramp:handlers/{graphql,
+            // graphql-types}), declared as `graphql`.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let gql = [
+                lbl("boatramp:handlers", "graphql"),
+                lbl("boatramp:handlers", "graphql-types"),
+            ];
+            assert!(
+                check_interface_policy(&gql, &exports, &["graphql".into()], Role::Handler).is_ok()
+            );
+            let err = check_interface_policy(&gql, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`graphql`"), "{err}");
+        }
+
+        #[test]
         fn policy_gates_messaging_producer_and_consumer_export() {
             // A request handler may import the messaging producer under a
             // `wasi:messaging` grant (the host interface is boatramp:handlers/*).
@@ -414,6 +579,152 @@ mod imp {
             assert!(err.contains("wasi:http/incoming-handler"), "{err}");
             // Garbage bytes are rejected as an invalid component.
             assert!(validate_component(b"not a wasm component", &[], Role::Handler).is_err());
+        }
+
+        /// A guest component's embedded metadata **preserves the version** of an
+        /// imported package across `embed_component_metadata` → `ComponentEncoder` →
+        /// `decode`. The deploy-time capability check relies on this to compare a
+        /// guest's required `boatramp:handlers@x` against what the host implements;
+        /// if this ever regresses, the check must fall back to feature-set
+        /// (interface-presence) granularity.
+        #[test]
+        fn imported_package_version_survives_metadata_roundtrip() {
+            // Two sources: a versioned capability package + a guest world importing
+            // it. Mirrors a guest importing `boatramp:handlers@x`.
+            let mut resolve = Resolve::new();
+            resolve
+                .push_source(
+                    "cap.wit",
+                    "package versioned:cap@1.2.3;\ninterface thing { doit: func(); }",
+                )
+                .unwrap();
+            let guest = resolve
+                .push_source(
+                    "guest.wit",
+                    "package test:guest;\ninterface run { go: func(); }\n\
+                     world h { import versioned:cap/thing@1.2.3; export run; }",
+                )
+                .unwrap();
+            let world = resolve.select_world(&[guest], Some("h")).unwrap();
+            let mut module = wit_component::dummy_module(
+                &resolve,
+                world,
+                wit_parser::ManglingAndAbi::Standard32,
+            );
+            wit_component::embed_component_metadata(
+                &mut module,
+                &resolve,
+                world,
+                wit_component::StringEncoding::UTF8,
+            )
+            .unwrap();
+            let bytes = wit_component::ComponentEncoder::default()
+                .module(&module)
+                .unwrap()
+                .encode()
+                .unwrap();
+            let decoded = decode(&bytes).unwrap();
+            let (resolve, world) = match &decoded {
+                DecodedWasm::Component(r, w) => (r, *w),
+                _ => panic!("not a component"),
+            };
+            let mut version = None;
+            for (_, item) in &resolve.worlds[world].imports {
+                if let WorldItem::Interface { id, .. } = item {
+                    let iface = &resolve.interfaces[*id];
+                    if let Some(pkg_id) = iface.package {
+                        let pkg = &resolve.packages[pkg_id].name;
+                        if pkg.namespace == "versioned" && pkg.name == "cap" {
+                            version = pkg.version.as_ref().map(|v| v.to_string());
+                        }
+                    }
+                }
+            }
+            eprintln!("SPIKE: imported versioned:cap version after roundtrip = {version:?}");
+            assert_eq!(
+                version.as_deref(),
+                Some("1.2.3"),
+                "imported package version did not survive the metadata roundtrip"
+            );
+        }
+
+        #[test]
+        fn host_handlers_version_matches_the_wit() {
+            // Drift guard: HOST_HANDLERS_VERSION must equal the package version in
+            // world.wit, or the deploy check advertises the wrong number.
+            let wit = include_str!("../../boatramp-handlers/wit/world.wit");
+            let (m, n, p) = HOST_HANDLERS_VERSION;
+            let expect = format!("package boatramp:handlers@{m}.{n}.{p};");
+            assert!(
+                wit.contains(&expect),
+                "world.wit package version != HOST_HANDLERS_VERSION (expected `{expect}`)"
+            );
+        }
+
+        #[test]
+        fn rejects_guest_pinning_a_newer_handlers_version() {
+            // A guest pinning a newer capability version than the host implements is
+            // rejected at deploy, with an actionable message — not left to fail at
+            // instantiation.
+            let newer = build_handlers_guest("0.2.19");
+            let err = decode_interfaces(&newer).unwrap_err();
+            assert!(err.contains("0.2.19"), "{err}");
+            assert!(err.contains("host implements"), "{err}");
+            // The host's own version and an older one pass the version gate.
+            assert!(decode_interfaces(&build_handlers_guest("0.2.18")).is_ok());
+            assert!(decode_interfaces(&build_handlers_guest("0.2.17")).is_ok());
+        }
+
+        #[test]
+        fn undeclared_capability_message_states_the_component_scoped_rule() {
+            // The rejection must state the component-scoped rule inline, so a dev
+            // isn't confused why a route that never uses the capability still needs
+            // to grant it.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let sql = [
+                lbl("boatramp:handlers", "sql-query"),
+                lbl("boatramp:handlers", "sql-types"),
+            ];
+            let err = check_interface_policy(&sql, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("component-scoped"), "{err}");
+            assert!(err.contains("`sql`"), "{err}");
+        }
+
+        #[test]
+        fn validate_deploy_names_the_offending_route_not_just_the_component() {
+            use boatramp_core::config::{DeployConfig, HandlerConfig};
+            use std::collections::BTreeMap;
+
+            // A real component that fails validation (exports test:guest, not
+            // wasi:http). The failure reason is immaterial here — what matters is
+            // that the *route + methods* prefix the message (the §5 label), so with
+            // one component on several routes the dev sees which one is at fault.
+            let wit = "package test:guest;\n\
+                       interface incoming-handler { handle: func(); }\n\
+                       world h { export incoming-handler; }";
+            let bytes = build_fixture(wit, "h");
+
+            let dir = std::env::temp_dir().join(format!("br-validate-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("portal.wasm"), &bytes).unwrap();
+
+            let config = DeployConfig {
+                handlers: vec![HandlerConfig {
+                    route: "/intake/status".into(),
+                    methods: vec!["GET".into()],
+                    component: "portal.wasm".into(),
+                    imports: vec![],
+                    limits: None,
+                    env: BTreeMap::new(),
+                    invoke_targets: vec![],
+                }],
+                ..Default::default()
+            };
+
+            let err = validate_deploy(&dir, &config).unwrap_err().to_string();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(err.contains("/intake/status"), "{err}");
+            assert!(err.contains("GET"), "{err}");
         }
     }
 }

@@ -42,6 +42,11 @@ pub enum SqlValue {
     Text(String),
     /// A byte string.
     Blob(Vec<u8>),
+    /// A JSON document (its JSON text). Bound with the engine's JSON column type
+    /// (`jsonb`/`json` on Postgres, a JSON string on MySQL, text on SQLite), so a
+    /// guest can write a `jsonb` column with no `::jsonb` cast. Read back as
+    /// [`Text`](Self::Text) (the engines stringify JSON on the way out).
+    Json(String),
 }
 
 /// The rows a [`SqlTransaction::query`] returned: column names plus row-major

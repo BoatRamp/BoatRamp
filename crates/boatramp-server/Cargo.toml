@@ -29,6 +29,10 @@ handlers = [
   "dep:async-graphql-value",
   "dep:wasmparser",
 ]
+# The orm `related-aggregate` correlated roll-up. Independently toggleable so an operator can
+# ship a host that refuses the one scalar-subquery form; implies `handlers` (it rides the orm
+# binding). On in batteries-included builds, off if you drop it from the feature set.
+orm-subquery = ["handlers", "boatramp-handlers/orm-subquery"]
 
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via

@@ -329,6 +329,9 @@ impl Value {
             },
             SqlValue::Real(f) => Self::Float { value: *f },
             SqlValue::Text(s) => Self::Text { value: s.clone() },
+            // The hrana wire (SQLite family) has no JSON type — a JSON document rides as text,
+            // exactly as SQLite stores it.
+            SqlValue::Json(s) => Self::Text { value: s.clone() },
             SqlValue::Blob(b) => Self::Blob {
                 base64: base64::engine::general_purpose::STANDARD.encode(b),
             },
