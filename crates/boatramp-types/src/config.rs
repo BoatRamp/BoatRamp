@@ -448,8 +448,10 @@ pub struct HandlerConfig {
     /// (SSE, chunked, agent token streaming) via a `#[handler(stream)]` body. The
     /// host serves it on the isolated **streaming lane** (its own concurrency
     /// budget + a much larger wall-clock) so a long-lived stream never holds a
-    /// fast-request slot. Must match the guest's declared shape — the activation
-    /// pre-check rejects a mismatch. Default `false` (a buffered handler).
+    /// fast-request slot. Should match the guest's declared shape — the activation
+    /// pre-check *warns* when a `#[handler(stream)]` guest is deployed without it
+    /// (it would otherwise run on the sync lane and be cut at the sync timeout).
+    /// Default `false` (a buffered handler).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub streaming: bool,
     /// Optional resource limits (capped by site config at activation).
