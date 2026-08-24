@@ -416,6 +416,73 @@ mod imp {
             assert!(validate_component(b"not a wasm component", &[], Role::Handler).is_err());
         }
 
+        /// A guest component's embedded metadata **preserves the version** of an
+        /// imported package across `embed_component_metadata` → `ComponentEncoder` →
+        /// `decode`. The deploy-time capability check relies on this to compare a
+        /// guest's required `boatramp:handlers@x` against what the host implements;
+        /// if this ever regresses, the check must fall back to feature-set
+        /// (interface-presence) granularity.
+        #[test]
+        fn imported_package_version_survives_metadata_roundtrip() {
+            // Two sources: a versioned capability package + a guest world importing
+            // it. Mirrors a guest importing `boatramp:handlers@x`.
+            let mut resolve = Resolve::new();
+            resolve
+                .push_source(
+                    "cap.wit",
+                    "package versioned:cap@1.2.3;\ninterface thing { doit: func(); }",
+                )
+                .unwrap();
+            let guest = resolve
+                .push_source(
+                    "guest.wit",
+                    "package test:guest;\ninterface run { go: func(); }\n\
+                     world h { import versioned:cap/thing@1.2.3; export run; }",
+                )
+                .unwrap();
+            let world = resolve.select_world(&[guest], Some("h")).unwrap();
+            let mut module = wit_component::dummy_module(
+                &resolve,
+                world,
+                wit_parser::ManglingAndAbi::Standard32,
+            );
+            wit_component::embed_component_metadata(
+                &mut module,
+                &resolve,
+                world,
+                wit_component::StringEncoding::UTF8,
+            )
+            .unwrap();
+            let bytes = wit_component::ComponentEncoder::default()
+                .module(&module)
+                .unwrap()
+                .encode()
+                .unwrap();
+            let decoded = decode(&bytes).unwrap();
+            let (resolve, world) = match &decoded {
+                DecodedWasm::Component(r, w) => (r, *w),
+                _ => panic!("not a component"),
+            };
+            let mut version = None;
+            for (_, item) in &resolve.worlds[world].imports {
+                if let WorldItem::Interface { id, .. } = item {
+                    let iface = &resolve.interfaces[*id];
+                    if let Some(pkg_id) = iface.package {
+                        let pkg = &resolve.packages[pkg_id].name;
+                        if pkg.namespace == "versioned" && pkg.name == "cap" {
+                            version = pkg.version.as_ref().map(|v| v.to_string());
+                        }
+                    }
+                }
+            }
+            eprintln!("SPIKE: imported versioned:cap version after roundtrip = {version:?}");
+            assert_eq!(
+                version.as_deref(),
+                Some("1.2.3"),
+                "imported package version did not survive the metadata roundtrip"
+            );
+        }
+
         #[test]
         fn undeclared_capability_message_states_the_component_scoped_rule() {
             // The rejection must state the component-scoped rule inline, so a dev
