@@ -45,11 +45,11 @@
 //! native `$N`/`?` in guest SQL is refused, not silently accepted.
 //!
 //! ## `NULL` parameter typing
-//! A positional `NULL` bind carries no SQL type in the vocabulary, so it is sent
-//! with text affinity. Postgres is strict about parameter types, so a `NULL`
-//! bound against a non-text column may need an explicit cast on the placeholder
-//! (e.g. `?1::int`, which becomes `$1::int`); MySQL coerces and is unaffected.
-//! Actual (non-null) values bind with their natural type.
+//! A positional `NULL` bind carries no SQL type in the vocabulary. On Postgres it
+//! is sent with an **unspecified type (OID 0)**, so the server infers the column
+//! type at `Parse` — a `NULL` into any column works with no cast (see
+//! `PgUntypedNull`). MySQL coerces a text null fine. Actual (non-null) values bind
+//! with their natural type.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -306,14 +306,16 @@ fn map_err(err: sqlx::Error) -> SqlError {
 }
 
 /// Bind the guest params onto a sqlx query in positional order. See the
-/// module-level note on `NULL` parameter typing.
+/// module-level note on `NULL` parameter typing. `$null` is the value bound for a
+/// `SqlValue::Null` — it differs per backend (Postgres wants an unspecified-type
+/// null so the server infers the column type; MySQL coerces a text null fine).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 macro_rules! bind_params {
-    ($query:expr, $params:expr) => {{
+    ($query:expr, $params:expr, $null:expr) => {{
         let mut q = $query;
         for value in $params {
             q = match value {
-                ::boatramp_core::sql::SqlValue::Null => q.bind(Option::<String>::None),
+                ::boatramp_core::sql::SqlValue::Null => q.bind($null),
                 ::boatramp_core::sql::SqlValue::Boolean(b) => q.bind(*b),
                 ::boatramp_core::sql::SqlValue::Integer(i) => q.bind(*i),
                 ::boatramp_core::sql::SqlValue::Real(r) => q.bind(*r),
@@ -338,6 +340,28 @@ mod postgres_backend {
     use sqlx::pool::PoolConnection;
     use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
     use sqlx::{Column, Executor, Postgres, Row, TypeInfo, ValueRef};
+
+    /// A `NULL` bound with an **unspecified** Postgres type (OID 0), so the server
+    /// infers the target column's type at `Parse`. Binding `None::<String>` instead
+    /// forces `text` affinity, which a strict non-text column (`bigint`, `jsonb`, …)
+    /// rejects with no cast — the latent-bug source this fixes. Non-null values are
+    /// unaffected; they still bind with their natural type.
+    struct PgUntypedNull;
+
+    impl sqlx::Type<Postgres> for PgUntypedNull {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(0))
+        }
+    }
+
+    impl<'q> sqlx::Encode<'q, Postgres> for PgUntypedNull {
+        fn encode_by_ref(
+            &self,
+            _buf: &mut sqlx::postgres::PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            Ok(sqlx::encode::IsNull::Yes)
+        }
+    }
 
     /// An external PostgreSQL [`SqlBackend`] over a lazily-connecting pool.
     pub struct PgSqlBackend {
@@ -418,7 +442,11 @@ mod postgres_backend {
                 params.len(),
             )?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                PgUntypedNull
+            );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
         }
@@ -430,7 +458,11 @@ mod postgres_backend {
                 params.len(),
             )?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                PgUntypedNull
+            );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
         }
@@ -647,7 +679,11 @@ mod mysql_backend {
             let stmt =
                 crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                Option::<String>::None
+            );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
         }
@@ -656,7 +692,11 @@ mod mysql_backend {
             let stmt =
                 crate::sql_placeholders::normalize(sql, PlaceholderDialect::MySql, params.len())?;
             let bound = stmt.reorder(params);
-            let q = bind_params!(sqlx::query(stmt.sql.as_ref()), bound.as_ref());
+            let q = bind_params!(
+                sqlx::query(stmt.sql.as_ref()),
+                bound.as_ref(),
+                Option::<String>::None
+            );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
         }

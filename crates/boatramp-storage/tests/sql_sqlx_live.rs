@@ -52,7 +52,7 @@ async fn postgres_round_trip() {
     .unwrap();
     let affected = tx
         .execute(
-            "INSERT INTO bramp_ext_test VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO bramp_ext_test VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
                 SqlValue::Integer(1),
                 SqlValue::Text("alpha".into()),
@@ -130,6 +130,61 @@ async fn postgres_round_trip() {
         .unwrap_err();
     assert!(matches!(err, SqlError::Other(_)), "got {err:?}");
     tx.rollback().await.unwrap();
+}
+
+/// §1a regression: a bound `NULL` reaches a **non-text** column with no cast — it
+/// is sent as an unspecified-type parameter (OID 0), so Postgres infers the column
+/// type — AND a subsequent non-null bind into the same placeholder still works.
+/// Before the fix a `NULL` bound as `text`, which `bigint`/`jsonb` reject
+/// ("column \"n\" is of type bigint but expression is of type text").
+#[cfg(feature = "sql-postgres")]
+#[tokio::test]
+async fn postgres_null_binds_untyped_into_nontext_columns() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip postgres_null_binds_untyped: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    tx.execute("DROP TABLE IF EXISTS bramp_null_test", &[])
+        .await
+        .unwrap();
+    tx.execute("CREATE TABLE bramp_null_test (n BIGINT, doc JSONB)", &[])
+        .await
+        .unwrap();
+
+    // A bound NULL into `bigint` and `jsonb`, no `::cast` in the SQL.
+    tx.execute(
+        "INSERT INTO bramp_null_test (n, doc) VALUES (?1, ?2)",
+        &[SqlValue::Null, SqlValue::Null],
+    )
+    .await
+    .unwrap();
+
+    // The same placeholder then binds a real integer — the fix must not re-break
+    // the non-null path.
+    tx.execute(
+        "INSERT INTO bramp_null_test (n) VALUES (?1)",
+        &[SqlValue::Integer(42)],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    let rows = tx
+        .query("SELECT n FROM bramp_null_test ORDER BY n NULLS FIRST", &[])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(rows.rows.len(), 2);
+    assert!(
+        matches!(rows.rows[0][0], SqlValue::Null),
+        "got {:?}",
+        rows.rows[0][0]
+    );
+    assert_eq!(rows.rows[1][0], SqlValue::Integer(42));
 }
 
 /// The external MySQL backend: same round-trip. MySQL has no native `BOOL`
