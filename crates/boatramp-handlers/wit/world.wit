@@ -34,6 +34,11 @@ interface sql-types {
     %float(f64),
     text(string),
     blob(list<u8>),
+    /// A JSON document (the JSON text). The host binds it with the right column
+    /// type per engine (`jsonb`/`json` on Postgres, JSON string on MySQL, text on
+    /// SQLite) — so a guest can write a `jsonb` column without a `::jsonb` cast.
+    /// Added in `boatramp:handlers@0.2.18`.
+    json(string),
   }
 
   /// One result row, column order matching `query-result.columns`.

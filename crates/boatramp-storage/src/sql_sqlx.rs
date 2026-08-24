@@ -50,6 +50,13 @@
 //! type at `Parse` — a `NULL` into any column works with no cast (see
 //! `PgUntypedNull`). MySQL coerces a text null fine. Actual (non-null) values bind
 //! with their natural type.
+//!
+//! ## `JSON` binding
+//! A `SqlValue::Json` (JSON text) is bound so it reaches a JSON column with no
+//! `::jsonb` cast in the query: on Postgres as `json` (OID 114, whose wire format
+//! is the raw text — see `PgJson`), which lands in a `json` column directly and in
+//! a `jsonb` column via the json→jsonb assignment cast; on MySQL as text (a valid
+//! JSON string is accepted by a `JSON` column). SQLite/libsql store it as text.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -311,7 +318,7 @@ fn map_err(err: sqlx::Error) -> SqlError {
 /// null so the server infers the column type; MySQL coerces a text null fine).
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 macro_rules! bind_params {
-    ($query:expr, $params:expr, $null:expr) => {{
+    ($query:expr, $params:expr, $null:expr, $json:expr $(,)?) => {{
         let mut q = $query;
         for value in $params {
             q = match value {
@@ -321,6 +328,9 @@ macro_rules! bind_params {
                 ::boatramp_core::sql::SqlValue::Real(r) => q.bind(*r),
                 ::boatramp_core::sql::SqlValue::Text(s) => q.bind(s.as_str()),
                 ::boatramp_core::sql::SqlValue::Blob(b) => q.bind(b.as_slice()),
+                // JSON differs per engine (`$json` wraps the text with the right
+                // column type); see the module note on JSON binding.
+                ::boatramp_core::sql::SqlValue::Json(s) => q.bind($json(s.as_str())),
             };
         }
         q
@@ -360,6 +370,28 @@ mod postgres_backend {
             _buf: &mut sqlx::postgres::PgArgumentBuffer,
         ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
             Ok(sqlx::encode::IsNull::Yes)
+        }
+    }
+
+    /// A JSON document bound as Postgres `json` (OID 114) — whose binary wire
+    /// format is the raw JSON text — so it lands in a `json` column directly and in
+    /// a `jsonb` column via the built-in json→jsonb assignment cast, with no
+    /// `::jsonb` in the query. Non-JSON values are unaffected.
+    struct PgJson<'a>(&'a str);
+
+    impl sqlx::Type<Postgres> for PgJson<'_> {
+        fn type_info() -> sqlx::postgres::PgTypeInfo {
+            sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(114))
+        }
+    }
+
+    impl<'q> sqlx::Encode<'q, Postgres> for PgJson<'q> {
+        fn encode_by_ref(
+            &self,
+            buf: &mut sqlx::postgres::PgArgumentBuffer,
+        ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            buf.extend_from_slice(self.0.as_bytes());
+            Ok(sqlx::encode::IsNull::No)
         }
     }
 
@@ -445,7 +477,8 @@ mod postgres_backend {
             let q = bind_params!(
                 sqlx::query(stmt.sql.as_ref()),
                 bound.as_ref(),
-                PgUntypedNull
+                PgUntypedNull,
+                PgJson,
             );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
@@ -461,7 +494,8 @@ mod postgres_backend {
             let q = bind_params!(
                 sqlx::query(stmt.sql.as_ref()),
                 bound.as_ref(),
-                PgUntypedNull
+                PgUntypedNull,
+                PgJson,
             );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
@@ -603,6 +637,13 @@ mod mysql_backend {
     use sqlx::pool::PoolConnection;
     use sqlx::{Column, Executor, MySql, Row, TypeInfo, ValueRef};
 
+    /// MySQL binds a JSON document as its text — a valid JSON string is accepted by
+    /// a JSON column directly, no special type. A fn item (not a closure) so it is
+    /// higher-ranked over the borrow's lifetime for `bind_params!`.
+    fn json_as_text(s: &str) -> &str {
+        s
+    }
+
     /// An external MySQL/MariaDB [`SqlBackend`] over a lazily-connecting pool.
     pub struct MySqlSqlBackend {
         pool: MySqlPool,
@@ -682,7 +723,8 @@ mod mysql_backend {
             let q = bind_params!(
                 sqlx::query(stmt.sql.as_ref()),
                 bound.as_ref(),
-                Option::<String>::None
+                Option::<String>::None,
+                json_as_text,
             );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
@@ -695,7 +737,8 @@ mod mysql_backend {
             let q = bind_params!(
                 sqlx::query(stmt.sql.as_ref()),
                 bound.as_ref(),
-                Option::<String>::None
+                Option::<String>::None,
+                json_as_text,
             );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())

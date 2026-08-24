@@ -240,6 +240,7 @@ fn to_values(values: Vec<sql_types::Value>) -> Vec<SqlValue> {
             sql_types::Value::Float(f) => SqlValue::Real(f),
             sql_types::Value::Text(s) => SqlValue::Text(s),
             sql_types::Value::Blob(b) => SqlValue::Blob(b),
+            sql_types::Value::Json(s) => SqlValue::Json(s),
         })
         .collect()
 }
@@ -253,6 +254,7 @@ fn to_wit_value(value: SqlValue) -> sql_types::Value {
         SqlValue::Real(f) => sql_types::Value::Float(f),
         SqlValue::Text(s) => sql_types::Value::Text(s),
         SqlValue::Blob(b) => sql_types::Value::Blob(b),
+        SqlValue::Json(s) => sql_types::Value::Json(s),
     }
 }
 

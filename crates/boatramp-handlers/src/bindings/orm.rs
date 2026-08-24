@@ -236,6 +236,7 @@ fn to_sqlvalue(v: wit::Value) -> SqlValue {
         wit::Value::Float(f) => SqlValue::Real(f),
         wit::Value::Text(s) => SqlValue::Text(s),
         wit::Value::Blob(b) => SqlValue::Blob(b),
+        wit::Value::Json(s) => SqlValue::Json(s),
     }
 }
 
@@ -441,6 +442,7 @@ fn to_wit_value(value: SqlValue) -> wit::Value {
         SqlValue::Real(f) => wit::Value::Float(f),
         SqlValue::Text(s) => wit::Value::Text(s),
         SqlValue::Blob(b) => wit::Value::Blob(b),
+        SqlValue::Json(s) => wit::Value::Json(s),
     }
 }
 

@@ -187,6 +187,64 @@ async fn postgres_null_binds_untyped_into_nontext_columns() {
     assert_eq!(rows.rows[1][0], SqlValue::Integer(42));
 }
 
+/// §1b: a `SqlValue::Json` binds into a `jsonb` (and `json`) column with **no
+/// `::jsonb` cast in the query** — it goes out as Postgres `json` (raw text),
+/// which assignment-casts to `jsonb`. The `->>'a'` read proves it stored as real
+/// JSON (a text column would reject the operator / not parse), and JSON reads
+/// back as `Text`.
+#[cfg(feature = "sql-postgres")]
+#[tokio::test]
+async fn postgres_json_writes_to_jsonb_without_a_cast() {
+    let Ok(url) = std::env::var("BOATRAMP_TEST_PG_URL") else {
+        eprintln!("skip postgres_json: BOATRAMP_TEST_PG_URL unset");
+        return;
+    };
+    let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    tx.execute("DROP TABLE IF EXISTS bramp_json_test", &[])
+        .await
+        .unwrap();
+    tx.execute("CREATE TABLE bramp_json_test (doc JSONB, doc2 JSON)", &[])
+        .await
+        .unwrap();
+    tx.execute(
+        "INSERT INTO bramp_json_test (doc, doc2) VALUES (?1, ?2)",
+        &[
+            SqlValue::Json(r#"{"a":1,"b":[2,3]}"#.into()),
+            SqlValue::Json(r#"{"x":true}"#.into()),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    let rows = tx
+        .query(
+            "SELECT doc->>'a' AS a, doc2->>'x' AS x, jsonb_typeof(doc) AS t FROM bramp_json_test",
+            &[],
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        matches!(&rows.rows[0][0], SqlValue::Text(s) if s == "1"),
+        "doc->>'a' = {:?}",
+        rows.rows[0][0]
+    );
+    assert!(
+        matches!(&rows.rows[0][1], SqlValue::Text(s) if s == "true"),
+        "doc2->>'x' = {:?}",
+        rows.rows[0][1]
+    );
+    assert!(
+        matches!(&rows.rows[0][2], SqlValue::Text(s) if s == "object"),
+        "jsonb_typeof = {:?}",
+        rows.rows[0][2]
+    );
+}
+
 /// The external MySQL backend: same round-trip. MySQL has no native `BOOL`
 /// (`TINYINT(1)`), so a boolean reads back as the integer `1`.
 #[cfg(feature = "sql-mysql")]
