@@ -9,11 +9,12 @@
 //!
 //! # Expressiveness
 //! [`Expr`] is a recursive scalar expression (column, bound value, aggregate, arithmetic,
-//! a small allow-listed [`Func`] set) and [`Predicate`] is a recursive boolean tree
-//! (`AND`/`OR`/`NOT` + comparisons/`BETWEEN`/`IN`/`LIKE`/`IS NULL`). Selects add joins,
-//! `GROUP BY`/`HAVING`, aliases, ordering and pagination; inserts/updates add `RETURNING`.
-//! Subqueries, CTEs, window functions and dialect-specific constructs (`DISTINCT ON`, JSON
-//! paths, …) are deliberately out of scope — they go through the raw `sql-query` escape hatch.
+//! a small allow-listed [`Func`] set, JSON key-path extraction, and Postgres-only `pgvector`
+//! distance) and [`Predicate`] is a recursive boolean tree (`AND`/`OR`/`NOT` +
+//! comparisons/`BETWEEN`/`IN`/`LIKE`/`IS NULL`). Selects add joins, `GROUP BY`/`HAVING`,
+//! aliases, ordering and pagination; inserts/updates add `RETURNING`. Subqueries, CTEs and
+//! window functions are deliberately out of scope — they go through the raw `sql-query`
+//! escape hatch.
 //!
 //! # Safety
 //! - **Every value binds as a parameter** (`?N`); no value is ever formatted into the SQL.
@@ -110,6 +111,25 @@ impl Func {
     }
 }
 
+/// A `pgvector` distance metric. A closed enum, so the rendered operator is a compiler
+/// constant (never a guest string) and can't inject. Postgres-only (see [`Expr::Distance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    /// Cosine distance (`<=>`).
+    Cosine,
+    /// Euclidean / L2 distance (`<->`).
+    L2,
+}
+
+impl Metric {
+    fn operator(self) -> &'static str {
+        match self {
+            Self::Cosine => "<=>",
+            Self::L2 => "<->",
+        }
+    }
+}
+
 /// A scalar expression: the leaf/branch type used in select lists, comparisons, `SET`,
 /// `GROUP BY`, `ORDER BY` and join conditions.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +150,19 @@ pub enum Expr {
     /// Rendered per-dialect (SQLite/MySQL `json_extract`, Postgres `#>>`); each key is
     /// validated as an identifier so the built path can't inject.
     JsonExtract(Box<Self>, Vec<String>),
+    /// A `pgvector` distance between two vector expressions, rendered `(left <op> right)`.
+    /// **Postgres-only** — SQLite/MySQL have no vector type, so it fails closed
+    /// ([`OrmError::BadExpr`]); there is no correct portable fallback. Usable in a select
+    /// list and in `ORDER BY` (nearest-neighbour search).
+    Distance {
+        left: Box<Self>,
+        right: Box<Self>,
+        metric: Metric,
+    },
+    /// A vector literal — a bracketed float list (`[0.1, 0.2, …]`) bound as a `?N` parameter
+    /// and rendered `?N::vector`. The components are validated as finite numbers; the value
+    /// binds (never formatted in), so it can't inject. **Postgres-only.**
+    VectorLiteral(String),
 }
 
 impl Expr {
@@ -442,7 +475,61 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
                 }
             }
         }
+        Expr::Distance {
+            left,
+            right,
+            metric,
+        } => {
+            if dialect != Dialect::Postgres {
+                return Err(OrmError::BadExpr("vector distance is Postgres-only"));
+            }
+            format!(
+                "({} {} {})",
+                render_expr(left, params, dialect)?,
+                metric.operator(),
+                render_expr(right, params, dialect)?,
+            )
+        }
+        Expr::VectorLiteral(v) => {
+            if dialect != Dialect::Postgres {
+                return Err(OrmError::BadExpr("vector literals are Postgres-only"));
+            }
+            let p = params.bind(SqlValue::Text(vector_literal(v)?));
+            // The `::vector` cast rides through the `?N` placeholder normaliser unchanged.
+            format!("{p}::vector")
+        }
     })
+}
+
+/// Validate a `pgvector` literal — a bracketed, comma-separated list of finite numbers
+/// (`[0.1, 0.2]`) — returning it whitespace-normalised. The result binds as a parameter, so
+/// this is a data-quality gate (a clear early error over a Postgres runtime failure), not an
+/// injection defence.
+fn vector_literal(s: &str) -> Result<String, OrmError> {
+    let inner = s
+        .trim()
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .ok_or(OrmError::BadExpr(
+            "vector literal must be a bracketed list like [0.1, 0.2]",
+        ))?;
+    if inner.trim().is_empty() {
+        return Err(OrmError::BadExpr(
+            "vector literal must have at least one component",
+        ));
+    }
+    let mut parts = Vec::new();
+    for part in inner.split(',') {
+        let p = part.trim();
+        let f: f64 = p
+            .parse()
+            .map_err(|_| OrmError::BadExpr("vector literal component is not a number"))?;
+        if !f.is_finite() {
+            return Err(OrmError::BadExpr("vector literal component must be finite"));
+        }
+        parts.push(p);
+    }
+    Ok(format!("[{}]", parts.join(",")))
 }
 
 /// Render a predicate; `nested` parenthesizes a compound (`AND`/`OR`) so precedence is explicit.
@@ -1336,5 +1423,107 @@ mod tests {
             q.compile(Dialect::Postgres),
             Err(OrmError::InvalidIdentifier(_))
         ));
+    }
+
+    // ---- pgvector distance (Postgres-only) -----------------------------------
+
+    fn knn_query() -> Select {
+        // Nearest-neighbour: `ORDER BY embedding <=> [q] LIMIT k`.
+        Select {
+            columns: vec![item(Expr::col("id"))],
+            order: vec![OrderBy {
+                expr: Expr::Distance {
+                    left: Box::new(Expr::col("embedding")),
+                    right: Box::new(Expr::VectorLiteral("[0.1, 0.2, 0.3]".into())),
+                    metric: Metric::Cosine,
+                },
+                dir: Direction::Asc,
+            }],
+            limit: Some(5),
+            ..Select::from("doc")
+        }
+    }
+
+    #[test]
+    fn distance_orders_by_cosine_nearest_neighbour_on_postgres() {
+        let (sql, params) = knn_query().compile(Dialect::Postgres).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id FROM doc ORDER BY (embedding <=> ?1::vector) ASC LIMIT 5"
+        );
+        // The literal binds as a parameter (whitespace-normalised), never formatted in.
+        assert_eq!(params, vec![t("[0.1,0.2,0.3]")]);
+    }
+
+    #[test]
+    fn distance_l2_in_select_list_on_postgres() {
+        let q = Select {
+            columns: vec![
+                item(Expr::col("id")),
+                SelectItem {
+                    expr: Expr::Distance {
+                        left: Box::new(Expr::col("embedding")),
+                        right: Box::new(Expr::VectorLiteral("[-1, 2e0, 3.5]".into())),
+                        metric: Metric::L2,
+                    },
+                    alias: Some("dist".into()),
+                },
+            ],
+            ..Select::from("doc")
+        };
+        let (sql, params) = q.compile(Dialect::Postgres).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id, (embedding <-> ?1::vector) AS dist FROM doc"
+        );
+        assert_eq!(params, vec![t("[-1,2e0,3.5]")]);
+    }
+
+    #[test]
+    fn distance_fails_closed_off_postgres() {
+        for d in [Dialect::Sqlite, Dialect::Mysql] {
+            assert!(
+                matches!(knn_query().compile(d), Err(OrmError::BadExpr(_))),
+                "vector distance must be rejected on {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_literal_fails_closed_off_postgres() {
+        for d in [Dialect::Sqlite, Dialect::Mysql] {
+            let q = Select {
+                columns: vec![item(Expr::VectorLiteral("[1, 2]".into()))],
+                ..Select::from("doc")
+            };
+            assert!(
+                matches!(q.compile(d), Err(OrmError::BadExpr(_))),
+                "vector literal must be rejected on {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_vector_literal_is_rejected() {
+        // No brackets, non-numeric, empty, unclosed, empty component, and non-finite
+        // (`inf`/`NaN` parse as floats but must be refused).
+        for bad in [
+            "1,2",
+            "[a, b]",
+            "[]",
+            "[1, 2",
+            "[1,,2]",
+            "[Infinity]",
+            "[1, NaN]",
+        ] {
+            let q = Select {
+                columns: vec![item(Expr::VectorLiteral(bad.to_string()))],
+                ..Select::from("doc")
+            };
+            assert!(
+                matches!(q.compile(Dialect::Postgres), Err(OrmError::BadExpr(_))),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 }

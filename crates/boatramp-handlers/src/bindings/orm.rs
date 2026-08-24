@@ -169,6 +169,12 @@ fn build_expr(exprs: &[wit::ExprNode], idx: u32) -> Result<core::Expr, wit::Erro
         wit::ExprNode::JsonExtract(j) => {
             core::Expr::JsonExtract(Box::new(child(j.base)?), j.path.clone())
         }
+        wit::ExprNode::Distance(d) => core::Expr::Distance {
+            left: Box::new(child(d.left)?),
+            right: Box::new(child(d.right)?),
+            metric: to_core_metric(d.metric),
+        },
+        wit::ExprNode::VectorLiteral(s) => core::Expr::VectorLiteral(s.clone()),
     })
 }
 
@@ -270,6 +276,13 @@ fn to_core_func(f: wit::ScalarFunc) -> core::Func {
         wit::ScalarFunc::Round => core::Func::Round,
         wit::ScalarFunc::Coalesce => core::Func::Coalesce,
         wit::ScalarFunc::Now => core::Func::Now,
+    }
+}
+
+fn to_core_metric(m: wit::DistanceMetric) -> core::Metric {
+    match m {
+        wit::DistanceMetric::Cosine => core::Metric::Cosine,
+        wit::DistanceMetric::L2 => core::Metric::L2,
     }
 }
 
@@ -728,6 +741,41 @@ mod tests {
         };
         let err = host.select(db, sel).await.unwrap_err();
         assert!(matches!(err, wit::Error::Syntax(_)));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn vector_distance_rebuilds_from_the_arena_then_fails_closed_on_sqlite() {
+        // A pgvector nearest-neighbour `ORDER BY` rebuilds from the expr arena (distance node
+        // with two children + a bound vector literal), then the default SQLite backend refuses
+        // it — vector distance is Postgres-only.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let sel = wit::SelectQuery {
+            exprs: vec![
+                col("id"),                                         // 0
+                col("embedding"),                                  // 1
+                wit::ExprNode::VectorLiteral("[0.1, 0.2]".into()), // 2
+                wit::ExprNode::Distance(wit::DistanceNode {
+                    left: 1,
+                    right: 2,
+                    metric: wit::DistanceMetric::Cosine,
+                }), // 3
+            ],
+            columns: vec![item(0)],
+            order: vec![wit::OrderTerm {
+                expr: 3,
+                dir: wit::Direction::Asc,
+            }],
+            limit: Some(5),
+            ..empty_select("doc")
+        };
+        let err = host.select(db, sel).await.unwrap_err();
+        assert!(matches!(err, wit::Error::Syntax(_)));
+        // Refused at compile time — the backend was never queried.
         assert!(log.lock().unwrap().is_empty());
     }
 

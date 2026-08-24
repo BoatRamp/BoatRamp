@@ -121,6 +121,8 @@ interface orm {
   enum cmp-op { eq, ne, lt, le, gt, ge }
   enum join-kind { inner, left-join }
   enum direction { asc, desc }
+  // `pgvector` distance metric (Postgres-only): cosine `<=>` / L2 `<->`. @since 0.2.18.
+  enum distance-metric { cosine, l2 }
 
   // ---- expression arena ----------------------------------------------------
   // Recursive scalar expressions cross the WIT boundary as a flat arena: an `expr-node`'s
@@ -131,6 +133,8 @@ interface orm {
   record binary-node { op: bin-op, left: u32, right: u32 }
   record call-node { which: scalar-func, args: list<u32> }
   record json-node { base: u32, path: list<string> }   // path keys => `$.a.b` / `#>>'{a,b}'`
+  // `(exprs[left] <op> exprs[right])` per `metric`; Postgres-only (fails closed elsewhere).
+  record distance-node { left: u32, right: u32, metric: distance-metric }
   variant expr-node {
     column(string),
     literal(value),
@@ -139,6 +143,11 @@ interface orm {
     binary(binary-node),
     call(call-node),
     json-extract(json-node),
+    // Adding cases to this param-position variant is backward-compatible (a host only ever
+    // accepts more); a guest that emits them must run on a host that understands them (pin
+    // `@0.2.18`). @since 0.2.18.
+    distance(distance-node),
+    vector-literal(string),     // a bracketed float list, bound + rendered `?N::vector`
   }
 
   // ---- predicate arena -----------------------------------------------------
