@@ -8,6 +8,16 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **A dedicated streaming lane for long-lived response handlers.** A handler that streams its
+  response body (`#[handler(stream)]` via the shim — SSE, chunked, agent token streaming) is
+  connection-bearing but long-lived, so on the sync request lane each stream would hold a
+  fast-request slot for its whole life and be cut at the ~10s sync timeout. Mark such a route
+  `streaming = true` in its handler config and the host serves it on a third engine lane with its
+  own concurrency budget + a much larger wall-clock (defaults: 15 min, 64 concurrent) — isolated
+  from both the fast request pool and the durable async drain, so a burst of streams starves
+  neither. Sizable via `[handlers] streaming_max_{timeout_ms,concurrency,fuel}`; defaults to the
+  sync ceiling until configured (back-compat). The activation pre-check warns when a streaming
+  guest is deployed without `streaming = true`, so the lane isn't silently missed.
 - **ORM correlated roll-ups.** A new `related-aggregate` expression renders a filtered aggregate
   over one named table — `(SELECT agg(col) FROM table WHERE <predicate>)` — the correct shape for
   several counts per row (a `LEFT JOIN … GROUP BY` rewrite fans out; multiple `count(DISTINCT …)`
