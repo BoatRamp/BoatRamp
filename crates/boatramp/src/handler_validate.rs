@@ -102,11 +102,20 @@ mod imp {
         match (pkg, iface) {
             ("wasi:keyvalue", _) => Some("wasi:keyvalue"),
             ("wasi:blobstore", _) => Some("wasi:blobstore"),
-            ("boatramp:handlers", "sql-query" | "sql-types") => Some("sql"),
+            // `orm` is a **typed view of the same `sql` capability** — it runs on the
+            // same per-invocation SQL session/backend and `use`s `sql-types`. So it
+            // is the `sql` token: declaring `sql` grants orm (and inherits the
+            // "requires a SQL backend" activation check). Before this it mapped to
+            // None → "disallowed", so an orm-importing guest was rejected at deploy.
+            ("boatramp:handlers", "sql-query" | "sql-types" | "orm") => Some("sql"),
             ("boatramp:handlers", "messaging-producer" | "messaging-types") => {
                 Some("wasi:messaging")
             }
             ("boatramp:handlers", "invoke" | "invoke-types") => Some("invoke"),
+            // GraphQL is a distinct capability (federated subgraph access over the
+            // project's composed supergraph). Always linked, so it is gated only by
+            // declaration (there is no server-level backend to reject against).
+            ("boatramp:handlers", "graphql" | "graphql-types") => Some("graphql"),
             _ => None,
         }
     }
@@ -377,6 +386,40 @@ mod imp {
             );
             let err = check_interface_policy(&invoke, &exports, &[], Role::Handler).unwrap_err();
             assert!(err.contains("`invoke`"), "{err}");
+        }
+
+        #[test]
+        fn policy_gates_orm_as_the_sql_capability() {
+            // orm imports boatramp:handlers/orm and (via `use`) sql-types; it is the
+            // `sql` capability, so declaring `sql` satisfies it and nothing extra is
+            // needed. Before, `orm` mapped to no token and was rejected as disallowed.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let orm = [
+                lbl("boatramp:handlers", "orm"),
+                lbl("boatramp:handlers", "sql-types"),
+            ];
+            assert!(check_interface_policy(&orm, &exports, &["sql".into()], Role::Handler).is_ok());
+            assert!(
+                check_interface_policy(&orm, &exports, &["sql:*".into()], Role::Handler).is_ok()
+            );
+            let err = check_interface_policy(&orm, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`sql`"), "{err}");
+        }
+
+        #[test]
+        fn policy_gates_graphql_by_the_real_interface() {
+            // GraphQL is its own capability (host: boatramp:handlers/{graphql,
+            // graphql-types}), declared as `graphql`.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let gql = [
+                lbl("boatramp:handlers", "graphql"),
+                lbl("boatramp:handlers", "graphql-types"),
+            ];
+            assert!(
+                check_interface_policy(&gql, &exports, &["graphql".into()], Role::Handler).is_ok()
+            );
+            let err = check_interface_policy(&gql, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`graphql`"), "{err}");
         }
 
         #[test]

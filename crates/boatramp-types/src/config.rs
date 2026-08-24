@@ -225,6 +225,7 @@ impl DeployConfig {
 const KNOWN_IMPORTS: &[&str] = &[
     "sql",
     "invoke",
+    "graphql",
     "wasi:http",
     "wasi:io",
     "wasi:keyvalue",
