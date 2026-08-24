@@ -415,5 +415,57 @@ mod imp {
             // Garbage bytes are rejected as an invalid component.
             assert!(validate_component(b"not a wasm component", &[], Role::Handler).is_err());
         }
+
+        #[test]
+        fn undeclared_capability_message_states_the_component_scoped_rule() {
+            // The rejection must state the component-scoped rule inline, so a dev
+            // isn't confused why a route that never uses the capability still needs
+            // to grant it.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            let sql = [
+                lbl("boatramp:handlers", "sql-query"),
+                lbl("boatramp:handlers", "sql-types"),
+            ];
+            let err = check_interface_policy(&sql, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("component-scoped"), "{err}");
+            assert!(err.contains("`sql`"), "{err}");
+        }
+
+        #[test]
+        fn validate_deploy_names_the_offending_route_not_just_the_component() {
+            use boatramp_core::config::{DeployConfig, HandlerConfig};
+            use std::collections::BTreeMap;
+
+            // A real component that fails validation (exports test:guest, not
+            // wasi:http). The failure reason is immaterial here — what matters is
+            // that the *route + methods* prefix the message (the §5 label), so with
+            // one component on several routes the dev sees which one is at fault.
+            let wit = "package test:guest;\n\
+                       interface incoming-handler { handle: func(); }\n\
+                       world h { export incoming-handler; }";
+            let bytes = build_fixture(wit, "h");
+
+            let dir = std::env::temp_dir().join(format!("br-validate-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("portal.wasm"), &bytes).unwrap();
+
+            let config = DeployConfig {
+                handlers: vec![HandlerConfig {
+                    route: "/intake/status".into(),
+                    methods: vec!["GET".into()],
+                    component: "portal.wasm".into(),
+                    imports: vec![],
+                    limits: None,
+                    env: BTreeMap::new(),
+                    invoke_targets: vec![],
+                }],
+                ..Default::default()
+            };
+
+            let err = validate_deploy(&dir, &config).unwrap_err().to_string();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(err.contains("/intake/status"), "{err}");
+            assert!(err.contains("GET"), "{err}");
+        }
     }
 }

@@ -557,7 +557,9 @@ impl HandlerRuntime {
                 max_component,
                 &handler.imports,
                 &handler.component,
-                &format!("handler {:?}", handler.route),
+                // Name route + methods (matching the client-side validator), so with
+                // one component on several routes the operator sees which is at fault.
+                &format!("route {:?} [{}]", handler.route, handler.methods.join(",")),
                 false,
             )
             .await?;
