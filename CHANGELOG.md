@@ -7,6 +7,42 @@ versions.
 
 ## [Unreleased]
 
+### Added
+- **ORM correlated roll-ups.** A new `related-aggregate` expression renders a filtered aggregate
+  over one named table — `(SELECT agg(col) FROM table WHERE <predicate>)` — the correct shape for
+  several counts per row (a `LEFT JOIN … GROUP BY` rewrite fans out; multiple `count(DISTINCT …)`
+  are unrepresentable). It is the *only* subquery form: a closed aggregate, an identifier-validated
+  table + column-or-`*`, and a bound-parameter predicate — no arbitrary nested `FROM`, so nothing
+  free-form reaches SQL and it stays mechanically scopable. The cross-arena reference (the roll-up
+  is an expr whose filter indexes the predicate arena, whose comparisons index the expr arena) is
+  kept acyclic by an expr upper-bound: a roll-up's filter — and everything it transitively reaches —
+  must sit strictly below the roll-up, so a guest can never build a cycle that would hang the host.
+  Gated behind an off-by-default `orm-subquery` cargo feature (it is a guest-declared nested-`FROM`
+  access path, so an operator can build a host that refuses it); the shipped binary enables it.
+- **ORM pgvector distance (Postgres).** `Expr::Distance` (cosine `<=>` / L2 `<->`) and
+  `Expr::VectorLiteral` (a validated bracketed float list, bound and rendered `?N::vector`) support
+  nearest-neighbour search in a select list or `ORDER BY`. The metric operators are compiler
+  constants and the vector binds as a parameter, so nothing is interpolated. Postgres-only — SQLite
+  and MySQL fail closed with a clear error, since there is no correct portable fallback.
+- **A `json` SQL value.** `SqlValue::Json` lets a handler (raw `sql` or the ORM) bind a JSON
+  document straight into a `jsonb`/`json` column with no `::jsonb` cast — the host binds it with the
+  right column type per engine; reads come back as text.
+- **Capability-contract versioning.** The `boatramp:handlers` WIT package is now versioned
+  (`@0.2.18`), and a deploy-time check rejects a component that imports a *newer* handlers package
+  than the host implements — with a clear "needs a newer host" error instead of a cryptic
+  instantiation failure. A new `boatramp capabilities` command (human or `--json`) prints the host's
+  package version and declarable capability imports. The `orm` and `graphql` capabilities are now
+  first-class in the import allow-list, so a handler can declare (and be gated on) them.
+
+### Fixed
+- **Postgres `NULL` into a non-text column.** A bound `NULL` on the external-Postgres (`sqlx`) path
+  was typed as text, so `INSERT`ing `NULL` into a non-text column (int, bool, `jsonb`, …) could be
+  rejected by the server's type check. `NULL` now binds as an unspecified type (OID 0), so the
+  column's own type applies. The managed libsql path was already untyped and unaffected.
+- **Deploy errors name the offending route.** A handler validation failure now reports the route
+  (method + path) that failed, not just the component, so a multi-route deploy points at the
+  problem.
+
 ## [0.2.17] - 2026-08-23
 
 ### Added
