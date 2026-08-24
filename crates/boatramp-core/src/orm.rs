@@ -9,12 +9,13 @@
 //!
 //! # Expressiveness
 //! [`Expr`] is a recursive scalar expression (column, bound value, aggregate, arithmetic,
-//! a small allow-listed [`Func`] set, JSON key-path extraction, and Postgres-only `pgvector`
-//! distance) and [`Predicate`] is a recursive boolean tree (`AND`/`OR`/`NOT` +
+//! a small allow-listed [`Func`] set, JSON key-path extraction, Postgres-only `pgvector`
+//! distance, and a narrow correlated roll-up — a filtered aggregate over one named table) and
+//! [`Predicate`] is a recursive boolean tree (`AND`/`OR`/`NOT` +
 //! comparisons/`BETWEEN`/`IN`/`LIKE`/`IS NULL`). Selects add joins, `GROUP BY`/`HAVING`,
-//! aliases, ordering and pagination; inserts/updates add `RETURNING`. Subqueries, CTEs and
-//! window functions are deliberately out of scope — they go through the raw `sql-query`
-//! escape hatch.
+//! aliases, ordering and pagination; inserts/updates add `RETURNING`. General scalar
+//! subqueries (beyond the correlated roll-up), CTEs and window functions are deliberately out
+//! of scope — they go through the raw `sql-query` escape hatch.
 //!
 //! # Safety
 //! - **Every value binds as a parameter** (`?N`); no value is ever formatted into the SQL.
@@ -130,6 +131,17 @@ impl Metric {
     }
 }
 
+/// The argument of a correlated roll-up ([`Expr::RelatedAggregate`]): `*` (only valid for
+/// `count`) or a single validated column. Deliberately not a full [`Expr`] — a correlated
+/// aggregate takes a column or `*`, nothing free-form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelArg {
+    /// `count(*)`.
+    Star,
+    /// `agg(<column>)`.
+    Column(String),
+}
+
 /// A scalar expression: the leaf/branch type used in select lists, comparisons, `SET`,
 /// `GROUP BY`, `ORDER BY` and join conditions.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +175,20 @@ pub enum Expr {
     /// and rendered `?N::vector`. The components are validated as finite numbers; the value
     /// binds (never formatted in), so it can't inject. **Postgres-only.**
     VectorLiteral(String),
+    /// A filtered aggregate over a *named* related table, rendered as a scalar subquery
+    /// `(SELECT agg(arg) FROM table WHERE <filter>)` — a correlated roll-up. The correlation
+    /// to the outer row lives in `filter` (e.g. `child.fk = parent.pk`); unlike a
+    /// `LEFT JOIN … GROUP BY` rewrite it never fans out, so several counts per row are just
+    /// several select-list entries. Everything reachable is closed/validated: a closed [`Agg`],
+    /// a [`RelArg`] column-or-`*`, an identifier-checked `table`, and a bound-parameter
+    /// predicate — no arbitrary nested `FROM`, which keeps it mechanically scopable. This is
+    /// the *only* subquery form; general scalar subqueries are deliberately not supported.
+    RelatedAggregate {
+        agg: Agg,
+        arg: RelArg,
+        table: String,
+        filter: Box<Predicate>,
+    },
 }
 
 impl Expr {
@@ -497,6 +523,26 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
             let p = params.bind(SqlValue::Text(vector_literal(v)?));
             // The `::vector` cast rides through the `?N` placeholder normaliser unchanged.
             format!("{p}::vector")
+        }
+        Expr::RelatedAggregate {
+            agg,
+            arg,
+            table,
+            filter,
+        } => {
+            let arg_sql = match arg {
+                RelArg::Star if *agg == Agg::Count => "*".to_string(),
+                RelArg::Star => return Err(OrmError::BadExpr("`*` is only valid as count(*)")),
+                RelArg::Column(c) => ident(c)?.to_string(),
+            };
+            let table_sql = ident(table)?;
+            // The correlated filter reuses the ordinary predicate compiler (bound params); the
+            // WHERE clause delimits it, so it renders unparenthesised (`nested = false`).
+            let where_sql = render_pred(filter, params, false, dialect)?;
+            format!(
+                "(SELECT {}({arg_sql}) FROM {table_sql} WHERE {where_sql})",
+                agg.keyword()
+            )
         }
     })
 }
@@ -1525,5 +1571,185 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    // ---- correlated roll-ups (related-aggregate) -----------------------------
+
+    /// `agg(arg) FROM table WHERE child.fk = parent.pk [AND extra]` — the correlation is a
+    /// column-to-column comparison in the subquery's filter.
+    fn related(agg: Agg, arg: RelArg, table: &str, filter: Predicate) -> Expr {
+        Expr::RelatedAggregate {
+            agg,
+            arg,
+            table: table.into(),
+            filter: Box::new(filter),
+        }
+    }
+    fn correlate(fk: &str, pk: &str) -> Predicate {
+        Predicate::Cmp {
+            left: Expr::col(fk),
+            op: CmpOp::Eq,
+            right: Expr::col(pk),
+        }
+    }
+
+    #[test]
+    fn related_aggregate_single_correlated_count() {
+        // construens subgraph-chain:701 — count of child rows per parent, no fan-out.
+        let q = Select {
+            columns: vec![
+                item(Expr::col("id")),
+                SelectItem {
+                    expr: related(
+                        Agg::Count,
+                        RelArg::Star,
+                        "element",
+                        correlate("element.order_id", "work_order.id"),
+                    ),
+                    alias: Some("element_count".into()),
+                },
+            ],
+            ..Select::from("work_order")
+        };
+        let (sql, params) = q.compile(Dialect::Postgres).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id, (SELECT count(*) FROM element WHERE element.order_id = work_order.id) AS element_count FROM work_order"
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn related_aggregate_two_counts_bind_distinct_params_and_dont_fan_out() {
+        // Two correlated counts in one SELECT — each its own subquery (no join, no fan-out),
+        // and their bound filters take distinct `?N` in left-to-right order.
+        let with_status = |child: &str, fk: &str, status: &str| {
+            related(
+                Agg::Count,
+                RelArg::Star,
+                child,
+                Predicate::And(vec![
+                    correlate(fk, "party.id"),
+                    Predicate::Cmp {
+                        left: Expr::col("status"),
+                        op: CmpOp::Eq,
+                        right: Expr::val(t(status)),
+                    },
+                ]),
+            )
+        };
+        let q = Select {
+            columns: vec![
+                item(with_status("party_role", "party_role.party_id", "active")),
+                item(with_status(
+                    "party_qualification",
+                    "party_qualification.party_id",
+                    "valid",
+                )),
+            ],
+            ..Select::from("party")
+        };
+        let (sql, params) = q.compile(Dialect::Postgres).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \
+             (SELECT count(*) FROM party_role WHERE party_role.party_id = party.id AND status = ?1), \
+             (SELECT count(*) FROM party_qualification WHERE party_qualification.party_id = party.id AND status = ?2) \
+             FROM party"
+        );
+        assert_eq!(params, vec![t("active"), t("valid")]);
+    }
+
+    #[test]
+    fn related_aggregate_with_temporal_or_filter() {
+        // construens subgraph-chain:731 — correlated count with a temporal `valid_to` filter.
+        let q = Select {
+            columns: vec![SelectItem {
+                expr: related(
+                    Agg::Count,
+                    RelArg::Star,
+                    "party_qualification",
+                    Predicate::And(vec![
+                        correlate("party_qualification.party_id", "party.id"),
+                        Predicate::Or(vec![
+                            Predicate::Null {
+                                expr: Expr::col("valid_to"),
+                                negated: false,
+                            },
+                            Predicate::Cmp {
+                                left: Expr::col("valid_to"),
+                                op: CmpOp::Gt,
+                                right: Expr::val(t("2026-01-01")),
+                            },
+                        ]),
+                    ]),
+                ),
+                alias: Some("active_quals".into()),
+            }],
+            ..Select::from("party")
+        };
+        let (sql, params) = q.compile(Dialect::Postgres).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (SELECT count(*) FROM party_qualification WHERE party_qualification.party_id = party.id AND (valid_to IS NULL OR valid_to > ?1)) AS active_quals FROM party"
+        );
+        assert_eq!(params, vec![t("2026-01-01")]);
+    }
+
+    #[test]
+    fn related_aggregate_max_over_a_column_is_portable() {
+        // A correlated MAX over a column (construens subgraph-chain:1932 shape) — an ordinary
+        // subquery, portable across engines (not Postgres-specific like vector distance).
+        let q = Select {
+            columns: vec![SelectItem {
+                expr: related(
+                    Agg::Max,
+                    RelArg::Column("total_minor".into()),
+                    "line_item",
+                    correlate("line_item.order_id", "order_summary.id"),
+                ),
+                alias: Some("max_total".into()),
+            }],
+            ..Select::from("order_summary")
+        };
+        let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (SELECT max(total_minor) FROM line_item WHERE line_item.order_id = order_summary.id) AS max_total FROM order_summary"
+        );
+    }
+
+    #[test]
+    fn related_aggregate_star_is_count_only() {
+        let q = Select {
+            columns: vec![item(related(
+                Agg::Sum,
+                RelArg::Star,
+                "t",
+                correlate("t.fk", "p.id"),
+            ))],
+            ..Select::from("p")
+        };
+        assert!(matches!(
+            q.compile(Dialect::Postgres),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn related_aggregate_table_injection_is_rejected() {
+        let q = Select {
+            columns: vec![item(related(
+                Agg::Count,
+                RelArg::Star,
+                "element; DROP TABLE users",
+                correlate("element.order_id", "p.id"),
+            ))],
+            ..Select::from("p")
+        };
+        assert!(matches!(
+            q.compile(Dialect::Postgres),
+            Err(OrmError::InvalidIdentifier(_))
+        ));
     }
 }

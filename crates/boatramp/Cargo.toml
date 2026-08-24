@@ -53,6 +53,7 @@ default = [
   "compression",
   "bundler",
   "handlers",
+  "orm-subquery",
   "cluster",
   "operator",
   "mcp",
@@ -161,6 +162,10 @@ handlers = [
   "dep:hyper",
   "dep:hyper-util",
 ]
+# The orm `related-aggregate` correlated roll-up (the one scalar-subquery form). Implies
+# `handlers`; in the default (batteries-included) feature set. Drop it to ship a host that
+# refuses correlated subqueries.
+orm-subquery = ["handlers", "boatramp-server/orm-subquery"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

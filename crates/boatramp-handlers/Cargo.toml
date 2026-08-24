@@ -39,6 +39,12 @@ engine = [
 # `boatramp_core::sql::SqlBackend`; the concrete database (libsql, single-node
 # file or sqld namespace) is a `boatramp-storage` backend the server wires in.
 sql = ["engine"]
+# The orm `related-aggregate` correlated roll-up — the one scalar-subquery form
+# (`(SELECT agg(col) FROM table WHERE …)`). Off in THIS crate's own default set: it is a
+# (guest-declared) nested-`FROM` access path, so an operator can build a host that refuses it.
+# Enabling it needs `sql` (it rides the orm binding). NOTE: the shipped `boatramp` binary turns
+# it ON via its batteries-included default — a kill-switch is a rebuild without the feature.
+orm-subquery = ["sql"]
 # The `wasi:messaging` producer binding: publish to boatramp's internal
 # `boatramp_core::messaging::Messaging` substrate. (Consumer dispatch is the
 # server's job.)

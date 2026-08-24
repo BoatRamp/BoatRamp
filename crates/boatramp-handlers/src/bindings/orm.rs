@@ -138,18 +138,25 @@ fn bad_arena(msg: &'static str) -> wit::Error {
     wit::Error::Syntax(format!("malformed orm query arena: {msg}"))
 }
 
-/// Rebuild a core [`Expr`](core::Expr) from the `exprs` arena at `idx`. A child reference must
-/// be strictly less than its parent's index, which makes the arena acyclic (and this recursion
-/// terminating) and is rejected otherwise.
-fn build_expr(exprs: &[wit::ExprNode], idx: u32) -> Result<core::Expr, wit::Error> {
+/// Rebuild a core [`Expr`](core::Expr) from the `exprs` arena at `idx`. `upper` is the
+/// exclusive index bound this node must stay below — the acyclicity invariant. A top-level
+/// expression passes `exprs.len()`; a child tightens it to the parent's index; the correlated
+/// filter of a [`related-aggregate`](build_related_aggregate) passes that roll-up's own index,
+/// so a roll-up can never (even transitively, through the pred arena) refer back to itself.
+/// `preds` is threaded through so a roll-up can rebuild its filter from the pred arena.
+fn build_expr(
+    exprs: &[wit::ExprNode],
+    preds: &[wit::PredNode],
+    idx: u32,
+    upper: usize,
+) -> Result<core::Expr, wit::Error> {
     let i = idx as usize;
+    if i >= upper {
+        return Err(bad_arena("expr index out of range or forward reference"));
+    }
     let node = exprs.get(i).ok_or(bad_arena("expr index out of range"))?;
-    let child = |c: u32| -> Result<core::Expr, wit::Error> {
-        if c as usize >= i {
-            return Err(bad_arena("expr child index must be < its parent"));
-        }
-        build_expr(exprs, c)
-    };
+    // A child recurses with `upper = i`, so it must be strictly lower than this node.
+    let child = |c: u32| build_expr(exprs, preds, c, i);
     Ok(match node {
         wit::ExprNode::Column(s) => core::Expr::Column(s.clone()),
         wit::ExprNode::Literal(v) => core::Expr::Value(to_sqlvalue(v.clone())),
@@ -175,15 +182,56 @@ fn build_expr(exprs: &[wit::ExprNode], idx: u32) -> Result<core::Expr, wit::Erro
             metric: to_core_metric(d.metric),
         },
         wit::ExprNode::VectorLiteral(s) => core::Expr::VectorLiteral(s.clone()),
+        // The filter — and everything it reaches — is bounded by this node's own index `i`.
+        wit::ExprNode::RelatedAggregate(r) => build_related_aggregate(exprs, preds, r, i)?,
     })
 }
 
+/// Rebuild a correlated roll-up. Gated on the host's `orm-subquery` feature: it is the only
+/// subquery form and adds an (already guest-declared) nested-`FROM` access path, so an operator
+/// can build a host that refuses it entirely.
+#[cfg(feature = "orm-subquery")]
+fn build_related_aggregate(
+    exprs: &[wit::ExprNode],
+    preds: &[wit::PredNode],
+    r: &wit::RelatedAggregateNode,
+    upper: usize,
+) -> Result<core::Expr, wit::Error> {
+    let arg = match &r.arg {
+        None => core::RelArg::Star,
+        Some(c) => core::RelArg::Column(c.clone()),
+    };
+    Ok(core::Expr::RelatedAggregate {
+        agg: to_core_agg(r.agg),
+        arg,
+        table: r.table.clone(),
+        // Bound the filter's expr references by this roll-up's index — no back-reference.
+        filter: Box::new(build_pred(preds, exprs, r.filter, upper)?),
+    })
+}
+
+#[cfg(not(feature = "orm-subquery"))]
+fn build_related_aggregate(
+    _exprs: &[wit::ExprNode],
+    _preds: &[wit::PredNode],
+    _r: &wit::RelatedAggregateNode,
+    _upper: usize,
+) -> Result<core::Expr, wit::Error> {
+    Err(bad_arena(
+        "related-aggregate requires the host's orm-subquery feature",
+    ))
+}
+
 /// Rebuild a core [`Predicate`](core::Predicate) from the `preds` arena at `idx` (same
-/// strictly-lower-child rule for the boolean children; scalar fields reference `exprs`).
+/// strictly-lower-child rule for the boolean children). Every expression it references is
+/// bounded by `expr_upper` — for a top-level predicate that is `exprs.len()`; for the filter of
+/// a correlated roll-up it is that roll-up's index, which is what makes the cross-arena
+/// reference (pred → expr) acyclic.
 fn build_pred(
     preds: &[wit::PredNode],
     exprs: &[wit::ExprNode],
     idx: u32,
+    expr_upper: usize,
 ) -> Result<core::Predicate, wit::Error> {
     let i = idx as usize;
     let node = preds.get(i).ok_or(bad_arena("pred index out of range"))?;
@@ -191,8 +239,9 @@ fn build_pred(
         if c as usize >= i {
             return Err(bad_arena("pred child index must be < its parent"));
         }
-        build_pred(preds, exprs, c)
+        build_pred(preds, exprs, c, expr_upper)
     };
+    let pexpr = |e: u32| build_expr(exprs, preds, e, expr_upper);
     Ok(match node {
         wit::PredNode::Conj(cs) => {
             core::Predicate::And(cs.iter().map(|&c| pchild(c)).collect::<Result<_, _>>()?)
@@ -202,33 +251,33 @@ fn build_pred(
         }
         wit::PredNode::Negate(c) => core::Predicate::Not(Box::new(pchild(*c)?)),
         wit::PredNode::Compare(c) => core::Predicate::Cmp {
-            left: build_expr(exprs, c.left)?,
+            left: pexpr(c.left)?,
             op: to_core_cmpop(c.op),
-            right: build_expr(exprs, c.right)?,
+            right: pexpr(c.right)?,
         },
         wit::PredNode::Between(b) => core::Predicate::Between {
-            expr: build_expr(exprs, b.expr)?,
-            low: build_expr(exprs, b.low)?,
-            high: build_expr(exprs, b.high)?,
+            expr: pexpr(b.expr)?,
+            low: pexpr(b.low)?,
+            high: pexpr(b.high)?,
             negated: b.negated,
         },
         wit::PredNode::Within(n) => core::Predicate::In {
-            expr: build_expr(exprs, n.expr)?,
+            expr: pexpr(n.expr)?,
             values: n
                 .values
                 .iter()
-                .map(|&v| build_expr(exprs, v))
+                .map(|&v| pexpr(v))
                 .collect::<Result<_, _>>()?,
             negated: n.negated,
         },
         wit::PredNode::Matches(l) => core::Predicate::Like {
-            expr: build_expr(exprs, l.expr)?,
+            expr: pexpr(l.expr)?,
             pattern: l.pattern.clone(),
             insensitive: l.insensitive,
             negated: l.negated,
         },
         wit::PredNode::IsNull(n) => core::Predicate::Null {
-            expr: build_expr(exprs, n.expr)?,
+            expr: pexpr(n.expr)?,
             negated: n.negated,
         },
     })
@@ -320,34 +369,37 @@ fn to_core_scope(s: wit::Scope) -> core::Scope {
 
 fn to_core_item(
     exprs: &[wit::ExprNode],
+    preds: &[wit::PredNode],
     it: &wit::SelectItem,
 ) -> Result<core::SelectItem, wit::Error> {
     Ok(core::SelectItem {
-        expr: build_expr(exprs, it.expr)?,
+        expr: build_expr(exprs, preds, it.expr, exprs.len())?,
         alias: it.alias.clone(),
     })
 }
 
 fn to_core_assignment(
     exprs: &[wit::ExprNode],
+    preds: &[wit::PredNode],
     a: &wit::Assignment,
 ) -> Result<core::Assignment, wit::Error> {
     Ok(core::Assignment {
         column: a.column.clone(),
-        value: build_expr(exprs, a.value)?,
+        value: build_expr(exprs, preds, a.value, exprs.len())?,
     })
 }
 
 fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
     let exprs = &q.exprs;
     let preds = &q.preds;
+    let upper = exprs.len();
     Ok(core::Select {
         table: q.table.clone(),
         table_alias: q.table_alias.clone(),
         columns: q
             .columns
             .iter()
-            .map(|it| to_core_item(exprs, it))
+            .map(|it| to_core_item(exprs, preds, it))
             .collect::<Result<_, _>>()?,
         joins: q
             .joins
@@ -357,25 +409,31 @@ fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
                     kind: to_core_joinkind(j.kind),
                     table: j.table.clone(),
                     alias: j.alias.clone(),
-                    on: build_pred(preds, exprs, j.on)?,
+                    on: build_pred(preds, exprs, j.on, upper)?,
                 })
             })
             .collect::<Result<_, _>>()?,
-        filter: q.filter.map(|f| build_pred(preds, exprs, f)).transpose()?,
+        filter: q
+            .filter
+            .map(|f| build_pred(preds, exprs, f, upper))
+            .transpose()?,
         scope: q.scope.clone().map(to_core_scope),
         group_by: q
             .group_by
             .iter()
-            .map(|&g| build_expr(exprs, g))
+            .map(|&g| build_expr(exprs, preds, g, upper))
             .collect::<Result<_, _>>()?,
-        having: q.having.map(|h| build_pred(preds, exprs, h)).transpose()?,
+        having: q
+            .having
+            .map(|h| build_pred(preds, exprs, h, upper))
+            .transpose()?,
         distinct: q.distinct,
         order: q
             .order
             .iter()
             .map(|o| {
                 Ok::<_, wit::Error>(core::OrderBy {
-                    expr: build_expr(exprs, o.expr)?,
+                    expr: build_expr(exprs, preds, o.expr, upper)?,
                     dir: to_core_dir(o.dir),
                 })
             })
@@ -387,6 +445,9 @@ fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
 
 fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
     let exprs = &q.exprs;
+    // An insert carries no predicate arena, so a correlated roll-up (whose filter would index
+    // it) is simply unreachable here — its filter index falls outside this empty slice.
+    let preds: &[wit::PredNode] = &[];
     Ok(core::Insert {
         table: q.table.clone(),
         rows: q
@@ -397,7 +458,7 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
                     cells: r
                         .cells
                         .iter()
-                        .map(|a| to_core_assignment(exprs, a))
+                        .map(|a| to_core_assignment(exprs, preds, a))
                         .collect::<Result<_, _>>()?,
                 })
             })
@@ -411,7 +472,7 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
                     update: c
                         .update
                         .iter()
-                        .map(|a| to_core_assignment(exprs, a))
+                        .map(|a| to_core_assignment(exprs, preds, a))
                         .collect::<Result<_, _>>()?,
                 })
             })
@@ -420,7 +481,7 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
         returning: q
             .returning
             .iter()
-            .map(|it| to_core_item(exprs, it))
+            .map(|it| to_core_item(exprs, preds, it))
             .collect::<Result<_, _>>()?,
     })
 }
@@ -428,19 +489,20 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
 fn to_core_update(q: &wit::UpdateQuery) -> Result<core::Update, wit::Error> {
     let exprs = &q.exprs;
     let preds = &q.preds;
+    let upper = exprs.len();
     Ok(core::Update {
         table: q.table.clone(),
         set: q
             .set
             .iter()
-            .map(|a| to_core_assignment(exprs, a))
+            .map(|a| to_core_assignment(exprs, preds, a))
             .collect::<Result<_, _>>()?,
-        filter: build_pred(preds, exprs, q.filter)?,
+        filter: build_pred(preds, exprs, q.filter, upper)?,
         scope: q.scope.clone().map(to_core_scope),
         returning: q
             .returning
             .iter()
-            .map(|it| to_core_item(exprs, it))
+            .map(|it| to_core_item(exprs, preds, it))
             .collect::<Result<_, _>>()?,
     })
 }
@@ -776,6 +838,81 @@ mod tests {
         let err = host.select(db, sel).await.unwrap_err();
         assert!(matches!(err, wit::Error::Syntax(_)));
         // Refused at compile time — the backend was never queried.
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// A correlated roll-up in the select list: `related-aggregate` at expr 2, its filter
+    /// `element.order_id = work_order.id` in the pred arena (exprs 0/1). Both filter exprs are
+    /// below the roll-up's index, so it rebuilds and reaches the backend as a scalar subquery.
+    fn correlated_count_select() -> wit::SelectQuery {
+        wit::SelectQuery {
+            exprs: vec![
+                col("element.order_id"), // 0
+                col("work_order.id"),    // 1
+                wit::ExprNode::RelatedAggregate(wit::RelatedAggregateNode {
+                    agg: wit::Agg::Count,
+                    arg: None, // count(*)
+                    table: "element".into(),
+                    filter: 0, // preds[0]
+                }), // 2
+            ],
+            preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+            columns: vec![item(2)],
+            ..empty_select("work_order")
+        }
+    }
+
+    #[cfg(feature = "orm-subquery")]
+    #[tokio::test]
+    async fn related_aggregate_rebuilds_from_the_arena_and_reaches_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        host.select(db, correlated_count_select()).await.unwrap();
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with(
+                "query|SELECT (SELECT count(*) FROM element WHERE element.order_id = work_order.id) FROM work_order|"
+            )),
+            "got: {log:?}"
+        );
+    }
+
+    #[cfg(feature = "orm-subquery")]
+    #[tokio::test]
+    async fn related_aggregate_filter_cannot_reference_the_rollup_itself() {
+        // The filter pred compares against expr 2 — the roll-up itself. The expr upper-bound
+        // (the roll-up's own index) rejects the self/forward reference, so the cross-arena
+        // pred→expr edge can't form a cycle and the host never recurses without end.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let sel = wit::SelectQuery {
+            preds: vec![cmp(0, wit::CmpOp::Eq, 2)], // element.order_id = <the roll-up expr 2>
+            ..correlated_count_select()
+        };
+        let err = host.select(db, sel).await.unwrap_err();
+        assert!(matches!(err, wit::Error::Syntax(_)));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[cfg(not(feature = "orm-subquery"))]
+    #[tokio::test]
+    async fn related_aggregate_is_refused_without_the_orm_subquery_feature() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let err = host
+            .select(db, correlated_count_select())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, wit::Error::Syntax(_)));
         assert!(log.lock().unwrap().is_empty());
     }
 

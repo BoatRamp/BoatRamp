@@ -135,6 +135,11 @@ interface orm {
   record json-node { base: u32, path: list<string> }   // path keys => `$.a.b` / `#>>'{a,b}'`
   // `(exprs[left] <op> exprs[right])` per `metric`; Postgres-only (fails closed elsewhere).
   record distance-node { left: u32, right: u32, metric: distance-metric }
+  // A correlated roll-up: `(SELECT agg(arg) FROM table WHERE preds[filter])`. `arg` is a column
+  // name (`none` = `*`, count-only); `filter` indexes the `preds` arena and — like every arena
+  // reference reachable from it — must stay strictly below this node so the whole thing is
+  // acyclic. Only accepted when the host has the `orm-subquery` feature. @since 0.2.18.
+  record related-aggregate-node { agg: agg, arg: option<string>, table: string, filter: u32 }
   variant expr-node {
     column(string),
     literal(value),
@@ -148,6 +153,7 @@ interface orm {
     // `@0.2.18`). @since 0.2.18.
     distance(distance-node),
     vector-literal(string),     // a bracketed float list, bound + rendered `?N::vector`
+    related-aggregate(related-aggregate-node),
   }
 
   // ---- predicate arena -----------------------------------------------------
