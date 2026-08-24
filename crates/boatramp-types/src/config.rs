@@ -1138,6 +1138,7 @@ mod tests {
                 methods: Vec::new(),
                 component: "h.wasm".into(),
                 imports: Vec::new(),
+                streaming: false,
                 limits: None,
                 env: BTreeMap::from([("AWS_KEY".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string())]),
                 invoke_targets: Vec::new(),

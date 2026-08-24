@@ -714,6 +714,7 @@ mod imp {
                     methods: vec!["GET".into()],
                     component: "portal.wasm".into(),
                     imports: vec![],
+                    streaming: false,
                     limits: None,
                     env: BTreeMap::new(),
                     invoke_targets: vec![],

@@ -763,6 +763,7 @@ mod tests {
                 .collect(),
             component: "h.wasm".into(),
             imports: Vec::new(),
+            streaming: false,
             limits: None,
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),

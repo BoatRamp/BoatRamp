@@ -907,6 +907,7 @@ mod tests {
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect(),
+            streaming: false,
             limits: None,
             env: BTreeMap::new(),
             invoke_targets: Vec::new(),
