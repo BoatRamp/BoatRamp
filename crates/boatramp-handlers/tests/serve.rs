@@ -382,6 +382,57 @@ async fn async_ceiling_defaults_to_the_sync_ceiling_until_opted_in() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn streaming_lane_clamps_to_its_own_ceiling() {
+    // A streaming response runs on the streaming lane, clamped to *its* ceiling — separate
+    // from the sync request lane — so a per-invocation request for more is capped here.
+    let sync_ceiling = Limits {
+        timeout_ms: 10_000,
+        ..Limits::default()
+    };
+    let streaming_ceiling = Limits {
+        timeout_ms: 100,
+        ..Limits::default()
+    };
+    let engine = HandlerEngine::new(sync_ceiling, 16)
+        .expect("engine")
+        .with_streaming_limits(streaming_ceiling);
+    let declares_10s = Limits {
+        timeout_ms: 10_000,
+        ..Limits::default()
+    };
+    let err = engine
+        .serve_with_limits_streaming(
+            "http-200",
+            HTTP_200,
+            request_path("/loop"),
+            no_caps(),
+            declares_10s,
+        )
+        .await
+        .expect_err("the streaming lane clamps to its own 100ms ceiling");
+    assert!(matches!(err, HandlerError::Timeout), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_ceiling_defaults_to_the_sync_ceiling_until_opted_in() {
+    // Back-compat: without opting in, the streaming lane mirrors the sync ceiling.
+    let engine = HandlerEngine::new(Limits::default(), 16).expect("engine");
+    assert_eq!(engine.streaming_timeout_ms(), Limits::default().timeout_ms);
+    assert_eq!(
+        engine.streaming_max_concurrency(),
+        Limits::default().max_concurrency
+    );
+
+    let raised = engine.with_streaming_limits(Limits {
+        timeout_ms: 900_000,
+        max_concurrency: 64,
+        ..Limits::default()
+    });
+    assert_eq!(raised.streaming_timeout_ms(), 900_000);
+    assert_eq!(raised.streaming_max_concurrency(), 64);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pooling_allocator_serves_real_components() {
     // The pooling allocator must be sized so a real wasi:http + wasi:keyvalue
     // component instantiates and serves (under-sizing fails instantiation).

@@ -29,6 +29,17 @@ const DEFAULT_ASYNC_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 #[cfg(feature = "handlers")]
 const DEFAULT_ASYNC_CONCURRENCY: usize = 8;
 
+/// Default streaming-lane wall-clock: like the async lane, a long-lived streaming
+/// response (SSE, agent token streaming) can run for minutes.
+#[cfg(feature = "handlers")]
+const DEFAULT_STREAMING_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+
+/// Default streaming-lane concurrency: larger than the async drain because
+/// concurrent connected SSE clients are the expected shape, but still an isolated
+/// budget so a burst can't touch the fast request pool.
+#[cfg(feature = "handlers")]
+const DEFAULT_STREAMING_CONCURRENCY: usize = 64;
+
 /// Build the WebAssembly handler runtime. With the `handlers` feature it wraps a
 /// wasmtime engine serving the kv/blob bindings from the server's own backends;
 /// otherwise it is an empty placeholder (handler routes fall through to static).
@@ -73,6 +84,20 @@ pub async fn build_handler_runtime(
         fuel: handlers_cfg.and_then(|h| h.async_max_fuel),
         ..sync_limits
     };
+    // The **streaming** ceiling bounds a `#[handler(stream)]` response (SSE, chunked, agent
+    // token streaming): connection-bearing but long-lived, so — like the async lane — a large
+    // wall-clock on its own concurrency budget, kept apart from both the fast request pool and
+    // the durable drain.
+    let streaming_limits = boatramp_handlers::Limits {
+        timeout_ms: handlers_cfg
+            .and_then(|h| h.streaming_max_timeout_ms)
+            .unwrap_or(DEFAULT_STREAMING_TIMEOUT_MS),
+        max_concurrency: handlers_cfg
+            .and_then(|h| h.streaming_max_concurrency)
+            .unwrap_or(DEFAULT_STREAMING_CONCURRENCY),
+        fuel: handlers_cfg.and_then(|h| h.streaming_max_fuel),
+        ..sync_limits
+    };
     let outbound_timeout = handlers_cfg
         .and_then(|h| h.outbound_timeout_ms)
         .map(std::time::Duration::from_millis);
@@ -84,6 +109,7 @@ pub async fn build_handler_runtime(
         boatramp_handlers::HandlerEngine::new(sync_limits, 64)?
     }
     .with_async_limits(async_limits)
+    .with_streaming_limits(streaming_limits)
     .with_outbound_timeout(outbound_timeout);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
