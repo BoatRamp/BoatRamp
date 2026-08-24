@@ -549,6 +549,29 @@ impl HandlerRuntime {
                     );
                 }
             }
+            // A guest that self-declares a streaming handler (`#[handler(stream)]`) but whose
+            // config doesn't mark the route `streaming` would run on the tight sync request lane
+            // and be cut at the sync timeout — a silent footgun for a long-lived SSE/agent stream.
+            // Warn (don't block) so the operator sets `streaming = true` for the dedicated lane.
+            if !handler.streaming {
+                if let Some(entry) = manifest.files.get(&handler.component) {
+                    if let Ok(bytes) = read_blob_bytes(deploy, &entry.hash).await {
+                        if crate::function_api::component_declares_streaming_route(
+                            &bytes,
+                            &handler.route,
+                        ) {
+                            let route = &handler.route;
+                            tracing::warn!(
+                                "route {route:?} is a streaming handler (#[handler(stream)]) but \
+                                 its config lacks streaming = true: it will run on the sync request \
+                                 lane and be cut at sync_max_timeout_ms={sync_ceiling}ms. Set \
+                                 streaming = true so it serves on the dedicated streaming lane (its \
+                                 own concurrency budget + a much larger wall-clock)."
+                            );
+                        }
+                    }
+                }
+            }
             precheck_component(
                 deploy,
                 manifest,

@@ -343,10 +343,20 @@ pub(super) async fn dispatch_handler(
     // time-to-head (the body streams afterward on its own task) — the meaningful
     // latency of the handler logic.
     let start = std::time::Instant::now();
-    let result = inner
-        .engine
-        .serve_with_limits(&entry.hash, &wasm, request, bindings, limits)
-        .await;
+    // A streaming handler runs on the isolated streaming lane (its own concurrency budget + a
+    // much larger wall-clock), so a long-lived SSE/token stream never holds a fast-request slot;
+    // a buffered handler stays on the tight sync request lane.
+    let result = if handler.streaming {
+        inner
+            .engine
+            .serve_with_limits_streaming(&entry.hash, &wasm, request, bindings, limits)
+            .await
+    } else {
+        inner
+            .engine
+            .serve_with_limits(&entry.hash, &wasm, request, bindings, limits)
+            .await
+    };
     inner.metrics.observe(
         site,
         metrics::Trigger::Http,

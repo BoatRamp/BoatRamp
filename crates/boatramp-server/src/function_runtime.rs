@@ -385,6 +385,15 @@ pub(super) async fn execute_function(
                 .serve_with_limits_async(component, &wasm, request, bindings, limits)
                 .await
         }
+        // Function invokes are Sync (synchronous call) or Async (durable); the streaming lane
+        // is HTTP-handler-only. Handle it for exhaustiveness — it runs there correctly if a
+        // streaming invoke path is ever added.
+        boatramp_handlers::Lane::Streaming => {
+            inner
+                .engine
+                .serve_with_limits_streaming(component, &wasm, request, bindings, limits)
+                .await
+        }
     };
     let elapsed = start.elapsed();
     inner.metrics.observe(

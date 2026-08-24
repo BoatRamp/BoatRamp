@@ -141,6 +141,43 @@ fn component_declares_subgraph(component: &[u8]) -> bool {
     declared
 }
 
+/// Whether a component's `boatramp:function-manifest` self-declares that the route with request
+/// path `route` is a **streaming** handler (`#[handler(stream)]` emits `"streaming": true` on that
+/// function's manifest line). Matches by the http trigger's path (the part after an optional
+/// `METHOD `), so a multi-route component reports per route. Returns `false` when no line matches
+/// or none declares streaming — including for a guest built before the flag existed.
+#[cfg(feature = "handlers")]
+pub(crate) fn component_declares_streaming_route(component: &[u8], route: &str) -> bool {
+    let mut declared = false;
+    scan_manifest_sections(component, &mut |data| {
+        for line in data.split(|&b| b == b'\n') {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("streaming").and_then(serde_json::Value::as_bool) != Some(true) {
+                continue;
+            }
+            // This line is streaming — does one of its http triggers target `route`?
+            let Some(triggers) = v.get("triggers").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for t in triggers {
+                if t.get("on").and_then(serde_json::Value::as_str) != Some("http") {
+                    continue;
+                }
+                if let Some(r) = t.get("route").and_then(serde_json::Value::as_str) {
+                    // `route` is `"METHOD /path"` or `"/path"`; compare the path portion.
+                    let path = r.rsplit(char::is_whitespace).next().unwrap_or(r);
+                    if path == route {
+                        declared = true;
+                    }
+                }
+            }
+        }
+    });
+    declared
+}
+
 /// Keep the project's GraphQL supergraph correct across a function deploy. The function is a
 /// subgraph to (re)register when it is **already registered** *or* its component
 /// **self-declares** one (the shim marker); in either case introspect the **pending** version's

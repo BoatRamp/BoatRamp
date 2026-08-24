@@ -417,6 +417,20 @@ pub struct HandlersConfig {
     /// timeout bounds only wall-clock; without a fuel bound a CPU-bound guest can
     /// spin for the whole window. Absent ⇒ unmetered (same as the sync default).
     pub async_max_fuel: Option<u64>,
+    /// Max wall-clock for a *streaming-lane* response (a `#[handler(stream)]`
+    /// route — SSE, chunked, agent token streaming), milliseconds. A client is
+    /// connected but the body is written incrementally over seconds-to-minutes,
+    /// so this is far larger than the sync ceiling. Runs on its own concurrency
+    /// budget (`streaming_max_concurrency`), isolated from both the fast request
+    /// pool and the async drain. Absent ⇒ 15 minutes.
+    pub streaming_max_timeout_ms: Option<u64>,
+    /// Max concurrent in-flight *streaming-lane* responses, kept separate from the
+    /// request pool and the async drain so a burst of long-lived streams starves
+    /// neither. Absent ⇒ 64.
+    pub streaming_max_concurrency: Option<usize>,
+    /// Optional CPU **fuel** ceiling for a streaming-lane response. Absent ⇒
+    /// unmetered (a stream is I/O-bound on the client, not CPU-bound).
+    pub streaming_max_fuel: Option<u64>,
     /// Optional ceiling on a guest's **outbound** `wasi:http` call — the connect
     /// and time-to-first-byte wait — milliseconds, independent of the invocation
     /// timeout, so a hung upstream is bounded on its own terms. The streaming

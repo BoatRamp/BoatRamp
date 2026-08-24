@@ -132,12 +132,21 @@ impl Default for Limits {
 /// - [`Lane::Async`] — the durable drain / workflow-step path. No client is
 ///   connected, the work is retried and dead-lettered, so it can carry a much
 ///   larger ceiling on its own concurrency budget without touching live traffic.
+/// - [`Lane::Streaming`] — a **long-lived, connection-bearing** response (SSE,
+///   chunked, agent token streaming). A client *is* connected, but the response
+///   is written incrementally over seconds-to-minutes, so it has the resource
+///   profile of background work, not a fast request: its own concurrency budget
+///   (so a burst of streams can't exhaust the sync request pool, nor starve the
+///   durable async drain) and a much larger wall-clock ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
     /// Connection-bearing; tight ceiling; the shared request concurrency pool.
     Sync,
     /// Durable background; large ceiling; an isolated concurrency budget.
     Async,
+    /// Connection-bearing but long-lived (streaming responses); its own large
+    /// ceiling + concurrency budget, isolated from both `Sync` and `Async`.
+    Streaming,
 }
 
 /// Epoch ticks happen every this many milliseconds; the store deadline is
@@ -297,11 +306,19 @@ pub struct HandlerEngine {
     /// clamped to this instead. Defaults to `limits` (identical behavior) until a
     /// caller opts into a larger one via [`with_async_limits`](Self::with_async_limits).
     async_limits: Limits,
+    /// The [`Lane::Streaming`] ceiling — a long-lived streaming response is
+    /// clamped to this (a much larger wall-clock than the sync default).
+    /// Defaults to `limits` until a caller opts into a larger one via
+    /// [`with_streaming_limits`](Self::with_streaming_limits).
+    streaming_limits: Limits,
     /// Concurrency gate for the sync lane (the shared request pool).
     semaphore: Semaphore,
     /// A **separate** concurrency gate for the async lane, so a long background
     /// job can never exhaust the pool live site traffic draws from.
     async_semaphore: Semaphore,
+    /// A **separate** concurrency gate for the streaming lane, so a burst of
+    /// long-lived streams can't exhaust the sync request pool or the async drain.
+    streaming_semaphore: Semaphore,
     /// Optional ceiling on a guest's **outbound** `wasi:http` call (connect +
     /// time-to-first-byte), independent of the invocation's own timeout, so a
     /// hung upstream is bounded on its own terms. `None` keeps wasmtime's default.
@@ -354,11 +371,13 @@ impl HandlerEngine {
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
-            // The async lane defaults to the sync ceiling + an equally-sized,
-            // *independent* pool, so an engine built without opting in behaves
+            // The async + streaming lanes default to the sync ceiling + an equally-sized,
+            // *independent* pool each, so an engine built without opting in behaves
             // exactly as before (back-compat for tests and existing callers).
             async_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             async_limits: limits,
+            streaming_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
+            streaming_limits: limits,
             outbound_timeout: None,
             limits,
             epoch_ticker,
@@ -374,6 +393,19 @@ impl HandlerEngine {
     pub fn with_async_limits(mut self, async_limits: Limits) -> Self {
         self.async_semaphore = Semaphore::new(async_limits.max_concurrency.max(1));
         self.async_limits = async_limits;
+        self
+    }
+
+    /// Set the [`Lane::Streaming`] ceiling — a long-lived streaming response
+    /// (SSE, chunked, agent token streaming) runs here instead of the sync lane,
+    /// on its own concurrency budget (`streaming_limits.max_concurrency`) with a
+    /// much larger wall-clock (`streaming_limits.timeout_ms`), so a stream that
+    /// runs for minutes never holds a slot the fast-request pool needs and can't
+    /// starve the durable async drain either.
+    #[must_use]
+    pub fn with_streaming_limits(mut self, streaming_limits: Limits) -> Self {
+        self.streaming_semaphore = Semaphore::new(streaming_limits.max_concurrency.max(1));
+        self.streaming_limits = streaming_limits;
         self
     }
 
@@ -405,6 +437,21 @@ impl HandlerEngine {
     #[must_use]
     pub fn async_max_concurrency(&self) -> usize {
         self.async_limits.max_concurrency
+    }
+
+    /// The [`Lane::Streaming`] wall-clock ceiling, milliseconds — a streaming
+    /// route's response may run for at most this long. A deploy can inspect it to
+    /// warn that a longer per-handler timeout will still be capped here.
+    #[must_use]
+    pub fn streaming_timeout_ms(&self) -> u64 {
+        self.streaming_limits.timeout_ms
+    }
+
+    /// The [`Lane::Streaming`] concurrency budget — the maximum number of
+    /// concurrent streaming responses the lane will admit.
+    #[must_use]
+    pub fn streaming_max_concurrency(&self) -> usize {
+        self.streaming_limits.max_concurrency
     }
 
     /// Compile (and cache) a component without serving it — the activation
@@ -581,15 +628,18 @@ impl HandlerEngine {
         match lane {
             Lane::Sync => self.limits,
             Lane::Async => self.async_limits,
+            Lane::Streaming => self.streaming_limits,
         }
     }
 
     /// The concurrency gate for `lane` — the sync lane shares the request pool;
-    /// the async lane has its own, so the two can't starve each other.
+    /// the async and streaming lanes each have their own, so no lane can starve
+    /// another.
     fn lane_semaphore(&self, lane: Lane) -> &Semaphore {
         match lane {
             Lane::Sync => &self.semaphore,
             Lane::Async => &self.async_semaphore,
+            Lane::Streaming => &self.streaming_semaphore,
         }
     }
 
@@ -712,6 +762,27 @@ impl HandlerEngine {
         B::Error: std::fmt::Display + Send,
     {
         self.serve_lane(hash, wasm, request, bindings, limits, Lane::Async)
+            .await
+    }
+
+    /// Like [`serve_with_limits`](Self::serve_with_limits) but on the
+    /// **streaming** lane: a long-lived, connection-bearing streaming response
+    /// (SSE, chunked, agent token streaming), clamped to the larger streaming
+    /// ceiling on its own concurrency budget — isolated from both the fast sync
+    /// request pool and the durable async drain.
+    pub async fn serve_with_limits_streaming<B>(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        request: http::Request<B>,
+        bindings: Bindings,
+        limits: Limits,
+    ) -> Result<http::Response<HyperOutgoingBody>, HandlerError>
+    where
+        B: HttpBody<Data = Bytes> + Send + 'static,
+        B::Error: std::fmt::Display + Send,
+    {
+        self.serve_lane(hash, wasm, request, bindings, limits, Lane::Streaming)
             .await
     }
 
