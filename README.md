@@ -2,9 +2,9 @@
 
 # boatramp
 
-**Launch the web from your own shore.** A self-hosted, streaming-first platform
-for publishing static sites *and the functions that run beside them* — from a
-laptop to an edge-compute cluster — shipped as one Rust binary.
+**Launch the web from your own shore.** A streaming-first platform that folds
+an entire cloud (sites, services, and state) into one Rust binary, yours from
+a laptop to the edge.
 
 [![CI](https://github.com/BoatRamp/BoatRamp/actions/workflows/ci.yml/badge.svg)](https://github.com/BoatRamp/BoatRamp/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-boatramp.dev-2088c1.svg)](https://docs.boatramp.dev/)
