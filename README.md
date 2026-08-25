@@ -7,6 +7,7 @@ an entire cloud (sites, services, and state) into one Rust binary, yours from
 a laptop to the edge.
 
 [![CI](https://github.com/BoatRamp/BoatRamp/actions/workflows/ci.yml/badge.svg)](https://github.com/BoatRamp/BoatRamp/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/boatramp.svg?logo=rust&label=crates.io)](https://crates.io/crates/boatramp)
 [![Docs](https://img.shields.io/badge/docs-boatramp.dev-2088c1.svg)](https://docs.boatramp.dev/)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.82+](https://img.shields.io/badge/rust-1.82%2B-orange.svg)](https://www.rust-lang.org)
@@ -86,7 +87,7 @@ commands and the same config*.
   systemd unit, a **NixOS module + overlay**, a reproducible OCI image, and a **Kubernetes operator + Helm chart**
 - The **same UX on every target** — bare metal, systemd, NixOS, Docker/OCI, Kubernetes, Cloudflare, and a cluster
 
-> **Status:** boatramp is pre-1.0 (`v0.1`) and honest about it — interfaces may
+> **Status:** boatramp is pre-1.0 and honest about it — interfaces may
 > still shift before the first stable release, but what's here is real and
 > **dogfooded** (both [boatramp.dev](https://boatramp.dev) and
 > [docs.boatramp.dev](https://docs.boatramp.dev) run on it). The default build is
@@ -159,21 +160,21 @@ source; needs a Rust toolchain):
 
 ```sh
 cargo install boatramp --locked           # latest release, batteries-included
-cargo install boatramp@0.2.7 --locked     # pin a version
+cargo install boatramp@0.3.0 --locked     # pin a version
 ```
 
 **With Nix** (flakes):
 
 ```sh
 nix run github:BoatRamp/BoatRamp -- serve         # run without installing (latest commit)
-nix run github:BoatRamp/BoatRamp/v0.2.7 -- serve  # pin a release
+nix run github:BoatRamp/BoatRamp/v0.3.0 -- serve  # pin a release
 nix profile install github:BoatRamp/BoatRamp      # install the binary
 ```
 
 **From source** (Rust 1.82+):
 
 ```sh
-git checkout v0.2.7                                                # the release (omit for the development tip)
+git checkout v0.3.0                                                # the release (omit for the development tip)
 cargo build --release                                              # batteries-included: all non-conflicting backends
 cargo build --release --no-default-features --features fs,slatedb  # the minimal opt-down slice
 ```

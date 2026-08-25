@@ -85,6 +85,37 @@ jobs:
           fi
           echo "all #[ignore] attributes carry a reason"
 
+      # The README's install pins (`cargo install boatramp@X`, `nix run …/vX`,
+      # `git checkout vX`) MUST equal the workspace version, so a release bump can never
+      # leave the front page advertising a stale version — it once still read `v0.1` at
+      # v0.3.0. A version bump that forgets the README fails here. The canonical version
+      # is shown via the live crates.io badge, never hardcoded in prose; a bare `(vN.M)`
+      # in prose is refused so the footgun can't come back.
+      - name: README version pins match the workspace
+        run: |
+          set -eo pipefail
+          ver=$(grep -m1 -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "workspace version: $ver"
+          pins=$(grep -oE '(boatramp@|BoatRamp/v|checkout v)[0-9]+\.[0-9]+\.[0-9]+' README.md \
+                 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+          if [ -z "$pins" ]; then
+            echo "::error::found no README version pins to check — did the pin format change?"
+            exit 1
+          fi
+          fail=0
+          for p in $pins; do
+            if [ "$p" != "$ver" ]; then
+              echo "::error::README pins boatramp $p but the workspace is $ver — bump the README pins"
+              fail=1
+            fi
+          done
+          if grep -nE '\(`?v[0-9]+\.[0-9]+`?\)' README.md; then
+            echo "::error::README hardcodes a version in prose — show it via the crates.io badge instead"
+            fail=1
+          fi
+          if [ "$fail" != 0 ]; then exit 1; fi
+          echo "README pins all match $ver"
+
       # rustfmt only — no workspace build, so this lane stays sub-minute.
       - uses: dtolnay/rust-toolchain@stable
         with:
