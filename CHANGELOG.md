@@ -7,7 +7,29 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-25
+
+### Changed (BREAKING)
+- **The `boatramp:handlers` capability contract is now unversioned, and `sql`/`orm` guests must
+  rebuild.** The `sql-types.value` variant gained a `json` case (no-cast `jsonb` writes). Because
+  `value` appears in a result position (`query-result`), adding a case is a structural (covariance)
+  change: a component built against the old `value` no longer links (wasmtime reports "a matching
+  implementation was not found in the linker"). Rebuild any handler/function that imports `sql` or
+  `orm` against the 0.3.0 contract. Handlers using only `wasi:*` capabilities are unaffected.
+- **Capability versioning is redesigned (`PLAN-capability-contract-versioning-v2`).** A short-lived
+  attempt to version the WIT package (`boatramp:handlers@0.2.18`) is reverted: a WIT package version
+  is a component-model *linking* identity, and pinning it broke every unversioned consumer guest
+  (the export lookup became version-strict) and rejected unversioned imports at deploy. The contract
+  is unversioned again and evolves append-only. Host↔guest capability **availability** now lives in a
+  `requires` list in the guest's function-manifest (metadata), checked at deploy — never in the ABI.
+
 ### Added
+- **Capability `requires` admission check.** A function's manifest may declare `requires =
+  ["orm-subquery", "streaming", …]` (via `#[handler/function(requires = …)]` in the shim). The host
+  advertises the capability features it implements (`boatramp capabilities`) and the activation
+  pre-check fails loud, naming the missing feature, when a guest needs one this host build lacks —
+  instead of an opaque runtime failure. The deploy pre-check also translates raw wasmtime linker
+  errors ("matching implementation not found") into an actionable capability message.
 - **A dedicated streaming lane for long-lived response handlers.** A handler that streams its
   response body (`#[handler(stream)]` via the shim — SSE, chunked, agent token streaming) is
   connection-bearing but long-lived, so on the sync request lane each stream would hold a

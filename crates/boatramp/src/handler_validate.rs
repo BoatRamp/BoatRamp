@@ -148,7 +148,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 2, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 3, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
