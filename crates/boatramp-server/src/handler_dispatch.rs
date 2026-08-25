@@ -660,14 +660,37 @@ pub(super) async fn precheck_component(
         inner
             .engine
             .precompile_consumer(&entry.hash, &wasm)
-            .map_err(|err| format!("{label} is not a valid wasi:messaging consumer: {err}"))?;
+            .map_err(|err| translate_link_error(label, &err.to_string()))?;
     } else {
         inner
             .engine
             .precompile(&entry.hash, &wasm)
-            .map_err(|err| format!("{label} failed to compile: {err}"))?;
+            .map_err(|err| translate_link_error(label, &err.to_string()))?;
     }
     Ok(())
+}
+
+/// Turn wasmtime's opaque "a matching implementation was not found in the linker" into an
+/// actionable capability message. That error means the component imports a `boatramp:handlers/*`
+/// interface (or a shape of it) this host does not provide — the host predates the capability the
+/// function targets, or was built without it. Anything else passes through unchanged.
+#[cfg(feature = "handlers")]
+fn translate_link_error(label: &str, err: &str) -> String {
+    if err.contains("matching implementation was not found") {
+        // Pull the imported interface out of "... imports instance `pkg/iface`, but ...".
+        let iface = err
+            .split_once("imports instance `")
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(name, _)| name)
+            .unwrap_or("a boatramp:handlers capability");
+        format!(
+            "{label} imports `{iface}`, which this host does not provide. The host may predate \
+             the capability this function targets, or be built without it — upgrade boatramp, or \
+             check `boatramp capabilities` for the interfaces + features this host implements."
+        )
+    } else {
+        format!("{label} failed to compile: {err}")
+    }
 }
 
 /// Read a content-addressed blob fully into memory.
