@@ -2,7 +2,8 @@
 # multiple sites, routed by Host —
 #   docs.boatramp.dev → site "docs" (published from this repo, deploy-docs.yml)
 #   boatramp.dev      → site "www"  (published from ../boatramp-website, its own CI)
-# Cloudflare fronts both; the origin scales to zero between cache misses.
+# Cloudflare fronts both; one origin machine stays warm so the first request
+# after a cache miss/purge never pays a cold VM start.
 #
 # Safe to commit publicly: this is configuration, not secrets. The one secret —
 # the control-plane root key — is set out-of-band and injected at runtime:
@@ -27,11 +28,13 @@ BOATRAMP_DEFAULT_SITE = "www"
 [http_service]
 internal_port = 8080
 force_https = true
-# Cloudflare fronts + caches the site, so the origin sleeps between the rare
-# cache-miss / post-purge requests. Scale to zero; fly resumes on demand.
-auto_stop_machines = "stop"
+# Cloudflare fronts + caches the site, but the origin still serves the first
+# request after a cache miss or purge — and a scaled-to-zero origin makes that
+# first hit pay a cold VM start, a hiccup that's visible on the showcase. Keep one
+# 256MB machine always warm (~$2/mo) so the origin never cold-starts in public.
+auto_stop_machines = false
 auto_start_machines = true
-min_machines_running = 0
+min_machines_running = 1
 
 [http_service.concurrency]
 type = "requests"
