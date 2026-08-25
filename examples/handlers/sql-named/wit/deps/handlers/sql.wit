@@ -11,6 +11,7 @@ interface sql-types {
     %float(f64),
     text(string),
     blob(list<u8>),
+    json(string),
   }
 
   record row {
