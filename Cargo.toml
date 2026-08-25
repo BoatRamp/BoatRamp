@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-  "boatramp-http",
+  "crates/boatramp-http",
   "crates/boatramp-types",
   "crates/boatramp-core",
   "crates/boatramp-storage",
@@ -41,7 +41,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.18"
+version = "0.2.17"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
@@ -93,7 +93,7 @@ boatramp-docker = { path = "crates/boatramp-docker", version = "0.2.17" }
 boatramp-vz = { path = "crates/boatramp-vz", version = "0.2.17" }
 boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.2.17" }
 boatramp-node = { path = "crates/boatramp-node", version = "0.2.17" }
-boatramp-http = { path = "boatramp-http", version = "0.2.17" }
+boatramp-http = { path = "crates/boatramp-http", version = "0.2.17" }
 
 tokio = { version = "1", features = [
   "rt-multi-thread",

@@ -7,8 +7,6 @@ versions.
 
 ## [Unreleased]
 
-## [0.2.18] - 2026-08-24
-
 ### Added
 - **A dedicated streaming lane for long-lived response handlers.** A handler that streams its
   response body (`#[handler(stream)]` via the shim — SSE, chunked, agent token streaming) is
