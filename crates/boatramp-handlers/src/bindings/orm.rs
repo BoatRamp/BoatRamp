@@ -949,4 +949,40 @@ mod tests {
         let mut host = OrmHost::new(&mut table, &mut sess);
         assert!(host.open("nope".into()).is_err());
     }
+
+    /// Append-only drift guard for the shared `sql-types.value` variant (PLAN v2).
+    ///
+    /// `value` appears in **result** position (`query-result`), so its cases are
+    /// **covariant**: adding a case is a structural break for every already-deployed
+    /// `sql`/`orm` guest (the guest's linker has the old, narrower type — wasmtime
+    /// rejects instantiation with "a matching implementation was not found"). Because
+    /// the `boatramp:handlers` package is deliberately unversioned (linking identity is
+    /// not a capability advertisement), the only safe evolution *within a major* is
+    /// append-only, and even an append is a guest-recompile event gated at deploy by
+    /// `requires` — never a silent add.
+    ///
+    /// This match has **no wildcard arm on purpose**: any change to the variant — a
+    /// removed/renamed case (a covariance break that must never ship) or a newly
+    /// appended case (which must be a conscious, reviewed, `requires`-gated act) — fails
+    /// to compile here first. Update this baseline only alongside a deliberate,
+    /// documented capability change (and bump `HOST_HANDLERS_VERSION` + the feature
+    /// registry accordingly).
+    #[test]
+    fn sql_value_variant_is_append_only_baseline() {
+        fn assert_frozen(v: wit::Value) {
+            match v {
+                wit::Value::Null => {}
+                wit::Value::Boolean(_) => {}
+                wit::Value::Integer(_) => {}
+                wit::Value::Float(_) => {}
+                wit::Value::Text(_) => {}
+                wit::Value::Blob(_) => {}
+                // Appended in 0.3.0 — the JSON document capability. A guest that reads a
+                // `json` column declares `requires: ["sql-json"]` so a host that predates
+                // it fails the deploy loud rather than wrongly binding the column.
+                wit::Value::Json(_) => {}
+            }
+        }
+        assert_frozen(wit::Value::Null);
+    }
 }

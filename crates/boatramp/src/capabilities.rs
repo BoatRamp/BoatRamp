@@ -1,8 +1,10 @@
 //! The `capabilities` subcommand: print the capability surface this host
-//! implements — the `boatramp:handlers` package version and the imports a deploy
-//! may declare — so an operator (or a remote deploy) can check compatibility
-//! before shipping a guest that pins a capability version. The same data backs
-//! `GET /api/capabilities`.
+//! implements — the informational `boatramp:handlers` surface revision, the
+//! imports a deploy may declare, and the capability **features** a guest may
+//! `require` in its manifest — so an operator (or a remote deploy) can check that
+//! a host satisfies a guest's requirements before shipping it. The `features` list
+//! is exactly what the deploy-time `requires` admission check enforces. The same
+//! data backs `GET /api/capabilities`.
 
 /// Arguments for `boatramp capabilities`.
 #[derive(Debug, clap::Args)]
@@ -25,5 +27,6 @@ pub fn run(args: CapabilitiesArgs) {
     } else {
         println!("package: {}@{}", caps.package, caps.version);
         println!("declarable imports: {}", caps.declarable_imports.join(", "));
+        println!("capability features: {}", caps.features.join(", "));
     }
 }

@@ -184,7 +184,7 @@ pub(crate) fn component_declares_streaming_route(component: &[u8], route: &str) 
 /// 0.3.0 except the correlated roll-up, which is cargo-gated. This is the admission side of the
 /// contract: availability lives in metadata, not the linkable WIT (PLAN v2).
 #[cfg(feature = "handlers")]
-fn host_capability_features() -> Vec<&'static str> {
+pub fn host_capability_features() -> Vec<&'static str> {
     let mut f: Vec<&'static str> = boatramp_core::config::known_imports().to_vec();
     // Surface features that a guest may name in `requires` (beyond the base interface grants).
     f.extend(["sql-json", "orm-vector", "streaming"]);

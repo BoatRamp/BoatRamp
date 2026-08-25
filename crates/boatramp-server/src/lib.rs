@@ -105,6 +105,11 @@ pub(crate) use handler_dispatch::{
 #[cfg(all(feature = "handlers", test))]
 use handler_dispatch::{resolve_env, set_forwarded_headers};
 mod function_api;
+/// The capability **features** this host build implements — the registry a guest's manifest
+/// `requires` is admission-checked against, re-exported so `boatramp capabilities` reports the
+/// exact same set the deploy gate enforces (PLAN v2).
+#[cfg(feature = "handlers")]
+pub use function_api::host_capability_features;
 pub(crate) use function_api::{
     alias_function, deploy_function, list_functions, remove_function, rollback_function,
 };
