@@ -178,6 +178,53 @@ pub(crate) fn component_declares_streaming_route(component: &[u8], route: &str) 
     declared
 }
 
+/// The capability **features** this host build implements — what a guest's manifest `requires`
+/// is checked against. The base grantable capabilities are always present with the handler
+/// engine (they are the `KNOWN_IMPORTS` tokens); the granular surface features are always-on in
+/// 0.3.0 except the correlated roll-up, which is cargo-gated. This is the admission side of the
+/// contract: availability lives in metadata, not the linkable WIT (PLAN v2).
+#[cfg(feature = "handlers")]
+fn host_capability_features() -> Vec<&'static str> {
+    let mut f: Vec<&'static str> = boatramp_core::config::known_imports().to_vec();
+    // Surface features that a guest may name in `requires` (beyond the base interface grants).
+    f.extend(["sql-json", "orm-vector", "streaming"]);
+    if cfg!(feature = "orm-subquery") {
+        f.push("orm-subquery");
+    }
+    f
+}
+
+/// The capability features a component's `boatramp:function-manifest` **requires** (any NDJSON
+/// line's `"requires": [...]`), deduped. A guest that uses a capability whose availability varies
+/// by host build declares it here so the deploy can fail loud on a host that lacks it.
+#[cfg(feature = "handlers")]
+fn component_requires(component: &[u8]) -> Vec<String> {
+    let mut reqs = Vec::new();
+    scan_manifest_sections(component, &mut |data| {
+        for line in data.split(|&b| b == b'\n') {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+                if let Some(arr) = v.get("requires").and_then(serde_json::Value::as_array) {
+                    reqs.extend(arr.iter().filter_map(|r| r.as_str().map(str::to_string)));
+                }
+            }
+        }
+    });
+    reqs.sort();
+    reqs.dedup();
+    reqs
+}
+
+/// The capability features a component `requires` that this host does **not** implement — empty
+/// when the host can satisfy the component. A non-empty result is a fail-loud deploy rejection.
+#[cfg(feature = "handlers")]
+pub(crate) fn unmet_requires(component: &[u8]) -> Vec<String> {
+    let host = host_capability_features();
+    component_requires(component)
+        .into_iter()
+        .filter(|r| !host.contains(&r.as_str()))
+        .collect()
+}
+
 /// Keep the project's GraphQL supergraph correct across a function deploy. The function is a
 /// subgraph to (re)register when it is **already registered** *or* its component
 /// **self-declares** one (the shim marker); in either case introspect the **pending** version's
@@ -408,6 +455,29 @@ mod tests {
     use boatramp_core::function::{Function, FunctionConfig, Lifecycle, Owner};
     use boatramp_core::kv::MemoryKv;
     use std::sync::Arc;
+
+    #[test]
+    fn host_capability_features_registry_and_requires_filter() {
+        let host = host_capability_features();
+        // Base grantable capabilities (KNOWN_IMPORTS) + always-on surface features are advertised.
+        assert!(host.contains(&"sql"), "base capability token present");
+        assert!(
+            host.contains(&"streaming"),
+            "always-on surface feature present"
+        );
+        assert!(host.contains(&"orm-vector"));
+        // The correlated roll-up is cargo-gated: advertised iff this build enabled it.
+        assert_eq!(
+            host.contains(&"orm-subquery"),
+            cfg!(feature = "orm-subquery")
+        );
+        // The admission filter keeps only requirements the host cannot satisfy.
+        let unmet: Vec<&str> = ["sql", "streaming", "quantum-teleport", "warp-drive"]
+            .into_iter()
+            .filter(|r| !host.contains(r))
+            .collect();
+        assert_eq!(unmet, vec!["quantum-teleport", "warp-drive"]);
+    }
 
     /// A blob store the subgraph-refresh guard never reaches (it returns before touching blobs).
     struct NullStorage;

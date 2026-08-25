@@ -572,6 +572,24 @@ impl HandlerRuntime {
                     }
                 }
             }
+            // Fail loud at deploy if the guest's function-manifest `requires` a capability feature
+            // this host build does not implement — availability lives in metadata, not the linkable
+            // WIT (PLAN v2). A clear message beats an opaque runtime failure later.
+            if let Some(entry) = manifest.files.get(&handler.component) {
+                if let Ok(bytes) = read_blob_bytes(deploy, &entry.hash).await {
+                    let unmet = crate::function_api::unmet_requires(&bytes);
+                    if !unmet.is_empty() {
+                        return Err(format!(
+                            "route {:?} [{}] requires capabilities this host does not implement: \
+                             {}. Upgrade boatramp or enable those features — see `boatramp \
+                             capabilities`.",
+                            handler.route,
+                            handler.methods.join(","),
+                            unmet.join(", ")
+                        ));
+                    }
+                }
+            }
             precheck_component(
                 deploy,
                 manifest,
