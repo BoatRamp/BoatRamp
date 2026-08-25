@@ -178,27 +178,96 @@ pub(crate) fn component_declares_streaming_route(component: &[u8], route: &str) 
     declared
 }
 
-/// The capability **features** this host build implements — what a guest's manifest `requires`
-/// is checked against. The base grantable capabilities are always present with the handler
-/// engine (they are the `KNOWN_IMPORTS` tokens); the granular surface features are always-on in
-/// 0.3.0 except the correlated roll-up, which is cargo-gated. This is the admission side of the
-/// contract: availability lives in metadata, not the linkable WIT (PLAN v2).
+/// The stability of a capability feature — an honest, present-tense signal to operators and
+/// guest authors, and the seam the future deprecation clock extends (a deprecated capability is
+/// just this with a removal target). `Experimental` = new or off-by-default surface whose shape
+/// or behaviour may still change; `Stable` = safe to build on. Not a quality judgement — a
+/// stable capability isn't "better", it's *settled*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lifecycle {
+    Stable,
+    Experimental,
+}
+
+impl Lifecycle {
+    /// Lowercase label for human output (matches the JSON serialization).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
+/// A capability feature this host implements, paired with its stability. The `name` is the token
+/// a guest names in its manifest `requires`; admission checks the name, and `boatramp
+/// capabilities` shows the name + lifecycle so operators can see what's settled vs. provisional.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CapabilityFeature {
+    pub name: &'static str,
+    pub lifecycle: Lifecycle,
+}
+
+/// The capability **features** this host build implements, with lifecycle — what a guest's
+/// manifest `requires` is checked against. The base grantable capabilities are always present
+/// with the handler engine (the `KNOWN_IMPORTS` tokens, all settled); the granular surface
+/// features are always-on in 0.3.0 except the correlated roll-up, which is cargo-gated. This is
+/// the admission side of the contract: availability lives in metadata, not the linkable WIT
+/// (PLAN v2).
 #[cfg(feature = "handlers")]
-pub fn host_capability_features() -> Vec<&'static str> {
-    let mut f: Vec<&'static str> = boatramp_core::config::known_imports().to_vec();
-    // Surface features that a guest may name in `requires` (beyond the base interface grants).
-    f.extend(["sql-json", "orm-vector", "streaming"]);
+pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
+    use Lifecycle::{Experimental, Stable};
+    // Base grantable capabilities (the KNOWN_IMPORTS tokens) — the established interface grants.
+    let mut f: Vec<CapabilityFeature> = boatramp_core::config::known_imports()
+        .iter()
+        .map(|&name| CapabilityFeature {
+            name,
+            lifecycle: Stable,
+        })
+        .collect();
+    // Surface features beyond the base grants.
+    f.push(CapabilityFeature {
+        name: "sql-json",
+        lifecycle: Stable,
+    });
+    // pgvector `distance` is new and Postgres-only (fail-closed elsewhere); the vector surface is
+    // the most likely to grow more operators/index hints — flagged experimental until it settles.
+    f.push(CapabilityFeature {
+        name: "orm-vector",
+        lifecycle: Experimental,
+    });
+    f.push(CapabilityFeature {
+        name: "streaming",
+        lifecycle: Stable,
+    });
     if cfg!(feature = "orm-subquery") {
-        f.push("orm-subquery");
+        // Correlated roll-ups ship off-by-default (the riskiest query surface) — experimental
+        // until the shape settles.
+        f.push(CapabilityFeature {
+            name: "orm-subquery",
+            lifecycle: Experimental,
+        });
     }
     f
+}
+
+/// The capability feature **names** this host implements — what a guest manifest `requires` is
+/// checked against. Names only; [`host_capability_features_detailed`] pairs them with lifecycle.
+#[cfg(feature = "handlers")]
+pub fn host_capability_features() -> Vec<&'static str> {
+    host_capability_features_detailed()
+        .into_iter()
+        .map(|c| c.name)
+        .collect()
 }
 
 /// The capability features a component's `boatramp:function-manifest` **requires** (any NDJSON
 /// line's `"requires": [...]`), deduped. A guest that uses a capability whose availability varies
 /// by host build declares it here so the deploy can fail loud on a host that lacks it.
 #[cfg(feature = "handlers")]
-fn component_requires(component: &[u8]) -> Vec<String> {
+pub fn component_requires(component: &[u8]) -> Vec<String> {
     let mut reqs = Vec::new();
     scan_manifest_sections(component, &mut |data| {
         for line in data.split(|&b| b == b'\n') {
@@ -217,7 +286,7 @@ fn component_requires(component: &[u8]) -> Vec<String> {
 /// The capability features a component `requires` that this host does **not** implement — empty
 /// when the host can satisfy the component. A non-empty result is a fail-loud deploy rejection.
 #[cfg(feature = "handlers")]
-pub(crate) fn unmet_requires(component: &[u8]) -> Vec<String> {
+pub fn unmet_requires(component: &[u8]) -> Vec<String> {
     let host = host_capability_features();
     component_requires(component)
         .into_iter()
@@ -470,6 +539,26 @@ mod tests {
         assert_eq!(
             host.contains(&"orm-subquery"),
             cfg!(feature = "orm-subquery")
+        );
+        // The detailed registry pairs each name with a lifecycle, and its names are exactly the
+        // flat list (one source of truth — the flat list derives from the detailed one).
+        let detailed = host_capability_features_detailed();
+        let detailed_names: Vec<&str> = detailed.iter().map(|c| c.name).collect();
+        assert_eq!(
+            detailed_names, host,
+            "detailed names match the flat registry"
+        );
+        let lifecycle = |name: &str| {
+            detailed
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.lifecycle)
+        };
+        assert_eq!(lifecycle("sql"), Some(super::Lifecycle::Stable));
+        assert_eq!(lifecycle("sql-json"), Some(super::Lifecycle::Stable));
+        assert_eq!(
+            lifecycle("orm-vector"),
+            Some(super::Lifecycle::Experimental)
         );
         // The admission filter keeps only requirements the host cannot satisfy.
         let unmet: Vec<&str> = ["sql", "streaming", "quantum-teleport", "warp-drive"]

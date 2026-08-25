@@ -59,12 +59,22 @@ versions.
 - **A `json` SQL value.** `SqlValue::Json` lets a handler (raw `sql` or the ORM) bind a JSON
   document straight into a `jsonb`/`json` column with no `::jsonb` cast — the host binds it with the
   right column type per engine; reads come back as text.
-- **Capability-contract versioning.** The `boatramp:handlers` WIT package is now versioned
-  (`@0.2.18`), and a deploy-time check rejects a component that imports a *newer* handlers package
-  than the host implements — with a clear "needs a newer host" error instead of a cryptic
-  instantiation failure. A new `boatramp capabilities` command (human or `--json`) prints the host's
-  package version and declarable capability imports. The `orm` and `graphql` capabilities are now
-  first-class in the import allow-list, so a handler can declare (and be gated on) them.
+- **Capability-contract model.** The `boatramp:handlers` WIT package is deliberately **unversioned**:
+  a component-model version is a *structural linking identity*, not a capability advertisement, so
+  conflating the two (an earlier `@0.2.18` attempt) broke unversioned guests without buying safety.
+  Capability *availability* instead lives in the guest's manifest `requires` (metadata), checked at
+  deploy (see the admission entry above). Evolution within the contract is **append-only**, enforced
+  by a drift guard on the shared `sql-types.value` variant and by a guard that freezes the package
+  as unversioned (the host consumes one guest export, `messaging-handler`, via a version-strict
+  lookup — versioning it would break every deployed consumer, so it stays unversioned until a
+  version-window resolver exists). `boatramp capabilities` (human or `--json`) prints the host's
+  surface: declarable capability imports and the capability **features** a guest may `require`, each
+  tagged **stable** or **experimental** (a present-tense honesty signal — e.g. `orm-subquery` and
+  `orm-vector` are experimental — and the seam a future deprecation clock extends). `boatramp
+  capabilities check <component.wasm>` is the shift-left form: it scans a component's `requires` and
+  exits non-zero if this build can't satisfy them, so a guest author can gate CI on "my function
+  still fits the boatramp version I target." The `orm` and `graphql` capabilities are first-class in
+  the import allow-list, so a handler can declare (and be gated on) them.
 
 ### Fixed
 - **Postgres `NULL` into a non-text column.** A bound `NULL` on the external-Postgres (`sqlx`) path

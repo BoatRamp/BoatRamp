@@ -55,7 +55,7 @@ pub struct HostCapabilities {
     pub package: &'static str,
     pub version: String,
     pub declarable_imports: Vec<&'static str>,
-    pub features: Vec<&'static str>,
+    pub features: Vec<boatramp_server::CapabilityFeature>,
 }
 
 /// Without the `handlers` feature the host implements no handler capabilities.
@@ -158,23 +158,24 @@ mod imp {
         pub package: &'static str,
         pub version: String,
         pub declarable_imports: Vec<&'static str>,
-        /// The capability **features** this build implements — the registry a guest's
-        /// manifest `requires` is admission-checked against. This is the availability
-        /// vocabulary (metadata, not the linkable WIT); a guest names what it needs here
-        /// and the deploy fails loud on a host that lacks it (PLAN v2).
-        pub features: Vec<&'static str>,
+        /// The capability **features** this build implements, each with its lifecycle
+        /// (stable/experimental) — the registry a guest's manifest `requires` is
+        /// admission-checked against. This is the availability vocabulary (metadata, not
+        /// the linkable WIT); a guest names what it needs here and the deploy fails loud on
+        /// a host that lacks it (PLAN v2).
+        pub features: Vec<boatramp_server::CapabilityFeature>,
     }
 
     /// What this host implements: the informational `boatramp:handlers` surface
     /// revision, the import tokens a deploy may grant, and the capability features a
-    /// guest may `require`.
+    /// guest may `require` (with their stability).
     pub fn host_capabilities() -> HostCapabilities {
         let (m, n, p) = HOST_HANDLERS_VERSION;
         HostCapabilities {
             package: "boatramp:handlers",
             version: format!("{m}.{n}.{p}"),
             declarable_imports: boatramp_core::config::known_imports().to_vec(),
-            features: boatramp_server::host_capability_features(),
+            features: boatramp_server::host_capability_features_detailed(),
         }
     }
 
