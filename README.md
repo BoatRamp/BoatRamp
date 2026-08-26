@@ -160,21 +160,21 @@ source; needs a Rust toolchain):
 
 ```sh
 cargo install boatramp --locked           # latest release, batteries-included
-cargo install boatramp@0.3.0 --locked     # pin a version
+cargo install boatramp@0.3.1 --locked     # pin a version
 ```
 
 **With Nix** (flakes):
 
 ```sh
 nix run github:BoatRamp/BoatRamp -- serve         # run without installing (latest commit)
-nix run github:BoatRamp/BoatRamp/v0.3.0 -- serve  # pin a release
+nix run github:BoatRamp/BoatRamp/v0.3.1 -- serve  # pin a release
 nix profile install github:BoatRamp/BoatRamp      # install the binary
 ```
 
 **From source** (Rust 1.82+):
 
 ```sh
-git checkout v0.3.0                                                # the release (omit for the development tip)
+git checkout v0.3.1                                                # the release (omit for the development tip)
 cargo build --release                                              # batteries-included: all non-conflicting backends
 cargo build --release --no-default-features --features fs,slatedb  # the minimal opt-down slice
 ```

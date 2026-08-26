@@ -251,6 +251,9 @@ bump-version version:
     perl -i -pe 's/(boatramp-[a-z]+ = \{ path = "crates\/boatramp-[a-z]+", )version = "[^"]*"( \})/${1}version = "'"$v"'"${2}/' Cargo.toml
     # The workspace-excluded console crate (its own manifest + lockfile).
     perl -i -pe 's/^version = "[^"]*"$/version = "'"$v"'"/' crates/boatramp-console/Cargo.toml
+    # The README's install pins (`cargo install boatramp@X`, `nix run …/vX`,
+    # `git checkout vX`) — kept in lockstep so the CI version-pin tripwire passes.
+    perl -i -pe 's/(boatramp\@)[0-9]+\.[0-9]+\.[0-9]+/${1}'"$v"'/; s/(BoatRamp\/v)[0-9]+\.[0-9]+\.[0-9]+/${1}'"$v"'/; s/(checkout v)[0-9]+\.[0-9]+\.[0-9]+/${1}'"$v"'/' README.md
     # Refresh the lockfiles' workspace-member versions.
     cargo update --workspace
     ( cd crates/boatramp-console && cargo update --workspace )
