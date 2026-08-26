@@ -126,9 +126,137 @@ pub(super) async fn serve_domain_challenge(
     }
 }
 
-/// Virtualhost fallback: resolve the site from the `Host` header, serve the
-/// request path. Catches everything not matched by `/healthz`, `/api/*`, or the
-/// explicit `/_sites/*` route.
+/// The serve fast path (hot-path bypass): the dependencies the axum router's Extension
+/// layers hold, cloned so [`RouterHandler`](crate::http_serve) can call
+/// [`serve_by_host_inner`] directly for a plain site GET/HEAD — skipping the axum
+/// Router + middleware future-composition tax (~15–20% of per-core CPU, profiled) — while
+/// every security check still runs inside `serve_by_host_inner`. Non-eligible requests
+/// fall through to the full router unchanged.
+// An opaque handle held by the serve loops (`RouterHandler`); `pub` because the public
+// `router_with_fast` returns it, but its fields are `pub(crate)` so it stays opaque to
+// external crates — they only pass it back into a serve loop.
+#[derive(Clone)]
+pub struct FastServe {
+    pub(crate) deploy: DeployStore,
+    pub(crate) limiter: Arc<dyn RateLimitStore>,
+    pub(crate) handlers: Arc<HandlerRuntime>,
+    pub(crate) daemon: Arc<DaemonRuntime>,
+    pub(crate) implicit: ImplicitRouting,
+    pub(crate) preview_auth: Auth,
+    /// The operator security posture and listener TLS flag the router carries as
+    /// per-request extensions (`Extension(posture)` / `Extension(served_over_tls)`). The
+    /// site path reads them from the request — the SSRF gate on a gateway-upstream proxy
+    /// ([`proxy::request_posture`](crate::proxy)) and the scheme/HSTS derivation
+    /// ([`serve_request`]) — so the bypass must re-insert them to stay byte-identical to
+    /// the router (a permissive fleet would otherwise wrongly refuse a private upstream,
+    /// and a TLS listener would derive `http`).
+    pub(crate) posture: boatramp_core::security::SecurityPosture,
+    pub(crate) served_over_tls: bool,
+}
+
+impl FastServe {
+    /// Whether `request` may take the fast path: a plain site GET/HEAD the router would
+    /// route to its `serve_by_host` fallback anyway. **Conservative** — anything the
+    /// router matches explicitly (any `/api`, `/_*`, `/healthz`, `/readyz`, `/mcp`,
+    /// `/.well-known`) or that the console owns falls through to the full router.
+    /// Excluding too much only forgoes the speedup; excluding too little is the exact
+    /// bug the differential test guards against.
+    pub(crate) fn eligible(&self, request: &Request) -> bool {
+        if !matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) {
+            return false;
+        }
+        let path = request.uri().path();
+        let reserved = path == "/api"
+            || path.starts_with("/api/")
+            || path.starts_with("/_") // /_deploy /_sites /_webhooks (path-form; host-form previews still serve)
+            || path.starts_with("/.well-known/")
+            || path == "/healthz"
+            || path == "/readyz"
+            || path == "/mcp"
+            || path.starts_with("/mcp/");
+        if reserved {
+            return false;
+        }
+        // The console owns a runtime-configured host+path — never serve it as site
+        // content. This is the *same* predicate the console middleware uses (host from the
+        // `Host` header only, exactly as it resolves it), so the two can't disagree.
+        #[cfg(feature = "console")]
+        {
+            let effective = self.daemon.effective();
+            let host = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(crate::strip_port)
+                .unwrap_or("");
+            if crate::console::would_intercept(&effective, host, path) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Serve an already-[`eligible`](Self::eligible) `request` directly, applying the same
+    /// request-id + access-log/metrics guarantees the `access_log` middleware would (via the
+    /// shared [`assign_request_id`](crate::assign_request_id) /
+    /// [`AccessLogCtx`](crate::AccessLogCtx)). Auth, rate-limiting, host-routing, previews,
+    /// and the DV gate all run inside [`serve_by_host_inner`], so the bypass can never skip
+    /// them. The caller MUST have checked [`eligible`](Self::eligible) first — that gate is
+    /// what keeps the bypass from stealing a request the router would match explicitly.
+    pub(crate) async fn dispatch(&self, mut request: Request, peer: SocketAddr) -> Response {
+        debug_assert!(
+            self.eligible(&request),
+            "FastServe::dispatch called on an ineligible request — caller must gate on eligible()"
+        );
+        // A HEAD is served like its GET but with the body dropped. The router path relies on
+        // axum stripping the HEAD body before the response reaches the codec; the h1 codec
+        // also suppresses it, but the h2 codec does not — so the bypass strips it here to be
+        // correct (and byte-identical to the router) over every protocol. Captured before the
+        // request is consumed below.
+        let is_head = *request.method() == axum::http::Method::HEAD;
+        let request_id = crate::assign_request_id(&mut request);
+        // Re-insert the per-request extensions the router's tower layers would add and the
+        // site path reads: the security posture (the gateway-upstream SSRF gate) and the
+        // listener's TLS flag (scheme + HSTS). `RequestId` (WASM handlers) and `ConnectInfo`
+        // (peer) are already present — from `assign_request_id` above and `RouterHandler`.
+        {
+            let ext = request.extensions_mut();
+            ext.insert(self.posture);
+            ext.insert(crate::ServedOverTls(self.served_over_tls));
+        }
+        let log = crate::AccessLogCtx::capture(&request, request_id);
+        let response = serve_by_host_inner(
+            self.deploy.clone(),
+            self.limiter.clone(),
+            self.handlers.clone(),
+            self.daemon.clone(),
+            self.implicit,
+            self.preview_auth.clone(),
+            peer,
+            request,
+        )
+        .await;
+        // Drop the body for HEAD (headers stand in for the GET response), matching the
+        // router; the codec recomputes framing from the now-empty body identically.
+        let response = if is_head {
+            let (parts, _body) = response.into_parts();
+            Response::from_parts(parts, axum::body::Body::empty())
+        } else {
+            response
+        };
+        match log {
+            Some(ctx) => ctx.finish(response),
+            None => response,
+        }
+    }
+}
+
+/// axum extractor wrapper over [`serve_by_host_inner`] — the router's site fallback.
+/// The plain-arg inner is called directly by the serve hot-path bypass (stage 2), so the
+/// two paths share one serving implementation.
 #[allow(clippy::too_many_arguments)] // axum extractors, not a real parameter list
 pub(super) async fn serve_by_host(
     State(deploy): State<DeployStore>,
@@ -138,6 +266,35 @@ pub(super) async fn serve_by_host(
     Extension(implicit): Extension<ImplicitRouting>,
     Extension(preview_auth): Extension<Auth>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    serve_by_host_inner(
+        deploy,
+        limiter,
+        handlers,
+        daemon,
+        implicit,
+        preview_auth,
+        peer,
+        request,
+    )
+    .await
+}
+
+/// Host-routed static + reverse-proxy serving: resolves the site from the request host,
+/// applies preview auth + rate-limiting (`Visitor`) + virtualhost routing, then serves.
+/// Plain-arg form so both the axum router (via [`serve_by_host`]) and the hot-path bypass
+/// call one implementation — the bypass can never diverge on the security-relevant checks
+/// because they live here, not in the middleware. (Serve hot-path bypass, stage 2.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_by_host_inner(
+    deploy: DeployStore,
+    limiter: Arc<dyn RateLimitStore>,
+    handlers: Arc<HandlerRuntime>,
+    daemon: Arc<DaemonRuntime>,
+    implicit: ImplicitRouting,
+    preview_auth: Auth,
+    peer: SocketAddr,
     request: Request,
 ) -> Response {
     // Catch-all site + preview protection are read live from the daemon-config

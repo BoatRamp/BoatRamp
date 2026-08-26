@@ -46,18 +46,50 @@ pub fn alpn_h1_h2() -> Vec<Vec<u8>> {
     vec![b"h2".to_vec(), b"http/1.1".to_vec()]
 }
 
+/// A [`Router`] plus the optional hot-path handle, flowed through the serve loops as
+/// one unit. A bare `Router` converts in with **no** fast path (`From<Router>`), so
+/// auxiliary listeners (the `:80` HTTP→HTTPS redirect, ACME challenge) are unchanged;
+/// the main site listeners pass `(router, fast)` (via `From<(Router, FastServe)>`) to
+/// enable the bypass. Cheap to clone (an `Arc`-y `Router` clone + an `Option`).
+#[derive(Clone)]
+pub struct ServeInput {
+    router: Router,
+    fast: Option<crate::FastServe>,
+}
+
+impl From<Router> for ServeInput {
+    fn from(router: Router) -> Self {
+        Self { router, fast: None }
+    }
+}
+
+impl From<(Router, crate::FastServe)> for ServeInput {
+    fn from((router, fast): (Router, crate::FastServe)) -> Self {
+        Self {
+            router,
+            fast: Some(fast),
+        }
+    }
+}
+
 /// Bridges [`boatramp_http`]'s serving surface to the axum [`Router`] (a tower
 /// `Service`). Both codecs produce a native `http::Request`, so the bridge only
 /// swaps the body type and attaches the peer address; method / URI / headers pass
-/// through untouched. Constructed once per connection.
+/// through untouched. Constructed once per connection. Carries the optional
+/// [`FastServe`](crate::FastServe) hot-path handle: an eligible plain site GET/HEAD is
+/// dispatched straight to `serve_by_host`, skipping the axum router + middleware
+/// composition; everything else falls through to the router unchanged.
 pub struct RouterHandler {
-    router: Router,
+    serve: ServeInput,
     peer: SocketAddr,
 }
 
 impl RouterHandler {
-    pub fn new(router: Router, peer: SocketAddr) -> Self {
-        Self { router, peer }
+    pub fn new(serve: impl Into<ServeInput>, peer: SocketAddr) -> Self {
+        Self {
+            serve: serve.into(),
+            peer,
+        }
     }
 }
 
@@ -71,12 +103,24 @@ impl Handler for RouterHandler {
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(self.peer));
 
-        // Call the router as a tower Service (axum's Router is always ready).
-        use tower_service::Service as _;
-        let mut router = self.router.clone();
-        let resp = match router.call(request).await {
-            Ok(r) => r,
-            Err(_) => return boatramp_http::response(502, b"bad gateway".to_vec()),
+        // Hot path: an eligible plain site GET/HEAD skips the axum router + middleware
+        // future-composition (~15–20% of per-core CPU, profiled) and dispatches straight
+        // to `serve_by_host`. `FastServe::dispatch` still applies the request-id +
+        // access-log/metrics guarantees, and rate-limit / visitor-auth / host-routing /
+        // preview-auth / DV all run inside `serve_by_host_inner` — so the bypass can never
+        // skip a security check. Everything else (and every build without a fast handle)
+        // falls through to the router, byte-identical to before.
+        let resp = match &self.serve.fast {
+            Some(fast) if fast.eligible(&request) => fast.dispatch(request, self.peer).await,
+            _ => {
+                // Call the router as a tower Service (axum's Router is always ready).
+                use tower_service::Service as _;
+                let mut router = self.serve.router.clone();
+                match router.call(request).await {
+                    Ok(r) => r,
+                    Err(_) => return boatramp_http::response(502, b"bad gateway".to_vec()),
+                }
+            }
         };
         let (parts, body) = resp.into_parts();
         // Hand the router's body to the codec as a pull `Stream` it polls itself —
@@ -101,11 +145,11 @@ impl Handler for RouterHandler {
 /// into `router`. A clean close is silent; an unexpected IO error is logged at
 /// debug. Generic over the IO so a raw `TcpStream`, a rewound stream, or a
 /// `TlsStream` all serve identically.
-pub async fn serve_router_conn<IO>(io: IO, peer: SocketAddr, router: Router)
+pub async fn serve_router_conn<IO>(io: IO, peer: SocketAddr, serve: impl Into<ServeInput>)
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    if let Err(err) = boatramp_http::serve_connection(io, RouterHandler::new(router, peer)).await {
+    if let Err(err) = boatramp_http::serve_connection(io, RouterHandler::new(serve, peer)).await {
         tracing::debug!(%peer, %err, "connection served with error");
     }
 }
@@ -120,10 +164,10 @@ where
 async fn serve_tls_stream(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     peer: SocketAddr,
-    router: Router,
+    serve: ServeInput,
 ) {
     let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-    let handler = RouterHandler::new(router, peer);
+    let handler = RouterHandler::new(serve, peer);
     let result = match alpn.as_deref() {
         // The challenge handshake alone satisfies the CA — nothing to serve.
         Some(p) if p == ACME_TLS_ALPN => {
@@ -183,14 +227,14 @@ const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 pub async fn serve_tls<S>(
     addr: SocketAddr,
     tls: ReloadableTls,
-    router: Router,
+    serve: impl Into<ServeInput>,
     shutdown: S,
 ) -> std::io::Result<()>
 where
     S: Future<Output = ()> + Send,
 {
     let listener = TcpListener::bind(addr).await?;
-    serve_tls_listener(listener, tls, router, shutdown).await
+    serve_tls_listener(listener, tls, serve, shutdown).await
 }
 
 /// [`serve_tls`] on an already-bound [`TcpListener`] — for callers that must learn
@@ -199,7 +243,7 @@ where
 pub async fn serve_tls_listener<S>(
     listener: TcpListener,
     tls: ReloadableTls,
-    router: Router,
+    serve: impl Into<ServeInput>,
     shutdown: S,
 ) -> std::io::Result<()>
 where
@@ -208,6 +252,7 @@ where
     if let Ok(addr) = listener.local_addr() {
         tracing::info!(%addr, "serving HTTPS (boatramp-http)");
     }
+    let serve = serve.into();
     let inflight = Arc::new(AtomicUsize::new(0));
     tokio::pin!(shutdown);
     loop {
@@ -223,12 +268,12 @@ where
                 };
                 crate::disable_nagle(&mut tcp);
                 let acceptor = TlsAcceptor::from(tls.current());
-                let router = router.clone();
+                let serve = serve.clone();
                 let inflight = inflight.clone();
                 inflight.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     match acceptor.accept(tcp).await {
-                        Ok(stream) => serve_tls_stream(stream, peer, router).await,
+                        Ok(stream) => serve_tls_stream(stream, peer, serve).await,
                         Err(err) => tracing::debug!(%peer, %err, "TLS handshake failed"),
                     }
                     inflight.fetch_sub(1, Ordering::SeqCst);
@@ -245,26 +290,27 @@ where
 /// redirect listener. Returns once `shutdown` resolves, after a bounded drain.
 pub async fn serve_plaintext<S>(
     addr: SocketAddr,
-    router: Router,
+    serve: impl Into<ServeInput>,
     shutdown: S,
 ) -> std::io::Result<()>
 where
     S: Future<Output = ()> + Send,
 {
     let listener = TcpListener::bind(addr).await?;
-    serve_plaintext_listener(listener, router, shutdown).await
+    serve_plaintext_listener(listener, serve, shutdown).await
 }
 
 /// [`serve_plaintext`] on an already-bound [`TcpListener`] (see
 /// [`serve_tls_listener`]).
 pub async fn serve_plaintext_listener<S>(
     listener: TcpListener,
-    router: Router,
+    serve: impl Into<ServeInput>,
     shutdown: S,
 ) -> std::io::Result<()>
 where
     S: Future<Output = ()> + Send,
 {
+    let serve = serve.into();
     let inflight = Arc::new(AtomicUsize::new(0));
     tokio::pin!(shutdown);
     loop {
@@ -279,11 +325,11 @@ where
                     }
                 };
                 crate::disable_nagle(&mut tcp);
-                let router = router.clone();
+                let serve = serve.clone();
                 let inflight = inflight.clone();
                 inflight.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    serve_router_conn(tcp, peer, router).await;
+                    serve_router_conn(tcp, peer, serve).await;
                     inflight.fetch_sub(1, Ordering::SeqCst);
                 });
             }

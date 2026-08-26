@@ -15,13 +15,29 @@ pub fn router(deploy: DeployStore, auth: Auth, handlers: HandlerRuntime) -> Rout
 }
 
 /// [`router`] with explicit [`ServerOptions`] — lets a caller set request limits
-/// or inject a custom domain-ownership probe.
+/// or inject a custom domain-ownership probe. Returns just the axum [`Router`];
+/// the serve loop uses [`router_with_fast`] to also obtain the hot-path handle.
 pub fn router_with(
     deploy: DeployStore,
     auth: Auth,
     handlers: HandlerRuntime,
     options: ServerOptions,
 ) -> Router {
+    router_with_fast(deploy, auth, handlers, options).0
+}
+
+/// Like [`router_with`] but also returns the [`FastServe`](crate::serve_pipeline::FastServe)
+/// hot-path handle, so the serve loop can dispatch eligible requests directly to
+/// `serve_by_host` and bypass the axum router/middleware composition tax. The handle is
+/// opaque; a caller only passes it (with the router) into a serve loop
+/// ([`serve_tls`](crate::serve_tls) / [`serve_plaintext`](crate::serve_plaintext) / the
+/// splice loop) via [`ServeInput`](crate::ServeInput).
+pub fn router_with_fast(
+    deploy: DeployStore,
+    auth: Auth,
+    handlers: HandlerRuntime,
+    options: ServerOptions,
+) -> (Router, crate::serve_pipeline::FastServe) {
     // Opt-in CORS allowlist for the control-plane API; empty ⇒ CORS off.
     // Captured before `options` is partially moved below.
     let cors_origins = options.cors_allowed_origins.clone();
@@ -350,6 +366,23 @@ pub fn router_with(
     // feature.
     #[cfg(feature = "handlers")]
     let app = app.route("/_webhooks/{name}", post(webhook_ingress));
+    // Bundle the serve deps for the hot-path bypass (`FastServe`) before they move into
+    // the router's Extension layers below — cloned so the fast path and the axum path serve
+    // from identical state. `handlers` is bound as its `Arc` here so the layer below and the
+    // bypass share one runtime.
+    let handlers = Arc::new(handlers);
+    let fast = crate::serve_pipeline::FastServe {
+        deploy: deploy.clone(),
+        limiter: rate_limiter.clone(),
+        handlers: handlers.clone(),
+        daemon: daemon.clone(),
+        implicit: implicit_routing,
+        preview_auth: preview_auth.clone(),
+        // Same values as `Extension(posture)` / `Extension(served_over_tls)` below, so the
+        // bypass re-inserts identical per-request extensions.
+        posture,
+        served_over_tls: served_over_tls.0,
+    };
     let app = app
         .fallback(serve_by_host)
         .with_state(deploy)
@@ -360,7 +393,7 @@ pub fn router_with(
         // extension, like the rate limiter; added after `merge` so it reaches
         // both the public serving routes and the control-plane API (activation
         // runs the handler compile-gate). An empty runtime means handlers off.
-        .layer(Extension(Arc::new(handlers)))
+        .layer(Extension(handlers))
         // Whether an unmatched host may resolve implicitly (first-label / sole
         // site); gated to dev/single-tenant/loopback by `serve`.
         .layer(Extension(implicit_routing))
@@ -426,8 +459,9 @@ pub fn router_with(
     // request hits that fallback, so the outer layer runs for all of them ahead of the
     // inner router's own routing. `access_log` stays outermost (it logs the original
     // path the client sent); `project_scope` is a no-op for every non-project path.
-    Router::new()
+    let router = Router::new()
         .fallback_service(app)
         .layer(axum::middleware::from_fn(project_scope))
-        .layer(axum::middleware::from_fn(access_log))
+        .layer(axum::middleware::from_fn(access_log));
+    (router, fast)
 }

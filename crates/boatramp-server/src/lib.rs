@@ -151,7 +151,7 @@ mod splice;
 mod http_serve;
 pub use http_serve::{
     alpn_h1_h2, serve_plaintext, serve_plaintext_listener, serve_router_conn, serve_tls,
-    serve_tls_listener, ReloadableTls,
+    serve_tls_listener, ReloadableTls, ServeInput,
 };
 // Only the `handlers`-gated websocket-upgrade path in the serve pipeline uses it.
 #[cfg(feature = "handlers")]
@@ -164,13 +164,15 @@ mod project_scope;
 pub(crate) use project_scope::{project_scope, OriginalPath, ProjectContext};
 mod ratelimit;
 mod routes;
-pub use routes::{router, router_with};
+pub use routes::{router, router_with, router_with_fast};
 #[cfg(feature = "mcp")]
 mod mcp_http;
 #[cfg(feature = "handlers")]
 mod scheduler;
 mod serve_pipeline;
-pub use serve_pipeline::http_redirect_router;
+pub use serve_pipeline::{http_redirect_router, FastServe};
+#[cfg(test)]
+mod hotpath_test;
 #[cfg(all(test, feature = "handlers"))]
 use serve_pipeline::{apply_vary, parse_cookie_header, parse_query_string};
 pub(crate) use serve_pipeline::{
@@ -1157,16 +1159,16 @@ pub async fn serve_with(
     let gateway_prober = gateway::spawn_active_health_prober();
     // Connect-info make-service so handlers can see the peer address (for IP
     // rules / rate limiting / access logs).
-    let router = router_with(deploy, auth, handlers, options);
+    let (router, fast) = router_with_fast(deploy, auth, handlers, options);
 
     // The graceful drain begins when the OS signal fires; `signalled` flips at
     // that instant so the drain deadline is measured from the signal, not from
     // server start.
     let (signalled_tx, signalled_rx) = tokio::sync::watch::channel(false);
-    // The splice serve loop intercepts eligible plaintext reverse-proxy
-    // connections (Linux) and serves everything else with `router` over hyper —
-    // identical behaviour to `axum::serve`.
-    let server = splice::serve(tcp, splice_ctx, router, async move {
+    // The splice serve loop intercepts eligible plaintext reverse-proxy connections
+    // (Linux) and serves everything else through `boatramp-http` — an eligible plain
+    // site GET/HEAD via the `fast` hot-path bypass, the rest through the full `router`.
+    let server = splice::serve(tcp, splice_ctx, (router, fast), async move {
         shutdown_signal().await;
         let _ = signalled_tx.send(true);
     });
@@ -1334,7 +1336,7 @@ impl Drop for AccessLog {
 /// Runs for every request regardless of the access-log level; returns the id. Shared by
 /// the [`access_log`] middleware and any direct serve path so correlation is never
 /// skipped on a bypass. (Serve hot-path bypass, stage 1.)
-fn assign_request_id(request: &mut axum::extract::Request) -> String {
+pub(crate) fn assign_request_id(request: &mut axum::extract::Request) -> String {
     let request_id = request_id_for(request.headers());
     request
         .extensions_mut()
@@ -1346,7 +1348,7 @@ fn assign_request_id(request: &mut axum::extract::Request) -> String {
 /// plus the Prometheus request counters — both emitted from [`AccessLog`]'s `Drop` once
 /// the body has fully streamed (or the client disconnected). Extracted so the access-log
 /// middleware and a direct serve path share one implementation.
-struct AccessLogCtx {
+pub(crate) struct AccessLogCtx {
     request_id: String,
     method: Method,
     path: String,
@@ -1361,7 +1363,7 @@ impl AccessLogCtx {
     /// both skipped (~4 string allocations plus a body-stream wrapper avoided, matching
     /// how nginx/Envoy run with `access_log off`). The id is assigned separately and
     /// unconditionally via [`assign_request_id`].
-    fn capture(request: &axum::extract::Request, request_id: String) -> Option<Self> {
+    pub(crate) fn capture(request: &axum::extract::Request, request_id: String) -> Option<Self> {
         if !tracing::enabled!(target: "boatramp::access", tracing::Level::INFO) {
             return None;
         }
@@ -1388,7 +1390,7 @@ impl AccessLogCtx {
     /// Wrap `response` so its bytes are tallied as they stream; the access line + request
     /// metrics emit from the counter's `Drop` when the body finishes (or the client
     /// disconnects).
-    fn finish(self, response: Response) -> Response {
+    pub(crate) fn finish(self, response: Response) -> Response {
         let encoding = response
             .headers()
             .get(header::CONTENT_ENCODING)

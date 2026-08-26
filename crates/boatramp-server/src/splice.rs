@@ -89,12 +89,13 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub async fn serve<S>(
     tcp: TcpListener,
     ctx: SpliceCtx,
-    router: axum::Router,
+    serve: impl Into<crate::ServeInput>,
     shutdown: S,
 ) -> io::Result<()>
 where
     S: std::future::Future<Output = ()> + Send,
 {
+    let serve = serve.into();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -109,7 +110,7 @@ where
                 };
                 crate::disable_nagle(&mut io);
                 let ctx = ctx.clone();
-                let router = router.clone();
+                let serve = serve.clone();
                 // Classify off the accept path so a slow/silent client can't stall
                 // the loop; a peek timeout bounds how long we hold before falling back.
                 tokio::spawn(async move {
@@ -120,12 +121,12 @@ where
                         .unwrap_or_default();
                     match eligible {
                         Some(plan) => {
-                            if let Err(err) = splice_conn(io, peer, plan, ctx, router).await {
+                            if let Err(err) = splice_conn(io, peer, plan, ctx, serve).await {
                                 tracing::debug!(%peer, %err, "splice connection ended");
                             }
                         }
                         // The peek did not consume, so the fallback reads the full request.
-                        None => serve_fallback(io, peer, router).await,
+                        None => serve_fallback(io, peer, serve).await,
                     }
                 });
             }
@@ -188,11 +189,11 @@ impl tokio::io::AsyncWrite for Rewind {
 /// rules / rate limiting / access logs) and owning HTTP upgrades (WebSocket handler
 /// routes). Generic over the IO so a [`Rewind`] (mid-connection fallback) serves
 /// identically to a raw socket.
-async fn serve_fallback<IO>(io: IO, peer: SocketAddr, router: axum::Router)
+async fn serve_fallback<IO>(io: IO, peer: SocketAddr, serve: crate::ServeInput)
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    crate::http_serve::serve_router_conn(io, peer, router).await;
+    crate::http_serve::serve_router_conn(io, peer, serve).await;
 }
 
 /// Replay `head` + `leftover` (already consumed off `client`) and serve the rest of
@@ -204,7 +205,7 @@ async fn fall_back(
     leftover: Vec<u8>,
     client: TcpStream,
     peer: SocketAddr,
-    router: axum::Router,
+    serve: crate::ServeInput,
 ) -> io::Result<()> {
     let mut pre = head;
     pre.extend_from_slice(&leftover);
@@ -213,7 +214,7 @@ async fn fall_back(
         pos: 0,
         inner: client,
     };
-    serve_fallback(rewind, peer, router).await;
+    serve_fallback(rewind, peer, serve).await;
     Ok(())
 }
 
@@ -406,7 +407,7 @@ async fn splice_conn(
     peer: SocketAddr,
     plan: SplicePlan,
     ctx: SpliceCtx,
-    router: axum::Router,
+    serve: crate::ServeInput,
 ) -> io::Result<()> {
     let mut upstream = TcpStream::connect(plan.resolved.addr).await?;
     upstream.set_nodelay(true).ok();
@@ -424,7 +425,7 @@ async fn splice_conn(
             .filter(|(m, _, _)| matches!(m.as_str(), "GET" | "HEAD") && leftover.is_empty());
         let (method, target_path, headers) = match eligible {
             Some(v) => v,
-            None => return fall_back(head, leftover, client, peer, router).await,
+            None => return fall_back(head, leftover, client, peer, serve).await,
         };
         // Honor a client `Connection: close`: serve this one request, then close
         // (HTTP/1.1 defaults to keep-alive otherwise).
@@ -436,7 +437,7 @@ async fn splice_conn(
             .await
             .is_none()
         {
-            return fall_back(head, leftover, client, peer, router).await;
+            return fall_back(head, leftover, client, peer, serve).await;
         }
         // Build + send the upstream request head.
         let up_head = build_upstream_head(&plan, &method, &target_path, &headers, client_ip);
