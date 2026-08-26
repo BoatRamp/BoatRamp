@@ -17,7 +17,7 @@
 //! per direction, so these are two separate, unsynchronized tables.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use bytes::Bytes;
 
@@ -62,11 +62,27 @@ const WRITE_BATCH_TARGET: usize = 64 * 1024;
 /// queued-but-unsent for its stream (the writer is behind — usually a flow-control
 /// window the slow client hasn't opened). Bounds per-stream memory regardless of body
 /// size; large enough to keep the writer fed across a batch + a window.
-const STREAM_HIGH_WATER: usize = 256 * 1024;
+///
+/// The dominant per-stream resident cost under h2 concurrency (256 streams × this),
+/// so it is tunable via `BOATRAMP_H2_HIGH_WATER_KB` (default 256) to trade steady-state
+/// RSS against producer stalls on memory-constrained hosts.
+static STREAM_HIGH_WATER: LazyLock<usize> =
+    LazyLock::new(|| env_kb("BOATRAMP_H2_HIGH_WATER_KB", 256));
 /// A parked streaming producer resumes once the writer drains the per-stream buffer
-/// back below this. The gap to [`STREAM_HIGH_WATER`] gives hysteresis so a producer
-/// isn't woken for every frame the writer sends.
-const STREAM_LOW_WATER: usize = 128 * 1024;
+/// back below this. **Derived** as half the high-water (not an independent knob) so the
+/// hysteresis gap is always valid: a hand-set low-water above the high-water inverts the
+/// pause/resume logic and stalls the stream (measured — a 64 KiB high-water against the
+/// old fixed 128 KiB low-water collapsed 100 KiB h2 throughput to ~210 rps). Half gives a
+/// generous gap while tracking the high-water automatically; default 256→128 as before.
+static STREAM_LOW_WATER: LazyLock<usize> = LazyLock::new(|| *STREAM_HIGH_WATER / 2);
+
+/// Read a kibibyte-valued env knob, falling back to `default_kb` when unset/invalid.
+fn env_kb(name: &str, default_kb: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(default_kb * 1024, |kb| kb * 1024)
+}
 /// How long the reader keeps draining inbound bytes after we've decided to close,
 /// before giving up and letting the socket drop. Bounds a graceful close against a
 /// peer that never closes its side; a well-behaved peer closes as soon as it sees
@@ -746,7 +762,7 @@ async fn emit_response(shared: &Conn, notify: &Arc<Notify>, sid: u32, resp: Resp
                             // A reset/gone stream, or a torn-down connection whose window
                             // can no longer reopen, means we stop producing.
                             Some(st) if st.reset => return,
-                            Some(st) if st.unsent > STREAM_HIGH_WATER => {
+                            Some(st) if st.unsent > *STREAM_HIGH_WATER => {
                                 if s.reader_done {
                                     return;
                                 }
@@ -1128,7 +1144,7 @@ fn build_batch(shared: &Conn, hpack: &mut Hpack, batch: &mut Batch) {
                 // send buffer below the low-water mark, wake a producer parked on it.
                 let before = st.unsent;
                 st.unsent = st.unsent.saturating_sub(chunk);
-                (before > STREAM_LOW_WATER && st.unsent <= STREAM_LOW_WATER)
+                (before > *STREAM_LOW_WATER && st.unsent <= *STREAM_LOW_WATER)
                     .then(|| st.drain.clone())
             };
             if let Some(drain) = wake {

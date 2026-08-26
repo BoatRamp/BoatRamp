@@ -7,6 +7,29 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+- **Large static-file serving no longer collapses.** Files above the small-blob cache
+  threshold were streamed off disk in `ReaderStream`'s 8 KiB default chunks, and
+  `tokio::fs::File` dispatches every read to the blocking thread pool — so a 1 MiB file
+  meant ~128 blocking round-trips, and under concurrency that pool serialised and
+  throughput cratered (measured ~40× behind nginx on plaintext 1 MiB). Reads now use a
+  64 KiB chunk — the measured knee (~2× the throughput of 8 KiB for only ~+24 MB RSS;
+  larger chunks add memory for no throughput). On TLS static (where nobody gets kernel
+  `sendfile`) BoatRamp now leads nginx and Caddy. Tunable via `BOATRAMP_READ_CHUNK_KB`.
+- **HTTP/2 per-stream backpressure hysteresis.** The resume (low-water) threshold is now
+  derived as half the pause (high-water) threshold instead of being independent, so a
+  hand-lowered high-water can no longer invert the hysteresis and stall a stream (a
+  64 KiB high-water against the old fixed 128 KiB low-water collapsed 100 KiB h2
+  throughput to ~210 rps).
+
+### Added
+- **Serving tuning knobs (env).** `BOATRAMP_READ_CHUNK_KB` (static read chunk) and
+  `BOATRAMP_H2_HIGH_WATER_KB` (h2 per-stream send-buffer bound) for throughput-vs-memory
+  tuning. Memory-constrained hosts can also cut the h2/TLS resident set ~60% by enabling
+  aggressive allocator page-return with
+  `_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0` (the
+  default stays throughput-first; this trades some CPU for RSS).
+
 ## [0.3.0] - 2026-08-25
 
 ### Changed (BREAKING)

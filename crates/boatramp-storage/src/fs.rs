@@ -5,12 +5,38 @@
 //! memory.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::{ReaderStream, StreamReader};
+
+/// Read-stream chunk size for serving files off disk.
+///
+/// `ReaderStream`'s 8 KiB default is a performance trap here: `tokio::fs::File`
+/// dispatches every read to the blocking thread pool, so an 8 KiB chunk means ~128
+/// blocking round-trips per 1 MiB served. Under concurrency that pool serialises and
+/// large-file throughput collapses (~40× slower than nginx on 1 MiB in the fair
+/// benchmark).
+///
+/// 64 KiB is the measured **knee** (lighthouse `static/1m`, c256): it ~doubles
+/// throughput over 8 KiB (16 reads/MiB instead of 128) for only ~+24 MB RSS, whereas
+/// 256 KiB adds a further +114 MB RSS for <2% more throughput — a bad trade that would
+/// aggravate the h2/TLS resident-set gap. Files ≤ the small-blob cache threshold never
+/// reach this streaming path. This removes the pathology; the zero-copy
+/// `sendfile`/`splice` path is the eventual nginx-parity fix (the userspace copy still
+/// ceilings throughput well below nginx's kernel path).
+///
+/// Tunable via `BOATRAMP_READ_CHUNK_KB` (default 64) — raise it on throughput-bound,
+/// memory-rich hosts; floored at 4 KiB.
+static READ_CHUNK: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("BOATRAMP_READ_CHUNK_KB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(64 * 1024, |kb| (kb * 1024).max(4 * 1024))
+});
 
 /// Stores objects as files under a root directory, streaming reads and writes.
 #[derive(Debug, Clone)]
@@ -56,8 +82,8 @@ impl Storage for FsStorage {
         };
         let len = file.metadata().await?.len();
 
-        // Stream the file off disk, chunk by chunk.
-        let body: ByteStream = ReaderStream::new(file)
+        // Stream the file off disk in large chunks (see `READ_CHUNK`).
+        let body: ByteStream = ReaderStream::with_capacity(file, *READ_CHUNK)
             .map(|chunk| chunk.map_err(StorageError::Io))
             .boxed();
 
@@ -90,8 +116,9 @@ impl Storage for FsStorage {
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let length = len.unwrap_or_else(|| total.saturating_sub(offset));
 
-        // `take` bounds the read to the requested length; still fully streamed.
-        let body: ByteStream = ReaderStream::new(file.take(length))
+        // `take` bounds the read to the requested length; still fully streamed
+        // (large chunks — see `READ_CHUNK`).
+        let body: ByteStream = ReaderStream::with_capacity(file.take(length), *READ_CHUNK)
             .map(|chunk| chunk.map_err(StorageError::Io))
             .boxed();
 
