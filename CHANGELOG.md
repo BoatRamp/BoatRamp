@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-26
+
 ### Fixed
 - **Large static-file serving no longer collapses.** Files above the small-blob cache
   threshold were streamed off disk in `ReaderStream`'s 8 KiB default chunks, and
