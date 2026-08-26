@@ -1329,70 +1329,105 @@ impl Drop for AccessLog {
     }
 }
 
-/// Structured access-log middleware: method, path, host, client IP, status,
-/// response bytes, and duration. The line is emitted once the body has fully
-/// streamed (or the connection drops), counting bytes as they pass through.
-async fn access_log(mut request: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    // Assign the correlation id and make it readable downstream (handler dispatch
-    // tags captured guest logs with it) before running the request — unconditional.
+/// Assign the request correlation id (from the client's header or freshly minted) and
+/// make it readable downstream — handler dispatch tags captured guest logs with it.
+/// Runs for every request regardless of the access-log level; returns the id. Shared by
+/// the [`access_log`] middleware and any direct serve path so correlation is never
+/// skipped on a bypass. (Serve hot-path bypass, stage 1.)
+fn assign_request_id(request: &mut axum::extract::Request) -> String {
     let request_id = request_id_for(request.headers());
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
-    // If the `boatramp::access` line would be filtered out (access logging off),
-    // skip everything below: ~4 per-request string allocations plus a response-body
-    // stream wrapper, all purely to build a line nobody will read. The correlation
-    // id above is still assigned. Matches how nginx/Envoy run with `access_log off`.
-    if !tracing::enabled!(target: "boatramp::access", tracing::Level::INFO) {
-        return next.run(request).await;
-    }
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| request.uri().host()) // HTTP/2: `:authority` lives in the URI, not a Host header
-        .unwrap_or("-")
-        .to_string();
-    let client = request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip().to_string())
-        .unwrap_or_else(|| "-".to_string());
+    request_id
+}
 
-    let start = std::time::Instant::now();
-    let response = next.run(request).await;
-    let encoding = response
-        .headers()
-        .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("identity")
-        .to_string();
-    let log = AccessLog {
-        request_id,
-        method,
-        path,
-        host,
-        client,
-        status: response.status().as_u16(),
-        encoding,
-        start,
-        bytes: std::sync::atomic::AtomicU64::new(0),
-    };
+/// Request metadata captured *before* the response is produced, for the access-log line
+/// plus the Prometheus request counters — both emitted from [`AccessLog`]'s `Drop` once
+/// the body has fully streamed (or the client disconnected). Extracted so the access-log
+/// middleware and a direct serve path share one implementation.
+struct AccessLogCtx {
+    request_id: String,
+    method: Method,
+    path: String,
+    host: String,
+    client: String,
+    start: std::time::Instant,
+}
 
-    // Wrap the body so bytes are tallied as they stream; `log` is owned by the
-    // stream closure, so its Drop emits the line when the body finishes (or the
-    // client disconnects).
-    let (parts, body) = response.into_parts();
-    let counted = body.into_data_stream().map(move |chunk| {
-        if let Ok(bytes) = &chunk {
-            log.bytes
-                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+impl AccessLogCtx {
+    /// Capture the request for logging, or `None` when the `boatramp::access` line is
+    /// filtered out — in which case logging *and* the per-request metric aggregation are
+    /// both skipped (~4 string allocations plus a body-stream wrapper avoided, matching
+    /// how nginx/Envoy run with `access_log off`). The id is assigned separately and
+    /// unconditionally via [`assign_request_id`].
+    fn capture(request: &axum::extract::Request, request_id: String) -> Option<Self> {
+        if !tracing::enabled!(target: "boatramp::access", tracing::Level::INFO) {
+            return None;
         }
-        chunk
-    });
-    Response::from_parts(parts, Body::from_stream(counted))
+        Some(Self {
+            request_id,
+            method: request.method().clone(),
+            path: request.uri().path().to_string(),
+            host: request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .or_else(|| request.uri().host()) // HTTP/2: `:authority` lives in the URI
+                .unwrap_or("-")
+                .to_string(),
+            client: request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            start: std::time::Instant::now(),
+        })
+    }
+
+    /// Wrap `response` so its bytes are tallied as they stream; the access line + request
+    /// metrics emit from the counter's `Drop` when the body finishes (or the client
+    /// disconnects).
+    fn finish(self, response: Response) -> Response {
+        let encoding = response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("identity")
+            .to_string();
+        let log = AccessLog {
+            request_id: self.request_id,
+            method: self.method,
+            path: self.path,
+            host: self.host,
+            client: self.client,
+            status: response.status().as_u16(),
+            encoding,
+            start: self.start,
+            bytes: std::sync::atomic::AtomicU64::new(0),
+        };
+        let (parts, body) = response.into_parts();
+        let counted = body.into_data_stream().map(move |chunk| {
+            if let Ok(bytes) = &chunk {
+                log.bytes
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            chunk
+        });
+        Response::from_parts(parts, Body::from_stream(counted))
+    }
+}
+
+/// Structured access-log middleware: assigns the correlation id, then (when access
+/// logging is on) records method / path / host / client IP / status / response bytes /
+/// duration once the body has fully streamed. Assignment and the capture/finish logic
+/// are shared with any direct serve path via [`assign_request_id`] + [`AccessLogCtx`].
+async fn access_log(mut request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let request_id = assign_request_id(&mut request);
+    match AccessLogCtx::capture(&request, request_id) {
+        None => next.run(request).await,
+        Some(ctx) => ctx.finish(next.run(request).await),
+    }
 }
 
 /// Whether the request's `If-None-Match` matches `etag` (or `*`).
