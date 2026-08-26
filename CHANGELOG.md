@@ -7,6 +7,17 @@ versions.
 
 ## [Unreleased]
 
+### Changed
+- **Site-serving hot-path bypass.** An eligible plain site `GET`/`HEAD` is now dispatched
+  straight to the host-routing serve pipeline, skipping the router + middleware
+  composition it would otherwise traverse — the router-level analog of the plaintext
+  reverse-proxy splice fast-path. Measured +35% throughput on a 4-core plaintext static
+  benchmark (the production shape behind a TLS-terminating edge). Every security check
+  (rate-limit, visitor auth, host routing, preview auth, domain-verification gate) still
+  runs, unchanged, inside the shared serve pipeline; the bypass is deny-by-default and
+  never intercepts a control-plane, preview, `.well-known`, health, MCP, or console
+  request. Purely internal — no configuration or behavior change.
+
 ## [0.3.1] - 2026-08-26
 
 ### Fixed
