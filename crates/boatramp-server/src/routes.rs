@@ -382,6 +382,8 @@ pub fn router_with_fast(
         // bypass re-inserts identical per-request extensions.
         posture,
         served_over_tls: served_over_tls.0,
+        // Set later by `FastServe::advertise_http3` where the router gets the Alt-Svc layer.
+        alt_svc: None,
     };
     let app = app
         .fallback(serve_by_host)

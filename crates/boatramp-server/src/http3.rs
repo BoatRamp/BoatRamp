@@ -39,12 +39,20 @@ pub enum Http3Error {
     H3(#[from] h3::error::ConnectionError),
 }
 
+/// The `Alt-Svc` header value advertising the h3 listener on `port`. Shared by the
+/// router layer ([`advertise_http3`]) and the serve hot-path bypass
+/// ([`FastServe::advertise_http3`](crate::FastServe::advertise_http3)) so the two can
+/// never drift on the advertised max-age.
+pub(crate) fn alt_svc_value(port: u16) -> String {
+    format!("h3=\":{port}\"; ma=86400")
+}
+
 /// Wrap `router` so every response carries an `Alt-Svc` header advertising the
 /// HTTP/3 listener on `port`. Without it the h3 endpoint is
 /// served but clients never discover it — they keep using HTTP/1.1/2 over TCP.
 /// Apply only to the TLS/TCP path that has a paired h3 listener.
 pub fn advertise_http3(router: Router, port: u16) -> Router {
-    let value = format!("h3=\":{port}\"; ma=86400");
+    let value = alt_svc_value(port);
     router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let value = value.clone();

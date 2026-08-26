@@ -152,9 +152,24 @@ pub struct FastServe {
     /// and a TLS listener would derive `http`).
     pub(crate) posture: boatramp_core::security::SecurityPosture,
     pub(crate) served_over_tls: bool,
+    /// When serving a TLS listener paired with an HTTP/3 endpoint, the `Alt-Svc` value the
+    /// router's [`advertise_http3`](crate::advertise_http3) layer would add — re-applied by
+    /// [`dispatch`](Self::dispatch) so a bypassed response still advertises h3. `None` on
+    /// the plaintext path (no h3) and on TLS without http3.
+    pub(crate) alt_svc: Option<axum::http::HeaderValue>,
 }
 
 impl FastServe {
+    /// Advertise a paired HTTP/3 listener on `port`: an eligible bypassed response gains the
+    /// same `Alt-Svc` header the router's [`advertise_http3`](crate::advertise_http3) layer
+    /// adds. Call it (with the same port) exactly where `advertise_http3` wraps the router, so
+    /// the two paths stay byte-identical. TLS + http3 only.
+    #[cfg(feature = "http3")]
+    pub fn advertise_http3(mut self, port: u16) -> Self {
+        self.alt_svc = axum::http::HeaderValue::from_str(&crate::http3::alt_svc_value(port)).ok();
+        self
+    }
+
     /// Whether `request` may take the fast path: a plain site GET/HEAD the router would
     /// route to its `serve_by_host` fallback anyway. **Conservative** — anything the
     /// router matches explicitly (any `/api`, `/_*`, `/healthz`, `/readyz`, `/mcp`,
@@ -241,12 +256,19 @@ impl FastServe {
         .await;
         // Drop the body for HEAD (headers stand in for the GET response), matching the
         // router; the codec recomputes framing from the now-empty body identically.
-        let response = if is_head {
+        let mut response = if is_head {
             let (parts, _body) = response.into_parts();
             Response::from_parts(parts, axum::body::Body::empty())
         } else {
             response
         };
+        // Advertise a paired h3 listener, matching the outermost `advertise_http3` router
+        // layer on a TLS+http3 listener (`None`, so a no-op, on every other path).
+        if let Some(alt_svc) = &self.alt_svc {
+            response
+                .headers_mut()
+                .insert(axum::http::header::ALT_SVC, alt_svc.clone());
+        }
         match log {
             Some(ctx) => ctx.finish(response),
             None => response,

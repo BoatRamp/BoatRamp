@@ -372,3 +372,55 @@ async fn fast_path_is_byte_identical_to_the_router_for_every_eligible_request() 
         "fast path did not proxy"
     );
 }
+
+/// Under a TLS listener paired with an HTTP/3 endpoint, the bypass must (a) derive the
+/// `https` scheme + HSTS from `served_over_tls` and (b) carry the `Alt-Svc` advertisement
+/// the `advertise_http3` router layer adds — both byte-identical to the router.
+#[cfg(feature = "http3")]
+#[tokio::test]
+async fn tls_http3_fast_path_matches_router_with_alt_svc() {
+    let up = spawn_upstream().await;
+    let deploy = seed(up).await;
+    let (router, fast) = crate::router_with_fast(
+        deploy,
+        Auth::disabled(),
+        HandlerRuntime::disabled(),
+        ServerOptions {
+            posture: SecurityProfile::Dev.preset(),
+            served_over_tls: true,
+            ..Default::default()
+        },
+    );
+    // Pair with an h3 endpoint on :8443 — the router layer + the bypass both advertise it.
+    let port = 8443u16;
+    let router = crate::advertise_http3(router, port);
+    let fast = fast.advertise_http3(port);
+
+    for (host, path) in [
+        ("app.local", "/"),
+        ("app.local", "/about"),
+        ("app.local", "/app.js"),
+        ("app.local", "/old"),
+    ] {
+        let probe = mk(host, Method::GET, path);
+        assert!(fast.eligible(&probe), "should be eligible: {host}{path}");
+        let via_router = collect(
+            router
+                .clone()
+                .oneshot(mk(host, Method::GET, path))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let via_fast = collect(fast.dispatch(mk(host, Method::GET, path), PEER).await).await;
+        assert_eq!(
+            via_router, via_fast,
+            "TLS+h3 fast path diverged for {host}{path}"
+        );
+        // Positive check: the Alt-Svc advertisement is actually present (not both-absent).
+        assert!(
+            via_fast.1.iter().any(|(k, _)| k == "alt-svc"),
+            "Alt-Svc missing on the fast path for {host}{path}"
+        );
+    }
+}

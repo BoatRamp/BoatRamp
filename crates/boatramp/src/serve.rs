@@ -1792,21 +1792,25 @@ async fn serve_cluster_acme_dns(
     tracing::info!(%addr, domains = ?domains, "cluster: serving HTTPS (cluster-managed ACME DNS-01)");
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let app = boatramp_server::router_with(deploy, auth, handlers, options);
-    // Serve h3 over the QUIC endpoint + advertise it on the HTTPS responses.
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
+    // Serve h3 over the QUIC endpoint + advertise it on the HTTPS responses (on the
+    // bypass too, so a hot-path response advertises h3 identically to the router).
     #[cfg(feature = "http3")]
-    let app = if let Some(endpoint) = h3_endpoint {
+    let (app, fast) = if let Some(endpoint) = h3_endpoint {
         let app_h3 = app.clone();
         tokio::spawn(async move {
             if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
                 tracing::error!(%err, "cluster acme-dns: HTTP/3 listener failed");
             }
         });
-        boatramp_server::advertise_http3(app, addr.port())
+        (
+            boatramp_server::advertise_http3(app, addr.port()),
+            fast.advertise_http3(addr.port()),
+        )
     } else {
-        app
+        (app, fast)
     };
-    boatramp_server::serve_tls(addr, tls, app, boatramp_server::shutdown_signal()).await?;
+    boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal()).await?;
     Ok(())
 }
 
@@ -1969,20 +1973,23 @@ async fn serve_acme_dns(
     // handle detaches for the server's lifetime.
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let app = boatramp_server::router_with(deploy, auth, handlers, options);
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
     #[cfg(feature = "http3")]
-    let app = if let Some(endpoint) = h3_endpoint {
+    let (app, fast) = if let Some(endpoint) = h3_endpoint {
         let app_h3 = app.clone();
         tokio::spawn(async move {
             if let Err(err) = boatramp_server::serve_http3_endpoint(endpoint, app_h3).await {
                 tracing::error!(%err, "acme-dns: HTTP/3 listener failed");
             }
         });
-        boatramp_server::advertise_http3(app, addr.port())
+        (
+            boatramp_server::advertise_http3(app, addr.port()),
+            fast.advertise_http3(addr.port()),
+        )
     } else {
-        app
+        (app, fast)
     };
-    boatramp_server::serve_tls(addr, tls, app, boatramp_server::shutdown_signal()).await?;
+    boatramp_server::serve_tls(addr, tls, (app, fast), boatramp_server::shutdown_signal()).await?;
     Ok(())
 }
 
@@ -2091,13 +2098,14 @@ async fn serve_custom(
     // handle detaches for the server's lifetime.
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let app = boatramp_server::router_with(deploy, auth, handlers, options);
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
 
     // Optionally serve HTTP/3 on the same UDP port, feeding the same router, and
     // advertise it (`Alt-Svc`) on the HTTPS responses so clients upgrade to h3 —
-    // without the header the h3 listener is never discovered.
+    // without the header the h3 listener is never discovered. The bypass gets the same
+    // Alt-Svc so a hot-path response advertises h3 identically.
     #[cfg(feature = "http3")]
-    let app = if args.http3 {
+    let (app, fast) = if args.http3 {
         let (certs, key) = load_cert_chain_and_key(&cert, &key)?;
         let app_h3 = app.clone();
         tokio::spawn(async move {
@@ -2105,13 +2113,21 @@ async fn serve_custom(
                 tracing::error!(%err, "HTTP/3 listener failed");
             }
         });
-        boatramp_server::advertise_http3(app, addr.port())
+        (
+            boatramp_server::advertise_http3(app, addr.port()),
+            fast.advertise_http3(addr.port()),
+        )
     } else {
-        app
+        (app, fast)
     };
 
-    boatramp_server::serve_tls(addr, config.into(), app, boatramp_server::shutdown_signal())
-        .await?;
+    boatramp_server::serve_tls(
+        addr,
+        config.into(),
+        (app, fast),
+        boatramp_server::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2186,9 +2202,14 @@ async fn serve_rpk(
 
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let app = boatramp_server::router_with(deploy, auth, handlers, options);
-    boatramp_server::serve_tls(addr, config.into(), app, boatramp_server::shutdown_signal())
-        .await?;
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
+    boatramp_server::serve_tls(
+        addr,
+        config.into(),
+        (app, fast),
+        boatramp_server::shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2269,11 +2290,11 @@ async fn serve_acme(
     // handle detaches for the server's lifetime.
     #[cfg(feature = "handlers")]
     let _scheduler = handlers.spawn_scheduler(deploy.clone());
-    let app = boatramp_server::router_with(deploy, auth, handlers, options);
+    let (app, fast) = boatramp_server::router_with_fast(deploy, auth, handlers, options);
     boatramp_server::serve_tls(
         addr,
         rustls_config.into(),
-        app,
+        (app, fast),
         boatramp_server::shutdown_signal(),
     )
     .await?;
