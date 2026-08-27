@@ -64,15 +64,14 @@ A deployment that ships handlers is refused at activation unless the **site**
 permits them — the `handlers.enabled`
 [site policy](../reference/siteconfig.md#handlers), which is separate from the
 deployment and which **`sync` does not set**. Enable it once. This handler requests
-no imports, so `allow_imports` stays empty:
+no imports, so there's no allowlist to pass:
 
 ```sh
-curl -fsS -X PUT "http://127.0.0.1:8080/api/sites/my-site/config" \
-  -H "Content-Type: application/json" -d '{"handlers":{"enabled":true}}'
+boatramp handlers enable --site my-site
 ```
 
-(If the server has auth on, add `-H "Authorization: Bearer $TOKEN"`. You can also
-declare the policy in an `apply.cfg` and run `boatramp apply` instead — see
+(`boatramp handlers show --site my-site` prints the policy. You can also declare it in
+an `apply.cfg` and run `boatramp apply` instead — see
 [Deploy a handler](../how-to/deploy-handler.md#3-enable-handlers-on-the-site).)
 
 ## 5. Validate and publish

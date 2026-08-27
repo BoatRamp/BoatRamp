@@ -77,11 +77,22 @@ and **`sync` never sets it**. Skip this step and the sync below fails with:
 activation refused: deployment ships handlers/consumers but the site has them disabled
 ```
 
-Enable it once, either way:
+Enable it once with `boatramp handlers`. List the interfaces your handlers import
+(`allow_imports` must be a **superset** of every handler's `imports`); the example
+`/api/**` handler above imports `sql` and `wasi:keyvalue`:
 
-**Declaratively with `boatramp apply`** — an `apply.cfg` carries both the deployment
-routing *and* the site policy, and applies them in the right order (policy first,
-then activate):
+```sh
+boatramp handlers enable --site my-site --allow sql --allow wasi:keyvalue
+```
+
+`boatramp handlers show --site my-site` prints the current policy; `handlers disable`
+turns it back off; `handlers allow`/`deny <import>…` adjust the allowlist. An import a
+handler requests but the site doesn't grant is refused at activation — see
+[Use handler bindings](./handler-bindings.md).
+
+**Or, declaratively**, fold the same policy into an `apply.cfg` `config.handlers` block
+and run `boatramp apply` — it sets the site policy *then* deploys + activates, in the
+right order, so one command does the whole thing:
 
 ```ron
 sites: [(
@@ -89,28 +100,9 @@ sites: [(
     path: "./dist",
     routing: ( handlers: [( route: "/api/**", component: "dist/api.wasm",
                             methods: ["GET", "POST"], imports: ["sql", "wasi:keyvalue"] )] ),
-    // The site policy — the gate. `allow_imports` must be a superset of every
-    // handler's `imports`.
     config:  ( handlers: ( enabled: true, allow_imports: ["sql", "wasi:keyvalue"] ) ),
 )],
 ```
-
-```sh
-boatramp apply            # sets the site policy, then deploys + activates
-```
-
-**Or set the policy directly on the site over the admin API** (then use `sync` as in
-step 4). `PUT …/config` replaces the whole site config, so `GET` it first and merge if
-the site already has domains/access configured:
-
-```sh
-curl -fsS -X PUT "$SERVER/api/sites/my-site/config" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"handlers":{"enabled":true,"allow_imports":["sql","wasi:keyvalue"]}}'
-```
-
-An import a handler requests but the site's `allow_imports` doesn't grant is refused at
-activation — see [Use handler bindings](./handler-bindings.md).
 
 ## 4. Sync the deployment
 

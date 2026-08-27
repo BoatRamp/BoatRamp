@@ -54,6 +54,9 @@ pub enum CliError {
     /// The `access` command.
     #[error(transparent)]
     Access(#[from] crate::access::Error),
+    /// The `handlers` command.
+    #[error(transparent)]
+    Handlers(#[from] crate::handlers::Error),
     /// The `token` command.
     #[error(transparent)]
     Token(#[from] crate::token::Error),

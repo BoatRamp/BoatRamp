@@ -62,6 +62,7 @@ mod error;
 mod function;
 mod gateway;
 mod handler_validate;
+mod handlers;
 mod workflow;
 // Joiner-side dynamic cluster join (CJ-2/CJ-3): the ticket codec, root-anchored
 // verification, founding decision, and `join_cluster` orchestration wired into
@@ -140,6 +141,8 @@ enum Command {
     Alias(alias::AliasArgs),
     /// Configure visitor access control (basic auth, IP rules, rate limit).
     Access(access::AccessArgs),
+    /// Manage a site's handler policy (enable/disable, import allowlist, caps).
+    Handlers(handlers::HandlersArgs),
     /// Manage control-plane API tokens.
     Token(token::TokenArgs),
     /// Operate a self-hosted cluster's mesh membership (mint join tokens).
@@ -447,6 +450,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Alias(args) => alias::run(args, &config).await?,
         Command::Project(args) => project::run(args, &config).await?,
         Command::Access(args) => access::run(args, &config).await?,
+        Command::Handlers(args) => handlers::run(args, &config).await?,
         Command::Token(args) => token::run(args, &config).await?,
         Command::Cluster(args) => cluster::run(args, &config).await?,
         Command::Auth(args) => authcmd::run(args, &config).await?,
