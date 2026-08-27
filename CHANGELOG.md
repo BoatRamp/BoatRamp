@@ -7,6 +7,31 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-27
+
+### Added
+- **First-class CLI for every site-config section.** Aspects that were only settable via
+  `apply.cfg` or a raw `curl` to the admin API now have imperative subcommands:
+  - `boatramp handlers` — the handler policy: `enable`/`disable` (the gate a
+    handler-shipping deploy is checked against), `allow`/`deny` imports, `cache`, and
+    `cookie-auth`.
+  - `boatramp access waf` — user-agent rules + anomaly scoring.
+  - `boatramp compression` — on/off + min-size.
+  - `boatramp security-headers` — HTTPS redirect, HSTS, CSP, X-Frame-Options.
+  - `boatramp graphql` — the GraphQL admin: `safelist` (persisted operations) and
+    `subgraph` federation (SDL / SQL / function) + `supergraph`.
+- **Console: a Handlers panel** in the site config editor (enable toggle, import
+  allowlist, resource caps), alongside the existing domains / security / access / WAF /
+  compression panels.
+
+### Fixed
+- **Docs: enabling handlers on a site is now documented.** The handler how-to and the
+  first-handler tutorial declared a route and said `sync`, but never mentioned that a
+  handler-shipping deployment is refused at activation until the site's `handlers.enabled`
+  policy is set (which `sync` doesn't set) — following them hit a 422. Both now include an
+  explicit "enable handlers on the site" step, and the GraphQL how-to uses the new
+  `boatramp graphql` command instead of `curl`.
+
 ## [0.3.2] - 2026-08-27
 
 ### Added

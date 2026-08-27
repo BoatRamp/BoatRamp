@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-acme"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-cloudflare"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-cluster"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-container"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-docker"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-firecracker"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-handlers"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-http"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "h2 0.4.14",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-mcp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "boatramp-core",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-node"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-rpktls"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aws-lc-rs",
  "rustls 0.23.40",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-storage"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-types"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-vz"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-trait",
  "block2",
