@@ -17,10 +17,10 @@ run the same kind of component *invoked by name* instead of behind a route, see
   `wasi:http/incoming-handler`. Sync rejects a component without this export.
 - The component file reachable from your project root (here, `dist/api.wasm`).
 - A server built with the `handlers` feature.
-- Site policy that permits handlers and allows every import you request. The
-  requested imports are intersected with the site's allowed imports at
-  activation; an import the site does not grant is refused — see
-  [Use handler bindings](./handler-bindings.md).
+- The **site policy enabled** (`handlers.enabled` on the site) and its
+  `allow_imports` covering every import you request — set this in
+  [step 3](#3-enable-handlers-on-the-site). `sync` does **not** set it, so a fresh
+  site refuses a handler deployment until you do.
 
 ## 1. Declare the handler in `project.cfg`
 
@@ -65,7 +65,54 @@ project.cfg: routing OK (1 handler: /api/** [GET, POST])
 `wasi:http/incoming-handler` export, and the import allowlist — is validated at
 sync.
 
-## 3. Sync the deployment
+## 3. Enable handlers on the site
+
+The route you declared ships **in the deployment**, but a deployment that ships
+handlers is refused at activation unless the **site** permits them. That gate is the
+site's `handlers.enabled` policy — a piece of
+[site config](../reference/siteconfig.md#handlers) **separate from the deployment**,
+and **`sync` never sets it**. Skip this step and the sync below fails with:
+
+```text
+activation refused: deployment ships handlers/consumers but the site has them disabled
+```
+
+Enable it once, either way:
+
+**Declaratively with `boatramp apply`** — an `apply.cfg` carries both the deployment
+routing *and* the site policy, and applies them in the right order (policy first,
+then activate):
+
+```ron
+sites: [(
+    name: "my-site",
+    path: "./dist",
+    routing: ( handlers: [( route: "/api/**", component: "dist/api.wasm",
+                            methods: ["GET", "POST"], imports: ["sql", "wasi:keyvalue"] )] ),
+    // The site policy — the gate. `allow_imports` must be a superset of every
+    // handler's `imports`.
+    config:  ( handlers: ( enabled: true, allow_imports: ["sql", "wasi:keyvalue"] ) ),
+)],
+```
+
+```sh
+boatramp apply            # sets the site policy, then deploys + activates
+```
+
+**Or set the policy directly on the site over the admin API** (then use `sync` as in
+step 4). `PUT …/config` replaces the whole site config, so `GET` it first and merge if
+the site already has domains/access configured:
+
+```sh
+curl -fsS -X PUT "$SERVER/api/sites/my-site/config" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"handlers":{"enabled":true,"allow_imports":["sql","wasi:keyvalue"]}}'
+```
+
+An import a handler requests but the site's `allow_imports` doesn't grant is refused at
+activation — see [Use handler bindings](./handler-bindings.md).
+
+## 4. Sync the deployment
 
 Upload the component and activate it:
 
@@ -81,7 +128,7 @@ activated my-site -> 7f3a2b2c — handler /api/**
 If the component requests an import the site does not allow, sync rejects the
 deployment and the previous one stays live.
 
-## 4. Call the route
+## 5. Call the route
 
 ```sh
 curl https://my-site.example/api/health

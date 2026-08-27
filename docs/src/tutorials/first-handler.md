@@ -58,7 +58,24 @@ requests; it requests no host bindings:
 )
 ```
 
-## 4. Validate and publish
+## 4. Enable handlers on the site
+
+A deployment that ships handlers is refused at activation unless the **site**
+permits them — the `handlers.enabled`
+[site policy](../reference/siteconfig.md#handlers), which is separate from the
+deployment and which **`sync` does not set**. Enable it once. This handler requests
+no imports, so `allow_imports` stays empty:
+
+```sh
+curl -fsS -X PUT "http://127.0.0.1:8080/api/sites/my-site/config" \
+  -H "Content-Type: application/json" -d '{"handlers":{"enabled":true}}'
+```
+
+(If the server has auth on, add `-H "Authorization: Bearer $TOKEN"`. You can also
+declare the policy in an `apply.cfg` and run `boatramp apply` instead — see
+[Deploy a handler](../how-to/deploy-handler.md#3-enable-handlers-on-the-site).)
+
+## 5. Validate and publish
 
 Check the config, then publish the `site` folder. The component blob is validated
 at sync — parseability and the `wasi:http/incoming-handler` export:
@@ -83,7 +100,7 @@ uploading 1 missing blob(s)… done
 activated my-site -> 8c1f2a3d — handler /hello
 ```
 
-## 5. Call the route
+## 6. Call the route
 
 `my-site` is the only site on this server, so it answers at the root — call the
 handler's route directly:
