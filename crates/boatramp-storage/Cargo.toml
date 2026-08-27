@@ -15,7 +15,9 @@ description = "Pluggable streaming blob backends and KV stores for boatramp"
 
 [features]
 default = ["fs"]
-fs = []
+# Local filesystem backend. `memmap2` lets it serve a large blob by memory-mapping
+# the (immutable) file — one borrowed body, no `tokio::fs` double-buffer copy.
+fs = ["dep:bytes", "dep:memmap2"]
 s3 = [
   "dep:aws-config",
   "dep:aws-sdk-s3",
@@ -93,6 +95,8 @@ libsql = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
+# Memory-map local blob files for zero-copy large-static serving (`fs` feature).
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

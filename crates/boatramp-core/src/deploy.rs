@@ -167,6 +167,10 @@ struct DomainResolveCache {
 pub enum BlobBody {
     /// A small blob served from the in-memory cache as one refcounted frame.
     Cached(bytes::Bytes),
+    /// A large blob served as one borrowed frame backed by a memory-mapped local
+    /// file — no `tokio::fs` double-buffer copy, and a single content-length body
+    /// instead of a chunked stream. Only local-file backends produce this.
+    Mapped(bytes::Bytes),
     /// A blob streamed from storage (too large to cache, or Range/large path).
     Stream(GetObject),
 }
@@ -539,6 +543,13 @@ impl DeployStore {
     pub async fn open_blob_cached(&self, hash: &str, size: u64) -> Result<BlobBody, DeployError> {
         use futures::TryStreamExt;
         if size > SMALL_BLOB_CACHE_MAX {
+            // Too big to cache in memory. On a local-file backend, memory-map it and
+            // serve one borrowed frame — skips `tokio::fs`'s double-buffer copy and
+            // sends a content-length body, not a chunked stream. Remote/opaque
+            // backends (S3/GCS/Azure) return `None` here and stream instead.
+            if let Some(bytes) = self.storage.mapped(&keys::blob(hash)) {
+                return Ok(BlobBody::Mapped(bytes));
+            }
             return Ok(BlobBody::Stream(self.open_blob(hash).await?));
         }
         if let Some(bytes) = self.blob_body_cache.read().unwrap().map.get(hash).cloned() {
@@ -5256,6 +5267,7 @@ mod tests {
         {
             BlobBody::Cached(bytes) => assert_eq!(&bytes[..], small),
             BlobBody::Stream(_) => panic!("small blob should be cached, not streamed"),
+            BlobBody::Mapped(_) => panic!("small blob should be cached, not mapped"),
         }
         {
             let cache = store.blob_body_cache.read().unwrap();
@@ -5292,6 +5304,8 @@ mod tests {
                 assert_eq!(got, large);
             }
             BlobBody::Cached(_) => panic!("large blob must stream, not cache"),
+            // MemStorage has no local file to map, so a large blob streams here.
+            BlobBody::Mapped(_) => panic!("MemStorage can't memory-map; expected a stream"),
         }
         assert!(!store
             .blob_body_cache

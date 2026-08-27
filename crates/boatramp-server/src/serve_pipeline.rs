@@ -1437,7 +1437,10 @@ async fn serve_entry(
     set_header(&mut headers, header::CONTENT_LENGTH, &blob_size.to_string());
     set_content_encoding(&mut headers, encoding);
     match deploy.open_blob_cached(blob_hash, blob_size).await {
-        Ok(boatramp_core::deploy::BlobBody::Cached(bytes)) => {
+        // Cached (small) and Mapped (large, memory-mapped file) both serve one
+        // borrowed frame as a content-length body.
+        Ok(boatramp_core::deploy::BlobBody::Cached(bytes))
+        | Ok(boatramp_core::deploy::BlobBody::Mapped(bytes)) => {
             (base_status, headers, Body::from(bytes)).into_response()
         }
         Ok(boatramp_core::deploy::BlobBody::Stream(object)) => {

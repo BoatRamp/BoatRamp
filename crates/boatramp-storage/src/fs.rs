@@ -71,6 +71,17 @@ impl FsStorage {
 
 #[async_trait]
 impl Storage for FsStorage {
+    fn mapped(&self, key: &str) -> Option<bytes::Bytes> {
+        let path = self.resolve(key).ok()?;
+        let file = std::fs::File::open(&path).ok()?;
+        // SAFETY: the blob keyspace is content-addressed and immutable — a stored
+        // file is never rewritten or truncated while a mapping is live, which is
+        // the one condition that makes `Mmap::map` unsound. Any error (missing
+        // file, empty file, mmap failure) returns `None` and the caller streams.
+        let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+        Some(bytes::Bytes::from_owner(mmap))
+    }
+
     async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
         let path = self.resolve(key)?;
         let file = match tokio::fs::File::open(&path).await {
@@ -338,6 +349,34 @@ mod tests {
         assert!(store.resolve("../etc/passwd").is_err());
         assert!(store.resolve("/etc/passwd").is_err());
         assert!(store.resolve("ok/index.html").is_ok());
+    }
+
+    #[tokio::test]
+    async fn mapped_returns_file_bytes_and_none_when_missing() {
+        let root = std::env::temp_dir().join(format!("boatramp-fsmap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = FsStorage::new(&root);
+
+        // A "large" (over the small-blob cache threshold) content-addressed blob.
+        let content = vec![0xABu8; 300 * 1024];
+        let body: ByteStream = {
+            let content = content.clone();
+            futures::stream::once(async move { Ok(bytes::Bytes::from(content)) }).boxed()
+        };
+        store
+            .put("blobs/abc", body, PutMeta::default())
+            .await
+            .unwrap();
+
+        // Present: the mapped bytes equal the file content (served borrowed).
+        let mapped = store.mapped("blobs/abc").expect("a local file memory-maps");
+        assert_eq!(&mapped[..], &content[..]);
+        // Missing key → None, so the caller falls back to streaming.
+        assert!(store.mapped("blobs/missing").is_none());
+        // Traversal is rejected the same as every other path-taking method.
+        assert!(store.mapped("../etc/passwd").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

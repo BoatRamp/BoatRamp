@@ -150,6 +150,18 @@ pub trait Storage: Send + Sync {
     /// List object metadata under `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError>;
 
+    /// If this backend stores objects as local files, memory-map `key` and return
+    /// its bytes for zero-copy serving. The blob keyspace is content-addressed and
+    /// immutable (a file is never modified after it is written), so a mapping can
+    /// never see a truncated/rewritten file — the one hazard that makes `mmap`
+    /// unsafe. Returns `None` for remote/opaque backends (S3/GCS/Azure) or on any
+    /// error, so the caller falls back to streaming. Large static bodies use this
+    /// to skip `tokio::fs`'s internal double-buffering copy (and serve one
+    /// content-length body instead of a chunked stream).
+    fn mapped(&self, _key: &str) -> Option<bytes::Bytes> {
+        None
+    }
+
     /// Whether this backend can natively watch for changes (FA-5 blob-change
     /// triggers). A cheap, side-effect-free capability probe: a `Blob` trigger is
     /// **refused at activation** on a backend that returns `false`, so the
