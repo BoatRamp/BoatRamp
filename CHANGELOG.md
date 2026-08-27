@@ -7,6 +7,17 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+- **Reverse proxy: the streamed response body is no longer copied per chunk.** The
+  HTTP/1.1 response writer framed each streamed body chunk by allocating a buffer and
+  copying the chunk into it (`<hex-size>` + data + CRLF) before handing it to the
+  transport — a second, body-sized copy on top of the one unavoidable copy into the TLS
+  record buffer. It now writes the size line, the borrowed chunk, and the trailing CRLF as
+  a single vectored write (byte-identical framing), removing the copy and the per-chunk
+  allocation. A load profile of `tls-proxy` at 100 KB showed that per-chunk `memmove`
+  rivaling the AES-GCM encryption itself; the fix measured **+8%** throughput on that cell,
+  with small responses and the plaintext proxy path unchanged.
+
 ## [0.3.3] - 2026-08-27
 
 ### Added

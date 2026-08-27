@@ -371,7 +371,16 @@ where
                 match item {
                     Ok(chunk) if chunk.is_empty() => {}
                     Ok(chunk) => {
-                        if let Err(e) = write_all(io, &chunked::encode(&chunk)).await {
+                        // Frame the chunk without copying its body: write the size line,
+                        // the borrowed chunk, and the trailing CRLF as one vectored write
+                        // (`<hex>CRLF<data>CRLF` — byte-identical to `chunked::encode`).
+                        // Copying a large proxied chunk into a framing buffer here — on top
+                        // of the one unavoidable copy into the TLS record buffer — was a
+                        // measurable cost on the reverse-proxy path (a second ~body-sized
+                        // memmove per chunk).
+                        let size_line = format!("{:x}\r\n", chunk.len());
+                        let mut parts: [&[u8]; 3] = [size_line.as_bytes(), &chunk, b"\r\n"];
+                        if let Err(e) = write_all_vectored(io, &mut parts).await {
                             return (Err(e), true);
                         }
                     }
@@ -393,6 +402,46 @@ where
     IO: AsyncWrite + Unpin,
 {
     io.write_all(bytes).await
+}
+
+/// Write every slice in `parts` (in order) using vectored writes, advancing across
+/// partial writes. Lets a large borrowed body chunk go straight to the transport (a
+/// TLS stream buffers the slices into one record run) instead of being copied into a
+/// framing buffer first. On a transport without vectored-write support this still makes
+/// progress one slice at a time. `parts` is trimmed in place as bytes are written.
+async fn write_all_vectored<IO>(io: &mut IO, parts: &mut [&[u8]]) -> std::io::Result<()>
+where
+    IO: AsyncWrite + Unpin,
+{
+    let mut i = 0;
+    loop {
+        while i < parts.len() && parts[i].is_empty() {
+            i += 1;
+        }
+        if i >= parts.len() {
+            return Ok(());
+        }
+        let slices: Vec<std::io::IoSlice<'_>> = parts[i..]
+            .iter()
+            .map(|p| std::io::IoSlice::new(p))
+            .collect();
+        let mut n = io.write_vectored(&slices).await?;
+        drop(slices);
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        while n > 0 {
+            let len = parts[i].len();
+            if n >= len {
+                n -= len;
+                parts[i] = &[];
+                i += 1;
+            } else {
+                parts[i] = &parts[i][n..];
+                n = 0;
+            }
+        }
+    }
 }
 
 /// Build a `101 Switching Protocols` head: the status line + the handler's response
