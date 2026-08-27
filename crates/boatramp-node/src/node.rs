@@ -125,6 +125,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // returned `RunningNode` without a lingering borrow.
     let max_handler_blob_bytes = options.posture.max_handler_blob_bytes;
     let max_component_bytes = options.posture.max_component_bytes;
+    let allow_guest_private_egress = options.posture.allow_guest_private_egress;
     let allow_shared_kernel = options.posture.allow_shared_kernel_compute;
     let domain_verify_allow_private = options.posture.domain_verify_allow_private;
 
@@ -148,6 +149,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         messaging,
         max_handler_blob_bytes,
         max_component_bytes,
+        allow_guest_private_egress,
         &deploy,
         secrets_envelope.clone(),
     )

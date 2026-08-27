@@ -201,6 +201,9 @@ struct HostState {
     /// Ceiling on this invocation's outbound `wasi:http` connect + first-byte
     /// wait (from the engine), independent of the invocation's own timeout.
     outbound_timeout: Option<Duration>,
+    /// Whether this invocation's guest outbound `wasi:http` may reach a private/loopback
+    /// address (from the engine's `allow_private_egress`). `false` is the SSRF default.
+    allow_private_egress: bool,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -242,8 +245,9 @@ impl WasiHttpView for HostState {
             config.first_byte_timeout = timeout;
         }
         let use_tls = config.use_tls;
+        let allow_private = self.allow_private_egress;
         let handle = wasmtime_wasi::runtime::spawn(async move {
-            let result = match egress_target_allowed(request.uri(), use_tls).await {
+            let result = match egress_target_allowed(request.uri(), use_tls, allow_private).await {
                 Ok(()) => {
                     wasmtime_wasi_http::types::default_send_request_handler(request, config).await
                 }
@@ -255,11 +259,16 @@ impl WasiHttpView for HostState {
     }
 }
 
-/// Resolve `uri`'s host and require every address be globally routable, so a
-/// guest's `wasi:http` request can't target internal infrastructure (SSRF).
+/// Resolve `uri`'s host and (unless `allow_private`) require every address be globally
+/// routable, so a guest's `wasi:http` request can't target internal infrastructure (SSRF).
+/// `allow_private` is the operator posture's `allow_guest_private_egress` — on a trusted
+/// single-tenant/dev fleet a guest may reach loopback/private hosts; the multi-tenant
+/// default keeps the gate closed. Even with `allow_private`, the destination must still
+/// resolve (an empty/unresolvable host is refused).
 async fn egress_target_allowed(
     uri: &http::Uri,
     use_tls: bool,
+    allow_private: bool,
 ) -> Result<(), wasmtime_wasi_http::bindings::http::types::ErrorCode> {
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
     let authority = uri.authority().ok_or(ErrorCode::HttpRequestUriInvalid)?;
@@ -278,7 +287,8 @@ async fn egress_target_allowed(
     let mut saw_any = false;
     for addr in addrs.by_ref() {
         saw_any = true;
-        if !boatramp_core::access::is_global_ip(addr.ip()) {
+        // The SSRF gate — skipped only when the operator posture trusts guest egress.
+        if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
             return Err(ErrorCode::DestinationIpProhibited);
         }
     }
@@ -323,6 +333,11 @@ pub struct HandlerEngine {
     /// time-to-first-byte), independent of the invocation's own timeout, so a
     /// hung upstream is bounded on its own terms. `None` keeps wasmtime's default.
     outbound_timeout: Option<Duration>,
+    /// Whether a guest's outbound `wasi:http` may reach a private/loopback/link-local
+    /// address (the operator posture's `allow_guest_private_egress`). `false` is the SSRF
+    /// default: guests reach only globally-routable hosts. Does not affect a guest calling
+    /// its own site (served in-process, never network egress).
+    allow_private_egress: bool,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -379,6 +394,7 @@ impl HandlerEngine {
             streaming_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             streaming_limits: limits,
             outbound_timeout: None,
+            allow_private_egress: false,
             limits,
             epoch_ticker,
         })
@@ -422,6 +438,15 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_outbound_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.outbound_timeout = timeout;
+        self
+    }
+
+    /// Permit (or refuse) a guest's outbound `wasi:http` reaching a private/loopback IP —
+    /// the operator posture's `allow_guest_private_egress`. Default (`false`) is the strict
+    /// SSRF gate; an operator on a trusted single-tenant/dev posture opts in.
+    #[must_use]
+    pub fn with_private_egress(mut self, allow: bool) -> Self {
+        self.allow_private_egress = allow;
         self
     }
 
@@ -688,6 +713,7 @@ impl HandlerEngine {
             limits: store_limits,
             bindings,
             outbound_timeout: self.outbound_timeout,
+            allow_private_egress: self.allow_private_egress,
             #[cfg(feature = "sql")]
             sql,
         };
@@ -1006,7 +1032,11 @@ mod tests {
     }
 
     async fn egress(uri: &str, tls: bool) -> Result<(), ErrorCode> {
-        egress_target_allowed(&uri.parse().unwrap(), tls).await
+        egress_target_allowed(&uri.parse().unwrap(), tls, false).await
+    }
+
+    async fn egress_priv(uri: &str, tls: bool) -> Result<(), ErrorCode> {
+        egress_target_allowed(&uri.parse().unwrap(), tls, true).await
     }
 
     /// The SSRF egress guard refuses guest outbound HTTP to
@@ -1034,6 +1064,30 @@ mod tests {
         // A request with no authority is rejected as an invalid URI.
         assert!(matches!(
             egress("/relative-only", false).await,
+            Err(ErrorCode::HttpRequestUriInvalid)
+        ));
+    }
+
+    /// With `allow_guest_private_egress` on (trusted single-tenant/dev posture), the SSRF
+    /// gate opens for private/loopback addresses — but the URI still has to be valid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn egress_guard_allows_private_when_posture_permits() {
+        for allowed in [
+            "http://127.0.0.1/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "https://[::1]:8443/",
+        ] {
+            assert!(
+                egress_priv(allowed, allowed.starts_with("https"))
+                    .await
+                    .is_ok(),
+                "{allowed} should be permitted under allow_guest_private_egress"
+            );
+        }
+        // Structural refusals still hold regardless of the knob.
+        assert!(matches!(
+            egress_priv("/relative-only", false).await,
             Err(ErrorCode::HttpRequestUriInvalid)
         ));
     }
