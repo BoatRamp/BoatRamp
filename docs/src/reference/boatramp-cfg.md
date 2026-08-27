@@ -92,6 +92,7 @@ Override knobs (byte caps: `0` = unlimited):
 | `max_upload_bytes` | Blob upload cap. |
 | `allow_site_unix_upstreams` | Let a site's gateway target `unix:` sockets. |
 | `allow_site_private_upstreams` | Let a site's gateway target private IPs. |
+| `allow_guest_private_egress` | Let a handler guest's outbound `wasi:http` reach private/loopback IPs. Off under `multi-tenant` (the SSRF default — guests reach only public hosts); on under `single-tenant`/`dev`. A guest calling its own site or a sibling function uses the capability-gated `invoke` binding instead, which is unaffected by this knob. |
 | `max_handler_blob_bytes` | Per-handler blobstore write cap. |
 | `max_component_bytes` | Wasm component size cap. |
 | `oidc_require_audience` | Require an `aud` claim on OIDC exchange. |

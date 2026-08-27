@@ -7,6 +7,17 @@ versions.
 
 ## [Unreleased]
 
+### Added
+- **`allow_guest_private_egress` security posture knob.** A handler guest's outbound
+  `wasi:http` has its own SSRF gate, separate from the gateway-upstream gate that
+  `allow_site_private_upstreams` controls. That guest gate was previously hardcoded to
+  block every non-global address with no way to relax it; it is now governed by this knob
+  — off under `multi-tenant` (guests reach only globally-routable hosts), on under
+  `single-tenant`/`dev`, and `[security]`-overridable. Lets a trusted-posture deployment
+  (or a test) allow guest egress to a private/loopback upstream. A guest calling its own
+  site or a sibling function still uses the capability-gated, depth-capped `invoke`
+  binding, which is unaffected.
+
 ### Changed
 - **Site-serving hot-path bypass.** An eligible plain site `GET`/`HEAD` is now dispatched
   straight to the host-routing serve pipeline, skipping the router + middleware
