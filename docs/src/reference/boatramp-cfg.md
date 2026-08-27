@@ -93,6 +93,7 @@ Override knobs (byte caps: `0` = unlimited):
 | `allow_site_unix_upstreams` | Let a site's gateway target `unix:` sockets. |
 | `allow_site_private_upstreams` | Let a site's gateway target private IPs. |
 | `allow_guest_private_egress` | Let a handler guest's outbound `wasi:http` reach private/loopback IPs. Off under `multi-tenant` (the SSRF default — guests reach only public hosts); on under `single-tenant`/`dev`. A guest calling its own site or a sibling function uses the capability-gated `invoke` binding instead, which is unaffected by this knob. |
+| `allow_guest_self_egress` | Let a handler guest's outbound `wasi:http` reach **this instance's own serve socket** (loopback on the serve port) even when `allow_guest_private_egress` is off — a much tighter grant, exposing only boatramp's own front door (which re-applies host routing + auth + rate-limit). Self-recursion is depth-capped. On by default in every posture. |
 | `max_handler_blob_bytes` | Per-handler blobstore write cap. |
 | `max_component_bytes` | Wasm component size cap. |
 | `oidc_require_audience` | Require an `aud` claim on OIDC exchange. |

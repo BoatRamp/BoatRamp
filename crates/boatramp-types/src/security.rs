@@ -106,6 +106,7 @@ impl SecurityProfile {
                 allow_site_unix_upstreams: false,
                 allow_site_private_upstreams: false,
                 allow_guest_private_egress: false,
+                allow_guest_self_egress: true,
                 max_handler_blob_bytes: MT_MAX_BLOB,
                 max_component_bytes: MT_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -123,6 +124,7 @@ impl SecurityProfile {
                 allow_site_unix_upstreams: true,
                 allow_site_private_upstreams: true,
                 allow_guest_private_egress: true,
+                allow_guest_self_egress: true,
                 max_handler_blob_bytes: ST_MAX_BLOB,
                 max_component_bytes: ST_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -140,6 +142,7 @@ impl SecurityProfile {
                 allow_site_unix_upstreams: true,
                 allow_site_private_upstreams: true,
                 allow_guest_private_egress: true,
+                allow_guest_self_egress: true,
                 max_handler_blob_bytes: 0,
                 max_component_bytes: 0,
                 oidc_require_audience: false,
@@ -174,6 +177,8 @@ pub struct PostureOverrides {
     pub allow_site_private_upstreams: Option<bool>,
     /// Permit a guest handler's outbound `wasi:http` to reach private/loopback IPs.
     pub allow_guest_private_egress: Option<bool>,
+    /// Permit a guest handler's outbound `wasi:http` to reach this instance's own serve socket.
+    pub allow_guest_self_egress: Option<bool>,
     /// Cap on handler blobstore host reads/ranges/copies in bytes (`0` = unlimited).
     pub max_handler_blob_bytes: Option<u64>,
     /// Cap on a Wasm component blob in bytes (`0` = unlimited).
@@ -282,6 +287,11 @@ impl SecurityConfig {
             o.allow_guest_private_egress.is_some(),
         );
         row(
+            "allow_guest_self_egress",
+            p.allow_guest_self_egress.to_string(),
+            o.allow_guest_self_egress.is_some(),
+        );
+        row(
             "max_handler_blob_bytes",
             fmt_cap(p.max_handler_blob_bytes),
             o.max_handler_blob_bytes.is_some(),
@@ -352,6 +362,16 @@ pub struct SecurityPosture {
     /// cover a guest calling its own site — that is served in-process, host-asserted, and is
     /// never treated as private egress.
     pub allow_guest_private_egress: bool,
+    /// Permit a **guest** handler's outbound `wasi:http` to reach **this instance's own HTTP
+    /// serve socket** (loopback / the bind address on the serve port) even when
+    /// [`allow_guest_private_egress`](Self::allow_guest_private_egress) is off. A much tighter
+    /// grant than opening the whole private range: the only reachable internal target is
+    /// boatramp's own front door, which re-enters the full pipeline (host routing, visitor
+    /// auth, rate-limit, DV) — so a guest reaches only what any anonymous client could. A
+    /// self-recursion is bounded by a process-stamped depth cap. **On** by default in every
+    /// posture. (For depth-capped, allowlisted function-to-function calls, prefer the `invoke`
+    /// binding, which is unaffected by any egress knob.)
+    pub allow_guest_self_egress: bool,
     /// Cap on handler blobstore host reads/ranges/copies, `0` = unlimited.
     pub max_handler_blob_bytes: u64,
     /// Cap on a Wasm component blob, `0` = unlimited.
@@ -405,6 +425,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_private_egress {
         base.allow_guest_private_egress = v;
+    }
+    if let Some(v) = o.allow_guest_self_egress {
+        base.allow_guest_self_egress = v;
     }
     if let Some(v) = o.max_handler_blob_bytes {
         base.max_handler_blob_bytes = v;

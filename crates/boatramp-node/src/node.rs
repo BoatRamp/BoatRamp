@@ -55,6 +55,11 @@ pub struct NodeInput<'a> {
     /// Server options, already carrying the resolved posture, daemon runtime, and
     /// (post-`configure_auth`/`configure_oidc`) issuer / OIDC verifier.
     pub options: boatramp_server::ServerOptions,
+    /// The public HTTP serve bind address, if known — used (under
+    /// `allow_guest_self_egress`) to let a handler guest's `wasi:http` reach this
+    /// instance's own front door over loopback. `None` (an in-process embedder with no
+    /// listener) disables self-egress.
+    pub serve_addr: Option<std::net::SocketAddr>,
     /// The cloud blob-change watch provider (FA-5b2), if the backend is a cloud one.
     pub watch_provider: Option<Arc<dyn boatramp_core::blob_provision::WatchProvider>>,
     /// The provisioning tier for the watch provider.
@@ -100,6 +105,30 @@ pub struct RunningNode {
     pub reconcile: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// The instance's own serve socket(s) a guest self-call may reach, given the bind `addr` and
+/// whether the posture (`allow_guest_self_egress`) permits it. A wildcard bind
+/// (`0.0.0.0`/`::`) is reachable over loopback, so it normalizes to `127.0.0.1` **and** `::1`
+/// on the serve port; a specific bind is reachable at itself. Empty when disabled or no
+/// listener.
+fn self_egress_addrs(
+    addr: Option<std::net::SocketAddr>,
+    enabled: bool,
+) -> Vec<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let Some(addr) = addr.filter(|_| enabled) else {
+        return Vec::new();
+    };
+    if addr.ip().is_unspecified() {
+        let port = addr.port();
+        vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+        ]
+    } else {
+        vec![addr]
+    }
+}
+
 /// Wire [`NodeInput`] into a [`RunningNode`]: build the handler runtime, the
 /// deploy store (materializing the reserved `default` project), the compute
 /// backends + reconcile loop, and the domain-verify reconcile loop.
@@ -114,6 +143,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         kv,
         auth,
         options,
+        serve_addr,
         watch_provider,
         provision_tier,
         messaging,
@@ -126,6 +156,10 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let max_handler_blob_bytes = options.posture.max_handler_blob_bytes;
     let max_component_bytes = options.posture.max_component_bytes;
     let allow_guest_private_egress = options.posture.allow_guest_private_egress;
+    // The instance's own serve socket(s) a guest self-call may reach, when the posture allows
+    // it: a wildcard bind (`0.0.0.0`/`::`) is reachable on loopback, so normalize to
+    // `127.0.0.1`/`::1`; a specific bind is itself.
+    let self_egress_addrs = self_egress_addrs(serve_addr, options.posture.allow_guest_self_egress);
     let allow_shared_kernel = options.posture.allow_shared_kernel_compute;
     let domain_verify_allow_private = options.posture.domain_verify_allow_private;
 
@@ -150,6 +184,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         max_handler_blob_bytes,
         max_component_bytes,
         allow_guest_private_egress,
+        self_egress_addrs,
         &deploy,
         secrets_envelope.clone(),
     )
@@ -351,6 +386,7 @@ mod tests {
             kv,
             auth: boatramp_server::Auth::disabled(),
             options,
+            serve_addr: None,
             watch_provider: None,
             provision_tier: boatramp_core::blob_notify::ProvisionTier::default(),
             messaging: None,

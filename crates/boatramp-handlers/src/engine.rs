@@ -1,9 +1,10 @@
 //! The wasmtime component engine: compile (cached by blob hash), instantiate
 //! per request, drive `wasi:http/incoming-handler`, and enforce limits.
 
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -204,6 +205,14 @@ struct HostState {
     /// Whether this invocation's guest outbound `wasi:http` may reach a private/loopback
     /// address (from the engine's `allow_private_egress`). `false` is the SSRF default.
     allow_private_egress: bool,
+    /// The instance's own serve socket(s) a guest self-call may reach (empty ⇒ self-egress
+    /// off). Copied from the engine.
+    self_egress_addrs: Arc<[SocketAddr]>,
+    /// This invocation's inbound self-egress recursion depth: 0 for an external request, or
+    /// the value a parent self-call stamped (validated against [`egress_nonce`](Self::egress_nonce)).
+    egress_depth: u32,
+    /// The per-process nonce that authenticates a self-egress depth marker.
+    egress_nonce: u64,
     /// The invocation's SQL transaction state (begun lazily on first query).
     #[cfg(feature = "sql")]
     sql: bindings::sql::SqlSession,
@@ -246,9 +255,28 @@ impl WasiHttpView for HostState {
         }
         let use_tls = config.use_tls;
         let allow_private = self.allow_private_egress;
+        let self_addrs = self.self_egress_addrs.clone();
+        let egress_depth = self.egress_depth;
+        let egress_nonce = self.egress_nonce;
         let handle = wasmtime_wasi::runtime::spawn(async move {
-            let result = match egress_target_allowed(request.uri(), use_tls, allow_private).await {
-                Ok(()) => {
+            let mut request = request;
+            let result = match egress_target_allowed(
+                request.uri(),
+                use_tls,
+                allow_private,
+                &self_addrs,
+                egress_depth,
+            )
+            .await
+            {
+                Ok(plan) => {
+                    // A self-call carries its (nonce-stamped) recursion depth so the
+                    // re-entering invocation sees it and the gate can cap the chain.
+                    if let Some(next) = plan.self_depth {
+                        if let Ok(v) = format!("{egress_nonce:x}:{next}").parse() {
+                            request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
+                        }
+                    }
                     wasmtime_wasi_http::types::default_send_request_handler(request, config).await
                 }
                 Err(code) => Err(code),
@@ -259,17 +287,44 @@ impl WasiHttpView for HostState {
     }
 }
 
+/// The request header carrying a guest self-egress call's recursion depth, stamped with the
+/// per-process [`HandlerEngine::egress_nonce`] as `<nonce>:<depth>` so an external client
+/// cannot forge it (a mismatched nonce is read as depth 0). Set on an outgoing self-call and
+/// read back when that call re-enters the serve pipeline.
+const SELF_EGRESS_DEPTH_HEADER: &str = "x-boatramp-egress-depth";
+
+/// Max guest→own-instance self-call depth before the egress gate refuses, so a guest can't
+/// self-recurse over loopback to exhaust the handler pool. Mirrors `MAX_INVOKE_DEPTH`.
+const MAX_SELF_EGRESS_DEPTH: u32 = 8;
+
+/// What the egress gate decided for a permitted request.
+struct EgressPlan {
+    /// `Some(next_depth)` when the target is this instance's own serve socket: the caller
+    /// stamps [`SELF_EGRESS_DEPTH_HEADER`] with `next_depth` on the outgoing request.
+    self_depth: Option<u32>,
+}
+
 /// Resolve `uri`'s host and (unless `allow_private`) require every address be globally
 /// routable, so a guest's `wasi:http` request can't target internal infrastructure (SSRF).
 /// `allow_private` is the operator posture's `allow_guest_private_egress` — on a trusted
 /// single-tenant/dev fleet a guest may reach loopback/private hosts; the multi-tenant
 /// default keeps the gate closed. Even with `allow_private`, the destination must still
 /// resolve (an empty/unresolvable host is refused).
+///
+/// `allow_private` is the posture's `allow_guest_private_egress` — on a trusted fleet a
+/// guest may reach any loopback/private host. `self_addrs` is the instance's own serve
+/// socket(s) (from `allow_guest_self_egress`): a target that resolves there is permitted
+/// **even when** `allow_private` is off — it is only boatramp's own auth-gated front door —
+/// but is capped at [`MAX_SELF_EGRESS_DEPTH`] against `egress_depth` so a guest can't
+/// self-recurse over loopback to exhaust the pool. Even when permitted, the destination
+/// must still resolve.
 async fn egress_target_allowed(
     uri: &http::Uri,
     use_tls: bool,
     allow_private: bool,
-) -> Result<(), wasmtime_wasi_http::bindings::http::types::ErrorCode> {
+    self_addrs: &[SocketAddr],
+    egress_depth: u32,
+) -> Result<EgressPlan, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
     let authority = uri.authority().ok_or(ErrorCode::HttpRequestUriInvalid)?;
     let port = authority
@@ -285,18 +340,31 @@ async fn egress_target_allowed(
         .await
         .map_err(|_| ErrorCode::DestinationNotFound)?;
     let mut saw_any = false;
+    let mut hit_self = false;
     for addr in addrs.by_ref() {
         saw_any = true;
-        // The SSRF gate — skipped only when the operator posture trusts guest egress.
-        if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
+        // The instance's own serve socket is always permitted (it re-enters the pipeline);
+        // depth-capped below. Otherwise apply the SSRF gate unless the posture trusts egress.
+        if self_addrs.contains(&addr) {
+            hit_self = true;
+        } else if !allow_private && !boatramp_core::access::is_global_ip(addr.ip()) {
             return Err(ErrorCode::DestinationIpProhibited);
         }
     }
-    if saw_any {
-        Ok(())
-    } else {
-        Err(ErrorCode::DestinationNotFound)
+    if !saw_any {
+        return Err(ErrorCode::DestinationNotFound);
     }
+    if hit_self {
+        let next = egress_depth.saturating_add(1);
+        if next > MAX_SELF_EGRESS_DEPTH {
+            // Too deep a self-recursion — refuse rather than nest further.
+            return Err(ErrorCode::DestinationIpProhibited);
+        }
+        return Ok(EgressPlan {
+            self_depth: Some(next),
+        });
+    }
+    Ok(EgressPlan { self_depth: None })
 }
 
 /// The handler engine: a wasmtime [`Engine`], a blob-hash-keyed cache of
@@ -338,6 +406,13 @@ pub struct HandlerEngine {
     /// default: guests reach only globally-routable hosts. Does not affect a guest calling
     /// its own site (served in-process, never network egress).
     allow_private_egress: bool,
+    /// The instance's own serve socket(s) a guest self-call may reach (`allow_guest_self_egress`).
+    /// Empty ⇒ self-egress off. Loopback normalization (`0.0.0.0` ⇒ `127.0.0.1`/`::1`) is done
+    /// by the caller (`build_handler_runtime`).
+    self_egress_addrs: Arc<[SocketAddr]>,
+    /// A per-process random nonce stamped on the self-egress depth header so an external
+    /// client can't forge it. Generated once at engine build.
+    egress_nonce: u64,
     epoch_ticker: tokio::task::JoinHandle<()>,
 }
 
@@ -395,6 +470,14 @@ impl HandlerEngine {
             streaming_limits: limits,
             outbound_timeout: None,
             allow_private_egress: false,
+            self_egress_addrs: Arc::from([] as [SocketAddr; 0]),
+            egress_nonce: {
+                let mut b = [0u8; 8];
+                // A failure here would only weaken the anti-forgery nonce, never break
+                // serving — fall back to a fixed value rather than refuse to build.
+                getrandom::getrandom(&mut b).ok();
+                u64::from_le_bytes(b)
+            },
             limits,
             epoch_ticker,
         })
@@ -447,6 +530,15 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_private_egress(mut self, allow: bool) -> Self {
         self.allow_private_egress = allow;
+        self
+    }
+
+    /// The instance's own serve socket(s) a guest self-call may reach (the posture's
+    /// `allow_guest_self_egress`). Empty ⇒ self-egress off. Pass the loopback-normalized
+    /// addresses (`0.0.0.0`/`[::]` ⇒ `127.0.0.1` + `::1` on the serve port).
+    #[must_use]
+    pub fn with_self_egress(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.self_egress_addrs = Arc::from(addrs);
         self
     }
 
@@ -714,6 +806,9 @@ impl HandlerEngine {
             bindings,
             outbound_timeout: self.outbound_timeout,
             allow_private_egress: self.allow_private_egress,
+            self_egress_addrs: self.self_egress_addrs.clone(),
+            egress_depth: 0,
+            egress_nonce: self.egress_nonce,
             #[cfg(feature = "sql")]
             sql,
         };
@@ -846,6 +941,22 @@ impl HandlerEngine {
         // errors map to `ErrorCode` — so the live request body flows into the
         // guest frame-by-frame instead of being buffered up front.
         let (parts, body) = request.into_parts();
+        // Inbound self-egress recursion depth: trust the marker only when it carries this
+        // process's nonce (an external client can't forge it) — otherwise this is a fresh
+        // external request at depth 0. A guest self-call then continues the chain at depth+1.
+        let nonce = store.data().egress_nonce;
+        let egress_depth = parts
+            .headers
+            .get(SELF_EGRESS_DEPTH_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split_once(':'))
+            .and_then(|(n, d)| {
+                (u64::from_str_radix(n, 16).ok()? == nonce)
+                    .then(|| d.parse::<u32>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        store.data_mut().egress_depth = egress_depth;
         let incoming = HostIncomingBody::new(
             stream_incoming_body(body, effective.max_body_bytes),
             BODY_FRAME_TIMEOUT,
@@ -1032,11 +1143,47 @@ mod tests {
     }
 
     async fn egress(uri: &str, tls: bool) -> Result<(), ErrorCode> {
-        egress_target_allowed(&uri.parse().unwrap(), tls, false).await
+        egress_target_allowed(&uri.parse().unwrap(), tls, false, &[], 0)
+            .await
+            .map(|_| ())
     }
 
     async fn egress_priv(uri: &str, tls: bool) -> Result<(), ErrorCode> {
-        egress_target_allowed(&uri.parse().unwrap(), tls, true).await
+        egress_target_allowed(&uri.parse().unwrap(), tls, true, &[], 0)
+            .await
+            .map(|_| ())
+    }
+
+    /// Self-egress: with the instance's own serve socket in the allow-set, a guest may reach
+    /// it even under the strict (private-blocked) posture — capped against recursion depth —
+    /// while other loopback/private targets stay blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn egress_guard_allows_self_socket_capped_by_depth() {
+        let self_sock: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let plan = |uri: &'static str, depth: u32| async move {
+            egress_target_allowed(&uri.parse().unwrap(), false, false, &[self_sock], depth).await
+        };
+        // The instance's own socket is permitted (private blocked otherwise) and marks the
+        // outgoing call as self at depth+1.
+        let ok = plan("http://127.0.0.1:8080/api", 0).await.unwrap();
+        assert_eq!(ok.self_depth, Some(1));
+        // A *different* loopback port is not the self socket → still blocked.
+        assert!(matches!(
+            plan("http://127.0.0.1:9999/", 0).await,
+            Err(ErrorCode::DestinationIpProhibited)
+        ));
+        // The self chain is depth-capped: at the max, one more hop is refused.
+        assert_eq!(
+            plan("http://127.0.0.1:8080/", MAX_SELF_EGRESS_DEPTH - 1)
+                .await
+                .unwrap()
+                .self_depth,
+            Some(MAX_SELF_EGRESS_DEPTH)
+        );
+        assert!(matches!(
+            plan("http://127.0.0.1:8080/", MAX_SELF_EGRESS_DEPTH).await,
+            Err(ErrorCode::DestinationIpProhibited)
+        ));
     }
 
     /// The SSRF egress guard refuses guest outbound HTTP to

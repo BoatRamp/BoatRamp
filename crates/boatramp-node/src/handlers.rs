@@ -55,6 +55,8 @@ pub async fn build_handler_runtime(
     max_component_bytes: u64,
     // Posture: whether a guest's outbound `wasi:http` may reach private/loopback hosts.
     allow_guest_private_egress: bool,
+    // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
+    self_egress_addrs: Vec<std::net::SocketAddr>,
     // The deploy store (for a managed compute-backed `sql` database's endpoint
     // resolution) and the `[secrets]` envelope (to seal a managed credential).
     deploy: &DeployStore,
@@ -113,7 +115,8 @@ pub async fn build_handler_runtime(
     .with_async_limits(async_limits)
     .with_streaming_limits(streaming_limits)
     .with_outbound_timeout(outbound_timeout)
-    .with_private_egress(allow_guest_private_egress);
+    .with_private_egress(allow_guest_private_egress)
+    .with_self_egress(self_egress_addrs);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
         data_dir,
@@ -322,6 +325,7 @@ pub async fn build_handler_runtime(
     _max_blob_bytes: u64,
     _max_component_bytes: u64,
     _allow_guest_private_egress: bool,
+    _self_egress_addrs: Vec<std::net::SocketAddr>,
     _deploy: &DeployStore,
     _secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {

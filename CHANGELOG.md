@@ -8,6 +8,16 @@ versions.
 ## [Unreleased]
 
 ### Added
+- **`allow_guest_self_egress` security posture knob.** A tighter companion to
+  `allow_guest_private_egress`: it lets a handler guest's outbound `wasi:http` reach **only
+  this instance's own HTTP serve socket** (loopback on the serve port, or the bind address)
+  even when private egress is off — so a guest can call its own front door over standard HTTP
+  without opening the whole private range. The self-call re-enters the full pipeline (host
+  routing, visitor auth, rate-limit, DV), so it reaches only what any anonymous client could,
+  and a self-recursion is bounded by a process-nonce-stamped depth cap (a value an external
+  client can't forge). **On by default** in every posture; `[security]`-overridable. For
+  depth-capped, allowlisted function-to-function calls, the `invoke` binding remains the
+  intended path and is unaffected by any egress knob.
 - **`allow_guest_private_egress` security posture knob.** A handler guest's outbound
   `wasi:http` has its own SSRF gate, separate from the gateway-upstream gate that
   `allow_site_private_upstreams` controls. That guest gate was previously hardcoded to

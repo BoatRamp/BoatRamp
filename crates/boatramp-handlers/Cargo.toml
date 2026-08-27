@@ -29,6 +29,7 @@ engine = [
   "dep:bytes",
   "dep:futures",
   "dep:tracing",
+  "dep:getrandom",
   "tokio/sync",
   "tokio/rt",
   "tokio/time",
@@ -74,6 +75,8 @@ hyper = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+# A per-process nonce stamps the self-egress depth marker so an external client can't forge it.
+getrandom = { workspace = true, optional = true }
 # For the object-safe `Invoker` trait behind the `invoke` feature.
 async-trait = { workspace = true, optional = true }
 

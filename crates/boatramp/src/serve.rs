@@ -730,6 +730,7 @@ pub async fn run(args: ServeArgs, config: &ServerConfig) -> Result<()> {
         kv,
         auth,
         options,
+        serve_addr: Some(addr),
         watch_provider: built_blobs.watch_provider.clone(),
         provision_tier: built_blobs.provision_tier,
         // Single-node: default messaging, an always-true leader gate (one node), id 0.
@@ -1591,6 +1592,7 @@ async fn run_cluster(
         kv,
         auth,
         options,
+        serve_addr: Some(addr),
         watch_provider: built_blobs.watch_provider.clone(),
         provision_tier: built_blobs.provision_tier,
         messaging: Some(node.messaging.clone()),
