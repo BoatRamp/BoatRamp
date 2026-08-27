@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use boatramp_types::access::{hash_password, BasicAuth, RateLimit};
-use boatramp_types::config::{Hsts, SiteConfig};
+use boatramp_types::config::{HandlersSiteConfig, Hsts, SiteConfig};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -105,6 +105,7 @@ fn config_form(props: &ConfigFormProps) -> Html {
             <SecurityPanel config={config.clone()} />
             <AccessPanel config={config.clone()} />
             <WafPanel config={config.clone()} />
+            <HandlersPanel config={config.clone()} />
             <CompressionPanel config={config.clone()} />
             <DomainVerifications site={site.clone()} />
 
@@ -660,6 +661,125 @@ fn waf_panel(props: &PanelProps) -> Html {
 }
 
 // ---- Compression ------------------------------------------------------------
+
+/// Parse a cap text field: empty ⇒ `None` (engine default), else the parsed number.
+fn parse_opt_u32(s: &str) -> Option<u32> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.parse().ok()).flatten()
+}
+
+/// Like [`parse_opt_u32`] for the 64-bit fuel cap.
+fn parse_opt_u64(s: &str) -> Option<u64> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.parse().ok()).flatten()
+}
+
+/// Render an optional cap as a text-field value (`None` ⇒ empty).
+fn cap_str<T: ToString>(v: Option<T>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// The site's WebAssembly handler policy (`SiteConfig.handlers`): the enablement gate
+/// activation checks against, the import allowlist, and the per-handler resource caps.
+#[function_component(HandlersPanel)]
+fn handlers_panel(props: &PanelProps) -> Html {
+    let update = make_update(&props.config);
+    // The current policy (a default when unset) for rendering.
+    let h = props.config.handlers.clone().unwrap_or_default();
+
+    let on_enabled = {
+        let update = update.clone();
+        Callback::from(move |v: bool| {
+            update(&move |c: &mut SiteConfig| {
+                c.handlers
+                    .get_or_insert_with(HandlersSiteConfig::default)
+                    .enabled = v;
+            });
+        })
+    };
+    let on_imports = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let list = lines_split(&v);
+            update(&move |c: &mut SiteConfig| {
+                c.handlers
+                    .get_or_insert_with(HandlersSiteConfig::default)
+                    .allow_imports = list.clone();
+            });
+        })
+    };
+    let on_mem = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let val = parse_opt_u32(&v);
+            update(&move |c: &mut SiteConfig| {
+                c.handlers
+                    .get_or_insert_with(HandlersSiteConfig::default)
+                    .max_memory_mb = val;
+            });
+        })
+    };
+    let on_timeout = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let val = parse_opt_u32(&v);
+            update(&move |c: &mut SiteConfig| {
+                c.handlers
+                    .get_or_insert_with(HandlersSiteConfig::default)
+                    .max_timeout_ms = val;
+            });
+        })
+    };
+    let on_conc = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let val = parse_opt_u32(&v);
+            update(&move |c: &mut SiteConfig| {
+                c.handlers
+                    .get_or_insert_with(HandlersSiteConfig::default)
+                    .max_concurrency = val;
+            });
+        })
+    };
+    let on_fuel = {
+        let update = update.clone();
+        Callback::from(move |v: String| {
+            let val = parse_opt_u64(&v);
+            update(&move |c: &mut SiteConfig| {
+                c.handlers
+                    .get_or_insert_with(HandlersSiteConfig::default)
+                    .max_fuel = val;
+            });
+        })
+    };
+
+    html! {
+        <Section title="Handlers">
+            <CheckField label="Run WebAssembly handlers on this site" checked={h.enabled}
+                        on_change={on_enabled} />
+            if h.enabled {
+                <div class="ml-6 space-y-3 border-l border-slate-100 pl-4">
+                    <TextAreaField label="Allowed imports (one per line)"
+                        value={lines_join(&h.allow_imports)}
+                        hint={"Interfaces a handler may import (sql, wasi:keyvalue, invoke, …). Must be a superset of every handler's declared imports, or activation is refused."}
+                        on_change={on_imports} />
+                    <TextField label="Max memory (MiB)" value={cap_str(h.max_memory_mb)}
+                               hint="Empty ⇒ engine default." on_change={on_mem} />
+                    <TextField label="Max timeout (ms)" value={cap_str(h.max_timeout_ms)}
+                               hint="Empty ⇒ engine default." on_change={on_timeout} />
+                    <TextField label="Max concurrency" value={cap_str(h.max_concurrency)}
+                               hint="Concurrent invocations for this site." on_change={on_conc} />
+                    <TextField label="Max fuel" value={cap_str(h.max_fuel)}
+                               hint="Per-handler CPU fuel budget." on_change={on_fuel} />
+                </div>
+            } else {
+                <p class="ml-6 text-sm text-slate-500">
+                    { "A deployment that ships handlers is refused at activation until this is on." }
+                </p>
+            }
+        </Section>
+    }
+}
 
 #[function_component(CompressionPanel)]
 fn compression_panel(props: &PanelProps) -> Html {
