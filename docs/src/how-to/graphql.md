@@ -209,18 +209,17 @@ real security control.
 
 ### The safelist (managing the allowlist)
 
-Curate the project's trusted operations with the safelist endpoint. Registering
-an operation returns its hash (validated for parse + depth/complexity first, so a
-bad operation is rejected here, not at run time):
+Curate the project's trusted operations with `boatramp graphql safelist`.
+Registering an operation returns its hash (validated for parse + depth/complexity
+first, so a bad operation is rejected here, not at run time):
 
-```bash
-# Register a trusted operation (returns { "hash": "<sha256>" })
-curl -X POST https://api.example.com/api/projects/acme/graphql/safelist \
-  -H 'content-type: application/json' \
-  -d '{"query": "{ me { name } }"}'
+```sh
+# Register a trusted operation (returns its hash). `--project` selects the project;
+# give the query inline or with `--file query.graphql`.
+boatramp graphql safelist add '{ me { name } }' --project acme
 
-curl     https://api.example.com/api/projects/acme/graphql/safelist          # list
-curl -X DELETE https://api.example.com/api/projects/acme/graphql/safelist/<hash>  # remove
+boatramp graphql safelist list --project acme          # list registered operations
+boatramp graphql safelist rm <hash> --project acme     # remove one by hash
 ```
 
 ## Run the supergraph from a guest
@@ -267,19 +266,18 @@ compose them into one supergraph.
 
 ### Register subgraphs
 
-Publish each subgraph's SDL to the project registry:
+Publish each subgraph's SDL to the project registry with
+`boatramp graphql subgraph put`:
 
-```bash
-curl -X PUT --data-binary @accounts.graphql \
-  https://api.example.com/api/projects/acme/graphql/subgraphs/accounts
-curl -X PUT --data-binary @reviews.graphql \
-  https://api.example.com/api/projects/acme/graphql/subgraphs/reviews
+```sh
+boatramp graphql subgraph put accounts --sdl accounts.graphql --project acme
+boatramp graphql subgraph put reviews  --sdl reviews.graphql  --project acme
 ```
 
 Each publish recomposes the whole supergraph and **rejects the change if it
 does not compose** (a field co-owned without `@shareable`, or SDL that does not
 parse) — a bad publish never corrupts the registry. Read the composed
-supergraph with `GET /api/projects/acme/graphql/supergraph`.
+supergraph with `boatramp graphql supergraph --project acme`.
 
 A **function subgraph** registers itself — no hand-written SDL, and often **no separate call
 at all**:
@@ -293,8 +291,8 @@ at all**:
 - **Explicit.** For a hand-written subgraph (or to register out-of-band), call it directly —
   boatramp introspects the *deployed* function and publishes:
 
-  ```bash
-  curl -X PUT https://api.example.com/api/projects/acme/graphql/subgraphs/accounts/function
+  ```sh
+  boatramp graphql subgraph function accounts --project acme
   ```
 
 boatramp invokes the function anonymously (the SDL is public), publishes the returned SDL
@@ -313,7 +311,7 @@ For a **coordinated migration** across several subgraphs (an entity-key change, 
 field's ownership) where an intermediate step can't compose, use the escape hatches:
 deploy the new version *without* touching the registry with
 `PUT /api/functions/accounts?register_subgraph=false`, or unregister the subgraph first
-with `DELETE /api/projects/acme/graphql/subgraphs/accounts`, then re-register when the set
+with `boatramp graphql subgraph rm accounts --project acme`, then re-register when the set
 composes again.
 
 A subgraph can also be **SQL-backed** — the [data connector](#graphql-from-your-database-no-resolver-code)
@@ -321,10 +319,11 @@ acting as a federation subgraph. Register it by naming a site's managed database
 what to expose; boatramp introspects the database and generates the `@key` SDL for you
 (no hand-written SDL):
 
-```bash
-curl -X PUT https://api.example.com/api/projects/acme/graphql/subgraphs/accounts/sql \
-  -H 'content-type: application/json' \
-  -d '{"site": "accounts", "config": {"enabled": true, "tables": {"users": {"columns": ["id", "name"]}}}}'
+```sh
+# accounts-sql.json:
+#   {"site": "accounts",
+#    "config": {"enabled": true, "tables": {"users": {"columns": ["id", "name"]}}}}
+boatramp graphql subgraph sql accounts --file accounts-sql.json --project acme
 ```
 
 The gateway then resolves that subgraph's fetches by compiling to SQL — both its root

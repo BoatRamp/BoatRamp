@@ -57,6 +57,15 @@ pub enum CliError {
     /// The `handlers` command.
     #[error(transparent)]
     Handlers(#[from] crate::handlers::Error),
+    /// The `compression` command.
+    #[error(transparent)]
+    Compression(#[from] crate::compression::Error),
+    /// The `security-headers` command.
+    #[error(transparent)]
+    SecurityHeaders(#[from] crate::security_headers::Error),
+    /// The `graphql` command.
+    #[error(transparent)]
+    Graphql(#[from] crate::graphql::Error),
     /// The `token` command.
     #[error(transparent)]
     Token(#[from] crate::token::Error),

@@ -69,6 +69,35 @@ enum AccessCommand {
         #[command(subcommand)]
         command: TrustedProxyCommand,
     },
+    /// Configure the built-in WAF (user-agent rules + anomaly scoring).
+    Waf {
+        #[command(subcommand)]
+        command: WafCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WafCommand {
+    /// Enable user-agent filtering, optionally setting the deny/allow lists
+    /// (`--deny`/`--allow` **replace** the respective list when given).
+    UserAgent {
+        /// A user-agent substring/pattern to deny; repeatable.
+        #[arg(long = "deny", value_name = "PATTERN")]
+        deny: Vec<String>,
+        /// A user-agent substring/pattern to always allow; repeatable.
+        #[arg(long = "allow", value_name = "PATTERN")]
+        allow: Vec<String>,
+    },
+    /// Disable user-agent filtering.
+    UserAgentOff,
+    /// Enable heuristic anomaly scoring, optionally setting the block threshold.
+    Anomaly {
+        /// Score at or above which a request is blocked.
+        #[arg(long)]
+        threshold: Option<u32>,
+    },
+    /// Disable anomaly scoring.
+    AnomalyOff,
 }
 
 #[derive(Debug, Subcommand)]
@@ -230,6 +259,36 @@ pub async fn run(args: AccessArgs, config: &ProjectConfig) -> Result<()> {
             TrustedProxyCommand::Clear => {
                 access.trusted_proxies.clear();
                 println!("cleared trusted proxies for {site}");
+            }
+        },
+        AccessCommand::Waf { command } => match command {
+            WafCommand::UserAgent { deny, allow } => {
+                access.waf.user_agent.enabled = true;
+                if !deny.is_empty() {
+                    access.waf.user_agent.deny = deny;
+                }
+                if !allow.is_empty() {
+                    access.waf.user_agent.allow = allow;
+                }
+                println!("waf: user-agent filtering enabled for {site}");
+            }
+            WafCommand::UserAgentOff => {
+                access.waf.user_agent.enabled = false;
+                println!("waf: user-agent filtering disabled for {site}");
+            }
+            WafCommand::Anomaly { threshold } => {
+                access.waf.anomaly.enabled = true;
+                if let Some(t) = threshold {
+                    access.waf.anomaly.threshold = t;
+                }
+                println!(
+                    "waf: anomaly scoring enabled for {site} (threshold {})",
+                    access.waf.anomaly.threshold
+                );
+            }
+            WafCommand::AnomalyOff => {
+                access.waf.anomaly.enabled = false;
+                println!("waf: anomaly scoring disabled for {site}");
             }
         },
     }

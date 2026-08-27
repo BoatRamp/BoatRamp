@@ -7,7 +7,7 @@
 //! A deployment that ships handlers is refused at activation unless the site is
 //! `enabled` and its `allow_imports` is a superset of every handler's declared imports.
 
-use boatramp_core::config::HandlersSiteConfig;
+use boatramp_core::config::{CookieAuthConfig, HandlerCacheConfig, HandlersSiteConfig};
 use clap::Subcommand;
 
 use crate::client;
@@ -77,6 +77,46 @@ enum HandlersCommand {
         #[arg(required = true, value_name = "IMPORT")]
         imports: Vec<String>,
     },
+    /// Configure the edge response cache for handler routes.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+    /// Configure browser cookie → application-bearer session auth.
+    CookieAuth {
+        #[command(subcommand)]
+        command: CookieAuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Enable the edge response cache, optionally with per-entry / TTL caps.
+    Enable {
+        /// Max cached response body size (bytes).
+        #[arg(long)]
+        max_entry_bytes: Option<u64>,
+        /// Max cache entry lifetime (seconds).
+        #[arg(long)]
+        max_ttl_secs: Option<u64>,
+    },
+    /// Disable the edge response cache.
+    Disable,
+}
+
+#[derive(Debug, Subcommand)]
+enum CookieAuthCommand {
+    /// Treat the named cookie as the application bearer for this site.
+    Set {
+        /// Cookie name (e.g. `__Host-session`).
+        #[arg(long)]
+        cookie_name: String,
+        /// An extra allowed browser origin (for a cross-origin app); repeatable.
+        #[arg(long = "allowed-origin", value_name = "ORIGIN")]
+        allowed_origins: Vec<String>,
+    },
+    /// Turn off cookie session auth.
+    Clear,
 }
 
 /// Entry point for `boatramp handlers`.
@@ -149,6 +189,47 @@ pub async fn run(args: HandlersArgs, config: &ProjectConfig) -> Result<()> {
                 fmt_list(&handlers.allow_imports)
             );
         }
+        HandlersCommand::Cache { command } => match command {
+            CacheCommand::Enable {
+                max_entry_bytes,
+                max_ttl_secs,
+            } => {
+                let cache = handlers
+                    .cache
+                    .get_or_insert_with(HandlerCacheConfig::default);
+                cache.enabled = true;
+                if max_entry_bytes.is_some() {
+                    cache.max_entry_bytes = max_entry_bytes;
+                }
+                if max_ttl_secs.is_some() {
+                    cache.max_ttl_secs = max_ttl_secs;
+                }
+                println!("handlers cache enabled for {site}");
+            }
+            CacheCommand::Disable => {
+                if let Some(cache) = handlers.cache.as_mut() {
+                    cache.enabled = false;
+                }
+                println!("handlers cache disabled for {site}");
+            }
+        },
+        HandlersCommand::CookieAuth { command } => match command {
+            CookieAuthCommand::Set {
+                cookie_name,
+                allowed_origins,
+            } => {
+                let ca = handlers
+                    .cookie_auth
+                    .get_or_insert_with(CookieAuthConfig::default);
+                ca.cookie_name = cookie_name.clone();
+                ca.allowed_origins = allowed_origins;
+                println!("cookie auth on {site}: cookie {cookie_name}");
+            }
+            CookieAuthCommand::Clear => {
+                handlers.cookie_auth = None;
+                println!("cookie auth disabled for {site}");
+            }
+        },
     }
 
     cp.put_site_config(&site, &site_config).await?;

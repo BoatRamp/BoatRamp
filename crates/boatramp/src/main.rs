@@ -49,6 +49,7 @@ mod cluster;
 mod cluster_tls;
 mod completions;
 mod compose;
+mod compression;
 mod compute;
 // The config model moved to `boatramp-node` (library); re-export it under the
 // binary's `crate::config` so existing call sites are unchanged.
@@ -61,6 +62,7 @@ mod domains;
 mod error;
 mod function;
 mod gateway;
+mod graphql;
 mod handler_validate;
 mod handlers;
 mod workflow;
@@ -78,6 +80,7 @@ mod migrate;
 mod operator;
 mod project;
 mod security;
+mod security_headers;
 mod serve;
 mod sync;
 mod token;
@@ -143,6 +146,12 @@ enum Command {
     Access(access::AccessArgs),
     /// Manage a site's handler policy (enable/disable, import allowlist, caps).
     Handlers(handlers::HandlersArgs),
+    /// Manage a project's GraphQL admin (persisted-op safelist + federation subgraphs).
+    Graphql(graphql::GraphqlArgs),
+    /// Configure on-the-fly response compression for a site.
+    Compression(compression::CompressionArgs),
+    /// Configure a site's response security headers (HTTPS redirect, HSTS, CSP, frame-options).
+    SecurityHeaders(security_headers::SecurityHeadersArgs),
     /// Manage control-plane API tokens.
     Token(token::TokenArgs),
     /// Operate a self-hosted cluster's mesh membership (mint join tokens).
@@ -451,6 +460,9 @@ async fn async_main() -> Result<(), CliError> {
         Command::Project(args) => project::run(args, &config).await?,
         Command::Access(args) => access::run(args, &config).await?,
         Command::Handlers(args) => handlers::run(args, &config).await?,
+        Command::Compression(args) => compression::run(args, &config).await?,
+        Command::SecurityHeaders(args) => security_headers::run(args, &config).await?,
+        Command::Graphql(args) => graphql::run(args, &config).await?,
         Command::Token(args) => token::run(args, &config).await?,
         Command::Cluster(args) => cluster::run(args, &config).await?,
         Command::Auth(args) => authcmd::run(args, &config).await?,
