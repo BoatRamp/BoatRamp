@@ -247,6 +247,37 @@ fn dedup(imports: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Render a string list as `[a, b]` or `[]`.
+fn fmt_list(list: &[String]) -> String {
+    format!("[{}]", list.join(", "))
+}
+
+/// Print the site's handler policy for `handlers show`.
+fn print_policy(site: &str, handlers: Option<&HandlersSiteConfig>) {
+    match handlers.filter(|h| h.enabled) {
+        None => {
+            println!("handlers: disabled for {site}");
+            println!("  enable with: boatramp handlers enable --site {site} [--allow <import>]…");
+        }
+        Some(h) => {
+            println!("handlers: enabled for {site}");
+            println!("  allow_imports: {}", fmt_list(&h.allow_imports));
+            if let Some(v) = h.max_memory_mb {
+                println!("  max_memory_mb: {v}");
+            }
+            if let Some(v) = h.max_timeout_ms {
+                println!("  max_timeout_ms: {v}");
+            }
+            if let Some(v) = h.max_concurrency {
+                println!("  max_concurrency: {v}");
+            }
+            if let Some(v) = h.max_fuel {
+                println!("  max_fuel: {v}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,36 +315,5 @@ mod tests {
         // disable keeps the allowlist
         h.enabled = false;
         assert_eq!(h.allow_imports, vec!["sql", "invoke"]);
-    }
-}
-
-/// Render a string list as `[a, b]` or `[]`.
-fn fmt_list(list: &[String]) -> String {
-    format!("[{}]", list.join(", "))
-}
-
-/// Print the site's handler policy for `handlers show`.
-fn print_policy(site: &str, handlers: Option<&HandlersSiteConfig>) {
-    match handlers.filter(|h| h.enabled) {
-        None => {
-            println!("handlers: disabled for {site}");
-            println!("  enable with: boatramp handlers enable --site {site} [--allow <import>]…");
-        }
-        Some(h) => {
-            println!("handlers: enabled for {site}");
-            println!("  allow_imports: {}", fmt_list(&h.allow_imports));
-            if let Some(v) = h.max_memory_mb {
-                println!("  max_memory_mb: {v}");
-            }
-            if let Some(v) = h.max_timeout_ms {
-                println!("  max_timeout_ms: {v}");
-            }
-            if let Some(v) = h.max_concurrency {
-                println!("  max_concurrency: {v}");
-            }
-            if let Some(v) = h.max_fuel {
-                println!("  max_fuel: {v}");
-            }
-        }
     }
 }
