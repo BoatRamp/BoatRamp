@@ -7,6 +7,8 @@ versions.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-27
+
 ### Added
 - **`allow_guest_self_egress` security posture knob.** A tighter companion to
   `allow_guest_private_egress`: it lets a handler guest's outbound `wasi:http` reach **only
