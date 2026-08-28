@@ -7,6 +7,16 @@
 use super::*;
 use boatramp_core::project::ProjectRef;
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::http;
+use boatramp_http::h1::{chunked, encode_request_head, BodyReader, Conn};
+use bytes::Bytes;
+use futures::Stream;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+
 /// Reverse-proxy a GET to an absolute upstream URL, streaming the response.
 ///
 /// Guarded against SSRF: only `http`/`https`, the host must pass the deploy
@@ -27,7 +37,8 @@ pub(super) async fn proxy(
             return (StatusCode::FORBIDDEN, "proxy target not allowed\n").into_response();
         }
     };
-    let client = match pinned_client(&host, addr) {
+    let https = parsed.scheme() == "https";
+    let client = match pinned_client(&host, addr, https) {
         Ok(client) => client,
         Err(_) => return (StatusCode::BAD_GATEWAY, "proxy client error\n").into_response(),
     };
@@ -87,8 +98,9 @@ pub(super) async fn proxy(
                 }
                 headers.insert(name.clone(), value.clone());
             }
-            // Stream `hyper::body::Incoming` straight to the client — no copy.
-            (status, headers, Body::new(resp.into_body())).into_response()
+            // Stream the upstream body straight to the client off the pooled connection —
+            // no hyper connection task, no intermediate copy (see [`ClientBody`]).
+            (status, headers, Body::from_stream(resp.into_body())).into_response()
         }
         Err(UpstreamError::Timeout) => {
             tracing::warn!(%url, "proxy request timed out");
@@ -151,41 +163,83 @@ async fn check_proxy_target(
 /// overhead. Operators can override it per upstream (`read_buffer_bytes`).
 const DEFAULT_UPSTREAM_READ_BUFFER: usize = 32 * 1024;
 
-/// Cache key for a pinned upstream client: the pinned resolution plus the
-/// per-upstream options that change the built client.
+/// Pool key for pinned upstream connections: the pinned resolution plus the per-upstream
+/// options that determine how a connection is dialed (so a TLS and a plaintext connection,
+/// or two different read-buffer sizes, never share a pool bucket).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UpstreamClientKey {
     host: String,
     addr: SocketAddr,
+    /// Whether the upstream leg is TLS (`https`/`wss`) — a pooled plaintext connection can
+    /// never satisfy an `https` request, so it is part of the identity.
+    https: bool,
     connect_timeout_ms: Option<u64>,
     request_timeout_ms: Option<u64>,
     tls_insecure: bool,
     read_buffer_bytes: Option<usize>,
 }
 
-/// Our pinned upstream connector: an `HttpConnector` whose resolver only ever
-/// returns the pre-verified `addr` (so a reconnect can never reach a different,
-/// internal host — the SSRF pin holds), wrapped by hyper-rustls for TLS.
-type PinnedConnector = hyper_rustls::HttpsConnector<
-    hyper_util::client::legacy::connect::HttpConnector<PinnedResolver>,
->;
+/// One end of an established upstream HTTP/1.1 connection: plaintext TCP, or a rustls TLS
+/// stream over TCP. The pool holds these and `boatramp_http::h1::Conn` drives the wire over
+/// whichever transport this is. Delegating `AsyncRead`/`AsyncWrite` (rather than boxing to
+/// `dyn`) keeps the hot read/write path monomorphic.
+enum Upstream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
 
-/// The raw-hyper (no reqwest) pooled client backing the reverse-proxy data plane.
-/// hyper-util's `legacy::Client` exposes the knob reqwest hides —
-/// `http1_max_buf_size`, which caps the per-connection H1 read buffer — and lets us
-/// stream `hyper::body::Incoming` straight through with no intermediate copy. It has
-/// no redirect layer, so a reverse proxy hands upstream 3xx back to the client by
-/// construction (reqwest's `Policy::limited(10)` default would instead chase them,
-/// un-pinned, past our SSRF allow-list).
-type HyperClient = hyper_util::client::legacy::Client<PinnedConnector, Body>;
+impl AsyncRead for Upstream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
 
-/// A pinned upstream client plus its total-request timeout. hyper-util's client has
-/// no built-in per-request deadline (unlike reqwest's `.timeout()`), so we carry it
-/// and enforce it in [`UpstreamClient::send`]. Cheap to clone (`Arc` inside).
-#[derive(Clone)]
-struct UpstreamClient {
-    inner: HyperClient,
-    request_timeout: Option<Duration>,
+impl AsyncWrite for Upstream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_write_vectored(),
+            Self::Tls(s) => s.is_write_vectored(),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
 }
 
 /// How an upstream request failed, mapped to a client-visible status.
@@ -197,65 +251,374 @@ enum UpstreamError {
     Failed,
 }
 
+/// An idle keep-alive upstream connection plus when it went idle (for the reap bound).
+struct IdleConn {
+    conn: Conn<Upstream>,
+    idle_since: std::time::Instant,
+}
+
+/// How long an idle upstream connection is retained before it is reaped on the next
+/// checkout — mirrors the previous hyper `pool_idle_timeout`, returning connection memory
+/// promptly after a spike drains.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cap on idle connections retained per upstream key — bounds idle pool memory at fan-out.
+const MAX_IDLE_PER_KEY: usize = 64;
+
+/// Process-wide pool of idle keep-alive upstream connections, keyed by the pinned upstream
+/// identity. Replaces hyper-util's internal connection pool: a cleanly drained keep-alive
+/// response returns its connection here (see [`ClientBody`]), and the next request to the
+/// same upstream checks one out instead of re-dialing + re-handshaking.
+static POOL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<UpstreamClientKey, Vec<IdleConn>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Check out a live idle connection for `key`, discarding any that have exceeded the idle
+/// bound. Returns `None` when the pool has no fresh connection (the caller then dials).
+fn pool_checkout(key: &UpstreamClientKey) -> Option<Conn<Upstream>> {
+    let mut pool = POOL.lock().unwrap();
+    let list = pool.get_mut(key)?;
+    while let Some(idle) = list.pop() {
+        if idle.idle_since.elapsed() < POOL_IDLE_TIMEOUT {
+            return Some(idle.conn);
+        }
+        // Expired — drop it and try the next-most-recent.
+    }
+    None
+}
+
+/// Return a drained keep-alive connection to the pool for reuse. A connection with any
+/// out-of-band leftover bytes (a pipelined byte past the body) is dropped, not pooled — the
+/// message boundary can no longer be trusted for the next request.
+fn pool_return(key: &UpstreamClientKey, conn: Conn<Upstream>) {
+    if conn.buffered() != 0 {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap();
+    let list = pool.entry(key.clone()).or_default();
+    if list.len() < MAX_IDLE_PER_KEY {
+        list.push(IdleConn {
+            conn,
+            idle_since: std::time::Instant::now(),
+        });
+    }
+    // Over the cap: drop the connection (close it) rather than grow the idle set.
+}
+
+/// Cached rustls client configs for the upstream leg, keyed by `tls_insecure`. Building one
+/// loads the webpki root store, so the two variants are cached and reused across dials.
+static TLS_CLIENT_CONFIGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<bool, Arc<rustls::ClientConfig>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn tls_client_config(tls_insecure: bool) -> Result<Arc<rustls::ClientConfig>, ()> {
+    if let Some(cfg) = TLS_CLIENT_CONFIGS.lock().unwrap().get(&tls_insecure) {
+        return Ok(cfg.clone());
+    }
+    let cfg = Arc::new(upstream_tls_config(tls_insecure)?);
+    Ok(TLS_CLIENT_CONFIGS
+        .lock()
+        .unwrap()
+        .entry(tls_insecure)
+        .or_insert(cfg)
+        .clone())
+}
+
+/// The request body, framed for the upstream write. Built once per request from the
+/// forwarded headers + the inbound body stream; `None`/idempotent requests are retryable on
+/// a stale pooled connection, bodied requests are not (the stream can't be replayed).
+enum BodyPlan {
+    /// No request body.
+    None,
+    /// A fixed-length body (the forwarded `Content-Length`) — forward the stream raw.
+    Fixed,
+    /// An unknown-length body — chunk-encode it, starting with this already-peeked chunk.
+    Chunked(Bytes),
+}
+
+/// The inbound request-body data stream (from `axum::body::Body::into_data_stream`), boxed
+/// so it can be threaded through the send path without a generic parameter. Only consumed
+/// for `Fixed`/`Chunked` plans (never for the retryable `None` path).
+type BodyData = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
+
+/// A pinned upstream client: a handle over the shared connection pool for one upstream
+/// identity. Cheap to clone (just the key); the connections live in [`POOL`].
+#[derive(Clone)]
+struct UpstreamClient {
+    key: UpstreamClientKey,
+}
+
 impl UpstreamClient {
-    /// Send `req` upstream and return the response with its body streamed back.
-    /// Enforces the per-upstream total-request timeout (to first byte) if set.
-    async fn send(
+    /// Send `req` upstream and return the response with its body streamed straight back to
+    /// the client — no hyper connection task, and no copy of the body between the upstream
+    /// read buffer and the downstream writer. Enforces the per-upstream total-request
+    /// timeout (to the response head) if set.
+    async fn send(&self, req: Request<Body>) -> Result<Response<ClientBody>, UpstreamError> {
+        let (mut parts, body) = req.into_parts();
+
+        // Origin-form request target (path + query); `Host` from the pinned URI authority.
+        let target = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        // We own framing: capture the declared length, then strip the framing headers and
+        // set our own (so a forwarded `Content-Length`/`Transfer-Encoding` can't desync us).
+        let declared_len = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::TRANSFER_ENCODING);
+        if !parts.headers.contains_key(header::HOST) {
+            if let Some(auth) = parts.uri.authority() {
+                if let Ok(v) = HeaderValue::from_str(auth.as_str()) {
+                    parts.headers.insert(header::HOST, v);
+                }
+            }
+        }
+
+        // Decide request-body framing. A declared length forwards the stream fixed; no
+        // length peeks the body — empty ⇒ no body (a GET), non-empty ⇒ chunked.
+        let mut data: BodyData = Box::pin(body.into_data_stream());
+        let plan = match declared_len {
+            Some(0) => BodyPlan::None,
+            Some(n) => {
+                parts
+                    .headers
+                    .insert(header::CONTENT_LENGTH, HeaderValue::from(n));
+                BodyPlan::Fixed
+            }
+            None => match data.next().await {
+                None => BodyPlan::None,
+                Some(Ok(first)) => {
+                    parts.headers.insert(
+                        header::TRANSFER_ENCODING,
+                        HeaderValue::from_static("chunked"),
+                    );
+                    BodyPlan::Chunked(first)
+                }
+                Some(Err(_)) => return Err(UpstreamError::Failed),
+            },
+        };
+
+        let head_bytes = encode_request_head(&parts.method, &target, &parts.headers);
+        let method = parts.method.clone();
+
+        // A bodyless idempotent request is safe to replay on a fresh connection if a pooled
+        // one turns out to have been closed by the upstream (the request never reached it,
+        // or the method is idempotent). A bodied request is not — its stream is consumed.
+        let retryable = matches!(plan, BodyPlan::None) && is_idempotent(&method);
+        if let Some(conn) = pool_checkout(&self.key) {
+            match self.attempt(conn, &head_bytes, plan, data, &method).await {
+                Ok(resp) => return Ok(resp),
+                Err(UpstreamError::Timeout) => return Err(UpstreamError::Timeout),
+                Err(UpstreamError::Failed) if retryable => {
+                    // Fall through to a fresh dial — the pooled connection was stale.
+                    let conn = self.dial().await.map_err(|()| UpstreamError::Failed)?;
+                    return self
+                        .attempt(
+                            conn,
+                            &head_bytes,
+                            BodyPlan::None,
+                            empty_body_data(),
+                            &method,
+                        )
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let conn = self.dial().await.map_err(|()| UpstreamError::Failed)?;
+        self.attempt(conn, &head_bytes, plan, data, &method).await
+    }
+
+    /// One attempt over `conn`: write the request head + body, read the response head, and
+    /// wrap the response in a [`ClientBody`] that streams the body and returns the drained
+    /// connection to the pool. Bounded by the per-upstream request timeout (to the head).
+    async fn attempt(
         &self,
-        req: Request<Body>,
-    ) -> Result<Response<hyper::body::Incoming>, UpstreamError> {
-        let fut = self.inner.request(req);
-        let result = match self.request_timeout {
-            Some(dur) => match tokio::time::timeout(dur, fut).await {
+        mut conn: Conn<Upstream>,
+        head_bytes: &[u8],
+        plan: BodyPlan,
+        mut data: BodyData,
+        method: &Method,
+    ) -> Result<Response<ClientBody>, UpstreamError> {
+        let exchange = async {
+            conn.write_all(head_bytes).await?;
+            match plan {
+                BodyPlan::None => {}
+                BodyPlan::Fixed => {
+                    while let Some(item) = data.next().await {
+                        let chunk =
+                            item.map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                        conn.write_all(&chunk).await?;
+                    }
+                }
+                BodyPlan::Chunked(first) => {
+                    if !first.is_empty() {
+                        conn.write_all(&chunked::encode(&first)).await?;
+                    }
+                    while let Some(item) = data.next().await {
+                        let chunk =
+                            item.map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                        if !chunk.is_empty() {
+                            conn.write_all(&chunked::encode(&chunk)).await?;
+                        }
+                    }
+                    conn.write_all(&chunked::encode_last(&HeaderMap::new()))
+                        .await?;
+                }
+            }
+            conn.flush().await?;
+            conn.read_response_head().await
+        };
+
+        let request_timeout = self.key.request_timeout_ms.map(Duration::from_millis);
+        let head = match request_timeout {
+            Some(dur) => match tokio::time::timeout(dur, exchange).await {
                 Ok(result) => result,
                 Err(_) => return Err(UpstreamError::Timeout),
             },
-            None => fut.await,
-        };
-        result.map_err(|err| {
+            None => exchange.await,
+        }
+        .map_err(|err| {
             tracing::warn!(error = %err, "upstream request failed");
             UpstreamError::Failed
-        })
+        })?;
+
+        let reader = BodyReader::r#for(method, &head);
+        let keep_alive = reader.keep_alive_possible() && response_keep_alive(&head);
+        let status = head.status;
+        let headers = head.headers;
+        let body = ClientBody {
+            conn: Some(conn),
+            reader,
+            key: self.key.clone(),
+            keep_alive,
+        };
+        let mut resp = http::Response::new(body);
+        *resp.status_mut() = status;
+        *resp.headers_mut() = headers;
+        Ok(resp)
+    }
+
+    /// Dial a fresh connection to the pinned address: connect TCP (the SSRF pin is now
+    /// "connect to exactly `addr`", enforced by construction — no resolver to steer),
+    /// disable Nagle, and TLS-handshake with SNI = the pinned host when the leg is `https`.
+    async fn dial(&self) -> Result<Conn<Upstream>, ()> {
+        let connect = TcpStream::connect(self.key.addr);
+        let tcp = match self.key.connect_timeout_ms {
+            Some(ms) => tokio::time::timeout(Duration::from_millis(ms), connect)
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?,
+            None => connect.await.map_err(|_| ())?,
+        };
+        // Disable Nagle on the upstream leg (the inbound path already does): a proxied
+        // request would otherwise pay the ~40 ms delayed-ACK stall.
+        let _ = tcp.set_nodelay(true);
+        let read_chunk = self
+            .key
+            .read_buffer_bytes
+            .unwrap_or(DEFAULT_UPSTREAM_READ_BUFFER);
+        let transport = if self.key.https {
+            let cfg = tls_client_config(self.key.tls_insecure)?;
+            let connector = tokio_rustls::TlsConnector::from(cfg);
+            let server_name =
+                rustls::pki_types::ServerName::try_from(self.key.host.clone()).map_err(|_| ())?;
+            let tls = connector.connect(server_name, tcp).await.map_err(|_| ())?;
+            Upstream::Tls(Box::new(tls))
+        } else {
+            Upstream::Plain(tcp)
+        };
+        Ok(Conn::with_read_chunk(transport, read_chunk))
     }
 }
 
-/// A DNS resolver pinned to one pre-verified address. `HttpConnector` calls this to
-/// "resolve" the upstream host; we always hand back the single address
-/// `check_proxy_target` verified as public, so the connection can never be steered
-/// to a different (internal) host on connect or reconnect. This *is* the SSRF pin,
-/// enforced structurally in the connector.
-#[derive(Clone)]
-struct PinnedResolver(SocketAddr);
+/// Whether a request method is safe to replay on a fresh connection after a stale pooled
+/// connection failed before the response — the idempotent methods (RFC 9110 §9.2.2).
+fn is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
 
-impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for PinnedResolver {
-    type Response = std::iter::Once<SocketAddr>;
-    type Error = std::convert::Infallible;
-    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+/// Whether the upstream connection may be kept alive after this response: HTTP/1.1 defaults
+/// to keep-alive unless `Connection: close`; HTTP/1.0 defaults to close unless
+/// `Connection: keep-alive`.
+fn response_keep_alive(head: &boatramp_http::h1::ResponseHead) -> bool {
+    let conn = head
+        .headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if conn.split(',').any(|t| t.trim() == "close") {
+        return false;
     }
+    if head.version == http::Version::HTTP_10 {
+        return conn.split(',').any(|t| t.trim() == "keep-alive");
+    }
+    true
+}
 
-    fn call(&mut self, _name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
-        std::future::ready(Ok(std::iter::once(self.0)))
+/// An empty request-body data stream — for the bodyless retry path, which never reads it.
+fn empty_body_data() -> BodyData {
+    Box::pin(futures::stream::empty())
+}
+
+/// The reverse-proxy response body: streams the upstream response body straight to the
+/// downstream client off the pooled connection, then — on a clean, fully-drained,
+/// keep-alive response — returns that connection to [`POOL`] for reuse. A mid-body error
+/// drops the connection (never pools it) and surfaces as a stream error, so the downstream
+/// sees a truncated (aborted) body, never a clean end.
+struct ClientBody {
+    /// The driving connection, taken once the body ends (drained → pool, error → dropped).
+    conn: Option<Conn<Upstream>>,
+    reader: BodyReader,
+    key: UpstreamClientKey,
+    keep_alive: bool,
+}
+
+impl Stream for ClientBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let Some(conn) = this.conn.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match conn.poll_read_body_chunk(cx, &mut this.reader) {
+            Poll::Ready(Ok(Some(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Ok(None)) => {
+                // Body fully drained — return the connection to the pool if reusable.
+                if let Some(conn) = this.conn.take() {
+                    if this.keep_alive {
+                        pool_return(&this.key, conn);
+                    }
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Err(e)) => {
+                this.conn = None; // broken mid-body — drop, never pool
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 /// A rustls client config for the upstream leg: webpki roots by default, or an
 /// accept-anything verifier when the upstream is declared `tls_insecure`. ALPN is
-/// pinned to HTTP/1.1 (the only protocol the connector enables).
+/// pinned to HTTP/1.1 (the only protocol the native upstream client speaks).
 fn upstream_tls_config(tls_insecure: bool) -> Result<rustls::ClientConfig, ()> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|_| ())?;
-    // NB: do NOT set `alpn_protocols` here — hyper-rustls' `with_tls_config` asserts
-    // it is empty and sets ALPN itself from `.enable_http1()`/`.enable_http2()`.
-    // Pre-setting it panics on every client build.
-    let config = if tls_insecure {
+    let mut config = if tls_insecure {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertVerify))
@@ -265,6 +628,8 @@ fn upstream_tls_config(tls_insecure: bool) -> Result<rustls::ClientConfig, ()> {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         builder.with_root_certificates(roots).with_no_client_auth()
     };
+    // We dial rustls directly now (no hyper-rustls), so we own ALPN: offer HTTP/1.1.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -311,17 +676,11 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
     }
 }
 
-/// Process-wide cache of pinned upstream clients. A client owns a connection pool
-/// and builds its rustls `ClientConfig` at construction, so it MUST be reused across
-/// requests: building one per request forfeits pooling AND rebuilds the trust store
-/// every time. Cheap to clone (`Arc` inside).
-static UPSTREAM_CLIENTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<UpstreamClientKey, UpstreamClient>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// A pinned upstream client, reused across requests. `host` resolves to the
-/// pre-verified `addr` (closing the SSRF DNS-rebinding window — the kernel never
-/// re-resolves). Built once per distinct upstream key, then served from the cache.
+/// A pinned upstream client handle for one upstream identity. The handle is just the pool
+/// key (cheap to build + clone); the actual keep-alive connections live in [`POOL`] and are
+/// shared across all handles with the same key. `host` was resolved to the pre-verified
+/// `addr` (closing the SSRF DNS-rebinding window — the connection dials `addr` directly,
+/// never re-resolving). Returns `Result` for call-site compatibility; it cannot fail.
 fn cached_client(
     host: &str,
     addr: SocketAddr,
@@ -329,70 +688,25 @@ fn cached_client(
     request_timeout_ms: Option<u64>,
     tls_insecure: bool,
     read_buffer_bytes: Option<usize>,
+    https: bool,
 ) -> Result<UpstreamClient, ()> {
-    let key = UpstreamClientKey {
-        host: host.to_string(),
-        addr,
-        connect_timeout_ms,
-        request_timeout_ms,
-        tls_insecure,
-        read_buffer_bytes,
-    };
-    if let Some(client) = UPSTREAM_CLIENTS.lock().unwrap().get(&key) {
-        return Ok(client.clone());
-    }
-    // Build outside the lock; a rare race just rebuilds once and `or_insert` keeps
-    // whichever landed first.
-    let tls = upstream_tls_config(tls_insecure)?;
-    let mut http =
-        hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(PinnedResolver(addr));
-    http.enforce_http(false); // allow https upstreams — the address pin still holds
-                              // Disable Nagle on the upstream leg too: a proxied request would otherwise pay
-                              // the same ~40 ms delayed-ACK stall the inbound path already avoids.
-    http.set_nodelay(true);
-    if let Some(ms) = connect_timeout_ms {
-        http.set_connect_timeout(Some(Duration::from_millis(ms)));
-    }
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .wrap_connector(http);
-    let inner = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        // A timer is required for `pool_idle_timeout` to reap idle connections in the
-        // background; without it, expired connections are only dropped lazily on the
-        // next checkout. Reuse of live connections works either way — this makes the
-        // 20 s idle bound actually fire.
-        .pool_timer(hyper_util::rt::TokioTimer::new())
-        // Return upstream connection memory promptly after a spike drains (reqwest's
-        // default holds idle connections 90 s). In-use connections are unaffected, so
-        // steady-state reuse — and throughput — is unchanged.
-        .pool_idle_timeout(Duration::from_secs(20))
-        // Cap the per-connection H1 read buffer (hyper's 400 KB default) — the knob
-        // reqwest does not expose. Each upstream connection retains this buffer, and a
-        // reverse proxy holds one per concurrent request, so at fan-out it is the
-        // dominant proxy-path resident set: profiling a 256-concurrency 100 KB H2 proxy
-        // showed ~500 MB, almost all in these buffers. The 32 KiB default streams a
-        // large response in a few reads and cuts the footprint ~2.7x for ~5% throughput;
-        // an upstream can override it (`read_buffer_bytes`) either way.
-        .http1_max_buf_size(read_buffer_bytes.unwrap_or(DEFAULT_UPSTREAM_READ_BUFFER))
-        .build(https);
-    let client = UpstreamClient {
-        inner,
-        request_timeout: request_timeout_ms.map(Duration::from_millis),
-    };
-    Ok(UPSTREAM_CLIENTS
-        .lock()
-        .unwrap()
-        .entry(key)
-        .or_insert(client)
-        .clone())
+    Ok(UpstreamClient {
+        key: UpstreamClientKey {
+            host: host.to_string(),
+            addr,
+            https,
+            connect_timeout_ms,
+            request_timeout_ms,
+            tls_insecure,
+            read_buffer_bytes,
+        },
+    })
 }
 
 /// A pinned client with no per-upstream overrides (the absolute-URL proxy path).
-/// Reused across requests — see [`cached_client`].
-fn pinned_client(host: &str, addr: SocketAddr) -> Result<UpstreamClient, ()> {
-    cached_client(host, addr, None, None, false, None)
+/// `https` selects the TLS vs plaintext transport — see [`cached_client`].
+fn pinned_client(host: &str, addr: SocketAddr, https: bool) -> Result<UpstreamClient, ()> {
+    cached_client(host, addr, None, None, false, None, https)
 }
 
 /// The request-independent resolution of a gateway upstream `target`: its parsed
@@ -852,6 +1166,7 @@ async fn proxy_upstream(
     if upstream.tls_insecure {
         tracing::warn!(%host, "gateway upstream TLS verification disabled (tls_insecure)");
     }
+    let https = resolved.parsed.scheme() == "https";
     let client = match cached_client(
         host,
         addr,
@@ -859,6 +1174,7 @@ async fn proxy_upstream(
         upstream.request_timeout_ms,
         upstream.tls_insecure,
         upstream.read_buffer_bytes.map(|n| n as usize),
+        https,
     ) {
         Ok(client) => client,
         Err(_) => return (StatusCode::BAD_GATEWAY, "gateway client error\n").into_response(),
@@ -948,7 +1264,7 @@ async fn proxy_upstream(
             for (name, value) in &upstream.header_down.set {
                 set_header_str(&mut headers, name, value);
             }
-            (status, headers, Body::new(resp.into_body())).into_response()
+            (status, headers, Body::from_stream(resp.into_body())).into_response()
         }
         Err(UpstreamError::Timeout) => {
             tracing::warn!(%host, "gateway upstream request timed out");
@@ -1424,7 +1740,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client = cached_client("127.0.0.1", addr, None, None, false, None).unwrap();
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
         let uri = format!("http://127.0.0.1:{}/", addr.port());
         let mut worst = 0f64;
         for i in 0..30 {
@@ -1438,7 +1754,7 @@ mod tests {
                 Ok(resp) => resp,
                 Err(err) => panic!("send failed at iter {i}: {err:?}"),
             };
-            let body = axum::body::to_bytes(Body::new(resp.into_body()), 1 << 20)
+            let body = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
                 .await
                 .unwrap();
             assert_eq!(body.len(), 1024);
@@ -1450,7 +1766,7 @@ mod tests {
         }
         assert!(
             worst < 15.0,
-            "warm upstream request latency {worst:.1}ms — Nagle/flush stall on the raw-hyper client"
+            "warm upstream request latency {worst:.1}ms — Nagle/flush stall on the native upstream client"
         );
     }
 
@@ -1466,5 +1782,139 @@ mod tests {
         assert_eq!(upgrade_transport("ftp"), None);
         assert_eq!(upgrade_transport("unix"), None);
         assert_eq!(upgrade_transport(""), None);
+    }
+
+    /// Bind an ephemeral upstream serving `app`, with `TCP_NODELAY` (any stall would be
+    /// on our client leg). Returns the address.
+    async fn spawn_upstream(app: axum::Router) -> SocketAddr {
+        use axum::serve::ListenerExt;
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = raw.local_addr().unwrap();
+        let listener = raw.tap_io(|s| {
+            let _ = s.set_nodelay(true);
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    /// The plaintext pool key with no overrides (matches `pinned_client(host, addr, false)`).
+    fn plain_key(addr: SocketAddr) -> UpstreamClientKey {
+        UpstreamClientKey {
+            host: "127.0.0.1".to_string(),
+            addr,
+            https: false,
+            connect_timeout_ms: None,
+            request_timeout_ms: None,
+            tls_insecure: false,
+            read_buffer_bytes: None,
+        }
+    }
+
+    /// A large response proxies back byte-for-byte over the native client, and its
+    /// keep-alive connection is returned to the pool (a second request reuses it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_large_get_byte_identical_and_pools_connection() {
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let served = big.clone();
+        let app = axum::Router::new().route(
+            "/big",
+            axum::routing::get(move || {
+                let b = served.clone();
+                async move { axum::body::Bytes::from(b) }
+            }),
+        );
+        let addr = spawn_upstream(app).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!("http://127.0.0.1:{}/big", addr.port());
+
+        for round in 0..2 {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = client.send(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                big.as_slice(),
+                "body mismatch on round {round}"
+            );
+            // After a fully drained keep-alive response the connection is back in the pool,
+            // and it never grows past one for a single serial caller.
+            let idle = POOL
+                .lock()
+                .unwrap()
+                .get(&plain_key(addr))
+                .map_or(0, Vec::len);
+            assert_eq!(
+                idle, 1,
+                "expected exactly one pooled connection after round {round}"
+            );
+        }
+    }
+
+    /// A request body with a declared `Content-Length` is forwarded fixed-length and the
+    /// upstream echoes it back unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_forwards_fixed_length_request_body() {
+        let app = axum::Router::new().route(
+            "/echo",
+            axum::routing::post(|body: axum::body::Bytes| async move { body }),
+        );
+        let addr = spawn_upstream(app).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!("http://127.0.0.1:{}/echo", addr.port());
+        let payload = vec![b'p'; 4096];
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .header(header::CONTENT_LENGTH, payload.len())
+            .body(Body::from(payload.clone()))
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let echoed = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(echoed.as_ref(), payload.as_slice());
+    }
+
+    /// A request body of unknown length is chunk-encoded to the upstream, which echoes the
+    /// reassembled bytes back unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_client_forwards_chunked_request_body() {
+        let app = axum::Router::new().route(
+            "/echo",
+            axum::routing::post(|body: axum::body::Bytes| async move { body }),
+        );
+        let addr = spawn_upstream(app).await;
+        let client = cached_client("127.0.0.1", addr, None, None, false, None, false).unwrap();
+        let uri = format!("http://127.0.0.1:{}/echo", addr.port());
+
+        // No Content-Length header + a streamed body ⇒ the client picks chunked framing.
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"the quick ")),
+            Ok(Bytes::from_static(b"brown fox ")),
+            Ok(Bytes::from_static(b"jumps")),
+        ];
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&uri)
+            .body(Body::from_stream(futures::stream::iter(chunks)))
+            .unwrap();
+        let resp = client.send(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let echoed = axum::body::to_bytes(Body::from_stream(resp.into_body()), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(echoed.as_ref(), b"the quick brown fox jumps".as_slice());
     }
 }

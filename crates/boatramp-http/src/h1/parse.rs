@@ -104,10 +104,11 @@ pub fn parse_request_head(buf: &[u8]) -> ParseResult {
 
 /// The largest request head (request line + all headers, through the terminating
 /// CRLFCRLF) we will buffer before rejecting — a slowloris / oversized-header bound.
-const MAX_HEAD: usize = 64 * 1024;
+/// Shared with the client codec's response-head parser ([`super::client`]).
+pub(super) const MAX_HEAD: usize = 64 * 1024;
 
 /// One CRLF-terminated line pulled from a buffer, or a signal to stop.
-enum Line<'a> {
+pub(super) enum Line<'a> {
     /// The line content (CRLF stripped) and the offset just past its CRLF.
     Got(&'a [u8], usize),
     /// No complete CRLF-terminated line yet — read more.
@@ -117,7 +118,7 @@ enum Line<'a> {
 /// Read one strictly-CRLF-terminated line starting at `pos`. Enforces CRLF framing: a
 /// bare LF (not preceded by CR) or a bare CR (inside the line) is a hard reject — those
 /// are the h1 line-terminator smuggling vectors.
-fn next_line(buf: &[u8], pos: usize) -> Result<Line<'_>, Reject> {
+pub(super) fn next_line(buf: &[u8], pos: usize) -> Result<Line<'_>, Reject> {
     let Some(rel_nl) = buf[pos..].iter().position(|&b| b == b'\n') else {
         return Ok(Line::Incomplete);
     };
@@ -279,7 +280,7 @@ fn parse_target(method: &Method, target: &[u8]) -> Result<Uri, Reject> {
 /// Split a header line into `(name, value)`: the name is up to the first colon (and must
 /// be all-`tchar`, so whitespace before the colon is a reject); the value is OWS-trimmed
 /// and must contain no CTL other than HTAB.
-fn split_header(line: &[u8]) -> Result<(&[u8], &[u8]), Reject> {
+pub(super) fn split_header(line: &[u8]) -> Result<(&[u8], &[u8]), Reject> {
     let colon = line
         .iter()
         .position(|&b| b == b':')
@@ -366,7 +367,7 @@ fn resolve_framing(
 }
 
 /// Trim leading + trailing optional whitespace (SP / HTAB) — RFC 9110 OWS.
-fn trim_ows(mut v: &[u8]) -> &[u8] {
+pub(super) fn trim_ows(mut v: &[u8]) -> &[u8] {
     while let [first, rest @ ..] = v {
         if *first == b' ' || *first == b'\t' {
             v = rest;
