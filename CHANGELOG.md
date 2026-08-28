@@ -5,7 +5,24 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [Unreleased]
+## [0.3.4] - 2026-08-28
+
+### Changed
+- **The reverse-proxy data plane no longer runs on hyper.** The upstream leg (the gateway
+  upstream path and the absolute-URL proxy) dialed backends over hyper-util's pooled
+  `legacy::Client` and streamed the response back as `hyper::body::Incoming`, which copied
+  every body chunk through hyper's internal read buffer and drove the connection on a
+  background task. It now runs on boatramp's own HTTP/1 client codec plus a native
+  keep-alive connection pool: the response body streams straight from the pooled connection
+  to the downstream writer with no connection task and no intermediate copy, and the
+  connection returns to the pool once drained. Every prior property is preserved — the SSRF
+  address pin (now enforced by dialing the verified address directly, with no resolver to
+  steer), per-upstream TLS / connect + request timeouts / read-buffer cap, `TCP_NODELAY`,
+  and idle reaping — plus a conservative idempotent-bodyless retry on a stale pooled
+  connection. On a dedicated 32-core box, the reverse proxy leads the field
+  (nginx/caddy/traefik/envoy) on every large-body `proxy` and `tls-proxy` cell (100 KB and
+  1 MB). hyper now remains only on the cold WebSocket-upgrade and unix-socket paths, and the
+  `hyper-rustls` dependency is dropped. Proxied bodies are byte-identical.
 
 ### Fixed
 - **Large static files are memory-mapped instead of streamed through `tokio::fs`.** A
@@ -14,9 +31,11 @@ versions.
   profile of a 1 MB file showed ~15% of CPU in that copy alone, and the body went out
   chunked. The local-file backend now memory-maps the (immutable, content-addressed) blob
   and serves it as one borrowed, content-length body: no double-buffer copy, one large
-  vectored write. Measured on a 1 MB plaintext static file, throughput rose **~3.5×**
-  (from last place to ahead of the field); remote backends (S3/GCS/Azure) and range
-  requests are unchanged (they still stream). Byte-identical output.
+  vectored write. Measured on a 1 MB plaintext static file, throughput rose **~3.5×** on
+  the local-file serving path; remote backends (S3/GCS/Azure) and range requests are
+  unchanged (they still stream). Byte-identical output. (Note: against the field, large
+  plaintext static remains bounded by kernel `sendfile` zero-copy in nginx/caddy — this
+  removes boatramp's userspace double-copy but not the userspace write itself.)
 - **Reverse proxy: the streamed response body is no longer copied per chunk.** The
   HTTP/1.1 response writer framed each streamed body chunk by allocating a buffer and
   copying the chunk into it (`<hex-size>` + data + CRLF) before handing it to the
