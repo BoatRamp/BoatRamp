@@ -210,6 +210,151 @@ async fn container_live_launch_and_hold() {
     }
 }
 
+/// End-to-end **co-located Postgres from an OCI image**: pull `pgvector/pgvector:pg16`
+/// over the registry HTTP API (no Docker daemon — `RootSource::Image`), launch it
+/// rootless with a persistent volume, and assert it `initdb`s and answers a real query
+/// over TCP — proving the two container-backend gaps at runtime: the image pull
+/// (`materialize` → `stage_image`) and the sticky `/run` tmpfs Postgres needs to create
+/// `/run/postgresql` for its socket during init.
+///
+/// The container backend overlays only the image's *filesystem* layers, not its OCI
+/// *config*, so the spec supplies the entrypoint + env explicitly (the managed-compute
+/// layer would; applying the image's own config is a separate follow-up). Run as root
+/// with the bridge up (see the module header); shells out to `psql` for the query, so it
+/// needs a Postgres client on PATH. Ignored by default (pulls ~150 MB + is privileged).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_live_postgres_from_oci_image() {
+    let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
+        eprintln!("container_live_postgres: set BOATRAMP_BIN to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let data_dir = std::env::temp_dir().join(format!("boatramp-cpg-{}", std::process::id()));
+    let backend = ContainerBackend::new(
+        // Storage is unused for the Image path (the pull is over HTTP, not from Storage).
+        Arc::new(FileBlob(Vec::new())),
+        data_dir.clone(),
+        bridge,
+        &subnet,
+        PathBuf::from(bin),
+    )
+    .expect("backend");
+
+    let pw = "s3cr3t-pw";
+    let mut spec = spec_for(&"d".repeat(64));
+    spec.root = RootSource::Image("pgvector/pgvector:pg16".into());
+    spec.mem_mib = 512;
+    spec.port = 5432;
+    // Run as the image's postgres user (uid 999) directly, so the entrypoint inits as
+    // that user AND the backend chowns the data volume to it — otherwise the entrypoint
+    // (as namespace-root) would gosu-drop to 999, which then can't write a volume owned
+    // by root. This is what the managed-compute layer sets for a rootless managed DB.
+    spec.user = Some("999:999".into());
+    // The postgres image's entrypoint + the env it expects (the backend applies only the
+    // image's filesystem layers, not its OCI config). `listen_addresses=*` so the server
+    // answers on the container's bridge IP; a password so the TCP query authenticates.
+    spec.entrypoint = vec![
+        "/usr/local/bin/docker-entrypoint.sh".into(),
+        "postgres".into(),
+        "-c".into(),
+        "listen_addresses=*".into(),
+    ];
+    spec.env = std::collections::BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\
+             /usr/lib/postgresql/16/bin"
+                .to_string(),
+        ),
+        ("PGDATA".to_string(), "/var/lib/postgresql/data".to_string()),
+        ("POSTGRES_USER".to_string(), "app".to_string()),
+        ("POSTGRES_PASSWORD".to_string(), pw.to_string()),
+        ("POSTGRES_DB".to_string(), "app".to_string()),
+    ]);
+    spec.volumes = vec![boatramp_core::compute::VolumeRef {
+        mount: "/var/lib/postgresql/data".into(),
+        name: "pgdata".into(),
+        size_mib: 512,
+    }];
+
+    let artifact = backend
+        .materialize(&spec)
+        .await
+        .expect("materialize (pull) pgvector image");
+    assert!(matches!(artifact, Artifact::Rootfs { .. }));
+
+    let req = LaunchRequest {
+        workload: "cpg".into(),
+        replica: 0,
+        spec,
+        artifact,
+    };
+    let inst = backend
+        .launch(&req)
+        .await
+        .expect("launch pgvector container");
+    let host = inst.endpoint.host.clone();
+    let port = inst.endpoint.port;
+    eprintln!("== pgvector launched == endpoint={host}:{port}");
+
+    // Poll a real query over TCP: success proves initdb ran (so `/run` was writable —
+    // Gap B) and the pulled image booted (Gap A). ~30 s budget for first-boot initdb.
+    let conn = format!("postgresql://app:{pw}@{host}:{port}/app");
+    let mut ok = false;
+    let mut last = String::new();
+    for _ in 0..60 {
+        if let Ok(out) = std::process::Command::new("psql")
+            .args([&conn, "-tAc", "select 1"])
+            .output()
+        {
+            last = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if out.status.success() && last.trim() == "1" {
+                ok = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Also confirm the pgvector extension is installable (the whole point of the image).
+    let mut ext = false;
+    if ok {
+        if let Ok(out) = std::process::Command::new("psql")
+            .args([
+                &conn,
+                "-tAc",
+                "create extension if not exists vector; select extversion from pg_extension where extname='vector'",
+            ])
+            .output()
+        {
+            ext = out.status.success() && !out.stdout.is_empty();
+            eprintln!(
+                "pgvector extension: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+    }
+
+    let _ = backend.stop(&inst.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    assert!(
+        ok,
+        "postgres should answer `select 1` over TCP (last: {last:?})"
+    );
+    assert!(
+        ext,
+        "pgvector `vector` extension should create + report a version"
+    );
+    eprintln!("co-located pgvector from an OCI image: initdb + query + extension OK");
+}
+
 /// Poll the container's `/nonce` endpoint over HTTP, returning the body or empty.
 fn probe_nonce(host: &str, port: u16) -> String {
     let url = format!("http://{host}:{port}/nonce");
