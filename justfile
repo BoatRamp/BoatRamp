@@ -261,7 +261,7 @@ bump-version version:
 
 # The workspace crates in dependency (publish) order — leaf crates first, so each
 # crate's internal deps are already on crates.io by the time it publishes.
-crate_order := "boatramp-http boatramp-types boatramp-rpktls boatramp-acme boatramp-core boatramp-storage boatramp-cloudflare boatramp-container boatramp-docker boatramp-firecracker boatramp-vz boatramp-mcp boatramp-cluster boatramp-handlers boatramp-server boatramp-node boatramp"
+crate_order := "boatramp-http boatramp-types boatramp-rpktls boatramp-acme boatramp-core boatramp-storage boatramp-cloudflare boatramp-firecracker boatramp-container boatramp-docker boatramp-vz boatramp-mcp boatramp-cluster boatramp-handlers boatramp-server boatramp-node boatramp"
 
 # Dry-run the release packaging of every workspace crate (no upload). `cargo` can't
 # validate a dependent crate until its internal deps are actually on crates.io, so
