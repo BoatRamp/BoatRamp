@@ -158,6 +158,10 @@ const ALLOWED: &[&str] = &[
     "fdatasync",
     "sync",
     "syncfs",
+    // flush dirty file / mmap data (self-scoped). Postgres flushes dirty data with
+    // `sync_file_range` during startup recovery, so a stock DB image needs it.
+    "sync_file_range",
+    "msync",
     "fadvise64",
     "ftruncate",
     "fallocate",
@@ -188,12 +192,21 @@ const ALLOWED: &[&str] = &[
     "umask",
     "fchmod",
     "fchmodat",
+    // The bare `chmod`/`chown`/`lchown`/`rmdir`/`creat`/`utime[s]` syscalls: glibc uses
+    // these directly on x86-64 (rather than the `*at` forms), so a stock image chmodding
+    // or chowning its own files (e.g. Postgres `initdb`) needs them. They only touch the
+    // caller's own files — no escape surface beyond the already-allowed `*at` variants.
+    "chmod",
     "fchown",
     "fchownat",
+    "chown",
+    "lchown",
     "mkdir",
     "mkdirat",
     "unlink",
     "unlinkat",
+    "rmdir",
+    "creat",
     "rename",
     "renameat",
     "renameat2",
@@ -203,6 +216,8 @@ const ALLOWED: &[&str] = &[
     "linkat",
     "truncate",
     "utimensat",
+    "utime",
+    "utimes",
     // event loops / multiplexing
     "poll",
     "ppoll",
@@ -224,6 +239,22 @@ const ALLOWED: &[&str] = &[
     "inotify_init1",
     "inotify_add_watch",
     "inotify_rm_watch",
+    // System V IPC (shared memory + semaphores + message queues). Namespaced by the
+    // container's IPC namespace (CLONE_NEWIPC), so it's isolated to the container — no
+    // host effect. Postgres uses a small shmget segment (the postmaster-alive check) plus
+    // semaphores, so a stock DB image needs these.
+    "shmget",
+    "shmat",
+    "shmdt",
+    "shmctl",
+    "semget",
+    "semop",
+    "semtimedop",
+    "semctl",
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
     // networking
     "socket",
     "socketpair",
@@ -250,6 +281,16 @@ const ALLOWED: &[&str] = &[
     "gettimeofday",
     "nanosleep",
     "times",
+    // interval + POSIX timers (self-scoped, no host effect). Postgres arms a SIGALRM
+    // timer for statement timeouts / deadlock detection, so a stock DB image needs these.
+    "setitimer",
+    "getitimer",
+    "alarm",
+    "timer_create",
+    "timer_settime",
+    "timer_gettime",
+    "timer_delete",
+    "timer_getoverrun",
     // signals
     "rt_sigaction",
     "rt_sigprocmask",

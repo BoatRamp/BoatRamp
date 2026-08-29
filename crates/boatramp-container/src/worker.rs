@@ -20,10 +20,11 @@
 use crate::sandbox::{Mount, SandboxPlan, VolumeMount};
 use nix::mount::{MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
+use nix::sys::stat::{mknod, Mode, SFlag};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
-    chdir, chown, execve, fork, pivot_root, setgroups, sethostname, setresgid, setresuid,
-    ForkResult, Gid, Uid,
+    chdir, execve, fork, pivot_root, setgroups, sethostname, setresgid, setresuid, ForkResult, Gid,
+    Uid,
 };
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -99,20 +100,24 @@ pub fn prepare(plan: &SandboxPlan) -> Result<(), WorkerError> {
     Ok(())
 }
 
-/// The unprivileged host id the container's id range maps onto: container
-/// uid/gid `0` → host `100000`, so in-container `root` is unprivileged on the
-/// host. 65536 ids cover a full container uid/gid range.
-const USERNS_HOST_BASE: u32 = 100_000;
+/// The default unprivileged host id the container's id range maps onto: container
+/// uid/gid `0` → host `100000`, so in-container `root` is unprivileged on the host
+/// (the **rootless** default). A `single-tenant` posture may opt into a `0` base
+/// (`0 → host 0`, in-container root = host root — see [`ContainerBackend::with_host_root`]).
+/// 65536 ids cover a full container uid/gid range. The launcher uses the active base to
+/// pre-own a volume dir at `base + guest_uid` and to shift the rootfs so the guest owns it.
+///
+/// [`ContainerBackend::with_host_root`]: crate::backend::ContainerBackend::with_host_root
+pub(crate) const USERNS_HOST_BASE: u32 = 100_000;
 /// The number of ids mapped from the container into the host range.
 const USERNS_COUNT: u32 = 65_536;
 
-/// The `/proc/<pid>/{uid,gid}_map` line mapping container id `0` onto the
-/// unprivileged host base for [`USERNS_COUNT`] ids. Written by the **launcher**
-/// (which holds `CAP_SETUID`/`CAP_SETGID` in the parent namespace, so it can write
-/// an arbitrary range and needs no `setgroups=deny` dance) against the worker's pid
-/// after it unshares.
-pub fn userns_map_line() -> String {
-    format!("0 {USERNS_HOST_BASE} {USERNS_COUNT}\n")
+/// The `/proc/<pid>/{uid,gid}_map` line mapping container id `0` onto host `base` for
+/// [`USERNS_COUNT`] ids. Written by the **launcher** (which holds `CAP_SETUID`/
+/// `CAP_SETGID` in the parent namespace, so it can write an arbitrary range and needs no
+/// `setgroups=deny` dance) against the worker's pid after it unshares.
+pub fn userns_map_line(base: u32) -> String {
+    format!("0 {base} {USERNS_COUNT}\n")
 }
 
 /// Fork the container init and run the jail. In the parent, returns the init's
@@ -202,6 +207,18 @@ fn clone_flags(ns: &crate::sandbox::Namespaces) -> CloneFlags {
 
 /// In the forked child: build the jail and `execve`. Never returns on success.
 fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
+    // Adopt the *mapped* namespace-root identity (uid/gid 0 → host `USERNS_HOST_BASE`).
+    // The launcher's host uid/gid (0) is unmapped in this user namespace — the mapped
+    // range starts at `USERNS_HOST_BASE` — so our fsuid/fsgid are the overflow id, and
+    // creating any new inode (e.g. a `/dev` node) fails with EOVERFLOW because the kernel
+    // can't assign it a valid owner. Setting uid/gid 0 (mapped) fixes that; as the userns
+    // creator we keep our capabilities, so the mounts + device setup below still work.
+    setgroups(&[Gid::from_raw(0)]).map_err(|e| WorkerError::Syscall("setgroups ns-root", e))?;
+    setresgid(Gid::from_raw(0), Gid::from_raw(0), Gid::from_raw(0))
+        .map_err(|e| WorkerError::Syscall("setresgid ns-root", e))?;
+    setresuid(Uid::from_raw(0), Uid::from_raw(0), Uid::from_raw(0))
+        .map_err(|e| WorkerError::Syscall("setresuid ns-root", e))?;
+
     // Become a session + process-group leader in the new pid namespace, detaching
     // from the launcher's session (which lives in the host pidns). Standard
     // container-init behavior — and required for checkpoint: CRIU refuses to dump a
@@ -215,22 +232,18 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
     // it (its `/.put_old/proc` etc.). Detaching it first (the old order) left no
     // reference → `mount proc -> /proc` failed with EPERM.
     apply_mounts(&plan.mounts)?;
+    // Populate the fresh `/dev` tmpfs with the standard device nodes a stock image needs,
+    // while the host `/dev` is still reachable at `/.put_old`.
+    populate_dev()?;
     detach_old_root()?;
 
     sethostname(&plan.hostname).map_err(|e| WorkerError::Syscall("sethostname", e))?;
 
-    // If the entrypoint runs as a non-root user, hand it ownership of its persistent
-    // volumes (the mount root only) so it can write — done here as namespace-root,
-    // before dropping privileges. Bind mounts share inodes with the host backing dir,
-    // so this persists across restarts; namespace uid 0 already owns everything.
-    if plan.uid != 0 {
-        let owner = Uid::from_raw(plan.uid);
-        let group = Gid::from_raw(plan.gid);
-        for v in &plan.volumes {
-            chown(v.mount.as_str(), Some(owner), Some(group))
-                .map_err(|e| WorkerError::Syscall("chown volume", e))?;
-        }
-    }
+    // Persistent volumes are already owned by the guest's uid/gid: the host-root launcher
+    // pre-chowns each backing dir to `USERNS_HOST_BASE + guest_uid` (see
+    // `ContainerBackend::stage_volumes`). Chowning here in the user namespace can't work —
+    // the backing dir would be host-root-owned, i.e. `nobody` in the namespace, which
+    // namespace-root cannot chown (EPERM) — so ownership is the launcher's job, not ours.
 
     // Drop privileges first (sets `no_new_privs`), then install seccomp — so the
     // filter can be applied without CAP_SYS_ADMIN and only the entrypoint (and
@@ -282,6 +295,103 @@ fn pivot_into_root(root: &str, volumes: &[VolumeMount]) -> Result<(), WorkerErro
     // NOTE: the old root stays mounted at `/.put_old` until [`detach_old_root`], so
     // it can serve as the `mount_too_revealing` reference for the `/proc`/`/sys`
     // mounts in [`apply_mounts`]. It is detached immediately after.
+    Ok(())
+}
+
+/// The standard character devices Docker exposes under `/dev` (all `crw-rw-rw-`, except
+/// `tty`). A user namespace can't `mknod` a real character device, so each is bound from
+/// the host instead.
+const STANDARD_DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
+
+/// The `/dev` symlinks Docker creates (`link -> target`). `fd`/`stdin`/`stdout`/`stderr`
+/// point into the process's own fd table; `ptmx` into the private devpts instance.
+const DEV_SYMLINKS: &[(&str, &str)] = &[
+    ("/dev/fd", "/proc/self/fd"),
+    ("/dev/stdin", "/proc/self/fd/0"),
+    ("/dev/stdout", "/proc/self/fd/1"),
+    ("/dev/stderr", "/proc/self/fd/2"),
+    ("/dev/ptmx", "pts/ptmx"),
+    ("/dev/core", "/proc/kcore"),
+];
+
+/// Populate the container's fresh `/dev` tmpfs to match a standard (non-privileged)
+/// Docker container: the six standard character devices, `/dev/shm`, `/dev/mqueue`, a
+/// private `newinstance` `/dev/pts`, and the `fd`/`std*`/`ptmx`/`core` symlinks.
+///
+/// A user namespace can't `mknod` real character devices, so each is **bind-mounted from
+/// the host** (still reachable at `/.put_old/dev/*` after `pivot_root`, before
+/// [`detach_old_root`]); the bound node keeps the host device's type + permissions
+/// (`/dev/null` is world-writable, so the guest can use it). Must run after
+/// [`apply_mounts`] (which mounts `/dev`) and before the old root is detached.
+///
+/// `/dev/console` is intentionally omitted: it needs a controlling terminal that a
+/// daemonized, rootless container does not have, and no standard workload requires it.
+fn populate_dev() -> Result<(), WorkerError> {
+    // Bind the standard character devices from the host onto empty-file targets, created
+    // with `mknod(S_IFREG)` (a plain empty file; the real device type + permissions come
+    // from the bound host node).
+    for dev in STANDARD_DEVICES {
+        let target = format!("/dev/{dev}");
+        if !Path::new(&target).exists() {
+            mknod(
+                target.as_str(),
+                SFlag::S_IFREG,
+                Mode::from_bits_truncate(0o644),
+                0,
+            )
+            .map_err(|e| WorkerError::Syscall("create /dev node", e))?;
+        }
+        nix::mount::mount(
+            Some(format!("/.put_old/dev/{dev}").as_str()),
+            target.as_str(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| WorkerError::Syscall("bind-dev", e))?;
+    }
+    // /dev/shm — POSIX shared memory (sticky + world-writable, like /tmp).
+    dev_mount(
+        "shm",
+        "tmpfs",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=1777"),
+    )?;
+    // /dev/mqueue — POSIX message queues (per-IPC-namespace).
+    dev_mount(
+        "mqueue",
+        "mqueue",
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None,
+    )?;
+    // /dev/pts — a private pseudo-terminal instance; `gid=5` is the `tty` group (mapped in
+    // the userns), `ptmxmode=0666` makes `/dev/ptmx` (the symlink below) usable.
+    dev_mount(
+        "pts",
+        "devpts",
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
+    )?;
+    // Docker's /dev symlinks.
+    for (link, target) in DEV_SYMLINKS {
+        std::os::unix::fs::symlink(target, link)
+            .map_err(|e| WorkerError::Io("symlink /dev entry", e))?;
+    }
+    Ok(())
+}
+
+/// Create `/dev/<name>` and mount `fstype` (with `flags`/`data`) onto it — the shared
+/// shape of the `shm`/`mqueue`/`pts` mounts in [`populate_dev`].
+fn dev_mount(
+    name: &str,
+    fstype: &str,
+    flags: MsFlags,
+    data: Option<&str>,
+) -> Result<(), WorkerError> {
+    let target = format!("/dev/{name}");
+    fs::create_dir_all(&target).map_err(|e| WorkerError::Io("create /dev subdir", e))?;
+    nix::mount::mount(Some(fstype), target.as_str(), Some(fstype), flags, data)
+        .map_err(|e| WorkerError::Syscall("mount /dev subfs", e))?;
     Ok(())
 }
 
@@ -492,10 +602,15 @@ mod tests {
 
     #[test]
     fn userns_maps_container_root_onto_an_unprivileged_host_id() {
-        // Container id 0 maps to the unprivileged host base, over a full range —
-        // so even in-container `root` has no host privilege.
-        assert_eq!(userns_map_line(), "0 100000 65536\n");
-        assert_ne!(USERNS_HOST_BASE, 0, "the host base must not be host root");
+        // The rootless default maps container id 0 to the unprivileged host base over a
+        // full range — so even in-container `root` has no host privilege.
+        assert_eq!(userns_map_line(USERNS_HOST_BASE), "0 100000 65536\n");
+        assert_ne!(
+            USERNS_HOST_BASE, 0,
+            "the rootless host base must not be host root"
+        );
+        // The host-root opt-in maps 0 → host 0 (identity).
+        assert_eq!(userns_map_line(0), "0 0 65536\n");
     }
 
     #[test]

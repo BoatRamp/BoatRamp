@@ -222,16 +222,15 @@ async fn container_live_launch_and_hold() {
 /// layer would; applying the image's own config is a separate follow-up). Run as root
 /// with the bridge up (see the module header); shells out to `psql` for the query, so it
 /// needs a Postgres client on PATH. Ignored by default (pulls ~150 MB + is privileged).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
-async fn container_live_postgres_from_oci_image() {
+async fn run_pg_e2e(host_root: bool) {
     let Some(bin) = std::env::var_os("BOATRAMP_BIN") else {
         eprintln!("container_live_postgres: set BOATRAMP_BIN to run");
         return;
     };
+    let tag = if host_root { "hr" } else { "rl" };
     let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
     let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
-    let data_dir = std::env::temp_dir().join(format!("boatramp-cpg-{}", std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!("boatramp-cpg-{tag}-{}", std::process::id()));
     let backend = ContainerBackend::new(
         // Storage is unused for the Image path (the pull is over HTTP, not from Storage).
         Arc::new(FileBlob(Vec::new())),
@@ -240,7 +239,10 @@ async fn container_live_postgres_from_oci_image() {
         &subnet,
         PathBuf::from(bin),
     )
-    .expect("backend");
+    .expect("backend")
+    // Rootless (default) shifts the rootfs into the mapped host range; host-root maps
+    // `0 → host 0` (single-tenant opt-in). Both must reach a serving Postgres.
+    .with_host_root(host_root);
 
     let pw = "s3cr3t-pw";
     let mut spec = spec_for(&"d".repeat(64));
@@ -286,7 +288,7 @@ async fn container_live_postgres_from_oci_image() {
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
 
     let req = LaunchRequest {
-        workload: "cpg".into(),
+        workload: format!("cpg{tag}"),
         replica: 0,
         spec,
         artifact,
@@ -352,7 +354,26 @@ async fn container_live_postgres_from_oci_image() {
         ext,
         "pgvector `vector` extension should create + report a version"
     );
-    eprintln!("co-located pgvector from an OCI image: initdb + query + extension OK");
+    eprintln!(
+        "co-located pgvector from an OCI image ({}): initdb + query + extension OK",
+        if host_root { "host-root" } else { "rootless" }
+    );
+}
+
+/// The **rootless** (default) path: in-container root maps to an unprivileged host uid, so
+/// the rootfs is ownership-shifted into the mapped range. Way 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_live_postgres_from_oci_image() {
+    run_pg_e2e(false).await;
+}
+
+/// The **host-root** opt-in: `0 → host 0`, so in-container root is real host root (a
+/// single-tenant / trusted posture, like a stock Docker container). Way 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Linux + root + a bridge + psql (privileged live seam); pulls pgvector"]
+async fn container_live_postgres_host_root() {
+    run_pg_e2e(true).await;
 }
 
 /// Poll the container's `/nonce` endpoint over HTTP, returning the body or empty.

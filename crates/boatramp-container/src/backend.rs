@@ -139,6 +139,11 @@ pub struct ContainerBackend {
     /// (single-tenant only); off under the multi-tenant guard, so a cap-add spec is
     /// forced back to the dropped-`ALL` default.
     cap_add_allowed: bool,
+    /// The host id container uid/gid `0` maps onto. Default [`USERNS_HOST_BASE`] (rootless
+    /// — in-container root is unprivileged host `100000`). A single-tenant operator may opt
+    /// into `0` (in-container root = host root) via [`Self::with_host_root`]. Governs the
+    /// userns map, the volume pre-chown, and the rootfs ownership shift.
+    userns_base: u32,
 }
 
 impl ContainerBackend {
@@ -166,6 +171,7 @@ impl ContainerBackend {
             ipam: Mutex::new(ipam),
             criu: crate::criu::Criu::detect(),
             cap_add_allowed: false,
+            userns_base: crate::worker::USERNS_HOST_BASE,
         })
     }
 
@@ -174,6 +180,21 @@ impl ContainerBackend {
     /// keeps every capability dropped.
     pub fn with_cap_add_allowed(mut self, allowed: bool) -> Self {
         self.cap_add_allowed = allowed;
+        self
+    }
+
+    /// Opt into **host-root** containers (a single-tenant / trusted posture): map the
+    /// container's user namespace `0 → host 0` instead of the rootless `0 → host 100000`.
+    /// In-container root is then real host root — like a stock Docker container — which
+    /// removes the rootfs ownership shift (the image is already host-root-owned). It trades
+    /// the rootless isolation guarantee for running your own trusted image, so it is
+    /// off by default; the rootless base stands unless an operator opts in.
+    pub fn with_host_root(mut self, host_root: bool) -> Self {
+        self.userns_base = if host_root {
+            0
+        } else {
+            crate::worker::USERNS_HOST_BASE
+        };
         self
     }
 
@@ -187,7 +208,13 @@ impl ContainerBackend {
     /// marker-less staging dir + temp blob back down so a half-extracted dir can
     /// never be mistaken for ready and a retry starts clean.
     async fn stage_rootfs(&self, hash: &str) -> Result<PathBuf, BackendError> {
-        let dir = self.data_dir.join("compute").join("rootfs").join(hash);
+        // Keyed by the userns base too: the unpacked tree is ownership-shifted for that
+        // base (see `shift_rootfs`), so a different base needs its own staging.
+        let dir = self
+            .data_dir
+            .join("compute")
+            .join("rootfs")
+            .join(format!("{hash}.b{}", self.userns_base));
         let ready = dir.join(".boatramp-ready");
         if tokio::fs::try_exists(&ready).await.unwrap_or(false) {
             return Ok(dir);
@@ -251,8 +278,12 @@ impl ContainerBackend {
         // entries.
         let unpack_dir = dir.to_path_buf();
         let unpack_tmp = tmp.to_path_buf();
+        let base = self.userns_base;
         tokio::task::spawn_blocking(move || {
-            unpack_tar_gz(&unpack_tmp, &unpack_dir, ArchiveCaps::DEFAULT)
+            unpack_tar_gz(&unpack_tmp, &unpack_dir, ArchiveCaps::DEFAULT)?;
+            // Shift the extracted ownership into the container's mapped host range so the
+            // guest's namespace-root owns its rootfs (a no-op when base == 0).
+            shift_rootfs(&unpack_dir, base).map_err(ArchiveError::Io)
         })
         .await
         .map_err(|e| BackendError::Materialize(format!("join: {e}")))??;
@@ -273,9 +304,11 @@ impl ContainerBackend {
     /// an atomic rename only after the ready marker is written, so a partial or
     /// interrupted pull can never be mistaken for a complete rootfs.
     async fn stage_image(&self, image: &str) -> Result<PathBuf, BackendError> {
+        // Keyed by the image reference AND the userns base (the overlaid tree is
+        // ownership-shifted for that base — see `shift_rootfs`).
         let key = boatramp_types::manifest::sha256_hex(image.as_bytes());
         let images = self.data_dir.join("compute").join("images");
-        let dir = images.join(&key);
+        let dir = images.join(format!("{key}.b{}", self.userns_base));
         if tokio::fs::try_exists(dir.join(".boatramp-ready"))
             .await
             .unwrap_or(false)
@@ -285,11 +318,18 @@ impl ContainerBackend {
         tokio::fs::create_dir_all(&images)
             .await
             .map_err(|e| BackendError::Materialize(format!("create {}: {e}", images.display())))?;
-        let tmp = images.join(format!(".{key}.tmp"));
+        let tmp = images.join(format!(".{key}.b{}.tmp", self.userns_base));
         // Clear any leftover partial from a prior interrupted pull.
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         match boatramp_firecracker::oci::build_rootfs_dir(image, &tmp).await {
             Ok(()) => {
+                // Shift the overlaid ownership into the container's mapped host range so
+                // the guest's namespace-root owns its rootfs (a no-op when base == 0).
+                let (shift_dir, base) = (tmp.clone(), self.userns_base);
+                tokio::task::spawn_blocking(move || shift_rootfs(&shift_dir, base))
+                    .await
+                    .map_err(|e| BackendError::Materialize(format!("join: {e}")))?
+                    .map_err(|e| BackendError::Materialize(format!("shift rootfs: {e}")))?;
                 tokio::fs::write(tmp.join(".boatramp-ready"), b"1")
                     .await
                     .map_err(|e| BackendError::Materialize(format!("mark ready: {e}")))?;
@@ -551,6 +591,14 @@ impl ContainerBackend {
     /// here (block-device size enforcement is the VMM volume path); the data
     /// persists across restarts because it lives outside the ephemeral rootfs.
     async fn stage_volumes(&self, spec: &ComputeSpec) -> Result<Vec<VolumeMount>, BackendError> {
+        // Pre-own each volume dir (as the host-root launcher) at the host id the guest's
+        // entrypoint uid/gid maps onto — `USERNS_HOST_BASE + guest_uid`. Without this the
+        // dir is host-root-owned, which is `nobody` inside the container's user namespace,
+        // so the guest (and even the worker's in-ns chown) can't write or chown it —
+        // EPERM. A fresh dir gets the guest as owner; a reused dir already is (no-op).
+        let (guest_uid, guest_gid) = spec_uid_gid(spec);
+        let host_uid = self.userns_base + guest_uid;
+        let host_gid = self.userns_base + guest_gid;
         let mut mounts = Vec::with_capacity(spec.volumes.len());
         for vol in &spec.volumes {
             validate_volume(&vol.name, &vol.mount)?;
@@ -558,6 +606,14 @@ impl ContainerBackend {
             tokio::fs::create_dir_all(&dir).await.map_err(|e| {
                 BackendError::Launch(format!("create volume {} dir: {e}", vol.name))
             })?;
+            if can_shift_ownership() {
+                std::os::unix::fs::chown(&dir, Some(host_uid), Some(host_gid)).map_err(|e| {
+                    BackendError::Launch(format!(
+                        "chown volume {} dir to guest owner: {e}",
+                        vol.name
+                    ))
+                })?;
+            }
             mounts.push(VolumeMount {
                 source: dir.display().to_string(),
                 mount: vol.mount.clone(),
@@ -681,7 +737,7 @@ impl ContainerBackend {
         // `/proc/<pid>/{uid,gid}_map` directly. Same pid-based handshake as the netns
         // setup below.
         if plan.namespaces.user {
-            write_userns_maps(pid)
+            write_userns_maps(pid, self.userns_base)
                 .map_err(|e| BackendError::Launch(format!("write userns maps: {e}")))?;
         }
 
@@ -899,13 +955,56 @@ fn unpack_tar_gz(tar_path: &Path, dir: &Path, caps: ArchiveCaps) -> Result<(), A
     Ok(())
 }
 
+/// The container backend runs as host root in production — namespaces, cgroups, and
+/// `pivot_root` all require it. Ownership shifting into the guest user namespace's mapped
+/// range only makes sense, and only succeeds, under that privilege; when not root (unit
+/// tests, unprivileged dev) no userns mapping is ever created, so there is nothing to
+/// shift and the chown would only fail EPERM. Gate the ownership steps on it — but note
+/// that once we *are* root, a chown failure is a real error and still propagates.
+fn can_shift_ownership() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
+/// Shift every entry's on-disk uid/gid up by `base` (recursively, not following
+/// symlinks), so a rootfs extracted as host root (image uids `0..65535`) is owned by the
+/// container user namespace's mapped host range (`base..base+65535`). Then the guest's
+/// namespace-root (host `base`) owns the image's root-owned files, and non-root image
+/// uids (e.g. `postgres` 999) map correctly. A no-op when `base == 0` (the host-root
+/// mapping — the image is already host-root-owned) or when unprivileged (no userns to
+/// map into). Runs blocking, off the runtime.
+fn shift_rootfs(dir: &Path, base: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if base == 0 || !can_shift_ownership() {
+        return Ok(());
+    }
+    // Shift an id within one container range; leave anything already out of range
+    // untouched (it can't be represented inside the guest regardless).
+    let shift = |id: u32| if id < 65_536 { base + id } else { id };
+    let relabel = |path: &Path, meta: &std::fs::Metadata| -> std::io::Result<()> {
+        std::os::unix::fs::lchown(path, Some(shift(meta.uid())), Some(shift(meta.gid())))
+    };
+    relabel(dir, &std::fs::symlink_metadata(dir)?)?;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            relabel(&path, &meta)?;
+            if meta.file_type().is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write the worker's user-namespace uid/gid maps from the launcher. The worker
 /// unshared `CLONE_NEWUSER` but can't self-write a range map (no CAP_SETUID in the
 /// parent ns after the unshare); the launcher still holds CAP_SETUID/SETGID in the
 /// parent, so it writes `/proc/<pid>/{uid,gid}_map` for it (uid first). No
 /// `setgroups=deny` is needed — a privileged writer may set gid_map directly.
-fn write_userns_maps(pid: u32) -> Result<(), String> {
-    let line = crate::worker::userns_map_line();
+fn write_userns_maps(pid: u32, base: u32) -> Result<(), String> {
+    let line = crate::worker::userns_map_line(base);
     std::fs::write(format!("/proc/{pid}/uid_map"), &line).map_err(|e| format!("uid_map: {e}"))?;
     std::fs::write(format!("/proc/{pid}/gid_map"), &line).map_err(|e| format!("gid_map: {e}"))?;
     Ok(())
