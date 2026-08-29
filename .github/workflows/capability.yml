@@ -100,13 +100,16 @@ jobs:
 
   # Tier B — the native container backend: root + user namespaces + a veth bridge +
   # CRIU checkpoint/restore. Uses a busybox rootfs exported from the public busybox
-  # image (a test-double, not a private artifact). No secrets.
+  # image (a test-double, not a private artifact) plus a public pgvector image pulled
+  # daemonless for the co-located managed-DB seam. No secrets.
   container:
-    name: container launch (root) + CRIU (informational)
+    name: container launch (root) + co-located Postgres + CRIU (informational)
     # Ubuntu 24.04 (noble) dropped the `criu` package; jammy still ships it. The native
     # container backend LAUNCH (userns + veth into br-boatramp + cgroup-v2 limits under a
     # delegated /sys/fs/cgroup/boatramp subtree + serve over HTTP) runs to GREEN here and
-    # is a HARD GATE. Only CRIU *restore* is informational: it segfaults on the hosted
+    # is a HARD GATE — for a busybox test-double AND for a real stock OCI image (pgvector)
+    # run co-located as a managed Postgres, in both id-mapping modes (rootless default +
+    # host-root opt-in). Only CRIU *restore* is informational: it segfaults on the hosted
     # runner's kernel (restore is highly kernel/environment-sensitive) — attempted +
     # surfaced, non-gating.
     runs-on: ubuntu-22.04
@@ -117,9 +120,11 @@ jobs:
         with:
           key: capability-container
 
-      - name: Host deps (criu) + a busybox rootfs tarball
+      - name: Host deps (criu, psql client) + a busybox rootfs tarball
         run: |
-          sudo apt-get update && sudo apt-get install -y criu
+          # `criu` for the informational restore tier; `postgresql-client` for the
+          # co-located Postgres gate's real `psql` query over TCP.
+          sudo apt-get update && sudo apt-get install -y criu postgresql-client
           # A minimal rootfs from the public busybox image — a test-double, built on
           # the runner, never a private artifact.
           cid="$(docker create busybox:latest)"
@@ -156,6 +161,28 @@ jobs:
             container_live_launch_and_hold -- --ignored --nocapture 2>&1 | tee container.log
           grep -qE 'test result: ok' container.log \
             || { echo "::error::container launch+serve failed" >&2; exit 1; }
+
+      - name: Co-located Postgres (pgvector) from an OCI image — rootless + host-root (hard gate)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # Pull pgvector/pgvector:pg16 daemonless and run it under the native container
+          # backend in BOTH id-mapping modes (rootless default + host-root opt-in), each
+          # proving a real `initdb` + query + `create extension vector` over TCP.
+          # --test-threads=1 so the two launches don't contend on the single test bridge.
+          timeout -k 30 600 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-container --test container_live \
+            container_live_postgres -- --ignored --test-threads=1 --nocapture 2>&1 | tee pg.log
+          # A skip (missing BOATRAMP_BIN) still reports `test result: ok` — the exact trap
+          # that once let a broken "tested e2e" claim through. Gate on the success markers
+          # that print ONLY after each mode reaches a serving Postgres, so a silent skip
+          # fails the job.
+          grep -qE 'test result: ok' pg.log \
+            || { echo "::error::co-located Postgres e2e did not pass" >&2; exit 1; }
+          grep -q 'co-located pgvector from an OCI image (rootless):' pg.log \
+            || { echo "::error::rootless mode never reached a serving Postgres (silent skip?)" >&2; exit 1; }
+          grep -q 'co-located pgvector from an OCI image (host-root):' pg.log \
+            || { echo "::error::host-root mode never reached a serving Postgres (silent skip?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true
