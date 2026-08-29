@@ -1661,6 +1661,7 @@ version = "0.3.4"
 dependencies = [
  "async-trait",
  "boatramp-core",
+ "boatramp-firecracker",
  "boatramp-types",
  "bytes",
  "caps",

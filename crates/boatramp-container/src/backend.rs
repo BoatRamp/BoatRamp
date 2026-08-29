@@ -262,6 +262,52 @@ impl ContainerBackend {
             .map_err(|e| BackendError::Materialize(format!("mark ready: {e}")))?;
         Ok(())
     }
+
+    /// Materialize an **OCI image** reference into an unpacked rootfs directory at
+    /// `<data_dir>/compute/images/<sha256(ref)>/` — pull the image over the registry
+    /// HTTP API and overlay its layers (honoring whiteouts), with no Docker daemon.
+    /// Idempotent and keyed by the image reference: a completed pull is reused (gated
+    /// by the `.boatramp-ready` marker), so relaunching the same image never re-pulls.
+    ///
+    /// The pull builds into a sibling temp dir and is published to its final path with
+    /// an atomic rename only after the ready marker is written, so a partial or
+    /// interrupted pull can never be mistaken for a complete rootfs.
+    async fn stage_image(&self, image: &str) -> Result<PathBuf, BackendError> {
+        let key = boatramp_types::manifest::sha256_hex(image.as_bytes());
+        let images = self.data_dir.join("compute").join("images");
+        let dir = images.join(&key);
+        if tokio::fs::try_exists(dir.join(".boatramp-ready"))
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(dir);
+        }
+        tokio::fs::create_dir_all(&images)
+            .await
+            .map_err(|e| BackendError::Materialize(format!("create {}: {e}", images.display())))?;
+        let tmp = images.join(format!(".{key}.tmp"));
+        // Clear any leftover partial from a prior interrupted pull.
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        match boatramp_firecracker::oci::build_rootfs_dir(image, &tmp).await {
+            Ok(()) => {
+                tokio::fs::write(tmp.join(".boatramp-ready"), b"1")
+                    .await
+                    .map_err(|e| BackendError::Materialize(format!("mark ready: {e}")))?;
+                // Publish atomically; replace any stale directory at the final path.
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                tokio::fs::rename(&tmp, &dir).await.map_err(|e| {
+                    BackendError::Materialize(format!("publish rootfs {}: {e}", dir.display()))
+                })?;
+                Ok(dir)
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&tmp).await;
+                Err(BackendError::Materialize(format!(
+                    "pull OCI image {image}: {e}"
+                )))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -287,17 +333,20 @@ impl ComputeBackend for ContainerBackend {
     }
 
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError> {
-        // The native container runtime stages + unpacks a **tar** rootfs archive; an
-        // image reference belongs to `docker`, an ext4 image to the micro-VM.
-        let hash = match &spec.root {
-            RootSource::Tar(hash) => hash,
-            RootSource::Image(_) | RootSource::Rootfs(_) => {
-                return Err(BackendError::Materialize(
-                    "container backend requires a tar rootfs archive (RootSource::Tar)".into(),
-                ))
-            }
-        };
-        let dir = self.stage_rootfs(hash).await?;
+        // Two rootfs sources produce a directory the worker `pivot_root`s into:
+        // a **tar** blob from the shared store (staged + unpacked), or an **OCI
+        // image** reference (pulled over the registry HTTP API + its layers
+        // overlaid — no Docker daemon). A `Rootfs` block image is the micro-VM's.
+        let dir =
+            match &spec.root {
+                RootSource::Tar(hash) => self.stage_rootfs(hash).await?,
+                RootSource::Image(image) => self.stage_image(image).await?,
+                RootSource::Rootfs(_) => return Err(BackendError::Materialize(
+                    "container backend requires a tar rootfs archive or an OCI image reference \
+                     (RootSource::Tar | RootSource::Image)"
+                        .into(),
+                )),
+            };
         Ok(Artifact::Rootfs {
             dir: dir.display().to_string(),
         })
@@ -1103,6 +1152,61 @@ mod tests {
 
         // Idempotent: a second materialize re-uses the staged dir.
         let art2 = backend.materialize(&spec).await.expect("materialize 2");
+        assert_eq!(art, art2);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Live (network): the container backend pulls a real OCI image over the registry
+    /// HTTP API — no Docker daemon — and overlays its layers into a rootfs directory the
+    /// worker can `pivot_root` into. Validates the `RootSource::Image` path
+    /// (`materialize` → `stage_image` → `oci::build_rootfs_dir`). Ignored by default
+    /// (pulls ~150 MB of `pgvector/pgvector:pg16` from a public registry).
+    #[tokio::test]
+    #[ignore = "network: pulls pgvector/pgvector:pg16 from a public registry"]
+    async fn materialize_pulls_an_oci_image_rootfs() {
+        let data_dir = unique_dir("image");
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())), // unused for the Image path (no Storage read)
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+        let mut spec = spec_for(&"d".repeat(64));
+        spec.root = RootSource::Image("pgvector/pgvector:pg16".into());
+
+        let art = backend.materialize(&spec).await.expect("materialize image");
+        let dir = match &art {
+            Artifact::Rootfs { dir } => PathBuf::from(dir),
+            other => panic!("expected Rootfs, got {other:?}"),
+        };
+        // The base postgres layer overlaid — the server binary + the image entrypoint.
+        assert!(
+            dir.join("usr/lib/postgresql/16/bin/postgres").is_file(),
+            "postgres server binary present"
+        );
+        assert!(
+            dir.join("usr/local/bin/docker-entrypoint.sh").is_file(),
+            "postgres image entrypoint present"
+        );
+        // The pgvector layer overlaid on top of the base — the extension control file.
+        assert!(
+            dir.join("usr/share/postgresql/16/extension/vector.control")
+                .is_file(),
+            "pgvector extension layer applied over the base"
+        );
+        assert!(
+            dir.join(".boatramp-ready").is_file(),
+            "ready marker written"
+        );
+
+        // Idempotent: a second materialize re-uses the pulled rootfs (no re-pull).
+        let art2 = backend
+            .materialize(&spec)
+            .await
+            .expect("materialize image 2");
         assert_eq!(art, art2);
 
         let _ = std::fs::remove_dir_all(&data_dir);

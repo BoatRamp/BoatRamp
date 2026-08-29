@@ -161,6 +161,11 @@ impl SandboxPlan {
             ),
             Mount::virt("tmpfs", "/dev", "tmpfs", &["nosuid", "mode=0755"]),
             Mount::virt("tmpfs", "/tmp", "tmpfs", &["nosuid", "nodev"]),
+            // `/run` (sticky, world-writable like `/tmp`) so a stock image can create
+            // its runtime dir — e.g. Postgres makes `/run/postgresql` for its unix
+            // socket during init. Without it, a rootless entrypoint can't write `/run`
+            // and init fails. Mirrors the docker backend's `mode=1777` `/run` tmpfs.
+            Mount::virt("tmpfs", "/run", "tmpfs", &["nosuid", "nodev", "mode=1777"]),
         ];
         let cgroup = CgroupLimits {
             cpu_max: Some(format!(
@@ -272,6 +277,18 @@ mod tests {
             .iter()
             .any(|m| m.target == "/tmp" && m.fstype == "tmpfs"));
         assert!(plan.mounts.iter().any(|m| m.target == "/dev"));
+        // `/run` is a sticky, world-writable tmpfs so a stock image (e.g. Postgres
+        // creating `/run/postgresql`) can write its runtime dir under a rootless uid.
+        let run = plan
+            .mounts
+            .iter()
+            .find(|m| m.target == "/run")
+            .expect("/run tmpfs is mounted");
+        assert_eq!(run.fstype, "tmpfs");
+        assert!(
+            run.flags.iter().any(|f| f == "mode=1777"),
+            "/run is world-writable + sticky (mode=1777)"
+        );
     }
 
     #[test]

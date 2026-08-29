@@ -54,6 +54,13 @@ tar.workspace = true
 flate2.workspace = true
 serde_json.workspace = true
 ipnet.workspace = true
+# The daemonless OCI puller (pull an image over the registry HTTP API + overlay its
+# layers into a rootfs directory, honoring whiteouts) so `materialize` accepts a
+# `RootSource::Image` — the container backend can then run a stock image (e.g. a
+# co-located Postgres) with no Docker daemon. Only the `build` feature is pulled
+# (tar/flate2/reqwest/hex/sha2); `build_rootfs_dir` stops before `mke2fs`, so no
+# e2fsprogs. The KVM/VMM deps are behind the crate's other (unselected) features.
+boatramp-firecracker = { workspace = true, features = ["build"] }
 
 [dev-dependencies]
 serde_json.workspace = true
