@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.5] - 2026-08-29
+
+### Fixed
+- **The native container backend can run a stock OCI image co-located as a managed
+  service (e.g. Postgres), for real.** It could stage an image rootfs, but a stack of
+  runtime gaps made a real stock image (`pgvector/pgvector:pg16`) fail after boot, so the
+  co-located managed-DB path had never actually reached a serving state. The whole path is
+  fixed:
+  - **Rootless user-namespace ID mapping (default).** The guest's uids `0..65535` map to an
+    unprivileged host range (`base..base+65535`, base `100000`); the extracted rootfs and
+    each volume dir are ownership-shifted into that range so the guest's namespace-root owns
+    the image's root-owned files and non-root image uids (`postgres` 999) map correctly, and
+    the worker adopts the mapped namespace-root identity after `unshare` rather than staying
+    the unmapped host-root that fails `EOVERFLOW` on the first inode it creates.
+  - **Opt-in host-root convergence for single-tenant / trusted use.** `0 → host 0`, so
+    in-container root is host root (a stock-Docker-like posture), with no ownership shift.
+  - **`/dev` populated to Docker parity** — `null`/`zero`/`full`/`random`/`urandom`/`tty`
+    devices, the `fd`/`stdin`/`stdout`/`stderr`/`ptmx`/`core` symlinks, and `shm`/`mqueue`/`pts`.
+  - **seccomp allowlist widened** to the syscalls a stock Debian image needs but the
+    default-deny filter was rejecting (`EPERM`): the bare `chmod`/`chown`/`lchown` family,
+    SysV IPC, POSIX/interval timers, and `sync_file_range`/`msync` — Postgres `initdb` hit
+    each in turn.
+
+  Validated end to end on an ephemeral CI runner (not a developer box): a real `pgvector`
+  image is pulled daemonless and run under the container backend in **both** id-mapping
+  modes, each proving `initdb` + a TCP query + `create extension vector`. This runs as a
+  hard gate on every nightly, so the co-located managed-DB path now has standing,
+  machine-backed coverage instead of a manual run.
+
 ## [0.3.4] - 2026-08-28
 
 ### Changed
