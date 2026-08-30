@@ -1359,10 +1359,20 @@ pub(crate) struct SendfileSource {
     pub(crate) len: u64,
 }
 
-/// Below this size a blob is served from the in-memory small-blob cache (one
-/// refcounted frame — cheaper than a syscall dance for a tiny file), so `sendfile`
-/// only kicks in above it. Matches the deploy layer's cache boundary.
-const SENDFILE_MIN_BYTES: u64 = 256 * 1024;
+/// Smallest blob that `sendfile`s rather than serving from the in-memory small-blob
+/// cache. There is a crossover: `sendfile` avoids the socket-buffer page-alloc/zero cost
+/// (`clear_page`) but adds an `open` + the `sendfile` syscall dance per request, a losing
+/// trade for a tiny cache-resident body at very high request rates. Measured on the EPYC
+/// benchmark box, the knee is ~32 KiB (≤16 KiB the cache wins by ~10–18%; ≥64 KiB
+/// `sendfile` wins by ~11% at 64 KiB, ~19% at 100 KiB, ~85% at 1 MiB). Default 64 KiB —
+/// captures the clear medium+ wins while leaving small bodies and the marginal 32–64 KiB
+/// range on the cache. Tune with `BOATRAMP_SENDFILE_MIN_KB` (floored at 4 KiB).
+static SENDFILE_MIN_BYTES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("BOATRAMP_SENDFILE_MIN_KB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(64 * 1024, |kb| kb.saturating_mul(1024).max(4 * 1024))
+});
 
 /// Kill-switch for the zero-copy `sendfile` static path (default on). `BOATRAMP_SENDFILE=0`
 /// (or `false`) forces the memory-mapped body path — a safety valve for the hot path and
@@ -1482,7 +1492,7 @@ async fn serve_entry(
     // extension; the `http_serve` bridge turns it into a `Body::File`. TLS, remote
     // backends, and small (cached) blobs fall through to the mapped/cached/stream path,
     // byte-identical to before. HEAD is unaffected (the codec suppresses the body).
-    if *SENDFILE_ENABLED && plaintext && blob_size > SENDFILE_MIN_BYTES {
+    if *SENDFILE_ENABLED && plaintext && blob_size > *SENDFILE_MIN_BYTES {
         if let Some(file) = deploy.blob_file(blob_hash) {
             let mut resp = (base_status, headers, axum::body::Body::empty()).into_response();
             resp.extensions_mut().insert(SendfileSource {
