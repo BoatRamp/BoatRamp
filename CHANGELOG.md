@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.6] - 2026-08-30
+
+### Changed
+- **Large and medium plaintext static files are served zero-copy with `sendfile`.** A static
+  file over the serving threshold was memory-mapped and written out with `writev`, which — as a
+  profile on an AMD EPYC box showed — spent ~43% of CPU in `clear_page_erms`: the kernel
+  allocating and zeroing a fresh socket-buffer page for every chunk written (`tcp_sendmsg` →
+  `sk_page_frag_refill`). `sendfile` avoids this entirely by queuing references to the file's
+  page-cache pages — no send-buffer allocation and no copy, the way nginx/caddy serve static.
+  The serving pipeline still decides *what* is served (headers, content-type, caching, security,
+  conditional/range); only the body byte-movement changes, and it is byte-identical. On the EPYC
+  benchmark box, `static/1m` throughput went from a clear third of the field to a tie at the top
+  (parity with nginx and caddy), and medium bodies (≥ ~64 KiB) gained too. TLS, HTTP/2, remote
+  storage backends, and small (cached) bodies are unchanged. The crossover threshold is tunable
+  with `BOATRAMP_SENDFILE_MIN_KB` (default 64), and the whole path has a `BOATRAMP_SENDFILE=0`
+  kill-switch. Linux only; other targets read + write as before.
+
+### Added
+- **`serve`'s compute, security, and handler-SQL settings are now environment-settable**, so a
+  `boatramp.cfg` file is no longer required to configure them — convenient for 12-factor
+  deployments (fly.io / Cloudflare / containers) where dropping a config file on disk is awkward.
+  `BOATRAMP_COMPUTE_*`, `BOATRAMP_SECURITY_*` (the profile plus every posture-override knob), and
+  `BOATRAMP_HANDLERS_SQL_*` layer over the loaded config with **env-overrides-file** precedence
+  (matching the existing `serve` flags); a section absent from the file is materialised from
+  defaults when any of its variables is set. The compute kernel trust anchors
+  (`kernel_signing_pubkeys` / `kernel_allowed_hashes`) are deliberately kept file-only — they are
+  a host-access-gated security boundary. See `docs/reference/env`.
+
 ## [0.3.5] - 2026-08-29
 
 ### Fixed
