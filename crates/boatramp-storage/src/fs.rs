@@ -82,6 +82,14 @@ impl Storage for FsStorage {
         Some(bytes::Bytes::from_owner(mmap))
     }
 
+    fn local_file(&self, key: &str) -> Option<std::fs::File> {
+        // The open file for the zero-copy `sendfile` path (content-addressed +
+        // immutable, so the handle is stable). Any error (missing file, traversal
+        // reject) yields `None` and the caller falls back to `mapped`/streaming.
+        let path = self.resolve(key).ok()?;
+        std::fs::File::open(&path).ok()
+    }
+
     async fn get(&self, key: &str) -> Result<GetObject, StorageError> {
         let path = self.resolve(key)?;
         let file = match tokio::fs::File::open(&path).await {

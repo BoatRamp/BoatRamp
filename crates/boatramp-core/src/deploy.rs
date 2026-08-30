@@ -534,6 +534,14 @@ impl DeployStore {
         Ok(self.storage.get(&keys::blob(hash)).await?)
     }
 
+    /// The open local file backing a content-addressed blob, for the zero-copy
+    /// `sendfile` static path — `None` on remote/opaque backends (the caller then
+    /// uses [`open_blob_cached`](DeployStore::open_blob_cached)). The blob keyspace
+    /// is content-addressed and immutable, so the handle never sees a rewrite.
+    pub fn blob_file(&self, hash: &str) -> Option<std::fs::File> {
+        self.storage.local_file(&keys::blob(hash))
+    }
+
     /// Serve a blob body, using the in-memory small-blob cache for the static hot
     /// path. Blobs over [`SMALL_BLOB_CACHE_MAX`] always stream
     /// ([`BlobBody::Stream`]); small blobs are served from the content-hash cache

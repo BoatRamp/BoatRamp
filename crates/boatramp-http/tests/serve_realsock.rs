@@ -225,6 +225,121 @@ async fn client_disconnect_midresponse_is_graceful() {
     assert_eq!(status, 200);
 }
 
+// --- zero-copy `sendfile` static body -----------------------------------------
+
+/// A non-repeating byte pattern so a wrong offset, a truncation, or a duplicated/
+/// re-sent chunk is caught (an all-same-byte body would hide those).
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Serves one on-disk file as a [`Body::File`] (the `sendfile` fast-path) for `GET
+/// /file`, opening a fresh handle per request (as the serving layer does).
+#[derive(Clone)]
+struct FileApp {
+    path: std::sync::Arc<std::path::PathBuf>,
+    len: u64,
+}
+impl Handler for FileApp {
+    async fn handle(&self, _req: Request) -> Response {
+        let file = std::fs::File::open(&*self.path).unwrap();
+        response(200, Body::file(std::sync::Arc::new(file), 0, self.len))
+    }
+}
+
+async fn spawn_file_server(app: FileApp) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let _ = serve_connection_with(stream, app, Config::default()).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Over a real plaintext TCP socket the h1 codec serves a `Body::File` via `sendfile`
+/// (Linux) — the bytes the client receives must be byte-identical to the file, the
+/// framing (`Content-Length`) exact, and the connection reusable afterwards (the
+/// dup'd-fd `sendfile` must not disturb the original socket).
+#[tokio::test]
+async fn sendfile_large_static_over_tcp_is_byte_identical() {
+    let content = pattern(1_000_000);
+    let dir = std::env::temp_dir().join(format!("br-sendfile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blob");
+    std::fs::write(&path, &content).unwrap();
+    let addr = spawn_file_server(FileApp {
+        path: std::sync::Arc::new(path),
+        len: content.len() as u64,
+    })
+    .await;
+
+    let mut sender = connect_h1(addr).await;
+    // Two requests on one keep-alive connection: the second proves the socket survives
+    // the `sendfile` (dup + async_io) intact.
+    for _ in 0..2 {
+        let (status, body) = h1_get(&mut sender, "/file").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body.len(),
+            content.len(),
+            "Content-Length / framing must match"
+        );
+        assert_eq!(
+            body, content,
+            "sendfile body must be byte-identical to the file"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same `Body::File` over **h2c** takes the read fallback (no HTTP/2 `sendfile`
+/// analogue) — still byte-identical, which validates the region read used by every
+/// non-`sendfile` transport (TLS, wrapped streams).
+#[tokio::test]
+async fn file_body_over_h2c_is_byte_identical_via_fallback() {
+    let content = pattern(600_000);
+    let dir = std::env::temp_dir().join(format!("br-sendfile-h2c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blob");
+    std::fs::write(&path, &content).unwrap();
+    let addr = spawn_file_server(FileApp {
+        path: std::sync::Arc::new(path),
+        len: content.len() as u64,
+    })
+    .await;
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (h2, connection) = h2::client::handshake(stream).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2 = h2.ready().await.unwrap();
+    let req = http::Request::builder()
+        .uri("http://x/file")
+        .body(())
+        .unwrap();
+    let (resp, _) = h2.send_request(req, true).unwrap();
+    let resp = resp.await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        let _ = body.flow_control().release_capacity(chunk.len());
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        got, content,
+        "h2c read-fallback body must be byte-identical"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_h1_and_h2_concurrent() {
     let addr = spawn_server(Config::default()).await;

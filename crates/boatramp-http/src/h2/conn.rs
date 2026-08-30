@@ -598,6 +598,13 @@ where
             }
             http::Body::Bytes(buf)
         }
+        // The `sendfile` file body has no HTTP/2 zero-copy analogue; materialize the
+        // region to bytes (positioned read) so the framer treats it like any other.
+        // Only a plaintext-h2c large static hits this — HTTP/2 is almost always TLS,
+        // which keeps the mapped path.
+        http::Body::File { file, offset, len } => http::Body::Bytes(
+            crate::serving::read_file_region(&file, offset, len).unwrap_or_default(),
+        ),
         other => other,
     };
     let status = parts.status.as_u16().to_string();
@@ -686,10 +693,14 @@ where
                     .await
                     .map_err(|_| H2Error::conn(ErrorCode::InternalError))?;
             }
-            // `respond` drains a streamed body to `Bytes` before it is ever queued, so
-            // the serial driver never flushes a `Stream`.
+            // `respond` drains a streamed body to `Bytes` — and materializes a file body
+            // to `Bytes` — before either is ever queued, so the serial driver never
+            // flushes a `Stream` or a `File`.
             http::Body::Stream(_) => {
                 unreachable!("serial driver buffers stream bodies in respond")
+            }
+            http::Body::File { .. } => {
+                unreachable!("serial driver materializes file bodies in respond")
             }
         }
         conn.conn_send_window -= chunk as i64;

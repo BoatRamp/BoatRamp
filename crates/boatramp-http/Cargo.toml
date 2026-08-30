@@ -36,6 +36,10 @@ tokio-stream = "0.1"
 # without buffering the whole body.
 http-body = "1"
 
+# The zero-copy `sendfile` static fast-path is Linux-only; other targets read + write.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # hyper's HTTP/1 server is the DIFFERENTIAL ORACLE for the h1 codec: identical raw byte
 # streams are fed to boatramp-http and to hyper, and the two must agree on how the stream

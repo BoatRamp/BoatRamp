@@ -162,6 +162,18 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// If this backend stores objects as local files, open `key` and return the
+    /// file handle for the zero-copy `sendfile` serving path — the kernel moves the
+    /// file's bytes straight to the client socket with no userspace copy (what
+    /// nginx/caddy do for plaintext static). Same content-addressed-immutability
+    /// guarantee as [`mapped`](Storage::mapped). Returns `None` for remote/opaque
+    /// backends (S3/GCS/Azure) or on any error, so the caller falls back to
+    /// `mapped`/streaming. The caller decides whether `sendfile` is applicable
+    /// (plaintext only — TLS can't zero-copy through userspace crypto).
+    fn local_file(&self, _key: &str) -> Option<std::fs::File> {
+        None
+    }
+
     /// Whether this backend can natively watch for changes (FA-5 blob-change
     /// triggers). A cheap, side-effect-free capability probe: a `Blob` trigger is
     /// **refused at activation** on a backend that returns `false`, so the

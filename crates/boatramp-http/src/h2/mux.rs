@@ -912,6 +912,11 @@ async fn response_to_frames(
 async fn body_bytes(body: http::Body) -> Vec<u8> {
     match body {
         http::Body::Bytes(b) => b,
+        // A `sendfile` file body has no HTTP/2 zero-copy analogue; materialize the
+        // region (positioned read). Only a plaintext-h2c large static reaches this.
+        http::Body::File { file, offset, len } => {
+            crate::serving::read_file_region(&file, offset, len).unwrap_or_default()
+        }
         // `emit_response` streams a `Body::Stream` directly and never routes it here;
         // buffer it if it ever does, so this stays correct. A mid-stream error ends the
         // drain (best-effort — this fallback is only reached if a stream is ever routed

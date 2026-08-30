@@ -162,6 +162,20 @@ pub type BodyChunk = Result<Bytes, BodyError>;
 pub enum Body {
     Bytes(Vec<u8>),
     Stream(std::pin::Pin<Box<dyn tokio_stream::Stream<Item = BodyChunk> + Send>>),
+    /// A `[offset, offset+len)` region of an open local file, for the zero-copy
+    /// `sendfile` static path. Over a plaintext socket the h1 codec moves the bytes
+    /// kernel-to-kernel (no userspace copy — what nginx/caddy do); any other
+    /// transport (TLS, a wrapped/duplex stream, HTTP/2) reads the region and writes
+    /// it normally, so the output is always identical — the file variant is a pure
+    /// how-it-moves optimization. The serving layer only produces this for plaintext
+    /// large static blobs. `len` is the content length (framing is fixed).
+    File {
+        // `Arc` so the source can ride an `http::Extensions` (which requires the value
+        // be `Clone`) from the serving layer to the codec; `std::fs::File` is not `Clone`.
+        file: std::sync::Arc<std::fs::File>,
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl Body {
@@ -191,14 +205,39 @@ impl Body {
         match self {
             Self::Bytes(b) => b.len(),
             Self::Stream(_) => 0,
+            Self::File { len, .. } => *len as usize,
         }
     }
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Bytes(b) => b.is_empty(),
             Self::Stream(_) => false,
+            Self::File { len, .. } => *len == 0,
         }
     }
+
+    /// A zero-copy static body: `[offset, offset+len)` of `file` (see [`Body::File`]).
+    pub fn file(file: std::sync::Arc<std::fs::File>, offset: u64, len: u64) -> Self {
+        Self::File { file, offset, len }
+    }
+}
+
+/// Read a `[offset, offset+len)` region of a file into an owned buffer — the fallback
+/// path for a [`Body::File`] on a transport that can't `sendfile` (TLS, HTTP/2, a
+/// wrapped stream, or a non-Linux target). Reads through a private clone of the handle
+/// so the original's cursor (and any concurrent reader) is untouched. Portable
+/// (`Seek`+`Read`), so the codec builds on the release's Windows target too.
+pub(crate) fn read_file_region(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut handle = file.try_clone()?;
+    handle.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len as usize];
+    handle.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 impl Default for Body {

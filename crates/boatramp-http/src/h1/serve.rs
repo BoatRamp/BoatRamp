@@ -54,11 +54,13 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
-    // Split the connection so the response can be written WHILE the request body is still
-    // being read (a streaming reverse proxy: request body → upstream, upstream response →
-    // client, both in flight). The pump owns the read half; the response write owns the
-    // write half; the two run concurrently via `join!`.
-    let (mut rd, mut wr) = tokio::io::split(io);
+    // Keep the connection **un-split** by default. A request with no body (the common
+    // GET/HEAD — every static hit) is served sequentially (read head → handler → write
+    // response), which keeps the concrete socket reachable so a `Body::File` response can
+    // `sendfile` over the socket's own reactor registration. Only a request that carries
+    // a body splits (below), so its response can stream out while the body streams in (a
+    // reverse proxy). The split is then reunited for the next request.
+    let mut io = io;
     // Unconsumed bytes; each request drains its head from the front, the pump drains the
     // body, leaving any pipelined bytes for the next iteration.
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -70,11 +72,11 @@ where
                 ParseResult::Complete { head, consumed } => break (head, consumed),
                 ParseResult::Reject(_) => {
                     // Malformed / ambiguous head → 400 and close (never resync).
-                    let _ = write_status(&mut wr, 400, true).await;
+                    let _ = write_status(&mut io, 400, true).await;
                     return Ok(());
                 }
                 ParseResult::Incomplete => {
-                    match tokio::time::timeout(read_timeout, rd.read_buf(&mut buf)).await {
+                    match tokio::time::timeout(read_timeout, io.read_buf(&mut buf)).await {
                         Ok(Ok(0)) => return Ok(()), // EOF on a request boundary → clean close
                         Ok(Ok(_)) => continue,
                         _ => return Ok(()), // read error / slowloris timeout → drop
@@ -118,30 +120,52 @@ where
                 // so the serve future stays `Send`), write it, then reunite + hand off.
                 let head = build_upgrade_head(&resp);
                 drop(resp);
-                if write_all(&mut wr, &head).await.is_err() {
+                if write_all(&mut io, &head).await.is_err() {
                     return Ok(());
                 }
-                let io = rd.unsplit(wr);
                 let prefix = Bytes::from(std::mem::take(&mut buf));
                 let _ = up_tx.send(crate::upgrade::Upgraded::new(io, prefix));
                 return Ok(()); // the connection now belongs to the upgrade consumer
             }
             // The handler declined the upgrade: send its response and close (a rejected
             // upgrade never keeps the connection alive).
-            let _ = write_response(&mut wr, resp, &method, version, true).await;
+            let _ = write_response(&mut io, resp, &method, version, true).await;
             return Ok(());
         }
 
-        // A body carries an interim 100-continue if the client asked for one.
-        if !matches!(framing, BodyFraming::Empty)
-            && expect_continue
-            && write_all(&mut wr, b"HTTP/1.1 100 Continue\r\n\r\n")
+        // --- no request body: serve sequentially on the un-split connection ------
+        // The common GET/HEAD path (and every static hit). Keeping `io` whole is what
+        // lets a `Body::File` response `sendfile` over the socket's own registration.
+        if matches!(framing, BodyFraming::Empty) {
+            let mut req = http::Request::new(ReqBody::empty());
+            *req.method_mut() = head.method;
+            *req.uri_mut() = head.uri;
+            *req.version_mut() = head.version;
+            *req.headers_mut() = head.headers;
+
+            let resp = handler.handle(req).await;
+            let (result, resp_close) =
+                write_response(&mut io, resp, &method, version, client_close).await;
+            if result.is_err() {
+                return Ok(()); // client went away mid-response
+            }
+            if resp_close {
+                return Ok(());
+            }
+            continue;
+        }
+
+        // --- request has a body: split so the response streams out while the body -----
+        // streams in (a reverse proxy), then reunite `io` for the next request. A body
+        // request is never a static file, so `sendfile` doesn't apply here.
+        if expect_continue
+            && write_all(&mut io, b"HTTP/1.1 100 Continue\r\n\r\n")
                 .await
                 .is_err()
         {
             return Ok(());
         }
-
+        let (mut rd, mut wr) = tokio::io::split(io);
         // A bounded channel backs the request's ReqBody stream; the pump feeds it from the
         // connection (backpressured by the channel capacity) and closes it at the body's
         // end so the handler's body stream terminates.
@@ -162,6 +186,8 @@ where
             respond,
             pump_body(&mut rd, &mut buf, framing, tx, read_timeout)
         );
+        // Reunite the halves so the next keep-alive request is served un-split again.
+        io = rd.unsplit(wr);
 
         if result.is_err() {
             return Ok(()); // client went away mid-response
@@ -298,7 +324,9 @@ async fn write_response<IO>(
     client_close: bool,
 ) -> (std::io::Result<()>, bool)
 where
-    IO: AsyncWrite + Unpin,
+    // `Any` lets a `Body::File` recover the concrete plaintext socket from `io` and
+    // `sendfile` over its own reactor registration (see [`serve_connection_with`]).
+    IO: AsyncWrite + Unpin + std::any::Any,
 {
     let (mut parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
@@ -327,6 +355,7 @@ where
     }
     let framing = match &body {
         Body::Bytes(v) => Framing::Fixed(v.len()),
+        Body::File { len, .. } => Framing::Fixed(*len as usize),
         Body::Stream(_) => Framing::Chunked,
     };
 
@@ -364,6 +393,38 @@ where
         Body::Bytes(v) => {
             if let Err(e) = write_all(io, &v).await {
                 return (Err(e), true);
+            }
+        }
+        Body::File { file, offset, len } => {
+            // The head is already written; move the file body after it. Zero-copy
+            // `sendfile` when `io` is a plaintext socket (the common case for this
+            // variant) — over the socket's OWN reactor registration; otherwise read the
+            // region and write it through `io` (a TLS write half still encrypts it).
+            #[cfg(target_os = "linux")]
+            {
+                // Flush the head first (releases the `&mut io` borrow), then borrow the
+                // socket immutably for the sendfile — the two are sequential, no aliasing.
+                if let Err(e) = io.flush().await {
+                    return (Err(e), true);
+                }
+                if let Some(sock) = crate::serve::sendfile_socket(&*io) {
+                    return match crate::serve::sendfile_all(sock, &file, offset, len).await {
+                        Ok(()) => (Ok(()), will_close),
+                        Err(e) => (Err(e), true),
+                    };
+                }
+            }
+            // Fallback (non-Linux, or not a plaintext socket): read the region + write it.
+            match crate::serving::read_file_region(&file, offset, len) {
+                Ok(bytes) => {
+                    if let Err(e) = write_all(io, &bytes).await {
+                        return (Err(e), true);
+                    }
+                }
+                // A short read means the on-disk blob changed under us (impossible — the
+                // blob keyspace is content-addressed + immutable). Abort rather than frame
+                // a truncated body as complete.
+                Err(_) => return (Ok(()), true),
             }
         }
         Body::Stream(mut stream) => {

@@ -178,6 +178,18 @@ impl Storage for CachedStorage {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError> {
         self.inner.list(prefix).await
     }
+
+    /// Delegate the zero-copy accessors to the wrapped backend — the cache buffers
+    /// only small bodies, and large blobs (the ones these serve) are exactly what a
+    /// local backend should memory-map / `sendfile`. Not delegating them would
+    /// silently disable both fast paths behind the cache.
+    fn mapped(&self, key: &str) -> Option<bytes::Bytes> {
+        self.inner.mapped(key)
+    }
+
+    fn local_file(&self, key: &str) -> Option<std::fs::File> {
+        self.inner.local_file(key)
+    }
 }
 
 #[cfg(test)]

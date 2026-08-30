@@ -122,7 +122,21 @@ impl Handler for RouterHandler {
                 }
             }
         };
-        let (parts, body) = resp.into_parts();
+        let (mut parts, body) = resp.into_parts();
+        // Zero-copy static: `serve_entry` attached the open file as an extension for a
+        // large plaintext static blob. Hand the codec a `Body::File` — it moves the
+        // bytes with `sendfile` over a plaintext socket (no userspace copy) and reads +
+        // writes them otherwise. Only reachable for plaintext large static, so the h1
+        // codec's write half is a bare TCP socket and `sendfile` applies.
+        if let Some(src) = parts
+            .extensions
+            .remove::<crate::serve_pipeline::SendfileSource>()
+        {
+            return axum::http::Response::from_parts(
+                parts,
+                HttpBody::file(src.file, src.offset, src.len),
+            );
+        }
         // Hand the router's body to the codec as a pull `Stream` it polls itself —
         // no producer task, no channel, no buffering (unbounded bodies stream too).
         // Data frames pass through; a mid-stream body error (an upstream that dropped)

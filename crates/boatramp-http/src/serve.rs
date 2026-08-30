@@ -113,6 +113,82 @@ impl<IO> Rewind<IO> {
             inner,
         }
     }
+
+    /// The wrapped transport — so the `sendfile` fast-path can reach the underlying
+    /// socket through the classify wrapper.
+    pub(crate) fn get_ref(&self) -> &IO {
+        &self.inner
+    }
+}
+
+/// The plaintext TCP socket of `io` **if** this codec can `sendfile` to it — a bare
+/// [`TcpStream`](tokio::net::TcpStream) or one behind the classify [`Rewind`] wrapper
+/// (the shape the plaintext serve path produces). Any other transport (a TLS stream, a
+/// duplex/test stream, a doubly-wrapped fallback) returns `None`, so the caller writes
+/// the body normally. Returning the live `&TcpStream` (not a raw fd) is what lets
+/// `sendfile` drive readiness on the socket's **existing** reactor registration — a
+/// per-request `dup` + fresh registration regressed ~2.4× under load. Linux only.
+#[cfg(target_os = "linux")]
+pub(crate) fn sendfile_socket<IO: std::any::Any>(io: &IO) -> Option<&tokio::net::TcpStream> {
+    let any = io as &dyn std::any::Any;
+    if let Some(tcp) = any.downcast_ref::<tokio::net::TcpStream>() {
+        return Some(tcp);
+    }
+    if let Some(rw) = any.downcast_ref::<Rewind<tokio::net::TcpStream>>() {
+        return Some(rw.get_ref());
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn sendfile_socket<IO: std::any::Any>(_io: &IO) -> Option<&tokio::net::TcpStream> {
+    None
+}
+
+/// Zero-copy `[offset, offset+len)` of `file` → `sock`, via `sendfile`, driving
+/// readiness on the socket's **own** reactor registration (`async_io`) — no `dup`, no
+/// second registration (which misroutes edge-triggered wakeups and collapsed
+/// throughput). The head bytes were already flushed to the same socket, so ordering is
+/// preserved. This mirrors the reverse-proxy `splice` fast-path's `async_io` loop.
+#[cfg(target_os = "linux")]
+pub(crate) async fn sendfile_all(
+    sock: &tokio::net::TcpStream,
+    file: &std::fs::File,
+    mut offset: u64,
+    len: u64,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    let sock_fd = sock.as_raw_fd();
+    let file_fd = file.as_raw_fd();
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(1 << 20) as usize;
+        let n = sock
+            .async_io(Interest::WRITABLE, || {
+                // `sendfile` reads from `*off` and advances it; a fresh `off` per call
+                // (recomputed from `offset`) keeps the closure idempotent across the
+                // EAGAIN retries `async_io` may drive.
+                let mut off = offset as libc::off_t;
+                let r = unsafe { libc::sendfile(sock_fd, file_fd, &mut off, want) };
+                if r < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(r as usize)
+                }
+            })
+            .await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "sendfile moved 0 bytes before the content-length",
+            ));
+        }
+        offset += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(())
 }
 
 impl<IO: AsyncRead + Unpin> AsyncRead for Rewind<IO> {

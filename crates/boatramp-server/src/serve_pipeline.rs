@@ -1283,6 +1283,15 @@ async fn serve_resolved(
             }
         }
     }
+    // Plaintext (not TLS) gates the zero-copy `sendfile` static body. The listener
+    // stamps `ServedOverTls`; absent (an unusual direct call) defaults to plaintext,
+    // which is still correct — the codec only `sendfile`s a bare TCP socket and reads
+    // the file through the (encrypting) write half otherwise.
+    let plaintext = !request
+        .extensions()
+        .get::<ServedOverTls>()
+        .map(|s| s.0)
+        .unwrap_or(false);
     let response = match outcome {
         Outcome::Redirect { location, status } => redirect(status, &location),
         Outcome::Proxy { url } => proxy(request, &url, &manifest.config, client_ip).await,
@@ -1302,6 +1311,7 @@ async fn serve_resolved(
                 &entry,
                 request.headers(),
                 StatusCode::OK,
+                plaintext,
             )
             .await
         }
@@ -1315,6 +1325,7 @@ async fn serve_resolved(
                     &entry,
                     request.headers(),
                     StatusCode::NOT_FOUND,
+                    plaintext,
                 )
                 .await
             }
@@ -1336,8 +1347,35 @@ fn method_not_allowed() -> Response {
         .into_response()
 }
 
+/// A large static blob to serve zero-copy via `sendfile` — attached as a response
+/// extension (survives `into_parts`), the [`http_serve`](crate::http_serve) bridge
+/// turns it into a [`boatramp_http::Body::File`] the h1 codec moves kernel-to-kernel.
+/// Only produced for plaintext connections; TLS keeps the memory-mapped path.
+#[derive(Clone)]
+pub(crate) struct SendfileSource {
+    // `Arc` so this can ride an `http::Extensions` (which requires `Clone`).
+    pub(crate) file: std::sync::Arc<std::fs::File>,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+/// Below this size a blob is served from the in-memory small-blob cache (one
+/// refcounted frame — cheaper than a syscall dance for a tiny file), so `sendfile`
+/// only kicks in above it. Matches the deploy layer's cache boundary.
+const SENDFILE_MIN_BYTES: u64 = 256 * 1024;
+
+/// Kill-switch for the zero-copy `sendfile` static path (default on). `BOATRAMP_SENDFILE=0`
+/// (or `false`) forces the memory-mapped body path — a safety valve for the hot path and
+/// the knob for a same-binary A/B of the two.
+static SENDFILE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("BOATRAMP_SENDFILE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+});
+
 /// Stream a resolved entry, applying conditional/range/headers. `base_status` is
-/// `200` for a normal hit and `404` for a custom error document.
+/// `200` for a normal hit and `404` for a custom error document. `plaintext` is true
+/// when the connection is not TLS — the gate for the zero-copy `sendfile` body.
 #[allow(clippy::too_many_arguments)]
 async fn serve_entry(
     deploy: &DeployStore,
@@ -1347,6 +1385,7 @@ async fn serve_entry(
     entry: &FileEntry,
     req_headers: &HeaderMap,
     base_status: StatusCode,
+    plaintext: bool,
 ) -> Response {
     let is_range = base_status == StatusCode::OK && req_headers.contains_key(header::RANGE);
 
@@ -1436,6 +1475,25 @@ async fn serve_entry(
     let mut headers = response_headers(config, request_path, served_path, entry, &etag);
     set_header(&mut headers, header::CONTENT_LENGTH, &blob_size.to_string());
     set_content_encoding(&mut headers, encoding);
+
+    // Zero-copy `sendfile` fast-path: a large static blob on a local backend served
+    // over a plaintext connection is moved kernel-to-kernel by the h1 codec (no
+    // userspace copy — what nginx/caddy do). Hand an empty body + the file source as an
+    // extension; the `http_serve` bridge turns it into a `Body::File`. TLS, remote
+    // backends, and small (cached) blobs fall through to the mapped/cached/stream path,
+    // byte-identical to before. HEAD is unaffected (the codec suppresses the body).
+    if *SENDFILE_ENABLED && plaintext && blob_size > SENDFILE_MIN_BYTES {
+        if let Some(file) = deploy.blob_file(blob_hash) {
+            let mut resp = (base_status, headers, axum::body::Body::empty()).into_response();
+            resp.extensions_mut().insert(SendfileSource {
+                file: std::sync::Arc::new(file),
+                offset: 0,
+                len: blob_size,
+            });
+            return resp;
+        }
+    }
+
     match deploy.open_blob_cached(blob_hash, blob_size).await {
         // Cached (small) and Mapped (large, memory-mapped file) both serve one
         // borrowed frame as a content-length body.
