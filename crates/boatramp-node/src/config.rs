@@ -45,6 +45,14 @@ pub enum ConfigError {
     /// Reading the file failed (other than not-found, which yields defaults).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// An environment-variable override could not be parsed (bad number/bool).
+    #[error("environment variable {var}: {reason}")]
+    Env {
+        /// The offending `BOATRAMP_*` variable.
+        var: &'static str,
+        /// Why the value was rejected.
+        reason: String,
+    },
 }
 
 /// Project configuration, loaded from `project.cfg` (RON) in the project folder.
@@ -156,15 +164,275 @@ impl ServerConfig {
         Ok(ron_options().from_str(text)?)
     }
 
-    /// Load from `path` (RON). A missing file yields the default config.
+    /// Load from `path` (RON), then layer `BOATRAMP_*` environment overrides on
+    /// top. A missing file yields the default config, so `serve` can be configured
+    /// entirely from the environment (12-factor deployments where dropping a
+    /// `boatramp.cfg` is awkward — fly.io / Cloudflare / containers).
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        match std::fs::read_to_string(path) {
+        let mut config = match std::fs::read_to_string(path) {
             Ok(contents) => Self::parse(&contents).map_err(|err| ConfigError::File {
                 path: path.display().to_string(),
                 source: Box::new(err),
+            })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err.into()),
+        };
+        config.apply_env_overrides(&EnvSource::Process)?;
+        Ok(config)
+    }
+
+    /// Layer `BOATRAMP_*` environment overrides onto the loaded config for the
+    /// `compute`, `security`, and handler-`sql` sections — the operational knobs
+    /// that were previously reachable only through the `boatramp.cfg` file.
+    ///
+    /// **Precedence: env overrides file.** This matches the existing `serve`
+    /// section (its `#[arg(long, env = …)]` flags already let an env var win over
+    /// the file value), keeping the resolution rule uniform. A set variable
+    /// updates the field even when the file also set it; an unset variable leaves
+    /// the file (or built-in default) untouched. When a section is absent from the
+    /// file but any of its variables are set, the section is materialised from its
+    /// defaults first — so no config file is required to configure it.
+    ///
+    /// `source` supplies the variables (the process environment in production; an
+    /// explicit map in tests), so this stays a pure function of its inputs.
+    fn apply_env_overrides(&mut self, source: &EnvSource) -> Result<(), ConfigError> {
+        // --- compute ---------------------------------------------------------
+        // Materialise `[compute]` only if at least one of its variables is set, so
+        // an unset environment leaves an absent section absent (⇒ no compute).
+        if source.any(COMPUTE_ENV_VARS) {
+            let compute = self.compute.get_or_insert_with(ComputeConfig::default);
+            if let Some(v) = source.get("BOATRAMP_COMPUTE_BRIDGE") {
+                compute.bridge = v;
+            }
+            if let Some(v) = source.get("BOATRAMP_COMPUTE_SUBNET") {
+                compute.subnet = v;
+            }
+            if let Some(v) = source.parse("BOATRAMP_COMPUTE_VCPUS")? {
+                compute.vcpus = v;
+            }
+            if let Some(v) = source.parse("BOATRAMP_COMPUTE_MEM_MIB")? {
+                compute.mem_mib = v;
+            }
+            if let Some(v) = source.get("BOATRAMP_COMPUTE_REGION") {
+                compute.region = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_COMPUTE_SQL_SHIM_URL") {
+                compute.sql_shim_url = Some(v);
+            }
+        }
+
+        // --- security --------------------------------------------------------
+        // Always materialise `[security]` when any knob is set: an absent section
+        // resolves to the strict `multi-tenant` default, and an env override then
+        // layers over that exactly as a file `overrides` block would.
+        if source.any(SECURITY_ENV_VARS) {
+            let security = self
+                .security
+                .get_or_insert_with(boatramp_core::security::SecurityConfig::default);
+            if let Some(v) = source.get("BOATRAMP_SECURITY_PROFILE") {
+                security.profile = Some(v);
+            }
+            let o = &mut security.overrides;
+            if let Some(v) =
+                source.parse_bool("BOATRAMP_SECURITY_ALLOW_UNAUTHENTICATED_PUBLIC_BIND")?
+            {
+                o.allow_unauthenticated_public_bind = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_UPLOAD_BYTES")? {
+                o.max_upload_bytes = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SITE_UNIX_UPSTREAMS")? {
+                o.allow_site_unix_upstreams = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS")? {
+                o.allow_site_private_upstreams = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS")? {
+                o.allow_guest_private_egress = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS")? {
+                o.allow_guest_self_egress = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES")? {
+                o.max_handler_blob_bytes = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_COMPONENT_BYTES")? {
+                o.max_component_bytes = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE")? {
+                o.oidc_require_audience = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE")? {
+                o.domain_verify_allow_private = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE")? {
+                o.domain_verify_self_serve = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE")? {
+                o.allow_shared_kernel_compute = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN")? {
+                o.ratelimit_fail_open = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING")? {
+                o.allow_implicit_routing = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_POP")? {
+                o.require_pop = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION")? {
+                o.require_domain_verification = Some(v);
+            }
+        }
+
+        // --- handler sql (`handlers.bindings.sql`) ---------------------------
+        // Materialise the nested `handlers.bindings.sql` chain only when a `sql`
+        // variable is set, so an unset environment doesn't conjure an empty
+        // handlers section. The variables mirror the config path
+        // (`BOATRAMP_HANDLERS_SQL_*`) and cover the cluster-vs-single-node knobs;
+        // secrets stay indirected via `*_TOKEN_ENV` names, never the token itself.
+        if source.any(SQL_ENV_VARS) {
+            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
+            let sql = handlers
+                .bindings
+                .sql
+                .get_or_insert_with(SqlBindingConfig::default);
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_DIR") {
+                sql.dir = Some(PathBuf::from(v));
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_URL") {
+                sql.url = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_ADMIN_URL") {
+                sql.admin_url = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_REPLICA_URL") {
+                sql.replica_url = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_TOKEN_ENV") {
+                sql.token_env = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV") {
+                sql.admin_token_env = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_PREVIEW_MODE") {
+                sql.preview_mode = Some(v);
+            }
+            if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_PREVIEW_INIT") {
+                sql.preview_init = Some(PathBuf::from(v));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// The `BOATRAMP_*` variables that populate the `[compute]` section. Kept as one
+/// list so [`ServerConfig::apply_env_overrides`] can decide whether to materialise
+/// an absent section without repeating the names.
+const COMPUTE_ENV_VARS: &[&str] = &[
+    "BOATRAMP_COMPUTE_BRIDGE",
+    "BOATRAMP_COMPUTE_SUBNET",
+    "BOATRAMP_COMPUTE_VCPUS",
+    "BOATRAMP_COMPUTE_MEM_MIB",
+    "BOATRAMP_COMPUTE_REGION",
+    "BOATRAMP_COMPUTE_SQL_SHIM_URL",
+];
+
+/// The `BOATRAMP_*` variables that populate the `[security]` section.
+const SECURITY_ENV_VARS: &[&str] = &[
+    "BOATRAMP_SECURITY_PROFILE",
+    "BOATRAMP_SECURITY_ALLOW_UNAUTHENTICATED_PUBLIC_BIND",
+    "BOATRAMP_SECURITY_MAX_UPLOAD_BYTES",
+    "BOATRAMP_SECURITY_ALLOW_SITE_UNIX_UPSTREAMS",
+    "BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS",
+    "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
+    "BOATRAMP_SECURITY_MAX_COMPONENT_BYTES",
+    "BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE",
+    "BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE",
+    "BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE",
+    "BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE",
+    "BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN",
+    "BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING",
+    "BOATRAMP_SECURITY_REQUIRE_POP",
+    "BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION",
+];
+
+/// The `BOATRAMP_*` variables that populate `handlers.bindings.sql`.
+const SQL_ENV_VARS: &[&str] = &[
+    "BOATRAMP_HANDLERS_SQL_DIR",
+    "BOATRAMP_HANDLERS_SQL_URL",
+    "BOATRAMP_HANDLERS_SQL_ADMIN_URL",
+    "BOATRAMP_HANDLERS_SQL_REPLICA_URL",
+    "BOATRAMP_HANDLERS_SQL_TOKEN_ENV",
+    "BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV",
+    "BOATRAMP_HANDLERS_SQL_PREVIEW_MODE",
+    "BOATRAMP_HANDLERS_SQL_PREVIEW_INIT",
+];
+
+/// Where env-override values come from: the real process environment, or an
+/// explicit map for a deterministic unit test. Keeping the lookup behind this enum
+/// lets [`ServerConfig::apply_env_overrides`] be tested without touching (racy,
+/// process-global) `std::env`.
+enum EnvSource {
+    /// The live process environment (`std::env::var`).
+    Process,
+    /// A fixed name→value map (tests only).
+    #[cfg(test)]
+    Map(BTreeMap<String, String>),
+}
+
+impl EnvSource {
+    /// The value of `var`, if set to a non-empty string. An empty value is treated
+    /// as unset so an accidental `VAR=` doesn't clobber a file value with `""`.
+    fn get(&self, var: &str) -> Option<String> {
+        let raw = match self {
+            Self::Process => std::env::var(var).ok(),
+            #[cfg(test)]
+            Self::Map(m) => m.get(var).cloned(),
+        };
+        raw.filter(|v| !v.is_empty())
+    }
+
+    /// Whether any of `vars` is set (to a non-empty value).
+    fn any(&self, vars: &[&str]) -> bool {
+        vars.iter().any(|v| self.get(v).is_some())
+    }
+
+    /// Parse `var` as any [`FromStr`](std::str::FromStr) type (numbers), mapping a
+    /// parse failure to a clear [`ConfigError::Env`]. `Ok(None)` when the variable
+    /// is unset.
+    fn parse<T>(&self, var: &'static str) -> Result<Option<T>, ConfigError>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        match self.get(var) {
+            Some(raw) => raw.parse::<T>().map(Some).map_err(|e| ConfigError::Env {
+                var,
+                reason: e.to_string(),
             }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Parse `var` as a boolean, accepting the common truthy/falsey spellings
+    /// (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) case-insensitively so an
+    /// operator isn't surprised by a strict `true`-only parse. `Ok(None)` when
+    /// unset.
+    fn parse_bool(&self, var: &'static str) -> Result<Option<bool>, ConfigError> {
+        match self.get(var) {
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Ok(Some(true)),
+                "false" | "0" | "no" | "off" => Ok(Some(false)),
+                other => Err(ConfigError::Env {
+                    var,
+                    reason: format!("expected a boolean (true/false), got {other:?}"),
+                }),
+            },
+            None => Ok(None),
         }
     }
 }
@@ -877,6 +1145,183 @@ mod tests {
 
     fn server(text: &str) -> ServerConfig {
         ron_options().from_str(text).unwrap()
+    }
+
+    /// Build an [`EnvSource::Map`] from `(name, value)` pairs for deterministic
+    /// override tests (no process-global `std::env` mutation).
+    fn env(pairs: &[(&str, &str)]) -> EnvSource {
+        EnvSource::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn env_overrides_configure_all_three_sections_with_no_file() {
+        // The crux of the ask: with NO `boatramp.cfg` at all (the default config),
+        // env vars alone materialise + populate the compute, security, and handler
+        // `sql` sections. `ServerConfig::default()` has all three absent.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.compute.is_none() && cfg.security.is_none() && cfg.handlers.is_none());
+
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_COMPUTE_VCPUS", "8"),
+            ("BOATRAMP_COMPUTE_MEM_MIB", "4096"),
+            ("BOATRAMP_COMPUTE_REGION", "eu-central"),
+            ("BOATRAMP_SECURITY_PROFILE", "single-tenant"),
+            ("BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS", "true"),
+            ("BOATRAMP_SECURITY_MAX_UPLOAD_BYTES", "1048576"),
+            ("BOATRAMP_HANDLERS_SQL_URL", "http://sqld:8080"),
+            ("BOATRAMP_HANDLERS_SQL_ADMIN_URL", "http://sqld:9090"),
+        ]))
+        .expect("valid env overrides apply");
+
+        // compute: the section now exists with the env values (and defaults elsewhere).
+        let compute = cfg.compute.expect("compute materialised from env");
+        assert_eq!(compute.vcpus, 8);
+        assert_eq!(compute.mem_mib, 4096);
+        assert_eq!(compute.region.as_deref(), Some("eu-central"));
+        assert_eq!(compute.bridge, "br-boatramp"); // untouched default
+
+        // security: profile + an override both took, and the posture resolves.
+        let security = cfg.security.expect("security materialised from env");
+        assert_eq!(security.profile.as_deref(), Some("single-tenant"));
+        let posture = security.resolve().expect("resolves");
+        assert!(posture.allow_site_private_upstreams);
+        assert_eq!(posture.max_upload_bytes, 1_048_576);
+
+        // handler sql: the nested handlers.bindings.sql chain was created.
+        let sql = cfg
+            .handlers
+            .expect("handlers materialised from env")
+            .bindings
+            .sql
+            .expect("sql binding materialised from env");
+        assert_eq!(sql.url.as_deref(), Some("http://sqld:8080"));
+        assert_eq!(sql.admin_url.as_deref(), Some("http://sqld:9090"));
+    }
+
+    #[test]
+    fn env_override_wins_over_file_value_but_unset_defers() {
+        // A file that set each section; env then overrides one field per section
+        // and leaves the rest of the file value in place (precedence: env > file).
+        let mut cfg = server(
+            r#"(
+                compute: ( vcpus: 2, mem_mib: 512, region: "us-east" ),
+                security: ( profile: "multi-tenant" ),
+                handlers: ( bindings: ( sql: ( url: "http://file:8080", admin_url: "http://file:9090" ) ) ),
+            )"#,
+        );
+
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_COMPUTE_VCPUS", "16"),
+            ("BOATRAMP_SECURITY_PROFILE", "dev"),
+            ("BOATRAMP_HANDLERS_SQL_URL", "http://env:8080"),
+        ]))
+        .expect("valid env overrides apply");
+
+        let compute = cfg.compute.unwrap();
+        assert_eq!(compute.vcpus, 16, "env wins over the file vcpus");
+        assert_eq!(compute.mem_mib, 512, "unset env defers to the file mem_mib");
+        assert_eq!(
+            compute.region.as_deref(),
+            Some("us-east"),
+            "unset env defers to the file region"
+        );
+
+        assert_eq!(
+            cfg.security.unwrap().profile.as_deref(),
+            Some("dev"),
+            "env profile wins over the file profile"
+        );
+
+        let sql = cfg.handlers.unwrap().bindings.sql.unwrap();
+        assert_eq!(
+            sql.url.as_deref(),
+            Some("http://env:8080"),
+            "env wins over the file sql url"
+        );
+        assert_eq!(
+            sql.admin_url.as_deref(),
+            Some("http://file:9090"),
+            "unset env defers to the file sql admin_url"
+        );
+    }
+
+    #[test]
+    fn env_overrides_leave_unmentioned_sections_absent() {
+        // With no relevant env vars set, an empty config stays empty — the sections
+        // are materialised only on demand, so an unset environment adds nothing.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[("SOME_UNRELATED_VAR", "x")]))
+            .expect("no-op env applies");
+        assert!(cfg.compute.is_none());
+        assert!(cfg.security.is_none());
+        assert!(cfg.handlers.is_none());
+    }
+
+    #[test]
+    fn env_bool_accepts_common_spellings_and_rejects_garbage() {
+        // Truthy/falsey spellings all parse.
+        for (raw, want) in [
+            ("true", true),
+            ("1", true),
+            ("YES", true),
+            ("On", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("OFF", false),
+        ] {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides(&env(&[("BOATRAMP_SECURITY_REQUIRE_POP", raw)]))
+                .expect("boolean parses");
+            assert_eq!(
+                cfg.security.unwrap().overrides.require_pop,
+                Some(want),
+                "{raw:?} ⇒ {want}"
+            );
+        }
+        // A non-boolean value is a clear error, not a silent default.
+        let mut cfg = ServerConfig::default();
+        let err = cfg
+            .apply_env_overrides(&env(&[("BOATRAMP_SECURITY_REQUIRE_POP", "maybe")]))
+            .expect_err("garbage boolean is rejected");
+        assert!(matches!(
+            err,
+            ConfigError::Env {
+                var: "BOATRAMP_SECURITY_REQUIRE_POP",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn env_number_parse_error_names_the_variable() {
+        // A non-numeric numeric var is rejected with the variable named.
+        let mut cfg = ServerConfig::default();
+        let err = cfg
+            .apply_env_overrides(&env(&[("BOATRAMP_COMPUTE_VCPUS", "lots")]))
+            .expect_err("garbage number is rejected");
+        match err {
+            ConfigError::Env { var, .. } => assert_eq!(var, "BOATRAMP_COMPUTE_VCPUS"),
+            other => panic!("expected ConfigError::Env, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_env_value_is_treated_as_unset() {
+        // `VAR=` (empty) must not clobber a file value with an empty string.
+        let mut cfg = server(r#"( compute: ( region: "us-east" ) )"#);
+        cfg.apply_env_overrides(&env(&[("BOATRAMP_COMPUTE_REGION", "")]))
+            .expect("empty env applies as a no-op");
+        assert_eq!(
+            cfg.compute.unwrap().region.as_deref(),
+            Some("us-east"),
+            "an empty env value leaves the file value in place"
+        );
     }
 
     #[test]

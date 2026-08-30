@@ -87,14 +87,77 @@ For exchanging an identity-provider JWT for a boatramp token. See
 | `BOATRAMP_S3_PATH_STYLE` | Use path-style addressing (for non-AWS endpoints; R2 accepts it). |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Credentials for the `s3`/R2 backend (standard AWS resolution). |
 
+## Compute backend
+
+Map to the `[compute]` section in [boatramp.cfg](./boatramp-cfg.md). Set any of
+these and the section is enabled even without a config file (a set variable wins
+over its file value; an unset one defers to the file/default). See
+[Run compute workloads](../how-to/compute.md).
+
+| Variable | Overrides | Description |
+| --- | --- | --- |
+| `BOATRAMP_COMPUTE_BRIDGE` | `compute.bridge` | Bridge the container veths / VM taps attach to (default `br-boatramp`). |
+| `BOATRAMP_COMPUTE_SUBNET` | `compute.subnet` | Guest IP subnet (default `10.0.0.0/24`). |
+| `BOATRAMP_COMPUTE_VCPUS` | `compute.vcpus` | vCPUs advertised as schedulable (`0` = detect from the host). |
+| `BOATRAMP_COMPUTE_MEM_MIB` | `compute.mem_mib` | Memory (MiB) advertised as schedulable (`0` = a 1 GiB default). |
+| `BOATRAMP_COMPUTE_REGION` | `compute.region` | This node's region tag for nearest-replica routing. |
+| `BOATRAMP_COMPUTE_SQL_SHIM_URL` | `compute.sql_shim_url` | Guest-reachable base URL of the compute SQL shim (enables a workload's `--bind sql`). |
+
+The static trust anchors (`kernel_signing_pubkeys`, `kernel_allowed_hashes`)
+stay file-only — they are host-access-gated and not settable from the
+environment on purpose.
+
+## Security posture
+
+Map to the `[security]` section in [boatramp.cfg](./boatramp-cfg.md). Setting any
+of these materialises the posture even without a config file: an unset section
+resolves to the strict `multi-tenant` default and each variable layers over it
+exactly as a file `overrides` block would (a set variable wins over the file).
+See [boatramp.cfg](./boatramp-cfg.md) and
+`boatramp security explain`. Byte caps take `0` = unlimited; booleans accept
+`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`.
+
+| Variable | Overrides | Description |
+| --- | --- | --- |
+| `BOATRAMP_SECURITY_PROFILE` | `security.profile` | Base profile: `multi-tenant` (default), `single-tenant`, `dev`, or a custom `profiles` name. |
+| `BOATRAMP_SECURITY_ALLOW_UNAUTHENTICATED_PUBLIC_BIND` | `overrides.allow_unauthenticated_public_bind` | Permit a non-loopback bind with control-plane auth disabled. |
+| `BOATRAMP_SECURITY_MAX_UPLOAD_BYTES` | `overrides.max_upload_bytes` | Default blob-upload cap in bytes (`0` = unlimited). |
+| `BOATRAMP_SECURITY_ALLOW_SITE_UNIX_UPSTREAMS` | `overrides.allow_site_unix_upstreams` | Permit site-declared `unix:` gateway upstreams. |
+| `BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS` | `overrides.allow_site_private_upstreams` | Permit site-declared gateway upstreams to private/loopback IPs. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS` | `overrides.allow_guest_private_egress` | Permit a guest's outbound `wasi:http` to reach private/loopback IPs. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS` | `overrides.allow_guest_self_egress` | Permit a guest's outbound `wasi:http` to reach this instance's own serve socket. |
+| `BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES` | `overrides.max_handler_blob_bytes` | Cap on handler blobstore host reads/ranges/copies (`0` = unlimited). |
+| `BOATRAMP_SECURITY_MAX_COMPONENT_BYTES` | `overrides.max_component_bytes` | Cap on a Wasm component blob (`0` = unlimited). |
+| `BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE` | `overrides.oidc_require_audience` | Require an OIDC audience when OIDC is enabled. |
+| `BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE` | `overrides.domain_verify_allow_private` | Permit HTTP domain-verification probes to private hosts. |
+| `BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE` | `overrides.domain_verify_self_serve` | Serve pending ownership challenges from the edge (the domain-attach fix). |
+| `BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE` | `overrides.allow_shared_kernel_compute` | Permit untrusted workloads on shared-kernel compute backends. |
+| `BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN` | `overrides.ratelimit_fail_open` | Fail **open** instead of closed when the rate-limit KV is unreadable. |
+| `BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING` | `overrides.allow_implicit_routing` | Resolve an unmatched `Host` to a site without an explicit domain registration. |
+| `BOATRAMP_SECURITY_REQUIRE_POP` | `overrides.require_pop` | Require every token to be `cnf`-bound and PoP-proven fleet-wide. |
+| `BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION` | `overrides.require_domain_verification` | Refuse to serve a non-local `Host` that isn't a verified, attached virtualhost. |
+
 ## Handler backends
 
-| Variable | Description |
-| --- | --- |
-| `BOATRAMP_SQL_TOKEN` | Auth token for a remote libsql database referenced by the SQL binding. |
-| _(your `url_env`)_ | Connection URL (a secret) for an external bring-your-own SQL database — the var name is whatever you set as `url_env` / `read_url_env` under `[handlers.bindings.sql.databases]`. See [Bring your own database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql). |
-| `BOATRAMP_FC_*` | Embedded-VMM / Firecracker compute-backend settings (kernel, rootfs, bridge, subnet, …). See [Run compute workloads](../how-to/compute.md). |
-| `BOATRAMP_VMM_SERIAL` | Attach the microVM serial console (debugging). |
+The `[handlers.bindings.sql]` knobs (the single managed-SQL backend) map to
+these; set any and the section is created even without a config file (env wins
+over the file value; secrets stay indirected via the `*_TOKEN_ENV` names, never
+the token itself). See [Handler bindings](../how-to/handler-bindings.md).
+
+| Variable | Overrides | Description |
+| --- | --- | --- |
+| `BOATRAMP_HANDLERS_SQL_DIR` | `bindings.sql.dir` | Single-node: root dir for the per-site embedded databases (default `<data-dir>/handlers-sql`). |
+| `BOATRAMP_HANDLERS_SQL_URL` | `bindings.sql.url` | Cluster: base sqld data URL — switches from single-node to a shared sqld cluster. |
+| `BOATRAMP_HANDLERS_SQL_ADMIN_URL` | `bindings.sql.admin_url` | Cluster: sqld admin API base URL (required when `url` is set). |
+| `BOATRAMP_HANDLERS_SQL_REPLICA_URL` | `bindings.sql.replica_url` | Cluster: optional read-replica data URL for read-only transactions. |
+| `BOATRAMP_HANDLERS_SQL_TOKEN_ENV` | `bindings.sql.token_env` | Name of the env var holding the sqld data auth token. |
+| `BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV` | `bindings.sql.admin_token_env` | Name of the env var holding the sqld admin API key. |
+| `BOATRAMP_HANDLERS_SQL_PREVIEW_MODE` | `bindings.sql.preview_mode` | Preview-database policy: `empty` (default), `branch`, or `shared`. |
+| `BOATRAMP_HANDLERS_SQL_PREVIEW_INIT` | `bindings.sql.preview_init` | Path to an idempotent SQL script run when an `empty` preview db is first opened. |
+| `BOATRAMP_SQL_TOKEN` | — | Auth token for a remote libsql database referenced by the SQL binding. |
+| _(your `url_env`)_ | — | Connection URL (a secret) for an external bring-your-own SQL database — the var name is whatever you set as `url_env` / `read_url_env` under `[handlers.bindings.sql.databases]`. See [Bring your own database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql). |
+| `BOATRAMP_FC_*` | — | Embedded-VMM / Firecracker compute-backend settings (kernel, rootfs, bridge, subnet, …). See [Run compute workloads](../how-to/compute.md). |
+| `BOATRAMP_VMM_SERIAL` | — | Attach the microVM serial console (debugging). |
 
 Handler `secrets` are injected by *reference*: the site config names a host
 env-var, and the server resolves it at instantiation so the literal never lands
