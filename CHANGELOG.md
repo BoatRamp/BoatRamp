@@ -5,6 +5,33 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.8] - 2026-08-31
+
+### Added
+- **Every `serve` config field is settable from the environment — `boatramp.cfg` is no longer
+  required, even for a managed co-located database.** Earlier releases made the `compute`,
+  `security`, and handler-SQL *scalars* env-settable; this completes the 12-factor story so the
+  whole `ServerConfig` and its sub-configs can be configured with `BOATRAMP_*` variables alone,
+  layered `env > file > default` (a set variable wins over the file; an unset one defers; a
+  section absent from the file is materialised from its defaults when any of its variables is
+  set). New coverage:
+  - **`[compute]`** — `managed_db_privilege` (`rootless`/`caps`), `docker_endpoint`,
+    `docker_volume_mode`, and the kernel trust anchors `kernel_signing_pubkeys` /
+    `kernel_allowed_hashes` (comma-separated lists). The trust anchors are security-critical —
+    they decide which kernels a `multi-tenant` node will boot — and are documented with the
+    caveat that the environment is more visible than a file (it leaks through `/proc/<pid>/environ`).
+  - **`handlers.bindings.sql.databases`** — the keyed bring-your-own / managed-compute database
+    map, declared as `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`. Member names are discovered from
+    the environment (there is no file to enumerate them); the empty-string default database is
+    addressed by the reserved `DEFAULT` token. An env-declared database merges over the file's by
+    key, per field. This is the path that lets a managed co-located Postgres be configured purely
+    from a platform's `[env]`.
+  - **`[secrets]`** — the envelope backend, `kek_file` (a path, never key material), and the
+    nested Vault config (`addr`/`key`/`token_env`); the Vault token stays indirected by reference.
+  - **`[cluster]`** — the section's own fields (`listen`, `root_pubkeys`, `seeds`, `join_token`,
+    `store_dir`, and `mesh.*`), distinct from the founding/joining *action* flags that already
+    had their own `serve` env-args.
+
 ## [0.3.7] - 2026-08-31
 
 ### Fixed
