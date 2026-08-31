@@ -215,6 +215,19 @@ pub enum BackendError {
 /// The control plane only ever sees [`Instance`]/[`Endpoint`]; whether the
 /// backend runs the workload directly (VMM, container) or delegates to a
 /// platform/daemon (cloudflare, docker) is internal.
+/// The buffered result of running a one-shot command inside a running workload
+/// replica (`ComputeBackend::exec`). Non-streaming: stdout/stderr are captured to
+/// completion. `exit_code` is the command's status (128+signal if it was killed).
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    /// The command's exit status (128 + signal number if terminated by a signal).
+    pub exit_code: i32,
+    /// Captured standard output.
+    pub stdout: Vec<u8>,
+    /// Captured standard error.
+    pub stderr: Vec<u8>,
+}
+
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
     /// Stable backend id (`"vmm"` / `"container"` / `"cloudflare"` / `"docker"`).
@@ -243,6 +256,22 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Restore a snapshotted replica.
     async fn restore(&self, _snapshot: &Snapshot) -> Result<Instance, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Run a one-shot command **inside** a running replica (docker-exec style) and
+    /// return its buffered output — for operator ops (migrations, `pg_dump`, debug).
+    /// `stdin` is fed to the command's standard input when present. Only the
+    /// shared-kernel backends that can re-enter a running container implement it
+    /// (native `container` via `setns`, remote `docker` via the exec API); the
+    /// VM/edge backends return [`BackendError::Unsupported`]. The caller gates this
+    /// behind the `allow_compute_exec` security posture.
+    async fn exec(
+        &self,
+        _handle: &InstanceHandle,
+        _argv: &[String],
+        _stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput, BackendError> {
         Err(BackendError::Unsupported)
     }
 }

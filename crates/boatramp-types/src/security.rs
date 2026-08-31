@@ -113,6 +113,7 @@ impl SecurityProfile {
                 domain_verify_allow_private: false,
                 domain_verify_self_serve: true,
                 allow_shared_kernel_compute: false,
+                allow_compute_exec: false,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: false,
                 require_pop: false,
@@ -131,6 +132,7 @@ impl SecurityProfile {
                 domain_verify_allow_private: true,
                 domain_verify_self_serve: true,
                 allow_shared_kernel_compute: true,
+                allow_compute_exec: false,
                 ratelimit_fail_open: false,
                 allow_implicit_routing: true,
                 require_pop: false,
@@ -149,6 +151,7 @@ impl SecurityProfile {
                 domain_verify_allow_private: true,
                 domain_verify_self_serve: true,
                 allow_shared_kernel_compute: true,
+                allow_compute_exec: true,
                 ratelimit_fail_open: true,
                 allow_implicit_routing: true,
                 require_pop: false,
@@ -197,6 +200,10 @@ pub struct PostureOverrides {
     pub domain_verify_self_serve: Option<bool>,
     /// Permit scheduling untrusted workloads onto shared-kernel compute backends.
     pub allow_shared_kernel_compute: Option<bool>,
+    /// Permit `boatramp compute exec` — running a command inside a running workload
+    /// (docker-exec style). Arbitrary code execution in the workload, so **off** in
+    /// every profile but `dev`; an operator opts in for migrations/backups/debug.
+    pub allow_compute_exec: Option<bool>,
     /// Fail **open** (allow) instead of closed when the rate-limit KV is unreadable.
     pub ratelimit_fail_open: Option<bool>,
     /// Serve a site at root for an unmatched `Host` **without** an explicit domain
@@ -322,6 +329,11 @@ impl SecurityConfig {
             o.allow_shared_kernel_compute.is_some(),
         );
         row(
+            "allow_compute_exec",
+            p.allow_compute_exec.to_string(),
+            o.allow_compute_exec.is_some(),
+        );
+        row(
             "ratelimit_fail_open",
             p.ratelimit_fail_open.to_string(),
             o.ratelimit_fail_open.is_some(),
@@ -385,6 +397,8 @@ pub struct SecurityPosture {
     pub domain_verify_self_serve: bool,
     /// Permit untrusted workloads on shared-kernel compute backends.
     pub allow_shared_kernel_compute: bool,
+    /// Permit `boatramp compute exec` (run a command inside a running workload).
+    pub allow_compute_exec: bool,
     /// Fail open instead of closed on rate-limit KV errors.
     pub ratelimit_fail_open: bool,
     /// Resolve an unmatched `Host` to a site without an explicit domain
@@ -446,6 +460,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_shared_kernel_compute {
         base.allow_shared_kernel_compute = v;
+    }
+    if let Some(v) = o.allow_compute_exec {
+        base.allow_compute_exec = v;
     }
     if let Some(v) = o.ratelimit_fail_open {
         base.ratelimit_fail_open = v;

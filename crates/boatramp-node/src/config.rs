@@ -327,6 +327,9 @@ impl ServerConfig {
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE")? {
                 o.allow_shared_kernel_compute = Some(v);
             }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC")? {
+                o.allow_compute_exec = Some(v);
+            }
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN")? {
                 o.ratelimit_fail_open = Some(v);
             }
@@ -580,6 +583,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE",
     "BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE",
     "BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE",
+    "BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC",
     "BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN",
     "BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING",
     "BOATRAMP_SECURITY_REQUIRE_POP",

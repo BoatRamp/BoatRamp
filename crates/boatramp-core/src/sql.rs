@@ -126,6 +126,28 @@ pub trait SqlBackend: Send + Sync {
     async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         self.begin().await
     }
+
+    /// Run a multi-statement SQL **script** as one unit (the simple-query protocol),
+    /// for operator migrations: `CREATE EXTENSION` and long chains of DDL/DML that the
+    /// parameterized per-statement path can't express. Only the external
+    /// Postgres/MySQL backends implement it (the per-site libsql backend rejects it);
+    /// it is an operator tool, not a guest capability.
+    async fn run_script(&self, _sql: &str) -> Result<(), SqlError> {
+        Err(SqlError::Other(
+            "this database does not support running a raw SQL script".into(),
+        ))
+    }
+
+    /// Run one row-returning statement directly, in its own short-lived read-only
+    /// transaction — backs the operator `sql query`. The default composes the existing
+    /// transaction methods, so every backend supports it.
+    async fn run_query(&self, sql: &str) -> Result<SqlRows, SqlError> {
+        let mut tx = self.begin_read_only().await?;
+        let result = tx.query(sql, &[]).await;
+        // Read-only: always roll back so nothing lingers and no write can slip through.
+        let _ = tx.rollback().await;
+        result
+    }
 }
 
 /// How a **preview** deployment's SQL database relates to the site's live one
