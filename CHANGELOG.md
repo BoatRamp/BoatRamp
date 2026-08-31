@@ -5,6 +5,21 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.7] - 2026-08-31
+
+### Fixed
+- **Co-located compute is turnkey on a fresh host — boatramp creates its bridge itself.** The
+  native container and embedded-VMM backends attach each container's veth (and each microVM's
+  tap) to a shared bridge (`br-boatramp`), but nothing created it: on a stock image on fly, or a
+  bare VM, the backend advertised itself as available and then failed every launch with
+  `veth host setup: … No such device`, with no way for the operator to pre-create the bridge (the
+  image ships no `ip`). boatramp now creates it at compute-node init when it holds `CAP_NET_ADMIN`
+  (the same capability that creates the veths) — via the `SIOCBRADDBR` ioctl plus netlink for the
+  gateway address — and **gates the container/VMM backends on it**, so a node that can't make the
+  bridge reports those backends unavailable rather than advertising them and failing at launch.
+  Also fixes link resolution: a name-filtered `RTM_GETLINK` for a missing link answers `ENODEV`
+  (not an empty result), which is now treated as "not found" (previously it hard-errored).
+
 ## [0.3.6] - 2026-08-30
 
 ### Changed
