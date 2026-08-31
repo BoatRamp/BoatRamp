@@ -689,9 +689,8 @@ impl EnvSource {
     /// non-empty value). Used to decide whether to materialise a keyed map (the
     /// `databases` env scheme) whose member names aren't known ahead of time.
     fn any_with_prefix(&self, prefix: &str) -> bool {
-        self.names().any(|name| {
-            name.starts_with(prefix) && self.get(&name).is_some()
-        })
+        self.names()
+            .any(|name| name.starts_with(prefix) && self.get(&name).is_some())
     }
 
     /// The full set of variable names visible to this source. Used to discover the
@@ -1753,7 +1752,10 @@ mod tests {
             secrets.kek_file.as_deref(),
             Some(Path::new("/var/lib/boatramp/secrets/kek"))
         );
-        assert!(secrets.vault.is_none(), "no vault vars ⇒ no vault sub-config");
+        assert!(
+            secrets.vault.is_none(),
+            "no vault vars ⇒ no vault sub-config"
+        );
 
         // The managed-DB privilege strategy resolved from its lowercase variant.
         let compute = cfg.compute.expect("compute materialised from env");
@@ -1780,7 +1782,10 @@ mod tests {
             // longest-suffix name isolation (`_READ_URL_ENV`, not `_URL_ENV`).
             ("BOATRAMP_HANDLERS_SQL_DB_events_log_KIND", "mysql"),
             ("BOATRAMP_HANDLERS_SQL_DB_events_log_URL_ENV", "EVENTS_URL"),
-            ("BOATRAMP_HANDLERS_SQL_DB_events_log_READ_URL_ENV", "EVENTS_RO_URL"),
+            (
+                "BOATRAMP_HANDLERS_SQL_DB_events_log_READ_URL_ENV",
+                "EVENTS_RO_URL",
+            ),
             ("BOATRAMP_HANDLERS_SQL_DB_events_log_READ_ONLY", "true"),
         ]))
         .expect("valid env overrides apply");
@@ -1789,7 +1794,11 @@ mod tests {
         assert_eq!(sql.databases.len(), 2);
 
         let analytics = &sql.databases["analytics"];
-        assert_eq!(analytics.pool_max, Some(32), "env pool_max wins over the file");
+        assert_eq!(
+            analytics.pool_max,
+            Some(32),
+            "env pool_max wins over the file"
+        );
         assert_eq!(
             analytics.url_env, "FILE_PG_URL",
             "the file's url_env survives (env didn't touch it)"
