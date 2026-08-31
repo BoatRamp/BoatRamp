@@ -5,6 +5,40 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.9] - 2026-08-31
+
+### Added
+- **A managed co-located database boots from its binding alone — the compute workload
+  is auto-registered.** A `handlers.bindings.sql.databases` entry with `compute` set and
+  no `password_env` used to require separately creating the compute workload (`compute
+  set` / `apply`); without it the first query failed with "no healthy replica". The node
+  now auto-registers that workload from the databases config when it's absent, so
+  declaring the binding (e.g. purely from `[env]`) is enough to run a Postgres. The spec
+  comes from a shared builder the container capability gate also exercises, so the shipped
+  workload never diverges from the tested one. Non-clobbering (an operator-declared
+  workload wins) and idempotent; new env-settable `IMAGE` / `VOLUME_SIZE_MIB` per database.
+- **`boatramp sql exec` / `boatramp sql query` — operator SQL to a managed database.**
+  The server connects using the database's sealed managed credential (resolved
+  server-side — the credential never reaches the client) and runs the SQL: `exec` applies
+  a migration **script** (multiple statements via the simple-query protocol, so `CREATE
+  EXTENSION` + chained DDL/RLS work) from a file or stdin; `query` runs one statement and
+  prints a table or JSON. Admin-scoped. Backs `POST /api/sql/{db}/{exec,query}`.
+- **`boatramp compute exec <workload> -- <cmd>` — run a command inside a running
+  workload** (docker-exec style), for migrations piped into `psql`, `pg_dump` backups,
+  and debugging. The native `container` backend enters the running rootless-userns
+  container via `setns` (user-first, pid-last double-fork; stdin/stdout/stderr piped);
+  the remote `docker` backend uses the Engine exec API; VM / edge backends report
+  unsupported. **Gated by a new `allow_compute_exec` security posture** (off in every
+  profile but `dev`; env `BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC`) since it is arbitrary
+  code execution in the workload. The container path is hard-gated in CI (a real
+  `setns` command + stdin round-trip on an ephemeral Linux runner).
+- **Wildcard DNS-01 TLS configures with no config file.** The listener TLS mode and the
+  ACME issuance parameters — previously `serve` flags only — are now env-settable
+  (`BOATRAMP_TLS`, `BOATRAMP_ACME_DOMAINS` incl. an explicit `*.example.com` issued via
+  DNS-01, `BOATRAMP_ACME_DNS_PROVIDER`, and the rest), so a wildcard cert can be stood up
+  purely from a platform's `[env]`. An exact host still wins over a wildcard in both host
+  routing and SNI cert selection.
+
 ## [0.3.8] - 2026-08-31
 
 ### Added
