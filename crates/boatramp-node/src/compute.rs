@@ -374,3 +374,62 @@ pub async fn build_compute(
     };
     (backends, node)
 }
+
+/// The node's [`ComputeExec`](boatramp_core::compute::ComputeExec): resolve a
+/// workload's running replica from the control-plane state, pick its backend, and
+/// run the command inside it. Backs `POST /api/compute/{name}/exec`; the API gates
+/// it behind the `allow_compute_exec` posture. Only the shared-kernel backends
+/// (native `container`, remote `docker`) actually implement
+/// [`ComputeBackend::exec`](boatramp_core::compute::ComputeBackend::exec); the rest
+/// surface as [`ExecError::Unsupported`](boatramp_core::compute::ExecError).
+pub struct NodeComputeExec {
+    backends: boatramp_core::compute::BackendRegistry,
+    deploy: boatramp_core::deploy::DeployStore,
+}
+
+impl NodeComputeExec {
+    /// Build over this node's compute backends + the control-plane store. The
+    /// registry is a cheap `BTreeMap` of `Arc` backends (clone it before the
+    /// reconcile loop consumes the original).
+    pub fn new(
+        backends: boatramp_core::compute::BackendRegistry,
+        deploy: boatramp_core::deploy::DeployStore,
+    ) -> Self {
+        Self { backends, deploy }
+    }
+}
+
+#[async_trait::async_trait]
+impl boatramp_core::compute::ComputeExec for NodeComputeExec {
+    async fn exec(
+        &self,
+        project: &str,
+        workload: &str,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<boatramp_core::compute::ExecOutput, boatramp_core::compute::ExecError> {
+        use boatramp_core::compute::{BackendError, ExecError, ReplicaPhase};
+        use boatramp_core::project::ProjectRef;
+        let states = self
+            .deploy
+            .list_replica_states(ProjectRef::new(project), workload)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        // A running replica — prefer a healthy one, else any running (a just-launched
+        // DB may not be health-marked yet but can still accept an exec).
+        let target = states
+            .iter()
+            .find(|s| s.phase == ReplicaPhase::Running && s.healthy)
+            .or_else(|| states.iter().find(|s| s.phase == ReplicaPhase::Running))
+            .ok_or_else(|| ExecError::NoReplica(workload.to_string()))?;
+        let backend = self
+            .backends
+            .get(&target.backend)
+            .ok_or_else(|| ExecError::Unsupported(target.backend.clone()))?;
+        match backend.exec(&target.handle, argv, stdin).await {
+            Ok(out) => Ok(out),
+            Err(BackendError::Unsupported) => Err(ExecError::Unsupported(target.backend.clone())),
+            Err(e) => Err(ExecError::Other(e.to_string())),
+        }
+    }
+}

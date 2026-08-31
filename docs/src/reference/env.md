@@ -142,6 +142,7 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE` | `overrides.domain_verify_allow_private` | Permit HTTP domain-verification probes to private hosts. |
 | `BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE` | `overrides.domain_verify_self_serve` | Serve pending ownership challenges from the edge (the domain-attach fix). |
 | `BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE` | `overrides.allow_shared_kernel_compute` | Permit untrusted workloads on shared-kernel compute backends. |
+| `BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC` | `overrides.allow_compute_exec` | Permit `boatramp compute exec` (run a command inside a running workload). **Off** in every profile but `dev` — it is arbitrary code execution in the workload; opt in for migrations/backups/debug. |
 | `BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN` | `overrides.ratelimit_fail_open` | Fail **open** instead of closed when the rate-limit KV is unreadable. |
 | `BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING` | `overrides.allow_implicit_routing` | Resolve an unmatched `Host` to a site without an explicit domain registration. |
 | `BOATRAMP_SECURITY_REQUIRE_POP` | `overrides.require_pop` | Require every token to be `cnf`-bound and PoP-proven fleet-wide. |

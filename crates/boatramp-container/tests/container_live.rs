@@ -458,3 +458,97 @@ async fn container_criu_roundtrip() {
     );
     eprintln!("container scale-to-zero round-trip OK: nonce {nonce1} preserved across park/wake");
 }
+
+/// **Exec into a running container** (docker-exec style): launch a container, then
+/// re-enter its namespaces via `ComputeBackend::exec` and run a one-shot command,
+/// asserting (a) a plain command returns exit 0 with its stdout captured, and (b)
+/// a stdin pipe round-trips (`busybox cat` echoes the bytes we feed it). Proves the
+/// `setns`-into-a-running-container seam (user-ns first, `fork` for the pid ns, pipe
+/// capture) — the analog of the launch path's netns config, generalized to exec.
+///
+/// Needs Linux + root + a bridge + a rootfs tar with `/bin/busybox` (as the launch
+/// test); skips (passes) when the fixture env vars are absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Linux + root + a bridge + a rootfs tar with busybox (privileged live seam)"]
+async fn container_exec_runs_command_and_round_trips_stdin() {
+    let (Some(bin), Some(rootfs_path)) = (
+        std::env::var_os("BOATRAMP_BIN"),
+        std::env::var_os("BOATRAMP_CONTAINER_ROOTFS"),
+    ) else {
+        eprintln!("container_exec: set BOATRAMP_BIN + BOATRAMP_CONTAINER_ROOTFS to run");
+        return;
+    };
+    let bridge = std::env::var("CONTAINER_BRIDGE").unwrap_or_else(|_| "br-boatramp".into());
+    let subnet = std::env::var("CONTAINER_SUBNET").unwrap_or_else(|_| "10.0.0.0/24".into());
+
+    let rootfs = std::fs::read(&rootfs_path).expect("read rootfs tar");
+    let data_dir = std::env::temp_dir().join(format!("boatramp-cexec-{}", std::process::id()));
+    let backend = ContainerBackend::new(
+        Arc::new(FileBlob(rootfs)),
+        data_dir.clone(),
+        bridge,
+        &subnet,
+        PathBuf::from(bin),
+    )
+    .expect("backend");
+
+    let hash = "d".repeat(64);
+    let spec = spec_for(&hash);
+    let artifact = backend.materialize(&spec).await.expect("materialize");
+    let req = LaunchRequest {
+        workload: "cexec".into(),
+        replica: 0,
+        spec,
+        artifact,
+    };
+    let inst = backend.launch(&req).await.expect("launch container");
+
+    // The container serves the nonce over HTTP — wait for it so we know the jail is
+    // fully up (pid1 in the cgroup) before exec joins its namespaces.
+    let nonce = probe_nonce(&inst.endpoint.host, inst.endpoint.port);
+    assert!(!nonce.is_empty(), "container should be serving before exec");
+
+    // (a) A plain command: `busybox echo hi` → exit 0, stdout contains "hi".
+    let echo = backend
+        .exec(
+            &inst.handle,
+            &[
+                "/bin/busybox".to_string(),
+                "echo".to_string(),
+                "hi".to_string(),
+            ],
+            None,
+        )
+        .await
+        .expect("exec echo");
+    eprintln!(
+        "exec echo: code={} stdout={:?} stderr={:?}",
+        echo.exit_code,
+        String::from_utf8_lossy(&echo.stdout),
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    assert_eq!(echo.exit_code, 0, "echo exits 0");
+    assert!(
+        String::from_utf8_lossy(&echo.stdout).contains("hi"),
+        "echo stdout should contain 'hi'"
+    );
+
+    // (b) A stdin round-trip: `busybox cat` with stdin b"xyz" → stdout "xyz".
+    let cat = backend
+        .exec(
+            &inst.handle,
+            &["/bin/busybox".to_string(), "cat".to_string()],
+            Some(b"xyz"),
+        )
+        .await
+        .expect("exec cat");
+    assert_eq!(cat.exit_code, 0, "cat exits 0");
+    assert_eq!(
+        cat.stdout, b"xyz",
+        "cat should echo the stdin bytes back on stdout"
+    );
+
+    let _ = backend.stop(&inst.handle).await;
+    let _ = std::fs::remove_dir_all(&data_dir);
+    eprintln!("container exec OK: echo captured + stdin round-tripped");
+}

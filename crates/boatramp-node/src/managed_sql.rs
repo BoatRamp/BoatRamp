@@ -346,6 +346,124 @@ impl ComputeEndpointResolver for DeployEndpointResolver {
     }
 }
 
+/// The node's [`OperatorSql`](boatramp_core::sql::OperatorSql): the operator-facing
+/// migration/query capability over the handler `sql` `databases`. For a requested
+/// database name it (re)builds the same connection the handler runtime uses — a
+/// managed credential resolved + unsealed, or a bring-your-own URL from the
+/// environment — and runs the script/query server-side (the credential never leaves
+/// the node). Backs `POST /api/sql/{db}/{exec,query}`; admin-gated at the API.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub struct NodeOperatorSql {
+    databases: std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+    kv: Arc<dyn KvStore>,
+    envelope: Option<Arc<dyn KeyEnvelope>>,
+    deploy: DeployStore,
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+impl NodeOperatorSql {
+    /// Build over the handler `sql` `databases` config + the credential store.
+    pub fn new(
+        databases: std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+        kv: Arc<dyn KvStore>,
+        envelope: Option<Arc<dyn KeyEnvelope>>,
+        deploy: DeployStore,
+    ) -> Self {
+        Self {
+            databases,
+            kv,
+            envelope,
+            deploy,
+        }
+    }
+
+    /// Resolve + connect the SQL backend for database `db` in `project` (managed or
+    /// bring-your-own), mirroring the handler runtime's per-database construction.
+    async fn backend_for(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
+        use boatramp_storage::sql_sqlx::{connect, ExternalSqlOptions};
+        let cfg = self
+            .databases
+            .get(db)
+            .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        let kind = ExternalSqlKind::parse(&cfg.kind).ok_or_else(|| {
+            SqlError::other(format!("database {db:?}: unknown engine {:?}", cfg.kind))
+        })?;
+        let timeout = cfg.connect_timeout_secs.map(std::time::Duration::from_secs);
+        if let Some(workload) = cfg.compute.as_deref().filter(|c| !c.is_empty()) {
+            // Managed or brought-credential compute-backed database.
+            let password = match cfg.password_env.as_deref().filter(|v| !v.is_empty()) {
+                Some(var) => std::env::var(var)
+                    .map_err(|_| SqlError::other(format!("env var {var} (password) is unset")))?,
+                None => {
+                    let envelope = self.envelope.clone().ok_or_else(|| {
+                        SqlError::other(format!(
+                            "managed database {db:?} needs a [secrets] envelope to unseal its credential"
+                        ))
+                    })?;
+                    ManagedSqlCredentials::new(self.kv.clone(), envelope)
+                        .password(project, workload)
+                        .await
+                        .map_err(SqlError::other)?
+                }
+            };
+            let resolver = Arc::new(DeployEndpointResolver::new(self.deploy.clone(), project));
+            Ok(Arc::new(ComputeResolvedSqlBackend::new(
+                resolver,
+                workload,
+                kind,
+                cfg.database.clone().unwrap_or_default(),
+                cfg.user.clone().unwrap_or_default(),
+                password,
+                cfg.pool_max,
+                cfg.read_only,
+                timeout,
+            )))
+        } else {
+            // Bring-your-own URL (a secret named indirectly by an env var).
+            let url = std::env::var(&cfg.url_env)
+                .map_err(|_| SqlError::other(format!("env var {} (url) is unset", cfg.url_env)))?;
+            let read_url =
+                match &cfg.read_url_env {
+                    Some(var) => Some(std::env::var(var).map_err(|_| {
+                        SqlError::other(format!("env var {var} (read url) is unset"))
+                    })?),
+                    None => None,
+                };
+            let opts = ExternalSqlOptions::new(url)
+                .with_read_url(read_url)
+                .with_max_connections(cfg.pool_max)
+                .read_only(cfg.read_only)
+                .with_connect_timeout(timeout);
+            connect(kind, &opts)
+        }
+    }
+}
+
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait]
+impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
+    async fn exec_script(&self, project: &str, db: &str, script: &str) -> Result<(), SqlError> {
+        self.backend_for(project, db)
+            .await?
+            .run_script(script)
+            .await
+    }
+
+    async fn query(
+        &self,
+        project: &str,
+        db: &str,
+        sql: &str,
+    ) -> Result<boatramp_core::sql::SqlRows, SqlError> {
+        self.backend_for(project, db).await?.run_query(sql).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

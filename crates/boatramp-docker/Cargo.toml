@@ -19,7 +19,7 @@ async-trait.workspace = true
 bollard.workspace = true
 futures.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "io-util"] }
 
 [dev-dependencies]
 # `docker_live` integration test (self-skips without a daemon) needs a runtime.

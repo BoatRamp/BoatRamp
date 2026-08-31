@@ -39,6 +39,10 @@ pub mod backend;
 /// `criu` dump/restore drivers.
 #[cfg(target_os = "linux")]
 pub mod criu;
+/// `docker exec`-style re-entry into a running container (Linux): join the
+/// container's namespaces + `execvp` a one-shot command, capturing its output.
+#[cfg(target_os = "linux")]
+pub mod exec;
 /// The guest-log sink: drain the worker's (guest's) stdout/stderr to `tracing`
 /// + a per-container log file. Cross-platform + unit-tested.
 pub mod logsink;

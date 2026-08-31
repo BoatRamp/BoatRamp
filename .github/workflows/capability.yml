@@ -177,6 +177,25 @@ jobs:
           grep -qE 'test result: ok' container.log \
             || { echo "::error::container launch+serve failed" >&2; exit 1; }
 
+      - name: Exec into a running container (setns) — command + stdin round-trip (hard gate)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # `compute exec` re-enters a running container's namespaces (setns double-fork:
+          # user→mnt/uts/ipc/net, then pid, then fork) and runs a command, capturing
+          # stdout/stderr + feeding stdin. Proves the shared-kernel exec path the
+          # operator `boatramp compute exec` uses.
+          timeout -k 30 300 sudo -E env "PATH=$PATH" \
+            "BOATRAMP_BIN=$BIN" "BOATRAMP_CONTAINER_ROOTFS=/tmp/bb-rootfs.tar.gz" \
+            cargo test -p boatramp-container --test container_live \
+            container_exec_runs_command_and_round_trips_stdin -- --ignored --nocapture 2>&1 | tee exec.log
+          # A silent skip (missing fixtures) still prints `test result: ok`; gate on the
+          # end-of-test marker that prints ONLY after echo captured + stdin round-tripped.
+          grep -qE 'test result: ok' exec.log \
+            || { echo "::error::container exec test did not pass" >&2; exit 1; }
+          grep -q 'container exec OK: echo captured + stdin round-tripped' exec.log \
+            || { echo "::error::container exec never reached the success marker (silent skip?)" >&2; exit 1; }
+
       - name: Co-located Postgres (pgvector) from an OCI image — rootless + host-root (hard gate)
         run: |
           set -o pipefail

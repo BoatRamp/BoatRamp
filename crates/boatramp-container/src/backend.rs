@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -569,6 +569,30 @@ impl ComputeBackend for ContainerBackend {
                 port,
             },
         })
+    }
+
+    /// **Exec** (docker-exec style): run `argv` inside the already-running
+    /// container for `handle`, feeding `stdin` and buffering stdout/stderr + the
+    /// exit code. Resolves the container's pid1 from its cgroup
+    /// (`/sys/fs/cgroup/boatramp/<id>/cgroup.procs` → [`crate::criu::find_pid1`]),
+    /// then joins its namespaces (user first, then the rest; a `fork` after the pid
+    /// ns so the command is pid-in-namespace) and `execvp`s — reusing the launch
+    /// path's `setns` machinery rather than shelling out to `nsenter`. The blocking
+    /// `fork`/pipe work runs on a blocking thread. See [`crate::exec`].
+    async fn exec(
+        &self,
+        handle: &InstanceHandle,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput, BackendError> {
+        let id = container_id(&handle.workload, handle.replica);
+        let argv = argv.to_vec();
+        let stdin = stdin.map(<[u8]>::to_vec);
+        tokio::task::spawn_blocking(move || {
+            crate::exec::exec_in_container(&id, &argv, stdin.as_deref())
+        })
+        .await
+        .map_err(|e| BackendError::Other(format!("exec: join: {e}")))?
     }
 }
 
