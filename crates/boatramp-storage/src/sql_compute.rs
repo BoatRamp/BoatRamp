@@ -165,6 +165,14 @@ impl SqlBackend for ComputeResolvedSqlBackend {
     async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         self.pool().await?.begin_read_only().await
     }
+    async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
+        // Resolve the live endpoint + connect, then delegate to the concrete
+        // Postgres/MySQL backend's simple-query script path (operator migrations).
+        self.pool().await?.run_script(sql).await
+    }
+    async fn run_query(&self, sql: &str) -> Result<boatramp_core::sql::SqlRows, SqlError> {
+        self.pool().await?.run_query(sql).await
+    }
 }
 
 #[cfg(test)]

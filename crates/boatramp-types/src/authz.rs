@@ -282,6 +282,15 @@ impl Right {
                 let action = if get { Action::Read } else { Action::Deploy };
                 Self::new(Resource::Project, Some(default_project.clone()), action)
             }
+            // Operator SQL to a managed database (project-owned): migrations + queries
+            // are operator tools scoped to the default project. `project·deploy` (they
+            // are POST bodies that mutate or read the project's managed DB); the
+            // `compute exec`-style risk on writes is additionally posture-gated.
+            p if p.starts_with("/api/sql/") => Self::new(
+                Resource::Project,
+                Some(default_project.clone()),
+                Action::Deploy,
+            ),
             // GraphQL administration — subgraph registration, the operation safelist,
             // and the composed supergraph — is project-owned (0.2.0), the same as
             // functions/compute/workflows: read the surface with `project·read`, mutate

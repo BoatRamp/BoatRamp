@@ -251,6 +251,10 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // server-init env into the DB workload at launch from the sealed credential.
     // Reaching here with a managed DB implies an envelope (build_handler_runtime
     // fails closed otherwise), so the credential store always has one to seal with.
+    // Keep a clone of the secrets envelope for the operator-SQL capability below
+    // (the managed_db_resolver match moves the original).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let operator_envelope = secrets_envelope.clone();
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
         config
@@ -275,6 +279,46 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = None;
 
+    // Turnkey managed DB: auto-register the compute workload backing each managed
+    // co-located database that has none yet, so declaring the `databases` binding is
+    // enough to boot the DB (no separate `compute set` / apply). Non-clobbering and
+    // idempotent; runs before the reconcile loop so its first tick can launch it.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    if let Some(sql) = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .filter(|sql| !sql.databases.is_empty())
+    {
+        crate::managed_sql::auto_register_managed_db_workloads(&deploy, &sql.databases).await;
+    }
+
+    // Operator SQL capability (managed-DB migrations/queries via the sealed
+    // credential, resolved server-side) — backs `POST /api/sql/{db}/{exec,query}`.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .filter(|sql| !sql.databases.is_empty())
+        .map(|sql| {
+            Arc::new(crate::managed_sql::NodeOperatorSql::new(
+                sql.databases.clone(),
+                kv.clone(),
+                operator_envelope,
+                deploy.clone(),
+            )) as Arc<_>
+        });
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
+
+    // Operator compute-exec capability (run a command inside a running workload) —
+    // backs `POST /api/compute/{name}/exec`, gated by the `allow_compute_exec`
+    // posture. Clone the backend registry before the reconcile loop consumes it.
+    let compute_exec: Option<Arc<dyn boatramp_core::compute::ComputeExec>> = Some(Arc::new(
+        crate::compute::NodeComputeExec::new(compute_backends.clone(), deploy.clone()),
+    ) as Arc<_>);
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -296,6 +340,11 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         is_leader,
         DOMAIN_VERIFY_RECONCILE_TICK,
     );
+
+    // Wire the operator capabilities onto the options the router is built from.
+    let mut options = options;
+    options.operator_sql = operator_sql;
+    options.compute_exec = compute_exec;
 
     Ok(RunningNode {
         deploy,

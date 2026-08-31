@@ -327,6 +327,9 @@ impl ServerConfig {
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE")? {
                 o.allow_shared_kernel_compute = Some(v);
             }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC")? {
+                o.allow_compute_exec = Some(v);
+            }
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN")? {
                 o.ratelimit_fail_open = Some(v);
             }
@@ -438,6 +441,12 @@ impl ServerConfig {
                 }
                 if let Some(v) = source.parse(&format!("{prefix}CONNECT_TIMEOUT_SECS"))? {
                     db.connect_timeout_secs = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}IMAGE")) {
+                    db.image = Some(v);
+                }
+                if let Some(v) = source.parse(&format!("{prefix}VOLUME_SIZE_MIB"))? {
+                    db.volume_size_mib = Some(v);
                 }
             }
         }
@@ -574,6 +583,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_DOMAIN_VERIFY_ALLOW_PRIVATE",
     "BOATRAMP_SECURITY_DOMAIN_VERIFY_SELF_SERVE",
     "BOATRAMP_SECURITY_ALLOW_SHARED_KERNEL_COMPUTE",
+    "BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC",
     "BOATRAMP_SECURITY_RATELIMIT_FAIL_OPEN",
     "BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING",
     "BOATRAMP_SECURITY_REQUIRE_POP",
@@ -603,6 +613,7 @@ const SQL_DB_ENV_PREFIX: &str = "BOATRAMP_HANDLERS_SQL_DB_";
 /// before `_URL_ENV`). Each mirrors a field of [`ExternalDatabaseConfig`].
 const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_CONNECT_TIMEOUT_SECS",
+    "_VOLUME_SIZE_MIB",
     "_READ_URL_ENV",
     "_PASSWORD_ENV",
     "_ALLOW_PREVIEW",
@@ -611,6 +622,7 @@ const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_READ_ONLY",
     "_POOL_MAX",
     "_COMPUTE",
+    "_IMAGE",
     "_KIND",
     "_USER",
 ];
@@ -1189,6 +1201,14 @@ pub struct ExternalDatabaseConfig {
     pub allow_preview: bool,
     /// Connection/acquire timeout in seconds (default 10).
     pub connect_timeout_secs: Option<u64>,
+    /// The stock OCI image for a **managed co-located** database (`compute` set, no
+    /// `password_env`). When omitted, boatramp auto-registers the workload from the
+    /// engine's default image (`pgvector/pgvector:pg16` for postgres, `mysql:8.0`
+    /// for mysql). Ignored for a bring-your-own (`url_env`) database.
+    pub image: Option<String>,
+    /// The persistent data-volume size in MiB for a **managed co-located** database
+    /// (default 10240 = 10 GiB). Ignored for a bring-your-own database.
+    pub volume_size_mib: Option<u32>,
 }
 
 impl ExternalDatabaseConfig {

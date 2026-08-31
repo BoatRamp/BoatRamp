@@ -51,6 +51,7 @@ mod completions;
 mod compose;
 mod compression;
 mod compute;
+mod sql;
 // The config model moved to `boatramp-node` (library); re-export it under the
 // binary's `crate::config` so existing call sites are unchanged.
 pub use boatramp_node::config;
@@ -164,6 +165,8 @@ enum Command {
     Gateway(gateway::GatewayArgs),
     /// Manage Firecracker microVM compute workloads.
     Compute(compute::ComputeArgs),
+    /// Operator SQL to a managed database: apply a migration script or run a query.
+    Sql(sql::SqlArgs),
     /// Upload a file as a content-addressed blob (e.g. a microVM kernel).
     Blob(blob::BlobArgs),
     /// Read/change the dynamic daemon config (get/set/rollback/apply, no restart).
@@ -468,6 +471,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Auth(args) => authcmd::run(args, &config).await?,
         Command::Gateway(args) => gateway::run(args, &config).await?,
         Command::Compute(args) => compute::run(args, &config).await?,
+        Command::Sql(args) => sql::run(args, &config).await?,
         Command::Blob(args) => blob::run(args, &config).await?,
         Command::Config(args) => config_cmd::run(args, &config).await?,
         #[cfg(feature = "acme-dns")]

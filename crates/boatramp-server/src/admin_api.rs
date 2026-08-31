@@ -860,6 +860,196 @@ pub(super) async fn delete_compute(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Operator SQL to a managed co-located database (`/api/sql/{db}/{exec,query}`)
+// ---------------------------------------------------------------------------
+
+/// A managed-DB migration script (multiple statements; simple-query protocol).
+#[derive(Deserialize)]
+pub(super) struct SqlExecRequest {
+    /// The SQL script — `CREATE EXTENSION`, tables, RLS, chained DDL/DML.
+    pub sql: String,
+}
+
+/// A single row-returning query.
+#[derive(Deserialize)]
+pub(super) struct SqlQueryRequest {
+    /// One `SELECT` (or other row-returning) statement.
+    pub sql: String,
+}
+
+/// The rows a `sql query` returned, JSON-encoded per cell.
+#[derive(Serialize)]
+pub(super) struct SqlQueryResponse {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// Encode one [`SqlValue`](boatramp_core::sql::SqlValue) as a JSON value for the
+/// wire. A `Blob` becomes base64 text (JSON has no byte type); `Json` is re-parsed
+/// so it nests as structure rather than a string.
+fn sql_value_to_json(v: &boatramp_core::sql::SqlValue) -> serde_json::Value {
+    use boatramp_core::sql::SqlValue;
+    use serde_json::Value;
+    match v {
+        SqlValue::Null => Value::Null,
+        SqlValue::Boolean(b) => Value::Bool(*b),
+        SqlValue::Integer(i) => Value::from(*i),
+        SqlValue::Real(f) => Value::from(*f),
+        SqlValue::Text(s) => Value::String(s.clone()),
+        SqlValue::Blob(b) => {
+            use base64::Engine;
+            Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+        }
+        SqlValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
+    }
+}
+
+/// Run a migration **script** against managed database `db` using its sealed
+/// credential (resolved server-side). Admin-scoped; `501` if no managed SQL is
+/// wired on this node.
+pub(super) async fn sql_exec(
+    Extension(project): Extension<ProjectContext>,
+    Extension(op): Extension<Option<Arc<dyn boatramp_core::sql::OperatorSql>>>,
+    Path(db): Path<String>,
+    Json(req): Json<SqlExecRequest>,
+) -> Response {
+    let Some(op) = op else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "operator SQL is not available on this node (no managed database configured)\n",
+        )
+            .into_response();
+    };
+    match op
+        .exec_script(project.as_ref().as_str(), &db, &req.sql)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("sql exec failed: {e}\n")).into_response(),
+    }
+}
+
+/// Run one row-returning `query` against managed database `db`. Admin-scoped.
+pub(super) async fn sql_query(
+    Extension(project): Extension<ProjectContext>,
+    Extension(op): Extension<Option<Arc<dyn boatramp_core::sql::OperatorSql>>>,
+    Path(db): Path<String>,
+    Json(req): Json<SqlQueryRequest>,
+) -> Response {
+    let Some(op) = op else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "operator SQL is not available on this node (no managed database configured)\n",
+        )
+            .into_response();
+    };
+    match op.query(project.as_ref().as_str(), &db, &req.sql).await {
+        Ok(rows) => {
+            let out = SqlQueryResponse {
+                columns: rows.columns,
+                rows: rows
+                    .rows
+                    .iter()
+                    .map(|r| r.iter().map(sql_value_to_json).collect())
+                    .collect(),
+            };
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("sql query failed: {e}\n")).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run a command inside a running workload (`POST /api/compute/{name}/exec`)
+// ---------------------------------------------------------------------------
+
+/// A command to run inside a running workload replica.
+#[derive(Deserialize)]
+pub(super) struct ComputeExecRequest {
+    /// The argv (first element is the program; run inside the container).
+    pub argv: Vec<String>,
+    /// Optional standard input, base64-encoded (binary-safe).
+    #[serde(default)]
+    pub stdin_b64: Option<String>,
+}
+
+/// The buffered result of an exec (stdout/stderr base64-encoded, binary-safe).
+#[derive(Serialize)]
+pub(super) struct ComputeExecResponse {
+    pub exit_code: i32,
+    pub stdout_b64: String,
+    pub stderr_b64: String,
+}
+
+/// Run a command inside a running replica of workload `name` (docker-exec style).
+/// Admin-scoped **and** gated by the `allow_compute_exec` posture; `501` if no
+/// exec-capable backend is wired, `403` when the posture forbids it.
+pub(super) async fn compute_exec(
+    Extension(project): Extension<ProjectContext>,
+    Extension(posture): Extension<boatramp_core::security::SecurityPosture>,
+    Extension(exec): Extension<Option<Arc<dyn boatramp_core::compute::ComputeExec>>>,
+    Path(name): Path<String>,
+    Json(req): Json<ComputeExecRequest>,
+) -> Response {
+    if !posture.allow_compute_exec {
+        return (
+            StatusCode::FORBIDDEN,
+            "compute exec is disabled; set the `allow_compute_exec` posture \
+             (BOATRAMP_SECURITY_ALLOW_COMPUTE_EXEC=true) to enable it\n",
+        )
+            .into_response();
+    }
+    let Some(exec) = exec else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "compute exec is not available on this node\n",
+        )
+            .into_response();
+    };
+    if req.argv.is_empty() {
+        return (StatusCode::BAD_REQUEST, "argv must not be empty\n").into_response();
+    }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let stdin = match req.stdin_b64.as_deref().map(|s| b64.decode(s)).transpose() {
+        Ok(v) => v,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "stdin_b64 is not valid base64\n").into_response()
+        }
+    };
+    match exec
+        .exec(
+            project.as_ref().as_str(),
+            &name,
+            &req.argv,
+            stdin.as_deref(),
+        )
+        .await
+    {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(ComputeExecResponse {
+                exit_code: out.exit_code,
+                stdout_b64: b64.encode(&out.stdout),
+                stderr_b64: b64.encode(&out.stderr),
+            }),
+        )
+            .into_response(),
+        Err(boatramp_core::compute::ExecError::NoReplica(_)) => (
+            StatusCode::CONFLICT,
+            "workload has no running replica to exec in\n",
+        )
+            .into_response(),
+        Err(boatramp_core::compute::ExecError::Unsupported(b)) => (
+            StatusCode::NOT_IMPLEMENTED,
+            format!("the {b} backend does not support exec\n"),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("exec failed: {e}\n")).into_response(),
+    }
+}
+
 /// Response for the OIDC→token exchange.
 #[cfg(feature = "oidc")]
 #[derive(Serialize)]

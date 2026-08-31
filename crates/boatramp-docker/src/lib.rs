@@ -14,12 +14,14 @@
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource, Scheme, VolumeRef,
+    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
+    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
+    Scheme, VolumeRef,
 };
 use bollard::container::{
-    Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
+    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StopContainerOptions,
 };
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{
     HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy as DockerRestartPolicy,
@@ -595,6 +597,107 @@ impl ComputeBackend for DockerBackend {
             Health::Healthy
         } else {
             Health::Unhealthy
+        })
+    }
+
+    /// Run a one-shot command **inside** the running container via the Engine
+    /// exec API and buffer its output. `argv` is the command + args (no shell);
+    /// `stdin`, when present, is written to the command's standard input and the
+    /// stream is then half-closed so the command sees EOF. stdout/stderr are
+    /// captured to completion, and the command's exit status is read back from
+    /// `inspect_exec` after the output stream ends.
+    ///
+    /// The container name is the one encoded in the handle (falling back to the
+    /// deterministic `boatramp-<workload>-<replica>`, mirroring `health`/`stop`).
+    async fn exec(
+        &self,
+        handle: &InstanceHandle,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput, BackendError> {
+        use tokio::io::AsyncWriteExt;
+
+        let name = match decode_ref(&handle.backend_ref) {
+            Some((n, _, _)) => n,
+            None => container_name(&handle.workload, handle.replica),
+        };
+        if argv.is_empty() {
+            return Err(BackendError::Other("exec: empty argv".into()));
+        }
+        let created = self
+            .docker
+            .create_exec(
+                &name,
+                CreateExecOptions {
+                    cmd: Some(argv.to_vec()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    attach_stdin: Some(stdin.is_some()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| BackendError::Other(format!("exec create on {name}: {e}")))?;
+        let started = self
+            .docker
+            .start_exec(&created.id, None)
+            .await
+            .map_err(|e| BackendError::Other(format!("exec start on {name}: {e}")))?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        match started {
+            StartExecResults::Attached { mut output, input } => {
+                // Feed stdin (if any) and half-close so the command sees EOF, then
+                // drain stdout/stderr to completion.
+                if let Some(bytes) = stdin {
+                    let mut input = input;
+                    input.write_all(bytes).await.map_err(|e| {
+                        BackendError::Other(format!("exec stdin write on {name}: {e}"))
+                    })?;
+                    input.flush().await.map_err(|e| {
+                        BackendError::Other(format!("exec stdin flush on {name}: {e}"))
+                    })?;
+                    input.shutdown().await.map_err(|e| {
+                        BackendError::Other(format!("exec stdin close on {name}: {e}"))
+                    })?;
+                } else {
+                    // Nothing to send; drop the writer to close the stdin half.
+                    drop(input);
+                }
+                while let Some(chunk) = output.next().await {
+                    match chunk
+                        .map_err(|e| BackendError::Other(format!("exec output on {name}: {e}")))?
+                    {
+                        LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
+                        // No attached TTY, so `Console` shouldn't appear, but fold it
+                        // into stderr defensively if the daemon ever sends it.
+                        LogOutput::StdErr { message } | LogOutput::Console { message } => {
+                            stderr.extend_from_slice(&message);
+                        }
+                        LogOutput::StdIn { .. } => {}
+                    }
+                }
+            }
+            // We never request `detach`, so a detached result is unexpected; treat it
+            // as an empty run and fall through to read the (already-final) status.
+            StartExecResults::Detached => {}
+        }
+
+        // The exit status is only known after the exec has finished (the output
+        // stream has ended). `exit_code` is `Option<i64>`; default a still-unknown
+        // status to 0.
+        let inspected = self
+            .docker
+            .inspect_exec(&created.id)
+            .await
+            .map_err(|e| BackendError::Other(format!("exec inspect on {name}: {e}")))?;
+        let exit_code = inspected.exit_code.unwrap_or(0) as i32;
+
+        Ok(ExecOutput {
+            exit_code,
+            stdout,
+            stderr,
         })
     }
 }

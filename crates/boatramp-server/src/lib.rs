@@ -40,11 +40,11 @@ pub mod sql_shim;
 #[cfg(feature = "oidc")]
 pub(crate) use admin_api::auth_exchange;
 pub(crate) use admin_api::{
-    activate_deployment, cert_status, create_deployment, current_deployment, delete_compute,
-    delete_site, get_compute, get_daemon_config, get_deployment, get_site_config, invalidate_cache,
-    list_aliases, list_compute, list_deployments, list_sites, prune_delete, prune_report, put_blob,
-    put_compute, put_daemon_config, put_site_config, remove_alias, rollback_daemon_config,
-    scrub_blobs, set_alias,
+    activate_deployment, cert_status, compute_exec, create_deployment, current_deployment,
+    delete_compute, delete_site, get_compute, get_daemon_config, get_deployment, get_site_config,
+    invalidate_cache, list_aliases, list_compute, list_deployments, list_sites, prune_delete,
+    prune_report, put_blob, put_compute, put_daemon_config, put_site_config, remove_alias,
+    rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -729,6 +729,14 @@ pub struct ServerOptions {
     /// [`config_baseline`] + [`DaemonRuntime::new`]) so it can wake it on
     /// SIGHUP / changelog; `None` (tests, embedders) ⇒ the router builds its own.
     pub daemon_runtime: Option<Arc<DaemonRuntime>>,
+    /// Operator SQL capability for managed databases (migrations / queries via the
+    /// sealed credential, resolved server-side). Backs `POST /api/sql/{db}/{exec,query}`;
+    /// `None` ⇒ those routes return `501`. Wired by the node when a managed DB exists.
+    pub operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
+    /// Operator compute-exec capability (run a command inside a running workload).
+    /// Backs `POST /api/compute/{name}/exec`; `None` ⇒ `501`. Gated at the handler by
+    /// the `allow_compute_exec` posture. Wired by the node with the compute backends.
+    pub compute_exec: Option<Arc<dyn boatramp_core::compute::ComputeExec>>,
     /// The embedded web-console mount (`[serve.console]`), when the operator
     /// enabled it and the binary was built with the `console` feature. `None` ⇒
     /// not served. The static SPA is served unauthenticated at this host+path.

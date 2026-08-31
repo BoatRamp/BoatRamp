@@ -51,6 +51,9 @@ pub enum Error {
     /// Building the ext4 rootfs from the OCI image failed.
     #[error("rootfs build failed: {0}")]
     RootfsBuild(String),
+    /// The control-plane returned an error response.
+    #[error("{0}")]
+    Server(String),
 }
 
 /// `compute` module result; `Err` is [`Error`].
@@ -219,6 +222,20 @@ enum ComputeCommand {
     Rm {
         /// Workload name.
         name: String,
+    },
+    /// Run a command inside a running workload replica (docker-exec style) — e.g.
+    /// pipe a SQL file into `psql`, or run `pg_dump`. Requires the server's
+    /// `allow_compute_exec` posture; container + docker backends only. The command's
+    /// stdout/stderr are printed and this process exits with its exit code.
+    Exec {
+        /// Workload name.
+        name: String,
+        /// Feed this process's standard input to the command (pipe a file in).
+        #[arg(long)]
+        stdin: bool,
+        /// The command argv — everything after `--`, e.g. `-- psql -U app -d appdb`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
     },
 }
 
@@ -451,6 +468,48 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 .await?
                 .error_for_status()?;
             println!("removed {name}");
+        }
+        ComputeCommand::Exec { name, stdin, argv } => {
+            use base64::Engine;
+            use std::io::{Read, Write};
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let stdin_b64 = if stdin {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)?;
+                Some(b64.encode(&buf))
+            } else {
+                None
+            };
+            let body = serde_json::json!({ "argv": argv, "stdin_b64": stdin_b64 });
+            let resp = http
+                .post(format!("{server}/api/{seg}/{name}/exec"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "compute exec failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            let out: serde_json::Value = resp.json().await?;
+            if let Some(s) = out["stdout_b64"].as_str() {
+                std::io::stdout()
+                    .write_all(&b64.decode(s).unwrap_or_default())
+                    .ok();
+            }
+            if let Some(s) = out["stderr_b64"].as_str() {
+                std::io::stderr()
+                    .write_all(&b64.decode(s).unwrap_or_default())
+                    .ok();
+            }
+            // Mirror the command's exit code so scripts see failures.
+            let code = out["exit_code"].as_i64().unwrap_or(0);
+            if code != 0 {
+                std::process::exit(code as i32);
+            }
         }
     }
     Ok(())

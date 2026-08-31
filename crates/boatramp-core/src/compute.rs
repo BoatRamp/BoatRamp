@@ -215,6 +215,53 @@ pub enum BackendError {
 /// The control plane only ever sees [`Instance`]/[`Endpoint`]; whether the
 /// backend runs the workload directly (VMM, container) or delegates to a
 /// platform/daemon (cloudflare, docker) is internal.
+/// The buffered result of running a one-shot command inside a running workload
+/// replica (`ComputeBackend::exec`). Non-streaming: stdout/stderr are captured to
+/// completion. `exit_code` is the command's status (128+signal if it was killed).
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    /// The command's exit status (128 + signal number if terminated by a signal).
+    pub exit_code: i32,
+    /// Captured standard output.
+    pub stdout: Vec<u8>,
+    /// Captured standard error.
+    pub stderr: Vec<u8>,
+}
+
+/// Why an operator [`ComputeExec::exec`] failed (distinct from a backend launch
+/// error — this layer adds "no replica to target" and "backend can't exec").
+#[derive(Debug, thiserror::Error)]
+pub enum ExecError {
+    /// No running replica of the workload to exec inside.
+    #[error("workload {0:?} has no running replica to exec in")]
+    NoReplica(String),
+    /// The workload's backend doesn't support exec (VM / edge backends).
+    #[error("the {0} backend does not support exec")]
+    Unsupported(String),
+    /// Any other failure (backend error, resolution failure, …).
+    #[error("exec failed: {0}")]
+    Other(String),
+}
+
+/// The operator-facing "run a command inside a running workload" capability
+/// (docker-exec style), backing `POST /api/compute/{name}/exec` and `boatramp
+/// compute exec`. The node implementation resolves a workload's running replica,
+/// selects its backend, and calls [`ComputeBackend::exec`]; only the shared-kernel
+/// backends (native `container`, remote `docker`) support it. Gated by the
+/// `allow_compute_exec` security posture at the API.
+#[async_trait]
+pub trait ComputeExec: Send + Sync {
+    /// Run `argv` (feeding `stdin` when present) inside a running replica of
+    /// `workload` in `project`, returning its buffered output.
+    async fn exec(
+        &self,
+        project: &str,
+        workload: &str,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput, ExecError>;
+}
+
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
     /// Stable backend id (`"vmm"` / `"container"` / `"cloudflare"` / `"docker"`).
@@ -243,6 +290,22 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Restore a snapshotted replica.
     async fn restore(&self, _snapshot: &Snapshot) -> Result<Instance, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Run a one-shot command **inside** a running replica (docker-exec style) and
+    /// return its buffered output — for operator ops (migrations, `pg_dump`, debug).
+    /// `stdin` is fed to the command's standard input when present. Only the
+    /// shared-kernel backends that can re-enter a running container implement it
+    /// (native `container` via `setns`, remote `docker` via the exec API); the
+    /// VM/edge backends return [`BackendError::Unsupported`]. The caller gates this
+    /// behind the `allow_compute_exec` security posture.
+    async fn exec(
+        &self,
+        _handle: &InstanceHandle,
+        _argv: &[String],
+        _stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput, BackendError> {
         Err(BackendError::Unsupported)
     }
 }
@@ -772,6 +835,120 @@ impl PrivilegeDirective {
     }
 }
 
+/// The engine of a managed co-located database, selecting the stock OCI image, TCP
+/// port, in-guest data directory, and entrypoint that [`managed_db_spec`]
+/// synthesizes for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedDbEngine {
+    /// PostgreSQL — the pgvector image by default (a superset of the official
+    /// image, so `create extension vector` works out of the box).
+    Postgres,
+    /// MySQL — the official image.
+    Mysql,
+}
+
+impl ManagedDbEngine {
+    /// The default stock OCI image for this engine.
+    pub fn default_image(self) -> &'static str {
+        match self {
+            Self::Postgres => "pgvector/pgvector:pg16",
+            Self::Mysql => "mysql:8.0",
+        }
+    }
+
+    /// The TCP port the server listens on.
+    pub fn port(self) -> u16 {
+        match self {
+            Self::Postgres => 5432,
+            Self::Mysql => 3306,
+        }
+    }
+
+    /// The in-guest data directory that must be backed by a persistent volume.
+    pub fn data_dir(self) -> &'static str {
+        match self {
+            Self::Postgres => "/var/lib/postgresql/data",
+            Self::Mysql => "/var/lib/mysql",
+        }
+    }
+}
+
+/// Synthesize the immutable [`ComputeSpec`] for a managed co-located database from a
+/// stock engine image, so the auto-registration path (node assembly) and the
+/// capability gate build the **identical** workload — the gate proves exactly what
+/// ships (the managed-DB spec never diverges from the tested one).
+///
+/// The spec carries only non-secret, image-shaping fields: the OCI image, the TCP
+/// port, an **explicit entrypoint** (the shared-kernel backends apply the image's
+/// filesystem, not its OCI config, so the argv plus `listen_addresses`/`bind-address`
+/// must be supplied so the server answers on the container's bridge IP), the
+/// non-secret `PATH`/data-dir env, and one persistent volume at the data directory.
+/// The server-init credential env (`POSTGRES_*`/`MYSQL_*`) is injected at **launch**
+/// from the sealed credential — never stored in this content-addressed spec. `user`
+/// and `cap_add` are left unset so the reconcile's [`PrivilegeDirective`] (rootless
+/// by default) sets them per posture, keeping the rootless default intact.
+pub fn managed_db_spec(
+    engine: ManagedDbEngine,
+    image: Option<&str>,
+    volume_size_mib: u32,
+) -> ComputeSpec {
+    let data_dir = engine.data_dir();
+    let (entrypoint, env) = match engine {
+        ManagedDbEngine::Postgres => (
+            vec![
+                "/usr/local/bin/docker-entrypoint.sh".to_string(),
+                "postgres".to_string(),
+                "-c".to_string(),
+                "listen_addresses=*".to_string(),
+            ],
+            BTreeMap::from([
+                (
+                    "PATH".to_string(),
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\
+                     /usr/lib/postgresql/16/bin"
+                        .to_string(),
+                ),
+                ("PGDATA".to_string(), data_dir.to_string()),
+            ]),
+        ),
+        ManagedDbEngine::Mysql => (
+            vec![
+                "/usr/local/bin/docker-entrypoint.sh".to_string(),
+                "mysqld".to_string(),
+                "--bind-address=*".to_string(),
+            ],
+            BTreeMap::from([(
+                "PATH".to_string(),
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            )]),
+        ),
+    };
+    ComputeSpec {
+        version: 1,
+        root: RootSource::Image(image.unwrap_or_else(|| engine.default_image()).to_string()),
+        kernel: String::new(),
+        kernel_cmdline: None,
+        vcpus: 1,
+        mem_mib: 512,
+        entrypoint,
+        env,
+        port: engine.port(),
+        restart: RestartPolicy::Always,
+        scale_to_zero: false,
+        volumes: vec![VolumeRef {
+            mount: data_dir.to_string(),
+            name: "data".to_string(),
+            size_mib: volume_size_mib,
+        }],
+        writable_root: false,
+        cap_add: Vec::new(),
+        user: None,
+        isolation: IsolationRequirement::Trusted,
+        prefer_backend: None,
+        bindings: vec![],
+    }
+}
+
 /// One reconcile pass: for every workload, refresh replica health, compute the
 /// plan ([`reconcile_plan`]), and execute it against the chosen backends —
 /// launching/stopping replicas and persisting their observed state (which the
@@ -1077,6 +1254,41 @@ async fn launch_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_db_spec_is_launchable_and_privilege_deferred() {
+        // Postgres: default image, port, one volume at the data dir, explicit
+        // entrypoint (the shared-kernel backends don't apply OCI config), and
+        // `user`/`cap_add` LEFT UNSET so the privilege directive owns them.
+        let pg = managed_db_spec(ManagedDbEngine::Postgres, None, 2048);
+        assert_eq!(pg.root, RootSource::Image("pgvector/pgvector:pg16".into()));
+        assert_eq!(pg.port, 5432);
+        assert!(pg.user.is_none(), "rootless directive sets user at launch");
+        assert!(pg.cap_add.is_empty());
+        assert!(matches!(pg.restart, RestartPolicy::Always));
+        assert!(!pg.scale_to_zero, "a database must not snapshot when idle");
+        assert_eq!(pg.volumes.len(), 1);
+        assert_eq!(pg.volumes[0].mount, "/var/lib/postgresql/data");
+        assert_eq!(pg.volumes[0].size_mib, 2048);
+        assert!(pg.entrypoint.iter().any(|a| a == "listen_addresses=*"));
+        assert_eq!(
+            pg.env.get("PGDATA").map(String::as_str),
+            Some("/var/lib/postgresql/data")
+        );
+        // No secret env in the content-addressed spec — the credential is injected at launch.
+        assert!(!pg.env.contains_key("POSTGRES_PASSWORD"));
+
+        // The rootless directive then makes it launchable as the image's DB user.
+        let mut launched = pg.clone();
+        PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut launched);
+        assert_eq!(launched.user.as_deref(), Some("999:999"));
+
+        // An explicit image override is honored; MySQL uses its own port/data dir.
+        let my = managed_db_spec(ManagedDbEngine::Mysql, Some("mysql:8.4"), 512);
+        assert_eq!(my.root, RootSource::Image("mysql:8.4".into()));
+        assert_eq!(my.port, 3306);
+        assert_eq!(my.volumes[0].mount, "/var/lib/mysql");
+    }
 
     #[test]
     fn privilege_directive_applies_without_overriding_operator_values() {

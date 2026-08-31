@@ -456,6 +456,18 @@ mod postgres_backend {
             let pool = self.read_pool.as_ref().unwrap_or(&self.pool);
             begin_on(pool, true).await
         }
+
+        async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
+            // Simple-query protocol on one pooled connection: runs the whole
+            // multi-statement script (CREATE EXTENSION + chained DDL) that the
+            // parameterized per-statement path can't express — the operator migration
+            // path. An error in any statement aborts the batch and surfaces here.
+            sqlx::raw_sql(sql)
+                .execute(&self.pool)
+                .await
+                .map(|_| ())
+                .map_err(map_err)
+        }
     }
 
     /// One transaction, owning its pooled connection (raw `COMMIT`/`ROLLBACK`).
@@ -705,6 +717,17 @@ mod mysql_backend {
         async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             let pool = self.read_pool.as_ref().unwrap_or(&self.pool);
             begin_on(pool, true).await
+        }
+
+        async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
+            // Text protocol on one pooled connection: runs the whole multi-statement
+            // migration script (chained DDL/DML) the parameterized path can't express.
+            // An error in any statement aborts the batch and surfaces here.
+            sqlx::raw_sql(sql)
+                .execute(&self.pool)
+                .await
+                .map(|_| ())
+                .map_err(map_err)
         }
     }
 

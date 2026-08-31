@@ -8,7 +8,8 @@
 //! BOATRAMP_TEST_DOCKER=1 cargo test -p boatramp-docker --test docker_live -- --nocapture
 //! ```
 //! It pulls a tiny image, launches a replica, asserts it's healthy (running),
-//! then stops + removes it — exercising materialize → launch → health → stop.
+//! runs a command inside it via `exec` (stdout, stderr, stdin, exit code), then
+//! stops + removes it — exercising materialize → launch → health → exec → stop.
 
 use std::collections::BTreeMap;
 
@@ -68,6 +69,31 @@ async fn docker_round_trip() {
         Health::Healthy,
         "the launched container should be running"
     );
+
+    // exec: stdout capture + zero exit.
+    let out = backend
+        .exec(&instance.handle, &["echo".into(), "hello".into()], None)
+        .await
+        .expect("exec echo");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, b"hello\n");
+    assert!(out.stderr.is_empty());
+
+    // exec: non-zero exit code is surfaced.
+    let out = backend
+        .exec(&instance.handle, &["false".into()], None)
+        .await
+        .expect("exec false");
+    assert_ne!(out.exit_code, 0, "`false` exits non-zero");
+
+    // exec: stdin is fed to the command (cat echoes it back on stdout).
+    let out = backend
+        .exec(&instance.handle, &["cat".into()], Some(b"piped-in"))
+        .await
+        .expect("exec cat <stdin>");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, b"piped-in");
+
     backend.stop(&instance.handle).await.expect("stop");
     // After stop, the container is gone → unhealthy.
     assert_eq!(

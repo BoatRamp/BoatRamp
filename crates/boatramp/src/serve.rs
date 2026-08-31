@@ -336,7 +336,7 @@ pub struct ServeArgs {
     bootstrap_secret: Option<String>,
 
     /// TLS mode for the listener.
-    #[arg(long, value_enum, default_value_t = TlsMode::Off)]
+    #[arg(long, value_enum, env = "BOATRAMP_TLS", default_value_t = TlsMode::Off)]
     tls: TlsMode,
 
     /// PEM certificate chain (for `--tls custom`).
@@ -347,35 +347,51 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 
-    /// Domain to obtain an ACME certificate for (repeatable; for `--tls acme`).
-    #[arg(long = "acme-domain")]
+    /// Domain to obtain an ACME certificate for (repeatable; for `--tls acme`). An
+    /// explicit wildcard (`*.example.com`) is issued via DNS-01. `BOATRAMP_ACME_DOMAINS`
+    /// takes a comma-separated list.
+    #[arg(
+        long = "acme-domain",
+        env = "BOATRAMP_ACME_DOMAINS",
+        value_delimiter = ','
+    )]
     acme_domain: Vec<String>,
 
     /// ACME directory URL (defaults to Let's Encrypt production).
-    #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory")]
+    #[arg(
+        long,
+        env = "BOATRAMP_ACME_DIRECTORY",
+        default_value = "https://acme-v02.api.letsencrypt.org/directory"
+    )]
     acme_directory: String,
 
     /// Contact email for the ACME account.
-    #[arg(long)]
+    #[arg(long, env = "BOATRAMP_ACME_CONTACT")]
     acme_contact: Option<String>,
 
     /// Extra root CA (PEM) to trust for the ACME server (e.g. Pebble's CA).
-    #[arg(long)]
+    #[arg(long, env = "BOATRAMP_ACME_CA_CERT")]
     acme_ca_cert: Option<PathBuf>,
 
     /// Directory for the ACME certificate cache.
-    #[arg(long, default_value = "./data/acme")]
+    #[arg(long, env = "BOATRAMP_ACME_CACHE", default_value = "./data/acme")]
     acme_cache: PathBuf,
 
     /// DNS provider for `--tls acme-dns` and `boatramp dns`
-    /// (`manual` | `cloudflare` | `route53` | `oci`). Credentials come from the
+    /// (`manual` | `cloudflare` | `route53` | `oci` | …). Credentials come from the
     /// environment (see `boatramp dns --help`).
-    #[arg(long, default_value = "manual")]
+    #[arg(long, env = "BOATRAMP_ACME_DNS_PROVIDER", default_value = "manual")]
     acme_dns_provider: String,
 
     /// With `--tls acme-dns`, also issue a `*.deploy.<domain>` wildcard cert so
     /// the wildcard preview host form gets TLS.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BOATRAMP_ACME_WILDCARD_PREVIEW",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
     acme_wildcard_preview: bool,
 
     /// Reject blob uploads larger than this many bytes (default: unlimited).
