@@ -48,8 +48,10 @@ pub enum ConfigError {
     /// An environment-variable override could not be parsed (bad number/bool).
     #[error("environment variable {var}: {reason}")]
     Env {
-        /// The offending `BOATRAMP_*` variable.
-        var: &'static str,
+        /// The offending `BOATRAMP_*` variable. Owned because some names are built
+        /// dynamically (the keyed `databases` map, whose members aren't known at
+        /// compile time).
+        var: String,
         /// Why the value was rejected.
         reason: String,
     },
@@ -158,6 +160,16 @@ fn default_vault_token_env() -> String {
     "VAULT_TOKEN".to_string()
 }
 
+impl Default for VaultSecretsConfig {
+    fn default() -> Self {
+        Self {
+            addr: String::new(),
+            key: String::new(),
+            token_env: default_vault_token_env(),
+        }
+    }
+}
+
 impl ServerConfig {
     /// Parse a `boatramp.cfg` document (RON).
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -218,6 +230,50 @@ impl ServerConfig {
             }
             if let Some(v) = source.get("BOATRAMP_COMPUTE_SQL_SHIM_URL") {
                 compute.sql_shim_url = Some(v);
+            }
+            // The two shared-kernel enums have no `FromStr`, only a serde
+            // `rename_all = "lowercase"`; map their variants by that same spelling.
+            if let Some(v) = source.parse_enum(
+                "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
+                &[
+                    ("rootless", ManagedDbPrivilege::Rootless),
+                    ("caps", ManagedDbPrivilege::Caps),
+                ],
+            )? {
+                compute.managed_db_privilege = v;
+            }
+            if let Some(v) = source.parse_enum(
+                "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
+                &[
+                    ("published", boatramp_docker::DockerEndpoint::Published),
+                    ("bridge", boatramp_docker::DockerEndpoint::Bridge),
+                ],
+            )? {
+                compute.docker_endpoint = v;
+            }
+            if let Some(v) = source.parse_enum(
+                "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
+                &[
+                    ("named", boatramp_docker::DockerVolumeMode::Named),
+                    ("bind", boatramp_docker::DockerVolumeMode::Bind),
+                ],
+            )? {
+                compute.docker_volume_mode = v;
+            }
+            // Kernel trust anchors — comma-separated lists. These are
+            // security-critical: they are the trust anchor for the posture-scaled
+            // kernel bar, so a value here decides which kernels a `multi-tenant`
+            // node will boot. In a 12-factor deployment the environment IS the
+            // operator's trusted config source (a fly.toml `[env]` is committed the
+            // same as a file), so they are exposed here — but an operator should
+            // know the environment is *more* visible than a file (it leaks through
+            // `/proc/<pid>/environ` and is inherited by every subprocess), so a
+            // file remains the better home for them when one is available.
+            if let Some(v) = source.parse_list("BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS") {
+                compute.kernel_signing_pubkeys = v;
+            }
+            if let Some(v) = source.parse_list("BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES") {
+                compute.kernel_allowed_hashes = v;
             }
         }
 
@@ -323,6 +379,165 @@ impl ServerConfig {
             }
         }
 
+        // --- handler sql external databases (`handlers.bindings.sql.databases`) ---
+        // The bring-your-own / managed-compute DB map, keyed by name. There is no
+        // config file to enumerate the members, so the member names are discovered
+        // from the environment: any `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`
+        // variable declares database `<NAME>`. Each env-declared DB is merged into
+        // (overriding, per field, by key) whatever the file already declared under
+        // that name — the same env-over-file precedence as the scalars.
+        //
+        // The map key may be the **empty string** (the default database that a
+        // handler opens as `sql.open("")`); it can't appear in a variable name, so
+        // the reserved name token `DEFAULT` addresses it:
+        // `BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND` populates the `""` key.
+        if source.any_with_prefix(SQL_DB_ENV_PREFIX) {
+            let handlers = self.handlers.get_or_insert_with(HandlersConfig::default);
+            let sql = handlers
+                .bindings
+                .sql
+                .get_or_insert_with(SqlBindingConfig::default);
+            for name in source.sql_database_names() {
+                // `DEFAULT` is the reserved token for the `""` (default) database.
+                let key = if name == "DEFAULT" {
+                    String::new()
+                } else {
+                    name.clone()
+                };
+                let db = sql.databases.entry(key).or_default();
+                let prefix = format!("{SQL_DB_ENV_PREFIX}{name}_");
+                if let Some(v) = source.get(&format!("{prefix}KIND")) {
+                    db.kind = v;
+                }
+                if let Some(v) = source.get(&format!("{prefix}URL_ENV")) {
+                    db.url_env = v;
+                }
+                if let Some(v) = source.get(&format!("{prefix}READ_URL_ENV")) {
+                    db.read_url_env = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}COMPUTE")) {
+                    db.compute = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}DATABASE")) {
+                    db.database = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}USER")) {
+                    db.user = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}PASSWORD_ENV")) {
+                    db.password_env = Some(v);
+                }
+                if let Some(v) = source.parse(&format!("{prefix}POOL_MAX"))? {
+                    db.pool_max = Some(v);
+                }
+                if let Some(v) = source.parse_bool(&format!("{prefix}READ_ONLY"))? {
+                    db.read_only = v;
+                }
+                if let Some(v) = source.parse_bool(&format!("{prefix}ALLOW_PREVIEW"))? {
+                    db.allow_preview = v;
+                }
+                if let Some(v) = source.parse(&format!("{prefix}CONNECT_TIMEOUT_SECS"))? {
+                    db.connect_timeout_secs = Some(v);
+                }
+            }
+        }
+
+        // --- secrets (`[secrets]`) -------------------------------------------
+        // Envelope encryption for private keys at rest. `kek_file` holds a *path*
+        // (never key material) and the Vault token stays indirected via
+        // `token_env` (a variable name, not the token). Materialise the nested
+        // `vault` sub-config only when a vault variable is set.
+        if source.any(SECRETS_ENV_VARS) {
+            let secrets = self.secrets.get_or_insert_with(SecretsConfig::default);
+            if let Some(v) = source.get("BOATRAMP_SECRETS_ENVELOPE") {
+                secrets.envelope = v;
+            }
+            if let Some(v) = source.get("BOATRAMP_SECRETS_KEK_FILE") {
+                secrets.kek_file = Some(PathBuf::from(v));
+            }
+            if source.any(SECRETS_VAULT_ENV_VARS) {
+                let vault = secrets
+                    .vault
+                    .get_or_insert_with(VaultSecretsConfig::default);
+                if let Some(v) = source.get("BOATRAMP_SECRETS_VAULT_ADDR") {
+                    vault.addr = v;
+                }
+                if let Some(v) = source.get("BOATRAMP_SECRETS_VAULT_KEY") {
+                    vault.key = v;
+                }
+                if let Some(v) = source.get("BOATRAMP_SECRETS_VAULT_TOKEN_ENV") {
+                    vault.token_env = v;
+                }
+            }
+        }
+
+        // --- cluster (`[cluster]`) -------------------------------------------
+        // The self-hosted cluster section's own fields. The founding/joining
+        // *actions* already have their own `serve` flags with env
+        // (`BOATRAMP_CLUSTER_INIT` / `_JOIN` / `_ADVERTISE_ADDR`); those are
+        // distinct from — and not duplicated by — the `[cluster]` section fields
+        // exposed here. `join_token` keeps a secret out of plain sight via the
+        // usual `env:VAR` / `path:/file` prefix, so the env holds the *reference*,
+        // not the token. `ClusterConfig` has no `Default` (a founder needs at least
+        // a `listen`), so a `BOATRAMP_CLUSTER_LISTEN` is required to materialise an
+        // absent section from the environment.
+        if source.any(CLUSTER_ENV_VARS) {
+            // Materialise an absent section only if a bind address is supplied;
+            // otherwise there is no valid `ClusterConfig` to build (it has no
+            // `Default` — a node must know where to bind its mesh). When the file
+            // already declared `[cluster]`, its `listen` stands and the other env
+            // fields layer over it even without `BOATRAMP_CLUSTER_LISTEN`.
+            let listen = source.parse::<SocketAddr>("BOATRAMP_CLUSTER_LISTEN")?;
+            if self.cluster.is_none() {
+                if let Some(listen) = listen {
+                    self.cluster = Some(ClusterConfig {
+                        listen,
+                        root_pubkeys: Vec::new(),
+                        seeds: Vec::new(),
+                        join_token: None,
+                        store_dir: None,
+                        mesh: None,
+                    });
+                }
+            }
+            if let Some(cluster) = self.cluster.as_mut() {
+                // A `listen` override applies to an already-present section too (a
+                // freshly materialised one already carries it).
+                if let Some(v) = listen {
+                    cluster.listen = v;
+                }
+                if let Some(v) = source.parse_list("BOATRAMP_CLUSTER_ROOT_PUBKEYS") {
+                    cluster.root_pubkeys = v;
+                }
+                if let Some(v) = source.parse_list("BOATRAMP_CLUSTER_SEEDS") {
+                    cluster.seeds = v;
+                }
+                if let Some(v) = source.get("BOATRAMP_CLUSTER_JOIN_TOKEN") {
+                    cluster.join_token = Some(v);
+                }
+                if let Some(v) = source.get("BOATRAMP_CLUSTER_STORE_DIR") {
+                    cluster.store_dir = Some(PathBuf::from(v));
+                }
+                if source.any(CLUSTER_MESH_ENV_VARS) {
+                    let mesh = cluster.mesh.get_or_insert_with(MeshConfig::default);
+                    if let Some(v) = source.get("BOATRAMP_CLUSTER_MESH_KEY_FILE") {
+                        mesh.key_file = Some(PathBuf::from(v));
+                    }
+                    if let Some(v) = source.get("BOATRAMP_CLUSTER_MESH_KEY_ROTATION") {
+                        mesh.key_rotation = Some(v);
+                    }
+                    if let Some(v) = source.get("BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL") {
+                        mesh.join_token_ttl = Some(v);
+                    }
+                    if let Some(v) =
+                        source.parse_bool("BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES")?
+                    {
+                        mesh.gate_client_writes = Some(v);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -337,6 +552,11 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_MEM_MIB",
     "BOATRAMP_COMPUTE_REGION",
     "BOATRAMP_COMPUTE_SQL_SHIM_URL",
+    "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
+    "BOATRAMP_COMPUTE_DOCKER_ENDPOINT",
+    "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
+    "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
+    "BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES",
 ];
 
 /// The `BOATRAMP_*` variables that populate the `[security]` section.
@@ -372,6 +592,70 @@ const SQL_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_SQL_PREVIEW_INIT",
 ];
 
+/// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
+/// `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`. Member names aren't known ahead of
+/// time (there is no config file to enumerate them), so they are discovered by
+/// scanning the environment for this prefix.
+const SQL_DB_ENV_PREFIX: &str = "BOATRAMP_HANDLERS_SQL_DB_";
+
+/// The recognised `_<FIELD>` suffixes of a `databases` variable, ordered so a
+/// name-isolating strip matches the **longest** suffix first (`_READ_URL_ENV`
+/// before `_URL_ENV`). Each mirrors a field of [`ExternalDatabaseConfig`].
+const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
+    "_CONNECT_TIMEOUT_SECS",
+    "_READ_URL_ENV",
+    "_PASSWORD_ENV",
+    "_ALLOW_PREVIEW",
+    "_URL_ENV",
+    "_DATABASE",
+    "_READ_ONLY",
+    "_POOL_MAX",
+    "_COMPUTE",
+    "_KIND",
+    "_USER",
+];
+
+/// The `BOATRAMP_*` variables that populate the `[secrets]` section (excluding the
+/// nested `vault` sub-config, gated separately by [`SECRETS_VAULT_ENV_VARS`]).
+const SECRETS_ENV_VARS: &[&str] = &[
+    "BOATRAMP_SECRETS_ENVELOPE",
+    "BOATRAMP_SECRETS_KEK_FILE",
+    "BOATRAMP_SECRETS_VAULT_ADDR",
+    "BOATRAMP_SECRETS_VAULT_KEY",
+    "BOATRAMP_SECRETS_VAULT_TOKEN_ENV",
+];
+
+/// The `BOATRAMP_*` variables that populate the nested `[secrets.vault]` sub-config.
+const SECRETS_VAULT_ENV_VARS: &[&str] = &[
+    "BOATRAMP_SECRETS_VAULT_ADDR",
+    "BOATRAMP_SECRETS_VAULT_KEY",
+    "BOATRAMP_SECRETS_VAULT_TOKEN_ENV",
+];
+
+/// The `BOATRAMP_*` variables that populate the `[cluster]` section fields (the
+/// section's own config, distinct from the founding/joining *action* flags
+/// `BOATRAMP_CLUSTER_INIT` / `_JOIN` / `_ADVERTISE_ADDR`, which are `serve` clap
+/// args and are deliberately not listed here).
+const CLUSTER_ENV_VARS: &[&str] = &[
+    "BOATRAMP_CLUSTER_LISTEN",
+    "BOATRAMP_CLUSTER_ROOT_PUBKEYS",
+    "BOATRAMP_CLUSTER_SEEDS",
+    "BOATRAMP_CLUSTER_JOIN_TOKEN",
+    "BOATRAMP_CLUSTER_STORE_DIR",
+    "BOATRAMP_CLUSTER_MESH_KEY_FILE",
+    "BOATRAMP_CLUSTER_MESH_KEY_ROTATION",
+    "BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL",
+    "BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES",
+];
+
+/// The `BOATRAMP_*` variables that populate the nested `[cluster.mesh]` sub-config.
+const CLUSTER_MESH_ENV_VARS: &[&str] = &[
+    "BOATRAMP_CLUSTER_MESH_KEY_FILE",
+    "BOATRAMP_CLUSTER_MESH_KEY_ROTATION",
+    "BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL",
+    "BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES",
+];
+
 /// Where env-override values come from: the real process environment, or an
 /// explicit map for a deterministic unit test. Keeping the lookup behind this enum
 /// lets [`ServerConfig::apply_env_overrides`] be tested without touching (racy,
@@ -401,17 +685,109 @@ impl EnvSource {
         vars.iter().any(|v| self.get(v).is_some())
     }
 
+    /// Whether any variable whose name starts with `prefix` is set (to a
+    /// non-empty value). Used to decide whether to materialise a keyed map (the
+    /// `databases` env scheme) whose member names aren't known ahead of time.
+    fn any_with_prefix(&self, prefix: &str) -> bool {
+        self.names().any(|name| {
+            name.starts_with(prefix) && self.get(&name).is_some()
+        })
+    }
+
+    /// The full set of variable names visible to this source. Used to discover the
+    /// keyed-map member names from the environment (there is no config file to
+    /// enumerate them). Returned owned so it doesn't borrow the process env.
+    fn names(&self) -> Box<dyn Iterator<Item = String> + '_> {
+        match self {
+            Self::Process => Box::new(std::env::vars().map(|(k, _)| k)),
+            #[cfg(test)]
+            Self::Map(m) => Box::new(m.keys().cloned()),
+        }
+    }
+
+    /// Parse `var` as one of a fixed set of string-mapped variants, mapping an
+    /// unknown value to a clear [`ConfigError::Env`] that names the variable and
+    /// the accepted values. Used for the config enums that have no `FromStr`
+    /// (their only string mapping is a serde `rename_all`). `Ok(None)` when unset.
+    fn parse_enum<T: Copy>(
+        &self,
+        var: &str,
+        variants: &[(&str, T)],
+    ) -> Result<Option<T>, ConfigError> {
+        match self.get(var) {
+            Some(raw) => {
+                let lower = raw.trim().to_ascii_lowercase();
+                variants
+                    .iter()
+                    .find(|(name, _)| *name == lower)
+                    .map(|(_, v)| Some(*v))
+                    .ok_or_else(|| ConfigError::Env {
+                        var: var.to_string(),
+                        reason: format!(
+                            "expected one of {}, got {raw:?}",
+                            variants
+                                .iter()
+                                .map(|(n, _)| *n)
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        ),
+                    })
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The distinct `<NAME>` tokens of every `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`
+    /// variable that is set. The name is everything between the fixed prefix and the
+    /// *last* `_<FIELD>` segment, so a database name may itself contain underscores
+    /// (the field suffix is one of a known set). Returned sorted + de-duplicated so
+    /// the map is built deterministically.
+    fn sql_database_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .names()
+            .filter(|n| n.starts_with(SQL_DB_ENV_PREFIX) && self.get(n).is_some())
+            .filter_map(|n| {
+                let rest = n.strip_prefix(SQL_DB_ENV_PREFIX)?;
+                // Strip the recognised field suffix to isolate `<NAME>`. The suffixes
+                // are matched longest-first so `READ_URL_ENV` wins over `URL_ENV`.
+                SQL_DB_FIELD_SUFFIXES
+                    .iter()
+                    .find_map(|suffix| rest.strip_suffix(suffix))
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Parse `var` as a **comma-separated** list of non-empty trimmed items, e.g.
+    /// the kernel trust anchors. A single value (no comma) yields a one-element
+    /// list. Empty items are dropped so a trailing comma or doubled separator is
+    /// tolerated. `Ok(None)` when unset; `Some(Vec::new())` never happens (an
+    /// all-empty value is treated as unset by [`Self::get`]).
+    fn parse_list(&self, var: &str) -> Option<Vec<String>> {
+        self.get(var).map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+    }
+
     /// Parse `var` as any [`FromStr`](std::str::FromStr) type (numbers), mapping a
     /// parse failure to a clear [`ConfigError::Env`]. `Ok(None)` when the variable
     /// is unset.
-    fn parse<T>(&self, var: &'static str) -> Result<Option<T>, ConfigError>
+    fn parse<T>(&self, var: &str) -> Result<Option<T>, ConfigError>
     where
         T: std::str::FromStr,
         T::Err: std::fmt::Display,
     {
         match self.get(var) {
             Some(raw) => raw.parse::<T>().map(Some).map_err(|e| ConfigError::Env {
-                var,
+                var: var.to_string(),
                 reason: e.to_string(),
             }),
             None => Ok(None),
@@ -422,13 +798,13 @@ impl EnvSource {
     /// (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) case-insensitively so an
     /// operator isn't surprised by a strict `true`-only parse. `Ok(None)` when
     /// unset.
-    fn parse_bool(&self, var: &'static str) -> Result<Option<bool>, ConfigError> {
+    fn parse_bool(&self, var: &str) -> Result<Option<bool>, ConfigError> {
         match self.get(var) {
             Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "on" => Ok(Some(true)),
                 "false" | "0" | "no" | "off" => Ok(Some(false)),
                 other => Err(ConfigError::Env {
-                    var,
+                    var: var.to_string(),
                     reason: format!("expected a boolean (true/false), got {other:?}"),
                 }),
             },
@@ -1260,6 +1636,8 @@ mod tests {
         assert!(cfg.compute.is_none());
         assert!(cfg.security.is_none());
         assert!(cfg.handlers.is_none());
+        assert!(cfg.secrets.is_none());
+        assert!(cfg.cluster.is_none());
     }
 
     #[test]
@@ -1289,13 +1667,10 @@ mod tests {
         let err = cfg
             .apply_env_overrides(&env(&[("BOATRAMP_SECURITY_REQUIRE_POP", "maybe")]))
             .expect_err("garbage boolean is rejected");
-        assert!(matches!(
-            err,
-            ConfigError::Env {
-                var: "BOATRAMP_SECURITY_REQUIRE_POP",
-                ..
-            }
-        ));
+        match err {
+            ConfigError::Env { var, .. } => assert_eq!(var, "BOATRAMP_SECURITY_REQUIRE_POP"),
+            other => panic!("expected ConfigError::Env, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1322,6 +1697,259 @@ mod tests {
             Some("us-east"),
             "an empty env value leaves the file value in place"
         );
+    }
+
+    #[test]
+    fn env_configures_managed_postgres_secrets_and_privilege_with_no_file() {
+        // The construens acceptance case: with NO `boatramp.cfg` at all, the
+        // environment alone stands up a managed co-located Postgres. It configures
+        // the default (`""`-named) database in `handlers.bindings.sql.databases`
+        // (kind=postgres, compute=pg, database+user set), the `[secrets]` envelope
+        // (local + a kek path so the managed credential can be sealed), and
+        // `compute.managed_db_privilege = rootless`. All three sections start absent.
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.handlers.is_none() && cfg.secrets.is_none() && cfg.compute.is_none());
+
+        cfg.apply_env_overrides(&env(&[
+            // The default database is addressed by the reserved `DEFAULT` token,
+            // which maps to the empty-string map key.
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_COMPUTE", "pg"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "appdb"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_USER", "app"),
+            // Secrets: the local envelope + a KEK path (never key material).
+            ("BOATRAMP_SECRETS_ENVELOPE", "local"),
+            ("BOATRAMP_SECRETS_KEK_FILE", "/var/lib/boatramp/secrets/kek"),
+            // The shared-kernel DB privilege strategy.
+            ("BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE", "rootless"),
+        ]))
+        .expect("valid env overrides apply");
+
+        // The default (`""`-keyed) managed database exists with the right source.
+        let sql = cfg
+            .handlers
+            .expect("handlers materialised from env")
+            .bindings
+            .sql
+            .expect("sql binding materialised from env");
+        let db = sql
+            .databases
+            .get("")
+            .expect("the default `\"\"`-named database was created from DEFAULT");
+        assert_eq!(db.kind, "postgres");
+        assert_eq!(db.compute.as_deref(), Some("pg"));
+        assert_eq!(db.database.as_deref(), Some("appdb"));
+        assert_eq!(db.user.as_deref(), Some("app"));
+        // No `password_env` ⇒ boatramp manages the credential (Phase 2), and the
+        // compute-backed source validates.
+        assert!(db.password_env.is_none());
+        assert!(db.is_managed_credential());
+        assert!(db.validate("").is_ok());
+
+        // The secrets envelope + KEK path took (the path is a location, not a key).
+        let secrets = cfg.secrets.expect("secrets materialised from env");
+        assert_eq!(secrets.envelope, "local");
+        assert_eq!(
+            secrets.kek_file.as_deref(),
+            Some(Path::new("/var/lib/boatramp/secrets/kek"))
+        );
+        assert!(secrets.vault.is_none(), "no vault vars ⇒ no vault sub-config");
+
+        // The managed-DB privilege strategy resolved from its lowercase variant.
+        let compute = cfg.compute.expect("compute materialised from env");
+        assert_eq!(compute.managed_db_privilege, ManagedDbPrivilege::Rootless);
+    }
+
+    #[test]
+    fn env_declares_named_databases_and_merges_over_the_file() {
+        // A file declares one database; the env overrides one of its fields and
+        // ADDS a second, discovering both member names from the environment.
+        let mut cfg = server(
+            r#"(
+                handlers: ( bindings: ( sql: (
+                    databases: {
+                        "analytics": ( kind: "postgres", url_env: "FILE_PG_URL", pool_max: 4 ),
+                    },
+                ) ) ),
+            )"#,
+        );
+        cfg.apply_env_overrides(&env(&[
+            // Override the file database's pool size (merge by key, per field).
+            ("BOATRAMP_HANDLERS_SQL_DB_analytics_POOL_MAX", "32"),
+            // Add a brand-new database whose name has an underscore, exercising the
+            // longest-suffix name isolation (`_READ_URL_ENV`, not `_URL_ENV`).
+            ("BOATRAMP_HANDLERS_SQL_DB_events_log_KIND", "mysql"),
+            ("BOATRAMP_HANDLERS_SQL_DB_events_log_URL_ENV", "EVENTS_URL"),
+            ("BOATRAMP_HANDLERS_SQL_DB_events_log_READ_URL_ENV", "EVENTS_RO_URL"),
+            ("BOATRAMP_HANDLERS_SQL_DB_events_log_READ_ONLY", "true"),
+        ]))
+        .expect("valid env overrides apply");
+
+        let sql = cfg.handlers.unwrap().bindings.sql.unwrap();
+        assert_eq!(sql.databases.len(), 2);
+
+        let analytics = &sql.databases["analytics"];
+        assert_eq!(analytics.pool_max, Some(32), "env pool_max wins over the file");
+        assert_eq!(
+            analytics.url_env, "FILE_PG_URL",
+            "the file's url_env survives (env didn't touch it)"
+        );
+
+        let events = &sql.databases["events_log"];
+        assert_eq!(events.kind, "mysql");
+        assert_eq!(events.url_env, "EVENTS_URL");
+        assert_eq!(events.read_url_env.as_deref(), Some("EVENTS_RO_URL"));
+        assert!(events.read_only);
+    }
+
+    #[test]
+    fn env_enum_parse_error_names_the_variable_and_variants() {
+        // An unknown enum value is a clear error that names the offending variable.
+        let mut cfg = ServerConfig::default();
+        let err = cfg
+            .apply_env_overrides(&env(&[(
+                "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE",
+                "superuser",
+            )]))
+            .expect_err("unknown enum variant is rejected");
+        match err {
+            ConfigError::Env { var, reason } => {
+                assert_eq!(var, "BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE");
+                assert!(reason.contains("rootless") && reason.contains("caps"));
+            }
+            other => panic!("expected ConfigError::Env, got {other:?}"),
+        }
+        // The docker enums map their lowercase serde variants too.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_COMPUTE_DOCKER_ENDPOINT", "bridge"),
+            ("BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE", "bind"),
+        ]))
+        .expect("known enum variants parse");
+        let compute = cfg.compute.unwrap();
+        assert_eq!(
+            compute.docker_endpoint,
+            boatramp_docker::DockerEndpoint::Bridge
+        );
+        assert_eq!(
+            compute.docker_volume_mode,
+            boatramp_docker::DockerVolumeMode::Bind
+        );
+    }
+
+    #[test]
+    fn env_trust_anchors_parse_as_a_comma_separated_list() {
+        // The kernel trust anchors are comma-separated (whitespace trimmed, empty
+        // items dropped so a trailing comma is tolerated). A file default is
+        // fully replaced, not appended to.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            (
+                "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
+                " es256:aa , es256:bb ,",
+            ),
+            ("BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES", "deadbeef"),
+        ]))
+        .expect("valid list env applies");
+        let compute = cfg.compute.unwrap();
+        assert_eq!(
+            compute.kernel_signing_pubkeys,
+            vec!["es256:aa".to_string(), "es256:bb".to_string()],
+            "trimmed, comma-split, trailing-empty dropped, defaults replaced"
+        );
+        assert_eq!(
+            compute.kernel_allowed_hashes,
+            vec!["deadbeef".to_string()],
+            "a single value is a one-element list"
+        );
+    }
+
+    #[test]
+    fn env_configures_secrets_vault_subconfig() {
+        // The vault sub-config materialises only when a vault var is set, and the
+        // token stays indirected via a variable NAME (`token_env`), never inline.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_SECRETS_ENVELOPE", "vault"),
+            ("BOATRAMP_SECRETS_VAULT_ADDR", "https://vault:8200"),
+            ("BOATRAMP_SECRETS_VAULT_KEY", "certs"),
+        ]))
+        .expect("valid env overrides apply");
+        let secrets = cfg.secrets.unwrap();
+        assert_eq!(secrets.envelope, "vault");
+        let vault = secrets.vault.expect("vault sub-config materialised");
+        assert_eq!(vault.addr, "https://vault:8200");
+        assert_eq!(vault.key, "certs");
+        // token_env defaults to VAULT_TOKEN when not overridden.
+        assert_eq!(vault.token_env, "VAULT_TOKEN");
+    }
+
+    #[test]
+    fn env_materialises_and_overrides_the_cluster_section() {
+        // With no file, a `BOATRAMP_CLUSTER_LISTEN` materialises the section; the
+        // remaining fields (lists, join token, mesh) layer on. The founding/joining
+        // action flags (`BOATRAMP_CLUSTER_INIT`/`_JOIN`) are separate `serve` args
+        // and are not part of this section.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_CLUSTER_LISTEN", "10.0.0.2:7000"),
+            ("BOATRAMP_CLUSTER_ROOT_PUBKEYS", "es256:aa,es256:bb"),
+            ("BOATRAMP_CLUSTER_SEEDS", "https://10.0.0.1:8080"),
+            ("BOATRAMP_CLUSTER_JOIN_TOKEN", "env:BOATRAMP_JOIN_TOKEN"),
+            ("BOATRAMP_CLUSTER_STORE_DIR", "/var/lib/boatramp/raft"),
+            ("BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES", "true"),
+        ]))
+        .expect("valid env overrides apply");
+        let cluster = cfg.cluster.expect("cluster materialised from env");
+        assert_eq!(
+            cluster.listen,
+            "10.0.0.2:7000".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            cluster.root_pubkeys,
+            vec!["es256:aa".to_string(), "es256:bb".to_string()]
+        );
+        assert_eq!(cluster.seeds, vec!["https://10.0.0.1:8080".to_string()]);
+        assert_eq!(
+            cluster.join_token.as_deref(),
+            Some("env:BOATRAMP_JOIN_TOKEN")
+        );
+        assert_eq!(
+            cluster.store_dir.as_deref(),
+            Some(Path::new("/var/lib/boatramp/raft"))
+        );
+        assert_eq!(
+            cluster.mesh.expect("mesh sub-config").gate_client_writes,
+            Some(true)
+        );
+
+        // Without a listen (and no file section) there is nothing to materialise:
+        // a non-listen cluster var alone leaves the section absent.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[("BOATRAMP_CLUSTER_SEEDS", "https://10.0.0.1:8080")]))
+            .expect("applies");
+        assert!(
+            cfg.cluster.is_none(),
+            "no listen + no file section ⇒ no cluster"
+        );
+    }
+
+    #[test]
+    fn env_cluster_listen_overrides_a_file_section() {
+        // A file `[cluster]` section: env overrides `listen` and adds seeds.
+        let mut cfg = server(r#"( cluster: ( listen: "0.0.0.0:7000" ) )"#);
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_CLUSTER_LISTEN", "10.0.0.9:7000"),
+            ("BOATRAMP_CLUSTER_SEEDS", "https://seed:8080"),
+        ]))
+        .expect("applies");
+        let cluster = cfg.cluster.unwrap();
+        assert_eq!(
+            cluster.listen,
+            "10.0.0.9:7000".parse::<std::net::SocketAddr>().unwrap(),
+            "env listen wins over the file"
+        );
+        assert_eq!(cluster.seeds, vec!["https://seed:8080".to_string()]);
     }
 
     #[test]

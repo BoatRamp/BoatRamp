@@ -102,10 +102,20 @@ over its file value; an unset one defers to the file/default). See
 | `BOATRAMP_COMPUTE_MEM_MIB` | `compute.mem_mib` | Memory (MiB) advertised as schedulable (`0` = a 1 GiB default). |
 | `BOATRAMP_COMPUTE_REGION` | `compute.region` | This node's region tag for nearest-replica routing. |
 | `BOATRAMP_COMPUTE_SQL_SHIM_URL` | `compute.sql_shim_url` | Guest-reachable base URL of the compute SQL shim (enables a workload's `--bind sql`). |
+| `BOATRAMP_COMPUTE_MANAGED_DB_PRIVILEGE` | `compute.managed_db_privilege` | How a managed DB image runs on a shared-kernel backend: `rootless` (default) or `caps`. |
+| `BOATRAMP_COMPUTE_DOCKER_ENDPOINT` | `compute.docker_endpoint` | Remote-Docker endpoint mode: `published` (default) or `bridge`. |
+| `BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE` | `compute.docker_volume_mode` | Remote-Docker volume mode: `named` (default) or `bind`. |
+| `BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS` | `compute.kernel_signing_pubkeys` | Comma-separated `<alg>:<hex>` kernel-signing trust anchors (replaces, not appends to, the defaults). |
+| `BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES` | `compute.kernel_allowed_hashes` | Comma-separated sha256-hex allow-list of kernel content hashes (replaces the defaults). |
 
-The static trust anchors (`kernel_signing_pubkeys`, `kernel_allowed_hashes`)
-stay file-only — they are host-access-gated and not settable from the
-environment on purpose.
+**Security-critical:** `BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS` and
+`BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES` are the kernel trust anchors for the
+posture-scaled kernel bar — a value here decides which kernels a `multi-tenant`
+node will boot. In a 12-factor deployment the environment is the operator's
+trusted config source (a `fly.toml` `[env]` is committed the same as a file), so
+they are settable here; but the environment is *more* visible than a file (it
+leaks through `/proc/<pid>/environ` and is inherited by subprocesses), so prefer
+a config file for them when one is available.
 
 ## Security posture
 
@@ -159,9 +169,72 @@ the token itself). See [Handler bindings](../how-to/handler-bindings.md).
 | `BOATRAMP_FC_*` | — | Embedded-VMM / Firecracker compute-backend settings (kernel, rootfs, bridge, subnet, …). See [Run compute workloads](../how-to/compute.md). |
 | `BOATRAMP_VMM_SERIAL` | — | Attach the microVM serial console (debugging). |
 
+### External SQL databases (`[handlers.bindings.sql.databases]`)
+
+The bring-your-own / managed-compute database map is env-settable too, so a
+managed co-located Postgres needs no config file. Each database `<NAME>` is
+declared by setting one or more `BOATRAMP_HANDLERS_SQL_DB_<NAME>_<FIELD>`
+variables; the member names are discovered from the environment (there is no
+file to enumerate them). An env-declared database is merged over — per field, by
+key — whatever the file declared under that name.
+
+The default database (the empty-string map key, opened as `sql.open("")`) is
+addressed by the reserved name token **`DEFAULT`**:
+`BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND` populates the `""` key.
+
+`<FIELD>` is one of `KIND`, `URL_ENV`, `READ_URL_ENV`, `COMPUTE`, `DATABASE`,
+`USER`, `PASSWORD_ENV`, `POOL_MAX`, `READ_ONLY`, `ALLOW_PREVIEW`,
+`CONNECT_TIMEOUT_SECS` (each mirrors a field of the RON `databases` entry;
+secrets stay indirected via the `*_ENV` names). Example — a managed Postgres as
+the default database, with boatramp managing the credential (no `PASSWORD_ENV`):
+
+```
+BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND=postgres
+BOATRAMP_HANDLERS_SQL_DB_DEFAULT_COMPUTE=pg
+BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE=appdb
+BOATRAMP_HANDLERS_SQL_DB_DEFAULT_USER=app
+```
+
 Handler `secrets` are injected by *reference*: the site config names a host
 env-var, and the server resolves it at instantiation so the literal never lands
 in a manifest. See [Handler host bindings](../how-to/handler-bindings.md).
+
+## Secrets envelope
+
+Map to the `[secrets]` section in [boatramp.cfg](./boatramp-cfg.md) — envelope
+encryption for private keys at rest. Set any and the section is created even
+without a config file. `kek_file` holds a *path* (never key material); the Vault
+token stays indirected via `token_env` (a variable name, not the token).
+
+| Variable | Overrides | Description |
+| --- | --- | --- |
+| `BOATRAMP_SECRETS_ENVELOPE` | `secrets.envelope` | Backend: `local` (machine-local AES-256-GCM KEK) or `vault` (Vault Transit). |
+| `BOATRAMP_SECRETS_KEK_FILE` | `secrets.kek_file` | Path to the local-KEK key file (auto-generated `0600` if absent). Default `<data-dir>/secrets/kek`. |
+| `BOATRAMP_SECRETS_VAULT_ADDR` | `secrets.vault.addr` | Vault address, e.g. `https://vault:8200`. |
+| `BOATRAMP_SECRETS_VAULT_KEY` | `secrets.vault.key` | Vault Transit key name to wrap under. |
+| `BOATRAMP_SECRETS_VAULT_TOKEN_ENV` | `secrets.vault.token_env` | Name of the env var holding the Vault token (default `VAULT_TOKEN`). |
+
+## Cluster section (`[cluster]`)
+
+Map to the `[cluster]` section in [boatramp.cfg](./boatramp-cfg.md) — the
+self-hosted cluster mode's own config, distinct from the founding/joining
+*action* flags in the [Cluster & shared-store frontends](#cluster--shared-store-frontends)
+table above (`BOATRAMP_CLUSTER_INIT` / `BOATRAMP_CLUSTER_JOIN` /
+`BOATRAMP_CLUSTER_ADVERTISE_ADDR`). A `BOATRAMP_CLUSTER_LISTEN` materialises an
+absent section (a node must know where to bind its mesh); the other fields then
+layer on. List-valued vars are comma-separated.
+
+| Variable | Overrides | Description |
+| --- | --- | --- |
+| `BOATRAMP_CLUSTER_LISTEN` | `cluster.listen` | Address to bind this node's Raft peer mesh on (e.g. `10.0.0.2:7000`). Required to materialise an absent section. |
+| `BOATRAMP_CLUSTER_ROOT_PUBKEYS` | `cluster.root_pubkeys` | Comma-separated `es256:`/`ed25519:` root anchor set defining the cluster identity. |
+| `BOATRAMP_CLUSTER_SEEDS` | `cluster.seeds` | Comma-separated control-plane addresses of existing members to join through. |
+| `BOATRAMP_CLUSTER_JOIN_TOKEN` | `cluster.join_token` | Single-use join token (kept out of plain sight via an `env:VAR` / `path:/file` prefix). |
+| `BOATRAMP_CLUSTER_STORE_DIR` | `cluster.store_dir` | Directory for this node's durable Raft log/state (default `<data-dir>/raft`). |
+| `BOATRAMP_CLUSTER_MESH_KEY_FILE` | `cluster.mesh.key_file` | Path to this node's Ed25519 mesh identity key (auto-generated `0600`). |
+| `BOATRAMP_CLUSTER_MESH_KEY_ROTATION` | `cluster.mesh.key_rotation` | Automatic mesh key-rotation cadence (e.g. `30d`). |
+| `BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL` | `cluster.mesh.join_token_ttl` | TTL for a single-use join token (e.g. `1h`). |
+| `BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES` | `cluster.mesh.gate_client_writes` | Gate mesh client-writes behind a control-plane cluster-write capability. |
 
 ## DNS provider credentials
 
