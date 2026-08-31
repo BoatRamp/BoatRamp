@@ -275,6 +275,20 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = None;
 
+    // Turnkey managed DB: auto-register the compute workload backing each managed
+    // co-located database that has none yet, so declaring the `databases` binding is
+    // enough to boot the DB (no separate `compute set` / apply). Non-clobbering and
+    // idempotent; runs before the reconcile loop so its first tick can launch it.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    if let Some(sql) = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .filter(|sql| !sql.databases.is_empty())
+    {
+        crate::managed_sql::auto_register_managed_db_workloads(&deploy, &sql.databases).await;
+    }
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,

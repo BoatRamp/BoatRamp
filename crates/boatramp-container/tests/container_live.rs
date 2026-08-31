@@ -245,41 +245,26 @@ async fn run_pg_e2e(host_root: bool) {
     .with_host_root(host_root);
 
     let pw = "s3cr3t-pw";
-    let mut spec = spec_for(&"d".repeat(64));
-    spec.root = RootSource::Image("pgvector/pgvector:pg16".into());
-    spec.mem_mib = 512;
-    spec.port = 5432;
-    // Run as the image's postgres user (uid 999) directly, so the entrypoint inits as
-    // that user AND the backend chowns the data volume to it — otherwise the entrypoint
-    // (as namespace-root) would gosu-drop to 999, which then can't write a volume owned
-    // by root. This is what the managed-compute layer sets for a rootless managed DB.
-    spec.user = Some("999:999".into());
-    // The postgres image's entrypoint + the env it expects (the backend applies only the
-    // image's filesystem layers, not its OCI config). `listen_addresses=*` so the server
-    // answers on the container's bridge IP; a password so the TCP query authenticates.
-    spec.entrypoint = vec![
-        "/usr/local/bin/docker-entrypoint.sh".into(),
-        "postgres".into(),
-        "-c".into(),
-        "listen_addresses=*".into(),
-    ];
-    spec.env = std::collections::BTreeMap::from([
-        (
-            "PATH".to_string(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\
-             /usr/lib/postgresql/16/bin"
-                .to_string(),
-        ),
-        ("PGDATA".to_string(), "/var/lib/postgresql/data".to_string()),
-        ("POSTGRES_USER".to_string(), "app".to_string()),
-        ("POSTGRES_PASSWORD".to_string(), pw.to_string()),
-        ("POSTGRES_DB".to_string(), "app".to_string()),
-    ]);
-    spec.volumes = vec![boatramp_core::compute::VolumeRef {
-        mount: "/var/lib/postgresql/data".into(),
-        name: "pgdata".into(),
-        size_mib: 512,
-    }];
+    // Build the spec through the SHARED synthesizer the node's auto-register path uses,
+    // so this gate proves exactly the managed-DB workload that ships (never a divergent,
+    // hand-rolled copy). Then apply the two things the reconcile does at launch:
+    //  - the rootless privilege directive (sets user 999:999 against the pre-owned
+    //    volume — the entrypoint then inits as that user and can write the chowned data
+    //    dir, instead of gosu-dropping to a 999 that can't write a root-owned volume);
+    //  - the managed server-init credential env (`POSTGRES_*`), which reconcile injects
+    //    from the sealed credential (a password so the TCP query authenticates).
+    let mut spec = boatramp_core::compute::managed_db_spec(
+        boatramp_core::compute::ManagedDbEngine::Postgres,
+        Some("pgvector/pgvector:pg16"),
+        512,
+    );
+    boatramp_core::compute::PrivilegeDirective::Rootless { uid: 999, gid: 999 }.apply(&mut spec);
+    spec.env
+        .insert("POSTGRES_USER".to_string(), "app".to_string());
+    spec.env
+        .insert("POSTGRES_PASSWORD".to_string(), pw.to_string());
+    spec.env
+        .insert("POSTGRES_DB".to_string(), "app".to_string());
 
     let artifact = backend
         .materialize(&spec)

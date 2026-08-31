@@ -226,6 +226,89 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
     }
 }
 
+/// Auto-register the compute workload backing each **managed co-located** database
+/// (compute-backed, no `password_env`) that has no workload yet, so declaring the
+/// `databases` binding is enough to boot the DB — no separate `compute set` / apply
+/// step (turnkey from a stock image on a bare host). Idempotent and non-clobbering:
+/// a workload the operator declared explicitly (apply / admin API) always wins;
+/// this only fills an absent one, and re-running is a no-op. Best-effort — a write
+/// failure is logged, never fatal (serving proceeds; the reconcile simply has
+/// nothing to launch for that DB until its workload exists).
+///
+/// The synthesized spec comes from [`managed_db_spec`](boatramp_core::compute::managed_db_spec)
+/// — the same builder the container capability gate exercises — so the shipped
+/// managed-DB workload never diverges from the tested one.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub async fn auto_register_managed_db_workloads(
+    deploy: &DeployStore,
+    databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+) {
+    use boatramp_core::compute::{
+        managed_db_spec, ComputeWorkload, ManagedDbEngine, PlacementConstraints,
+    };
+
+    /// 10 GiB — the default managed data-volume size when the config sets none.
+    const DEFAULT_VOLUME_MIB: u32 = 10 * 1024;
+
+    for db in databases.values() {
+        if !db.is_managed_credential() {
+            continue;
+        }
+        let Some(workload) = db.compute.as_deref().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let engine = match ExternalSqlKind::parse(&db.kind) {
+            Some(ExternalSqlKind::Postgres) => ManagedDbEngine::Postgres,
+            Some(ExternalSqlKind::Mysql) => ManagedDbEngine::Mysql,
+            // Config validation rejects an unparsable engine before serve; skip defensively.
+            None => continue,
+        };
+        // Non-clobbering: only fill an absent workload — an operator-declared one
+        // (apply / admin API) always wins, which also makes re-runs idempotent.
+        match deploy
+            .get_compute_workload(ProjectRef::DEFAULT, workload)
+            .await
+        {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(%workload, error = %e, "managed sql: could not check for an existing compute workload; skipping auto-register");
+                continue;
+            }
+        }
+        let image = db.image.as_deref();
+        let spec = managed_db_spec(
+            engine,
+            image,
+            db.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
+        );
+        let spec_id = match deploy.put_compute_spec(&spec).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(%workload, error = %e, "managed sql: could not store the auto-registered compute spec");
+                continue;
+            }
+        };
+        let wl = ComputeWorkload {
+            version: 1,
+            name: workload.to_string(),
+            active: spec_id,
+            replicas: 1,
+            placement: PlacementConstraints::default(),
+        };
+        match deploy.set_compute_workload(ProjectRef::DEFAULT, &wl).await {
+            Ok(()) => tracing::info!(
+                %workload,
+                image = %image.unwrap_or_else(|| engine.default_image()),
+                "managed sql: auto-registered the co-located database compute workload"
+            ),
+            Err(e) => {
+                tracing::warn!(%workload, error = %e, "managed sql: could not register the auto-registered compute workload")
+            }
+        }
+    }
+}
+
 /// A [`ComputeEndpointResolver`] backed by the control-plane replica state: it
 /// lists a workload's **healthy, running** replicas (primary-first by replica
 /// index) as `(host, port)`, scoped to a fixed project. Backs the handler's
@@ -516,5 +599,69 @@ mod tests {
         );
         // A workload with no replicas resolves to nothing (a clear no-endpoint state).
         assert!(resolver.endpoints("absent").await.unwrap().is_empty());
+    }
+
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[tokio::test]
+    async fn auto_register_creates_managed_workloads_idempotently_and_never_clobbers() {
+        use boatramp_core::compute::{ComputeWorkload, PlacementConstraints};
+
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let p = ProjectRef::DEFAULT;
+
+        let mut dbs = BTreeMap::new();
+        // Managed (compute-backed, no password_env) → auto-registered.
+        dbs.insert(
+            "analytics".to_string(),
+            db("postgres", Some("pg"), "", None),
+        );
+        // BYO credential (compute-backed WITH password_env) → NOT managed, NOT registered.
+        dbs.insert(
+            "byo".to_string(),
+            db("postgres", Some("byopg"), "", Some("PW")),
+        );
+        // BYO URL (not compute-backed) → NOT registered.
+        dbs.insert("ext".to_string(), db("mysql", None, "MYSQL_URL", None));
+
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
+
+        // Only the managed workload was registered, desired 1 replica, spec stored.
+        let wl = deploy
+            .get_compute_workload(p, "pg")
+            .await
+            .unwrap()
+            .expect("managed workload `pg` auto-registered");
+        assert_eq!(wl.replicas, 1);
+        assert!(!wl.active.is_empty(), "an active spec hash was stored");
+        assert!(
+            deploy
+                .get_compute_workload(p, "byopg")
+                .await
+                .unwrap()
+                .is_none(),
+            "a BYO-credential DB is not auto-registered"
+        );
+
+        // Idempotent: a second pass leaves the same active spec (no churn).
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
+        let wl2 = deploy.get_compute_workload(p, "pg").await.unwrap().unwrap();
+        assert_eq!(wl2.active, wl.active, "re-run is a no-op");
+
+        // Non-clobbering: an operator-declared workload (apply / admin API) wins.
+        let operator = ComputeWorkload {
+            version: 1,
+            name: "pg".to_string(),
+            active: "operatorspec".to_string(),
+            replicas: 3,
+            placement: PlacementConstraints::default(),
+        };
+        deploy.set_compute_workload(p, &operator).await.unwrap();
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
+        let after = deploy.get_compute_workload(p, "pg").await.unwrap().unwrap();
+        assert_eq!(
+            after.replicas, 3,
+            "auto-register must not overwrite the operator's workload"
+        );
+        assert_eq!(after.active, "operatorspec");
     }
 }
