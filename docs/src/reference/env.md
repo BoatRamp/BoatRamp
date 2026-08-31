@@ -184,9 +184,10 @@ addressed by the reserved name token **`DEFAULT`**:
 
 `<FIELD>` is one of `KIND`, `URL_ENV`, `READ_URL_ENV`, `COMPUTE`, `DATABASE`,
 `USER`, `PASSWORD_ENV`, `POOL_MAX`, `READ_ONLY`, `ALLOW_PREVIEW`,
-`CONNECT_TIMEOUT_SECS` (each mirrors a field of the RON `databases` entry;
-secrets stay indirected via the `*_ENV` names). Example — a managed Postgres as
-the default database, with boatramp managing the credential (no `PASSWORD_ENV`):
+`CONNECT_TIMEOUT_SECS`, `IMAGE`, `VOLUME_SIZE_MIB` (each mirrors a field of the RON
+`databases` entry; secrets stay indirected via the `*_ENV` names). Example — a
+managed Postgres as the default database, with boatramp managing the credential (no
+`PASSWORD_ENV`):
 
 ```
 BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND=postgres
@@ -194,6 +195,13 @@ BOATRAMP_HANDLERS_SQL_DB_DEFAULT_COMPUTE=pg
 BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE=appdb
 BOATRAMP_HANDLERS_SQL_DB_DEFAULT_USER=app
 ```
+
+For a **managed co-located** database (`COMPUTE` set, no `PASSWORD_ENV`), boatramp
+**auto-registers the backing compute workload** — so the four lines above are enough
+to boot a Postgres; no separate `compute set` / `apply` step. `IMAGE` overrides the
+stock image (default `pgvector/pgvector:pg16` for postgres, `mysql:8.0` for mysql)
+and `VOLUME_SIZE_MIB` the persistent data-volume size (default `10240` = 10 GiB). An
+operator-declared workload of the same name always wins over the auto-registered one.
 
 Handler `secrets` are injected by *reference*: the site config names a host
 env-var, and the server resolves it at instantiation so the literal never lands
@@ -235,6 +243,27 @@ layer on. List-valued vars are comma-separated.
 | `BOATRAMP_CLUSTER_MESH_KEY_ROTATION` | `cluster.mesh.key_rotation` | Automatic mesh key-rotation cadence (e.g. `30d`). |
 | `BOATRAMP_CLUSTER_MESH_JOIN_TOKEN_TTL` | `cluster.mesh.join_token_ttl` | TTL for a single-use join token (e.g. `1h`). |
 | `BOATRAMP_CLUSTER_MESH_GATE_CLIENT_WRITES` | `cluster.mesh.gate_client_writes` | Gate mesh client-writes behind a control-plane cluster-write capability. |
+
+## TLS / ACME (incl. wildcard DNS-01)
+
+The listener's TLS mode and the ACME issuance parameters — previously `serve` flags
+only — are env-settable too, so wildcard DNS-01 can be configured with no config file
+(e.g. a fly `[env]`). The DNS provider *credentials* are already env-only (below).
+
+| Variable | Flag | Description |
+| --- | --- | --- |
+| `BOATRAMP_TLS` | `--tls` | Listener TLS mode: `off` (default), `custom`, `acme`, `acme-dns`, `acme-tls`, `rpk`. Use `acme-dns` for wildcard certs. |
+| `BOATRAMP_ACME_DOMAINS` | `--acme-domain` | Comma-separated domains to certify. An explicit wildcard (`*.example.com`) is issued via DNS-01. |
+| `BOATRAMP_ACME_DNS_PROVIDER` | `--acme-dns-provider` | DNS-01 provider: `manual`, `cloudflare`, `route53`, `oci`, `digitalocean`, `hetzner`, `ns1`, `dnsimple`, `gcp`, `azure`, `akamai`. |
+| `BOATRAMP_ACME_CONTACT` | `--acme-contact` | Contact email for the ACME account. |
+| `BOATRAMP_ACME_DIRECTORY` | `--acme-directory` | ACME directory URL (default Let's Encrypt production). |
+| `BOATRAMP_ACME_CACHE` | `--acme-cache` | Certificate cache directory (default `./data/acme`). |
+| `BOATRAMP_ACME_CA_CERT` | `--acme-ca-cert` | Extra root CA (PEM) to trust for the ACME server (e.g. Pebble's). |
+| `BOATRAMP_ACME_WILDCARD_PREVIEW` | `--acme-wildcard-preview` | Also issue a `*.deploy.<domain>` wildcard for preview hosts (`true`/`false`). |
+
+An **exact** host (an apex/`www`/`console` site or cert) always wins over a wildcard,
+in both host→site routing and SNI cert selection — so `*.example.com` never shadows a
+declared exact host.
 
 ## DNS provider credentials
 
