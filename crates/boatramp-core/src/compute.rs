@@ -228,6 +228,40 @@ pub struct ExecOutput {
     pub stderr: Vec<u8>,
 }
 
+/// Why an operator [`ComputeExec::exec`] failed (distinct from a backend launch
+/// error — this layer adds "no replica to target" and "backend can't exec").
+#[derive(Debug, thiserror::Error)]
+pub enum ExecError {
+    /// No running replica of the workload to exec inside.
+    #[error("workload {0:?} has no running replica to exec in")]
+    NoReplica(String),
+    /// The workload's backend doesn't support exec (VM / edge backends).
+    #[error("the {0} backend does not support exec")]
+    Unsupported(String),
+    /// Any other failure (backend error, resolution failure, …).
+    #[error("exec failed: {0}")]
+    Other(String),
+}
+
+/// The operator-facing "run a command inside a running workload" capability
+/// (docker-exec style), backing `POST /api/compute/{name}/exec` and `boatramp
+/// compute exec`. The node implementation resolves a workload's running replica,
+/// selects its backend, and calls [`ComputeBackend::exec`]; only the shared-kernel
+/// backends (native `container`, remote `docker`) support it. Gated by the
+/// `allow_compute_exec` security posture at the API.
+#[async_trait]
+pub trait ComputeExec: Send + Sync {
+    /// Run `argv` (feeding `stdin` when present) inside a running replica of
+    /// `workload` in `project`, returning its buffered output.
+    async fn exec(
+        &self,
+        project: &str,
+        workload: &str,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput, ExecError>;
+}
+
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
     /// Stable backend id (`"vmm"` / `"container"` / `"cloudflare"` / `"docker"`).

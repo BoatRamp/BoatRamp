@@ -218,6 +218,22 @@ pub trait SqlBackends: Send + Sync {
     }
 }
 
+/// The operator-facing SQL capability for a **managed** database: run a migration
+/// script or a single query against a compute-backed database boatramp runs, using
+/// its sealed managed credential (resolved server-side — the credential never leaves
+/// the node). Backs `POST /api/sql/{db}/{exec,query}` and the `boatramp sql` CLI.
+/// Distinct from [`SqlBackends`] (the per-site guest binding): this is a
+/// project-scoped **operator** tool, admin-gated at the API.
+#[async_trait]
+pub trait OperatorSql: Send + Sync {
+    /// Run a multi-statement migration `script` against managed database `db` in
+    /// `project` (the simple-query protocol — `CREATE EXTENSION` + chained DDL).
+    async fn exec_script(&self, project: &str, db: &str, script: &str) -> Result<(), SqlError>;
+
+    /// Run one row-returning `sql` statement against managed database `db`.
+    async fn query(&self, project: &str, db: &str, sql: &str) -> Result<SqlRows, SqlError>;
+}
+
 /// One transaction's worth of work. Dropping it without [`commit`] must leave
 /// the database unchanged (the engine rolls back).
 ///

@@ -44,6 +44,11 @@ pub fn router_with_fast(
     // The resolved security posture rides as an extension for the gateway /
     // proxy / domain-verify / upload paths (the hardening knobs).
     let posture = options.posture;
+    // Operator capabilities the node wires (managed-DB SQL + workload exec). Cheap
+    // `Option<Arc>` clones; they ride as `api` extensions read by the admin handlers.
+    // (`_cap` suffix so they don't shadow the `sql_exec`/`compute_exec` handler fns.)
+    let operator_sql_cap = options.operator_sql.clone();
+    let compute_exec_cap = options.compute_exec.clone();
     // Bind the auth layer's per-request PoP enforcement: the fleet's canonical
     // origin (the proof's required `aud`) and whether every token must be
     // holder-bound (`require_pop`). A holder-bound (`cnf`) token always requires a
@@ -203,7 +208,16 @@ pub fn router_with_fast(
         .route(
             "/api/compute/{name}",
             get(get_compute).put(put_compute).delete(delete_compute),
-        );
+        )
+        // Run a command inside a running workload replica (docker-exec style).
+        // Admin-scoped (deny-safe `Right::required` default for `/api/compute/*`)
+        // AND gated at the handler by the `allow_compute_exec` posture.
+        .route("/api/compute/{name}/exec", post(compute_exec))
+        // Operator SQL to a managed co-located database: run a migration script or a
+        // single query via the sealed managed credential (resolved server-side).
+        // Admin-scoped (deny-safe `Right::required` default for `/api/sql/*`).
+        .route("/api/sql/{db}/exec", post(sql_exec))
+        .route("/api/sql/{db}/query", post(sql_query));
     // OIDC → token exchange: validate the IdP JWT (presented as
     // the Bearer; `Right::required` returns None so the auth middleware lets it
     // through) and mint a short-TTL token. Only with the `oidc` feature.
@@ -331,6 +345,8 @@ pub fn router_with_fast(
         .layer(Extension(bootstrap))
         .layer(Extension(mesh_control))
         .layer(Extension(probe))
+        .layer(Extension(operator_sql_cap))
+        .layer(Extension(compute_exec_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]
     let api = api.layer(Extension(oidc_state));
