@@ -59,6 +59,12 @@ impl IpPool {
         self.gateway
     }
 
+    /// The network prefix length (e.g. `24` for a `/24`) — the mask to give the
+    /// gateway when configuring the compute bridge.
+    pub fn prefix_len(&self) -> u8 {
+        self.net.prefix_len()
+    }
+
     /// Mark `ip` as already in use (e.g. when rebuilding state from the KV).
     pub fn reserve(&mut self, ip: Ipv4Addr) {
         self.allocated.insert(ip.into());

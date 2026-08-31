@@ -135,9 +135,24 @@ jobs:
       - name: Build the boatramp binary (BOATRAMP_BIN)
         run: cargo build -p boatramp --no-default-features --features fs
 
+      - name: Auto-create the compute bridge (SIOCBRADDBR + netlink) — turnkey, hard gate
+        run: |
+          set -o pipefail
+          # Proves boatramp self-creates + addresses a bridge over netlink with no `ip`
+          # binary and no operator pre-step — the fly/stock-image turnkey path. The test
+          # makes, addresses, re-ensures (idempotent), and tears down its own throwaway
+          # bridge, so it doesn't touch the `br-boatramp` the container_live test uses.
+          sudo -E env "PATH=$PATH" \
+            cargo test -p boatramp-container --lib \
+            ensure_bridge_creates_and_is_idempotent -- --ignored --nocapture 2>&1 | tee bridge.log
+          grep -q 'idempotent, cleaned up' bridge.log \
+            || { echo "::error::ensure_bridge did not create + address a bridge" >&2; exit 1; }
+
       - name: Create the container bridge + delegate a cgroup subtree (best-effort)
         run: |
-          # Bridge with the gateway IP (the backend attaches each container's host veth).
+          # The container_live test drives the backend directly (not the node-init path
+          # that auto-creates the bridge), so give it `br-boatramp` explicitly here. In
+          # production `ensure_bridge` (gated above) makes this at compute-node startup.
           sudo ip link add br-boatramp type bridge 2>/dev/null || true
           sudo ip addr add 10.0.0.1/24 dev br-boatramp 2>/dev/null || true
           sudo ip link set br-boatramp up

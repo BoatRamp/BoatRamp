@@ -41,7 +41,7 @@ nix = { version = "0.29", features = [
 caps = "0.5"
 seccompiler = "0.4"
 syscalls = "0.6"
-# veth/bridge/netns wiring over netlink (no `ip` shell-outs).
+# veth/netns wiring over netlink (no `ip` shell-outs).
 rtnetlink = "0.14"
 futures = "0.3"
 # The `ContainerBackend` (ComputeBackend impl): the trait + Storage staging + the

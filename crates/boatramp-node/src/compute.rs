@@ -205,33 +205,60 @@ pub async fn build_compute(
         Err(e) => tracing::debug!(%e, "docker backend unavailable"),
     }
 
+    // Ensure the shared compute bridge exists before the backends that enslave a
+    // veth/tap to it. boatramp creates it itself over netlink (needs `CAP_NET_ADMIN`)
+    // rather than requiring the operator to pre-create it — so a stock image on a fresh
+    // host is turnkey. If it can't be created, the container + embedded-VMM backends are
+    // skipped rather than advertised and then failing at launch on the missing bridge.
+    #[cfg(target_os = "linux")]
+    let bridge_ready = match boatramp_core::ipam::IpPool::new(&cfg.subnet) {
+        Ok(pool) => {
+            match boatramp_container::ensure_bridge(&cfg.bridge, pool.gateway(), pool.prefix_len())
+                .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(%e, bridge = %cfg.bridge, "could not create the compute bridge (need CAP_NET_ADMIN); container + embedded-VMM backends disabled");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%e, subnet = %cfg.subnet, "bad compute subnet; container + embedded-VMM backends disabled");
+            false
+        }
+    };
+
     // Native container backend (Linux only).
     #[cfg(target_os = "linux")]
-    match worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())) {
-        Ok(self_exe) => match boatramp_container::ContainerBackend::new(
-            storage.clone(),
-            data_dir.to_path_buf(),
-            cfg.bridge.clone(),
-            &cfg.subnet,
-            self_exe,
-        ) {
-            Ok(c) => {
-                // Single-tenant posture (`!strict`) may honor `cap_add`; multi-tenant
-                // keeps every capability dropped.
-                let c = c.with_cap_add_allowed(!strict);
-                backends.insert("container".to_string(), std::sync::Arc::new(c));
-            }
-            Err(e) => tracing::warn!(%e, "container backend unavailable"),
-        },
-        Err(e) => tracing::warn!(%e, "current_exe for container backend"),
+    if bridge_ready {
+        match worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())) {
+            Ok(self_exe) => match boatramp_container::ContainerBackend::new(
+                storage.clone(),
+                data_dir.to_path_buf(),
+                cfg.bridge.clone(),
+                &cfg.subnet,
+                self_exe,
+            ) {
+                Ok(c) => {
+                    // Single-tenant posture (`!strict`) may honor `cap_add`; multi-tenant
+                    // keeps every capability dropped.
+                    let c = c.with_cap_add_allowed(!strict);
+                    backends.insert("container".to_string(), std::sync::Arc::new(c));
+                }
+                Err(e) => tracing::warn!(%e, "container backend unavailable"),
+            },
+            Err(e) => tracing::warn!(%e, "current_exe for container backend"),
+        }
     }
     // Embedded VMM backend (Linux + x86_64 + `/dev/kvm`): in-process microVMs, no
     // external `firecracker` binary — the strongest isolation when KVM is available.
-    // Like the container backend it enslaves each tap to `cfg.bridge` (assumed set
-    // up). The embedded VMM is KVM-x86-specific, so this is x86_64-only; boatramp
+    // Like the container backend it enslaves each tap to `cfg.bridge` (ensured above,
+    // hence the `bridge_ready` gate). The embedded VMM is KVM-x86-specific, so this is
+    // x86_64-only; boatramp
     // still serves on linux/aarch64 (with the container backend, no embedded VMM).
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if std::path::Path::new("/dev/kvm").exists() {
+    if bridge_ready && std::path::Path::new("/dev/kvm").exists() {
         match (
             worker_exe.map_or_else(std::env::current_exe, |p| Ok(p.to_path_buf())),
             boatramp_core::ipam::IpPool::new(&cfg.subnet),
