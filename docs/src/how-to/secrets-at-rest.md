@@ -61,7 +61,14 @@ Vault with its own token, so there is no key file to copy between hosts.
 
 ## What is protected
 
-The envelope wraps certificate private keys in the control plane. Back the KEK up
-alongside your other secrets — losing it makes the wrapped certificates
-unrecoverable (boatramp re-issues them, but any that cannot be re-issued are
-lost). See [Back up & restore](./backup.md).
+The envelope wraps, in the control plane: cluster-managed **certificate private
+keys**, **managed-database credentials** (the per-tenant passwords boatramp
+generates for a managed Postgres/MySQL), and the **internal secret store** that
+backs `boatramp:<name>` references (see [Give handlers & functions
+secrets](./secrets.md)). Configuring a `secrets:` envelope is therefore a
+prerequisite for the `boatramp secrets` commands.
+
+Back the KEK up alongside your other secrets — losing it makes everything the
+envelope wrapped unrecoverable (boatramp re-issues certificates, but stored
+secrets and managed-DB credentials cannot be re-derived). See [Back up &
+restore](./backup.md).

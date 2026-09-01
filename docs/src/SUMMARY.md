@@ -31,6 +31,7 @@
 - [Restrict visitor access](./how-to/visitor-access.md)
 - [Choose & inspect a security posture](./how-to/security-posture.md)
 - [Encrypt secrets at rest](./how-to/secrets-at-rest.md)
+- [Give handlers & functions secrets](./how-to/secrets.md)
 - [Enable the embedded web console](./how-to/web-console.md)
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Compose components into one handler](./how-to/compose.md)
