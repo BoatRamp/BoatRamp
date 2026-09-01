@@ -302,8 +302,15 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
                 .any(|t| word_lc(t).is_some_and(|w| w == GUC_NAMESPACE || is_reserved_var(&w)))
         };
         match leading.as_deref() {
-            // Anonymous code block / procedure call: procedural bodies we can't inspect.
-            Some("do") | Some("call") => return refused(),
+            // Anonymous code block / procedure call / prepared-statement indirection:
+            // deferred execution the token scan can't see through. `DO`/`CALL` run a
+            // body; `PREPARE s FROM '<text>'` + `EXECUTE s` (MySQL, same pooled
+            // connection within one invocation) hides the reserved write inside a
+            // *string literal* — which we must NOT scan (a literal naming the key is
+            // legitimate data), so refuse the deferral construct instead. The guest
+            // `sql` binding parameterizes via bind params (`$1`/`?`), never SQL-level
+            // PREPARE/EXECUTE, so refusing these on the RLS path costs nothing.
+            Some("do") | Some("call") | Some("prepare") | Some("execute") => return refused(),
             // Defining a routine (single- or dollar-quoted body) on the guest path.
             Some("create") | Some("alter") if has_word("function") || has_word("procedure") => {
                 return refused()
@@ -731,6 +738,21 @@ mod reserved_session_writes_tests {
         assert!(rejected("SELECT 1,'victim' INTO @junk, @boatramp_project"));
         assert!(rejected("select 'victim' into @boatramp_project"));
         assert!(rejected("SELECT 'v' INTO @boatramp_site"));
+    }
+
+    /// Prepared-statement indirection hides the reserved write inside a string literal
+    /// (which is legitimate data elsewhere, so must not be scanned): refuse the
+    /// deferral construct itself. The guest binding never issues SQL-level
+    /// PREPARE/EXECUTE (it parameterizes via bind params), so this costs nothing.
+    #[test]
+    fn prepared_statement_indirection_is_rejected() {
+        assert!(rejected(
+            "PREPARE s FROM 'SET @boatramp_project=''victim'''"
+        ));
+        assert!(rejected("EXECUTE s"));
+        assert!(rejected(
+            "prepare s from 'SELECT ''v'' INTO @boatramp_site'"
+        ));
     }
 
     // ---- legit forms must still parse-and-pass (no regression) ----
