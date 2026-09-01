@@ -584,6 +584,16 @@ mod tests {
             "SET @boatramp_project = 'victim'",
             "RESET ALL",
             "DISCARD ALL",
+            // The deferred-execution / MySQL bypass classes found by the security
+            // review loop (both query and execute must reject each — the guard is a
+            // pure fn, but this locks that BOTH guest entry points call it for the
+            // whole class, so a refactor can't silently drop one path).
+            "DO $$ BEGIN PERFORM set_config('boatramp.project','victim',false); END $$;",
+            "SET @x=1, @boatramp_project='victim'",
+            "SELECT 'victim' INTO @boatramp_project",
+            "PREPARE s FROM 'SET @boatramp_project=''victim'''",
+            "CREATE FUNCTION e() RETURNS void AS $$ SELECT set_config('boatramp.project','v',false) $$ LANGUAGE sql",
+            "ALTER ROLE tenant SET boatramp.project = 'victim'",
         ] {
             let log = Arc::new(Mutex::new(Vec::new()));
             let mut session = rls_session(true, log.clone());
