@@ -451,12 +451,23 @@ impl ServerConfig {
                 if let Some(v) = source.parse_enum(
                     &format!("{prefix}TENANT"),
                     &[
-                        ("shared", TenantScope::Shared),
+                        ("single", TenantIsolation::Single),
+                        ("shared", TenantIsolation::Shared),
+                    ],
+                )? {
+                    db.tenant = v;
+                }
+                if let Some(v) = source.parse_enum(
+                    &format!("{prefix}TENANT_SCOPE"),
+                    &[
                         ("project", TenantScope::Project),
                         ("site", TenantScope::Site),
                     ],
                 )? {
-                    db.tenant = v;
+                    db.tenant_scope = v;
+                }
+                if let Some(v) = source.parse_bool(&format!("{prefix}RLS_SESSION"))? {
+                    db.rls_session = v;
                 }
             }
         }
@@ -631,6 +642,8 @@ const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_DATABASE",
     "_READ_ONLY",
     "_POOL_MAX",
+    "_RLS_SESSION",
+    "_TENANT_SCOPE",
     "_COMPUTE",
     "_TENANT",
     "_IMAGE",
@@ -1220,27 +1233,54 @@ pub struct ExternalDatabaseConfig {
     /// The persistent data-volume size in MiB for a **managed co-located** database
     /// (default 10240 = 10 GiB). Ignored for a bring-your-own database.
     pub volume_size_mib: Option<u32>,
-    /// How this managed database isolates tenants on its shared server (a
-    /// compute-backed database only). `shared` (default) — one database for every
-    /// site/project, back-compatible; `project` — a separate database + login role
-    /// per project (the recommended per-tenant grain); `site` — one per site. In a
-    /// per-tenant mode boatramp provisions each tenant's own database + role (with
-    /// its own sealed credential) on the shared server, permission-isolated so one
-    /// tenant's role cannot reach another tenant's database.
-    pub tenant: TenantScope,
+    /// **Isolation mechanism** for a compute-backed managed database (2×2 axis 1).
+    /// `single` (default) — a *dedicated* database server (its own container) per
+    /// tenant; `shared` — *one* server hosting a permission-separated database + role
+    /// per tenant. Ignored for a bring-your-own (`url_env`) database.
+    pub tenant: TenantIsolation,
+    /// **Tenant grain** for a compute-backed managed database (2×2 axis 2). `project`
+    /// (default) — a tenant is a project; `site` — a tenant is a site. A tenant may
+    /// hold several databases (one per binding that names it); it gets one login role
+    /// + sealed credential per (tenant, server), granted on all its own databases and
+    /// none of another tenant's. The reserved `default` project uses the plain
+    /// configured name, so a single-tenant install is just one ordinary database.
+    pub tenant_scope: TenantScope,
+    /// **Opt-in** (default `false`): inject the request's `boatramp.project` /
+    /// `boatramp.site` into the SQL session at each transaction start (Postgres
+    /// `set_config` GUC, MySQL session var), so hand-written **native RLS** policies
+    /// can key on them per-request. The GraphQL data connector's row-level policy is
+    /// claim-sourced and needs nothing here; this is for hand-rolled RLS on the plain
+    /// `sql.open` path (Postgres — the engine with native row-level security).
+    pub rls_session: bool,
 }
 
-/// How a managed compute-backed database isolates tenants on its shared server.
+/// How a managed compute-backed database is physically isolated per tenant (2×2 axis
+/// 1). `Single` = a dedicated server (container) per tenant (isolation by separate
+/// process); `Shared` = one server with a per-tenant database + login role (isolation
+/// by grants — Postgres `REVOKE CONNECT FROM PUBLIC` + owner grant; MySQL per-schema
+/// grant), so a tenant's role cannot connect to another tenant's database.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TenantIsolation {
+    /// A dedicated database server (its own container) per tenant. The default.
+    #[default]
+    Single,
+    /// One shared server hosting a per-tenant database + role (grant-isolated).
+    Shared,
+}
+
+/// The grain of a tenant for a managed compute-backed database (2×2 axis 2) —
+/// `Project` (default) or `Site`. The two grains are parallel; the isolation
+/// mechanism is [`TenantIsolation`].
 #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TenantScope {
-    /// One shared database for every site/project (the default; pre-0.3.10 behavior).
+    /// A tenant is a **project** (the default).
     #[default]
-    Shared,
-    /// A separate database + login role per **project** — the tenant boundary.
     Project,
-    /// A separate database + login role per **site**.
+    /// A tenant is a **site** (finer than project).
     Site,
 }
 

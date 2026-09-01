@@ -51,6 +51,10 @@ mod sql_placeholders;
 pub mod sql_compute;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod sql_sqlx;
+// Pure per-tenant managed-database provisioning: sanitized name derivation and
+// idempotent DDL generation (no IO, no async). The caller runs the DDL.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod tenant_provision;
 
 #[cfg(feature = "cache")]
 pub mod cache;
