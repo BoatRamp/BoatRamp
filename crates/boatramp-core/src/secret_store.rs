@@ -30,6 +30,45 @@ const MAX_SECRET_NAME_LEN: usize = 128;
 /// write-DoS on the shared plane. 64 KiB is far above any real key/token.
 const MAX_SECRET_VALUE_LEN: usize = 64 * 1024;
 
+/// A secret-store failure, classified so the API returns the right status and never
+/// leaks backend internals. [`InvalidName`](Self::InvalidName) and
+/// [`ValueTooLarge`](Self::ValueTooLarge) are **client** errors — the message is about
+/// the *request* (safe to return, maps to `400`). [`Backend`](Self::Backend) is a KV /
+/// envelope failure whose detail (KV key shapes, a KMS endpoint/status) is logged
+/// server-side and **not** returned (maps to `500`).
+#[derive(Debug)]
+pub enum SecretError {
+    /// The secret name is not a valid KV key segment.
+    InvalidName(String),
+    /// The value exceeds [`MAX_SECRET_VALUE_LEN`].
+    ValueTooLarge { len: usize, max: usize },
+    /// A KV or envelope (seal/unseal) failure — detail is not client-safe.
+    Backend(String),
+}
+
+impl std::fmt::Display for SecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName(m) => write!(f, "{m}"),
+            Self::ValueTooLarge { len, max } => {
+                write!(f, "secret value is {len} bytes; the maximum is {max}")
+            }
+            Self::Backend(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for SecretError {}
+
+impl SecretError {
+    /// Whether this is a client error (the message describes the request and is safe to
+    /// return) vs a backend error (logged, returned generically).
+    #[must_use]
+    pub fn is_client_error(&self) -> bool {
+        matches!(self, Self::InvalidName(_) | Self::ValueTooLarge { .. })
+    }
+}
+
 /// The sealed record stored at `project/<proj>/secret/<name>`. Metadata is stored
 /// in the clear (names/timestamps aren't secret); only `sealed` is confidential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,13 +128,13 @@ impl SecretStore {
         project: ProjectRef<'_>,
         name: &str,
         plaintext: &[u8],
-    ) -> Result<SecretMeta, String> {
+    ) -> Result<SecretMeta, SecretError> {
         validate_name(name)?;
         if plaintext.len() > MAX_SECRET_VALUE_LEN {
-            return Err(format!(
-                "secret value is {} bytes; the maximum is {MAX_SECRET_VALUE_LEN}",
-                plaintext.len()
-            ));
+            return Err(SecretError::ValueTooLarge {
+                len: plaintext.len(),
+                max: MAX_SECRET_VALUE_LEN,
+            });
         }
         let key = crate::deploy::keys::secret(project, name);
         let now = crate::time::now_unix();
@@ -107,7 +146,7 @@ impl SecretStore {
             .envelope
             .wrap(plaintext)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
         let record = SecretRecord {
             version: 1,
             created_at,
@@ -115,8 +154,11 @@ impl SecretStore {
             revision,
             sealed,
         };
-        let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
-        self.kv.put(&key, bytes).await.map_err(|e| e.to_string())?;
+        let bytes = serde_json::to_vec(&record).map_err(|e| SecretError::Backend(e.to_string()))?;
+        self.kv
+            .put(&key, bytes)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(record.meta(name))
     }
 
@@ -126,7 +168,7 @@ impl SecretStore {
         &self,
         project: ProjectRef<'_>,
         name: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, SecretError> {
         validate_name(name)?;
         let key = crate::deploy::keys::secret(project, name);
         match self.load_record(&key).await? {
@@ -134,7 +176,7 @@ impl SecretStore {
                 self.envelope
                     .unwrap(&r.sealed)
                     .await
-                    .map_err(|e| e.to_string())?,
+                    .map_err(|e| SecretError::Backend(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -142,17 +184,22 @@ impl SecretStore {
 
     /// Value-free metadata for every secret in the project, sorted by name
     /// (`secrets ls`). A record that fails to parse is skipped, never surfaced.
-    pub async fn list(&self, project: ProjectRef<'_>) -> Result<Vec<SecretMeta>, String> {
+    pub async fn list(&self, project: ProjectRef<'_>) -> Result<Vec<SecretMeta>, SecretError> {
         let prefix = crate::deploy::keys::secret_prefix(project);
         let mut out = Vec::new();
         for key in self
             .kv
             .list_prefix(&prefix)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| SecretError::Backend(e.to_string()))?
         {
             let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-            if let Some(bytes) = self.kv.get(&key).await.map_err(|e| e.to_string())? {
+            if let Some(bytes) = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?
+            {
                 if let Ok(record) = serde_json::from_slice::<SecretRecord>(&bytes) {
                     out.push(record.meta(&name));
                 }
@@ -163,26 +210,34 @@ impl SecretStore {
     }
 
     /// Delete a secret. Returns whether it existed.
-    pub async fn delete(&self, project: ProjectRef<'_>, name: &str) -> Result<bool, String> {
+    pub async fn delete(&self, project: ProjectRef<'_>, name: &str) -> Result<bool, SecretError> {
         validate_name(name)?;
         let key = crate::deploy::keys::secret(project, name);
         let existed = self
             .kv
             .get(&key)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| SecretError::Backend(e.to_string()))?
             .is_some();
         if existed {
-            self.kv.delete(&key).await.map_err(|e| e.to_string())?;
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
         }
         Ok(existed)
     }
 
-    async fn load_record(&self, key: &str) -> Result<Option<SecretRecord>, String> {
-        match self.kv.get(key).await.map_err(|e| e.to_string())? {
+    async fn load_record(&self, key: &str) -> Result<Option<SecretRecord>, SecretError> {
+        match self
+            .kv
+            .get(key)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?
+        {
             Some(bytes) => serde_json::from_slice::<SecretRecord>(&bytes)
                 .map(Some)
-                .map_err(|e| format!("corrupt secret record at {key}: {e}")),
+                .map_err(|e| SecretError::Backend(format!("corrupt secret record at {key}: {e}"))),
             None => Ok(None),
         }
     }
@@ -191,20 +246,24 @@ impl SecretStore {
 /// Validate a secret name used as a KV key segment: non-empty, `≤ MAX_SECRET_NAME_LEN`,
 /// only `[A-Za-z0-9._-]` (so it can't inject a `/` and reach another keyspace), and
 /// not `.`/`..`. Fail-closed on anything else — the name is tenant-supplied.
-fn validate_name(name: &str) -> Result<(), String> {
+fn validate_name(name: &str) -> Result<(), SecretError> {
     if name.is_empty() || name.len() > MAX_SECRET_NAME_LEN {
-        return Err(format!(
+        return Err(SecretError::InvalidName(format!(
             "secret name must be 1..={MAX_SECRET_NAME_LEN} characters"
-        ));
+        )));
     }
     if name == "." || name == ".." {
-        return Err("secret name must not be '.' or '..'".to_string());
+        return Err(SecretError::InvalidName(
+            "secret name must not be '.' or '..'".to_string(),
+        ));
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
-        return Err("secret name may contain only [A-Za-z0-9._-]".to_string());
+        return Err(SecretError::InvalidName(
+            "secret name may contain only [A-Za-z0-9._-]".to_string(),
+        ));
     }
     Ok(())
 }
@@ -365,6 +424,18 @@ mod tests {
             .set(p, "toobig", &vec![b'x'; MAX_SECRET_VALUE_LEN + 1])
             .await
             .expect_err("an oversized value must be refused");
-        assert!(err.contains("maximum"), "{err}");
+        assert!(
+            matches!(err, SecretError::ValueTooLarge { .. }) && err.is_client_error(),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_classification_client_vs_backend() {
+        let s = store();
+        let p = ProjectRef::new("acme");
+        // An invalid name is a client error (safe to surface).
+        let e = s.set(p, "bad/name", b"v").await.unwrap_err();
+        assert!(matches!(e, SecretError::InvalidName(_)) && e.is_client_error());
     }
 }

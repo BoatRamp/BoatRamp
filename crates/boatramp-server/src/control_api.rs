@@ -655,6 +655,20 @@ fn no_secret_store_response() -> Response {
         .into_response()
 }
 
+/// Map a [`SecretError`] to a response without disclosing backend internals: a
+/// **client** error (invalid name, oversized value — the message is about the request)
+/// returns `400` with that message; a **backend** error (a KV / envelope failure whose
+/// detail could carry key shapes or a KMS endpoint) is logged server-side and returned
+/// as a generic `500`.
+fn secret_error_response(err: boatramp_core::secret_store::SecretError) -> Response {
+    if err.is_client_error() {
+        (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response()
+    } else {
+        tracing::warn!(%err, "secret store backend error");
+        (StatusCode::INTERNAL_SERVER_ERROR, "secret store error\n").into_response()
+    }
+}
+
 /// The secret store, injected as an extension by the node when a `[secrets]`
 /// envelope is present. `None` ⇒ the endpoints fail closed with a clear `501`.
 type SecretStoreExt = Option<Arc<boatramp_core::secret_store::SecretStore>>;
@@ -685,7 +699,7 @@ pub(super) async fn set_secret(
         .await
     {
         Ok(meta) => (StatusCode::CREATED, Json(meta)).into_response(),
-        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+        Err(err) => secret_error_response(err),
     }
 }
 
@@ -700,16 +714,7 @@ pub(super) async fn list_secrets(
     };
     match store.list(project.as_ref()).await {
         Ok(metas) => Json(metas).into_response(),
-        Err(err) => {
-            // Log the backend detail server-side; return a generic body so a KV/backend
-            // error string (key shapes, internals) isn't disclosed to the caller.
-            tracing::warn!(%err, "listing secrets failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "listing secrets failed\n",
-            )
-                .into_response()
-        }
+        Err(err) => secret_error_response(err),
     }
 }
 
@@ -727,6 +732,6 @@ pub(super) async fn delete_secret(
     match store.delete(project.as_ref(), &name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no matching secret\n").into_response(),
-        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+        Err(err) => secret_error_response(err),
     }
 }

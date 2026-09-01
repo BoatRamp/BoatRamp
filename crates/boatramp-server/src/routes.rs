@@ -165,7 +165,17 @@ pub fn router_with_fast(
         // only) + delete; there is deliberately **no value-GET** — a value leaves the
         // store only into a guest at instantiation, never over the API. Authorized as
         // `Secrets·Read`/`Secrets·Write` against the original project-scoped path.
-        .route("/api/secrets", post(set_secret).get(list_secrets))
+        // Bound the request body explicitly on the secrets route (rather than relying
+        // on axum's 2 MB default): a secret value is capped at 64 KiB in the store, so
+        // 512 KiB leaves headroom for JSON-escaping the value + the name/framing while
+        // keeping the transiently-buffered body small — a project admin can't buffer a
+        // large body before the store's size check runs.
+        .route(
+            "/api/secrets",
+            post(set_secret)
+                .get(list_secrets)
+                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
+        )
         .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
         .route("/api/tokens", post(create_token).get(list_tokens))
         // First-token bootstrap: RBAC-exempt (`Right::required` → None for exactly
