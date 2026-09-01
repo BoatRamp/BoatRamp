@@ -2247,6 +2247,24 @@ mod tests {
             .expect_err("a reserved scheme is not yet supported, even under single-tenant");
         assert!(err.contains("not yet supported"), "{err}");
 
+        // The rule is provider-neutral: ANY value with a colon is a scheme, so an
+        // un-enumerated one (a cloud secret manager) is refused too — never misread
+        // as a bare host var literally named "aws:sm/prod/apikey".
+        let arbitrary = HandlersSiteConfig {
+            enabled: true,
+            secrets: std::collections::BTreeMap::from([(
+                "KEY".to_string(),
+                "aws:sm/prod/apikey".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let err = resolve_env("evil", &deploy_env, &arbitrary, true)
+            .expect_err("any unknown scheme is reserved, even under single-tenant");
+        assert!(
+            err.contains("not yet supported") && err.contains("aws"),
+            "provider-neutral reservation names the scheme: {err}"
+        );
+
         std::env::remove_var("BOATRAMP_TEST_OTHER_TENANT_SECRET");
     }
 

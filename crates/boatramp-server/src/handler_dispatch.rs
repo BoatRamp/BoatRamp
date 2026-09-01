@@ -1034,9 +1034,10 @@ pub(super) fn resolve_env(
 ///   tenant's DB password, a cloud key) into their guest. Fail-closed: the whole
 ///   env resolution errors so the handler/function never instantiates with a
 ///   leaked value.
-/// - `boatramp:` / `vault:` / `hcp:` — reserved for a future project-scoped secret
-///   store; **not yet supported**, so any such ref errors rather than silently
-///   resolving.
+/// - any other `scheme:` (a value with a colon whose scheme isn't `env`) — reserved
+///   for a future resolver (the project-scoped `boatramp:` store, or an external
+///   secret manager); **not yet supported**, so any such ref errors rather than
+///   silently resolving. We don't enumerate provider names: a colon means "scheme".
 #[cfg(feature = "handlers")]
 pub(super) fn resolve_secret_env(
     label: &str,
@@ -1124,31 +1125,26 @@ enum SecretRef<'a> {
     /// A bare `HOST_VAR` or explicit `env:HOST_VAR` — the serve process's own
     /// environment (the operator's namespace). Carries the host variable name.
     Env(&'a str),
-    /// A reserved-but-unimplemented scheme (`boatramp:` / `vault:` / `hcp:`).
+    /// A reserved-but-unimplemented scheme — anything before the first `:` that we
+    /// don't yet resolve (a future `boatramp:` store or an external manager).
     /// Carries the scheme keyword for the error message.
     Unsupported(&'a str),
 }
 
-/// Parse a `secrets` map value into a [`SecretRef`]. A bare value (no recognised
-/// `scheme:` prefix) is an implicit `env:` reference (back-compat). `env:` is the
-/// explicit form of the same. `boatramp:` / `vault:` / `hcp:` are reserved for a
-/// future project-scoped secret store and are surfaced as unsupported. Any other
-/// unknown `scheme:` prefix is treated as a bare host-var name (so a value that
-/// merely happens to contain a colon — a URL-shaped default — is not misread as a
-/// scheme).
+/// Parse a `secrets` map value into a [`SecretRef`]. A **colon-free** value is a
+/// bare host-env var name (back-compat). Otherwise the part before the first `:` is
+/// a **scheme**: `env` is the explicit host-env form; every other scheme is reserved
+/// (a future project-scoped `boatramp:` store, or an external secret manager) and is
+/// surfaced as unsupported rather than misread as a host var. We deliberately do not
+/// enumerate provider names — any `scheme:` we don't resolve is refused, so a value
+/// containing a colon is never silently treated as an env var.
 #[cfg(feature = "handlers")]
 fn parse_secret_ref(secret_ref: &str) -> SecretRef<'_> {
-    if let Some(rest) = secret_ref.strip_prefix("env:") {
-        return SecretRef::Env(rest);
+    match secret_ref.split_once(':') {
+        Some(("env", host_var)) => SecretRef::Env(host_var),
+        Some((scheme, _)) => SecretRef::Unsupported(scheme),
+        None => SecretRef::Env(secret_ref),
     }
-    for scheme in ["boatramp", "vault", "hcp"] {
-        if let Some(rest) = secret_ref.strip_prefix(scheme) {
-            if rest.starts_with(':') {
-                return SecretRef::Unsupported(scheme);
-            }
-        }
-    }
-    SecretRef::Env(secret_ref)
 }
 
 /// Process one claimed batch for a consumer subscribed to `namespaced_topic`
