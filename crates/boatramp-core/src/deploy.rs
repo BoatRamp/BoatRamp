@@ -191,7 +191,7 @@ const SMALL_BLOB_CACHE_MAX: u64 = 256 * 1024;
 /// Total byte ceiling for the small-blob body cache.
 const BLOB_BODY_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-mod keys {
+pub(crate) mod keys {
     //! The KV keyspace, collected in one place (mirrors [`boatramp_types::function::keys`]),
     //! so the persisted layout is legible at a glance instead of scattered through
     //! [`DeployStore`]'s methods. The strings are the on-disk keyspace — changing one is
@@ -243,6 +243,20 @@ mod keys {
     /// The prefix listing **every** alias in a project (all sites).
     pub fn alias_project_prefix(project: ProjectRef<'_>) -> String {
         format!("project/{project}/alias/")
+    }
+
+    /// A project-scoped internal secret: `project/<proj>/secret/<name>` → an
+    /// envelope-sealed value plus small clear metadata. Project-scoped so a
+    /// `boatramp:<name>` ref resolves only within its own project — never another
+    /// tenant's secrets or the host env. The value is sealed at rest and unsealed
+    /// only at handler/function instantiation; it never leaves over the API.
+    pub fn secret(project: ProjectRef<'_>, name: &str) -> String {
+        format!("project/{project}/secret/{name}")
+    }
+
+    /// The prefix listing a project's internal secrets (for `secrets ls`).
+    pub fn secret_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/secret/")
     }
 
     /// Sharded blob key, e.g. `ab/abcdef...`, to avoid one huge directory (global CAS).
