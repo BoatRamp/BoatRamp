@@ -117,7 +117,7 @@ fn to_base36(mut n: u128) -> String {
 ///    quotes, and every SQL metacharacter) with `_`.
 /// 3. If the result is empty or starts with a digit, prefix `t_`.
 /// 4. Cap the human-readable body so the whole identifier fits `max_len` chars.
-/// 5. **Injectivity:** *always* append `_` + a 32-hex-char (128-bit) SHA-256
+/// 5. **Injectivity:** *always* append `_` + a 25-char base-36 (128-bit) SHA-256
 ///    digest of the **original** input.
 ///
 /// # Injectivity guarantee
