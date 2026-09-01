@@ -979,9 +979,21 @@ impl DeployStore {
         project: ProjectRef<'_>,
         name: &str,
     ) -> Result<bool, DeployError> {
-        let key = crate::function::keys::meta(project.as_str(), name);
-        let existed = self.kv.get(&key).await?.is_some();
-        self.kv.delete(&key).await?;
+        let meta = crate::function::keys::meta(project.as_str(), name);
+        let existed = self.kv.get(&meta).await?.is_some();
+        // Sweep the function's WHOLE subtree — versions / alias / triggers /
+        // invocations (which also hold idempotency replays) — plus its separate
+        // metering record, not just the `meta` key. The trailing `/` scopes the prefix
+        // to THIS function, so `foo/` never matches a sibling `foobar/…`. Otherwise a
+        // deleted function leaves orphaned keys under `project/<proj>/` that both look
+        // "still registered" and keep delete_project at 409 (see delete_project).
+        for key in self.kv.list_prefix(&format!("{meta}/")).await? {
+            self.kv.delete(&key).await?;
+        }
+        self.kv.delete(&meta).await?;
+        self.kv
+            .delete(&crate::function::keys::metering(project.as_str(), name))
+            .await?;
         Ok(existed)
     }
 
@@ -2460,15 +2472,18 @@ impl DeployStore {
             .get(&crate::project::pointer_key(name))
             .await?
             .is_some();
-        // Refuse if any owned resource remains under `project/<name>/`.
-        if !self
-            .kv
-            .list_prefix(&crate::project::resource_prefix(name))
-            .await?
-            .is_empty()
-        {
+        // Refuse if any owned resource remains under `project/<name>/`, and — so the
+        // operator never has to GUESS what's blocking — name exactly what's left,
+        // grouped by family (functions / sites / compute / graphql / secret / …) with
+        // the resource names. The failsafe stands: a project is deleted only once
+        // empty; `project rm --force` cascades the teardown instead.
+        let prefix = crate::project::resource_prefix(name);
+        let remaining = self.kv.list_prefix(&prefix).await?;
+        if !remaining.is_empty() {
             return Err(DeployError::Conflict(format!(
-                "project `{name}` still owns resources; delete its sites/functions/compute first"
+                "project `{name}` still owns resources — delete these first, or \
+                 `project rm --force` to cascade: {}",
+                Self::summarize_owned_resources(&prefix, &remaining)
             )));
         }
         self.kv
@@ -2478,6 +2493,52 @@ impl DeployStore {
             ])
             .await?;
         Ok(existed)
+    }
+
+    /// Summarize the keys still owned under a project `prefix`, grouped by family (the
+    /// first path segment after `project/<name>/`) with the distinct resource names
+    /// (the second segment) — so [`delete_project`](Self::delete_project)'s refusal names
+    /// exactly what to delete instead of leaving the operator to grep the KV. Bounded to
+    /// 10 names per family so the message stays legible.
+    fn summarize_owned_resources(prefix: &str, keys: &[String]) -> String {
+        use std::collections::{BTreeMap, BTreeSet};
+        // family → (distinct resource names, total key count)
+        let mut fam: BTreeMap<&str, (BTreeSet<&str>, usize)> = BTreeMap::new();
+        for key in keys {
+            let rest = key
+                .strip_prefix(prefix)
+                .unwrap_or(key)
+                .trim_start_matches('/');
+            let mut segs = rest.split('/');
+            let Some(family) = segs.next().filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            let entry = fam.entry(family).or_default();
+            entry.1 += 1;
+            if let Some(name) = segs.next().filter(|n| !n.is_empty()) {
+                entry.0.insert(name);
+            }
+        }
+        fam.iter()
+            .map(|(family, (names, count))| {
+                if names.is_empty() {
+                    format!(
+                        "{family} ({count} key{})",
+                        if *count == 1 { "" } else { "s" }
+                    )
+                } else {
+                    let shown: Vec<&str> = names.iter().take(10).copied().collect();
+                    let more = names.len() - shown.len();
+                    let suffix = if more > 0 {
+                        format!(", +{more} more")
+                    } else {
+                        String::new()
+                    };
+                    format!("{family}: [{}{suffix}]", shown.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Atomically point `site` at deployment `id`.
@@ -3207,6 +3268,80 @@ mod tests {
             .delete_function(ProjectRef::DEFAULT, "resize")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_function_sweeps_the_whole_subtree_only_for_that_function() {
+        use crate::function::keys as fk;
+        use crate::kv::{KvStore, MemoryKv};
+
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let proj = ProjectRef::new("acme");
+        // Seed a function's meta + its whole subtree (version/alias/trigger/invocation)
+        // + its separate metering record.
+        for k in [
+            fk::meta("acme", "greeter"),
+            fk::version("acme", "greeter", "v1"),
+            fk::alias("acme", "greeter", "prod"),
+            fk::trigger("acme", "greeter", "t1"),
+            fk::invocation("acme", "greeter", "i1"),
+            fk::metering("acme", "greeter"),
+        ] {
+            kv.put(&k, vec![1]).await.unwrap();
+        }
+        // A sibling whose name shares the `greeter` prefix must be untouched.
+        kv.put(&fk::version("acme", "greeterx", "z1"), vec![1])
+            .await
+            .unwrap();
+
+        assert!(store.delete_function(proj, "greeter").await.unwrap());
+
+        // Nothing left for `greeter`: meta, the whole subtree, and metering all gone.
+        assert!(kv
+            .get(&fk::meta("acme", "greeter"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(kv
+            .list_prefix(&format!("{}/", fk::meta("acme", "greeter")))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(kv
+            .get(&fk::metering("acme", "greeter"))
+            .await
+            .unwrap()
+            .is_none());
+        // The sibling is untouched (no over-match on the shared name prefix).
+        assert!(kv
+            .get(&fk::version("acme", "greeterx", "z1"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_project_refusal_names_what_remains() {
+        use crate::function::keys as fk;
+        use crate::kv::{KvStore, MemoryKv};
+
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        // Leftover owned resources under project/acme/: a function + two graphql safelist ops.
+        kv.put(&fk::meta("acme", "greeter"), vec![1]).await.unwrap();
+        kv.put("project/acme/graphql/safelist/op1", vec![1])
+            .await
+            .unwrap();
+        kv.put("project/acme/graphql/safelist/op2", vec![1])
+            .await
+            .unwrap();
+
+        let msg = store.delete_project("acme").await.unwrap_err().to_string();
+        // The refusal names exactly what's left (no guessing) + points at the cascade.
+        assert!(msg.contains("functions: [greeter]"), "{msg}");
+        assert!(msg.contains("graphql"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
     }
 
     #[tokio::test]
