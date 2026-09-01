@@ -988,7 +988,15 @@ pub(super) async fn build_bindings(
     // posture a bare / `env:` ref into the operator's environment is refused
     // (fail-closed) — the site config's author is an untrusted tenant.
     let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
-    let env = resolve_env(site, deploy_env, site_handlers, allow_env_secret_refs)?;
+    let env = resolve_env(
+        site,
+        project,
+        deploy_env,
+        site_handlers,
+        allow_env_secret_refs,
+        inner.secret_store.get().map(std::convert::AsRef::as_ref),
+    )
+    .await?;
     bindings = bindings.with_env(env);
     Ok(bindings)
 }
@@ -1002,18 +1010,23 @@ pub(super) async fn build_bindings(
 /// `env:`-scheme ref is **refused** (fail-closed) so an untrusted tenant's
 /// `secrets` map can't name an arbitrary host env var to exfiltrate it.
 #[cfg(feature = "handlers")]
-pub(super) fn resolve_env(
+pub(super) async fn resolve_env(
     site: &str,
+    project: boatramp_core::project::ProjectRef<'_>,
     deploy_env: &std::collections::BTreeMap<String, String>,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
     allow_env_secret_refs: bool,
+    secret_store: Option<&boatramp_core::secret_store::SecretStore>,
 ) -> Result<Vec<(String, String)>, String> {
     resolve_secret_env(
         site,
+        project,
         deploy_env,
         &site_handlers.secrets,
         allow_env_secret_refs,
+        secret_store,
     )
+    .await
 }
 
 /// Assemble a guest environment: static `env` first, then each `secrets` entry
@@ -1039,11 +1052,13 @@ pub(super) fn resolve_env(
 ///   secret manager); **not yet supported**, so any such ref errors rather than
 ///   silently resolving. We don't enumerate provider names: a colon means "scheme".
 #[cfg(feature = "handlers")]
-pub(super) fn resolve_secret_env(
+pub(super) async fn resolve_secret_env(
     label: &str,
+    project: boatramp_core::project::ProjectRef<'_>,
     static_env: &std::collections::BTreeMap<String, String>,
     secrets: &std::collections::BTreeMap<String, String>,
     allow_env_secret_refs: bool,
+    secret_store: Option<&boatramp_core::secret_store::SecretStore>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut env: Vec<(String, String)> = static_env
         .iter()
@@ -1071,6 +1086,38 @@ pub(super) fn resolve_secret_env(
                         secret = %guest_name,
                         "secret references env var {host_var}, which is not set; not injected"
                     ),
+                }
+            }
+            // `boatramp:NAME` — the project-scoped internal store. Resolves only
+            // within *this* project's sealed keyspace (multi-tenant-safe: never the
+            // host env or another tenant's secret), so it is not gated on
+            // `allow_env_secret_refs`. Fail-closed if no store is configured; a
+            // missing secret is warned + skipped (like a missing env var).
+            SecretRef::Boatramp(name) => {
+                let Some(store) = secret_store else {
+                    return Err(format!(
+                        "secret ref {guest_name:?} → boatramp:{name} cannot be resolved: no \
+                         internal secret store is configured (a [secrets] key envelope is required)"
+                    ));
+                };
+                match store.get(project, name).await {
+                    Ok(Some(bytes)) => {
+                        let value = String::from_utf8(bytes).map_err(|_| {
+                            format!("boatramp secret {name:?} is not valid UTF-8 for an env var")
+                        })?;
+                        env.retain(|(k, _)| k != guest_name);
+                        env.push((guest_name.clone(), value));
+                    }
+                    Ok(None) => tracing::warn!(
+                        label,
+                        secret = %guest_name,
+                        "secret references boatramp:{name}, which is not set; not injected"
+                    ),
+                    Err(err) => {
+                        return Err(format!(
+                            "resolving boatramp secret {name:?} for {guest_name:?} failed: {err}"
+                        ));
+                    }
                 }
             }
             // A reserved scheme we recognise but don't yet implement — fail-closed
@@ -1108,6 +1155,10 @@ pub(super) fn admit_secret_refs(
                     ));
                 }
             }
+            // `boatramp:` is the project-scoped store — always admissible (it can't
+            // reach the host env or another tenant). Its value isn't checked here;
+            // the secret may be set after deploy, resolved (or warned-missing) at run.
+            SecretRef::Boatramp(_) => {}
             SecretRef::Unsupported(scheme) => {
                 return Err(format!(
                     "secret ref {guest_name:?} uses the {scheme:?} scheme, which is not yet \
@@ -1125,23 +1176,27 @@ enum SecretRef<'a> {
     /// A bare `HOST_VAR` or explicit `env:HOST_VAR` — the serve process's own
     /// environment (the operator's namespace). Carries the host variable name.
     Env(&'a str),
+    /// `boatramp:NAME` — the project-scoped internal secret store. Resolves only
+    /// within the request's own project (multi-tenant-safe). Carries the secret name.
+    Boatramp(&'a str),
     /// A reserved-but-unimplemented scheme — anything before the first `:` that we
-    /// don't yet resolve (a future `boatramp:` store or an external manager).
-    /// Carries the scheme keyword for the error message.
+    /// don't yet resolve (an external manager). Carries the scheme keyword for the
+    /// error message.
     Unsupported(&'a str),
 }
 
 /// Parse a `secrets` map value into a [`SecretRef`]. A **colon-free** value is a
 /// bare host-env var name (back-compat). Otherwise the part before the first `:` is
-/// a **scheme**: `env` is the explicit host-env form; every other scheme is reserved
-/// (a future project-scoped `boatramp:` store, or an external secret manager) and is
-/// surfaced as unsupported rather than misread as a host var. We deliberately do not
-/// enumerate provider names — any `scheme:` we don't resolve is refused, so a value
-/// containing a colon is never silently treated as an env var.
+/// a **scheme**: `env` is the explicit host-env form, `boatramp` the project-scoped
+/// internal store; every other scheme is reserved (a future external secret manager)
+/// and is surfaced as unsupported rather than misread as a host var. We deliberately
+/// do not enumerate external provider names — any `scheme:` we don't resolve is
+/// refused, so a value containing a colon is never silently treated as an env var.
 #[cfg(feature = "handlers")]
 fn parse_secret_ref(secret_ref: &str) -> SecretRef<'_> {
     match secret_ref.split_once(':') {
         Some(("env", host_var)) => SecretRef::Env(host_var),
+        Some(("boatramp", name)) => SecretRef::Boatramp(name),
         Some((scheme, _)) => SecretRef::Unsupported(scheme),
         None => SecretRef::Env(secret_ref),
     }

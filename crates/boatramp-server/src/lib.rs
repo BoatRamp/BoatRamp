@@ -299,6 +299,12 @@ struct HandlerRuntimeInner {
     /// refuses such a ref instead of injecting the host value, closing the
     /// cross-tenant host-env exfiltration path under the multi-tenant posture.
     allow_env_secret_refs: std::sync::OnceLock<bool>,
+    /// The project-scoped internal secret store (sealed with the `[secrets]`
+    /// envelope). Backs the `boatramp:<name>` secret-ref scheme — the
+    /// multi-tenant-safe alternative to a host-env ref. Set once at startup via
+    /// [`HandlerRuntime::set_secret_store`]; **unset means no `boatramp:` ref can
+    /// resolve** (fail-closed — `resolve_secret_env` errors rather than injecting).
+    secret_store: std::sync::OnceLock<Arc<boatramp_core::secret_store::SecretStore>>,
     /// Per-function locks serializing the metering + rate-limit read-modify-write
     /// (FA-4), so concurrent invocations of one function can't lose an update.
     /// Created on first use, keyed by function name.
@@ -377,6 +383,7 @@ impl HandlerRuntime {
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
                 allow_env_secret_refs: std::sync::OnceLock::new(),
+                secret_store: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
                 watch_provider: std::sync::OnceLock::new(),
@@ -509,6 +516,17 @@ impl HandlerRuntime {
     pub fn set_allow_env_secret_refs(&self, allow: bool) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.allow_env_secret_refs.set(allow);
+        }
+    }
+
+    /// Wire the project-scoped internal secret store (sealed with the `[secrets]`
+    /// envelope) that backs the `boatramp:<name>` secret-ref scheme. Set once at
+    /// startup; if never set, a `boatramp:` ref cannot resolve and
+    /// `resolve_secret_env` errors fail-closed rather than injecting a value.
+    #[cfg(feature = "handlers")]
+    pub fn set_secret_store(&self, store: Arc<boatramp_core::secret_store::SecretStore>) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.secret_store.set(store);
         }
     }
 
@@ -2145,8 +2163,8 @@ mod tests {
         assert!(!gateway_addr_allowed(metadata, &loose));
     }
 
-    #[test]
-    fn resolve_env_merges_static_and_host_secrets() {
+    #[tokio::test]
+    async fn resolve_env_merges_static_and_host_secrets() {
         use boatramp_core::config::HandlersSiteConfig;
 
         // A uniquely-named host var holds the real secret value.
@@ -2177,7 +2195,16 @@ mod tests {
         };
         // Single-tenant / dev: host-env secret refs are permitted (the operator
         // authors the site config), so this resolves exactly as before.
-        let env = resolve_env("blog", &deploy_env, &site_handlers, true).expect("resolves");
+        let env = resolve_env(
+            "blog",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &site_handlers,
+            true,
+            None,
+        )
+        .await
+        .expect("resolves");
 
         // Static var present; secret resolved from the host env; a secret
         // overrides a static of the same name; a secret whose host var is unset
@@ -2190,8 +2217,8 @@ mod tests {
         std::env::remove_var("BOATRAMP_TEST_RESOLVE_SECRET");
     }
 
-    #[test]
-    fn multi_tenant_posture_refuses_a_host_env_handler_secret() {
+    #[tokio::test]
+    async fn multi_tenant_posture_refuses_a_host_env_handler_secret() {
         use boatramp_core::config::HandlersSiteConfig;
 
         // The exfiltration vector: an untrusted tenant names another tenant's / the
@@ -2208,8 +2235,16 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let err = resolve_env("evil", &deploy_env, &bare, false)
-            .expect_err("multi-tenant must refuse a bare host-env ref");
+        let err = resolve_env(
+            "evil",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &bare,
+            false,
+            None,
+        )
+        .await
+        .expect_err("multi-tenant must refuse a bare host-env ref");
         assert!(
             err.contains("STOLEN"),
             "error names the offending guest var: {err}"
@@ -2232,7 +2267,16 @@ mod tests {
             )]),
             ..Default::default()
         };
-        assert!(resolve_env("evil", &deploy_env, &explicit, false).is_err());
+        assert!(resolve_env(
+            "evil",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &explicit,
+            false,
+            None,
+        )
+        .await
+        .is_err());
 
         // A reserved-but-unimplemented scheme is also refused (no silent fall-through).
         let reserved = HandlersSiteConfig {
@@ -2243,8 +2287,16 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let err = resolve_env("evil", &deploy_env, &reserved, true)
-            .expect_err("a reserved scheme is not yet supported, even under single-tenant");
+        let err = resolve_env(
+            "evil",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &reserved,
+            true,
+            None,
+        )
+        .await
+        .expect_err("a reserved scheme is not yet supported, even under single-tenant");
         assert!(err.contains("not yet supported"), "{err}");
 
         // The rule is provider-neutral: ANY value with a colon is a scheme, so an
@@ -2258,8 +2310,16 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let err = resolve_env("evil", &deploy_env, &arbitrary, true)
-            .expect_err("any unknown scheme is reserved, even under single-tenant");
+        let err = resolve_env(
+            "evil",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &deploy_env,
+            &arbitrary,
+            true,
+            None,
+        )
+        .await
+        .expect_err("any unknown scheme is reserved, even under single-tenant");
         assert!(
             err.contains("not yet supported") && err.contains("aws"),
             "provider-neutral reservation names the scheme: {err}"
@@ -2268,8 +2328,8 @@ mod tests {
         std::env::remove_var("BOATRAMP_TEST_OTHER_TENANT_SECRET");
     }
 
-    #[test]
-    fn function_resolve_secret_env_reads_host_and_matches_handler_semantics() {
+    #[tokio::test]
+    async fn function_resolve_secret_env_reads_host_and_matches_handler_semantics() {
         // A top-level function resolves its `secrets` map exactly like a site
         // handler: `resolve_secret_env` reads the host env var named by the map's
         // value and injects it under the map's key. This is the SAME helper the
@@ -2295,7 +2355,16 @@ mod tests {
             ),
         ]);
         // Single-tenant / dev: host-env refs permitted, so this resolves as before.
-        let env = resolve_secret_env("fn/api", &static_env, &secrets, true).expect("resolves");
+        let env = resolve_secret_env(
+            "fn/api",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &static_env,
+            &secrets,
+            true,
+            None,
+        )
+        .await
+        .expect("resolves");
 
         assert!(env.contains(&("STAGE".to_string(), "prod".to_string())));
         // The secret is injected under its target ENV_VAR, read from the host env.
@@ -2308,8 +2377,8 @@ mod tests {
         std::env::remove_var("BOATRAMP_TEST_FN_SECRET");
     }
 
-    #[test]
-    fn multi_tenant_posture_refuses_a_host_env_function_secret() {
+    #[tokio::test]
+    async fn multi_tenant_posture_refuses_a_host_env_function_secret() {
         // The function analog of the handler exfiltration vector: a function's
         // `secrets` map naming a host env var must be REFUSED under the multi-tenant
         // posture (never read), using the SAME helper the handler path uses — so the
@@ -2322,8 +2391,16 @@ mod tests {
         )]);
 
         // Multi-tenant: refused, names the offending guest var, host value never read.
-        let err = resolve_secret_env("fn/api", &static_env, &secrets, false)
-            .expect_err("multi-tenant must refuse a function host-env ref");
+        let err = resolve_secret_env(
+            "fn/api",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &static_env,
+            &secrets,
+            false,
+            None,
+        )
+        .await
+        .expect_err("multi-tenant must refuse a function host-env ref");
         assert!(
             err.contains("DB_URL"),
             "error names the offending guest var: {err}"
@@ -2334,10 +2411,108 @@ mod tests {
         );
 
         // Single-tenant / dev: the same ref resolves + injects (operator owns config).
-        let env = resolve_secret_env("fn/api", &static_env, &secrets, true).expect("resolves");
+        let env = resolve_secret_env(
+            "fn/api",
+            boatramp_core::project::ProjectRef::DEFAULT,
+            &static_env,
+            &secrets,
+            true,
+            None,
+        )
+        .await
+        .expect("resolves");
         assert!(env.contains(&("DB_URL".to_string(), "leak-me".to_string())));
 
         std::env::remove_var("BOATRAMP_TEST_FN_LEAK");
+    }
+
+    #[tokio::test]
+    async fn boatramp_scheme_resolves_from_the_project_scoped_store() {
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::secret_store::SecretStore;
+        use std::sync::Arc;
+
+        // A reversible test envelope (XOR) so `set` seals and `get` unseals.
+        struct XorEnvelope;
+        #[async_trait::async_trait]
+        impl boatramp_core::envelope::KeyEnvelope for XorEnvelope {
+            async fn wrap(
+                &self,
+                p: &[u8],
+            ) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(p.iter().map(|b| b ^ 0x5a).collect())
+            }
+            async fn unwrap(
+                &self,
+                c: &[u8],
+            ) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+                Ok(c.iter().map(|b| b ^ 0x5a).collect())
+            }
+        }
+
+        let store = SecretStore::new(
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+            Arc::new(XorEnvelope),
+        );
+        store
+            .set(ProjectRef::new("acme"), "api-key", b"s3cr3t")
+            .await
+            .unwrap();
+
+        let static_env = std::collections::BTreeMap::new();
+        let secrets = std::collections::BTreeMap::from([
+            ("API_KEY".to_string(), "boatramp:api-key".to_string()),
+            ("MISSING".to_string(), "boatramp:not-set".to_string()),
+        ]);
+
+        // Resolves under the MULTI-TENANT posture (allow_env_secret_refs = false):
+        // the project-scoped store is the multi-tenant-safe path, not gated on it.
+        let env = resolve_secret_env(
+            "site",
+            ProjectRef::new("acme"),
+            &static_env,
+            &secrets,
+            false,
+            Some(&store),
+        )
+        .await
+        .expect("boatramp refs resolve without the host-env gate");
+        assert!(env.contains(&("API_KEY".to_string(), "s3cr3t".to_string())));
+        // A missing boatramp secret is skipped, never injected empty (like a missing env var).
+        assert!(!env.iter().any(|(k, _)| k == "MISSING"));
+
+        // Project isolation: the same ref under a different project does not see acme's secret.
+        let other_secrets = std::collections::BTreeMap::from([(
+            "API_KEY".to_string(),
+            "boatramp:api-key".to_string(),
+        )]);
+        let other = resolve_secret_env(
+            "site",
+            ProjectRef::new("globex"),
+            &static_env,
+            &other_secrets,
+            false,
+            Some(&store),
+        )
+        .await
+        .expect("resolves (a foreign project's secret is simply absent → skipped)");
+        assert!(
+            !other.iter().any(|(k, _)| k == "API_KEY"),
+            "a tenant must not read another project's secret"
+        );
+
+        // Fail-closed: a boatramp: ref with no store configured errors (does not silently skip).
+        let err = resolve_secret_env(
+            "site",
+            ProjectRef::new("acme"),
+            &static_env,
+            &other_secrets,
+            false,
+            None,
+        )
+        .await
+        .expect_err("no store configured must fail closed");
+        assert!(err.contains("no internal secret store"), "{err}");
     }
 
     fn req() -> Request {

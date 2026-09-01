@@ -524,7 +524,15 @@ async fn build_function_bindings(
     // referent is logged and skipped). Under the multi-tenant posture a bare /
     // `env:` ref into the operator's environment is refused (fail-closed).
     let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
-    let env = resolve_secret_env(scope, &config.env, &config.secrets, allow_env_secret_refs)?;
+    let env = resolve_secret_env(
+        scope,
+        project,
+        &config.env,
+        &config.secrets,
+        allow_env_secret_refs,
+        inner.secret_store.get().map(std::convert::AsRef::as_ref),
+    )
+    .await?;
     Ok(bindings.with_env(env))
 }
 

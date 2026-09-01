@@ -138,6 +138,9 @@ pub async fn build_handler_runtime(
                 kv.clone(),
             ))
         });
+    // Keep a KV handle for the internal secret store before `kv` is moved into the
+    // runtime below.
+    let kv_for_secrets = kv.clone();
     let runtime =
         boatramp_server::HandlerRuntime::new(engine, kv, storage, Some(sql), Some(messaging));
     // Apply the posture's host-side blob cap + component-size cap.
@@ -145,6 +148,15 @@ pub async fn build_handler_runtime(
     runtime.set_max_component_bytes(max_component_bytes);
     // Apply the posture's host-env secret-ref gate (fail-closed if never set).
     runtime.set_allow_env_secret_refs(allow_env_secret_refs);
+    // Wire the project-scoped internal secret store when a `[secrets]` envelope is
+    // configured, so `boatramp:<name>` refs resolve (sealed at rest). Without an
+    // envelope there is no sealed store and such refs stay fail-closed.
+    if let Some(envelope) = secrets_envelope {
+        runtime.set_secret_store(Arc::new(boatramp_core::secret_store::SecretStore::new(
+            kv_for_secrets,
+            envelope,
+        )));
+    }
     Ok(runtime)
 }
 
