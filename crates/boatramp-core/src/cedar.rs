@@ -11,9 +11,10 @@
 //!   group per granted role, carrying a `<role>_sites : Set<String>` attribute for
 //!   every target-scoped role (the raw grant targets — a `"<project>/<site>"` for a
 //!   site role, a bare `"<project>"` for a project role; always present, possibly empty).
-//! - **Resource** = `BR::<Resource>::"<id>"`. The two target-scoped resources carry
+//! - **Resource** = `BR::<Resource>::"<id>"`. The target-scoped resources carry
 //!   attributes the scoping guards read: `BR::Site` a `name` (the full `project/site`)
-//!   and a `project` (its project segment); `BR::Project` a `name` (the project).
+//!   and a `project` (its project segment); `BR::Project` and `BR::Secrets` a `name`
+//!   (the project).
 //! - **Action** = `BR::Action::"<action>"` with `read`/`write`/`deploy` parented to
 //!   `admin`, so an `admin` grant (`action in [BR::Action::"admin"]`) covers every
 //!   action — mirroring `Right::satisfies`' "granted Admin ⇒ any action".
@@ -187,6 +188,7 @@ fn resource_type(resource: Resource) -> &'static str {
     match resource {
         Resource::Site => "Site",
         Resource::Project => "Project",
+        Resource::Secrets => "Secrets",
         Resource::Blobs => "Blobs",
         Resource::Tokens => "Tokens",
         Resource::Certs => "Certs",
@@ -224,12 +226,12 @@ fn principal_entity(
     Ok(Entity::new(principal_uid.clone(), attrs, parents)?)
 }
 
-/// Build the resource entity for a required right. The two target-scoped resources
+/// Build the resource entity for a required right. The target-scoped resources
 /// carry attributes the scoping guards read: `Site` is keyed by its full
 /// `"<project>/<site>"` target and carries both `name` (the full target, for a site
 /// grant) and `project` (its project segment, for a project-wildcard grant); `Project`
-/// is keyed + `name`-attributed by the project. Other resources are global singletons
-/// keyed by their type term, needing no attributes.
+/// and `Secrets` are keyed + `name`-attributed by the project. Other resources are
+/// global singletons keyed by their type term, needing no attributes.
 fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Error>> {
     let ty = resource_type(required.resource);
     let (id, attrs) = match required.resource {
@@ -247,7 +249,9 @@ fn resource_entity(required: &Right) -> Result<(EntityUid, Entity), Box<dyn Erro
             );
             (name, a)
         }
-        Resource::Project => {
+        // Both project-target-scoped: keyed + `name`-attributed by the project, so
+        // the shared `RoleTarget` guard (`…_sites.contains(resource.name)`) matches.
+        Resource::Project | Resource::Secrets => {
             let name = required.target.clone().unwrap_or_default();
             let mut a = HashMap::new();
             a.insert(

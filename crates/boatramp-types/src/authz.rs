@@ -30,11 +30,12 @@ pub enum Action {
     Admin,
 }
 
-/// A class of control-plane resource a [`Right`] governs. Two are **target-scoped**:
+/// A class of control-plane resource a [`Right`] governs. Three are **target-scoped**:
 /// [`Resource::Site`] (target = `"<project>/<site>"`, the 0.2.0 project-qualified
-/// form) and [`Resource::Project`] (target = `"<project>"`, governing the project's
-/// **own** resources — functions, compute, workflows, and the project entity itself).
-/// The rest are global.
+/// form), [`Resource::Project`] (target = `"<project>"`, governing the project's
+/// **own** resources — functions, compute, workflows, and the project entity itself),
+/// and [`Resource::Secrets`] (target = `"<project>"`, the project's sealed secret
+/// store). The rest are global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Resource {
@@ -43,6 +44,10 @@ pub enum Resource {
     /// A project (`target` = `"<project>"`): its functions, compute, workflows, and
     /// project-level config/CRUD. The owning + tenant boundary above a site.
     Project,
+    /// A project's internal secret store (`target` = `"<project>"`): the sealed
+    /// `boatramp:<name>` values. Separate from [`Resource::Project`] so managing
+    /// credentials is a distinct, admin-gated right, auditable on its own.
+    Secrets,
     /// Content-addressed blob uploads (`PUT /api/blobs/<hash>`).
     Blobs,
     /// API token management (`/api/tokens`).
@@ -57,9 +62,10 @@ pub enum Resource {
 
 impl Resource {
     /// Every resource variant — used to expand the `admin` role to "all rights".
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Site,
         Self::Project,
+        Self::Secrets,
         Self::Blobs,
         Self::Tokens,
         Self::Certs,
@@ -72,6 +78,7 @@ impl Resource {
         match self {
             Self::Site => "site",
             Self::Project => "project",
+            Self::Secrets => "secrets",
             Self::Blobs => "blobs",
             Self::Tokens => "tokens",
             Self::Certs => "certs",
@@ -226,6 +233,15 @@ impl Right {
                         None => Self::new(Resource::System, None, Action::Admin),
                     }
                 }
+                // The project's internal secret store: sensitive (sealed credentials),
+                // so gated above the general project-owned mapping with its own
+                // `Resource::Secrets` — list with `Read`, mutate with `Write` (both
+                // satisfied by a `Secrets·Admin` grant); target = the project.
+                Some((&"secrets", _)) => Self::new(
+                    Resource::Secrets,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Write },
+                ),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -665,6 +681,10 @@ impl AuthzPolicy {
             "project_admin".to_string(),
             vec![
                 RightTemplate::scoped(Resource::Project, Action::Admin),
+                // Managing the project's sealed secrets is an admin-level right
+                // (reading/rotating credentials), granted to the project admin only —
+                // not to publishers, who merely *reference* a `boatramp:<name>`.
+                RightTemplate::scoped(Resource::Secrets, Action::Admin),
                 RightTemplate::project_wildcard(Resource::Site, Action::Admin),
                 RightTemplate::any(Resource::Blobs, Action::Deploy),
             ],
@@ -1137,6 +1157,36 @@ mod tests {
                     Action::Deploy,
                 )),
             ),
+            // Project-scoped internal secrets: the dedicated `Resource::Secrets`
+            // (target = the project), listed with Read, mutated with Write — NOT the
+            // general project-owned `Project·Deploy` mapping.
+            (
+                "GET",
+                "/api/projects/acme/secrets",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Read,
+                )),
+            ),
+            (
+                "POST",
+                "/api/projects/acme/secrets",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Write,
+                )),
+            ),
+            (
+                "DELETE",
+                "/api/projects/acme/secrets/db-password",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Write,
+                )),
+            ),
         ];
         for (method, path, expected) in cases {
             assert_eq!(
@@ -1337,6 +1387,61 @@ mod tests {
             Resource::Site,
             Some("blog".into()),
             Action::Read
+        )));
+    }
+
+    #[test]
+    fn secrets_are_managed_by_project_admin_only_and_project_scoped() {
+        let policy = AuthzPolicy::default_policy();
+
+        // project_admin:acme manages acme's secrets (list + mutate, via Secrets·Admin)…
+        let admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        for action in [Action::Read, Action::Write, Action::Admin] {
+            assert!(
+                admin.allows(&Right::new(Resource::Secrets, Some("acme".into()), action)),
+                "project-admin:acme manages acme secrets·{action:?}"
+            );
+        }
+        // …but NOT another project's secrets — the tenant boundary.
+        assert!(!admin.allows(&Right::new(
+            Resource::Secrets,
+            Some("globex".into()),
+            Action::Read
+        )));
+
+        // A project publisher ships + configures but must NOT manage secrets
+        // (credentials are admin-gated; a publisher only *references* boatramp:<name>).
+        let publisher = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        assert!(!publisher.allows(&Right::new(
+            Resource::Secrets,
+            Some("acme".into()),
+            Action::Read
+        )));
+        assert!(!publisher.allows(&Right::new(
+            Resource::Secrets,
+            Some("acme".into()),
+            Action::Write
+        )));
+
+        // A project viewer can't even list secret names.
+        let viewer = policy.rights_for(&[GrantedRole::scoped("project_viewer", "acme")]);
+        assert!(!viewer.allows(&Right::new(
+            Resource::Secrets,
+            Some("acme".into()),
+            Action::Read
+        )));
+
+        // The global admin manages every project's secrets (via Resource::ALL).
+        let root = policy.rights_for(&[GrantedRole::global("admin")]);
+        assert!(root.allows(&Right::new(
+            Resource::Secrets,
+            Some("acme".into()),
+            Action::Admin
+        )));
+        assert!(root.allows(&Right::new(
+            Resource::Secrets,
+            Some("globex".into()),
+            Action::Write
         )));
     }
 
