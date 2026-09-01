@@ -47,6 +47,11 @@ sha2.workspace = true
 hex.workspace = true
 lru.workspace = true
 getrandom.workspace = true
+# Dialect-aware SQL tokenizer for the guest-SQL reserved-session-key guard
+# (`sql::reject_reserved_session_writes`): comments/whitespace are normalized away
+# and casing/quoting handled, so a hostile guest cannot smuggle a reserved
+# `boatramp.*` / `@boatramp_*` write past a naive string filter.
+sqlparser.workspace = true
 
 # COSE/CWT tokens + Cedar authorization (`authz` feature). Optional, native only.
 coset = { version = "0.3", optional = true }

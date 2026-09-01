@@ -171,20 +171,38 @@ pub trait SqlBackend: Send + Sync {
 /// on, boatramp injects the request's tenant into those keys for the app's RLS, so a
 /// guest that could overwrite them would spoof its tenant and defeat that RLS.
 ///
-/// The match is deliberately **narrow** — only the reserved prefix is refused, so
-/// ordinary app SQL (`SET statement_timeout = …`, `SET search_path = …`, a `SELECT`
-/// mentioning "set" in an identifier or string) is untouched. Recognised hostile forms:
+/// The statement is **tokenized with `sqlparser`** (the [`GenericDialect`], which lexes
+/// Postgres `"idents"`, MySQL backticks, `@vars`, and comments), not string-matched, so
+/// the earlier naive filter's bypasses are closed: comments and whitespace are normalized
+/// away (`SET/*x*/ boatramp.project`, `/*c*/SET …`), casing is folded, and a
+/// concatenated / non-literal `set_config` argument can no longer smuggle the reserved
+/// name past the check. The match stays **narrow** — ordinary app SQL
+/// (`SET statement_timeout = …`, `SET search_path TO …`, `set_config('search_path', …)`,
+/// a `SELECT` merely mentioning "set" or "boatramp.project") is untouched.
 ///
-/// - `set_config('boatramp.<anything>', …)` — the Postgres GUC setter (in any casing,
-///   with any surrounding whitespace), whether written as its own statement or inside a
-///   `SELECT`.
-/// - a statement whose **leading keyword** is `SET` / `RESET` / `DISCARD` (including
-///   `SET SESSION` / `SET LOCAL`) targeting a `boatramp.` GUC or an `@boatramp_` var.
+/// Recognised hostile forms (all rejected):
+///
+/// - a statement whose leading keyword is `SET` / `SET SESSION` / `SET LOCAL` /
+///   `RESET` / `DISCARD` whose target is a `boatramp.*` GUC or an `@boatramp_*` var
+///   (`RESET ALL` / `DISCARD ALL` reset custom GUCs too, so they are refused);
+/// - any `set_config(<arg1>, …)` call — anywhere, incl. inside a `SELECT` — whose first
+///   argument is a single-quoted string literal naming `boatramp` / `boatramp.*`, **or**
+///   whose first argument is not a single simple string literal at all (a concatenation
+///   or other expression could construct `boatramp.*` at runtime; a legitimate caller
+///   always passes a plain literal such as `'search_path'`).
+///
+/// **Fail-closed:** if the tokenizer cannot lex the statement at all, it is rejected — a
+/// guest statement the guard cannot understand must not slip through while a session
+/// context is injected.
 ///
 /// Returns [`SqlError::Other`] with a clear message on a match, else `Ok(())`.
 pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
-    /// The reserved GUC namespace (Postgres) and MySQL user-var prefix, lowercased.
-    const GUC_PREFIX: &str = "boatramp.";
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer, Word};
+
+    /// The reserved GUC namespace (Postgres) — the first dotted segment, lowercased.
+    const GUC_NAMESPACE: &str = "boatramp";
+    /// The reserved MySQL user-var prefix, lowercased (an `@`-prefixed identifier).
     const MYSQL_VAR_PREFIX: &str = "@boatramp_";
 
     let refused = || {
@@ -196,60 +214,108 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
         ))
     };
 
-    // Lowercase once for case-insensitive keyword/identifier matching. Reserved keys
-    // are ASCII, so a byte-wise lowercase is exact for them.
-    let lower = sql.to_ascii_lowercase();
+    // Tokenize with the generic dialect: it lexes Postgres `"idents"`, MySQL backticks,
+    // `@vars`, and both comment styles, folding comments/whitespace into `Whitespace`
+    // tokens we then drop. A statement the tokenizer rejects fails closed (below).
+    let dialect = GenericDialect {};
+    let Ok(raw) = Tokenizer::new(&dialect, sql).tokenize() else {
+        // Fail closed: an unlexable guest statement (e.g. an unbalanced backtick like
+        // `SET @`boatramp_project`=1`) must not pass while a context is injected.
+        return refused();
+    };
 
-    // 1. `set_config('boatramp.…', …)` anywhere (it is a function call, so it can hide
-    //    inside a SELECT — including several in one statement). Check EVERY occurrence,
-    //    tolerant of whitespace after `(` and around the opening quote — e.g.
-    //    `set_config ( 'boatramp.project' , … )`.
-    for (pos, _) in lower.match_indices("set_config") {
-        let after = lower[pos + "set_config".len()..].trim_start();
-        let Some(args) = after.strip_prefix('(') else {
-            continue;
-        };
-        let arg0 = args.trim_start();
-        // The first argument is the setting name as a quoted string literal.
-        let Some(name) = arg0.strip_prefix('\'').or_else(|| arg0.strip_prefix('"')) else {
-            continue;
-        };
-        if name.trim_start().starts_with(GUC_PREFIX) {
-            return refused();
+    // Drop whitespace/comment tokens so a comment cannot split a keyword or hide inside
+    // a `set_config(` call. What remains are the statement's significant tokens.
+    let toks: Vec<&Token> = raw
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+
+    // The unquoted, case-folded text of a `Word` token, or `None` for any other token.
+    // Quoted identifiers keep their inner text (so a backtick-/double-quoted reserved
+    // name is still recognized), just without the quotes.
+    fn word_lc(tok: &Token) -> Option<String> {
+        match tok {
+            Token::Word(Word { value, .. }) => Some(value.to_ascii_lowercase()),
+            _ => None,
         }
     }
 
-    // 2. A leading `SET` / `RESET` / `DISCARD` targeting the reserved keys. Tokenize the
-    //    leading whitespace-separated words so `SET SESSION` / `SET LOCAL` are handled.
-    let mut words = lower.split_whitespace();
-    match words.next() {
-        // DISCARD ALL / DISCARD … resets ALL session state incl. our GUCs, so a guest
-        // must not run it while a session context is active.
-        Some("discard") => return refused(),
-        Some("reset") => {
-            // `RESET boatramp.project` / `RESET ALL` (ALL clears our GUC too).
-            if let Some(target) = words.next() {
-                if target == "all" || target.starts_with(GUC_PREFIX) {
+    // Whether a case-folded identifier names a reserved key: the MySQL `@boatramp_*`
+    // user var, or (as the leading segment of a GUC) the `boatramp` namespace.
+    let is_reserved_var = |w: &str| w.starts_with(MYSQL_VAR_PREFIX);
+
+    // ---- (a) A leading SET / RESET / DISCARD targeting a reserved key. ----
+    if let Some(first) = toks.first().and_then(|t| word_lc(t)) {
+        match first.as_str() {
+            // DISCARD [ALL|…]: DISCARD ALL resets every session GUC (incl. ours); any
+            // DISCARD is a broad session reset, so refuse it outright under a context.
+            "discard" => return refused(),
+            "reset" => {
+                // `RESET boatramp.project` (target segment == namespace) or `RESET ALL`
+                // (clears custom GUCs too).
+                if let Some(target) = toks.get(1).and_then(|t| word_lc(t)) {
+                    if target == "all" || target == GUC_NAMESPACE || is_reserved_var(&target) {
+                        return refused();
+                    }
+                }
+            }
+            "set" => {
+                // Skip an optional SESSION / LOCAL qualifier, then inspect the target.
+                let mut idx = 1;
+                if matches!(
+                    toks.get(idx).and_then(|t| word_lc(t)).as_deref(),
+                    Some("session") | Some("local")
+                ) {
+                    idx += 1;
+                }
+                if let Some(target) = toks.get(idx).and_then(|t| word_lc(t)) {
+                    // A GUC is `boatramp` `.` `project` (dotted); the MySQL var is the
+                    // single `@boatramp_*` word. Either way the first identifier decides.
+                    if target == GUC_NAMESPACE || is_reserved_var(&target) {
+                        return refused();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- (b) A `set_config(<arg1>, …)` call anywhere (it can hide inside a SELECT, and
+    // more than one can appear). For each `set_config` word immediately followed by `(`,
+    // inspect the first argument: reject unless it is a single simple string literal that
+    // does NOT start with `boatramp.`. A concatenation/expression first arg is refused
+    // (it could build `boatramp.*` at runtime). ----
+    for (i, tok) in toks.iter().enumerate() {
+        if word_lc(tok).as_deref() != Some("set_config") {
+            continue;
+        }
+        // Must be a call: the next significant token is `(`.
+        if !matches!(toks.get(i + 1), Some(Token::LParen)) {
+            continue;
+        }
+        // The first argument token and the token following it.
+        let arg0 = toks.get(i + 2);
+        let after = toks.get(i + 3);
+        match (arg0, after) {
+            // A single simple **string literal** delimited by `,` or `)` — the only form
+            // a legitimate caller uses for the setting name (`set_config('search_path', …)`).
+            // Allow it iff it does not name the reserved GUC namespace. Note the generic
+            // dialect lexes a double-quoted `"…"` as a *delimited identifier* (a quoted
+            // `Word`), not a string literal, so it falls through to the catch-all below —
+            // a non-idiomatic double-quoted first arg is refused, which is fine.
+            (Some(Token::SingleQuotedString(s)), Some(Token::Comma | Token::RParen)) => {
+                let name = s.to_ascii_lowercase();
+                // `boatramp` itself or `boatramp.<anything>` (`.` as the namespace boundary).
+                if name == GUC_NAMESPACE || name.starts_with(&format!("{GUC_NAMESPACE}.")) {
                     return refused();
                 }
             }
+            // Anything else as the first argument (a concatenation, a function call, a
+            // quoted identifier, a bind param, an empty `()`, …) cannot be proven safe →
+            // refuse: a non-literal could construct `boatramp.*` at runtime.
+            _ => return refused(),
         }
-        Some("set") => {
-            // Skip an optional SESSION / LOCAL qualifier, then inspect the target.
-            let mut target = words.next();
-            if matches!(target, Some("session") | Some("local")) {
-                target = words.next();
-            }
-            if let Some(t) = target {
-                // The target may be `name=value` or `name = value`; take the head up to
-                // `=` so `set boatramp.project='x'` (no spaces) is caught too.
-                let head = t.split('=').next().unwrap_or(t);
-                if head.starts_with(GUC_PREFIX) || head.starts_with(MYSQL_VAR_PREFIX) {
-                    return refused();
-                }
-            }
-        }
-        _ => {}
     }
 
     Ok(())
@@ -443,6 +509,81 @@ mod reserved_session_writes_tests {
         assert!(!rejected("SELECT set_config('search_path','app',false)"));
         assert!(!rejected(
             "SELECT set_config('statement_timeout', '5000', true)"
+        ));
+    }
+
+    // ---- bypasses of the earlier naive string filter, now closed by the tokenizer ----
+
+    /// A comment spliced into the keyword or between the function name and `(` used to
+    /// defeat the substring match; the tokenizer folds comments into whitespace we drop.
+    #[test]
+    fn inline_comment_splitting_the_keyword_is_rejected() {
+        assert!(rejected("SET/*x*/ boatramp.project='x'"));
+        assert!(rejected("set_config/*c*/('boatramp.project','x')"));
+    }
+
+    /// A leading comment used to push the real keyword out of the string's head.
+    #[test]
+    fn leading_comment_before_set_is_rejected() {
+        assert!(rejected("/*c*/SET boatramp.project='x'"));
+        assert!(rejected("/* hi */ set_config('boatramp.site','x')"));
+    }
+
+    /// String-concatenating the setting name hid `boatramp.` from a literal-prefix check;
+    /// a non-simple-literal first argument is now refused wholesale.
+    #[test]
+    fn set_config_with_concatenated_name_is_rejected() {
+        assert!(rejected(
+            "SELECT set_config('boat'||'ramp.project','x',false)"
+        ));
+        assert!(rejected(
+            "SELECT set_config('boatramp.'||'project','x',false)"
+        ));
+    }
+
+    /// MySQL quoting variants around the reserved user var.
+    #[test]
+    fn mysql_quoted_reserved_var_is_rejected() {
+        // Backtick-quoted whole var: `@boatramp_project` (one delimited identifier).
+        assert!(rejected("SET `@boatramp_project`=1"));
+        // `@` then a backtick-quoted name — an unbalanced/oddly-lexing form fails closed.
+        assert!(rejected("SET @`boatramp_project`=1"));
+    }
+
+    /// Casing of the keyword and of the `set_config` function name is folded.
+    #[test]
+    fn case_variants_are_rejected() {
+        assert!(rejected("sEt boatramp.project=1"));
+        assert!(rejected("SeT_config('boatramp.project','x')"));
+    }
+
+    /// The `set_config` guard tolerates whitespace/comments around the call and catches a
+    /// reserved call hiding after a benign one in the same statement.
+    #[test]
+    fn set_config_edge_forms_are_rejected() {
+        assert!(rejected(
+            "SELECT set_config ( 'boatramp.project' , 'v', false )"
+        ));
+        assert!(rejected(
+            "SELECT set_config('search_path','app',false), \
+             set_config('boatramp.project','v',false)"
+        ));
+    }
+
+    // ---- legit forms must still parse-and-pass (no regression) ----
+
+    #[test]
+    fn legit_set_and_set_config_forms_still_pass() {
+        assert!(!rejected("SET statement_timeout = '5s'"));
+        assert!(!rejected("SET search_path TO myschema"));
+        assert!(!rejected("SET SESSION time_zone = '+00:00'"));
+        assert!(!rejected("SET @my_var = 1"));
+        assert!(!rejected("RESET statement_timeout"));
+        assert!(!rejected("set_config('search_path','x',false)"));
+        assert!(!rejected("set_config('statement_timeout','5s',true)"));
+        // "set" / "boatramp.project" appearing only in identifiers or string literals.
+        assert!(!rejected(
+            "SELECT settings FROM t WHERE k = 'boatramp.project'"
         ));
     }
 }
