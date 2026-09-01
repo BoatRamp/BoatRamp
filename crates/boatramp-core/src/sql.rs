@@ -405,6 +405,28 @@ pub trait OperatorSql: Send + Sync {
     async fn query(&self, project: &str, db: &str, sql: &str) -> Result<SqlRows, SqlError>;
 }
 
+/// Tear down a deleted tenant's **managed** databases — the delete-time counterpart
+/// to the create-time provisioning of a per-tenant managed `sql` binding. When a
+/// project (or site) is deleted through the control plane, boatramp drops *that
+/// tenant's* databases + login roles + sealed credentials — exactly that tenant's,
+/// nothing else — so a deleted tenant leaves no orphaned data plane behind.
+///
+/// **Best-effort by contract.** Both methods return `()`: a deprovision failure is
+/// the implementation's to log, and must never block or fail the delete it hangs off
+/// (an orphaned database is a lesser evil than a delete that can't complete). The
+/// reserved `default` project is never touched — its "tenant" is the whole
+/// single-tenant install. Wired by the node when a compute-backed managed database
+/// exists; the delete handlers call it after the store delete succeeds.
+#[async_trait]
+pub trait TenantDeprovisioner: Send + Sync {
+    /// Deprovision every `Project`-scoped managed binding for the deleted `project`.
+    async fn deprovision_project(&self, project: &str);
+
+    /// Deprovision every `Site`-scoped managed binding for the deleted `site` of
+    /// `project`.
+    async fn deprovision_site(&self, project: &str, site: &str);
+}
+
 /// One transaction's worth of work. Dropping it without [`commit`] must leave
 /// the database unchanged (the engine rolls back).
 ///

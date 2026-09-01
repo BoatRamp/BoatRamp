@@ -255,6 +255,12 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // (the managed_db_resolver match moves the original).
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let operator_envelope = secrets_envelope.clone();
+    // …and a second clone for the tenant-deprovision capability (drops a deleted
+    // tenant's managed DB/role/credential on project/site delete). It needs a real
+    // envelope to seal/unseal + delete per-tenant credentials, so it is wired only
+    // when one is present (same fail-closed gating as the managed-DB paths).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let deprovision_envelope = secrets_envelope.clone();
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
         config
@@ -312,6 +318,28 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
     let operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>> = None;
 
+    // Tenant-deprovision capability (drop a deleted tenant's managed DB/role/sealed
+    // credential on project/site delete). Wired only when a compute-backed managed
+    // database + a secrets envelope are both present — same gating as operator_sql,
+    // plus the envelope requirement (it must seal/unseal per-tenant credentials).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>> = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .filter(|sql| !sql.databases.is_empty())
+        .zip(deprovision_envelope)
+        .map(|(sql, envelope)| {
+            Arc::new(crate::tenant_sql::NodeTenantDeprovisioner::new(
+                deploy.clone(),
+                kv.clone(),
+                envelope,
+                sql.databases.clone(),
+            )) as Arc<_>
+        });
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>> = None;
+
     // Operator compute-exec capability (run a command inside a running workload) —
     // backs `POST /api/compute/{name}/exec`, gated by the `allow_compute_exec`
     // posture. Clone the backend registry before the reconcile loop consumes it.
@@ -344,6 +372,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // Wire the operator capabilities onto the options the router is built from.
     let mut options = options;
     options.operator_sql = operator_sql;
+    options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
 
     Ok(RunningNode {

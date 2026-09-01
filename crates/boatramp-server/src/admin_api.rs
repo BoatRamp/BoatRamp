@@ -217,10 +217,22 @@ pub(super) async fn get_site_config(
 pub(super) async fn delete_site(
     State(deploy): State<DeployStore>,
     Extension(project): axum::extract::Extension<ProjectContext>,
+    Extension(deprovisioner): Extension<Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>>>,
     Path(site): Path<String>,
 ) -> Response {
     match deploy.delete_site(project.as_ref(), &site).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // The site is gone from the store. Best-effort: drop its managed
+            // databases + roles + sealed credentials (this site tenant's, nothing
+            // else). A failure is logged inside the deprovisioner and never affects
+            // this response — an orphaned DB is a lesser evil than a failed delete.
+            if let Some(deprovisioner) = deprovisioner {
+                deprovisioner
+                    .deprovision_site(project.as_ref().as_str(), &site)
+                    .await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => deploy_error_response(err),
     }
 }

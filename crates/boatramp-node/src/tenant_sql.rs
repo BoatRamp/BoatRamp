@@ -518,6 +518,112 @@ pub async fn deprovision_tenant(
     Ok(())
 }
 
+/// The node's [`TenantDeprovisioner`] — the delete-time orchestrator over
+/// [`deprovision_tenant`]. Holds everything a deprovision needs (the deploy store,
+/// KV, the secrets envelope, and the `databases` binding map) so the delete handlers
+/// can tear a deleted tenant's managed databases down after the store delete.
+///
+/// It walks the compute-backed **managed-credential** bindings and, matching each
+/// binding's `tenant_scope` against the axis of the delete (project vs site), drops
+/// exactly that tenant. Best-effort: every drop that fails is logged at `warn` and
+/// the walk continues — a stuck database never blocks the delete. The reserved
+/// `default` project is skipped outright (dropping the single-tenant install's
+/// database on a stray delete would be catastrophic; [`deprovision_tenant`] also
+/// guards it defensively).
+///
+/// [`TenantDeprovisioner`]: boatramp_core::sql::TenantDeprovisioner
+pub struct NodeTenantDeprovisioner {
+    deploy: DeployStore,
+    kv: Arc<dyn KvStore>,
+    envelope: Arc<dyn KeyEnvelope>,
+    databases: std::collections::BTreeMap<String, ExternalDatabaseConfig>,
+}
+
+impl NodeTenantDeprovisioner {
+    /// Build the deprovisioner from the wired managed-DB state. The same
+    /// (deploy, KV, envelope, databases) the provisioning + resolver seams use.
+    pub fn new(
+        deploy: DeployStore,
+        kv: Arc<dyn KvStore>,
+        envelope: Arc<dyn KeyEnvelope>,
+        databases: std::collections::BTreeMap<String, ExternalDatabaseConfig>,
+    ) -> Self {
+        Self {
+            deploy,
+            kv,
+            envelope,
+            databases,
+        }
+    }
+
+    /// Deprovision every compute-backed managed-credential binding whose
+    /// `tenant_scope` matches `scope`, for the tenant `(project, site)`. Best-effort:
+    /// log-and-continue on error, and never touch the reserved `default` project.
+    async fn deprovision_scope(&self, scope: TenantScope, project: &str, site: &str) {
+        if project == DEFAULT_PROJECT {
+            // The reserved default project is the single-tenant install; its managed
+            // database IS the install. A stray delete must never drop it.
+            return;
+        }
+        for (name, _kind, binding) in managed_bindings(&self.databases) {
+            // Only our managed-credential bindings on this delete's axis. A
+            // bring-your-own binding is filtered out by `managed_bindings` already;
+            // a `password_env` (operator-supplied credential) binding is left alone.
+            if !binding.is_managed_credential() || binding.tenant_scope != scope {
+                continue;
+            }
+            match deprovision_tenant(
+                &self.deploy,
+                &self.kv,
+                &self.envelope,
+                binding,
+                project,
+                site,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if matches!(scope, TenantScope::Site) {
+                        tracing::info!(
+                            binding = name,
+                            project,
+                            site,
+                            "deprovisioned managed database for deleted site tenant"
+                        );
+                    } else {
+                        tracing::info!(
+                            binding = name,
+                            project,
+                            "deprovisioned managed database for deleted project tenant"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    binding = name,
+                    project,
+                    site,
+                    error = %e,
+                    "managed-database deprovision failed (best-effort; delete not blocked)"
+                ),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl boatramp_core::sql::TenantDeprovisioner for NodeTenantDeprovisioner {
+    async fn deprovision_project(&self, project: &str) {
+        // A project tenant carries no site; the empty site is inert for Project scope.
+        self.deprovision_scope(TenantScope::Project, project, "")
+            .await;
+    }
+
+    async fn deprovision_site(&self, project: &str, site: &str) {
+        self.deprovision_scope(TenantScope::Site, project, site)
+            .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resolver seam: the node-side PerTenantSqlResolver.
 // ---------------------------------------------------------------------------
@@ -997,6 +1103,84 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// `deprovision_project("acme")` tears down EXACTLY acme's derived tenant (its
+    /// dedicated `Single` workload + sealed credential) and NEVER the reserved
+    /// `default` tenant's — the default-project guard. Uses `Single` isolation so the
+    /// teardown is observable without a live database: provisioning registers a
+    /// compute workload + seals a credential, and deprovision must remove acme's while
+    /// leaving default's (the single-tenant install) intact.
+    #[tokio::test]
+    async fn deprovision_project_targets_the_tenant_and_skips_default() {
+        use boatramp_core::sql::TenantDeprovisioner as _;
+
+        let binding = ExternalDatabaseConfig {
+            tenant: TenantIsolation::Single,
+            tenant_scope: TenantScope::Project,
+            ..shared_binding()
+        };
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+
+        // Provision two project tenants: the reserved `default` (single-tenant
+        // install, plain names) and the derived `acme`.
+        provision_tenant(&deploy, &kv, &envelope, &binding, "default", "")
+            .await
+            .unwrap();
+        provision_tenant(&deploy, &kv, &envelope, &binding, "acme", "")
+            .await
+            .unwrap();
+
+        let ident = sanitize_ident("acme");
+        let acme_wl = format!("pg-{ident}"); // acme's dedicated Single workload
+        let acme_cred = format!("managed-sql-cred/acme/pg-{ident}");
+        let default_cred = "managed-sql-cred/default/pg"; // the install's own key
+
+        // Preconditions: both tenants provisioned.
+        assert!(deploy
+            .get_compute_workload(ProjectRef::new("acme"), &acme_wl)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(kv.get(&acme_cred).await.unwrap().is_some());
+        assert!(kv.get(default_cred).await.unwrap().is_some());
+
+        let deprovisioner = NodeTenantDeprovisioner::new(
+            deploy.clone(),
+            kv.clone(),
+            envelope.clone(),
+            std::iter::once(("pg".to_string(), binding.clone())).collect(),
+        );
+
+        // Deleting the `default` project is a no-op (the default-project guard) — the
+        // single-tenant install must survive a stray delete.
+        deprovisioner.deprovision_project("default").await;
+        assert!(
+            kv.get(default_cred).await.unwrap().is_some(),
+            "default-project guard: the single-tenant install must never be dropped"
+        );
+
+        // Deleting `acme` tears down EXACTLY acme's workload + credential.
+        deprovisioner.deprovision_project("acme").await;
+        assert!(
+            deploy
+                .get_compute_workload(ProjectRef::new("acme"), &acme_wl)
+                .await
+                .unwrap()
+                .is_none(),
+            "acme's dedicated Single workload must be gone"
+        );
+        assert!(
+            kv.get(&acme_cred).await.unwrap().is_none(),
+            "acme's sealed credential must be gone"
+        );
+        // …and the default install is STILL untouched by the acme delete.
+        assert!(
+            kv.get(default_cred).await.unwrap().is_some(),
+            "acme delete must not touch the default install's credential"
+        );
     }
 
     /// A **Single** binding's default tenant seals its credential under the bare

@@ -98,6 +98,7 @@ pub(super) async fn get_project(
 /// owns resources or is the reserved `default`; `404` if it never existed.
 pub(super) async fn delete_project(
     State(deploy): State<DeployStore>,
+    Extension(deprovisioner): Extension<Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>>>,
     Path(proj): Path<String>,
 ) -> Response {
     if proj == DEFAULT_PROJECT {
@@ -108,7 +109,16 @@ pub(super) async fn delete_project(
             .into_response();
     }
     match deploy.delete_project(&proj).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // The project is gone from the store. Best-effort: drop its managed
+            // databases + roles + sealed credentials (the tenant's, nothing else).
+            // A failure is logged inside the deprovisioner and never affects this
+            // response — an orphaned DB is a lesser evil than a failed delete.
+            if let Some(deprovisioner) = deprovisioner {
+                deprovisioner.deprovision_project(&proj).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, format!("no project `{proj}`\n")).into_response(),
         Err(DeployError::Conflict(msg)) => {
             (StatusCode::CONFLICT, format!("{msg}\n")).into_response()

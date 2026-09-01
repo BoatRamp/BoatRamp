@@ -733,6 +733,11 @@ pub struct ServerOptions {
     /// sealed credential, resolved server-side). Backs `POST /api/sql/{db}/{exec,query}`;
     /// `None` ⇒ those routes return `501`. Wired by the node when a managed DB exists.
     pub operator_sql: Option<Arc<dyn boatramp_core::sql::OperatorSql>>,
+    /// Tenant-deprovision capability: drops a deleted tenant's managed databases +
+    /// roles + sealed credentials on project/site delete. `None` ⇒ delete does no
+    /// managed-DB teardown. Wired by the node when a compute-backed managed database
+    /// exists; the delete handlers call it best-effort after the store delete.
+    pub tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>>,
     /// Operator compute-exec capability (run a command inside a running workload).
     /// Backs `POST /api/compute/{name}/exec`; `None` ⇒ `501`. Gated at the handler by
     /// the `allow_compute_exec` posture. Wired by the node with the compute backends.

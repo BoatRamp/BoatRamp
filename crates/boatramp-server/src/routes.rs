@@ -48,6 +48,7 @@ pub fn router_with_fast(
     // `Option<Arc>` clones; they ride as `api` extensions read by the admin handlers.
     // (`_cap` suffix so they don't shadow the `sql_exec`/`compute_exec` handler fns.)
     let operator_sql_cap = options.operator_sql.clone();
+    let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     // Bind the auth layer's per-request PoP enforcement: the fleet's canonical
     // origin (the proof's required `aud`) and whether every token must be
@@ -346,6 +347,7 @@ pub fn router_with_fast(
         .layer(Extension(mesh_control))
         .layer(Extension(probe))
         .layer(Extension(operator_sql_cap))
+        .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]
