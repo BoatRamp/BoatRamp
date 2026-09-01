@@ -193,6 +193,11 @@ pub trait SqlBackend: Send + Sync {
 /// - a statement whose leading keyword is `SET` / `SET SESSION` / `SET LOCAL` /
 ///   `RESET` / `DISCARD` whose target is a `boatramp.*` GUC or an `@boatramp_*` var
 ///   (`RESET ALL` / `DISCARD ALL` reset custom GUCs too, so they are refused);
+/// - **any** `@boatramp_*` MySQL user-var token appearing *anywhere* in the statement
+///   — MySQL writes it not only as the leading `SET` target but after a comma
+///   (`SET @x=1, @boatramp_project=…`, incl. `:=`) or via `SELECT … INTO @boatramp_*`
+///   (no `SET` at all); the reserved namespace is refused position-independently
+///   (Postgres has no such token and a MySQL app never names the reserved var);
 /// - any `set_config(<arg1>, …)` call — anywhere, incl. inside a `SELECT` — whose first
 ///   argument is a single-quoted string literal naming `boatramp` / `boatramp.*`, **or**
 ///   whose first argument is not a single simple string literal at all (a concatenation
@@ -271,6 +276,21 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
     if toks
         .iter()
         .any(|t| matches!(t, Token::DollarQuotedString(_)))
+    {
+        return refused();
+    }
+
+    // ---- (0b) A reserved MySQL user var (`@boatramp_*`) appearing ANYWHERE. MySQL
+    // writes it not only via a leading `SET` but also mid-`SET` after a comma
+    // (`SET @x=1, @boatramp_project='v'` — a `:=` variant too) and via
+    // `SELECT … INTO @boatramp_project` (no `SET` keyword at all), none of which the
+    // leading-token check (a) sees. Postgres has no legitimate `@boatramp_*` token and
+    // a MySQL app never needs to name the reserved var, so a **position-independent**
+    // refusal (like the `set_config` scan) closes the whole family — comma-assign,
+    // `SELECT … INTO`, `:=`, and case/quote variants. ----
+    if toks
+        .iter()
+        .any(|t| word_lc(t).is_some_and(|w| is_reserved_var(&w)))
     {
         return refused();
     }
@@ -697,6 +717,22 @@ mod reserved_session_writes_tests {
         assert!(rejected("ALTER DATABASE app SET boatramp.site = 'victim'"));
     }
 
+    /// Round-2 High: MySQL writes the reserved `@boatramp_*` user var without it being
+    /// the first `SET` target — via a comma-list, a `:=` variant, or
+    /// `SELECT … INTO @var` (no `SET` at all) — evading the leading-target check. A
+    /// position-independent reserved-var refusal closes the whole family.
+    #[test]
+    fn mysql_reserved_var_anywhere_is_rejected() {
+        assert!(rejected("SET @x=1, @boatramp_project='victim'"));
+        assert!(rejected("SET @a=1, @b=2, @boatramp_project='victim'"));
+        assert!(rejected("SET @x:=1, @boatramp_project:='victim'"));
+        assert!(rejected("SELECT 'victim' INTO @boatramp_project"));
+        assert!(rejected("SELECT 'victim' AS v INTO @boatramp_project"));
+        assert!(rejected("SELECT 1,'victim' INTO @junk, @boatramp_project"));
+        assert!(rejected("select 'victim' into @boatramp_project"));
+        assert!(rejected("SELECT 'v' INTO @boatramp_site"));
+    }
+
     // ---- legit forms must still parse-and-pass (no regression) ----
 
     #[test]
@@ -721,5 +757,10 @@ mod reserved_session_writes_tests {
             "CREATE TABLE orders (id bigint primary key, total numeric)"
         ));
         assert!(!rejected("ALTER TABLE orders ADD COLUMN note text"));
+        // Non-reserved MySQL user vars (comma-list and `SELECT … INTO`) are untouched —
+        // only the `@boatramp_*` namespace is refused.
+        assert!(!rejected("SET @x = 1, @y = 2"));
+        assert!(!rejected("SELECT 42 INTO @myvar"));
+        assert!(!rejected("SELECT total INTO @t FROM orders WHERE id = $1"));
     }
 }
