@@ -544,6 +544,9 @@ pub struct NodeTenantSqlResolver {
     pool_max: Option<u32>,
     read_only: bool,
     connect_timeout: Option<Duration>,
+    // The full binding, kept so `resolve` can lazily provision the tenant (idempotent)
+    // before handing back a connection — the server is up by the time a request arrives.
+    binding: ExternalDatabaseConfig,
 }
 
 impl NodeTenantSqlResolver {
@@ -573,6 +576,7 @@ impl NodeTenantSqlResolver {
             pool_max: binding.pool_max,
             read_only: binding.read_only,
             connect_timeout: binding.connect_timeout_secs.map(Duration::from_secs),
+            binding: binding.clone(),
         })
     }
 
@@ -585,6 +589,23 @@ impl NodeTenantSqlResolver {
 #[async_trait]
 impl PerTenantSqlResolver for NodeTenantSqlResolver {
     async fn resolve(&self, project: &str, site: &str) -> Result<Arc<dyn SqlBackend>, SqlError> {
+        // Lazily provision this tenant's database/role (Shared) or dedicated workload
+        // (Single) before connecting — idempotent, and the composite caches the built
+        // backend per tenant so this runs once per tenant, when the server is already
+        // serving (so the maintenance connection for Shared DDL succeeds). This is the
+        // provisioning trigger; a create-time hook can also call `provision_tenant`
+        // ahead of the first request, but this guarantees the tenant is ready.
+        provision_tenant(
+            &self.deploy,
+            &self.kv,
+            &self.envelope,
+            &self.binding,
+            project,
+            site,
+        )
+        .await
+        .map_err(SqlError::other)?;
+
         let (tenant_ident_raw, is_default) = tenant_key(self.scope, project, site);
         let names = tenant_names(
             self.isolation,
