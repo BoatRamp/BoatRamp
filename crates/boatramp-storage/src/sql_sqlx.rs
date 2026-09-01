@@ -187,21 +187,58 @@ pub fn connect(
     }
 }
 
+/// Resolves a named binding to the caller's **own tenant's** SQL backend — the
+/// per-tenant seam for the managed-database data plane.
+///
+/// Registered on a [`CompositeSqlBackends`] entry for a compute-backed managed
+/// binding (every such binding is per-tenant; only a bring-your-own `url_env`
+/// binding stays shared). Given the request's `(project, site)`, the implementation
+/// (in `boatramp-node`) derives the tenant, resolves the per-tenant database +
+/// credential, and returns a [`SqlBackend`](boatramp_core::sql::SqlBackend) that
+/// connects **as that tenant's role to that tenant's database** — the isolation
+/// perimeter. The composite caches the returned backend per `(binding, tenant)`.
+///
+/// Security: an implementation MUST derive names/credentials from `(project, site)`
+/// alone (never from guest-controlled request state beyond those already-validated
+/// identity parts), so tenant A's request can only ever resolve to tenant A's
+/// credential.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[async_trait::async_trait]
+pub trait PerTenantSqlResolver: Send + Sync {
+    /// The [`SqlBackend`](boatramp_core::sql::SqlBackend) for the tenant identified by
+    /// `(project, site)` (per the binding's `tenant`/`tenant_scope`). Returns a fresh
+    /// or cached backend that connects as the tenant's role to the tenant's database.
+    async fn resolve(
+        &self,
+        project: &str,
+        site: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError>;
+}
+
 /// A [`SqlBackends`](boatramp_core::sql::SqlBackends) that overlays
 /// operator-configured **external** databases on a managed `default` (libsql).
 ///
-/// A guest `open(name)` for a configured name gets that shared external backend;
-/// any other name falls through to `default` — the per-site libsql file or
-/// namespace, isolation intact. External databases are **global and shared**
-/// across every site/function that opens the name (see the module docs); a
-/// preview deployment is refused an external database unless it was registered
-/// with `allow_preview`, mirroring the managed backend's safe-by-default preview
-/// policy so a preview can't reach the operator's live external database by
-/// accident.
+/// A guest `open(name)` for a configured name gets that binding's backend; any
+/// other name falls through to `default` — the per-site libsql file or namespace,
+/// isolation intact. A binding is one of two shapes:
+///
+/// - **Shared external** ([`with_external`](Self::with_external)) — a bring-your-own
+///   `url_env` database: a single *shared* endpoint reached by every project/site
+///   that opens the name (isolation is the operator's; see the module docs).
+/// - **Per-tenant** ([`with_per_tenant`](Self::with_per_tenant)) — a compute-backed
+///   *managed* database: the name resolves, per request `(project, site)`, to the
+///   caller's own tenant database via a [`PerTenantSqlResolver`]. The resolved
+///   backend is cached per `(name, tenant-cache-key)` so a hot path doesn't
+///   re-derive + reconnect each call.
+///
+/// A preview deployment is refused an external/per-tenant database unless it was
+/// registered with `allow_preview`, mirroring the managed backend's safe-by-default
+/// preview policy so a preview can't reach live data by accident.
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub struct CompositeSqlBackends {
     default: Arc<dyn boatramp_core::sql::SqlBackends>,
     external: std::collections::HashMap<String, ExternalEntry>,
+    per_tenant: std::collections::HashMap<String, PerTenantEntry>,
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -210,18 +247,51 @@ struct ExternalEntry {
     allow_preview: bool,
 }
 
+/// A per-tenant binding: its resolver plus a cache of already-resolved per-tenant
+/// backends keyed by the resolver's tenant-cache key (`"<project>"` or
+/// `"<project>/<site>"`). The cache guard is a plain `std::sync::Mutex` held only to
+/// read/insert the `Arc` (never across the resolver's `.await`).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+struct PerTenantEntry {
+    resolver: Arc<dyn PerTenantSqlResolver>,
+    allow_preview: bool,
+    /// The tenant grain (`tenant_scope == Site`) — selects the cache key shape.
+    site_scoped: bool,
+    cache: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<dyn boatramp_core::sql::SqlBackend>>,
+    >,
+}
+
+/// The `(project, site)`-derived key under which a per-tenant binding caches its
+/// resolved backend. Mirrors the tenant grain: a project tenant caches by project;
+/// a finer site tenant caches by `"<project>/<site>"`. Kept in this crate (not the
+/// node) so the composite can key its cache without a node dependency; the node's
+/// resolver derives the *same* tenant identity from the same inputs. `site_scoped`
+/// selects the grain (the binding's `tenant_scope == Site`).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+fn tenant_cache_key(project: &str, site: &str, site_scoped: bool) -> String {
+    if site_scoped {
+        format!("{project}/{site}")
+    } else {
+        project.to_string()
+    }
+}
+
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 impl CompositeSqlBackends {
     /// Wrap the managed `default` backend; register external databases with
-    /// [`with_external`](Self::with_external).
+    /// [`with_external`](Self::with_external) and per-tenant managed ones with
+    /// [`with_per_tenant`](Self::with_per_tenant).
     pub fn new(default: Arc<dyn boatramp_core::sql::SqlBackends>) -> Self {
         Self {
             default,
             external: std::collections::HashMap::new(),
+            per_tenant: std::collections::HashMap::new(),
         }
     }
 
-    /// Register a named external backend (built via [`connect`]). `allow_preview`
+    /// Register a named **shared external** backend (built via [`connect`]) — a
+    /// bring-your-own `url_env` database, a single shared endpoint. `allow_preview`
     /// permits preview deployments to reach it; naming it `""` replaces the
     /// site's default managed database with the shared external one.
     pub fn with_external(
@@ -240,10 +310,61 @@ impl CompositeSqlBackends {
         self
     }
 
-    /// Whether any external database is registered (else the composite is a pure
-    /// pass-through and the caller may use the `default` directly).
+    /// Register a named **per-tenant** managed binding: a `resolver` that maps the
+    /// request's `(project, site)` to the caller's own tenant database, plus the
+    /// tenant grain (`site_scoped` = the binding's `tenant_scope == Site`), used to
+    /// key the resolved-backend cache. `allow_preview` permits preview deployments.
+    pub fn with_per_tenant(
+        mut self,
+        name: impl Into<String>,
+        resolver: Arc<dyn PerTenantSqlResolver>,
+        site_scoped: bool,
+        allow_preview: bool,
+    ) -> Self {
+        self.per_tenant.insert(
+            name.into(),
+            PerTenantEntry {
+                resolver,
+                allow_preview,
+                site_scoped,
+                cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+        );
+        self
+    }
+
+    /// Whether any external or per-tenant database is registered (else the composite
+    /// is a pure pass-through and the caller may use the `default` directly).
     pub fn has_external(&self) -> bool {
-        !self.external.is_empty()
+        !self.external.is_empty() || !self.per_tenant.is_empty()
+    }
+
+    /// Resolve a per-tenant binding for `(project, site)`, caching the result by the
+    /// binding's tenant grain so a hot path re-uses the connection. The lock is held
+    /// only for the map read/insert, never across the resolver's `.await`.
+    async fn resolve_per_tenant(
+        &self,
+        entry: &PerTenantEntry,
+        project: &str,
+        site: &str,
+    ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        let key = tenant_cache_key(project, site, entry.site_scoped);
+        if let Some(hit) = entry
+            .cache
+            .lock()
+            .expect("per-tenant sql cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(hit);
+        }
+        let backend = entry.resolver.resolve(project, site).await?;
+        entry
+            .cache
+            .lock()
+            .expect("per-tenant sql cache poisoned")
+            .insert(key, backend.clone());
+        Ok(backend)
     }
 }
 
@@ -256,13 +377,18 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
         site: &str,
         name: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
-        // An external database is a single *shared* endpoint by design (see the
-        // type docs): every project/site opening the name reaches it. Only the
-        // managed `default` fall-through is per-tenant, and it qualifies the
-        // site by `project` itself.
+        // A per-tenant managed binding resolves to the caller's OWN tenant database
+        // (the isolation perimeter), keyed by (project, site) per its grain.
+        if let Some(entry) = self.per_tenant.get(name) {
+            return self.resolve_per_tenant(entry, project, site).await;
+        }
+        // A bring-your-own external database is a single *shared* endpoint by design
+        // (see the type docs): every project/site opening the name reaches it.
         if let Some(entry) = self.external.get(name) {
             return Ok(entry.backend.clone());
         }
+        // Fall-through: the managed `default` (per-site libsql), which qualifies the
+        // site by `project` itself.
         self.default.database(project, site, name).await
     }
 
@@ -273,6 +399,18 @@ impl boatramp_core::sql::SqlBackends for CompositeSqlBackends {
         name: &str,
         preview: &str,
     ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+        if let Some(entry) = self.per_tenant.get(name) {
+            if entry.allow_preview {
+                // A preview shares its parent tenant's managed database (there is no
+                // separate per-preview managed server); the parent's isolation still
+                // holds. Gated by `allow_preview` exactly like the shared-external case.
+                return self.resolve_per_tenant(entry, project, site).await;
+            }
+            return Err(SqlError::Other(format!(
+                "managed database `{name}` is not available to preview deployments \
+                 (set `allow_preview` on it to permit that)"
+            )));
+        }
         if let Some(entry) = self.external.get(name) {
             if entry.allow_preview {
                 return Ok(entry.backend.clone());
@@ -1100,5 +1238,114 @@ mod tests {
             .await,
             "sql error: DEFAULT"
         );
+    }
+
+    // ---- per-tenant seam: routing + caching ------------------------------
+
+    /// A resolver that hands out a `TagBackend` tagged with the tenant it was asked
+    /// for, and counts how many times it actually ran (to prove the composite caches).
+    struct TenantTagResolver {
+        calls: std::sync::Mutex<usize>,
+    }
+    #[async_trait::async_trait]
+    impl PerTenantSqlResolver for TenantTagResolver {
+        async fn resolve(
+            &self,
+            project: &str,
+            site: &str,
+        ) -> Result<Arc<dyn boatramp_core::sql::SqlBackend>, SqlError> {
+            *self.calls.lock().unwrap() += 1;
+            // Leak the per-tenant tag so `TagBackend`'s &'static str requirement is met
+            // in-test (the composite treats each Arc opaquely; the tag proves identity).
+            let tag: &'static str = Box::leak(format!("{project}/{site}").into_boxed_str());
+            Ok(std::sync::Arc::new(TagBackend(tag)))
+        }
+    }
+
+    #[tokio::test]
+    async fn per_tenant_routes_by_tenant_and_caches_per_grain() {
+        use boatramp_core::sql::SqlBackends;
+
+        let resolver = std::sync::Arc::new(TenantTagResolver {
+            calls: std::sync::Mutex::new(0),
+        });
+        // Site-scoped grain: the cache key is `<project>/<site>`.
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_per_tenant("data", resolver.clone(), /* site_scoped */ true, false);
+        assert!(composite.has_external());
+
+        // Two DIFFERENT tenants resolve to DIFFERENT backends (isolation).
+        assert_eq!(
+            tag(composite.database("acme", "blog", "data").await).await,
+            "sql error: acme/blog"
+        );
+        assert_eq!(
+            tag(composite.database("globex", "shop", "data").await).await,
+            "sql error: globex/shop"
+        );
+        assert_eq!(*resolver.calls.lock().unwrap(), 2, "one resolve per tenant");
+
+        // Re-opening the SAME tenant reuses the cached backend (no extra resolve).
+        assert_eq!(
+            tag(composite.database("acme", "blog", "data").await).await,
+            "sql error: acme/blog"
+        );
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            2,
+            "same tenant ⇒ cache hit, resolver not called again"
+        );
+
+        // A name with no per-tenant/external entry falls through to the managed default.
+        assert_eq!(
+            tag(composite.database("acme", "blog", "other").await).await,
+            "sql error: DEFAULT"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_tenant_project_grain_caches_across_sites() {
+        use boatramp_core::sql::SqlBackends;
+
+        let resolver = std::sync::Arc::new(TenantTagResolver {
+            calls: std::sync::Mutex::new(0),
+        });
+        // Project-scoped grain: the cache key is the project alone, so two sites of one
+        // project share one resolve.
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_per_tenant(
+                "data",
+                resolver.clone(),
+                /* site_scoped */ false,
+                false,
+            );
+
+        let _ = composite.database("acme", "blog", "data").await.unwrap();
+        let _ = composite.database("acme", "shop", "data").await.unwrap();
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            1,
+            "project grain ⇒ two sites of one project share one cached resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_tenant_preview_is_gated() {
+        use boatramp_core::sql::{SqlBackends, SqlError};
+
+        let resolver = std::sync::Arc::new(TenantTagResolver {
+            calls: std::sync::Mutex::new(0),
+        });
+        // allow_preview = false ⇒ a preview deployment is refused.
+        let composite = CompositeSqlBackends::new(std::sync::Arc::new(DefaultBackends))
+            .with_per_tenant("data", resolver, true, false);
+        let err = match composite
+            .preview_database("acme", "blog", "data", "pr1")
+            .await
+        {
+            Ok(_) => panic!("expected a managed DB to be refused in preview"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SqlError::Other(m) if m.contains("not available to preview")));
     }
 }

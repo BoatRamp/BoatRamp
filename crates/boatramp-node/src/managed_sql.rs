@@ -101,6 +101,17 @@ impl ManagedSqlCredentials {
         self.kv.put(&key, sealed).await.map_err(|e| e.to_string())?;
         Ok(password)
     }
+
+    /// Delete a workload's sealed credential (a tenant deprovision hook). Idempotent:
+    /// deleting an absent credential is a no-op (the underlying KV `delete` treats a
+    /// missing key as success), so re-running a teardown is harmless.
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+    pub async fn delete(&self, project: &str, workload: &str) -> Result<(), String> {
+        self.kv
+            .delete(&Self::key(project, workload))
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// One managed database's non-secret connection parts, keyed in [`ManagedDbEnv`]
@@ -110,6 +121,13 @@ struct ManagedDbSpec {
     kind: ExternalSqlKind,
     database: String,
     user: String,
+    /// The binding's isolation mechanism. A `Single` binding may also back a
+    /// **per-tenant** workload named `<base>-<tenant_ident>`, so its server-init env
+    /// must be resolvable under that derived name too (with a per-tenant credential
+    /// keyed by the derived workload). A `Shared` binding never spawns a separate
+    /// per-tenant workload (its per-tenant databases live inside the base server), so
+    /// only its exact base name resolves.
+    tenant: crate::config::TenantIsolation,
 }
 
 /// The node's [`ManagedDbEnvResolver`]: the set of managed databases (from the
@@ -175,6 +193,7 @@ impl ManagedDbEnv {
                     kind,
                     database,
                     user,
+                    tenant: db.tenant,
                 },
             );
         }
@@ -190,14 +209,44 @@ impl ManagedDbEnv {
     pub fn is_empty(&self) -> bool {
         self.dbs.is_empty()
     }
+
+    /// Resolve the launched `workload` to the [`ManagedDbSpec`] whose server-init env
+    /// it needs. An exact match wins (the base workload — the shared server, or a
+    /// single-tenant install). Otherwise a **`Single` per-tenant** workload
+    /// `<base>-<tenant_ident>` maps back to its `Single` base spec, so a dedicated
+    /// per-tenant container is initialized from the same binding — with its OWN
+    /// per-tenant credential, keyed by its OWN `(project, workload)` (the reconcile
+    /// passes the derived workload name, so `password(project, workload)` already
+    /// keys per tenant). A `Shared` base never matches a `-suffixed` name (it spawns
+    /// no per-tenant workload), so a stray derived name can never smuggle a Shared
+    /// server's credential.
+    fn resolve_spec(&self, workload: &str) -> Option<&ManagedDbSpec> {
+        if let Some(spec) = self.dbs.get(workload) {
+            return Some(spec);
+        }
+        // A `Single` per-tenant workload `<base>-<ident>`: find the `Single` base whose
+        // name is a `-`-separated prefix of `workload`.
+        self.dbs.iter().find_map(|(base, spec)| {
+            (matches!(spec.tenant, crate::config::TenantIsolation::Single)
+                && workload
+                    .strip_prefix(base.as_str())
+                    .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1))
+            .then_some(spec)
+        })
+    }
 }
 
 #[async_trait]
 impl ManagedDbEnvResolver for ManagedDbEnv {
     async fn managed_db_env(&self, project: &str, workload: &str) -> Vec<(String, String)> {
-        let Some(db) = self.dbs.get(workload) else {
+        let Some(db) = self.resolve_spec(workload) else {
             return Vec::new();
         };
+        // The credential key is the launched `(project, workload)` itself — the bare
+        // base for the shared server / single-tenant install, or the derived
+        // `<base>-<ident>` for a Single per-tenant container. So the init password and
+        // the handler's connection password agree by construction (the resolver keys
+        // it identically).
         match self.creds.password(project, workload).await {
             Ok(password) => managed_db_server_env(db.kind, &db.database, &db.user, &password),
             Err(e) => {
@@ -215,7 +264,7 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
     }
 
     fn managed_db_privilege(&self, _project: &str, workload: &str) -> Option<PrivilegeDirective> {
-        let db = self.dbs.get(workload)?;
+        let db = self.resolve_spec(workload)?;
         Some(match self.privilege {
             ManagedDbPrivilege::Rootless => {
                 let (uid, gid) = managed_db_default_ids(db.kind);

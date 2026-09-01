@@ -1241,8 +1241,8 @@ pub struct ExternalDatabaseConfig {
     /// **Tenant grain** for a compute-backed managed database (2×2 axis 2). `project`
     /// (default) — a tenant is a project; `site` — a tenant is a site. A tenant may
     /// hold several databases (one per binding that names it); it gets one login role
-    /// + sealed credential per (tenant, server), granted on all its own databases and
-    /// none of another tenant's. The reserved `default` project uses the plain
+    /// and sealed credential per (tenant, server), granted on all its own databases
+    /// and none of another tenant's. The reserved `default` project uses the plain
     /// configured name, so a single-tenant install is just one ordinary database.
     pub tenant_scope: TenantScope,
     /// **Opt-in** (default `false`): inject the request's `boatramp.project` /

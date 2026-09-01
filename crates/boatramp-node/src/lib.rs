@@ -26,4 +26,6 @@ pub mod handlers;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod managed_sql;
 pub mod node;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod tenant_sql;
 pub use node::{assemble, NodeInput, RunningNode};

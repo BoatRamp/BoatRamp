@@ -223,9 +223,7 @@ async fn build_sql_backends(
 
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     {
-        use boatramp_core::project::DEFAULT_PROJECT;
         use boatramp_core::sql::SqlBackend;
-        use boatramp_storage::sql_compute::ComputeResolvedSqlBackend;
         use boatramp_storage::sql_sqlx::{
             connect, CompositeSqlBackends, ExternalSqlKind, ExternalSqlOptions,
         };
@@ -238,47 +236,60 @@ async fn build_sql_backends(
                 name: name.clone(),
                 kind: db.kind.clone(),
             })?;
-            let external: Arc<dyn SqlBackend> = if let Some(workload) =
-                db.compute.as_deref().filter(|c| !c.is_empty())
-            {
-                // Compute-backed: resolve the workload's live endpoint on demand and
-                // build the connection. The credential is either brought
-                // (`password_env`) or **boatramp-managed** (generated + sealed).
-                let password = match db.password_env.as_deref().filter(|v| !v.is_empty()) {
-                    Some(var) => std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.into()))?,
-                    None => {
-                        // Managed credential: fail closed without a secrets envelope
-                        // (we will not persist a DB password in cleartext).
-                        let envelope = secrets_envelope
-                            .cloned()
-                            .ok_or_else(|| Error::SqlManagedNeedsSecrets(name.clone()))?;
-                        crate::managed_sql::ManagedSqlCredentials::new(kv.clone(), envelope)
-                            .password(DEFAULT_PROJECT, workload)
-                            .await
-                            .map_err(|reason| Error::SqlManagedCredential {
-                                name: name.clone(),
-                                reason,
-                            })?
-                    }
-                };
-                let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new(
+            if db.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+                // Compute-backed: EVERY such binding is per-tenant (Single or Shared
+                // isolation, Project or Site scope). It resolves, per request
+                // `(project, site)`, to the caller's OWN tenant database as its OWN
+                // role — the isolation perimeter — through the per-tenant seam.
+                //
+                // A brought password (`password_env`) is not per-tenant-managed and
+                // keeps its historical single-shared-endpoint shape.
+                if let Some(var) = db.password_env.as_deref().filter(|v| !v.is_empty()) {
+                    let workload = db.compute.as_deref().expect("compute checked above");
+                    let password =
+                        std::env::var(var).map_err(|_| Error::SqlEnvUnset(var.into()))?;
+                    let resolver = Arc::new(crate::managed_sql::DeployEndpointResolver::new(
+                        deploy.clone(),
+                        boatramp_core::project::DEFAULT_PROJECT,
+                    ));
+                    let external: Arc<dyn SqlBackend> = Arc::new(
+                        boatramp_storage::sql_compute::ComputeResolvedSqlBackend::new(
+                            resolver,
+                            workload,
+                            kind,
+                            db.database.clone().unwrap_or_default(),
+                            db.user.clone().unwrap_or_default(),
+                            password,
+                            db.pool_max,
+                            db.read_only,
+                            timeout(db),
+                        ),
+                    );
+                    composite = composite.with_external(name.clone(), external, db.allow_preview);
+                    continue;
+                }
+                // Managed credential: fail closed without a secrets envelope (we will
+                // not persist a DB password in cleartext).
+                let envelope = secrets_envelope
+                    .cloned()
+                    .ok_or_else(|| Error::SqlManagedNeedsSecrets(name.clone()))?;
+                let resolver = crate::tenant_sql::NodeTenantSqlResolver::new(
                     deploy.clone(),
-                    DEFAULT_PROJECT,
-                ));
-                Arc::new(ComputeResolvedSqlBackend::new(
-                    resolver,
-                    workload,
-                    kind,
-                    db.database.clone().unwrap_or_default(),
-                    db.user.clone().unwrap_or_default(),
-                    password,
-                    db.pool_max,
-                    db.read_only,
-                    timeout(db),
-                ))
+                    kv.clone(),
+                    envelope,
+                    db,
+                )
+                .expect("a compute-backed managed binding builds a per-tenant resolver");
+                let site_scoped = resolver.site_scoped();
+                composite = composite.with_per_tenant(
+                    name.clone(),
+                    Arc::new(resolver),
+                    site_scoped,
+                    db.allow_preview,
+                );
             } else {
-                // Bring-your-own URL: the connection URL(s) are secrets, resolved
-                // from the environment.
+                // Bring-your-own URL: a single shared endpoint, the connection URL(s)
+                // are secrets, resolved from the environment.
                 if db.url_env.trim().is_empty() {
                     return Err(Error::SqlExternalUrlEnvMissing(name.clone()));
                 }
@@ -295,12 +306,13 @@ async fn build_sql_backends(
                     .with_max_connections(db.pool_max)
                     .read_only(db.read_only)
                     .with_connect_timeout(timeout(db));
-                connect(kind, &opts).map_err(|source| Error::SqlExternalConnect {
-                    name: name.clone(),
-                    source,
-                })?
-            };
-            composite = composite.with_external(name.clone(), external, db.allow_preview);
+                let external: Arc<dyn SqlBackend> =
+                    connect(kind, &opts).map_err(|source| Error::SqlExternalConnect {
+                        name: name.clone(),
+                        source,
+                    })?;
+                composite = composite.with_external(name.clone(), external, db.allow_preview);
+            }
         }
         Ok(Arc::new(composite))
     }
@@ -431,18 +443,33 @@ mod tests {
         let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let envelope: Arc<dyn KeyEnvelope> = Arc::new(TestEnvelope);
         let cfg = managed_sql_cfg();
-        // No DB is running: the backend resolves the endpoint on first use, so
-        // assembly succeeds without a connection and the credential is sealed now.
+        // No DB is running: assembly builds the composite without a connection AND
+        // without minting any credential — every compute-backed managed binding is
+        // now **per-tenant**, so a credential is sealed lazily per (tenant, server)
+        // on first `open`, not eagerly at build (a tenant isn't known at build time).
         let backends = build_sql_backends(Some(&cfg), tmp.path(), &deploy, &kv, Some(&envelope))
             .await
             .expect("managed sql builds without a live DB (lazy connect)");
+        assert!(
+            kv.get("managed-sql-cred/default/pg")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing sealed at build — per-tenant credentials are minted on first open"
+        );
+
+        // Resolving the binding for the default project's site (the single-tenant
+        // install) seals the credential under the plain default-project + workload
+        // key, so the DB's server-init env (same key) and the handler connection agree.
+        let _ = backends
+            .database("default", "blog", "analytics")
+            .await
+            .unwrap();
         let sealed = kv
             .get("managed-sql-cred/default/pg")
             .await
             .unwrap()
-            .expect("managed credential sealed at build under the default project");
+            .expect("credential sealed on first resolve under the default project");
         assert_ne!(sealed.len(), 0);
-        // Sanity: the composite is usable as a provider (no connection yet).
-        let _: Arc<dyn boatramp_core::sql::SqlBackends> = backends;
     }
 }
