@@ -448,6 +448,16 @@ impl ServerConfig {
                 if let Some(v) = source.parse(&format!("{prefix}VOLUME_SIZE_MIB"))? {
                     db.volume_size_mib = Some(v);
                 }
+                if let Some(v) = source.parse_enum(
+                    &format!("{prefix}TENANT"),
+                    &[
+                        ("shared", TenantScope::Shared),
+                        ("project", TenantScope::Project),
+                        ("site", TenantScope::Site),
+                    ],
+                )? {
+                    db.tenant = v;
+                }
             }
         }
 
@@ -622,6 +632,7 @@ const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_READ_ONLY",
     "_POOL_MAX",
     "_COMPUTE",
+    "_TENANT",
     "_IMAGE",
     "_KIND",
     "_USER",
@@ -1209,6 +1220,28 @@ pub struct ExternalDatabaseConfig {
     /// The persistent data-volume size in MiB for a **managed co-located** database
     /// (default 10240 = 10 GiB). Ignored for a bring-your-own database.
     pub volume_size_mib: Option<u32>,
+    /// How this managed database isolates tenants on its shared server (a
+    /// compute-backed database only). `shared` (default) — one database for every
+    /// site/project, back-compatible; `project` — a separate database + login role
+    /// per project (the recommended per-tenant grain); `site` — one per site. In a
+    /// per-tenant mode boatramp provisions each tenant's own database + role (with
+    /// its own sealed credential) on the shared server, permission-isolated so one
+    /// tenant's role cannot reach another tenant's database.
+    pub tenant: TenantScope,
+}
+
+/// How a managed compute-backed database isolates tenants on its shared server.
+#[cfg_attr(not(feature = "handlers"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TenantScope {
+    /// One shared database for every site/project (the default; pre-0.3.10 behavior).
+    #[default]
+    Shared,
+    /// A separate database + login role per **project** — the tenant boundary.
+    Project,
+    /// A separate database + login role per **site**.
+    Site,
 }
 
 impl ExternalDatabaseConfig {
