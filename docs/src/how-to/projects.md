@@ -26,8 +26,24 @@ boatramp project ls
 
 `create` needs a slug (unique, no `/`); `--display`, `--description`, and `--region`
 are optional. `project ls` lists every project; `project show acme` prints the full
-record; `project rm acme` deletes an **empty** project (it refuses while the project
-still owns resources, and the `default` project can never be removed).
+record; `project rm acme` deletes an **empty** project. It **refuses** while the project
+still owns resources — and the refusal now enumerates exactly what remains, grouped by
+resource family — so you know what to delete first. The `default` project can never be
+removed.
+
+To tear a project down wholesale, `project rm acme --force` **cascades**: it
+deprovisions the project's managed databases, removes its compute workloads and their
+volumes, deletes its functions and sites (releasing the sites' global domain claims),
+clears its secrets and GraphQL safelist, then removes the project. Preview it first with
+`--dry-run` (prints exactly what would be destroyed, changes nothing); a bare `--force`
+shows that same plan and asks you to type the project name to confirm, so add `--yes` to
+skip the prompt (required when stdin isn't a terminal):
+
+```bash
+boatramp project rm acme --dry-run     # what would be destroyed
+boatramp project rm acme --force       # cascade, with a typed-name confirmation
+boatramp project rm acme --force --yes # cascade, unattended
+```
 
 ## 2. Target a project
 

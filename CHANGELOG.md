@@ -7,6 +7,24 @@ versions.
 
 ## [0.3.11] - 2026-09-02
 
+### Added
+- **Operator volume management — `boatramp compute volume ls` / `rm <name>`.** A compute
+  workload's persistent volume (backed at `<data_dir>/compute/volumes/<name>`) can now be
+  listed and reclaimed from the CLI. `ls` reports each volume's size and whether a
+  registered workload still references it; `rm` refuses (`409` / a clear CLI error) to
+  pull a volume out from under a workload whose active spec still mounts it, unless
+  `--force` — so the safe flow is `compute rm <workload>` then `compute volume rm <name>`.
+  Backed by `GET /api/compute/volumes` + `DELETE /api/compute/volumes/{name}`
+  (admin-scoped).
+- **`project rm --force` cascades the teardown.** Deleting a project still refuses by
+  default while it owns resources (the failsafe below), but `--force` now tears the
+  project down in order: deprovision its managed databases, remove its compute workloads
+  and their volumes, delete its functions and sites (releasing the sites' global domain
+  claims), clear its secrets and GraphQL safelist, then remove the project itself.
+  `--dry-run` prints exactly what would be destroyed and touches nothing; `--force`
+  without `--yes` first shows that plan and requires you to type the project name to
+  confirm (and refuses to run non-interactively without `--yes`).
+
 ### Fixed
 - **Per-tenant `Single`-mode managed databases now get isolated data volumes.** Every
   managed DB workload was launched with the same fixed volume name (`"data"`), and the
@@ -20,6 +38,16 @@ versions.
   single volume. A non-default `Single` workload's volume is now keyed to its own
   workload, giving each tenant an isolated directory; a live capability gate proves a
   per-tenant container authenticates on its own fresh volume.
+- **Deleting a function now unregisters it completely.** `delete_function` removed only
+  the function's metadata pointer, orphaning its versions, aliases, triggers,
+  invocations, and metering under `project/<proj>/functions/<name>/…` — so a project
+  could still report itself non-empty after every function had been "deleted". It now
+  sweeps the entire per-function subtree (and only that function's — a sibling whose name
+  is a prefix is left alone).
+- **A refused project delete now says what is left.** `DELETE /api/projects/{proj}`
+  without `--force` still fails closed while the project owns resources, but the `409`
+  now enumerates what remains — grouped by resource family, with names — instead of a
+  bare "not empty", so you know what to delete first (or to reach for `--force`).
 
 ### Upgrade notes
 - The default **single-tenant** managed DB keeps the `"data"` volume — **no change, no
@@ -31,9 +59,9 @@ versions.
   holds data you need, before upgrading move it to the tenant's workload-keyed name —
   `mv <data_dir>/compute/volumes/data <data_dir>/compute/volumes/<workload>` (find
   `<workload>` via `boatramp compute ls`) — or dump/restore into the re-provisioned DB.
-  (Reclaiming a decommissioned tenant's volume automatically — `compute rm` / project
-  delete — remains a follow-up; drop `<data_dir>/compute/volumes/<workload>` by hand for
-  now.)
+  Reclaiming a decommissioned tenant's orphaned volume is now `boatramp compute volume rm
+  <workload>` (after `compute rm`-ing the workload), and `project rm --force` removes a
+  project's volumes as part of its cascade.
 
 ## [0.3.10] - 2026-09-01
 

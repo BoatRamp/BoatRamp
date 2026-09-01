@@ -259,6 +259,31 @@ pub(crate) mod keys {
         format!("project/{project}/secret/")
     }
 
+    /// The prefix under which a project's GraphQL **safelist** (persisted trusted
+    /// operations, `hapq/<proj>/<hash>`) lives. Note it is **not** under the
+    /// `project/<proj>/…` resource prefix — the residual sweep in
+    /// [`purge_project`](super::DeployStore::purge_project) does not reach it, so the
+    /// teardown clears it explicitly.
+    pub fn graphql_safelist_prefix(project: ProjectRef<'_>) -> String {
+        format!("hapq/{project}/")
+    }
+
+    /// The prefix under which a project's whole GraphQL registry state lives
+    /// (`graphql/<proj>/…`): subgraph SDLs, per-subgraph backend records, and the
+    /// composition-version counter. Like the safelist, this is **not** under
+    /// `project/<proj>/…`, so the teardown clears it explicitly.
+    pub fn graphql_registry_prefix(project: ProjectRef<'_>) -> String {
+        format!("graphql/{project}/")
+    }
+
+    /// The prefix listing a project's registered GraphQL subgraph SDLs
+    /// (`graphql/<proj>/subgraph/<name>`) — the enumerable, named members of the
+    /// registry (backend records + version key are swept by
+    /// [`graphql_registry_prefix`]).
+    pub fn graphql_subgraph_prefix(project: ProjectRef<'_>) -> String {
+        format!("graphql/{project}/subgraph/")
+    }
+
     /// Sharded blob key, e.g. `ab/abcdef...`, to avoid one huge directory (global CAS).
     pub fn blob(hash: &str) -> String {
         if hash.len() >= 2 {
@@ -360,6 +385,72 @@ pub(crate) mod keys {
             .and_then(|rest| rest.split('/').next())
             .filter(|p| !p.is_empty())
     }
+}
+
+/// A structured, serializable enumeration of everything a project owns —
+/// [`DeployStore::enumerate_project_resources`]'s output. It is the single source of
+/// truth shared by the `project rm --force` **dry-run preview** (rendered to the
+/// operator, nothing deleted) and the **cascade loop** (which walks it in order to
+/// tear the project down), so the preview and the executed teardown can never drift.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectTeardownPlan {
+    /// The project this plan is for.
+    pub project: String,
+    /// The project's site names (each `delete_site` also frees the site's global
+    /// `domain/*`/`wildcard/*` routing claims).
+    pub sites: Vec<String>,
+    /// The project's function names (each `delete_function` sweeps its whole subtree).
+    pub functions: Vec<String>,
+    /// The project's compute workloads, each with the persistent volume names its
+    /// active spec mounts (captured before teardown drops the spec pointer).
+    pub compute: Vec<ComputeTeardown>,
+    /// The project's internal secret names.
+    pub secrets: Vec<String>,
+    /// The number of GraphQL safelist (persisted-operation) entries.
+    pub safelist: usize,
+    /// The project's registered GraphQL subgraph names.
+    pub subgraphs: Vec<String>,
+    /// Any remaining `project/<proj>/<family>/…` key families not surfaced as a
+    /// dedicated field above, counted per family — a forward-compatible catch-all so a
+    /// newly-added resource family is still previewed and swept.
+    pub other_families: std::collections::BTreeMap<String, usize>,
+}
+
+impl ProjectTeardownPlan {
+    /// Whether the project owns nothing at all (every family empty) — used to decide
+    /// the `404` for a force-delete of a project that never existed and owns nothing.
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty()
+            && self.functions.is_empty()
+            && self.compute.is_empty()
+            && self.secrets.is_empty()
+            && self.safelist == 0
+            && self.subgraphs.is_empty()
+            && self.other_families.is_empty()
+    }
+
+    /// Every persistent-volume name referenced across the plan's compute workloads
+    /// (de-duplicated, sorted) — the volumes the cascade reclaims once the workloads
+    /// that mounted them are gone.
+    pub fn all_volumes(&self) -> Vec<String> {
+        let mut vols: std::collections::BTreeSet<String> = Default::default();
+        for c in &self.compute {
+            for v in &c.volumes {
+                vols.insert(v.clone());
+            }
+        }
+        vols.into_iter().collect()
+    }
+}
+
+/// One compute workload in a [`ProjectTeardownPlan`]: its name plus the persistent
+/// volume names its active spec mounts (reclaimed after the workload is deleted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputeTeardown {
+    /// The workload name.
+    pub name: String,
+    /// The persistent volume names the workload's active spec mounts.
+    pub volumes: Vec<String>,
 }
 
 impl DeployStore {
@@ -2539,6 +2630,202 @@ impl DeployStore {
             })
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// Enumerate everything a project owns, as a structured, serializable plan — the
+    /// shared source of truth for both the `project rm --force` **dry-run preview**
+    /// and the **cascade loop** that executes the teardown. Reporting is read-only:
+    /// it mutates nothing.
+    ///
+    /// Each compute workload's active [`ComputeSpec`](crate::compute::ComputeSpec) is
+    /// resolved so the plan carries the **volume names** to reclaim — captured here,
+    /// *before* teardown, because deleting the workload drops the pointer to its spec.
+    ///
+    /// `other_families` counts any remaining `project/<proj>/<family>/…` key families
+    /// not surfaced as a first-class field (same family-grouping as
+    /// [`summarize_owned_resources`](Self::summarize_owned_resources)) — a
+    /// forward-compatible catch-all so a newly-added resource family still shows up in
+    /// the preview and is covered by [`purge_project`](Self::purge_project)'s sweep.
+    pub async fn enumerate_project_resources(
+        &self,
+        project: &str,
+    ) -> Result<ProjectTeardownPlan, DeployError> {
+        let pref = ProjectRef::new(project);
+
+        // Sites = the union of activated sites (a `current/<site>` pointer) AND
+        // config-only sites (a `site/<site>` config pointer with no live deployment).
+        // The cascade must `delete_site` every one — a config-only site still owns a
+        // global `domain/*`/`wildcard/*` claim that only `delete_site` frees.
+        let mut site_set: std::collections::BTreeSet<String> =
+            self.list_sites(pref).await?.into_iter().collect();
+        let site_pref = keys::site_prefix(pref);
+        for key in self.kv.list_prefix(&site_pref).await? {
+            if let Some(site) = key.strip_prefix(&site_pref).filter(|s| !s.is_empty()) {
+                site_set.insert(site.to_string());
+            }
+        }
+        let sites: Vec<String> = site_set.into_iter().collect();
+
+        let functions: Vec<String> = self
+            .list_stored_functions(pref)
+            .await?
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+
+        // Compute workloads + the volumes their active spec mounts (captured now,
+        // before the workload — and thus its spec pointer — is deleted).
+        let mut compute = Vec::new();
+        for w in self.list_compute_workloads(pref).await? {
+            let volumes = match self.get_compute_spec(&w.active).await? {
+                Some(spec) => spec.volumes.into_iter().map(|v| v.name).collect(),
+                None => Vec::new(),
+            };
+            compute.push(ComputeTeardown {
+                name: w.name,
+                volumes,
+            });
+        }
+
+        // Secrets live under `project/<proj>/secret/<name>` in this same control-plane
+        // KV, so the residual sweep would already reach them — but we surface the names
+        // for the preview.
+        let secret_prefix = keys::secret_prefix(pref);
+        let mut secrets: Vec<String> = self
+            .kv
+            .list_prefix(&secret_prefix)
+            .await?
+            .into_iter()
+            .filter_map(|k| k.strip_prefix(&secret_prefix).map(str::to_string))
+            .filter(|n| !n.is_empty())
+            .collect();
+        secrets.sort();
+
+        // GraphQL safelist + subgraphs live OUTSIDE `project/<proj>/…` (under `hapq/…`
+        // and `graphql/…`), so the residual sweep does not reach them — the cascade
+        // clears them explicitly (see purge_project).
+        let safelist = self
+            .kv
+            .list_prefix(&keys::graphql_safelist_prefix(pref))
+            .await?
+            .len();
+
+        let subgraph_prefix = keys::graphql_subgraph_prefix(pref);
+        let mut subgraphs: Vec<String> = self
+            .kv
+            .list_prefix(&subgraph_prefix)
+            .await?
+            .into_iter()
+            .filter_map(|k| k.strip_prefix(&subgraph_prefix).map(str::to_string))
+            .filter(|n| !n.is_empty())
+            .collect();
+        subgraphs.sort();
+
+        // Any residual `project/<proj>/<family>/…` families not surfaced above,
+        // counted by family — the forward-compatible catch-all.
+        let resource_prefix = crate::project::resource_prefix(project);
+        let residual = self.kv.list_prefix(&resource_prefix).await?;
+        let covered = ["site", "functions", "compute", "secret"];
+        let mut other_families: std::collections::BTreeMap<String, usize> = Default::default();
+        for key in &residual {
+            let rest = key
+                .strip_prefix(&resource_prefix)
+                .unwrap_or(key)
+                .trim_start_matches('/');
+            let Some(family) = rest.split('/').next().filter(|f| !f.is_empty()) else {
+                continue;
+            };
+            if covered.contains(&family) {
+                continue;
+            }
+            *other_families.entry(family.to_string()).or_default() += 1;
+        }
+
+        Ok(ProjectTeardownPlan {
+            project: project.to_string(),
+            sites,
+            functions,
+            compute,
+            secrets,
+            safelist,
+            subgraphs,
+            other_families,
+        })
+    }
+
+    /// The **backstop after external teardown**: sweep every remaining key a project
+    /// owns and remove the project itself. Called by the `--force` cascade *after* the
+    /// explicit per-resource deletes (sites/functions/compute/secrets/graphql), it
+    /// clears anything they left plus the project's own pointer/history/reverse-index —
+    /// so no orphan can keep the project half-alive. Returns the count of keys purged.
+    ///
+    /// Scoped strictly to this project. It removes:
+    /// - every `project/<project>/…` key (all owned resource state),
+    /// - the whole GraphQL registry (`graphql/<project>/…`) and safelist (`hapq/<project>/…`),
+    ///   which live outside the resource prefix,
+    /// - the project pointer (`projectmeta/<project>`) + its history ring
+    ///   (mirroring [`delete_project`](Self::delete_project)'s empty-path cleanup),
+    /// - the `owner/<kind>/<name>` reverse-index entries **whose value is this project**.
+    ///
+    /// It never touches another project or the global content-addressed store
+    /// (`projectver/`, `siteconfig/`, `computever/`, blob `{hh}/{hash}`, `manifests/`, …) —
+    /// those bodies are shared and left to `prune`. Refuses the reserved `default`.
+    pub async fn purge_project(&self, project: &str) -> Result<usize, DeployError> {
+        if project == crate::project::DEFAULT_PROJECT {
+            return Err(DeployError::Conflict(
+                "the `default` project cannot be deleted".to_string(),
+            ));
+        }
+        // Hold the domain-claim lock: delete_site already ran per-site under it, but a
+        // residual `project/<proj>/…` routing key (if any) is swept here, so serialize
+        // against concurrent domain claims for consistency.
+        let _claim = self.domain_claim_lock.lock().await;
+
+        let pref = ProjectRef::new(project);
+        let mut ops: Vec<WriteOp> = Vec::new();
+
+        // 1. Every owned resource key.
+        for key in self
+            .kv
+            .list_prefix(&crate::project::resource_prefix(project))
+            .await?
+        {
+            ops.push(WriteOp::Delete(key));
+        }
+        // 2. GraphQL registry + safelist (outside the resource prefix).
+        for key in self
+            .kv
+            .list_prefix(&keys::graphql_registry_prefix(pref))
+            .await?
+        {
+            ops.push(WriteOp::Delete(key));
+        }
+        for key in self
+            .kv
+            .list_prefix(&keys::graphql_safelist_prefix(pref))
+            .await?
+        {
+            ops.push(WriteOp::Delete(key));
+        }
+        // 3. The project pointer + history ring (matches delete_project's cleanup).
+        ops.push(WriteOp::Delete(crate::project::pointer_key(project)));
+        ops.push(WriteOp::Delete(crate::project::history_key(project)));
+        // 4. The reverse-index entries this project owns (value == project name).
+        for key in self.kv.list_prefix(crate::project::OWNER_PREFIX).await? {
+            if let Some(bytes) = self.kv.get(&key).await? {
+                if bytes == project.as_bytes() {
+                    ops.push(WriteOp::Delete(key));
+                }
+            }
+        }
+
+        let purged = ops.len();
+        if !ops.is_empty() {
+            self.kv.write_batch(ops).await?;
+        }
+        // Any freed hosts must stop resolving — invalidate the resolve cache.
+        self.bump_domain_epoch();
+        Ok(purged)
     }
 
     /// Atomically point `site` at deployment `id`.
@@ -5470,5 +5757,236 @@ mod tests {
             .unwrap()
             .map
             .contains_key(&large_hash));
+    }
+
+    #[tokio::test]
+    async fn enumerate_and_purge_project_are_scoped() {
+        use crate::compute::{
+            ComputeSpec, ComputeWorkload, PlacementConstraints, RestartPolicy, RootSource,
+            VolumeRef,
+        };
+        use crate::function::{Function, FunctionConfig, Lifecycle, Owner};
+        use crate::kv::MemoryKv;
+        use crate::project::Project;
+
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let acme = ProjectRef::new("acme");
+        let other = ProjectRef::new("other");
+
+        // Register the project.
+        store
+            .put_project(&Project {
+                version: crate::SCHEMA_VERSION,
+                name: "acme".into(),
+                created_at: 1,
+                meta: Default::default(),
+                config: Default::default(),
+                secrets_ref: None,
+            })
+            .await
+            .unwrap();
+
+        // A site with an exact-host domain claim (freed by delete_site).
+        let mut cfg = SiteConfig::default();
+        cfg.domains.primary = Some("acme.example".into());
+        store.set_site_config(acme, "www", &cfg).await.unwrap();
+        // Attach the host so the global `domain/*` routing claim exists.
+        kv.put(
+            &keys::domain("acme.example"),
+            crate::project::DomainOwner::new("acme", "www").to_bytes(),
+        )
+        .await
+        .unwrap();
+
+        // A function.
+        store
+            .put_function(
+                acme,
+                &Function::new(
+                    "worker",
+                    Owner::Project("acme".into()),
+                    "component-hash",
+                    FunctionConfig::default(),
+                    Lifecycle::default(),
+                    0,
+                ),
+            )
+            .await
+            .unwrap();
+
+        // A compute workload whose active spec mounts a named volume.
+        let spec = ComputeSpec {
+            version: crate::SCHEMA_VERSION,
+            root: RootSource::Rootfs("r".repeat(64)),
+            kernel: "k".repeat(64),
+            kernel_cmdline: None,
+            vcpus: 1,
+            mem_mib: 256,
+            entrypoint: vec!["/app".into()],
+            env: Default::default(),
+            port: 8080,
+            restart: RestartPolicy::Always,
+            scale_to_zero: false,
+            volumes: vec![VolumeRef {
+                mount: "/data".into(),
+                name: "pg-data".into(),
+                size_mib: 1024,
+            }],
+            writable_root: false,
+            cap_add: Vec::new(),
+            user: None,
+            isolation: Default::default(),
+            prefer_backend: None,
+            bindings: vec![],
+        };
+        let hash = store.put_compute_spec(&spec).await.unwrap();
+        store
+            .set_compute_workload(
+                acme,
+                &ComputeWorkload {
+                    version: crate::SCHEMA_VERSION,
+                    name: "pg".into(),
+                    active: hash,
+                    replicas: 1,
+                    placement: PlacementConstraints::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A secret (same control-plane KV, under project/acme/secret/).
+        kv.put(&keys::secret(acme, "api-key"), b"sealed".to_vec())
+            .await
+            .unwrap();
+        // A GraphQL safelist entry + a subgraph (both OUTSIDE project/acme/).
+        kv.put(
+            &format!("{}deadbeef", keys::graphql_safelist_prefix(acme)),
+            b"query{me}".to_vec(),
+        )
+        .await
+        .unwrap();
+        kv.put(
+            &format!("{}users", keys::graphql_subgraph_prefix(acme)),
+            b"type Query{me:ID}".to_vec(),
+        )
+        .await
+        .unwrap();
+        kv.put("graphql/acme/version", 3u64.to_be_bytes().to_vec())
+            .await
+            .unwrap();
+        // A reverse-index entry for acme, plus one for `other` that must survive.
+        kv.put(
+            &crate::project::owner_key(crate::project::owner_kind::COMPUTE, "pg"),
+            b"acme".to_vec(),
+        )
+        .await
+        .unwrap();
+        kv.put(
+            &crate::project::owner_key(crate::project::owner_kind::SITE, "elsewhere"),
+            b"other".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        // A second project's resource + a shared global CAS key — must be untouched.
+        store
+            .set_site_config(other, "shop", &SiteConfig::default())
+            .await
+            .unwrap();
+        kv.put("siteconfig/shared-cas", b"body".to_vec())
+            .await
+            .unwrap();
+
+        // --- enumerate reports each family with the right names + the volume ---
+        let plan = store.enumerate_project_resources("acme").await.unwrap();
+        assert_eq!(plan.project, "acme");
+        assert_eq!(plan.sites, vec!["www".to_string()]);
+        assert_eq!(plan.functions, vec!["worker".to_string()]);
+        assert_eq!(plan.compute.len(), 1);
+        assert_eq!(plan.compute[0].name, "pg");
+        assert_eq!(plan.compute[0].volumes, vec!["pg-data".to_string()]);
+        assert_eq!(plan.all_volumes(), vec!["pg-data".to_string()]);
+        assert_eq!(plan.secrets, vec!["api-key".to_string()]);
+        assert_eq!(plan.safelist, 1);
+        assert_eq!(plan.subgraphs, vec!["users".to_string()]);
+        assert!(!plan.is_empty());
+
+        // --- enumerate mutated nothing (the config-pointer site is still present) ---
+        assert!(store.get_project("acme").await.unwrap().is_some());
+        assert!(store.get_site_config(acme, "www").await.unwrap().is_some());
+
+        // --- teardown mirrors the cascade: delete the resources, then purge ---
+        store.delete_site(acme, "www").await.unwrap();
+        store.delete_function(acme, "worker").await.unwrap();
+        store.delete_compute_workload(acme, "pg").await.unwrap();
+        let purged = store.purge_project("acme").await.unwrap();
+        assert!(purged > 0, "purge removed residual keys");
+
+        // acme is gone: pointer, resource prefix, graphql, safelist, reverse index.
+        assert!(store.get_project("acme").await.unwrap().is_none());
+        assert!(kv
+            .list_prefix(&crate::project::resource_prefix("acme"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(kv.list_prefix("graphql/acme/").await.unwrap().is_empty());
+        assert!(kv
+            .list_prefix(&keys::graphql_safelist_prefix(acme))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(kv
+            .get(&crate::project::pointer_key("acme"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(kv
+            .get(&crate::project::history_key("acme"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(kv
+            .get(&crate::project::owner_key(
+                crate::project::owner_kind::COMPUTE,
+                "pg"
+            ))
+            .await
+            .unwrap()
+            .is_none());
+        // The freed host claim is gone.
+        assert!(kv
+            .get(&keys::domain("acme.example"))
+            .await
+            .unwrap()
+            .is_none());
+
+        // The second project + the shared global CAS key are intact.
+        assert!(store
+            .get_site_config(other, "shop")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!kv
+            .list_prefix(&crate::project::resource_prefix("other"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            kv.get(&crate::project::owner_key(
+                crate::project::owner_kind::SITE,
+                "elsewhere"
+            ))
+            .await
+            .unwrap(),
+            Some(b"other".to_vec())
+        );
+        assert!(kv.get("siteconfig/shared-cas").await.unwrap().is_some());
+
+        // purge refuses the reserved default.
+        assert!(matches!(
+            store.purge_project("default").await,
+            Err(DeployError::Conflict(_))
+        ));
     }
 }

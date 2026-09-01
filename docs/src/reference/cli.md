@@ -165,7 +165,7 @@ resolves to. Takes the common `--server` flag.
 | `create <name>` | Create a project. `<name>` is a slug (no `/`). Flags: `--display <name>`, `--description <text>`, `--region <name>` (default region for the project's compute/replicas). |
 | `ls` | List all projects. |
 | `show <name>` | Print one project's full record. |
-| `rm <name>` | Delete a project (refused while it still owns resources, or for the reserved `default`). |
+| `rm <name>` | Delete a project. Refused (with an enumeration of what remains) while it still owns resources, and always for the reserved `default`. `--force` cascades the teardown (deprovision managed DBs, remove compute workloads + volumes, delete functions + sites, clear secrets + GraphQL safelist, then remove the project); `--dry-run` prints what would be destroyed and changes nothing; `--force` prompts for a typed-name confirmation unless `--yes`/`-y` (required when stdin isn't a terminal). |
 
 ## `boatramp apply`
 
@@ -426,7 +426,9 @@ Manage Firecracker microVM compute workloads. See
 | `get <name>` | Print one workload's desired state as JSON. |
 | `set <name> …` | Create/update a workload from already-pushed rootfs/kernel blobs. |
 | `build <name> …` | Build an ext4 rootfs from an OCI image, upload it, and set the workload (needs `mke2fs`). |
-| `rm <name>` | Remove a workload (its replicas are stopped). |
+| `rm <name>` | Remove a workload (its replicas are stopped). Its persistent volume is left on disk — reclaim it with `compute volume rm`. |
+| `volume ls` | List persistent volumes on the node (`NAME`, `SIZE`, and whether a registered workload still references it). |
+| `volume rm <name>` | Remove a persistent volume. Refused (`409`) while a registered workload's active spec still mounts it, unless `--force`. |
 
 `set` takes exactly one **root-filesystem source** (matched to the substrate);
 `build` instead takes `--image` + `--size-mib` and produces a `--rootfs` source:

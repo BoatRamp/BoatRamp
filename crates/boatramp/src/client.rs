@@ -27,6 +27,10 @@ pub enum ClientError {
     /// Reading a local artifact (kernel/rootfs/blob) file failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The control plane refused the request (`409`), carrying its own explanatory
+    /// message — surfaced verbatim rather than as a generic HTTP status error.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// `client` module result: a control-plane API call; `Err` is [`ClientError`].
@@ -942,19 +946,62 @@ impl ControlPlane {
     }
 
     /// Delete a project (`DELETE /api/projects/<name>`). The server refuses a
-    /// non-empty project or the reserved `default`.
+    /// non-empty project or the reserved `default`. On a `409` refusal, the server's
+    /// enumerated body is returned as [`ClientError::Refused`] so the CLI can print it
+    /// verbatim (with a `--force` hint) rather than the opaque generic HTTP error.
     pub async fn delete_project(&self, name: &str) -> Result<()> {
         let Self {
             http: client,
             base: server,
             ..
         } = self;
-        client
+        let resp = client
             .delete(format!("{server}/api/projects/{name}"))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Refused(body.trim_end().to_string()));
+        }
+        resp.error_for_status()?;
         Ok(())
+    }
+
+    /// Fetch the **teardown plan** for a project (`DELETE /api/projects/<name>?dry_run=true`)
+    /// — a preview of everything a force-delete would remove. Mutates nothing.
+    pub async fn project_teardown_plan(&self, name: &str) -> Result<serde_json::Value> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .delete(format!("{server}/api/projects/{name}"))
+            .query(&[("dry_run", "true")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Force-delete a project (`DELETE /api/projects/<name>?force=true`): cascade the
+    /// teardown of everything it owns and remove the project. Returns the executed
+    /// teardown report.
+    pub async fn force_delete_project(&self, name: &str) -> Result<serde_json::Value> {
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .delete(format!("{server}/api/projects/{name}"))
+            .query(&[("force", "true")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 }
 

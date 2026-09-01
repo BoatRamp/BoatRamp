@@ -246,6 +246,36 @@ privilege strategy automatically — no `--user`/`--cap-add` needed. The strateg
 against its pre-owned volume, no capabilities, any posture) or `caps` (add the minimal
 set; single-tenant only).
 
+## Manage persistent volumes
+
+Unregistering a workload (`compute rm`) leaves its **persistent volume** on disk, so its
+data survives an accidental delete and a re-`set`. List what's on the node and reclaim a
+volume you no longer need:
+
+```bash
+boatramp compute volume ls
+```
+
+```text
+NAME                  SIZE    IN-USE
+pg-acme_3f9c…         214 MiB yes
+old-cache             12 MiB  no
+```
+
+`IN-USE` marks a volume still referenced by a registered workload's active spec.
+Removing one of those would pull data out from under a running (or relaunching) replica,
+so `rm` refuses it:
+
+```bash
+boatramp compute volume rm old-cache          # ok — orphaned
+boatramp compute volume rm pg-acme_3f9c…       # refused: in use
+boatramp compute rm pg-acme_3f9c… && \
+  boatramp compute volume rm pg-acme_3f9c…     # the safe order
+```
+
+Pass `--force` to remove a still-referenced volume anyway (disposable data only — it
+will be re-created empty on the next launch).
+
 ## Next steps
 
 - [Scale compute to zero](./scale-to-zero.md) when a workload is idle.
