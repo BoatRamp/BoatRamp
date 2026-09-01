@@ -5,6 +5,36 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.11] - 2026-09-02
+
+### Fixed
+- **Per-tenant `Single`-mode managed databases now get isolated data volumes.** Every
+  managed DB workload was launched with the same fixed volume name (`"data"`), and the
+  container backend backs a volume at `<data_dir>/compute/volumes/<name>` keyed by name
+  alone — so each per-tenant `Single` container mounted the **same** PGDATA. A per-tenant
+  container reused another tenant's (or a prior default / pre-per-tenant v0.3.9) data
+  directory: Postgres skipped `initdb`, the role kept the old password, and the app
+  failed `password authentication failed for user "…"` against its own freshly-minted
+  per-tenant credential (operator `sql`, which connects via the superuser credential,
+  kept working — the tell). It also meant two `Single` tenants on one node collided on a
+  single volume. A non-default `Single` workload's volume is now keyed to its own
+  workload, giving each tenant an isolated directory; a live capability gate proves a
+  per-tenant container authenticates on its own fresh volume.
+
+### Upgrade notes
+- The default **single-tenant** managed DB keeps the `"data"` volume — **no change, no
+  data loss** on upgrade.
+- A **non-default** managed `Single` DB (one under a non-`default` project, e.g.
+  `tenant_scope = project` with the app under its own project) **re-provisions on a fresh
+  isolated volume** on v0.3.11; its old shared `"data"` directory is orphaned, not
+  migrated (it was almost certainly failing auth on v0.3.10 anyway). If that directory
+  holds data you need, before upgrading move it to the tenant's workload-keyed name —
+  `mv <data_dir>/compute/volumes/data <data_dir>/compute/volumes/<workload>` (find
+  `<workload>` via `boatramp compute ls`) — or dump/restore into the re-provisioned DB.
+  (Reclaiming a decommissioned tenant's volume automatically — `compute rm` / project
+  delete — remains a follow-up; drop `<data_dir>/compute/volumes/<workload>` by hand for
+  now.)
+
 ## [0.3.10] - 2026-09-01
 
 ### Added
