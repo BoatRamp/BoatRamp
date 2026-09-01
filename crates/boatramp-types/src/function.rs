@@ -97,6 +97,12 @@ pub struct FunctionConfig {
     /// Static, non-secret environment.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Env-var name → secret reference (`ENV_VAR` → `HOST_ENV`), resolved
+    /// server-side from the serve env at instantiation; the value is a
+    /// reference, never stored in the manifest or the control-plane store
+    /// (mirrors a site handler's `[handlers].secrets`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
     /// Execution substrate (default `wasm`).
     pub runtime: Runtime,
     /// Usage quota (FA-4). Absent / all-`None` ⇒ unlimited.
@@ -170,6 +176,10 @@ impl FunctionConfig {
             imports: h.imports.clone(),
             limits: h.limits.clone(),
             env: h.env.clone(),
+            // Site handlers carry their secret refs on the site config
+            // (`[handlers].secrets`), resolved by the handler dispatch path — a
+            // desugared handler-function starts with none of its own.
+            secrets: BTreeMap::new(),
             runtime: Runtime::default(),
             quota: FunctionQuota::default(),
             webhook: None,
@@ -1255,6 +1265,31 @@ mod tests {
         };
         assert_eq!(custom.header(), "x-hub-signature-256");
         assert_eq!(custom.body_cap(), 4096);
+    }
+
+    #[test]
+    fn secret_refs_round_trip_as_references() {
+        // A `secrets` map is a name→host-env-var *reference*: it round-trips in the
+        // config and carries no literal secret value (the value is resolved from the
+        // serve env at instantiation, never baked into the stored config/manifest).
+        let cfg = FunctionConfig {
+            env: BTreeMap::from([("STAGE".into(), "prod".into())]),
+            secrets: BTreeMap::from([("DB_URL".into(), "PROD_DB_URL".into())]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        // The map serializes the *reference* (the host env var name), not a value.
+        assert!(json.contains("\"secrets\":{\"DB_URL\":\"PROD_DB_URL\"}"));
+        let back: FunctionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.secrets.get("DB_URL").map(String::as_str),
+            Some("PROD_DB_URL")
+        );
+
+        // An empty `secrets` map is elided (same serde shape as the handler's).
+        let bare = FunctionConfig::default();
+        assert!(!serde_json::to_string(&bare).unwrap().contains("secrets"));
     }
 
     #[test]

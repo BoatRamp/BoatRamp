@@ -506,11 +506,12 @@ async fn build_function_bindings(
     // A function invocation (API or in-process subgraph fetch) does not thread a request id
     // through the invoke path yet; its logs are scope-tagged but not request-correlated.
     bindings = bindings.with_logging(scope.to_string(), None, inner.logs.clone());
-    let env: Vec<(String, String)> = config
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    // Environment for the function: its static `env` strings, then its `secrets`
+    // — each a *reference* to a host env var, resolved here at instantiation and
+    // never stored in the manifest/config (same indirection as a site handler; a
+    // resolved secret overrides a static `env` of the same name, a missing
+    // referent is logged and skipped).
+    let env = resolve_secret_env(scope, &config.env, &config.secrets);
     bindings.with_env(env)
 }
 

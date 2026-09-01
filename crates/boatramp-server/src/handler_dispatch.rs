@@ -989,20 +989,36 @@ pub(super) fn resolve_env(
     deploy_env: &std::collections::BTreeMap<String, String>,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
 ) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = deploy_env
+    resolve_secret_env(site, deploy_env, &site_handlers.secrets)
+}
+
+/// Assemble a guest environment: static `env` first, then each `secrets` entry
+/// (`GUEST_NAME` → `HOST_ENV_VAR`) resolved from the host environment. A missing
+/// host referent is logged and skipped — **never** injected as an empty value —
+/// and a resolved secret overrides a static `env` of the same name. This is the
+/// single indirection both site handlers and top-level functions use, so the
+/// referenced value is only injected at instantiation and never lands in the
+/// stored config/manifest. `label` tags the warn log (site or function scope).
+#[cfg(feature = "handlers")]
+pub(super) fn resolve_secret_env(
+    label: &str,
+    static_env: &std::collections::BTreeMap<String, String>,
+    secrets: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = static_env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    for (guest_name, host_ref) in &site_handlers.secrets {
+    for (guest_name, host_ref) in secrets {
         match std::env::var(host_ref) {
             Ok(value) => {
                 env.retain(|(k, _)| k != guest_name);
                 env.push((guest_name.clone(), value));
             }
             Err(_) => tracing::warn!(
-                site,
+                label,
                 secret = %guest_name,
-                "site secret references env var {host_ref}, which is not set; not injected"
+                "secret references env var {host_ref}, which is not set; not injected"
             ),
         }
     }
