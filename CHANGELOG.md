@@ -5,6 +5,69 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.10] - 2026-09-01
+
+### Added
+- **Per-tenant managed databases.** A managed `handlers.bindings.sql.databases` entry now
+  isolates each tenant into its own database, configured by two knobs on the binding:
+  `tenant: single | shared` (default `single`) × `tenant_scope: project | site` (default
+  `project`). `shared` runs one server and gives each tenant its own database + login role
+  (Postgres `REVOKE CONNECT … FROM PUBLIC` + a per-role grant; MySQL a per-schema grant);
+  `single` runs a dedicated server (container) per tenant. Provisioning is
+  lazy-idempotent on first resolve, and each tenant gets its **own** sealed credential —
+  a tenant's role can never reach another tenant's database (proven by a live
+  cross-tenant-denial capability gate). Tenant identifiers are derived injectively (an
+  always-appended 128-bit SHA-256 suffix) so no two tenant names can ever collide onto one
+  database/role. The default project keeps plain names (a single-tenant install is one
+  ordinary database).
+- **`rls_session` — inject the tenant into the SQL session for app-level RLS.** With
+  `rls_session: true`, boatramp sets `boatramp.project` / `boatramp.site` (Postgres GUC) or
+  `@boatramp_project` / `@boatramp_site` (MySQL) to the request's tenant at transaction
+  start, so an app's own row-level-security policies can key on `current_setting(...)`. The
+  guest `sql` binding **refuses** any statement that would write those reserved keys (via
+  `SET`/`set_config`, a dollar-quoted `DO`/routine body, a MySQL comma-assignment or
+  `SELECT … INTO @var`, `PREPARE`/`EXECUTE`, or `CREATE/ALTER FUNCTION|PROCEDURE`), so a
+  hostile guest can't spoof its tenant — verified live on Postgres 16 and MySQL 8.0 and
+  gated in CI.
+- **Deprovision managed tenants on project/site delete.** Deleting a project or site now
+  tears down its managed tenant. A **Shared + Postgres** tenant is *soft*-deleted (database
+  renamed aside, role set `NOLOGIN`, a tombstone recorded) and hard-dropped by a
+  leader-gated reaper after a grace window (`BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS`,
+  default 7 days; `0` = immediate), with a recovery window in between; MySQL and every
+  `single` tenant hard-drop immediately (they can't be safely renamed aside). Best-effort
+  and guarded so the reserved `default` project is never reaped.
+- **A project-scoped internal secret store + `boatramp secrets`.** Operator secrets are
+  sealed with the `[secrets]` key envelope (the same one that wraps certificate keys and
+  managed-DB credentials) and stored per project. `boatramp secrets set|rotate|ls|rm`
+  manages them (`--stdin` / `--file` preferred; the value is sealed server-side, never
+  echoed, and never readable back — `ls` returns names + metadata only). Backs
+  `POST/GET/DELETE /api/projects/<proj>/secrets`, gated by a new project-scoped
+  `Resource::Secrets` admin right (a project admin manages secrets; a publisher only
+  references them).
+- **Scheme-aware secret references** for a site handler's / a function's `secrets` map:
+  `env:NAME` / bare `NAME` reads the serve process env, `boatramp:NAME` reads the internal
+  store, and any other `scheme:` is reserved (refused, not misread as an env var). Function
+  `secrets` maps are resolved server-side at instantiation and never persisted in the
+  manifest — `apply` transmits only references.
+
+### Security
+- **Host-env secret references are gated to the single-tenant posture.** A bare / `env:`
+  reference reads the *operator's* process environment, so under the **multi-tenant**
+  posture (where the config author is an untrusted tenant) it is now **refused,
+  fail-closed** — at deploy admission and again at instantiation, the host env is never
+  read. Multi-tenant deployments use the project-scoped `boatramp:` store instead. New
+  posture knob `allow_env_secret_refs` (env `BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS`; off
+  under multi-tenant, on under single-tenant/dev).
+- The per-tenant-DB and secret surfaces went through an iterated adversarial security
+  review; findings (an `rls_session` guard bypass class on both engines, a secret-value
+  size bound, an error-string disclosure) were fixed and re-reviewed to a clean pass.
+
+### Removed
+- **The `${…}` manifest text-interpolation (`apply --var`) is dropped.** It was fragile
+  pre-parse string substitution; per-environment values are handled by env-settable scalars
+  today (and a future typed override is planned). Function secret-references — the other
+  half of that change — are kept.
+
 ## [0.3.9] - 2026-08-31
 
 ### Added
