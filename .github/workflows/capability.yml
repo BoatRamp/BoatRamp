@@ -103,7 +103,7 @@ jobs:
   # image (a test-double, not a private artifact) plus a public pgvector image pulled
   # daemonless for the co-located managed-DB seam. No secrets.
   container:
-    name: container launch (root) + co-located Postgres + cross-tenant isolation + rls_session guard + CRIU (informational)
+    name: container launch (root) + co-located Postgres + cross-tenant isolation + rls_session guard + mysql rls_session + CRIU (informational)
     # Ubuntu 24.04 (noble) dropped the `criu` package; jammy still ships it. The native
     # container backend LAUNCH (userns + veth into br-boatramp + cgroup-v2 limits under a
     # delegated /sys/fs/cgroup/boatramp subtree + serve over HTTP) runs to GREEN here and
@@ -268,6 +268,37 @@ jobs:
             || { echo "::error::rls_session guard test did not pass" >&2; exit 1; }
           grep -q 'RLS SESSION GUARD OK' rls.log \
             || { echo "::error::rls_session guard never reached the success marker (silent skip or guard bypass?)" >&2; exit 1; }
+
+      - name: rls_session guard holds live on MySQL (hard gate — two-engine parity)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # The two-engine-parity counterpart to the Postgres rls_session gate above, on a
+          # stock `mysql:8.0`: MySQL is where the guard was previously live-bypassable (the
+          # `@boatramp_*` comma-assign + `SELECT … INTO @var` forms), so a committed live
+          # gate here is the durable proof. Launch ONE shared mysql via the container
+          # backend, provision an `acme` tenant with `rls_session = true` through the
+          # shipped resolver, and on the REAL session-context-injecting backend the data
+          # plane hands a request assert (1) the injected `@boatramp_project` reads back
+          # `acme`, and (2) every guest spoof is refused at the guest entry-point guard AND
+          # `@boatramp_project` still equals `acme` afterward, with a control proving an
+          # UNGUARDED overwrite WOULD change it. No host DB client is needed — readiness +
+          # every read go through boatramp's own MySQL backend; MySQL's slow first boot
+          # gets a generous readiness wait. --test-threads=1 so it doesn't contend on the
+          # single test bridge. The `sql-mysql` feature pulls the tenant_sql/rls_session
+          # data plane in.
+          timeout -k 30 600 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-node --features sql-mysql \
+            --test rls_session_mysql_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee rls-mysql.log
+          # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok` — the exact
+          # trap the project's anti-silent-skip rule guards against. Gate on the success
+          # marker that prints ONLY after the injection-is-real AND the spoof-refused +
+          # value-unchanged assertions all held, so a skip or a bypass fails the job.
+          grep -qE 'test result: ok' rls-mysql.log \
+            || { echo "::error::mysql rls_session guard test did not pass" >&2; exit 1; }
+          grep -q 'RLS SESSION GUARD OK (mysql)' rls-mysql.log \
+            || { echo "::error::mysql rls_session guard never reached the success marker (silent skip or guard bypass?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true
