@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use boatramp_core::compute::{
     Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
     Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
+    VolumeInfo,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -594,6 +595,71 @@ impl ComputeBackend for ContainerBackend {
         .await
         .map_err(|e| BackendError::Other(format!("exec: join: {e}")))?
     }
+
+    /// List the persistent volumes this node backs: the directories under
+    /// `<data_dir>/compute/volumes/`, each with its recursive on-disk size. Keyed
+    /// by volume name (not VM), so this is the same directory `stage_volumes`
+    /// creates + `volume_dir` addresses. A missing volumes dir (nothing ever
+    /// staged) is simply an empty list, not an error.
+    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, BackendError> {
+        let root = self.volumes_dir();
+        let mut dir = match tokio::fs::read_dir(&root).await {
+            Ok(d) => d,
+            // No volumes dir yet ⇒ nothing staged ⇒ empty list.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(BackendError::Other(format!(
+                    "read volumes dir {}: {e}",
+                    root.display()
+                )))
+            }
+        };
+        let mut out = Vec::new();
+        while let Some(entry) = dir
+            .next_entry()
+            .await
+            .map_err(|e| BackendError::Other(format!("scan volumes dir: {e}")))?
+        {
+            // Only directories are volumes; a stray file is ignored.
+            let ft = entry
+                .file_type()
+                .await
+                .map_err(|e| BackendError::Other(format!("stat volume entry: {e}")))?;
+            if !ft.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue; // skip a non-UTF-8 name (never staged by us)
+            };
+            let path = entry.path();
+            let size_bytes = tokio::task::spawn_blocking(move || dir_size_bytes(&path))
+                .await
+                .map_err(|e| BackendError::Other(format!("size join: {e}")))?;
+            out.push(VolumeInfo { name, size_bytes });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Remove the backing directory for persistent volume `name`
+    /// (`<data_dir>/compute/volumes/<name>`), returning whether it existed. Reuses
+    /// [`validate_volume`] so `name` can't traverse out of the volumes root. The
+    /// caller (the node volume capability) is responsible for the "still in use"
+    /// refusal; this is the raw on-disk removal.
+    async fn remove_volume(&self, name: &str) -> Result<bool, BackendError> {
+        // Reject a traversing / multi-component name before touching the fs (a
+        // fixed mount is fine — only `name` is load-bearing here).
+        validate_volume(name, "/")?;
+        let dir = self.volume_dir(name);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(BackendError::Other(format!(
+                "remove volume {} dir: {e}",
+                dir.display()
+            ))),
+        }
+    }
 }
 
 impl ContainerBackend {
@@ -602,11 +668,17 @@ impl ContainerBackend {
         self.data_dir.join("compute").join("logs")
     }
 
+    /// The root holding every persistent volume's backing directory
+    /// (`<data_dir>/compute/volumes/`).
+    fn volumes_dir(&self) -> PathBuf {
+        self.data_dir.join("compute").join("volumes")
+    }
+
     /// The host backing directory for persistent volume `name`
     /// (`<data_dir>/compute/volumes/<name>`) — keyed by volume name (not VM), so
     /// it persists across launches/replicas.
     fn volume_dir(&self, name: &str) -> PathBuf {
-        self.data_dir.join("compute").join("volumes").join(name)
+        self.volumes_dir().join(name)
     }
 
     /// Ensure each of the spec's persistent volumes has a backing directory and
@@ -987,6 +1059,36 @@ fn unpack_tar_gz(tar_path: &Path, dir: &Path, caps: ArchiveCaps) -> Result<(), A
 /// that once we *are* root, a chown failure is a real error and still propagates.
 fn can_shift_ownership() -> bool {
     nix::unistd::geteuid().is_root()
+}
+
+/// Sum the on-disk size (bytes) of every regular file under `dir`, recursively
+/// (blocking). Symlinks are counted by their own size, never followed, so a
+/// symlink inside a volume can't inflate the total or escape into the wider fs.
+/// A directory that vanishes mid-walk (concurrent removal) contributes what was
+/// read so far rather than erroring — the size is advisory for the operator
+/// listing, not a correctness invariant.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            // `DirEntry::metadata` does not follow symlinks (unlike `Path::metadata`),
+            // so a symlink is counted by its own size, never traversed.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.file_type().is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.size());
+            }
+        }
+    }
+    total
 }
 
 /// Shift every entry's on-disk uid/gid up by `base` (recursively, not following
@@ -1373,6 +1475,56 @@ mod tests {
         // Idempotent: staging again re-uses the existing dirs.
         let again = backend.stage_volumes(&spec).await.expect("stage volumes 2");
         assert_eq!(again, mounts);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn list_and_remove_volumes_over_the_backing_dir() {
+        let data_dir = unique_dir("volmgmt");
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            data_dir.clone(),
+            "br-boatramp".into(),
+            "10.0.0.0/24",
+            PathBuf::from("/proc/self/exe"),
+        )
+        .expect("backend");
+
+        // Nothing staged yet ⇒ empty list (no volumes dir), never an error.
+        assert!(backend.list_volumes().await.expect("list empty").is_empty());
+
+        // Stage two backing dirs with known content sizes.
+        let vols = data_dir.join("compute").join("volumes");
+        std::fs::create_dir_all(vols.join("db/sub")).unwrap();
+        std::fs::write(vols.join("db/a.bin"), vec![7u8; 100]).unwrap();
+        std::fs::write(vols.join("db/sub/b.bin"), vec![7u8; 23]).unwrap();
+        std::fs::create_dir_all(vols.join("cache")).unwrap();
+        std::fs::write(vols.join("cache/c.bin"), vec![1u8; 5]).unwrap();
+        // A stray non-directory entry at the root is ignored (not a volume).
+        std::fs::write(vols.join("stray-file"), b"x").unwrap();
+
+        let listed = backend.list_volumes().await.expect("list");
+        assert_eq!(listed.len(), 2, "two volume dirs, stray file ignored");
+        // Sorted by name: cache then db.
+        assert_eq!(listed[0].name, "cache");
+        assert_eq!(listed[0].size_bytes, 5);
+        assert_eq!(listed[1].name, "db");
+        assert_eq!(listed[1].size_bytes, 123, "recursive sum across subdirs");
+
+        // Remove one → it's gone; the other survives.
+        assert!(backend.remove_volume("db").await.expect("remove db"));
+        assert!(!vols.join("db").exists());
+        let after = backend.list_volumes().await.expect("list after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name, "cache");
+
+        // Removing an absent volume reports "did not exist" (idempotent, no error).
+        assert!(!backend.remove_volume("db").await.expect("remove absent"));
+
+        // A traversing name is rejected before touching the fs.
+        assert!(backend.remove_volume("../etc").await.is_err());
+        assert!(backend.remove_volume("a/b").await.is_err());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

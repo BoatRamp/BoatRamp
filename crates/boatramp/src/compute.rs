@@ -237,6 +237,29 @@ enum ComputeCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         argv: Vec<String>,
     },
+    /// Manage persistent volumes: list them (with in-use / orphaned status) and
+    /// reclaim a decommissioned workload's volume. The safe flow is `compute rm
+    /// <workload>` first (unregister → the reconcile loop stops it), then
+    /// `compute volume rm <name>`.
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+}
+
+/// `boatramp compute volume …` — persistent-volume management.
+#[derive(Debug, Subcommand)]
+enum VolumeCommand {
+    /// List persistent volumes (NAME / SIZE / IN-USE).
+    Ls,
+    /// Remove a persistent volume by name. Refused if a registered workload still
+    /// references it, unless `--force`.
+    Rm {
+        /// Volume name.
+        name: String,
+        /// Remove even when a registered workload's spec still references it (the
+        /// disposable-data override). Prefer `compute rm <workload>` first.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -511,8 +534,76 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 std::process::exit(code as i32);
             }
         }
+        ComputeCommand::Volume(VolumeCommand::Ls) => {
+            let vols: serde_json::Value = http
+                .get(format!("{server}/api/{seg}/volumes"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let arr = vols.as_array().cloned().unwrap_or_default();
+            if arr.is_empty() {
+                println!("no volumes");
+                return Ok(());
+            }
+            let (name_h, size_h, in_use_h) = ("NAME", "SIZE", "IN-USE");
+            println!("{name_h:<24}  {size_h:>12}  {in_use_h}");
+            for v in arr {
+                let name = v["name"].as_str().unwrap_or("?");
+                let size = human_size(v["size_bytes"].as_u64().unwrap_or(0));
+                let in_use = if v["in_use"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "no"
+                };
+                println!("{name:<24}  {size:>12}  {in_use}");
+            }
+        }
+        ComputeCommand::Volume(VolumeCommand::Rm { name, force }) => {
+            let mut url = format!("{server}/api/{seg}/volumes/{name}");
+            if force {
+                url.push_str("?force=true");
+            }
+            let resp = http.delete(url).send().await?;
+            match resp.status() {
+                s if s.is_success() => println!("removed {name}"),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(Error::Server(format!("no such volume {name:?}")))
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    return Err(Error::Server(format!(
+                        "volume {name:?} in use by a registered workload; `compute rm` it \
+                         first, or pass --force"
+                    )))
+                }
+                s => {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(Error::Server(format!(
+                        "remove volume failed: {s}: {}",
+                        text.trim()
+                    )));
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Render a byte count as a compact human-readable size for the `volume ls` table.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 /// Assemble a [`ComputeSpec`] from CLI fields (parsing `K=V` env pairs).
@@ -612,4 +703,63 @@ async fn put_workload(
         .json()
         .await?;
     Ok(resp["spec"].as_str().unwrap_or("").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// A minimal top-level parser mirroring `main`'s `compute` arm, so the
+    /// `compute volume …` surface can be arg-parsed in isolation.
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: Cmd,
+    }
+    #[derive(Subcommand)]
+    enum Cmd {
+        Compute(ComputeArgs),
+    }
+
+    fn parse(argv: &[&str]) -> std::result::Result<ComputeCommand, clap::Error> {
+        let cli = Cli::try_parse_from(std::iter::once("boatramp").chain(argv.iter().copied()))?;
+        let Cmd::Compute(args) = cli.cmd;
+        Ok(args.command)
+    }
+
+    #[test]
+    fn compute_volume_ls_and_rm_parse() {
+        assert!(matches!(
+            parse(&["compute", "volume", "ls"]),
+            Ok(ComputeCommand::Volume(VolumeCommand::Ls))
+        ));
+        // `rm <name>` defaults to no force.
+        match parse(&["compute", "volume", "rm", "data"]) {
+            Ok(ComputeCommand::Volume(VolumeCommand::Rm { name, force })) => {
+                assert_eq!(name, "data");
+                assert!(!force);
+            }
+            other => panic!("expected volume rm, got {other:?}"),
+        }
+        // `--force` flips the override.
+        match parse(&["compute", "volume", "rm", "data", "--force"]) {
+            Ok(ComputeCommand::Volume(VolumeCommand::Rm { name, force })) => {
+                assert_eq!(name, "data");
+                assert!(force);
+            }
+            other => panic!("expected forced volume rm, got {other:?}"),
+        }
+        // `rm` requires a name.
+        assert!(parse(&["compute", "volume", "rm"]).is_err());
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
 }

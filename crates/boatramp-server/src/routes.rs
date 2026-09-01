@@ -50,6 +50,7 @@ pub fn router_with_fast(
     let operator_sql_cap = options.operator_sql.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
+    let compute_volumes_cap = options.compute_volumes.clone();
     // The project-scoped internal secret store (`None` when no `[secrets]` envelope
     // is configured — the admin secrets endpoints then fail closed with a clear 501).
     // Rides as an `api` extension read by the secrets handlers; not handlers-gated.
@@ -229,6 +230,15 @@ pub fn router_with_fast(
         // Compute workloads — the control plane is uniform; only
         // *execution* needs KVM. Admin-scoped (deny-safe `Right::required`).
         .route("/api/compute", get(list_compute))
+        // Persistent-volume management — registered BEFORE `/api/compute/{name}` so the
+        // literal `volumes` segment wins over the `{name}` param. Admin-scoped (the
+        // deny-safe `/api/compute/*` `Right::required` default). List flags in-use vs
+        // orphaned; DELETE refuses a still-referenced volume (`409`) unless `?force=true`.
+        .route("/api/compute/volumes", get(list_compute_volumes))
+        .route(
+            "/api/compute/volumes/{name}",
+            axum::routing::delete(delete_compute_volume),
+        )
         .route(
             "/api/compute/{name}",
             get(get_compute).put(put_compute).delete(delete_compute),
@@ -372,6 +382,7 @@ pub fn router_with_fast(
         .layer(Extension(operator_sql_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
+        .layer(Extension(compute_volumes_cap))
         .layer(Extension(secret_store_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]

@@ -308,6 +308,90 @@ pub trait ComputeBackend: Send + Sync {
     ) -> Result<ExecOutput, BackendError> {
         Err(BackendError::Unsupported)
     }
+
+    /// List this backend's persistent volumes (the host-side backing for a
+    /// spec's [`VolumeRef`]s). Only the backends that own an on-node volume
+    /// directory implement it (the native `container` backend, under
+    /// `<data_dir>/compute/volumes/<name>`); the rest return the empty default,
+    /// so a listing across a mixed fleet simply omits them. Backs the operator
+    /// `GET /api/compute/volumes` volume-reclamation surface.
+    async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, BackendError> {
+        Ok(Vec::new())
+    }
+
+    /// Remove the backing for persistent volume `name`, returning whether it
+    /// existed. Only the backends that own an on-node volume directory implement
+    /// it (native `container`); the rest return [`BackendError::Unsupported`].
+    /// The caller (the node volume capability) refuses to remove a volume still
+    /// referenced by a registered workload's spec unless forced — see
+    /// [`ComputeVolumes`]. Backs `DELETE /api/compute/volumes/{name}`.
+    async fn remove_volume(&self, _name: &str) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+}
+
+/// A persistent volume as seen by an operator listing (`GET /api/compute/volumes`
+/// / `boatramp compute volume ls`): the volume `name` (which backs the on-node
+/// directory `<data_dir>/compute/volumes/<name>`) and its total on-disk size in
+/// bytes. Whether the volume is still referenced by a registered workload's spec
+/// (in use vs orphaned) is decided one layer up, by [`ComputeVolumes`], not by the
+/// backend, which only sees the on-disk directories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeInfo {
+    /// The volume name (the single path component under `.../compute/volumes/`).
+    pub name: String,
+    /// The volume's total on-disk size in bytes (summed recursively).
+    pub size_bytes: u64,
+}
+
+/// Why a [`ComputeVolumes`] operation failed. Distinct from a raw
+/// [`BackendError`]: this layer adds the "still in use" refusal (a volume a
+/// registered workload's spec still mounts) and "no volume-capable backend".
+#[derive(Debug, thiserror::Error)]
+pub enum VolumeError {
+    /// The volume is still referenced by a registered workload's active spec, so
+    /// removing it could corrupt a running/relaunching replica. `compute rm` the
+    /// workload first, or force the removal.
+    #[error("volume {0:?} is in use by a registered workload")]
+    InUse(String),
+    /// No backend on this node backs persistent volumes (so nothing to list/remove).
+    #[error("no volume-capable backend on this node")]
+    Unsupported,
+    /// Any other failure (backend error, store read failure, …).
+    #[error("volume operation failed: {0}")]
+    Other(String),
+}
+
+/// The operator-facing persistent-volume reclamation capability, backing
+/// `GET /api/compute/volumes` + `DELETE /api/compute/volumes/{name}` and the
+/// `boatramp compute volume` subcommand. The node implementation lists the
+/// volume-capable backends' on-node volumes, flags which are still referenced by
+/// a registered workload's spec (in use vs orphaned), and refuses to remove an
+/// in-use volume unless forced. Admin-scoped at the API (the deny-safe
+/// `/api/compute/*` default).
+#[async_trait]
+pub trait ComputeVolumes: Send + Sync {
+    /// List every persistent volume on this node, each flagged with whether a
+    /// registered workload's active spec still references it (`in_use`).
+    async fn list(&self) -> Result<Vec<VolumeStatus>, VolumeError>;
+
+    /// Remove the backing for volume `name`. Refuses with [`VolumeError::InUse`]
+    /// when a registered workload's spec still references it, unless `force`.
+    /// Returns whether the volume existed (`false` ⇒ `404` at the API).
+    async fn remove(&self, name: &str, force: bool) -> Result<bool, VolumeError>;
+}
+
+/// A persistent volume plus whether a registered workload's spec still references
+/// it — the `GET /api/compute/volumes` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeStatus {
+    /// The underlying volume (name + on-disk size).
+    #[serde(flatten)]
+    pub info: VolumeInfo,
+    /// Whether a registered workload's active spec still mounts this volume (a
+    /// running/relaunching replica depends on it). Removal of an in-use volume is
+    /// refused unless forced.
+    pub in_use: bool,
 }
 
 // ---------------------------------------------------------------------------

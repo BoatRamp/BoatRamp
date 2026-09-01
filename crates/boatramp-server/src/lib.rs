@@ -41,10 +41,11 @@ pub mod sql_shim;
 pub(crate) use admin_api::auth_exchange;
 pub(crate) use admin_api::{
     activate_deployment, cert_status, compute_exec, create_deployment, current_deployment,
-    delete_compute, delete_site, get_compute, get_daemon_config, get_deployment, get_site_config,
-    invalidate_cache, list_aliases, list_compute, list_deployments, list_sites, prune_delete,
-    prune_report, put_blob, put_compute, put_daemon_config, put_site_config, remove_alias,
-    rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_query,
+    delete_compute, delete_compute_volume, delete_site, get_compute, get_daemon_config,
+    get_deployment, get_site_config, invalidate_cache, list_aliases, list_compute,
+    list_compute_volumes, list_deployments, list_sites, prune_delete, prune_report, put_blob,
+    put_compute, put_daemon_config, put_site_config, remove_alias, rollback_daemon_config,
+    scrub_blobs, set_alias, sql_exec, sql_query,
 };
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
@@ -807,6 +808,11 @@ pub struct ServerOptions {
     /// Backs `POST /api/compute/{name}/exec`; `None` ⇒ `501`. Gated at the handler by
     /// the `allow_compute_exec` posture. Wired by the node with the compute backends.
     pub compute_exec: Option<Arc<dyn boatramp_core::compute::ComputeExec>>,
+    /// Operator volume-reclamation capability (list + remove persistent volumes).
+    /// Backs `GET /api/compute/volumes` + `DELETE /api/compute/volumes/{name}`;
+    /// `None` ⇒ `501`. Admin-scoped (the deny-safe `/api/compute/*` default). Wired
+    /// by the node with the compute backends.
+    pub compute_volumes: Option<Arc<dyn boatramp_core::compute::ComputeVolumes>>,
     /// The project-scoped internal secret store (sealed with the `[secrets]`
     /// envelope). Backs the admin secrets API (`/api/projects/{proj}/secrets{,/{name}}`,
     /// rewritten onto `/api/secrets{,/{name}}`) — set/list/delete of names + metadata,

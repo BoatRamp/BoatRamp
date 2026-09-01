@@ -433,3 +433,332 @@ impl boatramp_core::compute::ComputeExec for NodeComputeExec {
         }
     }
 }
+
+/// The node's [`ComputeVolumes`](boatramp_core::compute::ComputeVolumes): list +
+/// reclaim persistent volumes. Backs `GET /api/compute/volumes` +
+/// `DELETE /api/compute/volumes/{name}` (admin-scoped). Lists every
+/// volume-capable backend's on-node volumes, flags which are still referenced by a
+/// registered workload's active spec (in use vs orphaned), and refuses to remove
+/// an in-use volume unless forced — so `compute rm <workload>` (which unregisters
+/// it, then the reconcile loop stops the replica) is the safe precondition for
+/// reclaiming its volume.
+pub struct NodeComputeVolumes {
+    backends: boatramp_core::compute::BackendRegistry,
+    deploy: boatramp_core::deploy::DeployStore,
+}
+
+impl NodeComputeVolumes {
+    /// Build over this node's compute backends + the control-plane store.
+    pub fn new(
+        backends: boatramp_core::compute::BackendRegistry,
+        deploy: boatramp_core::deploy::DeployStore,
+    ) -> Self {
+        Self { backends, deploy }
+    }
+
+    /// The set of volume names still referenced by **any** registered workload's
+    /// active spec, across every project (the `_all` fan-out). A name in this set
+    /// is "in use": a running or relaunching replica mounts it, so removing its
+    /// backing would corrupt live data. Resolves each workload's content-addressed
+    /// spec to read its `volumes[].name`; a workload whose spec can't be resolved
+    /// is skipped (it can't be actively mounting a volume the backend still backs).
+    async fn referenced_volume_names(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, boatramp_core::compute::VolumeError> {
+        use boatramp_core::compute::VolumeError;
+        let mut names = std::collections::BTreeSet::new();
+        let workloads = self
+            .deploy
+            .list_compute_workloads_all()
+            .await
+            .map_err(|e| VolumeError::Other(e.to_string()))?;
+        for (_project, workload) in workloads {
+            let spec = self
+                .deploy
+                .get_compute_spec(&workload.active)
+                .await
+                .map_err(|e| VolumeError::Other(e.to_string()))?;
+            if let Some(spec) = spec {
+                for vol in spec.volumes {
+                    names.insert(vol.name);
+                }
+            }
+        }
+        Ok(names)
+    }
+}
+
+#[async_trait::async_trait]
+impl boatramp_core::compute::ComputeVolumes for NodeComputeVolumes {
+    async fn list(
+        &self,
+    ) -> Result<Vec<boatramp_core::compute::VolumeStatus>, boatramp_core::compute::VolumeError>
+    {
+        use boatramp_core::compute::{VolumeError, VolumeStatus};
+        let referenced = self.referenced_volume_names().await?;
+        // Union the volumes every backend reports (dedup by name — a name is unique
+        // per node's volumes dir). A backend that doesn't back volumes returns the
+        // empty default, so this naturally reduces to the volume-capable backend(s).
+        let mut by_name: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for backend in self.backends.values() {
+            let vols = backend
+                .list_volumes()
+                .await
+                .map_err(|e| VolumeError::Other(e.to_string()))?;
+            for v in vols {
+                // Keep the largest reported size if two backends somehow name-collide.
+                let slot = by_name.entry(v.name).or_insert(0);
+                *slot = (*slot).max(v.size_bytes);
+            }
+        }
+        Ok(by_name
+            .into_iter()
+            .map(|(name, size_bytes)| VolumeStatus {
+                in_use: referenced.contains(&name),
+                info: boatramp_core::compute::VolumeInfo { name, size_bytes },
+            })
+            .collect())
+    }
+
+    async fn remove(
+        &self,
+        name: &str,
+        force: bool,
+    ) -> Result<bool, boatramp_core::compute::VolumeError> {
+        use boatramp_core::compute::{BackendError, VolumeError};
+        // Safety guard: refuse to pull a volume out from under a registered
+        // workload unless the operator forces it. `compute rm <workload>` first is
+        // the safe flow; `--force` is the disposable-data override.
+        if !force && self.referenced_volume_names().await?.contains(name) {
+            return Err(VolumeError::InUse(name.to_string()));
+        }
+        // Remove from whichever backend owns it. `true` from any backend ⇒ existed.
+        // Every backend reports `Unsupported` ⇒ no volume-capable backend here.
+        let mut existed = false;
+        let mut any_supported = false;
+        for backend in self.backends.values() {
+            match backend.remove_volume(name).await {
+                Ok(removed) => {
+                    any_supported = true;
+                    existed |= removed;
+                }
+                Err(BackendError::Unsupported) => {}
+                Err(e) => return Err(VolumeError::Other(e.to_string())),
+            }
+        }
+        if !any_supported {
+            return Err(VolumeError::Unsupported);
+        }
+        Ok(existed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use boatramp_core::compute::{
+        Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, ComputeVolumes,
+        ComputeWorkload, Health, Instance, InstanceHandle, IsolationClass, IsolationRequirement,
+        LaunchRequest, RestartPolicy, RootSource, VolumeError, VolumeInfo, VolumeRef,
+    };
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::project::ProjectRef;
+    use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A `Storage` the `DeployStore` never actually reads on the volume paths (the
+    /// spec/workload records live in the KV) — every method is a stub.
+    struct NullStorage;
+    #[async_trait]
+    impl Storage for NullStorage {
+        async fn get(&self, _: &str) -> Result<GetObject, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn get_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<GetObject, StorageError> {
+            Err(StorageError::unsupported("range"))
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: ByteStream,
+            _: PutMeta,
+        ) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::unsupported("put"))
+        }
+        async fn head(&self, _: &str) -> Result<ObjectMeta, StorageError> {
+            Err(StorageError::NotFound(String::new()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMeta>, StorageError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A fake volume-capable backend over an in-memory set of `(name, size)`
+    /// volumes — enough to drive `NodeComputeVolumes` without a real container node.
+    struct FakeVolumeBackend {
+        vols: Mutex<BTreeMap<String, u64>>,
+    }
+    impl FakeVolumeBackend {
+        fn with(names: &[(&str, u64)]) -> Self {
+            Self {
+                vols: Mutex::new(names.iter().map(|(n, s)| (n.to_string(), *s)).collect()),
+            }
+        }
+    }
+    #[async_trait]
+    impl ComputeBackend for FakeVolumeBackend {
+        fn id(&self) -> &'static str {
+            "container"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: true,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(&self, _: &ComputeSpec) -> Result<Artifact, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        async fn launch(&self, _: &LaunchRequest) -> Result<Instance, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        async fn stop(&self, _: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Unknown)
+        }
+        async fn list_volumes(&self) -> Result<Vec<VolumeInfo>, BackendError> {
+            Ok(self
+                .vols
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, size)| VolumeInfo {
+                    name: name.clone(),
+                    size_bytes: *size,
+                })
+                .collect())
+        }
+        async fn remove_volume(&self, name: &str) -> Result<bool, BackendError> {
+            Ok(self.vols.lock().unwrap().remove(name).is_some())
+        }
+    }
+
+    fn spec_with_volume(vol: Option<&str>) -> ComputeSpec {
+        ComputeSpec {
+            version: 1,
+            root: RootSource::Image("img".into()),
+            kernel: String::new(),
+            kernel_cmdline: None,
+            vcpus: 1,
+            mem_mib: 64,
+            entrypoint: vec![],
+            env: BTreeMap::new(),
+            port: 8080,
+            restart: RestartPolicy::Always,
+            scale_to_zero: false,
+            volumes: vol
+                .map(|n| {
+                    vec![VolumeRef {
+                        mount: "/data".into(),
+                        name: n.into(),
+                        size_mib: 128,
+                    }]
+                })
+                .unwrap_or_default(),
+            writable_root: false,
+            cap_add: vec![],
+            user: None,
+            isolation: IsolationRequirement::Trusted,
+            prefer_backend: None,
+            bindings: vec![],
+        }
+    }
+
+    /// Build a store with one workload named `wl` whose spec references volume
+    /// `referenced` (or none), plus a `NodeComputeVolumes` over a fake backend that
+    /// backs `backend_vols`.
+    async fn setup(referenced: Option<&str>, backend_vols: &[(&str, u64)]) -> NodeComputeVolumes {
+        let store = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        let spec = spec_with_volume(referenced);
+        let hash = store.put_compute_spec(&spec).await.expect("put spec");
+        let workload = ComputeWorkload {
+            version: 1,
+            name: "wl".into(),
+            active: hash,
+            replicas: 1,
+            placement: Default::default(),
+        };
+        store
+            .set_compute_workload(ProjectRef::DEFAULT, &workload)
+            .await
+            .expect("set workload");
+        let mut backends: boatramp_core::compute::BackendRegistry = BTreeMap::new();
+        backends.insert(
+            "container".into(),
+            Arc::new(FakeVolumeBackend::with(backend_vols)) as Arc<dyn ComputeBackend>,
+        );
+        NodeComputeVolumes::new(backends, store)
+    }
+
+    #[tokio::test]
+    async fn list_flags_referenced_volume_in_use_and_orphan_free() {
+        // "data" is referenced by the workload spec; "old" is an orphan.
+        let vols = setup(Some("data"), &[("data", 100), ("old", 50)]).await;
+        let listed = vols.list().await.expect("list");
+        assert_eq!(listed.len(), 2);
+        let data = listed.iter().find(|v| v.info.name == "data").unwrap();
+        let old = listed.iter().find(|v| v.info.name == "old").unwrap();
+        assert!(data.in_use, "spec-referenced volume is in use");
+        assert_eq!(data.info.size_bytes, 100);
+        assert!(!old.in_use, "unreferenced volume is orphaned");
+        assert_eq!(old.info.size_bytes, 50);
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_in_use_without_force_and_allows_with_force() {
+        let vols = setup(Some("data"), &[("data", 100)]).await;
+        // Without force: refused (in use by the registered workload).
+        assert!(matches!(
+            vols.remove("data", false).await,
+            Err(VolumeError::InUse(n)) if n == "data"
+        ));
+        // The volume is still there (refusal didn't remove it).
+        assert!(vols
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|v| v.info.name == "data"));
+        // With force: removed.
+        assert!(vols.remove("data", true).await.expect("forced remove"));
+        assert!(vols.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_orphan_succeeds_and_absent_reports_false() {
+        // No workload references "old"; it removes without force.
+        let vols = setup(None, &[("old", 50)]).await;
+        assert!(vols.remove("old", false).await.expect("remove orphan"));
+        // Removing an absent volume reports "did not exist".
+        assert!(!vols.remove("gone", false).await.expect("remove absent"));
+    }
+}

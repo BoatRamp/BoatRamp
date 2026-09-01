@@ -380,6 +380,15 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         crate::compute::NodeComputeExec::new(compute_backends.clone(), deploy.clone()),
     ) as Arc<_>);
 
+    // Operator volume-reclamation capability (list + remove persistent volumes) —
+    // backs `GET /api/compute/volumes` + `DELETE /api/compute/volumes/{name}`.
+    // Same admin-scoped `/api/compute/*` gate; clone the registry before the
+    // reconcile loop consumes the original below.
+    let compute_volumes: Option<Arc<dyn boatramp_core::compute::ComputeVolumes>> = Some(Arc::new(
+        crate::compute::NodeComputeVolumes::new(compute_backends.clone(), deploy.clone()),
+    )
+        as Arc<_>);
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -432,6 +441,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.operator_sql = operator_sql;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
+    options.compute_volumes = compute_volumes;
     // The internal secret store backs the admin secrets API (set/list/delete). Not
     // handlers-gated — it must be reachable even on a lean node.
     options.secret_store = secret_store;

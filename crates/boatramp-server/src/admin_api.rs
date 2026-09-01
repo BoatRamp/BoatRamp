@@ -1062,6 +1062,86 @@ pub(super) async fn compute_exec(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent-volume management (`GET /api/compute/volumes`,
+// `DELETE /api/compute/volumes/{name}`)
+// ---------------------------------------------------------------------------
+
+/// Query for `DELETE /api/compute/volumes/{name}`.
+#[derive(Deserialize)]
+pub(super) struct RemoveVolumeQuery {
+    /// Remove even when the volume is still referenced by a registered workload's
+    /// spec (the `409` override — for disposable data). Default `false`.
+    #[serde(default)]
+    force: bool,
+}
+
+/// List every persistent volume this node backs, each flagged with whether a
+/// registered workload's active spec still references it (`in_use`). Admin-scoped
+/// (the deny-safe `/api/compute/*` default). `501` if no volume-capable backend is
+/// wired.
+pub(super) async fn list_compute_volumes(
+    Extension(volumes): Extension<Option<Arc<dyn boatramp_core::compute::ComputeVolumes>>>,
+) -> Response {
+    let Some(volumes) = volumes else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "compute volume management is not available on this node\n",
+        )
+            .into_response();
+    };
+    match volumes.list().await {
+        Ok(list) => (StatusCode::OK, Json(list)).into_response(),
+        Err(boatramp_core::compute::VolumeError::Unsupported) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "no volume-capable backend on this node\n",
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("list volumes failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// Remove a persistent volume by name. `204` on success, `404` if absent, and
+/// `409` when the volume is still referenced by a registered workload's spec —
+/// unless `?force=true`. Admin-scoped. `501` if no volume-capable backend is
+/// wired.
+pub(super) async fn delete_compute_volume(
+    Extension(volumes): Extension<Option<Arc<dyn boatramp_core::compute::ComputeVolumes>>>,
+    Path(name): Path<String>,
+    Query(q): Query<RemoveVolumeQuery>,
+) -> Response {
+    let Some(volumes) = volumes else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "compute volume management is not available on this node\n",
+        )
+            .into_response();
+    };
+    match volumes.remove(&name, q.force).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such volume\n").into_response(),
+        Err(boatramp_core::compute::VolumeError::InUse(_)) => (
+            StatusCode::CONFLICT,
+            "volume in use by a registered workload; `compute rm` it first, or pass --force\n",
+        )
+            .into_response(),
+        Err(boatramp_core::compute::VolumeError::Unsupported) => (
+            StatusCode::NOT_IMPLEMENTED,
+            "no volume-capable backend on this node\n",
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("remove volume failed: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Response for the OIDC→token exchange.
 #[cfg(feature = "oidc")]
 #[derive(Serialize)]
