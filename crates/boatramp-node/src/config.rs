@@ -342,6 +342,9 @@ impl ServerConfig {
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION")? {
                 o.require_domain_verification = Some(v);
             }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS")? {
+                o.allow_env_secret_refs = Some(v);
+            }
         }
 
         // --- handler sql (`handlers.bindings.sql`) ---------------------------
@@ -612,6 +615,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING",
     "BOATRAMP_SECURITY_REQUIRE_POP",
     "BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION",
+    "BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS",
 ];
 
 /// The `BOATRAMP_*` variables that populate `handlers.bindings.sql`.
@@ -2210,6 +2214,21 @@ mod tests {
         // ...but the explicit override wins over the profile.
         assert!(posture.oidc_require_audience);
         assert_eq!(posture.max_upload_bytes, 0); // unlimited
+    }
+
+    #[test]
+    fn env_wires_allow_env_secret_refs_over_the_multi_tenant_default() {
+        // With no file, the multi-tenant default leaves host-env secret refs off;
+        // the env knob re-enables them (env > default), same as the other posture bools.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[("BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS", "true")]))
+            .expect("valid env override applies");
+        let posture = cfg
+            .security
+            .expect("security materialised from env")
+            .resolve()
+            .expect("resolves");
+        assert!(posture.allow_env_secret_refs);
     }
 
     #[test]

@@ -397,6 +397,24 @@ pub(super) async fn deploy_function(
     if let Some(resp) = reject_invalid_name("function", &name) {
         return resp;
     }
+    // Fail loud at deploy on a `secrets` map the posture forbids: under the
+    // multi-tenant posture a bare / `env:` ref reads the operator's environment
+    // (cross-tenant host-env exfiltration). Refuse here with the same message the
+    // resolution-time backstop raises, so the tenant sees it now, not at first
+    // invocation. (Falls back to the fail-closed `false` on a no-op runtime.)
+    // Handlers-gated: without a wasm engine a function can't run, so there is no
+    // resolution-time path to guard at deploy.
+    #[cfg(feature = "handlers")]
+    if let Err(err) = crate::handler_dispatch::admit_secret_refs(
+        &body.config.secrets,
+        handlers.allow_env_secret_refs(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("function secrets: {err}\n"),
+        )
+            .into_response();
+    }
     match deploy.has_blob(&body.component).await {
         Ok(true) => {}
         Ok(false) => {

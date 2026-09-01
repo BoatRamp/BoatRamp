@@ -336,7 +336,7 @@ pub(super) async fn run_scheduler_tick(
                             }
                         }
                         let wasm = &wasm_cache[&entry.hash];
-                        let bindings = build_bindings(
+                        let bindings = match build_bindings(
                             inner,
                             project,
                             &site,
@@ -352,7 +352,17 @@ pub(super) async fn run_scheduler_tick(
                             // Background consumers have no request context to correlate with.
                             None,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(bindings) => bindings,
+                            // A refused secret ref (host-env ref under the multi-tenant
+                            // posture, or an unsupported scheme) fails the consumer
+                            // closed — skip dispatch rather than run with a leaked value.
+                            Err(err) => {
+                                tracing::warn!(site, topic = %consumer.topic, %err, "consumer bindings refused");
+                                continue;
+                            }
+                        };
                         // A `bus:<topic>` consumer subscribes to the shared,
                         // project-scoped bus (so it consumes events a *different*
                         // component published); a plain topic drains its own site
@@ -530,7 +540,7 @@ async fn fire_cron(
             return;
         }
     };
-    let bindings = build_bindings(
+    let bindings = match build_bindings(
         inner,
         project,
         site,
@@ -546,7 +556,16 @@ async fn fire_cron(
         // A cron trigger has no inbound request to correlate with.
         None,
     )
-    .await;
+    .await
+    {
+        Ok(bindings) => bindings,
+        // A refused secret ref fails the cron closed — skip firing rather than run
+        // with a leaked (multi-tenant host-env) or unsupported value.
+        Err(err) => {
+            tracing::warn!(site, route = %cron.route, %err, "cron bindings refused");
+            return;
+        }
+    };
     let limits = effective_limits(site_handlers, handler);
     let request = match axum::http::Request::builder()
         .method("GET")

@@ -299,7 +299,7 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::RequestId>()
         .map(|r| r.0.clone());
-    let bindings = build_bindings(
+    let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
         site,
@@ -314,7 +314,17 @@ pub(super) async fn dispatch_handler(
         0,
         request_id.as_deref(),
     )
-    .await;
+    .await
+    {
+        Ok(bindings) => bindings,
+        // A refused secret ref (host-env ref under the multi-tenant posture, or an
+        // unsupported scheme) fails the handler closed rather than instantiating it
+        // with a leaked or missing value.
+        Err(err) => {
+            tracing::warn!(site, route = %handler.route, %err, "handler bindings refused");
+            return handler_unavailable();
+        }
+    };
 
     // Per-site concurrency cap (held through the head response; the engine has
     // its own global cap on top). Keyed by `scope`, so a preview's load can't
@@ -882,7 +892,7 @@ pub(super) async fn build_bindings(
     invoke_targets: &[String],
     depth: u32,
     request_id: Option<&str>,
-) -> boatramp_handlers::Bindings {
+) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
     };
@@ -972,57 +982,173 @@ pub(super) async fn build_bindings(
     }
 
     // Environment for the guest: the deploy's static `env`
-    // strings, plus the site's `secrets` — each a *reference* to a host
-    // environment variable holding the real value, resolved here and never
-    // stored in the manifest/config. The guest sees only these; the host's own
-    // environment is never inherited.
-    bindings = bindings.with_env(resolve_env(site, deploy_env, site_handlers));
-    bindings
+    // strings, plus the site's `secrets` — each a *reference* to a secret value,
+    // resolved here and never stored in the manifest/config. The guest sees only
+    // these; the host's own environment is never inherited. Under the multi-tenant
+    // posture a bare / `env:` ref into the operator's environment is refused
+    // (fail-closed) — the site config's author is an untrusted tenant.
+    let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
+    let env = resolve_env(site, deploy_env, site_handlers, allow_env_secret_refs)?;
+    bindings = bindings.with_env(env);
+    Ok(bindings)
 }
 
 /// Assemble the guest environment: static deploy `env` first, then site
 /// `secrets` resolved from the host environment (a missing referent is logged
 /// and skipped, never injected as empty). A secret name overrides a static one.
+///
+/// `allow_env_secret_refs` is the security posture's `allow_env_secret_refs`
+/// (on under single-tenant/dev, off under multi-tenant): when off, a bare /
+/// `env:`-scheme ref is **refused** (fail-closed) so an untrusted tenant's
+/// `secrets` map can't name an arbitrary host env var to exfiltrate it.
 #[cfg(feature = "handlers")]
 pub(super) fn resolve_env(
     site: &str,
     deploy_env: &std::collections::BTreeMap<String, String>,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
-) -> Vec<(String, String)> {
-    resolve_secret_env(site, deploy_env, &site_handlers.secrets)
+    allow_env_secret_refs: bool,
+) -> Result<Vec<(String, String)>, String> {
+    resolve_secret_env(
+        site,
+        deploy_env,
+        &site_handlers.secrets,
+        allow_env_secret_refs,
+    )
 }
 
 /// Assemble a guest environment: static `env` first, then each `secrets` entry
-/// (`GUEST_NAME` → `HOST_ENV_VAR`) resolved from the host environment. A missing
-/// host referent is logged and skipped — **never** injected as an empty value —
-/// and a resolved secret overrides a static `env` of the same name. This is the
-/// single indirection both site handlers and top-level functions use, so the
-/// referenced value is only injected at instantiation and never lands in the
-/// stored config/manifest. `label` tags the warn log (site or function scope).
+/// (`GUEST_NAME` → `SECRET_REF`) resolved. A missing host referent is logged and
+/// skipped — **never** injected as an empty value — and a resolved secret
+/// overrides a static `env` of the same name. This is the single indirection both
+/// site handlers and top-level functions use, so the referenced value is only
+/// injected at instantiation and never lands in the stored config/manifest.
+/// `label` tags the warn log (site or function scope).
+///
+/// A `SECRET_REF` carries an optional scheme:
+/// - `env:HOST_VAR` (explicit) or a **bare** `HOST_VAR` (back-compat) — read the
+///   serve process's own environment. That namespace is the **operator's**, so a
+///   bare/`env:` ref is honored only when `allow_env_secret_refs` is true
+///   (single-tenant/dev). Under the multi-tenant posture (`false`) it is
+///   **refused** with a clear error — the config author is an untrusted tenant,
+///   and a permitted bare ref would let them exfiltrate any host env var (another
+///   tenant's DB password, a cloud key) into their guest. Fail-closed: the whole
+///   env resolution errors so the handler/function never instantiates with a
+///   leaked value.
+/// - `boatramp:` / `vault:` / `hcp:` — reserved for a future project-scoped secret
+///   store; **not yet supported**, so any such ref errors rather than silently
+///   resolving.
 #[cfg(feature = "handlers")]
 pub(super) fn resolve_secret_env(
     label: &str,
     static_env: &std::collections::BTreeMap<String, String>,
     secrets: &std::collections::BTreeMap<String, String>,
-) -> Vec<(String, String)> {
+    allow_env_secret_refs: bool,
+) -> Result<Vec<(String, String)>, String> {
     let mut env: Vec<(String, String)> = static_env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    for (guest_name, host_ref) in secrets {
-        match std::env::var(host_ref) {
-            Ok(value) => {
-                env.retain(|(k, _)| k != guest_name);
-                env.push((guest_name.clone(), value));
+    for (guest_name, secret_ref) in secrets {
+        match parse_secret_ref(secret_ref) {
+            // Bare / `env:` — the operator's own namespace. Permitted only when
+            // the config author IS the operator (single-tenant/dev).
+            SecretRef::Env(host_var) => {
+                if !allow_env_secret_refs {
+                    return Err(format!(
+                        "host-env secret ref {guest_name:?} → {host_var:?} is not permitted \
+                         under the multi-tenant posture (it would read the operator's \
+                         environment); use a project-scoped secret instead"
+                    ));
+                }
+                match std::env::var(host_var) {
+                    Ok(value) => {
+                        env.retain(|(k, _)| k != guest_name);
+                        env.push((guest_name.clone(), value));
+                    }
+                    Err(_) => tracing::warn!(
+                        label,
+                        secret = %guest_name,
+                        "secret references env var {host_var}, which is not set; not injected"
+                    ),
+                }
             }
-            Err(_) => tracing::warn!(
-                label,
-                secret = %guest_name,
-                "secret references env var {host_ref}, which is not set; not injected"
-            ),
+            // A reserved scheme we recognise but don't yet implement — fail-closed
+            // rather than fall through to reading the env.
+            SecretRef::Unsupported(scheme) => {
+                return Err(format!(
+                    "secret ref {guest_name:?} uses the {scheme:?} scheme, which is not yet \
+                     supported"
+                ));
+            }
         }
     }
-    env
+    Ok(env)
+}
+
+/// Deploy-time admission for a `secrets` map: the same scheme gate
+/// [`resolve_secret_env`] applies at instantiation, but **without** reading any
+/// env var — so a tenant deploying under the multi-tenant posture gets a clear
+/// failure at deploy time (naming the offending guest var), not only when the
+/// handler/function first runs. `Err(msg)` refuses the deploy. Kept in lockstep
+/// with `resolve_secret_env` so the two never diverge.
+#[cfg(feature = "handlers")]
+pub(super) fn admit_secret_refs(
+    secrets: &std::collections::BTreeMap<String, String>,
+    allow_env_secret_refs: bool,
+) -> Result<(), String> {
+    for (guest_name, secret_ref) in secrets {
+        match parse_secret_ref(secret_ref) {
+            SecretRef::Env(host_var) => {
+                if !allow_env_secret_refs {
+                    return Err(format!(
+                        "host-env secret ref {guest_name:?} → {host_var:?} is not permitted \
+                         under the multi-tenant posture (it would read the operator's \
+                         environment); use a project-scoped secret instead"
+                    ));
+                }
+            }
+            SecretRef::Unsupported(scheme) => {
+                return Err(format!(
+                    "secret ref {guest_name:?} uses the {scheme:?} scheme, which is not yet \
+                     supported"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A parsed secret reference from a `secrets` map value.
+#[cfg(feature = "handlers")]
+enum SecretRef<'a> {
+    /// A bare `HOST_VAR` or explicit `env:HOST_VAR` — the serve process's own
+    /// environment (the operator's namespace). Carries the host variable name.
+    Env(&'a str),
+    /// A reserved-but-unimplemented scheme (`boatramp:` / `vault:` / `hcp:`).
+    /// Carries the scheme keyword for the error message.
+    Unsupported(&'a str),
+}
+
+/// Parse a `secrets` map value into a [`SecretRef`]. A bare value (no recognised
+/// `scheme:` prefix) is an implicit `env:` reference (back-compat). `env:` is the
+/// explicit form of the same. `boatramp:` / `vault:` / `hcp:` are reserved for a
+/// future project-scoped secret store and are surfaced as unsupported. Any other
+/// unknown `scheme:` prefix is treated as a bare host-var name (so a value that
+/// merely happens to contain a colon — a URL-shaped default — is not misread as a
+/// scheme).
+#[cfg(feature = "handlers")]
+fn parse_secret_ref(secret_ref: &str) -> SecretRef<'_> {
+    if let Some(rest) = secret_ref.strip_prefix("env:") {
+        return SecretRef::Env(rest);
+    }
+    for scheme in ["boatramp", "vault", "hcp"] {
+        if let Some(rest) = secret_ref.strip_prefix(scheme) {
+            if rest.starts_with(':') {
+                return SecretRef::Unsupported(scheme);
+            }
+        }
+    }
+    SecretRef::Env(secret_ref)
 }
 
 /// Process one claimed batch for a consumer subscribed to `namespaced_topic`

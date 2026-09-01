@@ -57,6 +57,10 @@ pub async fn build_handler_runtime(
     allow_guest_private_egress: bool,
     // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
     self_egress_addrs: Vec<std::net::SocketAddr>,
+    // Posture: whether a site handler's / function's `secrets` map may resolve a bare /
+    // `env:` reference against the serve process's own environment (on under single-tenant/
+    // dev, off under multi-tenant — an untrusted tenant must not name arbitrary host env vars).
+    allow_env_secret_refs: bool,
     // The deploy store (for a managed compute-backed `sql` database's endpoint
     // resolution) and the `[secrets]` envelope (to seal a managed credential).
     deploy: &DeployStore,
@@ -139,6 +143,8 @@ pub async fn build_handler_runtime(
     // Apply the posture's host-side blob cap + component-size cap.
     runtime.set_max_blob_bytes(max_blob_bytes);
     runtime.set_max_component_bytes(max_component_bytes);
+    // Apply the posture's host-env secret-ref gate (fail-closed if never set).
+    runtime.set_allow_env_secret_refs(allow_env_secret_refs);
     Ok(runtime)
 }
 

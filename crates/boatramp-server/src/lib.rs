@@ -290,6 +290,15 @@ struct HandlerRuntimeInner {
     /// size *before* the blob is read. Set via
     /// [`HandlerRuntime::set_max_component_bytes`]; unset reads as `0`.
     max_component_bytes: std::sync::OnceLock<u64>,
+    /// Whether a site handler's / function's `secrets` map may resolve a **bare**
+    /// or `env:`-scheme reference against the serve process's own (operator)
+    /// environment, from the security posture's `allow_env_secret_refs`. Set once
+    /// at startup via [`HandlerRuntime::set_allow_env_secret_refs`]; **unset reads
+    /// as `false`** (fail-closed — a runtime that never wired the posture refuses
+    /// host-env refs rather than leaking them). When `false`, `resolve_secret_env`
+    /// refuses such a ref instead of injecting the host value, closing the
+    /// cross-tenant host-env exfiltration path under the multi-tenant posture.
+    allow_env_secret_refs: std::sync::OnceLock<bool>,
     /// Per-function locks serializing the metering + rate-limit read-modify-write
     /// (FA-4), so concurrent invocations of one function can't lose an update.
     /// Created on first use, keyed by function name.
@@ -367,6 +376,7 @@ impl HandlerRuntime {
                 cron_leader_gate: std::sync::OnceLock::new(),
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
+                allow_env_secret_refs: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
                 watch_provider: std::sync::OnceLock::new(),
@@ -488,6 +498,32 @@ impl HandlerRuntime {
         }
     }
 
+    /// Permit (or forbid) resolving a **bare** / `env:`-scheme secret ref against
+    /// the serve process's own environment, from the security posture's
+    /// `allow_env_secret_refs`. Set once at startup; **unset reads as `false`**
+    /// (fail-closed), so a runtime that never wired the posture refuses host-env
+    /// refs rather than leaking them. Under the multi-tenant posture (`false`) an
+    /// untrusted tenant's `secrets` map can no longer name an arbitrary host env
+    /// var to exfiltrate it into their guest.
+    #[cfg(feature = "handlers")]
+    pub fn set_allow_env_secret_refs(&self, allow: bool) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.allow_env_secret_refs.set(allow);
+        }
+    }
+
+    /// The resolved `allow_env_secret_refs` posture bool (fail-closed `false` if
+    /// unset, or if there is no runtime). Lets the function deploy-admission path
+    /// refuse a forbidden `secrets` map at deploy time — the same gate the
+    /// resolution-time backstop enforces.
+    #[cfg(feature = "handlers")]
+    pub(crate) fn allow_env_secret_refs(&self) -> bool {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.allow_env_secret_refs.get().copied())
+            .unwrap_or(false)
+    }
+
     /// Gate cron firing on a predicate (cluster mode: the node is the Raft
     /// leader), so a cron fires exactly once cluster-wide.
     /// Set once at startup; a no-op runtime ignores it. Consumers are never
@@ -528,6 +564,16 @@ impl HandlerRuntime {
                 "deployment ships handlers/consumers but the site has them disabled".to_string()
             })?;
         let max_component = inner.max_component_bytes.get().copied().unwrap_or(0);
+
+        // Fail loud at deploy on a `secrets` map the posture forbids: under the
+        // multi-tenant posture a bare / `env:` ref reads the operator's environment
+        // (cross-tenant host-env exfiltration), so refuse the activation with the
+        // same message the resolution-time backstop would raise — the tenant sees
+        // the failure now, not at first request. Uses the runtime's resolved
+        // `allow_env_secret_refs` (fail-closed if never wired).
+        let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
+        crate::handler_dispatch::admit_secret_refs(&site_handlers.secrets, allow_env_secret_refs)
+            .map_err(|err| format!("handler secrets: {err}"))?;
 
         // Sync-timeout footgun: a handler/site timeout above the sync ceiling is
         // silently clamped for connection-bearing (sync HTTP) calls, so a legit
@@ -2129,7 +2175,9 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let env = resolve_env("blog", &deploy_env, &site_handlers);
+        // Single-tenant / dev: host-env secret refs are permitted (the operator
+        // authors the site config), so this resolves exactly as before.
+        let env = resolve_env("blog", &deploy_env, &site_handlers, true).expect("resolves");
 
         // Static var present; secret resolved from the host env; a secret
         // overrides a static of the same name; a secret whose host var is unset
@@ -2140,6 +2188,66 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "MISSING"));
 
         std::env::remove_var("BOATRAMP_TEST_RESOLVE_SECRET");
+    }
+
+    #[test]
+    fn multi_tenant_posture_refuses_a_host_env_handler_secret() {
+        use boatramp_core::config::HandlersSiteConfig;
+
+        // The exfiltration vector: an untrusted tenant names another tenant's / the
+        // operator's host env var (bare or `env:`) in its site `secrets` map. Under
+        // the multi-tenant posture (`allow_env_secret_refs = false`) the resolver
+        // must REFUSE — never read the host env — and name the offending guest var.
+        std::env::set_var("BOATRAMP_TEST_OTHER_TENANT_SECRET", "leak-me");
+        let deploy_env = std::collections::BTreeMap::new();
+        let bare = HandlersSiteConfig {
+            enabled: true,
+            secrets: std::collections::BTreeMap::from([(
+                "STOLEN".to_string(),
+                "BOATRAMP_TEST_OTHER_TENANT_SECRET".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let err = resolve_env("evil", &deploy_env, &bare, false)
+            .expect_err("multi-tenant must refuse a bare host-env ref");
+        assert!(
+            err.contains("STOLEN"),
+            "error names the offending guest var: {err}"
+        );
+        assert!(
+            err.contains("multi-tenant"),
+            "error steers the tenant: {err}"
+        );
+        assert!(
+            !err.contains("leak-me"),
+            "the host value must never appear (never read): {err}"
+        );
+
+        // The explicit `env:` scheme is refused identically.
+        let explicit = HandlersSiteConfig {
+            enabled: true,
+            secrets: std::collections::BTreeMap::from([(
+                "STOLEN".to_string(),
+                "env:BOATRAMP_TEST_OTHER_TENANT_SECRET".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(resolve_env("evil", &deploy_env, &explicit, false).is_err());
+
+        // A reserved-but-unimplemented scheme is also refused (no silent fall-through).
+        let reserved = HandlersSiteConfig {
+            enabled: true,
+            secrets: std::collections::BTreeMap::from([(
+                "TOKEN".to_string(),
+                "vault:kv/data/app#token".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let err = resolve_env("evil", &deploy_env, &reserved, true)
+            .expect_err("a reserved scheme is not yet supported, even under single-tenant");
+        assert!(err.contains("not yet supported"), "{err}");
+
+        std::env::remove_var("BOATRAMP_TEST_OTHER_TENANT_SECRET");
     }
 
     #[test]
@@ -2168,7 +2276,8 @@ mod tests {
                 "BOATRAMP_TEST_FN_NOT_SET".to_string(),
             ),
         ]);
-        let env = resolve_secret_env("fn/api", &static_env, &secrets);
+        // Single-tenant / dev: host-env refs permitted, so this resolves as before.
+        let env = resolve_secret_env("fn/api", &static_env, &secrets, true).expect("resolves");
 
         assert!(env.contains(&("STAGE".to_string(), "prod".to_string())));
         // The secret is injected under its target ENV_VAR, read from the host env.
@@ -2179,6 +2288,38 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "MISSING"));
 
         std::env::remove_var("BOATRAMP_TEST_FN_SECRET");
+    }
+
+    #[test]
+    fn multi_tenant_posture_refuses_a_host_env_function_secret() {
+        // The function analog of the handler exfiltration vector: a function's
+        // `secrets` map naming a host env var must be REFUSED under the multi-tenant
+        // posture (never read), using the SAME helper the handler path uses — so the
+        // fail-closed semantics are identical by construction.
+        std::env::set_var("BOATRAMP_TEST_FN_LEAK", "leak-me");
+        let static_env = std::collections::BTreeMap::new();
+        let secrets = std::collections::BTreeMap::from([(
+            "DB_URL".to_string(),
+            "BOATRAMP_TEST_FN_LEAK".to_string(),
+        )]);
+
+        // Multi-tenant: refused, names the offending guest var, host value never read.
+        let err = resolve_secret_env("fn/api", &static_env, &secrets, false)
+            .expect_err("multi-tenant must refuse a function host-env ref");
+        assert!(
+            err.contains("DB_URL"),
+            "error names the offending guest var: {err}"
+        );
+        assert!(
+            !err.contains("leak-me"),
+            "host value must never appear: {err}"
+        );
+
+        // Single-tenant / dev: the same ref resolves + injects (operator owns config).
+        let env = resolve_secret_env("fn/api", &static_env, &secrets, true).expect("resolves");
+        assert!(env.contains(&("DB_URL".to_string(), "leak-me".to_string())));
+
+        std::env::remove_var("BOATRAMP_TEST_FN_LEAK");
     }
 
     fn req() -> Request {
@@ -3459,6 +3600,7 @@ mod tests {
                     None,
                 )
                 .await
+                .expect("no secrets → resolves")
                 .sql_database_names()
             }
         };

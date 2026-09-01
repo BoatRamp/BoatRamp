@@ -118,6 +118,7 @@ impl SecurityProfile {
                 allow_implicit_routing: false,
                 require_pop: false,
                 require_domain_verification: true,
+                allow_env_secret_refs: false,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -137,6 +138,7 @@ impl SecurityProfile {
                 allow_implicit_routing: true,
                 require_pop: false,
                 require_domain_verification: true,
+                allow_env_secret_refs: true,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -157,6 +159,7 @@ impl SecurityProfile {
                 require_pop: false,
                 // Dev serves arbitrary test hosts locally; the gate is off.
                 require_domain_verification: false,
+                allow_env_secret_refs: true,
             },
         }
     }
@@ -222,6 +225,14 @@ pub struct PostureOverrides {
     /// Setting `false` here (file + restart) disables the gate fleet-wide; a single
     /// host is excluded instead with an admin `domain add <host> --unverified`.
     pub require_domain_verification: Option<bool>,
+    /// Permit a site handler's `[handlers].secrets` / a function's `secrets` map to
+    /// name a **bare** / `env:`-scheme reference into the serve process's own
+    /// environment. Such a reference reads the *operator's* namespace, so it is only
+    /// safe when the config author IS the operator. On under `single-tenant`/`dev`;
+    /// **off** under `multi-tenant`, where an untrusted tenant authors the map and a
+    /// permitted bare ref would let them exfiltrate any host env var (another
+    /// tenant's DB password, a cloud key) into their guest.
+    pub allow_env_secret_refs: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -348,6 +359,11 @@ impl SecurityConfig {
             p.require_pop.to_string(),
             o.require_pop.is_some(),
         );
+        row(
+            "allow_env_secret_refs",
+            p.allow_env_secret_refs.to_string(),
+            o.allow_env_secret_refs.is_some(),
+        );
         Ok(out)
     }
 }
@@ -415,6 +431,14 @@ pub struct SecurityPosture {
     /// IP literals) always serve. An operator disables it globally in
     /// `[security]`, or excludes one host with an admin `domain add --unverified`.
     pub require_domain_verification: bool,
+    /// Permit a site handler's / function's `secrets` map to resolve a **bare** or
+    /// `env:`-scheme reference against the serve process's own environment. That
+    /// namespace is the *operator's*, so a bare ref is only safe when the config
+    /// author IS the operator: on under `single-tenant`/`dev`, **off** under
+    /// `multi-tenant`. When off, `resolve_secret_env` refuses such a ref (fail-closed)
+    /// instead of injecting the host value, so an untrusted tenant can't name an
+    /// arbitrary host env var to exfiltrate it across the tenant boundary.
+    pub allow_env_secret_refs: bool,
 }
 
 impl Default for SecurityPosture {
@@ -476,6 +500,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.require_domain_verification {
         base.require_domain_verification = v;
     }
+    if let Some(v) = o.allow_env_secret_refs {
+        base.allow_env_secret_refs = v;
+    }
     base
 }
 
@@ -506,7 +533,35 @@ mod tests {
         assert!(!p.ratelimit_fail_open);
         assert!(!p.allow_implicit_routing);
         assert!(!p.require_pop);
+        // Bare/`env:` secret refs read the operator namespace → off under multi-tenant.
+        assert!(!p.allow_env_secret_refs);
         assert_eq!(p.max_upload_bytes, MT_MAX_UPLOAD);
+    }
+
+    #[test]
+    fn allow_env_secret_refs_follows_the_trust_model() {
+        // Multi-tenant: untrusted config authors, so a bare host-env secret ref is off.
+        assert!(!SecurityProfile::MultiTenant.preset().allow_env_secret_refs);
+        // Single-tenant / dev: the operator owns every config, so it is on.
+        assert!(SecurityProfile::SingleTenant.preset().allow_env_secret_refs);
+        assert!(SecurityProfile::Dev.preset().allow_env_secret_refs);
+        // An explicit override wins over the profile (e.g. re-enable under multi-tenant).
+        let cfg = SecurityConfig {
+            overrides: PostureOverrides {
+                allow_env_secret_refs: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let p = cfg.resolve().unwrap();
+        assert!(p.allow_env_secret_refs);
+        assert!(cfg
+            .explain()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains("allow_env_secret_refs")
+                && l.contains("true")
+                && l.contains("override")));
     }
 
     #[test]

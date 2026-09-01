@@ -368,7 +368,18 @@ pub(super) async fn execute_function(
     // fn/<name>`, `non-default → {project}/fn/<name>` the `scope` above carries)
     // — never the already-qualified `scope`, to avoid double-qualifying.
     let bindings =
-        build_function_bindings(inner, project, &scope, &fn_ident, &function.config, depth).await;
+        match build_function_bindings(inner, project, &scope, &fn_ident, &function.config, depth)
+            .await
+        {
+            Ok(bindings) => bindings,
+            // A refused secret ref (a host-env ref under the multi-tenant posture, or
+            // an unsupported scheme) fails the invocation closed — the function never
+            // runs with a leaked or missing value.
+            Err(err) => {
+                tracing::warn!(function = %function.name, %err, "function bindings refused");
+                return (handler_unavailable(), 0);
+            }
+        };
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
@@ -429,7 +440,7 @@ async fn build_function_bindings(
     sql_site: &str,
     config: &boatramp_core::function::FunctionConfig,
     depth: u32,
-) -> boatramp_handlers::Bindings {
+) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| config.imports.iter().any(|i| i == name);
     let mut bindings = boatramp_handlers::Bindings::new(scope);
     if granted("wasi:keyvalue") {
@@ -507,12 +518,14 @@ async fn build_function_bindings(
     // through the invoke path yet; its logs are scope-tagged but not request-correlated.
     bindings = bindings.with_logging(scope.to_string(), None, inner.logs.clone());
     // Environment for the function: its static `env` strings, then its `secrets`
-    // — each a *reference* to a host env var, resolved here at instantiation and
+    // — each a *reference* to a secret value, resolved here at instantiation and
     // never stored in the manifest/config (same indirection as a site handler; a
     // resolved secret overrides a static `env` of the same name, a missing
-    // referent is logged and skipped).
-    let env = resolve_secret_env(scope, &config.env, &config.secrets);
-    bindings.with_env(env)
+    // referent is logged and skipped). Under the multi-tenant posture a bare /
+    // `env:` ref into the operator's environment is refused (fail-closed).
+    let allow_env_secret_refs = inner.allow_env_secret_refs.get().copied().unwrap_or(false);
+    let env = resolve_secret_env(scope, &config.env, &config.secrets, allow_env_secret_refs)?;
+    Ok(bindings.with_env(env))
 }
 
 /// Per-invocation limits for a function: its own `limits` (memory/timeout/fuel),

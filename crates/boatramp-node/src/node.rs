@@ -156,6 +156,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let max_handler_blob_bytes = options.posture.max_handler_blob_bytes;
     let max_component_bytes = options.posture.max_component_bytes;
     let allow_guest_private_egress = options.posture.allow_guest_private_egress;
+    let allow_env_secret_refs = options.posture.allow_env_secret_refs;
     // The instance's own serve socket(s) a guest self-call may reach, when the posture allows
     // it: a wildcard bind (`0.0.0.0`/`::`) is reachable on loopback, so normalize to
     // `127.0.0.1`/`::1`; a specific bind is itself.
@@ -185,6 +186,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         max_component_bytes,
         allow_guest_private_egress,
         self_egress_addrs,
+        allow_env_secret_refs,
         &deploy,
         secrets_envelope.clone(),
     )
