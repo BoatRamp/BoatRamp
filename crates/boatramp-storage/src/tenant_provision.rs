@@ -52,38 +52,61 @@
 use crate::ExternalSqlKind;
 use boatramp_core::deploy::sha256_hex;
 
-/// Length (in hex chars) of the digest suffix that keeps sanitization injective.
-/// 32 hex chars = **128 bits** of SHA-256, appended to *every* identifier so a
-/// pair of distinct originals collides only with ~2^-128 probability (see
-/// [`sanitize_ident`]).
-const HASH_HEX_LEN: usize = 32;
+/// Width (chars) of the base-36 digest suffix that keeps sanitization injective:
+/// **128 bits** of SHA-256 encoded in base-36 = ⌈128 / log2(36)⌉ = **25 chars**.
+/// base-36 (`[0-9a-z]`) is the densest encoding that survives Postgres identifier
+/// **case-folding** (an uppercase/base-62 alphabet would collapse to collisions),
+/// and 25 chars leaves the *whole* digest inside even MySQL's 32-char user-name
+/// limit — plain hex (32 chars) could not. Appended to every identifier so a pair
+/// of distinct originals collides only with ~2^-128 probability.
+const HASH_B36_LEN: usize = 25;
 
-/// Maximum length of a single derived identifier. Postgres truncates identifiers
-/// at 63 bytes (`NAMEDATALEN - 1`) and MySQL allows 64; we cap at the tighter
-/// Postgres limit so an identifier is valid on both engines. The layout is a
-/// human-readable body of up to [`IDENT_BODY_BUDGET`] chars, then `_`, then the
-/// [`HASH_HEX_LEN`]-char digest — `30 + 1 + 32 = 63`, exactly the Postgres cap.
+/// Maximum length of a general derived identifier — a **database** name. Postgres
+/// truncates identifiers at 63 bytes (`NAMEDATALEN - 1`); MySQL allows 64 for a
+/// schema. Cap at the tighter Postgres limit so it is valid on both.
 const MAX_IDENT_LEN: usize = 63;
 
-/// Chars of the human-readable (sanitized-body) portion an identifier may keep
-/// before the mandatory `_<digest>` suffix: `63 − 1 (`_`) − 32 (hex) = 30`.
-const IDENT_BODY_BUDGET: usize = MAX_IDENT_LEN - (HASH_HEX_LEN + 1);
+/// Maximum length of a per-tenant **login role / user** name. MySQL caps a user
+/// name at **32** bytes — far tighter than its 64-char schema names or Postgres's
+/// 63 — so a role (which may be provisioned on either engine) is capped here to be
+/// valid on both. The 25-char base-36 digest still fits: `≤ 6` body + `_` + 25 = 32.
+const MAX_ROLE_IDENT_LEN: usize = 32;
 
-/// The first [`HASH_HEX_LEN`] hex chars of the SHA-256 digest of `s`.
+/// The leading 128 bits of the SHA-256 digest of `s`, base-36-encoded to
+/// [`HASH_B36_LEN`] chars.
 ///
 /// The digest is a **stable** (fixed by the SHA-256 standard, unlike `std`'s
 /// [`DefaultHasher`], whose output is explicitly not guaranteed across builds or
 /// platforms) and **cryptographically collision-resistant** disambiguator derived
 /// from the *original*, pre-sanitization input. Truncating to 128 bits keeps the
-/// full-input collision probability at ~2^-128 while leaving room for a
-/// human-readable body within the engine identifier limit. Stability matters
-/// because a shift here would silently move a tenant's database/role name between
-/// binary versions.
+/// full-input collision probability at ~2^-128; base-36 encoding (vs hex) is what
+/// makes those 128 bits fit a 32-char MySQL user name while leaving room for a
+/// human-readable body. Stability matters because a shift here would silently move
+/// a tenant's database/role name between binary versions.
 ///
 /// [`DefaultHasher`]: std::collections::hash_map::DefaultHasher
 fn hash_suffix(s: &str) -> String {
-    // `sha256_hex` yields 64 lowercase hex chars; take the leading 128 bits.
-    sha256_hex(s.as_bytes())[..HASH_HEX_LEN].to_string()
+    // `sha256_hex` yields 64 lowercase hex chars; take the leading 128 bits as a
+    // u128 and re-encode in base-36 (denser than hex, case-fold-safe).
+    let hex = sha256_hex(s.as_bytes());
+    let n = u128::from_str_radix(&hex[..32], 16).expect("32 hex chars are a valid u128");
+    to_base36(n)
+}
+
+/// Encode a `u128` in base-36 (`[0-9a-z]`), left-padded with `0` to [`HASH_B36_LEN`]
+/// chars, so every digest is fixed-width. 128 bits needs at most 25 base-36 digits
+/// (36^25 > 2^128), so it always fits.
+fn to_base36(mut n: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = [b'0'; HASH_B36_LEN];
+    let mut i = HASH_B36_LEN;
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = DIGITS[(n % 36) as usize];
+        n /= 36;
+    }
+    debug_assert_eq!(n, 0, "128-bit digest overflowed the base-36 width");
+    String::from_utf8(buf.to_vec()).expect("base-36 digits are ASCII")
 }
 
 /// Map an arbitrary project/site name to a **safe** SQL identifier.
@@ -93,7 +116,7 @@ fn hash_suffix(s: &str) -> String {
 /// 2. Keep `[a-z0-9_]`; replace every other char (including `-`, whitespace,
 ///    quotes, and every SQL metacharacter) with `_`.
 /// 3. If the result is empty or starts with a digit, prefix `t_`.
-/// 4. Cap the human-readable body at [`IDENT_BODY_BUDGET`] chars.
+/// 4. Cap the human-readable body so the whole identifier fits `max_len` chars.
 /// 5. **Injectivity:** *always* append `_` + a 32-hex-char (128-bit) SHA-256
 ///    digest of the **original** input.
 ///
@@ -115,6 +138,16 @@ fn hash_suffix(s: &str) -> String {
 /// exactly the information that sanitization (case-folding, char replacement,
 /// truncation) threw away.
 pub fn sanitize_ident(name: &str) -> String {
+    sanitize_ident_capped(name, MAX_IDENT_LEN)
+}
+
+/// [`sanitize_ident`] with an explicit maximum length, so a role/user name can be
+/// held to the tighter [`MAX_ROLE_IDENT_LEN`] (MySQL's 32-char user limit) while a
+/// database name uses [`MAX_IDENT_LEN`]. Same guarantees: safe charset, valid start
+/// (never digit- or `pg_`-leading), and the full-width [`HASH_B36_LEN`] digest of the
+/// original input (so injectivity holds regardless of `max_len` — only the cosmetic
+/// body is truncated more aggressively for a tighter cap).
+fn sanitize_ident_capped(name: &str, max_len: usize) -> String {
     let lower = name.to_ascii_lowercase();
 
     let mut cleaned = String::with_capacity(lower.len());
@@ -145,7 +178,7 @@ pub fn sanitize_ident(name: &str) -> String {
     // Cap the human-readable body, leaving room for the mandatory `_<digest>`.
     // Truncation is harmless to injectivity now that the full-width digest of the
     // *original* input is always appended below.
-    body.truncate(IDENT_BODY_BUDGET);
+    body.truncate(max_len.saturating_sub(HASH_B36_LEN + 1));
 
     // Always append the wide digest of the original input.
     format!("{body}_{}", hash_suffix(name))
@@ -174,7 +207,9 @@ pub fn tenant_db_name(base: &str, tenant_ident: &str) -> String {
 /// `role` marker is truncated out of the body for a very long tenant. The
 /// distinctness is carried by the digest, not by the (cosmetic) marker.
 pub fn tenant_role_name(base: &str, tenant_ident: &str) -> String {
-    sanitize_ident(&format!("{base}_{tenant_ident}_role"))
+    // Capped to MAX_ROLE_IDENT_LEN (32) so it is a valid MySQL *user* name as well as
+    // a Postgres role; the full 25-char digest still fits, keeping it injective.
+    sanitize_ident_capped(&format!("{base}_{tenant_ident}_role"), MAX_ROLE_IDENT_LEN)
 }
 
 /// Quote a SQL **identifier** for `kind`, doubling the embedded quote char and
@@ -475,16 +510,16 @@ mod tests {
             "a".repeat(200).as_str(),
         ] {
             let out = sanitize_ident(input);
-            // Suffix present: ends in `_` + exactly HASH_HEX_LEN hex chars.
-            assert!(out.len() > HASH_HEX_LEN + 1, "too short: {out:?}");
-            let (body, sep_hash) = out.split_at(out.len() - (HASH_HEX_LEN + 1));
+            // Suffix present: ends in `_` + exactly HASH_B36_LEN base-36 chars.
+            assert!(out.len() > HASH_B36_LEN + 1, "too short: {out:?}");
+            let (body, sep_hash) = out.split_at(out.len() - (HASH_B36_LEN + 1));
             assert!(sep_hash.starts_with('_'), "no `_<hash>` in {out:?}");
             let hash = &sep_hash[1..];
-            assert_eq!(hash.len(), HASH_HEX_LEN, "wrong hash width in {out:?}");
+            assert_eq!(hash.len(), HASH_B36_LEN, "wrong hash width in {out:?}");
             assert!(
                 hash.chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                "non-hex suffix in {out:?}"
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "non-base36 suffix in {out:?}"
             );
             assert_eq!(hash, hash_suffix(input), "suffix must digest the original");
             let _ = body;
@@ -563,20 +598,22 @@ mod tests {
         );
     }
 
-    /// Security-review PoC class B: two distinct ≥50-char names sharing a 31-char
-    /// sanitized prefix (so the truncated body is identical) must still differ,
-    /// because the always-on digest disambiguates the full original.
+    /// Security-review PoC class B: two distinct names sharing a sanitized prefix
+    /// longer than the body budget (so the truncated body is identical) must still
+    /// differ, because the always-on digest disambiguates the full original. The
+    /// prefix is `MAX_IDENT_LEN` chars — comfortably past any body budget — so this
+    /// holds regardless of the digest width.
     #[test]
     fn sanitize_poc_shared_prefix_distinct() {
-        let prefix = "a".repeat(31);
-        let a = format!("{prefix}{}", "b".repeat(20)); // 51 chars
-        let b = format!("{prefix}{}", "c".repeat(20)); // 51 chars
+        let prefix = "a".repeat(MAX_IDENT_LEN);
+        let a = format!("{prefix}{}", "b".repeat(20));
+        let b = format!("{prefix}{}", "c".repeat(20));
         assert_ne!(a, b);
         let ia = sanitize_ident(&a);
         let ib = sanitize_ident(&b);
-        // Bodies are identical after truncation to the 30-char budget…
-        let body_a = &ia[..ia.len() - (HASH_HEX_LEN + 1)];
-        let body_b = &ib[..ib.len() - (HASH_HEX_LEN + 1)];
+        // Bodies are identical after truncation to the body budget…
+        let body_a = &ia[..ia.len() - (HASH_B36_LEN + 1)];
+        let body_b = &ib[..ib.len() - (HASH_B36_LEN + 1)];
         assert_eq!(body_a, body_b, "truncated bodies should match");
         // …but the identifiers differ in the digest suffix.
         assert_ne!(ia, ib, "shared-prefix long names collided");
@@ -589,9 +626,9 @@ mod tests {
         let a = sanitize_ident("acme-corp");
         let b = sanitize_ident("acme-corp");
         assert_eq!(a, b, "digest suffix must be stable");
-        // "acme-corp" -> body "acme_corp" plus `_` plus HASH_HEX_LEN hex chars.
+        // "acme-corp" -> body "acme_corp" plus `_` plus HASH_B36_LEN base-36 chars.
         assert!(a.starts_with("acme_corp_"), "unexpected body: {a}");
-        assert_eq!(a.len(), "acme_corp_".len() + HASH_HEX_LEN);
+        assert_eq!(a.len(), "acme_corp_".len() + HASH_B36_LEN);
     }
 
     /// A name longer than the body budget is truncated, but two long names that
@@ -621,7 +658,8 @@ mod tests {
         assert!(role.contains("appdb"));
         // Both fit the tightest engine identifier limit.
         assert!(db.len() <= MAX_IDENT_LEN, "db over cap: {db}");
-        assert!(role.len() <= MAX_IDENT_LEN, "role over cap: {role}");
+        // A role/user must fit the tighter MySQL 32-char user-name limit.
+        assert!(role.len() <= MAX_ROLE_IDENT_LEN, "role over cap: {role}");
         // Deterministic.
         assert_eq!(db, tenant_db_name("appdb", &ident));
         // Safe charset.
@@ -651,6 +689,38 @@ mod tests {
         assert!(sanitize_ident("pgbouncer").starts_with("pgbouncer"));
         // Injectivity survives the guard: distinct inputs → distinct names.
         assert_ne!(sanitize_ident("pg_x"), sanitize_ident("t_pg_x"));
+    }
+
+    /// A role/user name must fit MySQL's 32-char user-name limit on ANY base +
+    /// tenant, even a very long tenant — the digest (25 base-36 chars) still fits,
+    /// injectivity holds, and it never digit-/`pg_`-leads. Regression for the live
+    /// MySQL gate failure (`my_acme_… is too long for user name (max 32)`).
+    #[test]
+    fn role_name_fits_mysql_user_limit() {
+        let cases = [
+            ("my", "acme"),
+            ("pg", "acme"),
+            ("postgres", &"z".repeat(200) as &str),
+            (
+                "verylongworkloadname",
+                "another-long-tenant-name-with-dashes",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (base, tenant) in cases {
+            let role = tenant_role_name(base, &sanitize_ident(tenant));
+            assert!(
+                role.len() <= MAX_ROLE_IDENT_LEN,
+                "role {role:?} ({} chars) exceeds the MySQL user limit {MAX_ROLE_IDENT_LEN}",
+                role.len()
+            );
+            assert!(!role.starts_with("pg_"), "pg_-reserved role: {role}");
+            assert!(
+                !role.as_bytes()[0].is_ascii_digit(),
+                "digit-leading: {role}"
+            );
+            assert!(seen.insert(role.clone()), "role name collision: {role}");
+        }
     }
 
     /// Distinct tenants under the same base get distinct db + role names — and it
@@ -890,13 +960,11 @@ mod tests {
     #[test]
     fn digest_suffix_is_pinned() {
         // Full SHA-256("appdb") is
-        // 6f6115c972bf4b6e742ac51d4a2329d0d2c2e4d6269400191d88007c48be798b;
-        // we keep the leading 128 bits (32 hex chars).
-        assert_eq!(hash_suffix("appdb"), "6f6115c972bf4b6e742ac51d4a2329d0");
+        // 6f6115c972bf4b6e742ac51d4a2329d0d2c2e4d6269400191d88007c48be798b; we keep
+        // the leading 128 bits (0x6f6115c972bf4b6e742ac51d4a2329d0) and encode them in
+        // base-36, left-padded to 25 chars.
+        assert_eq!(hash_suffix("appdb"), "6ldpyd2wfh6vhvqhj6s5o6hg0");
         // Therefore the whole identifier for a clean name is fully determined.
-        assert_eq!(
-            sanitize_ident("appdb"),
-            "appdb_6f6115c972bf4b6e742ac51d4a2329d0"
-        );
+        assert_eq!(sanitize_ident("appdb"), "appdb_6ldpyd2wfh6vhvqhj6s5o6hg0");
     }
 }
