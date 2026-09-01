@@ -231,9 +231,12 @@ pub fn router_with_fast(
         // *execution* needs KVM. Admin-scoped (deny-safe `Right::required`).
         .route("/api/compute", get(list_compute))
         // Persistent-volume management — registered BEFORE `/api/compute/{name}` so the
-        // literal `volumes` segment wins over the `{name}` param. Admin-scoped (the
-        // deny-safe `/api/compute/*` `Right::required` default). List flags in-use vs
-        // orphaned; DELETE refuses a still-referenced volume (`409`) unless `?force=true`.
+        // literal `volumes` segment wins over the `{name}` param. NODE-GLOBAL (lists/
+        // removes volumes across every tenant), so `Right::required` gates it at
+        // `system·admin` explicitly — NOT the per-project right the general
+        // `/api/compute/*` mapping gives, which a project-scoped token would satisfy.
+        // List flags in-use vs orphaned; DELETE refuses a still-referenced volume
+        // (`409`) unless `?force=true`.
         .route("/api/compute/volumes", get(list_compute_volumes))
         .route(
             "/api/compute/volumes/{name}",

@@ -200,6 +200,23 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
+        // Persistent-**volume** management (`compute volume ls/rm`) is a NODE-GLOBAL
+        // operator tool: it lists/removes volume directories across *every*
+        // project/tenant on the node (keyed by bare volume name, not scoped to a
+        // project). It must therefore be gated at `system·admin` — never reachable by a
+        // project-scoped grant. Both the general `/api/compute/*` branch and the
+        // project-scoped `.../compute/*` catch-all below would otherwise map it to a
+        // per-project `Project·Read/Deploy` right, which a `project_admin`/`_publisher`
+        // (delete) or even a `project_viewer` (list) token on *any* project satisfies —
+        // letting that tenant enumerate and irreversibly destroy *another* tenant's
+        // volumes. Gate it explicitly, above both branches, matching both the direct
+        // (`/api/compute/volumes…`) and project-scoped (`/api/projects/<p>/compute/
+        // volumes…`) path forms (`require_auth` authorizes the original, project-
+        // qualified path, so both can appear here).
+        if is_compute_volumes_path(path) {
+            return Some(Self::new(Resource::System, None, Action::Admin));
+        }
+
         // Project-scoped endpoints: `/api/projects/<proj>/<rest...>` (0.2.0). Parsed
         // through the shared `project_api_path` so this and the request-scoping
         // middleware agree on the tenant segment.
@@ -417,6 +434,21 @@ pub fn project_of(target: &str) -> &str {
 pub fn project_api_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("/api/projects/")?;
     Some(rest.split_once('/').unwrap_or((rest, "")))
+}
+
+/// Whether `path` targets the node-global persistent-**volume** management surface
+/// (`compute volume ls/rm`) — `GET`/`DELETE` on `.../compute/volumes[/<name>]`, in
+/// either the direct (`/api/compute/volumes…`) or the project-scoped
+/// (`/api/projects/<proj>/compute/volumes…`) form. These endpoints operate across
+/// every tenant on the node, so [`Right::required`] gates them at `system·admin`
+/// rather than the per-project right the surrounding `/api/compute/*` mappings give.
+fn is_compute_volumes_path(path: &str) -> bool {
+    // The `compute/` segment after either `/api/` or `/api/projects/<proj>/`.
+    let after_compute = path.strip_prefix("/api/compute/").or_else(|| {
+        project_api_path(path)
+            .and_then(|(proj, sub)| (!proj.is_empty()).then_some(sub)?.strip_prefix("compute/"))
+    });
+    matches!(after_compute, Some(rest) if rest == "volumes" || rest.starts_with("volumes/"))
 }
 
 /// Whether a granted target covers a required target:
@@ -1222,6 +1254,48 @@ mod tests {
         assert!(!site_write.satisfies(&required));
         // A system-admin right does.
         assert!(Right::new(Resource::System, None, Action::Admin).satisfies(&required));
+    }
+
+    #[test]
+    fn compute_volume_management_is_node_admin_only() {
+        // `compute volume ls/rm` lists/removes volume directories across EVERY tenant
+        // on the node, so it must require system·admin in both path forms — never the
+        // per-project right the general `/api/compute/*` mapping gives. Otherwise a
+        // project-scoped token could enumerate/destroy another tenant's volumes.
+        let admin = Right::new(Resource::System, None, Action::Admin);
+        for (method, path) in [
+            // Direct (global) form.
+            ("GET", "/api/compute/volumes"),
+            ("DELETE", "/api/compute/volumes/pg-globex"),
+            // Project-scoped form (the `project_scope` rewrite's original path).
+            ("GET", "/api/projects/acme/compute/volumes"),
+            ("DELETE", "/api/projects/acme/compute/volumes/pg-globex"),
+        ] {
+            let required = Right::required(method, path).expect("route is gated");
+            assert_eq!(required, admin, "{method} {path} must need system·admin");
+            // A cross-tenant project grant must NOT satisfy it — not even the target
+            // project's own admin/publisher/viewer.
+            for role in ["project_admin", "project_publisher", "project_viewer"] {
+                let granted =
+                    AuthzPolicy::default_policy().rights_for(&[GrantedRole::scoped(role, "acme")]);
+                assert!(
+                    !granted.allows(&required),
+                    "{role}:acme must be refused on {method} {path}"
+                );
+            }
+            // A node admin does satisfy it.
+            assert!(admin.satisfies(&required));
+        }
+        // A sibling compute path that is NOT the volumes surface keeps its per-project
+        // right (so this special-case didn't over-reach).
+        assert_eq!(
+            Right::required("GET", "/api/compute/volumesnap"),
+            Some(Right::new(
+                Resource::Project,
+                Some(crate::project::DEFAULT_PROJECT.to_string()),
+                Action::Read
+            ))
+        );
     }
 
     #[test]
