@@ -40,12 +40,6 @@ pub enum Error {
     /// The manifest failed to parse as RON.
     #[error("invalid manifest syntax: {0}")]
     Ron(#[from] ron::error::SpannedError),
-    /// A `--var` argument was not `KEY=VALUE`.
-    #[error("--var must be KEY=VALUE, got {0:?}")]
-    BadVar(String),
-    /// The manifest references `${KEY}` but no `--var KEY=…` was supplied.
-    #[error("manifest references ${{{0}}} but no --var {0}=… was supplied")]
-    UndefinedVar(String),
     /// A site's `routing` failed its compile-check (a bad route/cron pattern).
     #[error("site {site}: routing: {source}")]
     Routing {
@@ -320,84 +314,17 @@ impl ApplyManifest {
         Ok(manifest)
     }
 
-    /// Parse a manifest after interpolating `${KEY}` placeholders from `vars`
-    /// (see [`interpolate`]). Scalar text substitution on the raw RON, before the
-    /// parse — the manifest can commit `${…}` placeholders and bind them at apply
-    /// time with `--var`.
-    pub fn parse_with_vars(
-        text: &str,
-        vars: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Self> {
-        Self::parse(&interpolate(text, vars)?)
-    }
-
-    /// Load a manifest from `path` (RON), interpolating `${KEY}` placeholders from
-    /// `vars` first. Unlike `project.cfg`, a **missing** file is an error — there
-    /// is nothing to apply.
-    pub fn load(path: &Path, vars: &std::collections::BTreeMap<String, String>) -> Result<Self> {
+    /// Load a manifest from `path` (RON). Unlike `project.cfg`, a **missing** file
+    /// is an error — there is nothing to apply.
+    pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse_with_vars(&text, vars),
+            Ok(text) => Self::parse(&text),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::Missing(path.display().to_string()))
             }
             Err(err) => Err(err.into()),
         }
     }
-}
-
-/// Substitute `${KEY}` placeholders in a raw manifest with their `--var` values,
-/// **before** the RON parse — pure scalar text substitution (no includes, no
-/// record-merge). A `${KEY}` with no matching `vars` entry is a hard error naming
-/// the key (never a silent empty). `$${` is an escape for a literal `${` (so a
-/// manifest that legitimately needs the two characters can emit them); a bare
-/// `${` is otherwise reserved for interpolation.
-pub fn interpolate(
-    text: &str,
-    vars: &std::collections::BTreeMap<String, String>,
-) -> Result<String> {
-    let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // `$${` → a literal `${` (escape), consumed without interpolating.
-        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'$') && bytes.get(i + 2) == Some(&b'{') {
-            out.push_str("${");
-            i += 3;
-            continue;
-        }
-        // `${KEY}` → the value of `KEY` from `vars` (error if unknown/unterminated).
-        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
-            let start = i + 2;
-            let end = text[start..]
-                .find('}')
-                .map(|rel| start + rel)
-                .ok_or_else(|| Error::UndefinedVar(text[start..].to_string()))?;
-            let key = &text[start..end];
-            let value = vars
-                .get(key)
-                .ok_or_else(|| Error::UndefinedVar(key.to_string()))?;
-            out.push_str(value);
-            i = end + 1;
-            continue;
-        }
-        // A non-placeholder byte: copy the whole UTF-8 char through verbatim.
-        let ch = text[i..].chars().next().expect("valid utf-8 boundary");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    Ok(out)
-}
-
-/// Parse repeatable `--var KEY=VALUE` flags into a map (mirrors compute `--env`).
-fn parse_vars(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut map = std::collections::BTreeMap::new();
-    for pair in pairs {
-        let (k, v) = pair
-            .split_once('=')
-            .ok_or_else(|| Error::BadVar(pair.clone()))?;
-        map.insert(k.to_string(), v.to_string());
-    }
-    Ok(map)
 }
 
 /// Arguments for `boatramp apply`.
@@ -418,18 +345,11 @@ pub struct ApplyArgs {
     /// Run each site's configured build command before publishing it.
     #[arg(long)]
     build: bool,
-
-    /// Bind a manifest variable: every `${KEY}` in the manifest is substituted
-    /// with VALUE before parsing (`KEY=VALUE`, repeatable). A `${KEY}` with no
-    /// `--var` is an error; write `$${` for a literal `${`.
-    #[arg(long = "var", value_name = "KEY=VALUE")]
-    var: Vec<String>,
 }
 
 /// Entry point for `boatramp apply`.
 pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
-    let vars = parse_vars(&args.var)?;
-    let manifest = ApplyManifest::load(&args.file, &vars)?;
+    let manifest = ApplyManifest::load(&args.file)?;
 
     // Resolve the target project: an explicit `project:` in the manifest wins over
     // the config-resolved value (`[publish].project` / `--project` / default).
@@ -975,10 +895,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("boatramp-apply-missing-{}.cfg", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(
-            ApplyManifest::load(&path, &Default::default()),
-            Err(Error::Missing(_))
-        ));
+        assert!(matches!(ApplyManifest::load(&path), Err(Error::Missing(_))));
     }
 
     #[test]
@@ -1019,64 +936,6 @@ mod tests {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| client::resolve_project(&config));
         assert_eq!(resolved, "acme");
-    }
-
-    #[test]
-    fn var_interpolation_substitutes_scalars() {
-        let vars = std::collections::BTreeMap::from([
-            ("project".to_string(), "construens".to_string()),
-            ("site".to_string(), "www".to_string()),
-        ]);
-        let manifest = ApplyManifest::parse_with_vars(
-            r#"( project: "${project}", sites: [ ( name: "${site}", path: "dist" ) ] )"#,
-            &vars,
-        )
-        .expect("interpolated manifest parses");
-        assert_eq!(manifest.project.as_deref(), Some("construens"));
-        assert_eq!(manifest.sites[0].name, "www");
-    }
-
-    #[test]
-    fn var_interpolation_missing_key_errors_and_names_it() {
-        let err =
-            ApplyManifest::parse_with_vars(r#"( project: "${project}" )"#, &Default::default())
-                .expect_err("a manifest with an unbound ${var} is rejected");
-        match err {
-            Error::UndefinedVar(key) => assert_eq!(key, "project"),
-            other => panic!("expected UndefinedVar, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn var_interpolation_escape_stays_literal() {
-        // `$${literal}` is the escape for a literal `${literal}` — it is NOT looked
-        // up in `vars` (so it does not error even though `literal` is unbound).
-        let out = interpolate("a $${literal} b", &Default::default()).unwrap();
-        assert_eq!(out, "a ${literal} b");
-
-        // The escape and a real substitution coexist on one line.
-        let vars = std::collections::BTreeMap::from([("x".to_string(), "1".to_string())]);
-        assert_eq!(interpolate("$${keep} ${x}", &vars).unwrap(), "${keep} 1");
-    }
-
-    #[test]
-    fn var_interpolation_unterminated_placeholder_errors() {
-        // A `${` with no closing `}` is a hard error (naming what it saw).
-        assert!(matches!(
-            interpolate("${oops", &Default::default()),
-            Err(Error::UndefinedVar(_))
-        ));
-    }
-
-    #[test]
-    fn parse_vars_rejects_non_kv() {
-        assert!(matches!(
-            parse_vars(&["nope".to_string()]),
-            Err(Error::BadVar(_))
-        ));
-        let ok = parse_vars(&["k=v=extra".to_string()]).unwrap();
-        // `split_once` keeps everything after the first `=` as the value.
-        assert_eq!(ok.get("k").map(String::as_str), Some("v=extra"));
     }
 
     #[test]
