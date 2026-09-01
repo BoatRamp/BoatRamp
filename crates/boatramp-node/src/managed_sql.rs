@@ -224,15 +224,24 @@ impl ManagedDbEnv {
         if let Some(spec) = self.dbs.get(workload) {
             return Some(spec);
         }
-        // A `Single` per-tenant workload `<base>-<ident>`: find the `Single` base whose
-        // name is a `-`-separated prefix of `workload`.
-        self.dbs.iter().find_map(|(base, spec)| {
-            (matches!(spec.tenant, crate::config::TenantIsolation::Single)
-                && workload
-                    .strip_prefix(base.as_str())
-                    .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1))
-            .then_some(spec)
-        })
+        // A `Single` per-tenant workload `<base>-<ident>`: match the `Single` base whose
+        // name is a `-`-separated prefix of `workload`. `find_map` over a HashMap is
+        // non-deterministic, and if one base is itself a `-`-prefix of another (e.g.
+        // `pg` and `pg-metrics`, so `pg-metrics-<ident>` matches both) iteration order
+        // would decide which spec's database/user fills the server-init env. Resolve to
+        // the **longest** matching base instead — `pg-metrics` wins over `pg` — so the
+        // choice is deterministic and unambiguous. (The credential key is exact, so this
+        // is a robustness/correctness fix, not a cross-tenant reach.)
+        self.dbs
+            .iter()
+            .filter(|(base, spec)| {
+                matches!(spec.tenant, crate::config::TenantIsolation::Single)
+                    && workload
+                        .strip_prefix(base.as_str())
+                        .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
+            })
+            .max_by_key(|(base, _)| base.len())
+            .map(|(_, spec)| spec)
     }
 }
 
@@ -652,6 +661,56 @@ mod tests {
         // The BYO-credential + BYO-URL workloads are NOT managed here.
         assert!(env.managed_db_env("default", "pg2").await.is_empty());
         assert!(env.managed_db_env("default", "nope").await.is_empty());
+    }
+
+    /// L3: when one `Single` compute base (`pg`) is a `-`-prefix of another
+    /// (`pg-metrics`), a per-tenant workload `pg-metrics-<ident>` is a valid derived
+    /// name for BOTH. `resolve_spec` must pick the **longest** matching base
+    /// deterministically (`pg-metrics`), not whichever the HashMap iterates first, so
+    /// the server-init env is filled from the right binding's database/user.
+    #[tokio::test]
+    async fn resolve_spec_prefers_the_longest_matching_single_base() {
+        use crate::config::TenantIsolation;
+
+        // Two Single bindings whose compute names are prefix-related. Give them
+        // distinct databases so the resolved spec is observable.
+        let mut pg = db("postgres", Some("pg"), "", None);
+        pg.tenant = TenantIsolation::Single;
+        pg.database = Some("appdb".into());
+        pg.user = Some("app".into());
+
+        let mut pg_metrics = db("postgres", Some("pg-metrics"), "", None);
+        pg_metrics.tenant = TenantIsolation::Single;
+        pg_metrics.database = Some("metricsdb".into());
+        pg_metrics.user = Some("metrics".into());
+
+        let mut dbs = BTreeMap::new();
+        dbs.insert("analytics".to_string(), pg);
+        dbs.insert("metrics".to_string(), pg_metrics);
+
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let creds = ManagedSqlCredentials::new(kv, Arc::new(ReverseEnvelope));
+        let env = ManagedDbEnv::from_config(&dbs, creds, ManagedDbPrivilege::default());
+
+        // A per-tenant workload of `pg-metrics` matches both `pg` and `pg-metrics`;
+        // the longest base (`pg-metrics`) must win → the metrics database/user.
+        let e = env.managed_db_env("acme", "pg-metrics-acme").await;
+        assert!(
+            e.contains(&("POSTGRES_DB".into(), "metricsdb".into())),
+            "longest base (`pg-metrics`) must win over `pg`: {e:?}"
+        );
+        assert!(e.contains(&("POSTGRES_USER".into(), "metrics".into())));
+
+        // A per-tenant workload of the shorter base still resolves to `pg`.
+        let e = env.managed_db_env("acme", "pg-acme").await;
+        assert!(e.contains(&("POSTGRES_DB".into(), "appdb".into())));
+        assert!(e.contains(&("POSTGRES_USER".into(), "app".into())));
+
+        // The privilege lookup uses the same resolver, so it is unambiguous too.
+        assert_eq!(
+            env.managed_db_privilege("acme", "pg-metrics-acme"),
+            Some(PrivilegeDirective::Rootless { uid: 999, gid: 999 })
+        );
     }
 
     // A no-op object store so a `DeployStore` can be built for the KV-only replica

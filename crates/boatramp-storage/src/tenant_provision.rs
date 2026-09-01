@@ -16,8 +16,10 @@
 //!   input to `[a-z0-9_]`, and — crucially — is **injective**: two distinct
 //!   inputs can never collapse to the same identifier (that would silently let
 //!   one tenant address another tenant's database). Injectivity is guaranteed by
-//!   appending a stable FNV-1a hash of the *original* input whenever the mapping
-//!   was lossy or the name was truncated (see [`sanitize_ident`]).
+//!   *unconditionally* appending a stable, wide (128-bit) SHA-256 digest of the
+//!   *original* input to every identifier — so two distinct originals differ in
+//!   the suffix with ~2^-128 (cryptographic) collision probability regardless of
+//!   how the human-readable body was folded or truncated (see [`sanitize_ident`]).
 //! - **Defense in depth in the DDL.** Even though the names reaching
 //!   [`provision_ddl`] / [`deprovision_ddl`] / [`rotate_ddl`] are already
 //!   sanitized and passwords are hex, every emitted statement quotes its
@@ -48,46 +50,40 @@
 )]
 
 use crate::ExternalSqlKind;
+use boatramp_core::deploy::sha256_hex;
 
-/// Maximum length of a single derived identifier. Postgres truncates
-/// identifiers at 63 bytes (`NAMEDATALEN - 1`) and MySQL allows 64; we cap well
-/// below both so that a `<base>_<tenant>` combination still fits after
-/// re-sanitization, and reserve room for the injectivity hash suffix.
-const MAX_IDENT_LEN: usize = 40;
+/// Length (in hex chars) of the digest suffix that keeps sanitization injective.
+/// 32 hex chars = **128 bits** of SHA-256, appended to *every* identifier so a
+/// pair of distinct originals collides only with ~2^-128 probability (see
+/// [`sanitize_ident`]).
+const HASH_HEX_LEN: usize = 32;
 
-/// Length (in hex chars) of the FNV-1a suffix appended to keep sanitization
-/// injective. 8 hex chars = 32 bits of the hash.
-const HASH_HEX_LEN: usize = 8;
+/// Maximum length of a single derived identifier. Postgres truncates identifiers
+/// at 63 bytes (`NAMEDATALEN - 1`) and MySQL allows 64; we cap at the tighter
+/// Postgres limit so an identifier is valid on both engines. The layout is a
+/// human-readable body of up to [`IDENT_BODY_BUDGET`] chars, then `_`, then the
+/// [`HASH_HEX_LEN`]-char digest — `30 + 1 + 32 = 63`, exactly the Postgres cap.
+const MAX_IDENT_LEN: usize = 63;
 
-/// FNV-1a 64-bit hash of `bytes`.
+/// Chars of the human-readable (sanitized-body) portion an identifier may keep
+/// before the mandatory `_<digest>` suffix: `63 − 1 (`_`) − 32 (hex) = 30`.
+const IDENT_BODY_BUDGET: usize = MAX_IDENT_LEN - (HASH_HEX_LEN + 1);
+
+/// The first [`HASH_HEX_LEN`] hex chars of the SHA-256 digest of `s`.
 ///
-/// A tiny, dependency-free, **stable** non-cryptographic hash. Stability is the
-/// whole point: `std`'s [`DefaultHasher`] output is explicitly *not* guaranteed
-/// stable across builds or platforms, which would make derived identifiers move
-/// under a tenant between binary versions. FNV-1a is fixed by its constants, so
-/// the same input always yields the same identifier. (It is not
-/// collision-resistant against an adversary, but it does not need to be — it is
-/// only a disambiguating suffix, and the leading sanitized portion already
-/// carries the human-meaningful bytes; see [`sanitize_ident`] for the
-/// injectivity argument.)
+/// The digest is a **stable** (fixed by the SHA-256 standard, unlike `std`'s
+/// [`DefaultHasher`], whose output is explicitly not guaranteed across builds or
+/// platforms) and **cryptographically collision-resistant** disambiguator derived
+/// from the *original*, pre-sanitization input. Truncating to 128 bits keeps the
+/// full-input collision probability at ~2^-128 while leaving room for a
+/// human-readable body within the engine identifier limit. Stability matters
+/// because a shift here would silently move a tenant's database/role name between
+/// binary versions.
 ///
 /// [`DefaultHasher`]: std::collections::hash_map::DefaultHasher
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    // 64-bit FNV offset basis / prime (the canonical constants).
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-/// The first [`HASH_HEX_LEN`] hex chars of the FNV-1a hash of `s`.
 fn hash_suffix(s: &str) -> String {
-    let full = format!("{:016x}", fnv1a_64(s.as_bytes()));
-    full[..HASH_HEX_LEN].to_string()
+    // `sha256_hex` yields 64 lowercase hex chars; take the leading 128 bits.
+    sha256_hex(s.as_bytes())[..HASH_HEX_LEN].to_string()
 }
 
 /// Map an arbitrary project/site name to a **safe** SQL identifier.
@@ -97,38 +93,29 @@ fn hash_suffix(s: &str) -> String {
 /// 2. Keep `[a-z0-9_]`; replace every other char (including `-`, whitespace,
 ///    quotes, and every SQL metacharacter) with `_`.
 /// 3. If the result is empty or starts with a digit, prefix `t_`.
-/// 4. Cap the human-readable portion at [`MAX_IDENT_LEN`] chars.
-/// 5. **Injectivity:** if step 2 or 4 was *lossy* (any char was replaced, or the
-///    name was truncated), append `_` + an 8-hex-char FNV-1a hash of the
-///    **original** input.
+/// 4. Cap the human-readable body at [`IDENT_BODY_BUDGET`] chars.
+/// 5. **Injectivity:** *always* append `_` + a 32-hex-char (128-bit) SHA-256
+///    digest of the **original** input.
 ///
 /// # Injectivity guarantee
 ///
 /// Two distinct inputs must never produce the same identifier — otherwise one
 /// tenant's derived database/role name could collide with another's, breaking
-/// isolation. This holds because:
+/// isolation. Every identifier ends in `_<digest-of-original>`, and the digest is
+/// a cryptographic (SHA-256, 128-bit-truncated) hash of the *original* bytes, so:
 ///
-/// - If neither input was lossy, the identifier equals the (lowercased, but
-///   already `[a-z0-9_]`) input verbatim, plus an optional `t_` prefix. Two such
-///   inputs are equal as identifiers only if they were equal as inputs. (Case is
-///   folded, so `Foo`/`foo` *would* collide here — but changing case is a lossy
-///   transform under a different definition; we treat any non-lowercase byte as
-///   lossy in step 5's check, so `Foo` carries a hash and `foo` does not,
-///   keeping them distinct. See the check below.)
-/// - If either input was lossy, its identifier ends in `_<hash-of-original>`.
-///   The hash is computed over the *original* bytes, so different originals get
-///   different suffixes with overwhelming probability, and — decisively — a
-///   lossy identifier always carries a hash while a lossless one never does, so
-///   the two classes can never collide either.
+/// - Two distinct originals yield the same 128-bit suffix only with ~2^-128
+///   probability — a cryptographically negligible, adversary-resistant chance.
+/// - Because the suffix is unconditional, there is no longer a "lossy" vs
+///   "lossless" class split whose boundary an attacker could straddle: the body
+///   is now purely cosmetic, and *all* disambiguation lives in the full-width
+///   digest of the pre-sanitization input.
 ///
 /// The suffix is derived from the pre-sanitization input, so it disambiguates
-/// exactly the information that sanitization threw away.
+/// exactly the information that sanitization (case-folding, char replacement,
+/// truncation) threw away.
 pub fn sanitize_ident(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-
-    // Lossy if lowercasing changed anything (case-folding erases information),
-    // or if any char is outside the safe set (and thus gets replaced below).
-    let mut lossy = lower != name;
 
     let mut cleaned = String::with_capacity(lower.len());
     for ch in lower.chars() {
@@ -136,15 +123,11 @@ pub fn sanitize_ident(name: &str) -> String {
             cleaned.push(ch);
         } else {
             cleaned.push('_');
-            lossy = true;
         }
     }
 
     // Empty or digit-leading ⇒ prefix `t_` so it's a valid identifier start.
-    // An empty input is degenerate (all its information is gone), so force the
-    // hash to keep distinct empties/whitespace-only names apart.
-    let mut prefixed = if cleaned.is_empty() {
-        lossy = true;
+    let mut body = if cleaned.is_empty() {
         String::from("t_")
     } else if cleaned.as_bytes()[0].is_ascii_digit() {
         format!("t_{cleaned}")
@@ -152,19 +135,13 @@ pub fn sanitize_ident(name: &str) -> String {
         cleaned
     };
 
-    // Truncate the human-readable portion, leaving room for `_<hash>`. Any
-    // truncation is lossy and forces the disambiguating suffix.
-    let budget = MAX_IDENT_LEN - (HASH_HEX_LEN + 1);
-    if prefixed.len() > budget {
-        prefixed.truncate(budget);
-        lossy = true;
-    }
+    // Cap the human-readable body, leaving room for the mandatory `_<digest>`.
+    // Truncation is harmless to injectivity now that the full-width digest of the
+    // *original* input is always appended below.
+    body.truncate(IDENT_BODY_BUDGET);
 
-    if lossy {
-        format!("{prefixed}_{}", hash_suffix(name))
-    } else {
-        prefixed
-    }
+    // Always append the wide digest of the original input.
+    format!("{body}_{}", hash_suffix(name))
 }
 
 /// Derive the per-tenant **database** name from the binding's own database name
@@ -173,8 +150,9 @@ pub fn sanitize_ident(name: &str) -> String {
 ///
 /// Scheme: `<base>_<tenant_ident>`, then the whole thing is re-sanitized and
 /// length-capped through [`sanitize_ident`] so the *combined* name is a valid,
-/// bounded identifier. Because the combination is deterministic and the re-pass
-/// preserves injectivity, distinct `(base, tenant_ident)` pairs stay distinct.
+/// bounded identifier carrying its own always-on digest. Because the combination
+/// is deterministic and [`sanitize_ident`] is injective over its (combined)
+/// input, distinct `(base, tenant_ident)` pairs stay distinct.
 pub fn tenant_db_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident(&format!("{base}_{tenant_ident}"))
 }
@@ -182,8 +160,12 @@ pub fn tenant_db_name(base: &str, tenant_ident: &str) -> String {
 /// Derive the per-tenant **login role** name.
 ///
 /// Scheme: `<base>_<tenant_ident>_role`, then re-sanitized and length-capped via
-/// [`sanitize_ident`]. Kept distinct from [`tenant_db_name`] by the `_role`
-/// suffix so the role and database never share a name.
+/// [`sanitize_ident`]. Because [`sanitize_ident`] digests the *whole* combined
+/// input — including the trailing `_role` — this identifier's 128-bit digest
+/// suffix always differs from [`tenant_db_name`]'s (whose input has no `_role`),
+/// so the role and database names can never collide even when the human-readable
+/// `role` marker is truncated out of the body for a very long tenant. The
+/// distinctness is carried by the digest, not by the (cosmetic) marker.
 pub fn tenant_role_name(base: &str, tenant_ident: &str) -> String {
     sanitize_ident(&format!("{base}_{tenant_ident}_role"))
 }
@@ -382,27 +364,82 @@ mod tests {
         }
     }
 
-    /// A clean, already-safe, short, lowercase name is passed through verbatim
-    /// with **no** hash suffix (the common, human-readable case).
+    /// A clean, already-safe, short, lowercase name keeps its human-readable
+    /// body verbatim, but — for injectivity — *always* carries the `_<digest>`
+    /// suffix (the digest disambiguator is unconditional now).
     #[test]
-    fn sanitize_clean_name_unmodified() {
-        assert_eq!(sanitize_ident("appdb"), "appdb");
-        assert_eq!(sanitize_ident("my_site_42"), "my_site_42");
+    fn sanitize_clean_name_keeps_body_with_suffix() {
+        let out = sanitize_ident("appdb");
+        assert!(out.starts_with("appdb_"), "unexpected body: {out}");
+        assert_eq!(out, format!("appdb_{}", hash_suffix("appdb")));
+
+        let out2 = sanitize_ident("my_site_42");
+        assert!(out2.starts_with("my_site_42_"), "unexpected body: {out2}");
+        assert_eq!(out2, format!("my_site_42_{}", hash_suffix("my_site_42")));
     }
 
-    /// A digit-leading but otherwise clean name gets the `t_` prefix. It is not
-    /// lossy, so it carries no hash.
+    /// A digit-leading but otherwise clean name gets the `t_` prefix, then the
+    /// mandatory digest suffix.
     #[test]
     fn sanitize_digit_leading_prefixed() {
-        assert_eq!(sanitize_ident("1tenant"), "t_1tenant");
+        assert_eq!(
+            sanitize_ident("1tenant"),
+            format!("t_1tenant_{}", hash_suffix("1tenant"))
+        );
+    }
+
+    /// The disambiguating digest suffix is **always present** — even for a clean,
+    /// lowercase, already-safe name — and every identifier stays within the
+    /// engine cap (Postgres 63 / MySQL 64 bytes).
+    #[test]
+    fn sanitize_suffix_always_present_and_bounded() {
+        for input in [
+            "appdb",
+            "my_site_42",
+            "acme-corp",
+            "Foo",
+            "1tenant",
+            "",
+            "a".repeat(200).as_str(),
+        ] {
+            let out = sanitize_ident(input);
+            // Suffix present: ends in `_` + exactly HASH_HEX_LEN hex chars.
+            assert!(out.len() > HASH_HEX_LEN + 1, "too short: {out:?}");
+            let (body, sep_hash) = out.split_at(out.len() - (HASH_HEX_LEN + 1));
+            assert!(sep_hash.starts_with('_'), "no `_<hash>` in {out:?}");
+            let hash = &sep_hash[1..];
+            assert_eq!(hash.len(), HASH_HEX_LEN, "wrong hash width in {out:?}");
+            assert!(
+                hash.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "non-hex suffix in {out:?}"
+            );
+            assert_eq!(hash, hash_suffix(input), "suffix must digest the original");
+            let _ = body;
+            // Within the Postgres cap (and thus MySQL's too).
+            assert!(
+                out.len() <= MAX_IDENT_LEN,
+                "over cap ({}): {out:?}",
+                out.len()
+            );
+        }
+        // The cap must fit the tightest engine limit (Postgres NAMEDATALEN-1).
+        const { assert!(MAX_IDENT_LEN <= 63) };
     }
 
     /// **Injectivity:** a battery of tricky, near-colliding inputs all map to
-    /// distinct identifiers. This is the core tenant-isolation property.
+    /// distinct identifiers. This is the core tenant-isolation property. Includes
+    /// the two security-review PoC collision classes (see the dedicated tests
+    /// below), so a regression to the old 32-bit / conditional-suffix scheme is
+    /// caught here too.
     #[test]
     fn sanitize_is_injective() {
         let long_a = "a".repeat(50);
         let long_b = format!("{}b", "a".repeat(49));
+        // PoC class B: two 50-char names sharing a 31-char prefix.
+        let prefix31 = "a".repeat(31);
+        let poc_b1 = format!("{prefix31}{}", "x".repeat(19));
+        let poc_b2 = format!("{prefix31}{}", "y".repeat(19));
         let inputs = [
             "acme-corp",
             "acme_corp",
@@ -418,6 +455,12 @@ mod tests {
             "x'; DROP DATABASE y; --",
             "hello world",
             "hello_world",
+            // PoC class A: two all-metacharacter names that sanitize to the same
+            // `______` body.
+            "#//$&%",
+            ".-!*%,",
+            poc_b1.as_str(),
+            poc_b2.as_str(),
         ];
         let mut seen: HashSet<String> = HashSet::new();
         for input in inputs {
@@ -436,21 +479,51 @@ mod tests {
         assert_ne!(sanitize_ident("Foo"), sanitize_ident("foo"));
     }
 
-    /// A lossy input carries an FNV-1a suffix; the same input is stable across
-    /// calls (no `DefaultHasher` run-to-run drift).
+    /// Security-review PoC class A: two distinct all-metacharacter names that both
+    /// sanitize to the same `______` body must still map to distinct identifiers,
+    /// because the digest is taken over the *original* bytes.
     #[test]
-    fn sanitize_lossy_has_stable_hash_suffix() {
+    fn sanitize_poc_metachar_bodies_distinct() {
+        assert_ne!(
+            sanitize_ident("#//$&%"),
+            sanitize_ident(".-!*%,"),
+            "distinct metachar-only names collided"
+        );
+    }
+
+    /// Security-review PoC class B: two distinct ≥50-char names sharing a 31-char
+    /// sanitized prefix (so the truncated body is identical) must still differ,
+    /// because the always-on digest disambiguates the full original.
+    #[test]
+    fn sanitize_poc_shared_prefix_distinct() {
+        let prefix = "a".repeat(31);
+        let a = format!("{prefix}{}", "b".repeat(20)); // 51 chars
+        let b = format!("{prefix}{}", "c".repeat(20)); // 51 chars
+        assert_ne!(a, b);
+        let ia = sanitize_ident(&a);
+        let ib = sanitize_ident(&b);
+        // Bodies are identical after truncation to the 30-char budget…
+        let body_a = &ia[..ia.len() - (HASH_HEX_LEN + 1)];
+        let body_b = &ib[..ib.len() - (HASH_HEX_LEN + 1)];
+        assert_eq!(body_a, body_b, "truncated bodies should match");
+        // …but the identifiers differ in the digest suffix.
+        assert_ne!(ia, ib, "shared-prefix long names collided");
+    }
+
+    /// The digest suffix is derived from the original input and is stable across
+    /// calls (fixed SHA-256, no `DefaultHasher` run-to-run drift).
+    #[test]
+    fn sanitize_has_stable_digest_suffix() {
         let a = sanitize_ident("acme-corp");
         let b = sanitize_ident("acme-corp");
-        assert_eq!(a, b, "hash suffix must be stable");
-        // "acme-corp" -> "acme_corp" is lossy, so a suffix is present: the
-        // sanitized body plus `_` plus 8 hex chars.
+        assert_eq!(a, b, "digest suffix must be stable");
+        // "acme-corp" -> body "acme_corp" plus `_` plus HASH_HEX_LEN hex chars.
         assert!(a.starts_with("acme_corp_"), "unexpected body: {a}");
         assert_eq!(a.len(), "acme_corp_".len() + HASH_HEX_LEN);
     }
 
-    /// A >40-char name is truncated and, being lossy, disambiguated by hash;
-    /// two long names that share a 40-char prefix still differ.
+    /// A name longer than the body budget is truncated, but two long names that
+    /// share a body-length prefix still differ via the always-on digest.
     #[test]
     fn sanitize_truncation_stays_distinct() {
         let long_a = format!("{}_alpha", "z".repeat(60));
@@ -463,7 +536,9 @@ mod tests {
 
     // ---- tenant_db_name / tenant_role_name -------------------------------
 
-    /// The db/role derivation is deterministic, role != db, and both are safe.
+    /// The db/role derivation is deterministic, role != db (carried by the
+    /// digest, since the role's input has a trailing `_role` the db's lacks),
+    /// both stay within the engine cap, and both are safe-charset.
     #[test]
     fn tenant_names_scheme() {
         let ident = sanitize_ident("acme");
@@ -472,7 +547,9 @@ mod tests {
         assert_ne!(db, role);
         assert!(db.contains("appdb"));
         assert!(role.contains("appdb"));
-        assert!(role.contains("role"));
+        // Both fit the tightest engine identifier limit.
+        assert!(db.len() <= MAX_IDENT_LEN, "db over cap: {db}");
+        assert!(role.len() <= MAX_IDENT_LEN, "role over cap: {role}");
         // Deterministic.
         assert_eq!(db, tenant_db_name("appdb", &ident));
         // Safe charset.
@@ -483,13 +560,38 @@ mod tests {
         }
     }
 
-    /// Distinct tenants under the same base get distinct db + role names.
+    /// Distinct tenants under the same base get distinct db + role names — and it
+    /// holds for very long tenants too, where the human-readable body truncates
+    /// away and only the always-on digest keeps them apart.
     #[test]
     fn tenant_names_distinct_across_tenants() {
         let a = sanitize_ident("alpha");
         let b = sanitize_ident("beta");
         assert_ne!(tenant_db_name("appdb", &a), tenant_db_name("appdb", &b));
         assert_ne!(tenant_role_name("appdb", &a), tenant_role_name("appdb", &b));
+
+        // Long tenants sharing a body prefix stay distinct via the digest, and
+        // the db/role of one long tenant never collide with each other.
+        let long_a = sanitize_ident(&"z".repeat(80));
+        let long_b = sanitize_ident(&format!("{}q", "z".repeat(79)));
+        assert_ne!(
+            tenant_db_name("appdb", &long_a),
+            tenant_db_name("appdb", &long_b)
+        );
+        assert_ne!(
+            tenant_role_name("appdb", &long_a),
+            tenant_role_name("appdb", &long_b)
+        );
+        assert_ne!(
+            tenant_db_name("appdb", &long_a),
+            tenant_role_name("appdb", &long_a)
+        );
+        for n in [
+            tenant_db_name("appdb", &long_a),
+            tenant_role_name("appdb", &long_a),
+        ] {
+            assert!(n.len() <= MAX_IDENT_LEN, "over cap: {n}");
+        }
     }
 
     // ---- quoting ---------------------------------------------------------
@@ -644,13 +746,19 @@ mod tests {
         }
     }
 
-    /// The FNV-1a hash matches the reference constants for a known vector, so a
-    /// refactor can't silently change derived identifiers.
+    /// Pin the derived-identifier digest to a known SHA-256 vector so a refactor
+    /// (e.g. swapping the hash or its truncation width) can't silently shift a
+    /// tenant's database/role name between binary versions.
     #[test]
-    fn fnv1a_known_vectors() {
-        // FNV-1a 64-bit of the empty string is the offset basis.
-        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
-        // Canonical FNV-1a 64-bit test vector for "a".
-        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    fn digest_suffix_is_pinned() {
+        // Full SHA-256("appdb") is
+        // 6f6115c972bf4b6e742ac51d4a2329d0d2c2e4d6269400191d88007c48be798b;
+        // we keep the leading 128 bits (32 hex chars).
+        assert_eq!(hash_suffix("appdb"), "6f6115c972bf4b6e742ac51d4a2329d0");
+        // Therefore the whole identifier for a clean name is fully determined.
+        assert_eq!(
+            sanitize_ident("appdb"),
+            "appdb_6f6115c972bf4b6e742ac51d4a2329d0"
+        );
     }
 }

@@ -4,6 +4,21 @@
 //! restarts (PLAN-managed-compute-sql). Endpoint lookup is injected as a
 //! [`ComputeEndpointResolver`] so this crate stays decoupled from the control
 //! plane — `boatramp-node` provides the `DeployStore`-backed impl.
+//!
+//! # RLS session context — trust model
+//!
+//! When a binding opts into `rls_session`, this backend injects the request's tenant
+//! (`boatramp.project` / `boatramp.site`) into the SQL session so an app's hand-written
+//! RLS can key on it. This **provides** the tenant; it is **not** a hostile-guest
+//! boundary on its own:
+//!
+//! - The reserved keys are protected from guest override at the `sql` binding
+//!   (`boatramp_core::sql::reject_reserved_session_writes`), so a guest cannot spoof
+//!   its injected tenant.
+//! - The real tenant-isolation boundary is the **per-tenant database + role**
+//!   (`Single` / `Shared`), which a compromised handler cannot cross. Claim-sourced
+//!   enforcement (the GraphQL connector) is the model for untrusted data. See the
+//!   `rls_session` config field doc for the full statement.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -171,6 +186,43 @@ impl ComputeResolvedSqlBackend {
         Ok(())
     }
 
+    /// Whether this backend injects a **connection-lifetime** MySQL session var that
+    /// must be scrubbed before a connection returns to the pool. Postgres's
+    /// `set_config(..., is_local => true)` is transaction-local (unset at COMMIT/
+    /// ROLLBACK by the engine), so only MySQL needs the explicit reset.
+    fn needs_mysql_session_reset(&self) -> bool {
+        matches!(self.kind, ExternalSqlKind::Mysql) && !self.session_context.is_empty()
+    }
+
+    /// Wrap `tx` in a [`MysqlSessionScopedTx`] when this backend sets a
+    /// connection-lifetime MySQL var, so the var is scrubbed to `NULL` before the
+    /// transaction ends and the pooled connection returns clean (L1). A no-op wrapper
+    /// otherwise (Postgres, or no session context): the transaction is returned as-is.
+    fn scope_mysql_session(&self, tx: Box<dyn SqlTransaction>) -> Box<dyn SqlTransaction> {
+        if !self.needs_mysql_session_reset() {
+            return tx;
+        }
+        Box::new(MysqlSessionScopedTx {
+            inner: tx,
+            keys: self.session_context.iter().map(|(k, _)| *k).collect(),
+        })
+    }
+
+    /// Prepend `SET @boatramp_<key> = NULL` statements to a raw MySQL script when this
+    /// backend sets connection-lifetime vars, so a `run_script` on a reused pooled
+    /// connection starts from a clean session (L1). `NULL` is a literal, so nothing is
+    /// bound. Returns `sql` unchanged for Postgres / no session context.
+    fn mysql_reset_prefixed(&self, sql: &str) -> String {
+        if !self.needs_mysql_session_reset() {
+            return sql.to_string();
+        }
+        let mut prefix = String::new();
+        for (key, _value) in &self.session_context {
+            prefix.push_str(&format!("SET @boatramp_{key} = NULL;\n"));
+        }
+        format!("{prefix}{sql}")
+    }
+
     /// Resolve the workload's primary healthy endpoint and build the connection URL.
     async fn resolve_url(&self) -> Result<String, SqlError> {
         let (host, port) = self
@@ -214,6 +266,57 @@ impl ComputeResolvedSqlBackend {
     }
 }
 
+/// Wraps a MySQL transaction so its `@boatramp_*` session vars are reset to `NULL`
+/// **just before** the transaction ends, scrubbing the pooled connection so the
+/// connection-lifetime var can never linger for a later reuse (L1). Only used for
+/// the MySQL path with a configured session context; the Postgres GUC is
+/// transaction-local and needs no wrapper. `keys` are our own reserved key constants
+/// (never guest input); `NULL` is a literal, so the reset binds nothing.
+struct MysqlSessionScopedTx {
+    inner: Box<dyn SqlTransaction>,
+    keys: Vec<&'static str>,
+}
+
+impl MysqlSessionScopedTx {
+    /// Reset every `@boatramp_<key>` var on the inner transaction. Best-effort at end:
+    /// on the error paths a failure here must not mask the real commit/rollback outcome.
+    async fn reset(&mut self) -> Result<(), SqlError> {
+        for key in &self.keys {
+            self.inner
+                .execute(&format!("SET @boatramp_{key} = NULL"), &[])
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SqlTransaction for MysqlSessionScopedTx {
+    async fn query(
+        &mut self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Result<boatramp_core::sql::SqlRows, SqlError> {
+        self.inner.query(sql, params).await
+    }
+    async fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<u64, SqlError> {
+        self.inner.execute(sql, params).await
+    }
+    async fn commit(mut self: Box<Self>) -> Result<(), SqlError> {
+        // Scrub before COMMIT so the connection returns to the pool clean; a reset
+        // failure fails the commit (the connection would otherwise be poisoned).
+        self.reset().await?;
+        self.inner.commit().await
+    }
+    async fn rollback(mut self: Box<Self>) -> Result<(), SqlError> {
+        // Reset (its own statement, unaffected by the ROLLBACK — MySQL user vars are
+        // connection- not transaction-scoped) before rolling back the actual work.
+        let reset = self.reset().await;
+        let rolled = self.inner.rollback().await;
+        reset.and(rolled)
+    }
+}
+
 #[async_trait]
 impl SqlBackend for ComputeResolvedSqlBackend {
     fn dialect(&self) -> boatramp_core::sql::Dialect {
@@ -223,22 +326,48 @@ impl SqlBackend for ComputeResolvedSqlBackend {
         }
     }
 
+    /// This backend injects the reserved `boatramp.*` / `@boatramp_*` session context
+    /// exactly when `rls_session` gave it a non-empty context — so the guest `sql`
+    /// binding rejects any guest statement that would overwrite those reserved keys
+    /// (H1: a guest must not be able to spoof its injected tenant and defeat app RLS).
+    fn injects_session_context(&self) -> bool {
+        !self.session_context.is_empty()
+    }
+
     async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         let mut tx = self.pool().await?.begin().await?;
         self.apply_session_context(&mut tx).await?;
-        Ok(tx)
+        Ok(self.scope_mysql_session(tx))
     }
     async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
         let mut tx = self.pool().await?.begin_read_only().await?;
         self.apply_session_context(&mut tx).await?;
-        Ok(tx)
+        Ok(self.scope_mysql_session(tx))
     }
     async fn run_script(&self, sql: &str) -> Result<(), SqlError> {
         // Resolve the live endpoint + connect, then delegate to the concrete
         // Postgres/MySQL backend's simple-query script path (operator migrations).
-        self.pool().await?.run_script(sql).await
+        // L1: `run_script` acquires a *pooled* connection that a prior transaction may
+        // have left carrying an `@boatramp_*` MySQL var. This operator path must not
+        // inherit a tenant's RLS context, so scrub the vars first (prepended into the
+        // same script → same connection). Postgres needs nothing (transaction-local GUC).
+        let sql = self.mysql_reset_prefixed(sql);
+        self.pool().await?.run_script(&sql).await
     }
     async fn run_query(&self, sql: &str) -> Result<boatramp_core::sql::SqlRows, SqlError> {
+        // L1: same as `run_script` — a reused pooled connection may carry a stale
+        // `@boatramp_*`. Run the query inside a read-only transaction that resets the
+        // vars first, so the operator query sees no tenant's RLS context.
+        if self.needs_mysql_session_reset() {
+            let mut tx = self.pool().await?.begin_read_only().await?;
+            for (key, _value) in &self.session_context {
+                tx.execute(&format!("SET @boatramp_{key} = NULL"), &[])
+                    .await?;
+            }
+            let result = tx.query(sql, &[]).await;
+            let _ = tx.rollback().await;
+            return result;
+        }
         self.pool().await?.run_query(sql).await
     }
 }
@@ -424,5 +553,97 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "no context ⇒ no statements"
         );
+    }
+
+    // ---- L1: MySQL connection-lifetime var must not leak on pooled reuse -----
+
+    /// The wrapper resets every `@boatramp_*` var to NULL on COMMIT so the pooled
+    /// connection can't carry a prior tenant's value into a later reuse.
+    #[tokio::test]
+    async fn mysql_session_scoped_tx_resets_on_commit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner: Box<dyn SqlTransaction> = Box::new(RecordingTx { seen: seen.clone() });
+        let tx: Box<dyn SqlTransaction> = Box::new(MysqlSessionScopedTx {
+            inner,
+            keys: vec![SESSION_KEY_PROJECT, SESSION_KEY_SITE],
+        });
+        tx.commit().await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        // Both reserved vars reset to the NULL literal (no bound params).
+        assert_eq!(seen.len(), 2, "one reset per reserved key before commit");
+        assert_eq!(seen[0].0, "SET @boatramp_project = NULL");
+        assert!(seen[0].1.is_empty(), "NULL is a literal, nothing bound");
+        assert_eq!(seen[1].0, "SET @boatramp_site = NULL");
+    }
+
+    /// The reset also happens on ROLLBACK (the var is connection-scoped, so a rollback
+    /// of the transaction would not clear it — the explicit SET does).
+    #[tokio::test]
+    async fn mysql_session_scoped_tx_resets_on_rollback() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner: Box<dyn SqlTransaction> = Box::new(RecordingTx { seen: seen.clone() });
+        let tx: Box<dyn SqlTransaction> = Box::new(MysqlSessionScopedTx {
+            inner,
+            keys: vec![SESSION_KEY_PROJECT],
+        });
+        tx.rollback().await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "SET @boatramp_project = NULL");
+    }
+
+    /// `scope_mysql_session` wraps only the MySQL-with-context case; Postgres (whose
+    /// GUC is transaction-local) and the empty-context case are returned unwrapped, so
+    /// a plain transaction issues NO reset on commit.
+    #[tokio::test]
+    async fn scope_mysql_session_is_a_noop_for_postgres_and_empty() {
+        // Postgres + context: not wrapped ⇒ no reset statements at commit.
+        let be = backend_with_ctx(
+            ExternalSqlKind::Postgres,
+            vec![(SESSION_KEY_PROJECT, "acme".to_string())],
+        );
+        assert!(!be.needs_mysql_session_reset());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tx = be.scope_mysql_session(Box::new(RecordingTx { seen: seen.clone() }));
+        tx.commit().await.unwrap();
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "postgres GUC is transaction-local — no explicit reset"
+        );
+
+        // MySQL + empty context: also not wrapped.
+        let be = backend_with_ctx(ExternalSqlKind::Mysql, Vec::new());
+        assert!(!be.needs_mysql_session_reset());
+    }
+
+    /// `run_script` on a MySQL backend with a session context prepends the NULL resets
+    /// to the raw script (same pooled connection), so an operator migration never
+    /// inherits a tenant's stale `@boatramp_*`. Postgres is untouched.
+    #[test]
+    fn mysql_reset_prefixed_prepends_for_mysql_context_only() {
+        let mysql = backend_with_ctx(
+            ExternalSqlKind::Mysql,
+            vec![
+                (SESSION_KEY_PROJECT, "acme".to_string()),
+                (SESSION_KEY_SITE, "blog".to_string()),
+            ],
+        );
+        let out = mysql.mysql_reset_prefixed("CREATE TABLE t (id INT)");
+        assert_eq!(
+            out,
+            "SET @boatramp_project = NULL;\nSET @boatramp_site = NULL;\nCREATE TABLE t (id INT)"
+        );
+
+        // Postgres: script unchanged (transaction-local GUC, no leak).
+        let pg = backend_with_ctx(
+            ExternalSqlKind::Postgres,
+            vec![(SESSION_KEY_PROJECT, "acme".to_string())],
+        );
+        assert_eq!(pg.mysql_reset_prefixed("SELECT 1"), "SELECT 1");
+
+        // MySQL without a session context: also unchanged.
+        let mysql_no_ctx = backend_with_ctx(ExternalSqlKind::Mysql, Vec::new());
+        assert_eq!(mysql_no_ctx.mysql_reset_prefixed("SELECT 1"), "SELECT 1");
     }
 }

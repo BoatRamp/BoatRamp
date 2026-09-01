@@ -148,6 +148,111 @@ pub trait SqlBackend: Send + Sync {
         let _ = tx.rollback().await;
         result
     }
+
+    /// Whether this backend injects a **reserved** boatramp session context
+    /// (`rls_session` — the `boatramp.project` / `boatramp.site` GUC on Postgres, or
+    /// the `@boatramp_project` / `@boatramp_site` MySQL session var) that an app's
+    /// row-level-security policy keys on. Default `false`.
+    ///
+    /// When `true`, the guest `sql` binding must **refuse** any guest statement that
+    /// would set/reset those reserved keys (see [`reject_reserved_session_writes`]):
+    /// otherwise a hostile guest could spoof its injected tenant and defeat the app's
+    /// RLS. This is a security signal, not a routing one — see the `rls_session` doc for
+    /// the trust model (the real isolation boundary is the per-tenant database + role).
+    fn injects_session_context(&self) -> bool {
+        false
+    }
+}
+
+/// Reject a guest SQL statement that would set or reset a **boatramp-reserved**
+/// session key — the `boatramp.*` GUC (Postgres) or an `@boatramp_*` user variable
+/// (MySQL). Used by the guest `sql` binding when the backend
+/// [`injects_session_context`](SqlBackend::injects_session_context): with `rls_session`
+/// on, boatramp injects the request's tenant into those keys for the app's RLS, so a
+/// guest that could overwrite them would spoof its tenant and defeat that RLS.
+///
+/// The match is deliberately **narrow** — only the reserved prefix is refused, so
+/// ordinary app SQL (`SET statement_timeout = …`, `SET search_path = …`, a `SELECT`
+/// mentioning "set" in an identifier or string) is untouched. Recognised hostile forms:
+///
+/// - `set_config('boatramp.<anything>', …)` — the Postgres GUC setter (in any casing,
+///   with any surrounding whitespace), whether written as its own statement or inside a
+///   `SELECT`.
+/// - a statement whose **leading keyword** is `SET` / `RESET` / `DISCARD` (including
+///   `SET SESSION` / `SET LOCAL`) targeting a `boatramp.` GUC or an `@boatramp_` var.
+///
+/// Returns [`SqlError::Other`] with a clear message on a match, else `Ok(())`.
+pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
+    /// The reserved GUC namespace (Postgres) and MySQL user-var prefix, lowercased.
+    const GUC_PREFIX: &str = "boatramp.";
+    const MYSQL_VAR_PREFIX: &str = "@boatramp_";
+
+    let refused = || {
+        Err(SqlError::Other(
+            "setting a boatramp-reserved session key (boatramp.* / @boatramp_*) is not \
+             permitted from a handler: it is managed by rls_session and reserved for \
+             per-request tenant isolation"
+                .to_string(),
+        ))
+    };
+
+    // Lowercase once for case-insensitive keyword/identifier matching. Reserved keys
+    // are ASCII, so a byte-wise lowercase is exact for them.
+    let lower = sql.to_ascii_lowercase();
+
+    // 1. `set_config('boatramp.…', …)` anywhere (it is a function call, so it can hide
+    //    inside a SELECT — including several in one statement). Check EVERY occurrence,
+    //    tolerant of whitespace after `(` and around the opening quote — e.g.
+    //    `set_config ( 'boatramp.project' , … )`.
+    for (pos, _) in lower.match_indices("set_config") {
+        let after = lower[pos + "set_config".len()..].trim_start();
+        let Some(args) = after.strip_prefix('(') else {
+            continue;
+        };
+        let arg0 = args.trim_start();
+        // The first argument is the setting name as a quoted string literal.
+        let Some(name) = arg0.strip_prefix('\'').or_else(|| arg0.strip_prefix('"')) else {
+            continue;
+        };
+        if name.trim_start().starts_with(GUC_PREFIX) {
+            return refused();
+        }
+    }
+
+    // 2. A leading `SET` / `RESET` / `DISCARD` targeting the reserved keys. Tokenize the
+    //    leading whitespace-separated words so `SET SESSION` / `SET LOCAL` are handled.
+    let mut words = lower.split_whitespace();
+    match words.next() {
+        // DISCARD ALL / DISCARD … resets ALL session state incl. our GUCs, so a guest
+        // must not run it while a session context is active.
+        Some("discard") => return refused(),
+        Some("reset") => {
+            // `RESET boatramp.project` / `RESET ALL` (ALL clears our GUC too).
+            if let Some(target) = words.next() {
+                if target == "all" || target.starts_with(GUC_PREFIX) {
+                    return refused();
+                }
+            }
+        }
+        Some("set") => {
+            // Skip an optional SESSION / LOCAL qualifier, then inspect the target.
+            let mut target = words.next();
+            if matches!(target, Some("session") | Some("local")) {
+                target = words.next();
+            }
+            if let Some(t) = target {
+                // The target may be `name=value` or `name = value`; take the head up to
+                // `=` so `set boatramp.project='x'` (no spaces) is caught too.
+                let head = t.split('=').next().unwrap_or(t);
+                if head.starts_with(GUC_PREFIX) || head.starts_with(MYSQL_VAR_PREFIX) {
+                    return refused();
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 /// How a **preview** deployment's SQL database relates to the site's live one
@@ -253,4 +358,91 @@ pub trait SqlTransaction: Send {
 
     /// Roll the transaction back.
     async fn rollback(self: Box<Self>) -> Result<(), SqlError>;
+}
+
+#[cfg(test)]
+mod reserved_session_writes_tests {
+    use super::reject_reserved_session_writes as check;
+
+    fn rejected(sql: &str) -> bool {
+        check(sql).is_err()
+    }
+
+    // ---- hostile statements that spoof the injected tenant MUST be rejected ----
+
+    #[test]
+    fn set_config_on_reserved_guc_is_rejected() {
+        assert!(rejected(
+            "SELECT set_config('boatramp.project','victim',false)"
+        ));
+        assert!(rejected("select set_config('boatramp.site', 'x', true)"));
+        // Tolerant of whitespace around the call and the quote.
+        assert!(rejected(
+            "SELECT set_config ( 'boatramp.project' , 'v', false )"
+        ));
+        // Double-quoted first arg (unusual but a literal in some dialects).
+        assert!(rejected(
+            "SELECT set_config(\"boatramp.project\", 'v', false)"
+        ));
+        // A reserved set_config hiding AFTER a benign one in the same statement is
+        // still caught (every occurrence is checked, not just the first).
+        assert!(rejected(
+            "SELECT set_config('search_path','app',false), \
+             set_config('boatramp.project','v',false)"
+        ));
+    }
+
+    #[test]
+    fn set_reserved_guc_is_rejected() {
+        assert!(rejected("SET boatramp.project = 'victim'"));
+        assert!(rejected("set boatramp.project='victim'")); // no spaces
+        assert!(rejected("SET SESSION boatramp.site = 'x'"));
+        assert!(rejected("SET LOCAL boatramp.project TO 'x'"));
+    }
+
+    #[test]
+    fn set_reserved_mysql_var_is_rejected() {
+        assert!(rejected("SET @boatramp_project = 'victim'"));
+        assert!(rejected("set @boatramp_site='x'"));
+        assert!(rejected("SET @boatramp_project := 'x'")); // MySQL := assignment
+        assert!(rejected("SET SESSION @boatramp_project = 'x'"));
+    }
+
+    #[test]
+    fn reset_and_discard_of_reserved_state_is_rejected() {
+        assert!(rejected("RESET boatramp.project"));
+        assert!(rejected("RESET ALL")); // clears our GUC too
+        assert!(rejected("DISCARD ALL"));
+        assert!(rejected("discard all"));
+    }
+
+    // ---- legitimate app SQL MUST be allowed (narrow match) ----
+
+    #[test]
+    fn unrelated_set_statements_are_allowed() {
+        assert!(!rejected("SET statement_timeout = 5000"));
+        assert!(!rejected("SET search_path TO app, public"));
+        assert!(!rejected("SET SESSION time_zone = '+00:00'"));
+        assert!(!rejected("SET @my_var = 1")); // a non-reserved MySQL user var
+        assert!(!rejected("RESET statement_timeout"));
+    }
+
+    #[test]
+    fn a_select_mentioning_set_in_an_identifier_is_allowed() {
+        // "set" appears only as an identifier / column word, not a SET statement.
+        assert!(!rejected("SELECT settings FROM boatramp_projects"));
+        assert!(!rejected(
+            "SELECT * FROM offset_table WHERE reset_at > now()"
+        ));
+        // A normal SELECT that happens to filter on a column literally named similarly.
+        assert!(!rejected("SELECT * FROM t WHERE name = 'boatramp.project'"));
+    }
+
+    #[test]
+    fn set_config_on_a_non_reserved_guc_is_allowed() {
+        assert!(!rejected("SELECT set_config('search_path','app',false)"));
+        assert!(!rejected(
+            "SELECT set_config('statement_timeout', '5000', true)"
+        ));
+    }
 }

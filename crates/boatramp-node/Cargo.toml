@@ -88,3 +88,8 @@ axum = "0.8"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
+# The live cross-tenant-isolation seam (`tests/tenant_isolation_live.rs`, Linux + root)
+# serves a rootfs blob through a test `Storage` (`FileBlob`) — needs the same byte/stream
+# helpers the container backend's live test uses.
+bytes.workspace = true
+futures.workspace = true

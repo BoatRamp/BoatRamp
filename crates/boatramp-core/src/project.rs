@@ -69,17 +69,30 @@ pub struct InvalidResourceName {
     pub reason: &'static str,
 }
 
+/// Maximum length, in bytes, of a project/site/function/compute/workflow name.
+/// Matches the tightest SQL identifier limit (Postgres `NAMEDATALEN - 1 = 63`)
+/// so a name can be folded into a per-tenant database identifier without forcing
+/// pathological truncation. Longer than any realistic human-chosen name.
+pub const MAX_RESOURCE_NAME_LEN: usize = 63;
+
 /// Validate a project/site/function/compute/workflow name at the create/write
 /// boundary, so a name can never escape its `project/<proj>/…` key prefix, collide
 /// with the store's fixed sub-key grammar, smuggle a (possibly percent-decoded)
 /// path separator, or break Cedar entity/target construction.
 ///
-/// Rejects: the empty string, `.` / `..`, and any name containing a path separator
-/// (`/` or `\`), a `*` (the authz wildcard sentinel — a resource named `*` would
-/// alias a project/site wildcard), whitespace, or an ASCII control character. This
-/// is a *targeted* denylist of the characters that carry a security or integrity
-/// consequence, not a full slug allowlist, so it does not reject pre-existing
-/// otherwise-ordinary names.
+/// Rejects: the empty string, names longer than [`MAX_RESOURCE_NAME_LEN`] bytes,
+/// `.` / `..`, and any name containing a path separator (`/` or `\`), a `*` (the
+/// authz wildcard sentinel — a resource named `*` would alias a project/site
+/// wildcard), whitespace, or an ASCII control character. This is a *targeted*
+/// denylist of the characters that carry a security or integrity consequence,
+/// plus a length bound, not a full slug allowlist, so it does not reject
+/// pre-existing otherwise-ordinary names.
+///
+/// The length bound is defense-in-depth for per-tenant database provisioning: it
+/// stops a caller from forcing pathological truncation when a name is folded into
+/// a SQL identifier (see `boatramp-storage`'s `sanitize_ident`). Injectivity there
+/// no longer depends on it (a wide, always-on digest carries it), but a bound
+/// keeps derived identifiers readable and keys short.
 pub fn validate_resource_name(kind: &'static str, value: &str) -> Result<(), InvalidResourceName> {
     let reject = |reason| {
         Err(InvalidResourceName {
@@ -90,6 +103,9 @@ pub fn validate_resource_name(kind: &'static str, value: &str) -> Result<(), Inv
     };
     if value.is_empty() {
         return reject("must not be empty");
+    }
+    if value.len() > MAX_RESOURCE_NAME_LEN {
+        return reject("must not exceed 63 bytes");
     }
     if value == "." || value == ".." {
         return reject("must not be '.' or '..'");
@@ -146,5 +162,22 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn resource_name_length_bound() {
+        // Exactly at the bound passes; one over is rejected.
+        let at = "a".repeat(MAX_RESOURCE_NAME_LEN);
+        let over = "a".repeat(MAX_RESOURCE_NAME_LEN + 1);
+        assert!(
+            validate_resource_name("site", &at).is_ok(),
+            "{}-char name should pass",
+            MAX_RESOURCE_NAME_LEN
+        );
+        assert!(
+            validate_resource_name("site", &over).is_err(),
+            "{}-char name should be rejected",
+            MAX_RESOURCE_NAME_LEN + 1
+        );
     }
 }

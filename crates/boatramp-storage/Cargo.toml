@@ -61,8 +61,8 @@ sql = ["dep:libsql", "dep:reqwest", "dep:sqlparser", "tokio/sync"]
 # the (heavy) sqlx tree is only pulled when actually used. Timestamp/uuid/
 # numeric/json columns are stringified through `sqlx::types` re-exports (the
 # chrono/uuid/bigdecimal/json features are set on the workspace `sqlx` dep).
-sql-postgres = ["dep:sqlx", "dep:sqlparser", "sqlx/postgres"]
-sql-mysql = ["dep:sqlx", "dep:sqlparser", "sqlx/mysql"]
+sql-postgres = ["dep:sqlx", "dep:sqlparser", "dep:log", "sqlx/postgres"]
+sql-mysql = ["dep:sqlx", "dep:sqlparser", "dep:log", "sqlx/mysql"]
 # A bounded local read-through cache over any `Storage`:
 # clustered/CF nodes front the shared object store with a hot-blob cache.
 cache = ["dep:lru", "dep:bytes"]
@@ -94,6 +94,9 @@ object_store = { version = "0.12", features = ["aws"], optional = true }
 libsql = { workspace = true, optional = true }
 sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
+# Only to name `log::LevelFilter::Off` when disabling sqlx statement logging on the
+# provisioning pools (credential DDL must never be logged). See `sql_sqlx::build_pool`.
+log = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
 # Memory-map local blob files for zero-copy large-static serving (`fs` feature).
 memmap2 = { version = "0.9", optional = true }

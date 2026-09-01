@@ -486,8 +486,10 @@ mod postgres_backend {
     use async_trait::async_trait;
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
     use sqlx::pool::PoolConnection;
-    use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-    use sqlx::{Column, Executor, Postgres, Row, TypeInfo, ValueRef};
+    use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
+    // `ConnectOptions` provides `log_statements` / `log_slow_statements` on the
+    // per-connection options (silences credential-DDL logging; see `build_pool`).
+    use sqlx::{Column, ConnectOptions, Executor, Postgres, Row, TypeInfo, ValueRef};
 
     /// A `NULL` bound with an **unspecified** Postgres type (OID 0), so the server
     /// infers the target column's type at `Parse`. Binding `None::<String>` instead
@@ -558,11 +560,21 @@ mod postgres_backend {
     }
 
     fn build_pool(url: &str, opts: &ExternalSqlOptions) -> Result<PgPool, SqlError> {
-        PgPoolOptions::new()
+        // sqlx logs every statement (on the `sqlx::query` target, INFO by default).
+        // This same connection runs per-tenant provisioning DDL — `CREATE ROLE …
+        // PASSWORD '…'` / `ALTER ROLE …` — so statement logging would leak the managed
+        // credential into the logs (the password is in the statement text, not a bound
+        // parameter). Silence it entirely — statements AND the slow-statement warning —
+        // on the connect options every pooled connection is opened with.
+        let connect_opts: PgConnectOptions = url
+            .parse::<PgConnectOptions>()
+            .map_err(map_err)?
+            .log_statements(log::LevelFilter::Off)
+            .log_slow_statements(log::LevelFilter::Off, std::time::Duration::default());
+        Ok(PgPoolOptions::new()
             .max_connections(opts.max_connections)
             .acquire_timeout(opts.connect_timeout)
-            .connect_lazy(url)
-            .map_err(map_err)
+            .connect_lazy_with(connect_opts))
     }
 
     /// Acquire a pooled connection and open a transaction (read-only when asked).
@@ -771,6 +783,33 @@ mod postgres_backend {
     {
         row.try_get::<T, _>(i).map_err(map_err)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The provisioning pool must build with statement logging disabled so
+        /// credential DDL (`CREATE ROLE … PASSWORD '…'`) never reaches the logs. A
+        /// lazy pool opens no connection, so this exercises the connect-options build
+        /// path (URL parse + `log_statements(Off)`) that carries that setting; the
+        /// pool constructing at all proves the logging config is accepted. Runs in a
+        /// Tokio context because a lazy pool spawns its idle reaper on build.
+        #[tokio::test]
+        async fn build_pool_disables_statement_logging() {
+            let opts = ExternalSqlOptions::new("postgres://app:s3cret@10.0.0.5:5432/analytics");
+            let pool = build_pool(&opts.url, &opts).expect("lazy pool builds");
+            // A lazy pool holds no live connections until first use.
+            assert_eq!(pool.size(), 0);
+        }
+
+        /// A malformed URL still fails cleanly (parsed via `PgConnectOptions`, not
+        /// silently ignored) — the credential-silencing path doesn't mask bad config.
+        #[test]
+        fn build_pool_rejects_a_malformed_url() {
+            let opts = ExternalSqlOptions::new("not a url");
+            assert!(build_pool(&opts.url, &opts).is_err());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,9 +822,11 @@ mod mysql_backend {
     use crate::sql_placeholders::PlaceholderDialect;
     use async_trait::async_trait;
     use boatramp_core::sql::{SqlBackend, SqlError, SqlRows, SqlTransaction, SqlValue};
-    use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
+    use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow};
     use sqlx::pool::PoolConnection;
-    use sqlx::{Column, Executor, MySql, Row, TypeInfo, ValueRef};
+    // `ConnectOptions` provides `log_statements` / `log_slow_statements` on the
+    // per-connection options (silences credential-DDL logging; see `build_pool`).
+    use sqlx::{Column, ConnectOptions, Executor, MySql, Row, TypeInfo, ValueRef};
 
     /// MySQL binds a JSON document as its text — a valid JSON string is accepted by
     /// a JSON column directly, no special type. A fn item (not a closure) so it is
@@ -818,11 +859,20 @@ mod mysql_backend {
     }
 
     fn build_pool(url: &str, opts: &ExternalSqlOptions) -> Result<MySqlPool, SqlError> {
-        MySqlPoolOptions::new()
+        // See the Postgres `build_pool`: this connection runs per-tenant provisioning
+        // DDL (`CREATE USER … IDENTIFIED BY '…'`), so sqlx's default INFO statement
+        // logging would leak the managed credential (the password is in the statement
+        // text, not a bound parameter). Silence it — statements AND the slow-statement
+        // warning — on the connect options every pooled connection is opened with.
+        let connect_opts: MySqlConnectOptions = url
+            .parse::<MySqlConnectOptions>()
+            .map_err(map_err)?
+            .log_statements(log::LevelFilter::Off)
+            .log_slow_statements(log::LevelFilter::Off, std::time::Duration::default());
+        Ok(MySqlPoolOptions::new()
             .max_connections(opts.max_connections)
             .acquire_timeout(opts.connect_timeout)
-            .connect_lazy(url)
-            .map_err(map_err)
+            .connect_lazy_with(connect_opts))
     }
 
     async fn begin_on(
@@ -1049,6 +1099,29 @@ mod mysql_backend {
         T: sqlx::Decode<'r, MySql> + sqlx::Type<MySql>,
     {
         row.try_get::<T, _>(i).map_err(map_err)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The provisioning pool must build with statement logging disabled so
+        /// credential DDL (`CREATE USER … IDENTIFIED BY '…'`) never reaches the logs.
+        /// The lazy pool constructing proves the connect-options path (URL parse +
+        /// `log_statements(Off)`) is accepted. Runs in a Tokio context because a lazy
+        /// pool spawns its idle reaper on build.
+        #[tokio::test]
+        async fn build_pool_disables_statement_logging() {
+            let opts = ExternalSqlOptions::new("mysql://app:s3cret@10.0.0.5:3306/shop");
+            let pool = build_pool(&opts.url, &opts).expect("lazy pool builds");
+            assert_eq!(pool.size(), 0);
+        }
+
+        #[test]
+        fn build_pool_rejects_a_malformed_url() {
+            let opts = ExternalSqlOptions::new("not a url");
+            assert!(build_pool(&opts.url, &opts).is_err());
+        }
     }
 }
 

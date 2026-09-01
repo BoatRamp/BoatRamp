@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use boatramp_core::sql::{SqlBackend, SqlError, SqlTransaction, SqlValue};
+use boatramp_core::sql::{
+    reject_reserved_session_writes, SqlBackend, SqlError, SqlTransaction, SqlValue,
+};
 use wasmtime::component::{Resource, ResourceTable};
 
 mod generated {
@@ -72,6 +74,17 @@ impl SqlSession {
     /// binding (which shares this session) can perform the same grant check.
     pub(super) fn granted(&self, name: &str) -> bool {
         self.backends.contains_key(name)
+    }
+
+    /// Whether the backend named `name` injects the reserved boatramp session context
+    /// (`rls_session`). When it does, a guest statement that would set/reset the
+    /// reserved `boatramp.*` / `@boatramp_*` keys must be refused (H1) — otherwise a
+    /// guest could spoof its injected tenant and defeat the app's RLS. `pub(super)` so
+    /// the sibling `orm` binding can guard the same way.
+    pub(super) fn injects_session_context(&self, name: &str) -> bool {
+        self.backends
+            .get(name)
+            .is_some_and(|b| b.injects_session_context())
     }
 
     /// The SQL dialect of the backend named `name` (SQLite-family if not granted — an
@@ -177,6 +190,11 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .get(&db)
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
+        // H1: if this database injects the reserved boatramp session context
+        // (rls_session), the guest must not overwrite those keys and spoof its tenant.
+        if self.session.injects_session_context(&name) {
+            reject_reserved_session_writes(&statement).map_err(to_wit_error)?;
+        }
         let params = to_values(params);
         let txn = self
             .session
@@ -207,6 +225,10 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .get(&db)
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
+        // H1: see `query` — refuse guest overwrites of the reserved session keys.
+        if self.session.injects_session_context(&name) {
+            reject_reserved_session_writes(&statement).map_err(to_wit_error)?;
+        }
         let params = to_values(params);
         let txn = self
             .session
@@ -515,5 +537,126 @@ mod tests {
         );
         // Two independent transactions, so two commits.
         assert_eq!(log.iter().filter(|l| l.ends_with(":commit")).count(), 2);
+    }
+
+    // ---- H1: a guest must not overwrite the reserved session keys -----------
+
+    /// A backend that reports it injects the reserved session context (rls_session on),
+    /// so the binding's guest-statement guard is active. Its transaction records the
+    /// SQL it is asked to run (to assert a rejected statement never reaches it).
+    struct RlsBackend {
+        injects: bool,
+        log: Log,
+    }
+    #[async_trait]
+    impl SqlBackend for RlsBackend {
+        fn injects_session_context(&self) -> bool {
+            self.injects
+        }
+        async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            Ok(Box::new(FakeTxn {
+                label: "rls",
+                log: self.log.clone(),
+            }))
+        }
+        async fn begin_read_only(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            Ok(Box::new(FakeTxn {
+                label: "rls",
+                log: self.log.clone(),
+            }))
+        }
+    }
+
+    fn rls_session(injects: bool, log: Log) -> SqlSession {
+        let mut map: HashMap<String, Arc<dyn SqlBackend>> = HashMap::new();
+        map.insert(String::new(), Arc::new(RlsBackend { injects, log }));
+        SqlSession::for_backends(map)
+    }
+
+    /// With rls_session on, a guest `query`/`execute` that sets a reserved
+    /// `boatramp.*` GUC or `@boatramp_*` var is refused, and the statement never
+    /// reaches the backend (nothing recorded).
+    #[tokio::test]
+    async fn rls_backend_rejects_guest_setting_reserved_keys() {
+        for hostile in [
+            "SELECT set_config('boatramp.project','victim',false)",
+            "SET boatramp.project = 'victim'",
+            "SET @boatramp_project = 'victim'",
+            "RESET ALL",
+            "DISCARD ALL",
+        ] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut session = rls_session(true, log.clone());
+            let mut table = ResourceTable::new();
+            let mut host = SqlHost::new(&mut table, &mut session);
+
+            let db = host.open(String::new()).unwrap();
+            let rep = db.rep();
+            // Via `query`.
+            assert!(
+                host.query(db, hostile.into(), vec![]).await.is_err(),
+                "query must reject: {hostile}"
+            );
+            // Via `execute`.
+            assert!(
+                host.execute(Resource::new_own(rep), hostile.into(), vec![])
+                    .await
+                    .is_err(),
+                "execute must reject: {hostile}"
+            );
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "a rejected statement must never reach the backend: {hostile}"
+            );
+        }
+    }
+
+    /// With rls_session on, ordinary app SQL (including an unrelated `SET`) is allowed
+    /// and reaches the backend.
+    #[tokio::test]
+    async fn rls_backend_allows_legit_sql() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = rls_session(true, log.clone());
+        let mut table = ResourceTable::new();
+        let mut host = SqlHost::new(&mut table, &mut session);
+
+        let db = host.open(String::new()).unwrap();
+        let rep = db.rep();
+        // A normal SELECT.
+        host.query(db, "SELECT n FROM t WHERE k = ?1".into(), vec![])
+            .await
+            .unwrap();
+        // An unrelated SET is NOT blocked by the reserved-prefix guard.
+        host.execute(
+            Resource::new_own(rep),
+            "SET statement_timeout = 5000".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let log = log.lock().unwrap();
+        assert!(log.iter().any(|l| l.contains("SELECT n FROM t")));
+        assert!(log.iter().any(|l| l.contains("SET statement_timeout")));
+    }
+
+    /// When the backend does NOT inject a session context (rls_session off), the guard
+    /// is inert — even a `SET boatramp.project` reaches the backend (no reserved keys to
+    /// protect, so nothing is filtered; the isolation boundary is the per-tenant DB).
+    #[tokio::test]
+    async fn non_rls_backend_does_not_filter() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = rls_session(false, log.clone());
+        let mut table = ResourceTable::new();
+        let mut host = SqlHost::new(&mut table, &mut session);
+
+        let db = host.open(String::new()).unwrap();
+        host.execute(db, "SET boatramp.project = 'x'".into(), vec![])
+            .await
+            .unwrap();
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("boatramp.project")));
     }
 }

@@ -118,6 +118,10 @@ include_dir = "0.7"
 # Async Docker Engine API client for the remote-docker compute backend.
 bollard = "0.17"
 thiserror = "2"
+# Named directly (not just as a transitive of sqlx) so the SQL backends can name
+# `log::LevelFilter` to silence sqlx's statement logging (credential DDL must never
+# be logged). Version-pinned to sqlx's own `log` to keep a single crate in the tree.
+log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = "0.8"

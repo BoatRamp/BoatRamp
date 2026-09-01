@@ -1251,6 +1251,24 @@ pub struct ExternalDatabaseConfig {
     /// can key on them per-request. The GraphQL data connector's row-level policy is
     /// claim-sourced and needs nothing here; this is for hand-rolled RLS on the plain
     /// `sql.open` path (Postgres — the engine with native row-level security).
+    ///
+    /// # Trust model — read before relying on this for isolation
+    ///
+    /// `rls_session` **provides** the request's tenant to the SQL session for an app's
+    /// RLS to key on. It is **not** a general hostile-guest boundary:
+    ///
+    /// - The reserved keys (`boatramp.*` / `@boatramp_*`) are **protected** from guest
+    ///   override — a handler statement that tries to `set_config('boatramp.…', …)` /
+    ///   `SET boatramp.… ` / `SET @boatramp_… ` (or `RESET`/`DISCARD` them) is refused,
+    ///   so a guest cannot spoof its injected tenant.
+    /// - But the **real tenant-isolation boundary** is the **per-tenant database +
+    ///   role** (`tenant = single` / `shared`), which a compromised handler cannot
+    ///   cross regardless of what it does in-session. `rls_session` is a convenience
+    ///   for app-authored RLS *within* a tenant's own database, layered on top of that
+    ///   boundary — not a substitute for it.
+    /// - For untrusted data, prefer **claim-sourced** enforcement (the GraphQL data
+    ///   connector's row-level policy), which derives the tenant from the verified
+    ///   request, not from anything the handler's SQL can influence.
     pub rls_session: bool,
 }
 

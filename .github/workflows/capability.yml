@@ -103,7 +103,7 @@ jobs:
   # image (a test-double, not a private artifact) plus a public pgvector image pulled
   # daemonless for the co-located managed-DB seam. No secrets.
   container:
-    name: container launch (root) + co-located Postgres + CRIU (informational)
+    name: container launch (root) + co-located Postgres + cross-tenant isolation + CRIU (informational)
     # Ubuntu 24.04 (noble) dropped the `criu` package; jammy still ships it. The native
     # container backend LAUNCH (userns + veth into br-boatramp + cgroup-v2 limits under a
     # delegated /sys/fs/cgroup/boatramp subtree + serve over HTTP) runs to GREEN here and
@@ -217,6 +217,31 @@ jobs:
             || { echo "::error::rootless mode never reached a serving Postgres (silent skip?)" >&2; exit 1; }
           grep -q 'co-located pgvector from an OCI image (host-root):' pg.log \
             || { echo "::error::host-root mode never reached a serving Postgres (silent skip?)" >&2; exit 1; }
+
+      - name: Cross-tenant isolation on a shared Postgres (hard gate — the #1 invariant)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # The load-bearing proof that per-tenant managed-DB isolation HOLDS live: launch
+          # ONE shared pgvector via the container backend (as the co-located gate above),
+          # provision two tenants (acme, globex) through the shipped `tenant_sql`
+          # provisioning path, then assert Postgres DENIES acme's role a connection to
+          # globex's database (REVOKE CONNECT FROM PUBLIC + per-role grant) while acme
+          # reaches its own. `psql` over TCP for the connections; --test-threads=1 so it
+          # doesn't contend with anything on the single test bridge. The `sql-postgres`
+          # feature pulls the tenant_sql/managed_sql data plane into the test.
+          timeout -k 30 600 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-node --features sql-postgres \
+            --test tenant_isolation_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee tenant-iso.log
+          # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok` — the exact
+          # trap the project's anti-silent-skip rule guards against. Gate on the success
+          # marker that prints ONLY after the positive AND the negative (cross-tenant DENY)
+          # assertions both held, so a skip or a partial pass fails the job.
+          grep -qE 'test result: ok' tenant-iso.log \
+            || { echo "::error::tenant isolation test did not pass" >&2; exit 1; }
+          grep -q 'TENANT ISOLATION OK: acme reaches acme, acme denied globex' tenant-iso.log \
+            || { echo "::error::tenant isolation never reached the success marker (silent skip or cross-tenant breach?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

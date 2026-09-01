@@ -383,11 +383,18 @@ async fn provision_shared(
         Some(Duration::from_secs(10)),
     );
 
-    // Run each statement; a Postgres "database already exists" on the bare
-    // CREATE DATABASE is the caller's documented OK-to-ignore (idempotency).
+    // Run each statement in order. The "database already exists" tolerance is
+    // scoped to ONLY the bare `CREATE DATABASE` statement (idempotency contract);
+    // any other statement failing — crucially the `REVOKE CONNECT ... FROM PUBLIC`
+    // and the per-role `GRANT`s that lock the database down — is FATAL, so we never
+    // report a tenant provisioned while its isolation DDL didn't apply. Because the
+    // caller (`resolve`) propagates this error and hands back no connection, a
+    // partially-created (created-but-not-yet-revoked) database is never served; the
+    // next resolve re-runs the idempotent DDL and completes the lockdown. (L2 + M2)
     for stmt in provision_ddl(kind, &names.database, &names.role, &tenant_pw) {
         if let Err(e) = admin.run_script(&stmt).await {
-            if is_database_exists_error(&e) {
+            let is_create_database = stmt.to_ascii_uppercase().contains("CREATE DATABASE");
+            if is_create_database && is_database_exists_error(&e) {
                 continue;
             }
             return Err(format!("provision {}: {e}", names.database));
@@ -605,7 +612,20 @@ impl PerTenantSqlResolver for NodeTenantSqlResolver {
         )
         .await
         .map_err(SqlError::other)?;
+        self.build_backend(project, site).await
+    }
+}
 
+impl NodeTenantSqlResolver {
+    /// Build the per-tenant backend: resolve the endpoint, seal + fetch the
+    /// per-tenant credential, and construct the connection. Split out from `resolve`
+    /// so it can be unit-tested without a live server — `resolve` runs the
+    /// (server-requiring) provisioning first, then calls this.
+    async fn build_backend(
+        &self,
+        project: &str,
+        site: &str,
+    ) -> Result<Arc<dyn SqlBackend>, SqlError> {
         let (tenant_ident_raw, is_default) = tenant_key(self.scope, project, site);
         let names = tenant_names(
             self.isolation,
@@ -931,8 +951,8 @@ mod tests {
         let (kv, resolver) = build_resolver(&binding);
 
         // No live DB: resolve builds the backend lazily but DOES seal the credential.
-        let _ = resolver.resolve("acme", "blog").await.unwrap();
-        let _ = resolver.resolve("globex", "shop").await.unwrap();
+        let _ = resolver.build_backend("acme", "blog").await.unwrap();
+        let _ = resolver.build_backend("globex", "shop").await.unwrap();
 
         let acme_ident = sanitize_ident("acme");
         let globex_ident = sanitize_ident("globex");
@@ -969,7 +989,7 @@ mod tests {
     async fn shared_default_tenant_uses_plain_superuser_credential() {
         let binding = shared_binding();
         let (kv, resolver) = build_resolver(&binding);
-        let _ = resolver.resolve("default", "blog").await.unwrap();
+        let _ = resolver.build_backend("default", "blog").await.unwrap();
         // Sealed under the plain `<default>/<compute>` key (matches server-init env),
         // NOT a per-tenant `pg/<ident>` key.
         assert!(kv
@@ -989,8 +1009,8 @@ mod tests {
             ..shared_binding()
         };
         let (kv, resolver) = build_resolver(&binding);
-        let _ = resolver.resolve("default", "blog").await.unwrap();
-        let _ = resolver.resolve("acme", "blog").await.unwrap();
+        let _ = resolver.build_backend("default", "blog").await.unwrap();
+        let _ = resolver.build_backend("acme", "blog").await.unwrap();
 
         // Default: bare `<default>/pg` (the server-init key of a single-tenant install).
         assert!(kv
