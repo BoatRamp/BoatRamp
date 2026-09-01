@@ -100,7 +100,7 @@ mod handler_dispatch;
 #[cfg(feature = "handlers")]
 pub(crate) use handler_dispatch::{
     build_bindings, dispatch_consumer_batch, dispatch_handler, precheck_component, read_blob_bytes,
-    read_blob_fully,
+    read_blob_fully, resolve_secret_env,
 };
 #[cfg(all(feature = "handlers", test))]
 use handler_dispatch::{resolve_env, set_forwarded_headers};
@@ -2140,6 +2140,45 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "MISSING"));
 
         std::env::remove_var("BOATRAMP_TEST_RESOLVE_SECRET");
+    }
+
+    #[test]
+    fn function_resolve_secret_env_reads_host_and_matches_handler_semantics() {
+        // A top-level function resolves its `secrets` map exactly like a site
+        // handler: `resolve_secret_env` reads the host env var named by the map's
+        // value and injects it under the map's key. This is the SAME helper the
+        // handler path uses, so the semantics are identical by construction.
+        std::env::set_var("BOATRAMP_TEST_FN_SECRET", "fnsecret");
+
+        let static_env = std::collections::BTreeMap::from([
+            ("STAGE".to_string(), "prod".to_string()),
+            ("OVERRIDE_ME".to_string(), "static".to_string()),
+        ]);
+        let secrets = std::collections::BTreeMap::from([
+            // guest ENV_VAR <- host env var holding the value
+            ("DB_URL".to_string(), "BOATRAMP_TEST_FN_SECRET".to_string()),
+            // a secret overrides a static of the same name
+            (
+                "OVERRIDE_ME".to_string(),
+                "BOATRAMP_TEST_FN_SECRET".to_string(),
+            ),
+            // an unset host referent is skipped, never injected empty
+            (
+                "MISSING".to_string(),
+                "BOATRAMP_TEST_FN_NOT_SET".to_string(),
+            ),
+        ]);
+        let env = resolve_secret_env("fn/api", &static_env, &secrets);
+
+        assert!(env.contains(&("STAGE".to_string(), "prod".to_string())));
+        // The secret is injected under its target ENV_VAR, read from the host env.
+        assert!(env.contains(&("DB_URL".to_string(), "fnsecret".to_string())));
+        // A secret overrides a static of the same name.
+        assert!(env.contains(&("OVERRIDE_ME".to_string(), "fnsecret".to_string())));
+        // Absent host var → skipped (matches the handler's missing-var behavior).
+        assert!(!env.iter().any(|(k, _)| k == "MISSING"));
+
+        std::env::remove_var("BOATRAMP_TEST_FN_SECRET");
     }
 
     fn req() -> Request {

@@ -261,6 +261,12 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // when one is present (same fail-closed gating as the managed-DB paths).
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let deprovision_envelope = secrets_envelope.clone();
+    // …and a third clone for the soft-delete tombstone reaper (the leader-gated task
+    // that hard-drops a Shared-Postgres tenant once its grace window elapses). It, too,
+    // needs a real envelope to unseal the superuser credential + delete the per-tenant
+    // one on hard-drop.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let reaper_envelope = secrets_envelope.clone();
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
         config
@@ -322,6 +328,18 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // credential on project/site delete). Wired only when a compute-backed managed
     // database + a secrets envelope are both present — same gating as operator_sql,
     // plus the envelope requirement (it must seal/unseal per-tenant credentials).
+    // The soft-delete grace window for a Shared-Postgres managed tenant
+    // (`handlers.bindings.sql.deprovision_grace_secs`, env-settable). Default 7 days;
+    // `0` disables the soft path (immediate hard drop). Threaded to the deprovisioner
+    // (which soft-deletes) and implicitly honored by the reaper (which only ever finds
+    // tombstones a >0 grace produced).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let deprovision_grace_secs = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .and_then(|sql| sql.deprovision_grace_secs)
+        .unwrap_or(crate::tenant_sql::DEFAULT_DEPROVISION_GRACE_SECS);
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let tenant_deprovisioner: Option<Arc<dyn boatramp_core::sql::TenantDeprovisioner>> = config
         .handlers
@@ -335,6 +353,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
                 kv.clone(),
                 envelope,
                 sql.databases.clone(),
+                deprovision_grace_secs,
             )) as Arc<_>
         });
     #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
@@ -359,6 +378,31 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         managed_db_resolver,
     );
 
+    // Tenant tombstone reaper: leader-gated hard-drop of soft-deleted Shared-Postgres
+    // tenants past their grace window (safe deprovision — see `tenant_sql`). Wired only
+    // when a compute-backed managed database + a secrets envelope are both present
+    // (same gating as the deprovisioner); each tombstone carries its own server +
+    // superuser, so the reaper needs no per-binding config. A `0` grace never writes a
+    // tombstone, so the sweep is simply inert then.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    let tombstone_reaper: Option<tokio::task::JoinHandle<()>> = config
+        .handlers
+        .as_ref()
+        .and_then(|h| h.bindings.sql.as_ref())
+        .filter(|sql| !sql.databases.is_empty())
+        .zip(reaper_envelope)
+        .map(|(_sql, envelope)| {
+            crate::tenant_sql::spawn_tenant_tombstone_reaper(
+                deploy.clone(),
+                kv.clone(),
+                envelope,
+                is_leader.clone(),
+                crate::tenant_sql::TOMBSTONE_REAPER_TICK,
+            )
+        });
+    #[cfg(not(any(feature = "sql-postgres", feature = "sql-mysql")))]
+    let tombstone_reaper: Option<tokio::task::JoinHandle<()>> = None;
+
     // Domain-verify auto-complete: periodically re-check every site's pending
     // ownership challenges and attach any that now pass — a published token (e.g.
     // via `domain add --provider`) converges without a manual `domain verify`.
@@ -375,12 +419,19 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
 
+    // The detached reconcile loops: the always-present compute + domain-verify ones,
+    // plus the optional tenant-tombstone reaper (only when a managed DB is configured).
+    let mut reconcile = vec![compute_reconcile, dv_reconcile];
+    if let Some(reaper) = tombstone_reaper {
+        reconcile.push(reaper);
+    }
+
     Ok(RunningNode {
         deploy,
         handlers,
         auth,
         options,
-        reconcile: vec![compute_reconcile, dv_reconcile],
+        reconcile,
     })
 }
 

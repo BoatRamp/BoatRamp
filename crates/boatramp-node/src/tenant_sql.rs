@@ -38,6 +38,40 @@
 //! `Single`, the plain `compute` workload) — with **no** `_<hash>` suffix, so the
 //! install is just one ordinary database exactly as before per-tenant existed.
 //! [`tenant_key`] marks that case (`is_default = true`).
+//!
+//! # Deprovision safety — the engine/cell split (safe soft delete)
+//!
+//! A project/site delete tears the tenant's managed database down. An immediate
+//! `DROP DATABASE` is **irreversible data loss** the instant the delete is issued,
+//! so [`deprovision_tenant`] splits by cell:
+//!
+//! | Cell                     | Behavior on delete                                    |
+//! |--------------------------|-------------------------------------------------------|
+//! | **Shared + Postgres**    | **Soft** delete — recoverable within the grace window |
+//! | **Shared + MySQL**       | Immediate hard drop — irreversible                    |
+//! | **Single** (any engine)  | Immediate hard drop — irreversible                    |
+//!
+//! - **Shared + Postgres** is the only cell whose engine can rename a database, so
+//!   the delete: (1) `pg_terminate_backend`s the tenant DB's live sessions, (2)
+//!   `ALTER DATABASE … RENAME TO "<db>__deleted_<unixts>"` — which **frees the
+//!   original name immediately** so a fresh same-named tenant is clean and can never
+//!   alias the renamed-aside data, (3) `ALTER ROLE … NOLOGIN` so the (retained)
+//!   sealed credential can't reach the renamed data, and (4) writes a
+//!   [`Tombstone`](crate::tenant_tombstone::Tombstone). A
+//!   [reaper](spawn_tenant_tombstone_reaper) hard-drops it once the grace window
+//!   elapses; before then [`recover_tenant`] can restore it. The sealed credential is
+//!   **kept** until the reaper hard-drops (recovery needs it).
+//! - **Shared + MySQL** can't rename a database, so retaining it aside would collide
+//!   or leak on a same-name re-create; it keeps the immediate `DROP DATABASE` +
+//!   `DROP USER`. **Single**'s isolation unit is a whole container/volume, dropped
+//!   immediately (workload + credential). Both are **irreversible** — no tombstone.
+//!
+//! # Grace period
+//!
+//! The grace window is `handlers.bindings.sql.deprovision_grace_secs` (env
+//! `BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS`), default **7 days**. `0` disables
+//! the soft path entirely — even Shared Postgres then hard-drops immediately (opt
+//! back into the pre-safe-deprovision behavior).
 
 #![cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 
@@ -58,16 +92,35 @@ use boatramp_storage::sql_compute::{
 };
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
-    provision_ddl, sanitize_ident, tenant_db_name, tenant_role_name,
+    provision_ddl, recover_soft_deprovision_ddl, sanitize_ident, soft_deprovision_ddl,
+    tenant_db_name, tenant_role_name,
 };
 use boatramp_storage::ExternalSqlKind;
 
 use crate::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
 use crate::managed_sql::{DeployEndpointResolver, ManagedSqlCredentials};
+use crate::tenant_tombstone::{self, Tombstone};
 
 /// 10 GiB — the default managed data-volume size when a `Single`-mode per-tenant
 /// binding sets none (matches [`auto_register_managed_db_workloads`]).
 const DEFAULT_VOLUME_MIB: u32 = 10 * 1024;
+
+/// The default soft-delete grace window: **7 days** (in seconds). A soft-deleted
+/// Shared-Postgres tenant is recoverable for this long before the reaper hard-drops
+/// it. A grace of `0` disables the soft path (immediate hard drop everywhere).
+pub const DEFAULT_DEPROVISION_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How often the tombstone reaper sweeps for due (grace-elapsed) soft-deletes.
+pub const TOMBSTONE_REAPER_TICK: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Current unix seconds (wall clock). Split out so the reaper's due-selection logic
+/// can be unit-tested with an injected "now".
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Map the config engine string to the enum, defensively (config validation already
 /// rejects an unparsable engine before serve).
@@ -433,13 +486,52 @@ pub async fn provision_binding_for_tenants(
 // Deprovision (for project/site delete hooks).
 // ---------------------------------------------------------------------------
 
+/// Build the superuser **maintenance** backend for a Shared server — the same
+/// endpoint-resolving path [`provision_shared`] uses to run tenant DDL. Connects as
+/// the superuser (`user` + its sealed superuser password under the reserved default
+/// project) to the engine's maintenance database.
+async fn shared_admin_backend(
+    deploy: &DeployStore,
+    creds: &ManagedSqlCredentials,
+    kind: ExternalSqlKind,
+    compute: &str,
+    superuser: &str,
+) -> Result<ComputeResolvedSqlBackend, String> {
+    let superuser_pw = creds
+        .password(DEFAULT_PROJECT, compute)
+        .await
+        .map_err(|e| format!("superuser credential ({compute}): {e}"))?;
+    let resolver = Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
+    Ok(ComputeResolvedSqlBackend::new(
+        resolver,
+        compute,
+        kind,
+        maintenance_database(kind),
+        superuser,
+        superuser_pw,
+        Some(1),
+        false,
+        Some(Duration::from_secs(10)),
+    ))
+}
+
 /// Tear down one compute-backed managed binding for the tenant `(project, site)`.
 ///
-/// - **Shared** — connect as the superuser and run
+/// **The delete behavior splits by cell** (see the module-level matrix) — because an
+/// immediate `DROP DATABASE` is irreversible data loss:
+///
+/// - **Shared + Postgres** (renameable engine), `grace_secs > 0` — **soft delete**:
+///   terminate the tenant DB's connections, `ALTER DATABASE … RENAME` it aside to
+///   `<db>__deleted_<unixts>` (freeing the original name at once), `ALTER ROLE …
+///   NOLOGIN`, and write a [`Tombstone`] with `delete_after = now + grace_secs`. The
+///   sealed credential is **kept** (recovery needs it). Recoverable via
+///   [`recover_tenant`] until the [reaper](spawn_tenant_tombstone_reaper) hard-drops.
+/// - **Shared + MySQL** and **all Single** (or Shared-Postgres with `grace_secs =
+///   0`) — **immediate hard delete** (irreversible): Shared runs
 ///   [`deprovision_ddl`](boatramp_storage::tenant_provision::deprovision_ddl)
-///   (`DROP DATABASE/ROLE IF EXISTS`), then delete the tenant's sealed credential.
-/// - **Single** — delete the tenant's dedicated compute workload (the reconcile
-///   tears down its container) and its sealed credential.
+///   (`DROP DATABASE/ROLE IF EXISTS`) then deletes the sealed credential; Single
+///   deletes the dedicated compute workload (the reconcile tears down its container)
+///   and its credential.
 ///
 /// The reserved default tenant is left untouched (its "database" is the ordinary
 /// single-tenant install; deprovisioning it would delete the whole install).
@@ -450,72 +542,204 @@ pub async fn deprovision_tenant(
     binding: &ExternalDatabaseConfig,
     project: &str,
     site: &str,
+    grace_secs: u64,
 ) -> Result<(), String> {
-    let Some(compute) = binding.compute.as_deref().filter(|c| !c.is_empty()) else {
-        return Ok(());
+    let Some(plan) = plan_deprovision(binding, project, site, grace_secs, now_unix_secs()) else {
+        return Ok(()); // not ours / bring-your-own / the reserved default tenant.
     };
-    let Some(kind) = ExternalSqlKind::parse(&binding.kind) else {
-        return Ok(());
-    };
-    let (tenant_ident_raw, is_default) = tenant_key(binding.tenant_scope, project, site);
-    if is_default {
-        return Ok(()); // never tear down the single-tenant install.
-    }
-    let database = binding.database.as_deref().unwrap_or_default();
-    let user = binding.user.as_deref().unwrap_or_default();
-    let ident = sanitize_ident(&tenant_ident_raw);
-    let names = tenant_names(binding.tenant, compute, database, &tenant_ident_raw, false);
     let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
 
-    match binding.tenant {
-        TenantIsolation::Single => {
+    match plan {
+        DeprovisionPlan::SingleDrop { workload } => {
+            // Single's isolation unit is a whole container/volume — dropped
+            // immediately (there is no rename-aside for a container). Irreversible.
             deploy
-                .delete_compute_workload(ProjectRef::new(project), &names.workload)
+                .delete_compute_workload(ProjectRef::new(project), &workload)
                 .await
-                .map_err(|e| format!("delete workload {}: {e}", names.workload))?;
+                .map_err(|e| format!("delete workload {workload}: {e}"))?;
             // The Single credential is keyed by the workload's own `(project, workload)`
             // (matching provision + the server-init env injector) — the bare derived
             // workload name under the tenant's project, no `credential_workload_key`.
             creds
-                .delete(project, &names.workload)
+                .delete(project, &workload)
                 .await
-                .map_err(|e| format!("delete credential {}: {e}", names.workload))?;
+                .map_err(|e| format!("delete credential {workload}: {e}"))?;
         }
-        TenantIsolation::Shared => {
-            let superuser_pw = creds
-                .password(DEFAULT_PROJECT, compute)
-                .await
-                .map_err(|e| format!("superuser credential ({compute}): {e}"))?;
-            let resolver = Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
-            let admin = ComputeResolvedSqlBackend::new(
-                resolver,
-                compute,
-                kind,
-                maintenance_database(kind),
-                user,
-                superuser_pw,
-                Some(1),
-                false,
-                Some(Duration::from_secs(10)),
-            );
-            for stmt in boatramp_storage::tenant_provision::deprovision_ddl(
-                kind,
-                &names.database,
-                &names.role,
-            ) {
+        DeprovisionPlan::SharedImmediate {
+            kind,
+            compute,
+            superuser,
+            ddl,
+            cred_workload,
+            database,
+        } => {
+            // Shared + MySQL (no database rename) OR Shared-Postgres with grace = 0
+            // (opted out): immediate hard drop. Irreversible.
+            let admin = shared_admin_backend(deploy, &creds, kind, &compute, &superuser).await?;
+            for stmt in ddl {
                 admin
                     .run_script(&stmt)
                     .await
-                    .map_err(|e| format!("deprovision {}: {e}", names.database))?;
+                    .map_err(|e| format!("deprovision {database}: {e}"))?;
             }
-            let cred_workload = credential_workload_key(compute, &ident);
             creds
                 .delete(project, &cred_workload)
                 .await
-                .map_err(|e| format!("delete credential {}: {e}", names.role))?;
+                .map_err(|e| format!("delete credential {cred_workload}: {e}"))?;
+        }
+        DeprovisionPlan::SharedSoftPostgres { ddl, tombstone } => {
+            // The ONE recoverable cell. terminate → RENAME (frees the original name) →
+            // NOLOGIN via the superuser maintenance connection. Any statement failing
+            // is fatal (returned Err); the caller logs it best-effort and the delete is
+            // not blocked. No tombstone is written unless the DDL fully applied, so a
+            // half-renamed database never leaves an orphan tombstone. The sealed
+            // credential is deliberately KEPT (recovery needs it).
+            let admin = shared_admin_backend(
+                deploy,
+                &creds,
+                ExternalSqlKind::Postgres,
+                &tombstone.compute,
+                &tombstone.superuser,
+            )
+            .await?;
+            for stmt in ddl {
+                admin
+                    .run_script(&stmt)
+                    .await
+                    .map_err(|e| format!("soft-deprovision {}: {e}", tombstone.original_db))?;
+            }
+            tenant_tombstone::put(kv, &tombstone).await?;
         }
     }
     Ok(())
+}
+
+/// The **pure** decision of how a delete tears a tenant down — the engine/cell split
+/// (see the module matrix), with no IO so it is fully unit-testable. Returns `None`
+/// for a binding this module doesn't own (bring-your-own `url_env`, unparsable
+/// engine) or the reserved default tenant (its database IS the single-tenant install).
+///
+/// `now` is injected (unix seconds) so the renamed-aside name + tombstone timestamps
+/// are deterministic in tests.
+fn plan_deprovision(
+    binding: &ExternalDatabaseConfig,
+    project: &str,
+    site: &str,
+    grace_secs: u64,
+    now: u64,
+) -> Option<DeprovisionPlan> {
+    let compute = binding.compute.as_deref().filter(|c| !c.is_empty())?;
+    let kind = ExternalSqlKind::parse(&binding.kind)?;
+    let (tenant_ident_raw, is_default) = tenant_key(binding.tenant_scope, project, site);
+    if is_default {
+        return None; // never tear down the single-tenant install.
+    }
+    let database = binding.database.as_deref().unwrap_or_default();
+    let superuser = binding.user.as_deref().unwrap_or_default();
+    let ident = sanitize_ident(&tenant_ident_raw);
+    let names = tenant_names(binding.tenant, compute, database, &tenant_ident_raw, false);
+
+    Some(match binding.tenant {
+        TenantIsolation::Single => DeprovisionPlan::SingleDrop {
+            workload: names.workload,
+        },
+        // Shared + Postgres, with a non-zero grace: the ONE recoverable cell.
+        TenantIsolation::Shared if kind == ExternalSqlKind::Postgres && grace_secs > 0 => {
+            // The aside name carries the delete timestamp, so it's unique per
+            // soft-delete and never collides with a same-named re-create's fresh
+            // database (the freed original name can't alias the renamed-aside data).
+            let renamed_db = format!("{}__deleted_{now}", names.database);
+            let ddl = soft_deprovision_ddl(&names.database, &renamed_db, &names.role);
+            let tombstone = Tombstone {
+                version: 1,
+                project: project.to_string(),
+                renamed_db,
+                original_db: names.database.clone(),
+                role: names.role.clone(),
+                engine: "postgres".to_string(),
+                compute: compute.to_string(),
+                superuser: superuser.to_string(),
+                cred_workload: credential_workload_key(compute, &ident),
+                deleted_at: now,
+                delete_after: now.saturating_add(grace_secs),
+            };
+            DeprovisionPlan::SharedSoftPostgres { ddl, tombstone }
+        }
+        // Shared + MySQL (no database rename) OR Shared-Postgres with grace = 0.
+        TenantIsolation::Shared => DeprovisionPlan::SharedImmediate {
+            kind,
+            compute: compute.to_string(),
+            superuser: superuser.to_string(),
+            ddl: boatramp_storage::tenant_provision::deprovision_ddl(
+                kind,
+                &names.database,
+                &names.role,
+            ),
+            cred_workload: credential_workload_key(compute, &ident),
+            database: names.database,
+        },
+    })
+}
+
+/// The pure plan a delete follows, one variant per cell of the deprovision matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeprovisionPlan {
+    /// Single (any engine): drop the dedicated workload + its credential. Immediate.
+    SingleDrop { workload: String },
+    /// Shared + MySQL, or Shared-Postgres with grace 0: hard-drop DDL + credential
+    /// delete. Immediate + irreversible.
+    SharedImmediate {
+        kind: ExternalSqlKind,
+        compute: String,
+        superuser: String,
+        ddl: Vec<String>,
+        cred_workload: String,
+        database: String,
+    },
+    /// Shared + Postgres with grace > 0: soft-delete DDL (RENAME + NOLOGIN) + a
+    /// tombstone. Recoverable within the grace window; keeps the credential.
+    SharedSoftPostgres {
+        ddl: Vec<String>,
+        tombstone: Tombstone,
+    },
+}
+
+/// Reverse a soft delete (see [`deprovision_tenant`]) for the tombstone identified by
+/// `(project, renamed_db)`, within its grace window: rename the aside database back to
+/// its original name, `ALTER ROLE … LOGIN`, and delete the tombstone. The sealed
+/// credential was never removed, so the recovered tenant connects exactly as before.
+/// The superuser + server are taken from the tombstone, so recovery needs no binding
+/// config.
+///
+/// Returns `Ok(false)` (a no-op) if no such tombstone exists — recovering an
+/// already-reaped or never-soft-deleted tenant is harmless.
+pub async fn recover_tenant(
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    project: &str,
+    renamed_db: &str,
+) -> Result<bool, String> {
+    let Some(ts) = tenant_tombstone::get(kv, project, renamed_db).await? else {
+        return Ok(false);
+    };
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let admin = shared_admin_backend(
+        deploy,
+        &creds,
+        ExternalSqlKind::Postgres,
+        &ts.compute,
+        &ts.superuser,
+    )
+    .await?;
+    for stmt in recover_soft_deprovision_ddl(&ts.renamed_db, &ts.original_db, &ts.role) {
+        admin
+            .run_script(&stmt)
+            .await
+            .map_err(|e| format!("recover {}: {e}", ts.original_db))?;
+    }
+    tenant_tombstone::delete(kv, &ts).await?;
+    Ok(true)
 }
 
 /// The node's [`TenantDeprovisioner`] — the delete-time orchestrator over
@@ -537,22 +761,31 @@ pub struct NodeTenantDeprovisioner {
     kv: Arc<dyn KvStore>,
     envelope: Arc<dyn KeyEnvelope>,
     databases: std::collections::BTreeMap<String, ExternalDatabaseConfig>,
+    /// The soft-delete grace window in seconds (Shared-Postgres only); `0` = the
+    /// soft path is disabled (immediate hard drop everywhere). See
+    /// [`deprovision_tenant`].
+    grace_secs: u64,
 }
 
 impl NodeTenantDeprovisioner {
     /// Build the deprovisioner from the wired managed-DB state. The same
-    /// (deploy, KV, envelope, databases) the provisioning + resolver seams use.
+    /// (deploy, KV, envelope, databases) the provisioning + resolver seams use, plus
+    /// the configured soft-delete `grace_secs`
+    /// (`handlers.bindings.sql.deprovision_grace_secs`, default
+    /// [`DEFAULT_DEPROVISION_GRACE_SECS`]).
     pub fn new(
         deploy: DeployStore,
         kv: Arc<dyn KvStore>,
         envelope: Arc<dyn KeyEnvelope>,
         databases: std::collections::BTreeMap<String, ExternalDatabaseConfig>,
+        grace_secs: u64,
     ) -> Self {
         Self {
             deploy,
             kv,
             envelope,
             databases,
+            grace_secs,
         }
     }
 
@@ -579,6 +812,7 @@ impl NodeTenantDeprovisioner {
                 binding,
                 project,
                 site,
+                self.grace_secs,
             )
             .await
             {
@@ -622,6 +856,136 @@ impl boatramp_core::sql::TenantDeprovisioner for NodeTenantDeprovisioner {
         self.deprovision_scope(TenantScope::Site, project, site)
             .await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone reaper: leader-gated hard-drop of grace-elapsed soft-deletes.
+// ---------------------------------------------------------------------------
+
+/// Hard-drop one due (grace-elapsed) soft-deleted tenant: as the superuser, `DROP
+/// DATABASE "<renamed_db>"` + `DROP ROLE "<role>"`, then delete the sealed credential
+/// and the tombstone. This is the point of no return the grace window protected.
+///
+/// The DROPs go through the pure `deprovision_ddl` builder (same quoting as
+/// everywhere else), targeting the **renamed** database. Only after both the DDL and
+/// the credential delete succeed is the tombstone removed — so a partial failure
+/// leaves the tombstone for the next sweep to retry (idempotent: `IF EXISTS` guards +
+/// idempotent credential/tombstone deletes make a re-run harmless).
+async fn hard_drop_tombstone(
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    ts: &Tombstone,
+) -> Result<(), String> {
+    let creds = ManagedSqlCredentials::new(kv.clone(), envelope.clone());
+    let admin = shared_admin_backend(
+        deploy,
+        &creds,
+        ExternalSqlKind::Postgres,
+        &ts.compute,
+        &ts.superuser,
+    )
+    .await?;
+    // DROP the RENAMED database + the role (IF EXISTS-guarded, so re-runnable).
+    for stmt in boatramp_storage::tenant_provision::deprovision_ddl(
+        ExternalSqlKind::Postgres,
+        &ts.renamed_db,
+        &ts.role,
+    ) {
+        admin
+            .run_script(&stmt)
+            .await
+            .map_err(|e| format!("reap {}: {e}", ts.renamed_db))?;
+    }
+    // Now the credential can go (recovery is no longer possible), then the tombstone.
+    creds
+        .delete(&ts.project, &ts.cred_workload)
+        .await
+        .map_err(|e| format!("reap credential {}: {e}", ts.cred_workload))?;
+    tenant_tombstone::delete(kv, ts).await
+}
+
+/// The tombstones **due** at wall-clock `now` — those whose grace window has elapsed
+/// (`delete_after <= now`). Pure, so due-selection is unit-testable with an injected
+/// `now` and no live clock or database.
+fn due_tombstones(all: Vec<Tombstone>, now: u64) -> Vec<Tombstone> {
+    all.into_iter().filter(|t| t.is_due(now)).collect()
+}
+
+/// Select the tombstones due at wall-clock `now` and hard-drop each, best-effort
+/// (log-and-continue). Returns the number reaped. Split from the spawn loop with an
+/// explicit `now` so due-selection is unit-testable without a live clock.
+async fn reap_due(
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    now: u64,
+) -> usize {
+    let tombstones = match tenant_tombstone::list(kv).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "tenant tombstone reaper: could not list tombstones");
+            return 0;
+        }
+    };
+    let mut reaped = 0;
+    for ts in due_tombstones(tombstones, now) {
+        match hard_drop_tombstone(deploy, kv, envelope, &ts).await {
+            Ok(()) => {
+                reaped += 1;
+                tracing::info!(
+                    project = %ts.project,
+                    renamed_db = %ts.renamed_db,
+                    "tenant tombstone reaper: hard-dropped a soft-deleted tenant past its grace window"
+                );
+            }
+            Err(e) => tracing::warn!(
+                project = %ts.project,
+                renamed_db = %ts.renamed_db,
+                error = %e,
+                "tenant tombstone reaper: hard-drop failed (best-effort; retried next sweep)"
+            ),
+        }
+    }
+    reaped
+}
+
+/// Spawn the leader-gated **tombstone reaper**: every [`TOMBSTONE_REAPER_TICK`], on
+/// the leader, hard-drop any soft-deleted Shared-Postgres tenant whose grace window
+/// has elapsed (see [`deprovision_tenant`]). Mirrors
+/// [`boatramp_server::spawn_compute_reconcile`] / the domain-verify reconcile — the
+/// leader gate makes it a single-writer in a cluster. A no-op while not leader or
+/// with no due tombstones. Detached for the process lifetime; the returned handle is
+/// collected into [`RunningNode::reconcile`](crate::RunningNode).
+///
+/// Each tombstone records its own server + superuser, so the reaper needs no binding
+/// config. A tenant is only ever soft-deleted (⇒ a tombstone written) when its
+/// configured `grace_secs > 0`; if grace is `0` everywhere, no tombstones exist and
+/// the sweep is inert — but the loop still runs so a config that later raises the
+/// grace still gets swept.
+pub fn spawn_tenant_tombstone_reaper(
+    deploy: DeployStore,
+    kv: Arc<dyn KvStore>,
+    envelope: Arc<dyn KeyEnvelope>,
+    is_leader: boatramp_server::CronLeaderGate,
+    tick: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tick);
+        // `interval` fires immediately; skip that first tick so the sweep waits a
+        // full period before its first run (matches the domain-verify reconcile).
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if !is_leader() {
+                continue;
+            }
+            let n = reap_due(&deploy, &kv, &envelope, now_unix_secs()).await;
+            if n > 0 {
+                tracing::info!(reaped = n, "tenant tombstone reaper sweep");
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,6 +1516,9 @@ mod tests {
             kv.clone(),
             envelope.clone(),
             std::iter::once(("pg".to_string(), binding.clone())).collect(),
+            // Grace is irrelevant for a Single tenant (always an immediate hard drop);
+            // pass the default so the constructor signature is exercised.
+            DEFAULT_DEPROVISION_GRACE_SECS,
         );
 
         // Deleting the `default` project is a no-op (the default-project guard) — the
@@ -1209,5 +1576,211 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    // ---- safe (soft) deprovision: the engine/cell split ------------------
+
+    fn mysql_shared_binding() -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            kind: "mysql".into(),
+            ..shared_binding()
+        }
+    }
+
+    fn single_binding() -> ExternalDatabaseConfig {
+        ExternalDatabaseConfig {
+            tenant: TenantIsolation::Single,
+            ..shared_binding()
+        }
+    }
+
+    /// **Shared + Postgres** with a positive grace is the ONE recoverable cell: the
+    /// plan is a *soft* delete — it emits the RENAME-aside + NOLOGIN DDL (never DROP)
+    /// and carries a tombstone whose `delete_after = now + grace`. This is the emitted
+    /// SQL the deprovision path would run.
+    #[test]
+    fn plan_shared_postgres_soft_deletes_renames_not_drops() {
+        let binding = shared_binding();
+        let now = 1_700_000_000;
+        let grace = DEFAULT_DEPROVISION_GRACE_SECS;
+        let plan = plan_deprovision(&binding, "acme", "", grace, now).expect("a plan");
+        let DeprovisionPlan::SharedSoftPostgres { ddl, tombstone } = plan else {
+            panic!("Shared+Postgres+grace>0 must be a soft delete, got {plan:?}");
+        };
+        let joined = ddl.join("\n");
+        // Soft: rename aside + disable login; NEVER a DROP.
+        assert!(joined.contains("ALTER DATABASE"), "must RENAME:\n{joined}");
+        assert!(joined.contains("RENAME TO"), "must RENAME aside:\n{joined}");
+        assert!(
+            joined.contains("NOLOGIN"),
+            "must disable the role:\n{joined}"
+        );
+        assert!(
+            joined.contains("pg_terminate_backend"),
+            "must evict sessions"
+        );
+        assert!(
+            !joined.to_ascii_uppercase().contains("DROP DATABASE"),
+            "soft delete must NOT drop the database:\n{joined}"
+        );
+        assert!(!joined.to_ascii_uppercase().contains("DROP ROLE"));
+        // Tombstone: recoverable window + the identity a reaper/recovery needs.
+        assert_eq!(tombstone.delete_after, now + grace);
+        assert_eq!(tombstone.deleted_at, now);
+        assert_eq!(tombstone.project, "acme");
+        assert_eq!(tombstone.engine, "postgres");
+        assert_eq!(tombstone.compute, "pg");
+        assert_eq!(tombstone.superuser, "super");
+        // The renamed name carries the timestamp; the original is recorded for recovery.
+        assert!(tombstone.renamed_db.ends_with(&format!("__deleted_{now}")));
+        assert!(tombstone.renamed_db.starts_with(&tombstone.original_db));
+        // The RENAME target in the DDL is exactly the tombstone's renamed name.
+        assert!(joined.contains(&tombstone.renamed_db));
+    }
+
+    /// The freed original name can't alias the renamed-aside data: the DDL renames the
+    /// original away (so a same-named re-create is a fresh, distinct database) and the
+    /// renamed name is timestamp-unique, distinct from the original.
+    #[test]
+    fn soft_delete_frees_original_name_without_aliasing() {
+        let binding = shared_binding();
+        let now = 1_700_000_000;
+        let plan = plan_deprovision(&binding, "acme", "", 60, now).expect("a plan");
+        let DeprovisionPlan::SharedSoftPostgres { ddl, tombstone } = plan else {
+            panic!("expected a soft delete");
+        };
+        // Original ≠ renamed (the data moved aside), and the original name is now free.
+        assert_ne!(tombstone.original_db, tombstone.renamed_db);
+        let joined = ddl.join("\n");
+        // The RENAME's *source* is the original name (it is vacated), its *target* is
+        // the timestamped aside name — so nothing keeps living under the original name.
+        assert!(joined.contains(&format!("RENAME TO \"{}\"", tombstone.renamed_db)));
+    }
+
+    /// **Shared + MySQL** keeps the IMMEDIATE hard delete — MySQL can't rename a
+    /// database, so a soft-aside would collide/leak on a same-name re-create. The plan
+    /// emits `DROP DATABASE`/`DROP USER`, no tombstone.
+    #[test]
+    fn plan_shared_mysql_hard_drops_immediately() {
+        let binding = mysql_shared_binding();
+        let plan = plan_deprovision(&binding, "acme", "", DEFAULT_DEPROVISION_GRACE_SECS, 0)
+            .expect("a plan");
+        let DeprovisionPlan::SharedImmediate { ddl, kind, .. } = plan else {
+            panic!("Shared+MySQL must be an immediate drop, got {plan:?}");
+        };
+        assert_eq!(kind, ExternalSqlKind::Mysql);
+        let joined = ddl.join("\n");
+        assert!(
+            joined.contains("DROP DATABASE IF EXISTS"),
+            "MySQL must hard-drop:\n{joined}"
+        );
+        assert!(joined.contains("DROP USER IF EXISTS"));
+        assert!(!joined.contains("RENAME TO"), "MySQL must NOT soft-rename");
+    }
+
+    /// **Single** (any engine) keeps the IMMEDIATE drop — its unit is a whole
+    /// container/volume. The plan is `SingleDrop` (workload + credential), regardless
+    /// of grace.
+    #[test]
+    fn plan_single_drops_the_workload_immediately() {
+        let binding = single_binding();
+        let plan = plan_deprovision(&binding, "acme", "", DEFAULT_DEPROVISION_GRACE_SECS, 0)
+            .expect("a plan");
+        let ident = sanitize_ident("acme");
+        assert_eq!(
+            plan,
+            DeprovisionPlan::SingleDrop {
+                workload: format!("pg-{ident}")
+            }
+        );
+    }
+
+    /// A grace of `0` disables the soft path even for Shared + Postgres — the operator
+    /// opted back into the immediate, irreversible hard drop.
+    #[test]
+    fn plan_grace_zero_takes_the_immediate_path_for_shared_postgres() {
+        let binding = shared_binding();
+        let plan = plan_deprovision(&binding, "acme", "", 0, 1_700_000_000).expect("a plan");
+        let DeprovisionPlan::SharedImmediate { ddl, kind, .. } = plan else {
+            panic!("grace=0 must be an immediate drop, got {plan:?}");
+        };
+        assert_eq!(kind, ExternalSqlKind::Postgres);
+        let joined = ddl.join("\n");
+        assert!(
+            joined.contains("DROP DATABASE IF EXISTS"),
+            "grace=0 must hard-drop:\n{joined}"
+        );
+        assert!(
+            !joined.contains("RENAME TO"),
+            "grace=0 must NOT soft-rename"
+        );
+    }
+
+    /// The reserved default tenant and a bring-your-own binding yield no plan (the
+    /// single-tenant install is never torn down; a `url_env` binding isn't ours).
+    #[test]
+    fn plan_skips_default_tenant_and_bring_your_own() {
+        // Default project ⇒ no plan.
+        assert!(plan_deprovision(&shared_binding(), "default", "", 60, 0).is_none());
+        // Bring-your-own (no compute) ⇒ no plan.
+        let byo = ExternalDatabaseConfig {
+            kind: "postgres".into(),
+            compute: None,
+            url_env: "PG_URL".into(),
+            ..Default::default()
+        };
+        assert!(plan_deprovision(&byo, "acme", "", 60, 0).is_none());
+    }
+
+    /// The reaper selects only tombstones whose grace window has elapsed
+    /// (`delete_after <= now`), with an injected fixed `now`.
+    #[test]
+    fn reaper_selects_only_due_tombstones() {
+        let mk = |renamed: &str, delete_after: u64| Tombstone {
+            version: 1,
+            project: "acme".into(),
+            renamed_db: renamed.into(),
+            original_db: "appdb_acme".into(),
+            role: "appdb_acme_role".into(),
+            engine: "postgres".into(),
+            compute: "pg".into(),
+            superuser: "super".into(),
+            cred_workload: "pg/x".into(),
+            deleted_at: 0,
+            delete_after,
+        };
+        let now = 1_000;
+        let past = mk("db__deleted_1", now - 1); // due (before now)
+        let exact = mk("db__deleted_2", now); // due (== now)
+        let future = mk("db__deleted_3", now + 1); // NOT due (after now)
+
+        let due = due_tombstones(vec![past.clone(), exact.clone(), future.clone()], now);
+        assert!(due.contains(&past), "an elapsed tombstone is due");
+        assert!(due.contains(&exact), "delete_after == now is due");
+        assert!(
+            !due.contains(&future),
+            "a tombstone still inside its grace window must NOT be reaped"
+        );
+        assert_eq!(due.len(), 2);
+    }
+
+    /// End-to-end recover selection: a soft-delete writes a tombstone; `recover_tenant`
+    /// on an ABSENT tombstone is a harmless no-op (`Ok(false)`), and the reverse DDL a
+    /// present tombstone would run is the RENAME-back + LOGIN (asserted at the pure DDL
+    /// builder). This exercises the recover fn's lookup + no-op path without a live DB.
+    #[tokio::test]
+    async fn recover_absent_tombstone_is_a_noop() {
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+        let recovered = recover_tenant(&deploy, &kv, &envelope, "acme", "nope__deleted_1")
+            .await
+            .unwrap();
+        assert!(!recovered, "recovering an absent tombstone is a no-op");
+
+        // The reverse DDL a present tombstone would emit: RENAME back + LOGIN, in order.
+        let ddl = recover_soft_deprovision_ddl("appdb__deleted_1", "appdb", "appdb_role");
+        assert!(ddl[0].contains("RENAME TO \"appdb\""), "renames back");
+        assert!(ddl[1].contains("LOGIN") && !ddl[1].contains("NOLOGIN"));
     }
 }

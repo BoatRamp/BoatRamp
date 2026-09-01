@@ -40,6 +40,10 @@ boatramp-storage = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 ron.workspace = true
 serde = { workspace = true, features = ["derive"] }
+# Serializing the managed-DB soft-delete tombstone records into the control-plane KV
+# (JSON, matching DeployStore's KV value encoding). Only used under the sql features,
+# but a tiny dep so it stays unconditional (as with getrandom below).
+serde_json.workspace = true
 thiserror.workspace = true
 # Naming the detached reconcile `JoinHandle`s that `assemble` returns.
 tokio.workspace = true

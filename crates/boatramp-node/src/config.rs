@@ -380,6 +380,9 @@ impl ServerConfig {
             if let Some(v) = source.get("BOATRAMP_HANDLERS_SQL_PREVIEW_INIT") {
                 sql.preview_init = Some(PathBuf::from(v));
             }
+            if let Some(v) = source.parse("BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS")? {
+                sql.deprovision_grace_secs = Some(v);
+            }
         }
 
         // --- handler sql external databases (`handlers.bindings.sql.databases`) ---
@@ -621,6 +624,7 @@ const SQL_ENV_VARS: &[&str] = &[
     "BOATRAMP_HANDLERS_SQL_ADMIN_TOKEN_ENV",
     "BOATRAMP_HANDLERS_SQL_PREVIEW_MODE",
     "BOATRAMP_HANDLERS_SQL_PREVIEW_INIT",
+    "BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS",
 ];
 
 /// The fixed prefix of a keyed `handlers.bindings.sql.databases` variable —
@@ -1176,6 +1180,17 @@ pub struct SqlBindingConfig {
     /// `sql-mysql` build feature for the engine. A name here shadows the same
     /// name on the managed libsql default.
     pub databases: BTreeMap<String, ExternalDatabaseConfig>,
+    /// **Soft-delete grace window** for a per-tenant managed database, in seconds
+    /// (env `BOATRAMP_HANDLERS_SQL_DEPROVISION_GRACE_SECS`). When a project/site is
+    /// deleted, a **Shared + Postgres** tenant is *soft*-deleted (its database is
+    /// renamed aside and its role disabled) and stays recoverable for this long
+    /// before a reaper hard-drops it — see
+    /// [`tenant_sql`](crate::tenant_sql). `None` ⇒ the 7-day default
+    /// (`DEFAULT_DEPROVISION_GRACE_SECS`); `0` ⇒ disable the soft path (immediate,
+    /// irreversible hard drop everywhere). MySQL and all `Single` tenants always
+    /// hard-drop immediately (the engine/cell can't be renamed aside safely), so this
+    /// knob only affects the Shared-Postgres cell.
+    pub deprovision_grace_secs: Option<u64>,
 }
 
 /// One external SQL database for the handler `sql` binding. Its **source** is one

@@ -175,7 +175,12 @@ pub fn tenant_role_name(base: &str, tenant_ident: &str) -> String {
 ///
 /// The names reaching this are pre-sanitized, but we quote defensively so no
 /// identifier — however it was derived — can break out of its quoting.
-fn quote_ident(kind: ExternalSqlKind, id: &str) -> String {
+///
+/// Public so the node-side soft-deprovision path (which composes its own
+/// `pg_terminate_backend` / `ALTER DATABASE … RENAME` statements) quotes
+/// identifiers through the exact same routine as the pure DDL builders here,
+/// rather than hand-rolling a second quoting rule.
+pub fn quote_ident(kind: ExternalSqlKind, id: &str) -> String {
     match kind {
         ExternalSqlKind::Postgres => format!("\"{}\"", id.replace('"', "\"\"")),
         ExternalSqlKind::Mysql => format!("`{}`", id.replace('`', "``")),
@@ -297,6 +302,66 @@ pub fn deprovision_ddl(kind: ExternalSqlKind, db: &str, role: &str) -> Vec<Strin
             ]
         }
     }
+}
+
+/// Ordered, **Postgres-only** DDL to *soft*-delete a tenant: rename its database
+/// aside to `renamed` and disable its login role, so the tenant's data survives a
+/// grace window (recoverable by [`recover_soft_deprovision_ddl`]) while the
+/// **original** database name is freed immediately for a clean same-named re-create,
+/// and nothing can reach the renamed-aside data in the meantime.
+///
+/// This is the recoverable half of the delete matrix — it exists for `Shared`
+/// Postgres only, because Postgres can `ALTER DATABASE … RENAME`. MySQL has no
+/// database rename, and `Single`'s unit is a whole container/volume, so those cells
+/// keep the immediate, irreversible [`deprovision_ddl`] drop.
+///
+/// Emitted in order:
+/// 1. `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname =
+///    '<db>'` — evict every live session on the source database (Postgres refuses
+///    to rename a database with open connections).
+/// 2. `ALTER DATABASE "<db>" RENAME TO "<renamed>"` — move the data aside; this
+///    frees `<db>` at once, so a fresh tenant re-created under the same name starts
+///    clean and can never alias the renamed-aside data.
+/// 3. `ALTER ROLE "<role>" NOLOGIN` — disable the tenant's login role so its sealed
+///    credential (kept for recovery) can't reach the renamed database.
+///
+/// `db`, `renamed`, and `role` are already-derived, sanitized names; every one is
+/// quoted through [`quote_ident`] (and the `datname` literal through
+/// [`quote_literal`]) defensively.
+pub fn soft_deprovision_ddl(db: &str, renamed: &str, role: &str) -> Vec<String> {
+    let kind = ExternalSqlKind::Postgres;
+    let db_id = quote_ident(kind, db);
+    let renamed_id = quote_ident(kind, renamed);
+    let role_id = quote_ident(kind, role);
+    let db_lit = quote_literal(db);
+    vec![
+        // 1. Evict live sessions so the RENAME can take the lock.
+        format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {db_lit};"),
+        // 2. Move the data aside; frees the original name for a clean re-create.
+        format!("ALTER DATABASE {db_id} RENAME TO {renamed_id};"),
+        // 3. Disable the tenant's login role — nothing reaches the renamed data.
+        format!("ALTER ROLE {role_id} NOLOGIN;"),
+    ]
+}
+
+/// Ordered, **Postgres-only** DDL to *reverse* a [`soft_deprovision_ddl`] within the
+/// grace window: rename the aside database `renamed` back to its `original` name and
+/// re-enable the tenant's login role. The mirror of the soft delete, so an operator
+/// (or a recovery hook) can restore a mistakenly-deleted tenant before the reaper
+/// hard-drops it.
+///
+/// Emitted in order:
+/// 1. `ALTER DATABASE "<renamed>" RENAME TO "<original>"` — restore the name.
+/// 2. `ALTER ROLE "<role>" LOGIN` — re-enable the login role.
+pub fn recover_soft_deprovision_ddl(renamed: &str, original: &str, role: &str) -> Vec<String> {
+    let kind = ExternalSqlKind::Postgres;
+    let renamed_id = quote_ident(kind, renamed);
+    let original_id = quote_ident(kind, original);
+    let role_id = quote_ident(kind, role);
+    vec![
+        format!("ALTER DATABASE {renamed_id} RENAME TO {original_id};"),
+        format!("ALTER ROLE {role_id} LOGIN;"),
+    ]
 }
 
 /// DDL to rotate a tenant role's login password (leaving its database and grants
@@ -719,6 +784,51 @@ mod tests {
             vec![
                 "ALTER USER 'appdb_acme_role'@'%' IDENTIFIED BY 'cafef00d';".to_string(),
                 "FLUSH PRIVILEGES;".to_string(),
+            ]
+        );
+    }
+
+    /// The Postgres soft-delete DDL evicts sessions, renames the database aside
+    /// (freeing the original name), and disables the role — in that order, quoted.
+    #[test]
+    fn soft_deprovision_renames_and_disables_in_order() {
+        let stmts = soft_deprovision_ddl(
+            "appdb_acme",
+            "appdb_acme__deleted_1700000000",
+            "appdb_acme_role",
+        );
+        assert_eq!(
+            stmts,
+            vec![
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'appdb_acme';".to_string(),
+                "ALTER DATABASE \"appdb_acme\" RENAME TO \"appdb_acme__deleted_1700000000\";".to_string(),
+                "ALTER ROLE \"appdb_acme_role\" NOLOGIN;".to_string(),
+            ]
+        );
+        let joined = stmts.join("\n");
+        // Soft delete NEVER drops — the data survives the grace window.
+        assert!(
+            !joined.to_ascii_uppercase().contains("DROP DATABASE"),
+            "soft delete must not DROP the database:\n{joined}"
+        );
+        assert!(!joined.to_ascii_uppercase().contains("DROP ROLE"));
+    }
+
+    /// Recovery reverses the soft delete: rename back to the original + re-enable
+    /// login, in that order.
+    #[test]
+    fn recover_soft_deprovision_reverses_rename_and_login() {
+        let stmts = recover_soft_deprovision_ddl(
+            "appdb_acme__deleted_1700000000",
+            "appdb_acme",
+            "appdb_acme_role",
+        );
+        assert_eq!(
+            stmts,
+            vec![
+                "ALTER DATABASE \"appdb_acme__deleted_1700000000\" RENAME TO \"appdb_acme\";"
+                    .to_string(),
+                "ALTER ROLE \"appdb_acme_role\" LOGIN;".to_string(),
             ]
         );
     }

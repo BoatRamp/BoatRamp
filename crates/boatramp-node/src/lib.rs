@@ -28,4 +28,6 @@ pub mod managed_sql;
 pub mod node;
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 pub mod tenant_sql;
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub mod tenant_tombstone;
 pub use node::{assemble, NodeInput, RunningNode};
