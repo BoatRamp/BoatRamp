@@ -254,6 +254,27 @@ fn single_credential_project(project: &str, is_default: bool) -> String {
     }
 }
 
+/// The data-volume name for a `Single`-mode managed workload.
+///
+/// The container backend backs a persistent volume at
+/// `<data_dir>/compute/volumes/<name>`, **keyed by name only** — so if every managed
+/// DB used the same literal `"data"`, each per-tenant Single container would mount the
+/// *same* PGDATA: a per-tenant container would reuse another tenant's (or a prior
+/// default / pre-per-tenant v0.3.9) data dir, Postgres would skip `initdb`, and the app
+/// would fail auth against its own freshly-minted credential (the v0.3.11 fix).
+///
+/// So a **non-default** per-tenant container is keyed to its own `workload` (a unique,
+/// already-sanitized single path component), giving each tenant an isolated volume. The
+/// **default** single-tenant install keeps the historical `"data"`, so an existing
+/// deployment's volume — and its data — is untouched on upgrade.
+fn managed_volume_name(workload: &str, is_default: bool) -> String {
+    if is_default {
+        "data".to_string()
+    } else {
+        workload.to_string()
+    }
+}
+
 /// The **compute-backed managed** bindings of a `databases` config — the ones this
 /// module owns (every compute-backed binding is per-tenant; a bring-your-own
 /// `url_env` binding is skipped). Returns `(name, engine, config)` tuples.
@@ -368,11 +389,16 @@ async fn provision_single(
         Ok(None) => {}
         Err(e) => return Err(format!("check workload {}: {e}", names.workload)),
     }
-    let spec = managed_db_spec(
+    let mut spec = managed_db_spec(
         engine_of(kind),
         binding.image.as_deref(),
         binding.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
     );
+    // Isolate a per-tenant (non-default) Single container's data volume (see
+    // [`managed_volume_name`]).
+    if let Some(vol) = spec.volumes.first_mut() {
+        vol.name = managed_volume_name(&names.workload, is_default);
+    }
     let spec_id = deploy
         .put_compute_spec(&spec)
         .await
@@ -1223,6 +1249,30 @@ mod tests {
         let s = tenant_names(TenantIsolation::Single, "pg", "appdb", "default", true);
         assert_eq!(s.database, "appdb");
         assert_eq!(s.workload, "pg");
+    }
+
+    /// The v0.3.11 fix: a non-default Single container's data volume is keyed to its own
+    /// workload (isolated), while the default install keeps the shared `"data"` (so an
+    /// existing deployment isn't re-initdb'd on upgrade). Two tenants never collide.
+    #[test]
+    fn managed_volume_name_isolates_non_default_tenants() {
+        // Default single-tenant install: unchanged historical volume name.
+        assert_eq!(managed_volume_name("pg", true), "data");
+        // Two distinct non-default Single tenants → distinct workloads → distinct volume
+        // dirs, and neither is the shared "data" (the bug was all of them sharing it).
+        let a = tenant_names(TenantIsolation::Single, "pg", "appdb", "acme", false).workload;
+        let b = tenant_names(TenantIsolation::Single, "pg", "appdb", "globex", false).workload;
+        assert_eq!(
+            managed_volume_name(&a, false),
+            a,
+            "keyed to its own workload"
+        );
+        assert_ne!(managed_volume_name(&a, false), "data");
+        assert_ne!(
+            managed_volume_name(&a, false),
+            managed_volume_name(&b, false),
+            "distinct tenants must not share a volume"
+        );
     }
 
     // ---- tenant_names: Shared derivation + isolation ---------------------
