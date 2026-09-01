@@ -356,6 +356,10 @@ pub async fn build_handler_runtime(
     _max_component_bytes: u64,
     _allow_guest_private_egress: bool,
     _self_egress_addrs: Vec<std::net::SocketAddr>,
+    // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
+    // node.rs caller (the caller passes the posture value unconditionally); a lean
+    // node has no guest to gate, so it is ignored.
+    _allow_env_secret_refs: bool,
     _deploy: &DeployStore,
     _secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {
