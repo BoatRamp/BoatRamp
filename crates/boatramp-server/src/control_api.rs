@@ -629,3 +629,95 @@ pub(super) async fn remove_root_anchor(
         Err(err) => deploy_error_response(err),
     }
 }
+
+// ---- Project-scoped internal secret store (admin API) --------------------
+//
+// The `/api/projects/{proj}/secrets{,/{name}}` surface is rewritten by
+// `project_scope` onto the global `/api/secrets{,/{name}}` handlers below, which
+// read the tenant from the `ProjectContext` extension (the same shape as the
+// site/function/compute handlers). Authorization is enforced upstream by
+// `require_auth` against the *original* project-scoped path
+// (`Secrets·Read`/`Secrets·Write`).
+//
+// The store seals every value with the `[secrets]` envelope; these handlers only
+// ever set/list/delete **names + metadata** and NEVER return a value. There is no
+// value-GET endpoint — a value leaves the store only into a guest at instantiation
+// (the resolver), never over the API.
+
+/// When no `[secrets]` key envelope is configured there is no sealed store, so
+/// every secrets endpoint returns this clear `501` — never a panic or a `500`.
+fn no_secret_store_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "no [secrets] key envelope configured; secrets require sealing at rest \
+         (set [secrets] envelope = \"local\" or \"vault\" in boatramp.cfg)\n",
+    )
+        .into_response()
+}
+
+/// The secret store, injected as an extension by the node when a `[secrets]`
+/// envelope is present. `None` ⇒ the endpoints fail closed with a clear `501`.
+type SecretStoreExt = Option<Arc<boatramp_core::secret_store::SecretStore>>;
+
+#[derive(Deserialize)]
+pub(super) struct SetSecretRequest {
+    /// The secret name (a KV key segment; validated inside the store).
+    name: String,
+    /// The plaintext value — sealed server-side; never stored in the clear,
+    /// logged, or returned.
+    value: String,
+}
+
+/// `POST /api/projects/{proj}/secrets` — seal `value` server-side under `name`
+/// (rotation = POST an existing name) and return the value-free [`SecretMeta`] as
+/// `201`. Never echoes the value. `501` when no envelope is configured; `400` on an
+/// invalid name (rejected fail-closed inside the store).
+pub(super) async fn set_secret(
+    Extension(store): Extension<SecretStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Json(request): Json<SetSecretRequest>,
+) -> Response {
+    let Some(store) = store else {
+        return no_secret_store_response();
+    };
+    match store
+        .set(project.as_ref(), &request.name, request.value.as_bytes())
+        .await
+    {
+        Ok(meta) => (StatusCode::CREATED, Json(meta)).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+    }
+}
+
+/// `GET /api/projects/{proj}/secrets` — list every secret's **name + metadata**
+/// (sorted), never a value. `501` when no envelope is configured.
+pub(super) async fn list_secrets(
+    Extension(store): Extension<SecretStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+) -> Response {
+    let Some(store) = store else {
+        return no_secret_store_response();
+    };
+    match store.list(project.as_ref()).await {
+        Ok(metas) => Json(metas).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}\n")).into_response(),
+    }
+}
+
+/// `DELETE /api/projects/{proj}/secrets/{name}` — remove a secret; `204` if it
+/// existed, `404` if not. `501` when no envelope is configured; `400` on an invalid
+/// name.
+pub(super) async fn delete_secret(
+    Extension(store): Extension<SecretStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    let Some(store) = store else {
+        return no_secret_store_response();
+    };
+    match store.delete(project.as_ref(), &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no matching secret\n").into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+    }
+}

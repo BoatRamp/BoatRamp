@@ -65,8 +65,9 @@ pub(crate) use content::{
 };
 pub(crate) use control_api::{
     add_root_anchor, auth_whoami, bootstrap_token, cluster_join, cluster_members, cluster_promote,
-    cluster_revoke, cluster_rotate_key, create_join_token, create_token, get_authz_policy,
-    list_root_anchors, list_tokens, put_authz_policy, remove_root_anchor, revoke_token,
+    cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_secret,
+    get_authz_policy, list_root_anchors, list_secrets, list_tokens, put_authz_policy,
+    remove_root_anchor, revoke_token, set_secret,
 };
 #[cfg(all(test, feature = "handlers"))]
 use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
@@ -806,6 +807,14 @@ pub struct ServerOptions {
     /// Backs `POST /api/compute/{name}/exec`; `None` ⇒ `501`. Gated at the handler by
     /// the `allow_compute_exec` posture. Wired by the node with the compute backends.
     pub compute_exec: Option<Arc<dyn boatramp_core::compute::ComputeExec>>,
+    /// The project-scoped internal secret store (sealed with the `[secrets]`
+    /// envelope). Backs the admin secrets API (`/api/projects/{proj}/secrets{,/{name}}`,
+    /// rewritten onto `/api/secrets{,/{name}}`) — set/list/delete of names + metadata,
+    /// **never** values. `None` ⇒ no `[secrets]` envelope was configured, and every
+    /// secrets endpoint returns a clear `501` ("no key envelope configured"), never a
+    /// panic. Not `handlers`-gated: `SecretStore` lives in boatramp-core, so the admin
+    /// API works on a lean node too. Wired by the node alongside the envelope.
+    pub secret_store: Option<Arc<boatramp_core::secret_store::SecretStore>>,
     /// The embedded web-console mount (`[serve.console]`), when the operator
     /// enabled it and the binary was built with the `console` feature. `None` ⇒
     /// not served. The static SPA is served unauthenticated at this host+path.

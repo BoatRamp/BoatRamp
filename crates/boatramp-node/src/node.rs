@@ -172,6 +172,18 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // The `[secrets]` envelope (local KEK / Vault) that seals a managed SQL
     // credential at rest. `None` ⇒ no wrapping (a managed DB then fails closed).
     let secrets_envelope = build_secrets_envelope(config.secrets.as_ref(), data_dir)?;
+    // The project-scoped internal secret store, built from the same KV + `[secrets]`
+    // envelope that seal managed-DB credentials. Backs both the `boatramp:<name>`
+    // resolver (wired into the handler runtime below, when that feature is present)
+    // and the admin secrets API (threaded into `ServerOptions` unconditionally, so it
+    // works on a lean node too). `None` when no envelope is configured — the admin
+    // endpoints then fail closed with a clear 501, never a panic.
+    let secret_store = secrets_envelope.clone().map(|envelope| {
+        Arc::new(boatramp_core::secret_store::SecretStore::new(
+            kv.clone(),
+            envelope,
+        ))
+    });
 
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
@@ -420,6 +432,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.operator_sql = operator_sql;
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
+    // The internal secret store backs the admin secrets API (set/list/delete). Not
+    // handlers-gated — it must be reachable even on a lean node.
+    options.secret_store = secret_store;
 
     // The detached reconcile loops: the always-present compute + domain-verify ones,
     // plus the optional tenant-tombstone reaper (only when a managed DB is configured).

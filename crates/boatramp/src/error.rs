@@ -69,6 +69,9 @@ pub enum CliError {
     /// The `token` command.
     #[error(transparent)]
     Token(#[from] crate::token::Error),
+    /// The `secrets` command.
+    #[error(transparent)]
+    Secrets(#[from] crate::secrets::Error),
     /// The `cluster` command.
     #[error(transparent)]
     Cluster(#[from] crate::cluster::Error),

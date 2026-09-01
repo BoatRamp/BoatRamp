@@ -80,6 +80,7 @@ mod migrate;
 #[cfg(feature = "operator")]
 mod operator;
 mod project;
+mod secrets;
 mod security;
 mod security_headers;
 mod serve;
@@ -155,6 +156,8 @@ enum Command {
     SecurityHeaders(security_headers::SecurityHeadersArgs),
     /// Manage control-plane API tokens.
     Token(token::TokenArgs),
+    /// Manage a project's internal, sealed secret store (`secrets set|ls|rm|rotate`).
+    Secrets(secrets::SecretsArgs),
     /// Operate a self-hosted cluster's mesh membership (mint join tokens).
     Cluster(cluster::ClusterArgs),
     /// Inspect the operator security posture (`security explain`).
@@ -467,6 +470,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::SecurityHeaders(args) => security_headers::run(args, &config).await?,
         Command::Graphql(args) => graphql::run(args, &config).await?,
         Command::Token(args) => token::run(args, &config).await?,
+        Command::Secrets(args) => secrets::run(args, &config).await?,
         Command::Cluster(args) => cluster::run(args, &config).await?,
         Command::Auth(args) => authcmd::run(args, &config).await?,
         Command::Gateway(args) => gateway::run(args, &config).await?,

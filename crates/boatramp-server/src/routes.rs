@@ -50,6 +50,10 @@ pub fn router_with_fast(
     let operator_sql_cap = options.operator_sql.clone();
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
+    // The project-scoped internal secret store (`None` when no `[secrets]` envelope
+    // is configured — the admin secrets endpoints then fail closed with a clear 501).
+    // Rides as an `api` extension read by the secrets handlers; not handlers-gated.
+    let secret_store_cap = options.secret_store.clone();
     // Bind the auth layer's per-request PoP enforcement: the fleet's canonical
     // origin (the proof's required `aud`) and whether every token must be
     // holder-bound (`require_pop`). A holder-bound (`cnf`) token always requires a
@@ -154,6 +158,15 @@ pub fn router_with_fast(
             "/api/sites/{site}/aliases/{name}",
             put(set_alias).delete(remove_alias),
         )
+        // Project-scoped internal secret store. The admin surface the client hits
+        // is `/api/projects/{proj}/secrets{,/{name}}`; `project_scope` rewrites it
+        // onto these global routes (tagging the request with its `ProjectContext`),
+        // exactly like sites/functions/compute. Set (seal) + list (names + metadata
+        // only) + delete; there is deliberately **no value-GET** — a value leaves the
+        // store only into a guest at instantiation, never over the API. Authorized as
+        // `Secrets·Read`/`Secrets·Write` against the original project-scoped path.
+        .route("/api/secrets", post(set_secret).get(list_secrets))
+        .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
         .route("/api/tokens", post(create_token).get(list_tokens))
         // First-token bootstrap: RBAC-exempt (`Right::required` → None for exactly
         // this path); the handler verifies a single-use operator-set secret. The
@@ -349,6 +362,7 @@ pub fn router_with_fast(
         .layer(Extension(operator_sql_cap))
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
+        .layer(Extension(secret_store_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]
     let api = api.layer(Extension(oidc_state));
@@ -484,4 +498,167 @@ pub fn router_with_fast(
         .layer(axum::middleware::from_fn(project_scope))
         .layer(axum::middleware::from_fn(access_log));
     (router, fast)
+}
+
+#[cfg(test)]
+mod secrets_api_tests {
+    //! Stage-3 admin secrets API, driven through the full router (project-scope
+    //! rewrite + auth layer + handlers). Asserts the value-free contract end to end:
+    //! set (201, seals) → list (names + metadata, **no values**) → delete (204/404),
+    //! plus that the no-envelope wiring fails closed with a clear 501 rather than a
+    //! panic. Auth is disabled (`Auth::disabled()`), so `ProjectContext` defaults to
+    //! `default` and the request flows straight through.
+    use std::sync::Arc;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Method, Request, StatusCode};
+    use boatramp_core::deploy::DeployStore;
+    use boatramp_core::kv::MemoryKv;
+    use boatramp_core::secret_store::{SecretMeta, SecretStore};
+    use tower::ServiceExt as _;
+
+    use crate::{Auth, HandlerRuntime, ServerOptions};
+
+    /// A reversible XOR test envelope: `set` seals, so a value is visibly different at
+    /// rest, yet round-trips (mirrors the store's own unit tests).
+    struct XorEnvelope;
+    #[async_trait::async_trait]
+    impl boatramp_core::envelope::KeyEnvelope for XorEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+            Ok(p.iter().map(|b| b ^ 0x5a).collect())
+        }
+        async fn unwrap(
+            &self,
+            c: &[u8],
+        ) -> Result<Vec<u8>, boatramp_core::envelope::EnvelopeError> {
+            Ok(c.iter().map(|b| b ^ 0x5a).collect())
+        }
+    }
+
+    /// Build the router with (or without) a secret store wired, over a fresh in-memory
+    /// deploy store. (Sealing-at-rest is proved by the store's own unit tests and the
+    /// resolver test; here we assert the API contract — including that no value ever
+    /// crosses the wire.)
+    fn router_with_store(store: Option<Arc<SecretStore>>) -> axum::Router {
+        // The secrets flow only touches the KV; blobs are irrelevant here, so a
+        // temp-dir FsStorage (as in the hot-path tests) is enough for the deploy store.
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let options = ServerOptions {
+            secret_store: store,
+            ..Default::default()
+        };
+        crate::router_with_fast(
+            deploy,
+            Auth::disabled(),
+            HandlerRuntime::disabled(),
+            options,
+        )
+        .0
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn set_list_delete_round_trips_and_never_returns_values() {
+        let store = Arc::new(SecretStore::new(
+            Arc::new(MemoryKv::new()),
+            Arc::new(XorEnvelope),
+        ));
+        let app = router_with_store(Some(store));
+
+        // POST /api/projects/default/secrets {name, value} → 201 + SecretMeta.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/projects/default/secrets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"db-pw","value":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_bytes(resp).await;
+        let meta: SecretMeta = serde_json::from_slice(&created).unwrap();
+        assert_eq!(meta.name, "db-pw");
+        assert_eq!(meta.revision, 1);
+        // Even the 201 create response is value-free — it echoes metadata, not the value.
+        let created_text = String::from_utf8(created).unwrap();
+        assert!(
+            !created_text.contains("hunter2"),
+            "the create response must never echo the value: {created_text}"
+        );
+
+        // GET → the metadata (name + revision + timestamps), never a value.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/projects/default/secrets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = body_bytes(resp).await;
+        let metas: Vec<SecretMeta> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].name, "db-pw");
+        // The value never crosses the API: the serialized list must not carry it, and
+        // the value-free `SecretMeta` has no field that could.
+        let text = String::from_utf8(raw).unwrap();
+        assert!(
+            !text.contains("hunter2") && !text.to_ascii_lowercase().contains("value"),
+            "the secrets list must never carry a value: {text}"
+        );
+
+        // DELETE the secret → 204 first time, 404 the second (idempotent existence).
+        let del = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/projects/default/secrets/db-pw")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(del().await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(del().await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn no_envelope_wiring_fails_closed_with_a_clear_501() {
+        // No secret store injected (no `[secrets]` envelope): every endpoint returns a
+        // clear 501, never a 500 or a panic.
+        let app = router_with_store(None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/projects/default/secrets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"x","value":"y"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let text = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(
+            text.contains("no [secrets] key envelope configured"),
+            "{text}"
+        );
+    }
 }
