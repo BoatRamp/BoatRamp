@@ -127,9 +127,16 @@ pub fn sanitize_ident(name: &str) -> String {
     }
 
     // Empty or digit-leading ⇒ prefix `t_` so it's a valid identifier start.
+    // Postgres additionally **reserves the `pg_` prefix** for system roles/schemas, so
+    // any input that would yield a `pg_`-leading identifier (e.g. a compute workload
+    // literally named `pg` — the natural name for a Postgres server, which becomes the
+    // per-tenant *role* base) gets the same `t_` guard; otherwise `CREATE ROLE "pg_…"`
+    // is rejected with "role name is reserved". Injectivity is unaffected — the digest
+    // is of the *original* input, so `pg_x` and `t_pg_x` still get distinct suffixes.
+    let reserved_pg = cleaned == "pg" || cleaned.starts_with("pg_");
     let mut body = if cleaned.is_empty() {
         String::from("t_")
-    } else if cleaned.as_bytes()[0].is_ascii_digit() {
+    } else if cleaned.as_bytes()[0].is_ascii_digit() || reserved_pg {
         format!("t_{cleaned}")
     } else {
         cleaned
@@ -623,6 +630,27 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
         }
+    }
+
+    /// A compute workload named `pg` (the natural name for a Postgres server) is the
+    /// role base, so the role must NOT come out `pg_…` — Postgres reserves that prefix
+    /// for system roles and rejects `CREATE ROLE "pg_…"`. Regression for the live gate
+    /// failure: `sanitize_ident` guards the `pg_` prefix like a digit-leading start.
+    #[test]
+    fn pg_reserved_prefix_is_guarded() {
+        let ident = sanitize_ident("acme");
+        let role = tenant_role_name("pg", &ident);
+        assert!(
+            !role.starts_with("pg_"),
+            "role name must not use the Postgres-reserved pg_ prefix: {role}"
+        );
+        // The chokepoint itself: neither `pg` nor a `pg_`-leading input escapes.
+        assert!(!sanitize_ident("pg").starts_with("pg_"));
+        assert!(!sanitize_ident("pg_prod").starts_with("pg_"));
+        // A non-reserved `pg`-*containing* name (no trailing `_`) is left alone.
+        assert!(sanitize_ident("pgbouncer").starts_with("pgbouncer"));
+        // Injectivity survives the guard: distinct inputs → distinct names.
+        assert_ne!(sanitize_ident("pg_x"), sanitize_ident("t_pg_x"));
     }
 
     /// Distinct tenants under the same base get distinct db + role names — and it
