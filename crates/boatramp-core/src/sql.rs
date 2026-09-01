@@ -182,6 +182,14 @@ pub trait SqlBackend: Send + Sync {
 ///
 /// Recognised hostile forms (all rejected):
 ///
+/// - a **deferred-execution or persistent-default** construct, whose body the tokenizer
+///   cannot see into and where a reserved-key write could hide: any **dollar-quoted**
+///   token (`$$…$$` / `$tag$…$tag$` — a `DO` block, a routine body, or a string literal),
+///   a leading `DO` / `CALL`, a `CREATE`/`ALTER … FUNCTION|PROCEDURE`, or an
+///   `ALTER ROLE|DATABASE|USER|SYSTEM … boatramp.*`. A guest on the RLS path has no
+///   legitimate need for procedural code, so these whole classes are refused (the
+///   operator keeps them via trusted operator SQL); `$1`/`$2` bind params are unaffected
+///   (they lex as placeholders, not dollar-quoted strings);
 /// - a statement whose leading keyword is `SET` / `SET SESSION` / `SET LOCAL` /
 ///   `RESET` / `DISCARD` whose target is a `boatramp.*` GUC or an `@boatramp_*` var
 ///   (`RESET ALL` / `DISCARD ALL` reset custom GUCs too, so they are refused);
@@ -244,6 +252,55 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
     // Whether a case-folded identifier names a reserved key: the MySQL `@boatramp_*`
     // user var, or (as the leading segment of a GUC) the `boatramp` namespace.
     let is_reserved_var = |w: &str| w.starts_with(MYSQL_VAR_PREFIX);
+
+    // ---- (0) Deferred-execution / persistent-default constructs the token scan below
+    // cannot see into. `sqlparser` lexes a **dollar-quoted body** (`$$…$$`, `$tag$…$tag$`)
+    // — a `DO` block or a `CREATE FUNCTION` body — as ONE opaque `DollarQuotedString`
+    // token, and a **single-quoted** `DO`/function body as a `SingleQuotedString`, so a
+    // reserved-key write hidden inside either (`DO $$ … set_config('boatramp.project', …,
+    // false) … $$`) is invisible to (a)/(b). A guest on the RLS path has no legitimate
+    // need for procedural code, so under an injected context these whole classes are
+    // refused outright — the operator keeps them via operator SQL, which is trusted and
+    // unguarded. Refused:
+    //   - any dollar-quoted token (a `$$…$$` / `$tag$…$tag$` body or string literal);
+    //   - a leading `DO` (anonymous block) or `CALL` (invoke a procedure that could set it);
+    //   - `CREATE`/`ALTER … FUNCTION|PROCEDURE` (defines a body the tokenizer can't inspect);
+    //   - `ALTER ROLE|DATABASE|USER|SYSTEM … boatramp.*` (sets a *persistent* default GUC).
+    // `$1`/`$2` bind params lex as `Placeholder`, not `DollarQuotedString`, so ordinary
+    // parameterized guest queries are unaffected.
+    if toks
+        .iter()
+        .any(|t| matches!(t, Token::DollarQuotedString(_)))
+    {
+        return refused();
+    }
+    {
+        let leading = toks.first().and_then(|t| word_lc(t));
+        let has_word = |w: &str| toks.iter().any(|t| word_lc(t).as_deref() == Some(w));
+        let names_reserved = || {
+            toks.iter()
+                .any(|t| word_lc(t).is_some_and(|w| w == GUC_NAMESPACE || is_reserved_var(&w)))
+        };
+        match leading.as_deref() {
+            // Anonymous code block / procedure call: procedural bodies we can't inspect.
+            Some("do") | Some("call") => return refused(),
+            // Defining a routine (single- or dollar-quoted body) on the guest path.
+            Some("create") | Some("alter") if has_word("function") || has_word("procedure") => {
+                return refused()
+            }
+            // A persistent GUC default: `ALTER ROLE/DATABASE/USER/SYSTEM … SET boatramp.*`
+            // (scoped to those targets so an `ALTER TABLE`/`INDEX` isn't caught).
+            Some("alter")
+                if matches!(
+                    toks.get(1).and_then(|t| word_lc(t)).as_deref(),
+                    Some("role") | Some("database") | Some("user") | Some("system")
+                ) && names_reserved() =>
+            {
+                return refused()
+            }
+            _ => {}
+        }
+    }
 
     // ---- (a) A leading SET / RESET / DISCARD targeting a reserved key. ----
     if let Some(first) = toks.first().and_then(|t| word_lc(t)) {
@@ -592,6 +649,54 @@ mod reserved_session_writes_tests {
         ));
     }
 
+    // ---- deferred-execution bypasses (the tokenizer can't see into a body) ----
+
+    /// The proven Round-1 High: a reserved write hidden in a **dollar-quoted** `DO`
+    /// block. `$$…$$` / `$tag$…$tag$` lex as one opaque token, so the inner
+    /// `set_config`/`SET` was invisible to the token scan — now the whole
+    /// dollar-quoted class is refused under an injected context.
+    #[test]
+    fn dollar_quoted_do_block_reserved_write_is_rejected() {
+        assert!(rejected(
+            "DO $$ BEGIN PERFORM set_config('boatramp.project','victim',false); END $$;"
+        ));
+        assert!(rejected(
+            "DO $$ BEGIN SET boatramp.project = 'victim'; END $$;"
+        ));
+        assert!(rejected(
+            "DO $tag$ PERFORM set_config('boatramp.project','v',false); $tag$;"
+        ));
+        // A dollar-quoted string literal anywhere is refused too (a guest has no need
+        // for one on the RLS path; it could carry a hidden body).
+        assert!(rejected(
+            "SELECT set_config($$boatramp.project$$, 'v', false)"
+        ));
+    }
+
+    /// The rest of the deferred-execution / persistent-default class: a single-quoted
+    /// `DO` body, `CALL`, defining a routine (single- or dollar-quoted body), and a
+    /// persistent GUC default via `ALTER ROLE/DATABASE`.
+    #[test]
+    fn procedural_and_persistent_constructs_are_rejected() {
+        assert!(rejected(
+            "DO 'BEGIN PERFORM set_config(''boatramp.project'',''v'',false); END'"
+        ));
+        assert!(rejected("CALL do_evil()"));
+        assert!(rejected(
+            "CREATE FUNCTION e() RETURNS void AS $$ SELECT set_config('boatramp.project','v',false) $$ LANGUAGE sql"
+        ));
+        assert!(rejected(
+            "CREATE FUNCTION e() RETURNS void AS 'BEGIN PERFORM set_config(''boatramp.project'',''v'',false); END' LANGUAGE plpgsql"
+        ));
+        assert!(rejected(
+            "CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$"
+        ));
+        assert!(rejected(
+            "ALTER ROLE tenant_role SET boatramp.project = 'victim'"
+        ));
+        assert!(rejected("ALTER DATABASE app SET boatramp.site = 'victim'"));
+    }
+
     // ---- legit forms must still parse-and-pass (no regression) ----
 
     #[test]
@@ -607,5 +712,14 @@ mod reserved_session_writes_tests {
         assert!(!rejected(
             "SELECT settings FROM t WHERE k = 'boatramp.project'"
         ));
+        // Ordinary app SQL on the RLS path is untouched: parameterized queries ($1 is a
+        // Placeholder, not a dollar-quoted body), plain DML, and non-routine DDL.
+        assert!(!rejected("SELECT * FROM orders WHERE id = $1"));
+        assert!(!rejected("INSERT INTO orders (id, total) VALUES ($1, $2)"));
+        assert!(!rejected("UPDATE orders SET total = $1 WHERE id = $2"));
+        assert!(!rejected(
+            "CREATE TABLE orders (id bigint primary key, total numeric)"
+        ));
+        assert!(!rejected("ALTER TABLE orders ADD COLUMN note text"));
     }
 }

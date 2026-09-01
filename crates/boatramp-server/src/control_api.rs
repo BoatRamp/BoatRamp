@@ -700,7 +700,16 @@ pub(super) async fn list_secrets(
     };
     match store.list(project.as_ref()).await {
         Ok(metas) => Json(metas).into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}\n")).into_response(),
+        Err(err) => {
+            // Log the backend detail server-side; return a generic body so a KV/backend
+            // error string (key shapes, internals) isn't disclosed to the caller.
+            tracing::warn!(%err, "listing secrets failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "listing secrets failed\n",
+            )
+                .into_response()
+        }
     }
 }
 

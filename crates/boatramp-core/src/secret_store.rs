@@ -24,6 +24,12 @@ use crate::project::ProjectRef;
 /// Max secret-name length (it is a KV key segment).
 const MAX_SECRET_NAME_LEN: usize = 128;
 
+/// Max secret **value** length. A secret is a credential/token, not a payload; the
+/// bound stops a tenant (a project admin on their own project) from sealing an
+/// arbitrarily large blob into the replicated control-plane KV — a Raft-amplified
+/// write-DoS on the shared plane. 64 KiB is far above any real key/token.
+const MAX_SECRET_VALUE_LEN: usize = 64 * 1024;
+
 /// The sealed record stored at `project/<proj>/secret/<name>`. Metadata is stored
 /// in the clear (names/timestamps aren't secret); only `sealed` is confidential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +91,12 @@ impl SecretStore {
         plaintext: &[u8],
     ) -> Result<SecretMeta, String> {
         validate_name(name)?;
+        if plaintext.len() > MAX_SECRET_VALUE_LEN {
+            return Err(format!(
+                "secret value is {} bytes; the maximum is {MAX_SECRET_VALUE_LEN}",
+                plaintext.len()
+            ));
+        }
         let key = crate::deploy::keys::secret(project, name);
         let now = crate::time::now_unix();
         let prev = self.load_record(&key).await?;
@@ -338,5 +350,21 @@ mod tests {
         }
         // A normal name passes.
         assert!(s.set(p, "ok.name_1-2", b"v").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_value_is_refused() {
+        let s = store();
+        let p = ProjectRef::new("acme");
+        // At the bound: fine. Over it: refused (before sealing/writing).
+        assert!(s
+            .set(p, "big", &vec![b'x'; MAX_SECRET_VALUE_LEN])
+            .await
+            .is_ok());
+        let err = s
+            .set(p, "toobig", &vec![b'x'; MAX_SECRET_VALUE_LEN + 1])
+            .await
+            .expect_err("an oversized value must be refused");
+        assert!(err.contains("maximum"), "{err}");
     }
 }
