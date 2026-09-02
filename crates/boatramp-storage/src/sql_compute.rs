@@ -39,6 +39,21 @@ pub const SESSION_KEY_PROJECT: &str = "project";
 /// See [`SESSION_KEY_PROJECT`].
 pub const SESSION_KEY_SITE: &str = "site";
 
+/// One replica observed for a workload, for a **diagnostic** "why is there no healthy
+/// endpoint" message. Not on the hot path — resolved only when [`endpoints`] came back
+/// empty, so a clear reachability/health error can name what exists-but-is-unhealthy.
+///
+/// [`endpoints`]: ComputeEndpointResolver::endpoints
+#[derive(Debug, Clone)]
+pub struct ReplicaDiag {
+    /// The replica's endpoint, `"ip:port"` (the health probe's TCP target).
+    pub endpoint: String,
+    /// Whether the last readiness probe passed.
+    pub healthy: bool,
+    /// The replica's lifecycle phase (e.g. `Running`, `Zero`), for the operator.
+    pub phase: String,
+}
+
 /// Resolves a compute workload's healthy replica endpoints as `(host, port)`,
 /// **primary-first** (the caller connects to the first). Implemented in
 /// `boatramp-node` over the `DeployStore`'s replica-state records.
@@ -46,6 +61,16 @@ pub const SESSION_KEY_SITE: &str = "site";
 pub trait ComputeEndpointResolver: Send + Sync {
     /// Healthy endpoints for `workload`, primary-first (empty ⇒ nothing running).
     async fn endpoints(&self, workload: &str) -> Result<Vec<(String, u16)>, SqlError>;
+
+    /// **Diagnostic** (off the hot path): every replica the resolver can see for
+    /// `workload`, healthy or not, so an empty-`endpoints` error can honestly say
+    /// whether replicas exist but none passed the readiness probe (a
+    /// reachability/health problem) vs the workload simply having no replicas (a
+    /// missing/never-launched workload). Default: `Vec::new()` — a resolver that can't
+    /// cheaply enumerate replica states just yields the plainer message.
+    async fn replica_diagnostics(&self, _workload: &str) -> Vec<ReplicaDiag> {
+        Vec::new()
+    }
 }
 
 /// Percent-encode a URL userinfo component (user / password): over-encode
@@ -225,18 +250,20 @@ impl ComputeResolvedSqlBackend {
 
     /// Resolve the workload's primary healthy endpoint and build the connection URL.
     async fn resolve_url(&self) -> Result<String, SqlError> {
-        let (host, port) = self
+        let endpoint = self
             .resolver
             .endpoints(&self.workload)
             .await?
             .into_iter()
-            .next()
-            .ok_or_else(|| {
-                SqlError::other(format!(
-                    "managed sql `{}` has no healthy replica to connect to",
-                    self.workload
-                ))
-            })?;
+            .next();
+        let (host, port) = match endpoint {
+            Some(hp) => hp,
+            // No healthy endpoint. Ask the resolver what replicas exist (off the hot
+            // path) so the error distinguishes a reachability/health problem (replicas
+            // running but none passed the readiness probe) from a genuinely missing
+            // workload — the operator's #1 question when a `SELECT` fails.
+            None => return Err(self.no_endpoint_error().await),
+        };
         Ok(build_url(
             self.kind,
             &self.user,
@@ -244,6 +271,40 @@ impl ComputeResolvedSqlBackend {
             &host,
             port,
             &self.database,
+        ))
+    }
+
+    /// Build the "no healthy replica" error, enriched with what the resolver can see.
+    /// - No replicas at all ⇒ the workload is missing / never launched.
+    /// - Replicas exist but none healthy ⇒ a reachability/health problem: they are
+    ///   running but no replica passed the readiness (TCP-connect) probe. The message
+    ///   names a probe target (`ip:port`) so the operator can correlate it with the
+    ///   `compute health` / `compute-net-debug` logs (e.g. an EHOSTUNREACH on the fly
+    ///   guest). Never over-engineered — one clear, honest sentence.
+    async fn no_endpoint_error(&self) -> SqlError {
+        let diags = self.resolver.replica_diagnostics(&self.workload).await;
+        if diags.is_empty() {
+            return SqlError::other(format!(
+                "managed sql `{}` has no replica to connect to: the workload has no running \
+                 replica (it may not be launched yet)",
+                self.workload
+            ));
+        }
+        let running = diags.iter().filter(|d| d.phase == "Running").count();
+        // A probe target to point the operator at (the first replica's endpoint).
+        let target = diags
+            .first()
+            .map(|d| d.endpoint.as_str())
+            .unwrap_or("unknown");
+        SqlError::other(format!(
+            "managed sql `{}`: {} replica(s) exist ({} running) but none is healthy — no replica \
+             passed the readiness probe, so this is a reachability/health problem, not a missing \
+             workload (last probe target `{}`; see the `compute health` / `compute-net-debug:` logs \
+             for the raw connect error)",
+            self.workload,
+            diags.len(),
+            running,
+            target,
         ))
     }
 
@@ -408,6 +469,19 @@ mod tests {
         }
     }
 
+    /// A resolver with no healthy endpoints but a set of replica diagnostics — models a
+    /// container that is running yet unreachable (the fly-guest reachability failure).
+    struct DiagResolver(Vec<ReplicaDiag>);
+    #[async_trait]
+    impl ComputeEndpointResolver for DiagResolver {
+        async fn endpoints(&self, _workload: &str) -> Result<Vec<(String, u16)>, SqlError> {
+            Ok(Vec::new()) // nothing healthy
+        }
+        async fn replica_diagnostics(&self, _workload: &str) -> Vec<ReplicaDiag> {
+            self.0.clone()
+        }
+    }
+
     #[test]
     fn build_url_per_engine_encodes_userinfo() {
         assert_eq!(
@@ -464,7 +538,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_healthy_replica_is_a_clear_error() {
+    async fn no_replica_at_all_is_a_clear_missing_workload_error() {
+        // No endpoints AND no diagnostics (default) ⇒ the workload has no replica: the
+        // "missing / not launched yet" message, distinct from the reachability one.
         let mock = Arc::new(MockResolver(Mutex::new(vec![])));
         let be = ComputeResolvedSqlBackend::new(
             mock,
@@ -477,8 +553,55 @@ mod tests {
             false,
             None,
         );
-        let err = be.resolve_url().await.unwrap_err();
-        assert!(err.to_string().contains("no healthy replica"), "got: {err}");
+        let msg = be.resolve_url().await.unwrap_err().to_string();
+        assert!(
+            msg.contains("managed sql `pg`"),
+            "names the workload: {msg}"
+        );
+        assert!(
+            msg.contains("no running replica"),
+            "explains the workload is not launched: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unhealthy_replicas_yield_a_reachability_error_naming_the_probe_target() {
+        // A replica is running but no probe passed — the fly-guest reachability failure.
+        // The error must name the workload, that a replica exists but is unhealthy, and a
+        // probe target, so the operator knows it's health/reachability, not a missing DB.
+        let diag = Arc::new(DiagResolver(vec![ReplicaDiag {
+            endpoint: "10.201.0.7:5432".into(),
+            healthy: false,
+            phase: "Running".into(),
+        }]));
+        let be = ComputeResolvedSqlBackend::new(
+            diag,
+            "pg-construens",
+            ExternalSqlKind::Postgres,
+            "db",
+            "u",
+            "p",
+            None,
+            false,
+            None,
+        );
+        let msg = be.resolve_url().await.unwrap_err().to_string();
+        assert!(
+            msg.contains("managed sql `pg-construens`"),
+            "names the workload: {msg}"
+        );
+        assert!(
+            msg.contains("1 replica(s) exist") && msg.contains("1 running"),
+            "says a replica exists + is running: {msg}"
+        );
+        assert!(
+            msg.contains("none is healthy") && msg.contains("readiness probe"),
+            "explains none passed the readiness probe: {msg}"
+        );
+        assert!(
+            msg.contains("10.201.0.7:5432"),
+            "names the last probe target: {msg}"
+        );
     }
 
     // ---- RLS session-context injection -----------------------------------

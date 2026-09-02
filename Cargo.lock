@@ -1668,6 +1668,7 @@ dependencies = [
  "flate2",
  "futures",
  "ipnet",
+ "netlink-packet-route",
  "nix 0.29.0",
  "rtnetlink",
  "seccompiler",

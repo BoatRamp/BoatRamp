@@ -43,6 +43,10 @@ seccompiler = "0.4"
 syscalls = "0.6"
 # veth/netns wiring over netlink (no `ip` shell-outs).
 rtnetlink = "0.14"
+# The netlink message/attribute types (LinkAttribute/LinkFlag/AddressAttribute), used to
+# read host link + address state in-process for the one-shot compute-net-debug dump. Pinned
+# to the version rtnetlink 0.14 already resolves so no new dependency graph is introduced.
+netlink-packet-route = "0.19"
 futures = "0.3"
 # The `ContainerBackend` (ComputeBackend impl): the trait + Storage staging + the
 # shared IpPool live in core; rootfs tar unpack via tar+flate2. Linux-only (it

@@ -17,7 +17,7 @@ use boatramp_core::envelope::KeyEnvelope;
 use boatramp_core::kv::KvStore;
 use boatramp_core::project::ProjectRef;
 use boatramp_core::sql::SqlError;
-use boatramp_storage::sql_compute::ComputeEndpointResolver;
+use boatramp_storage::sql_compute::{ComputeEndpointResolver, ReplicaDiag};
 use boatramp_storage::ExternalSqlKind;
 
 /// The env vars a managed DB server image reads to **initialize on first boot** with
@@ -302,14 +302,16 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
 ///   so there IS exactly one server workload: the bare `<compute>` under the reserved
 ///   default project, initialized from the binding's own env. Register it (non-clobbering);
 ///   per-tenant DDL stays lazy (no boot-time connection).
-/// - **`Single`** — each tenant gets a *dedicated* container `<compute>-<ident>`. There
-///   is no shared server to warm, so enumerate the tenants that have deployed resources
-///   and call [`provision_tenant`] for each — the SAME path the lazy resolver + a
-///   create hook use, so the boot-warm registration is byte-identical + non-clobbering
-///   with them (whichever runs first, the other is a no-op ⇒ exactly one workload per
-///   tenant, never a stray bare `<compute>`). Materialising the sealed credential needs
-///   the `[secrets]` envelope; without one, Single boot-warm is skipped (the lazy path
-///   surfaces the same missing-envelope error clearly at first request).
+/// - **`Single`** — each tenant gets a *dedicated* container `<compute>-<ident>`, created
+///   durably by [`provision_single`](crate::tenant_sql::provision_single) /
+///   [`provision_tenant`](crate::tenant_sql::provision_tenant) on the tenant's first `sql`
+///   resolve (the lazy path), and relaunched by the reconcile on every boot. So there is
+///   **nothing to warm at boot**: a tenant that has ever used the DB is already registered
+///   (and thus relaunched), and a project that has never used `sql` — e.g. a static-only
+///   `default` — must NOT get a spurious `pg`/`pg-<ident>`. The old boot-warm enumerated
+///   any project with a *site or function* (not one that uses `sql`), which over-warmed
+///   static-only projects into a running DB; dropped entirely here. (Result: a Single
+///   binding registers no workload at boot; the first `sql` resolve provisions it.)
 ///
 /// The synthesized spec comes from [`managed_db_spec`](boatramp_core::compute::managed_db_spec)
 /// — the same builder the container capability gate exercises — so the shipped
@@ -318,8 +320,6 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
 pub async fn auto_register_managed_db_workloads(
     deploy: &DeployStore,
     databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
-    kv: &Arc<dyn KvStore>,
-    envelope: &Option<Arc<dyn KeyEnvelope>>,
 ) {
     use crate::config::TenantIsolation;
 
@@ -341,21 +341,11 @@ pub async fn auto_register_managed_db_workloads(
             TenantIsolation::Shared => {
                 register_shared_server(deploy, db, workload).await;
             }
-            // A dedicated container per tenant: boot-warm each tenant that has resources
-            // via `provision_tenant` (the same path the lazy resolver uses), so there is
-            // never a tenant-blind bare `<compute>`/`default` workload.
-            TenantIsolation::Single => {
-                let Some(envelope) = envelope.as_ref() else {
-                    tracing::info!(
-                        %workload,
-                        "managed sql: `Single` per-tenant DB needs a [secrets] envelope to seal \
-                         a per-tenant credential; skipping boot-warm (the lazy resolve will \
-                         surface the same error at first request)"
-                    );
-                    continue;
-                };
-                auto_warm_single_tenants(deploy, kv, envelope, db, workload).await;
-            }
+            // A dedicated container per tenant, created durably by the lazy resolve
+            // (`provision_single`) on first `sql` use and relaunched by the reconcile on
+            // each boot. Nothing to warm at boot — warming any project with a site/function
+            // (not one that uses `sql`) over-warmed static-only projects into a running DB.
+            TenantIsolation::Single => {}
         }
     }
 }
@@ -433,107 +423,6 @@ async fn register_shared_server(
     }
 }
 
-/// Boot-warm the per-tenant `Single` workloads for a binding: for every tenant with
-/// deployed resources on the binding's scope, call [`provision_tenant`] — the same path
-/// the lazy resolver + a create hook take, so the registration is byte-identical and
-/// non-clobbering with them (exactly one `<compute>-<ident>` workload per tenant, never
-/// a bare `<compute>`/`default`). Best-effort per tenant (log-and-continue).
-///
-/// # Enumeration (deliberately resource-gated)
-///
-/// - **`Project` scope** — every project with ≥1 site OR ≥1 stored function.
-///   The reserved `default` project is included **only if it likewise has resources**,
-///   so a deliberately-removed/empty default DB is *not* resurrected (the whole point:
-///   the operator removed the default `pg` on purpose).
-/// - **`Site` scope** — for each such project, each of its sites.
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-async fn auto_warm_single_tenants(
-    deploy: &DeployStore,
-    kv: &Arc<dyn KvStore>,
-    envelope: &Arc<dyn KeyEnvelope>,
-    db: &crate::config::ExternalDatabaseConfig,
-    workload: &str,
-) {
-    use crate::config::TenantScope;
-
-    let projects = match deploy.list_projects().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%workload, error = %e, "managed sql: could not list projects for Single boot-warm; skipping");
-            return;
-        }
-    };
-
-    for project in &projects {
-        let sites = match deploy.list_sites(ProjectRef::new(&project.name)).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%workload, project = %project.name, error = %e, "managed sql: could not list sites for Single boot-warm; skipping project");
-                continue;
-            }
-        };
-        // A tenant is warmed only when it actually has deployed resources — so an empty
-        // (or deliberately-removed) project, including a deliberately-empty `default`,
-        // is never resurrected into a running DB container.
-        let has_functions = match deploy
-            .list_stored_functions(ProjectRef::new(&project.name))
-            .await
-        {
-            Ok(f) => !f.is_empty(),
-            Err(e) => {
-                tracing::warn!(%workload, project = %project.name, error = %e, "managed sql: could not list functions for Single boot-warm; treating as none");
-                false
-            }
-        };
-        let has_resources = !sites.is_empty() || has_functions;
-        if !has_resources {
-            continue;
-        }
-
-        match db.tenant_scope {
-            // Project scope: the tenant IS the project (empty site).
-            TenantScope::Project => {
-                warm_one(deploy, kv, envelope, db, workload, &project.name, "").await;
-            }
-            // Site scope: each site of the project is a distinct tenant.
-            TenantScope::Site => {
-                for site in &sites {
-                    warm_one(deploy, kv, envelope, db, workload, &project.name, site).await;
-                }
-            }
-        }
-    }
-}
-
-/// Provision one Single tenant at boot (log-and-continue on error). A thin wrapper over
-/// [`provision_tenant`] so `auto_warm_single_tenants` reads clearly.
-#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-async fn warm_one(
-    deploy: &DeployStore,
-    kv: &Arc<dyn KvStore>,
-    envelope: &Arc<dyn KeyEnvelope>,
-    db: &crate::config::ExternalDatabaseConfig,
-    workload: &str,
-    project: &str,
-    site: &str,
-) {
-    match crate::tenant_sql::provision_tenant(deploy, kv, envelope, db, project, site).await {
-        Ok(()) => tracing::info!(
-            %workload,
-            project,
-            site,
-            "managed sql: boot-warmed the per-tenant Single database workload"
-        ),
-        Err(e) => tracing::warn!(
-            %workload,
-            project,
-            site,
-            error = %e,
-            "managed sql: could not boot-warm a per-tenant Single database workload (best-effort; the lazy resolve retries)"
-        ),
-    }
-}
-
 /// A [`ComputeEndpointResolver`] backed by the control-plane replica state: it
 /// lists a workload's **healthy, running** replicas (primary-first by replica
 /// index) as `(host, port)`, scoped to a fixed project. Backs the handler's
@@ -568,6 +457,30 @@ impl ComputeEndpointResolver for DeployEndpointResolver {
             .filter(|s| s.phase == ReplicaPhase::Running && s.healthy)
             .map(|s| (s.endpoint.host, s.endpoint.port))
             .collect())
+    }
+
+    /// Every replica state the control plane holds for `workload` (healthy or not), so
+    /// a "no healthy replica" error can honestly say whether replicas exist but none
+    /// passed the readiness probe — the reachability/health vs missing-workload split.
+    /// Off the hot path (only when `endpoints` came back empty); a store error yields no
+    /// diagnostics (the caller then falls back to the plainer message).
+    async fn replica_diagnostics(&self, workload: &str) -> Vec<ReplicaDiag> {
+        let states = match self
+            .deploy
+            .list_replica_states(ProjectRef::new(&self.project), workload)
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        states
+            .into_iter()
+            .map(|s| ReplicaDiag {
+                endpoint: format!("{}:{}", s.endpoint.host, s.endpoint.port),
+                healthy: s.healthy,
+                phase: format!("{:?}", s.phase),
+            })
+            .collect()
     }
 }
 
@@ -1105,8 +1018,6 @@ mod tests {
         use boatramp_core::compute::{ComputeWorkload, PlacementConstraints};
 
         let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
-        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-        let envelope: Option<Arc<dyn KeyEnvelope>> = Some(Arc::new(ReverseEnvelope));
         let p = ProjectRef::DEFAULT;
 
         let mut shared = db("postgres", Some("pg"), "", None);
@@ -1122,7 +1033,7 @@ mod tests {
         // BYO URL (not compute-backed) → NOT registered.
         dbs.insert("ext".to_string(), db("mysql", None, "MYSQL_URL", None));
 
-        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
 
         // The shared server workload was registered, desired 1 replica, spec stored.
         let wl = deploy
@@ -1142,7 +1053,7 @@ mod tests {
         );
 
         // Idempotent: a second pass leaves the same active spec (no churn).
-        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
         let wl2 = deploy.get_compute_workload(p, "pg").await.unwrap().unwrap();
         assert_eq!(wl2.active, wl.active, "re-run is a no-op");
 
@@ -1155,7 +1066,7 @@ mod tests {
             placement: PlacementConstraints::default(),
         };
         deploy.set_compute_workload(p, &operator).await.unwrap();
-        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
         let after = deploy.get_compute_workload(p, "pg").await.unwrap().unwrap();
         assert_eq!(
             after.replicas, 3,
@@ -1193,27 +1104,24 @@ mod tests {
             .expect("seed a current site deployment pointer");
     }
 
-    /// Fix 1 (Bug 2): a `Single` binding must NOT register a tenant-blind bare
-    /// `pg`/`default` workload. Instead it boot-warms one `pg-<ident>` per project WITH
-    /// resources, via the same `provision_tenant` path the lazy resolver uses. A
-    /// deliberately-empty `default` project is NOT resurrected. And a subsequent
-    /// `provision_tenant` for the same tenant is a no-op (exactly one workload).
+    /// Fix 1: a `Single` binding registers **nothing at boot** — even for a project with
+    /// deployed resources. The per-tenant `pg-<ident>` is created durably by the lazy
+    /// resolve (`provision_single`/`provision_tenant`) on the first `sql` use and
+    /// relaunched by the reconcile; the old boot-warm enumerated projects by
+    /// site/function (not `sql` use) and so over-warmed static-only projects into a
+    /// spurious DB. There must be no bare `pg`/`default` and no `pg-<ident>` at boot.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     #[tokio::test]
-    async fn auto_register_single_boot_warms_tenants_with_resources_only() {
+    async fn auto_register_single_registers_nothing_at_boot() {
         use crate::config::{TenantIsolation, TenantScope};
-        use crate::tenant_sql::{provision_tenant, tenant_key, TenantNames};
+        use crate::tenant_sql::tenant_key;
         use boatramp_storage::tenant_provision::sanitize_ident;
 
-        // The store's deploy-state KV is shared with the credential KV so `list_sites`
-        // and `provision_tenant` see the same world.
         let store_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
         let deploy = DeployStore::new(Arc::new(NullStorage), store_kv.clone());
-        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-        let envelope: Option<Arc<dyn KeyEnvelope>> = Some(Arc::new(ReverseEnvelope));
 
-        // A non-empty `construens` project (has a site) + a deliberately-empty `default`
-        // (present via `list_projects`' always-there backstop, but with no resources).
+        // A `construens` project that HAS a site — under the old boot-warm this would have
+        // been enumerated + provisioned into a `pg-<ident>`. It must NOT be now.
         seed_project_with_site(&deploy, &store_kv, "construens", "app").await;
 
         let mut single = db("postgres", Some("pg"), "", None);
@@ -1221,24 +1129,23 @@ mod tests {
         single.tenant_scope = TenantScope::Project;
 
         let mut dbs = BTreeMap::new();
-        dbs.insert("main".to_string(), single.clone());
+        dbs.insert("main".to_string(), single);
 
-        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
 
-        // The per-tenant workload `pg-<ident(construens)>` was registered under the
-        // `construens` project — NOT a bare `pg` and NOT under `default`.
+        // No per-tenant `pg-<ident>` under the resourced project.
         let (raw, _is_default) = tenant_key(TenantScope::Project, "construens", "");
-        let ident = sanitize_ident(&raw);
-        let derived = format!("pg-{ident}");
-        let wl = deploy
-            .get_compute_workload(ProjectRef::new("construens"), &derived)
-            .await
-            .unwrap()
-            .expect("per-tenant Single workload registered under its project");
-        assert_eq!(wl.name, derived);
-        assert_eq!(wl.replicas, 1);
-
-        // (a) No tenant-blind bare `pg`/`default` workload exists.
+        let derived = format!("pg-{}", sanitize_ident(&raw));
+        assert!(
+            deploy
+                .get_compute_workload(ProjectRef::new("construens"), &derived)
+                .await
+                .unwrap()
+                .is_none(),
+            "a Single binding must NOT boot-warm a per-tenant `pg-<ident>` (that is the lazy \
+             resolve's job on first `sql` use)"
+        );
+        // No tenant-blind bare `pg`/`default` either.
         assert!(
             deploy
                 .get_compute_workload(ProjectRef::DEFAULT, "pg")
@@ -1247,80 +1154,49 @@ mod tests {
                 .is_none(),
             "a Single binding must NOT register a tenant-blind bare `pg`/`default`"
         );
-        // (b) The empty `default` project's DB is not resurrected — no `pg` under it.
-        assert!(
-            deploy
-                .list_compute_workloads(ProjectRef::DEFAULT)
-                .await
-                .unwrap()
-                .is_empty(),
-            "an empty default project must not be warmed into a DB workload"
-        );
-
-        // Consistency with the lazy path: a subsequent `provision_tenant` for the same
-        // tenant is a no-op — exactly ONE workload, because both take `provision_tenant`.
-        let before = deploy
-            .get_compute_workload(ProjectRef::new("construens"), &derived)
-            .await
-            .unwrap()
-            .unwrap();
-        provision_tenant(
-            &deploy,
-            &kv,
-            &(Arc::new(ReverseEnvelope) as Arc<dyn KeyEnvelope>),
-            &single,
-            "construens",
-            "",
-        )
-        .await
-        .unwrap();
-        let after = deploy
-            .get_compute_workload(ProjectRef::new("construens"), &derived)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.active, before.active, "same workload, no divergence");
-
-        // The derived workload name is exactly what `tenant_names` (via provision) uses.
-        let names = TenantNames {
-            database: "analytics".into(),
-            role: String::new(),
-            workload: derived.clone(),
-        };
-        assert_eq!(names.workload, derived);
-    }
-
-    /// Fix 1: with NO `[secrets]` envelope, a `Single` binding's boot-warm is skipped
-    /// (it can't seal a per-tenant credential) — and crucially it still does NOT register
-    /// a tenant-blind bare `pg`. Shared, which needs no envelope, would still register.
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    #[tokio::test]
-    async fn auto_register_single_without_envelope_skips_and_never_registers_bare() {
-        use crate::config::TenantIsolation;
-
-        let store_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-        let deploy = DeployStore::new(Arc::new(NullStorage), store_kv.clone());
-        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
-        let envelope: Option<Arc<dyn KeyEnvelope>> = None;
-
-        seed_project_with_site(&deploy, &store_kv, "construens", "app").await;
-
-        let mut single = db("postgres", Some("pg"), "", None);
-        single.tenant = TenantIsolation::Single;
-
-        let mut dbs = BTreeMap::new();
-        dbs.insert("main".to_string(), single);
-
-        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
-
-        // No workload of any kind was registered (no bare `pg`, no per-tenant one).
+        // Nothing anywhere — a Single binding is a complete no-op at boot.
         assert!(
             deploy
                 .list_compute_workloads_all()
                 .await
                 .unwrap()
                 .is_empty(),
-            "without an envelope, Single boot-warm is skipped and never registers a bare `pg`"
+            "a Single binding registers no managed workload at boot"
+        );
+    }
+
+    /// Fix 1 (the over-warming bug proper): a `Single` binding + a project that owns ONLY
+    /// a static site (never used `sql`) must register **no** managed workload at boot —
+    /// no spurious `pg`/`pg-<ident>`. This is the exact construens repro (a static-only
+    /// `default` was getting a bogus `pg`).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[tokio::test]
+    async fn auto_register_single_static_only_project_gets_no_db_at_boot() {
+        use crate::config::{TenantIsolation, TenantScope};
+
+        let store_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), store_kv.clone());
+
+        // The reserved `default` project owns only a static site — it has never resolved
+        // `sql`, so no managed DB should ever be provisioned for it.
+        seed_project_with_site(&deploy, &store_kv, "default", "www").await;
+
+        let mut single = db("postgres", Some("pg"), "", None);
+        single.tenant = TenantIsolation::Single;
+        single.tenant_scope = TenantScope::Project;
+
+        let mut dbs = BTreeMap::new();
+        dbs.insert("main".to_string(), single);
+
+        auto_register_managed_db_workloads(&deploy, &dbs).await;
+
+        assert!(
+            deploy
+                .list_compute_workloads_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a static-only project must not get a spurious managed `pg` at boot"
         );
     }
 

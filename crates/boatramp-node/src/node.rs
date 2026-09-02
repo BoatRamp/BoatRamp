@@ -281,11 +281,6 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // one on hard-drop.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let reaper_envelope = secrets_envelope.clone();
-    // …and a fourth clone for the turnkey auto-register boot-warm below: a `Single`
-    // per-tenant DB seals a per-tenant credential at boot (via `provision_tenant`), so
-    // it needs the envelope; a `Shared` server does not (it warms no per-tenant state).
-    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
-    let auto_register_envelope = secrets_envelope.clone();
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     let managed_db_resolver: Option<Arc<dyn boatramp_core::compute::ManagedDbEnvResolver>> = match (
         config
@@ -313,11 +308,12 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // Turnkey managed DB: auto-register the compute workload(s) backing each managed
     // co-located database that has none yet, so declaring the `databases` binding is
     // enough to boot the DB (no separate `compute set` / apply). Tenant-aware — a
-    // `Shared` binding registers its one shared server; a `Single` binding boot-warms
-    // one dedicated `<compute>-<ident>` workload per tenant with deployed resources (via
-    // the same `provision_tenant` path the lazy resolver uses, so it never diverges),
-    // and never a tenant-blind bare `<compute>`. Non-clobbering + idempotent; runs
-    // before the reconcile loop so its first tick can launch what it registered.
+    // `Shared` binding registers its one shared server; a `Single` binding registers
+    // nothing at boot (its per-tenant `<compute>-<ident>` is created durably by the lazy
+    // resolve on first `sql` use and relaunched by the reconcile, so a project that never
+    // uses `sql` — e.g. a static-only site — never gets a spurious DB). Non-clobbering +
+    // idempotent; runs before the reconcile loop so its first tick can launch what it
+    // registered.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     if let Some(sql) = config
         .handlers
@@ -325,13 +321,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         .and_then(|h| h.bindings.sql.as_ref())
         .filter(|sql| !sql.databases.is_empty())
     {
-        crate::managed_sql::auto_register_managed_db_workloads(
-            &deploy,
-            &sql.databases,
-            &kv,
-            &auto_register_envelope,
-        )
-        .await;
+        crate::managed_sql::auto_register_managed_db_workloads(&deploy, &sql.databases).await;
     }
 
     // Operator SQL capability (managed-DB migrations/queries via the sealed

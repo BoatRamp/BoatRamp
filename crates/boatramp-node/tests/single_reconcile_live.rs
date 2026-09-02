@@ -106,10 +106,8 @@ use boatramp_core::project::ProjectRef;
 use boatramp_core::sql::{OperatorSql, SqlBackend, SqlValue};
 use boatramp_core::{ByteStream, GetObject, ObjectMeta, PutMeta, Storage, StorageError};
 use boatramp_node::config::{ExternalDatabaseConfig, TenantIsolation, TenantScope};
-use boatramp_node::managed_sql::{
-    auto_register_managed_db_workloads, ManagedSqlCredentials, NodeOperatorSql,
-};
-use boatramp_node::tenant_sql::NodeTenantSqlResolver;
+use boatramp_node::managed_sql::{ManagedSqlCredentials, NodeOperatorSql};
+use boatramp_node::tenant_sql::{provision_tenant, NodeTenantSqlResolver};
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -340,15 +338,16 @@ async fn drive(
 ) -> Result<(), String> {
     let binding = single_project_binding();
 
-    // --- Provision through the REAL boot-warm path. Seed the tenant + a site, then run
-    // `auto_register_managed_db_workloads` — the shipped boot reconcile's registration,
-    // which for a Single binding boot-warms `pg-<ident>` via the SAME `provision_tenant`
-    // the lazy resolver uses (byte-identical, non-clobbering). This registers the workload
-    // with its per-tenant volume + mints its sealed credential; NO container yet.
+    // --- Provision through the REAL lazy-resolve path. Seed the tenant + a site, then run
+    // `provision_tenant` — the SAME durable per-tenant provisioning the lazy `sql` resolver
+    // performs on first use (a Single binding no longer boot-warms; the reconcile relaunches
+    // what the lazy path registered). This registers the `pg-<ident>` workload with its
+    // per-tenant volume + mints its sealed credential; NO container yet.
     seed_project_with_site(deploy, kv).await;
     let dbs = std::collections::BTreeMap::from([(DB_NAME.to_string(), binding.clone())]);
-    let envelope_opt: Option<Arc<dyn KeyEnvelope>> = Some(envelope.clone());
-    auto_register_managed_db_workloads(deploy, &dbs, kv, &envelope_opt).await;
+    provision_tenant(deploy, kv, envelope, &binding, TENANT, "")
+        .await
+        .map_err(|e| format!("provision_tenant: {e}"))?;
 
     // === Assertion 1 (NO TWO-WORKLOAD SPLIT): exactly ONE managed workload for the tenant
     // — `pg-<ident>` under `construens` — and NONE under the reserved `default`. This is the

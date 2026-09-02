@@ -448,8 +448,26 @@ impl ComputeBackend for ContainerBackend {
         let connect = tokio::net::TcpStream::connect(addr.as_str());
         match tokio::time::timeout(Duration::from_secs(2), connect).await {
             Ok(Ok(_)) => Ok(Health::Healthy),
-            Ok(Err(_)) => Ok(Health::Unhealthy),
-            Err(_) => Ok(Health::Unknown),
+            // Surface WHY the readiness probe failed — the raw connect error
+            // (EHOSTUNREACH vs ECONNREFUSED vs …) is the fly-guest reachability
+            // discriminator. Without this the failure reason was swallowed and every
+            // `SELECT` only saw "no healthy replica".
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    addr = %addr,
+                    error = %e,
+                    "compute health: TCP connect to the container failed"
+                );
+                Ok(Health::Unhealthy)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    addr = %addr,
+                    timeout_secs = 2,
+                    "compute health: TCP connect to the container timed out"
+                );
+                Ok(Health::Unknown)
+            }
         }
     }
 
@@ -844,6 +862,14 @@ impl ContainerBackend {
         configure_in_netns(pid, &veth.peer_veth, ip, self.prefix, self.gateway)
             .map_err(|e| BackendError::Launch(format!("netns config: {e}")))?;
 
+        // One-shot network-state dump (diagnostics): reveal the exact L2/L3 state and the
+        // host→container reachability result right after the netns is configured, so a
+        // reachability failure (e.g. EHOSTUNREACH on a fly guest) is diagnosable from the
+        // boot logs. Gated by `BOATRAMP_COMPUTE_NET_DEBUG` (default ON for this rc); a
+        // Linux-only best-effort that never fails the launch.
+        let port = req.spec.port;
+        net_debug_dump(&req.workload, pid, &self.bridge, &veth.host_veth, ip, port).await;
+
         // Networking is ready — release the worker to jail + exec the entrypoint.
         cstdin
             .write_all(b"go\n")
@@ -864,7 +890,6 @@ impl ContainerBackend {
         self.spawn_log_capture(id, cstdout, cstderr).await?;
         drop(child);
 
-        let port = req.spec.port;
         Ok(Instance {
             handle: InstanceHandle {
                 workload: req.workload.clone(),
@@ -1226,6 +1251,341 @@ async fn rename_up_addr_route(
         .await
         .map_err(|e| format!("lo up: {e}"))?;
     Ok(())
+}
+
+/// The env var that gates the one-shot network-state dump. Default **ON** for this
+/// diagnostic rc — set it to `0`/`false`/`off`/`no` to silence the dump.
+const NET_DEBUG_ENV: &str = "BOATRAMP_COMPUTE_NET_DEBUG";
+
+/// Whether the one-shot network dump is enabled. Default ON (any value other than an
+/// explicit disable keeps it on), so a normal managed-DB launch's logs carry it without
+/// a special build; an operator who finds it noisy can turn it off.
+fn net_debug_enabled() -> bool {
+    match std::env::var(NET_DEBUG_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// One-shot, best-effort **network-state dump** for a freshly-configured container, so
+/// the boot logs reveal the exact L2/L3 state and host→container reachability result —
+/// the discriminator for a fly-guest reachability failure (EHOSTUNREACH vs
+/// connection-refused vs timeout). Runs once per launch (right after `configure_in_netns`)
+/// when [`net_debug_enabled`]. Every line is prefixed `compute-net-debug:` for grepping.
+///
+/// **In-process only — no external command is ever spawned.** boatramp's OCI image is a
+/// minimal static-musl build with no `iproute2`/`nsenter`/shell, so shelling out to
+/// `ip`/`bridge`/`nsenter` would only ever log "command not found" on the real fly guest.
+/// Instead every datum is read straight from the kernel:
+///
+/// - **HOST side** — the compute bridge and the host veth are queried over `rtnetlink`
+///   (the same connection pattern `host_setup`/`configure_in_netns` use): existence,
+///   `IFF_UP` + oper-state, and the host veth's `master` (controller) ifindex, resolved
+///   back to a name so it can be compared with the bridge's index. The bridge's IPv4
+///   address(es) come from `rtnetlink` too (confirming it carries the gateway `.1`). The
+///   host ARP/neighbour state for the container IP is parsed from `/proc/net/arp`
+///   (`Flags 0x2` = resolved, `0x0` = incomplete — decisive for EHOSTUNREACH).
+///   All of these run in the launcher's (host) netns, which is exactly where the bridge
+///   and host veth live.
+/// - **CONTAINER side** — read from `/proc/<pid>/net/*`, which reflects that pid's netns
+///   with no `setns`: `/proc/<pid>/net/dev` for the interface names (is `eth0` present ⇒
+///   the veth peer moved in?), `/proc/<pid>/net/fib_trie` for the container-netns LOCAL
+///   IPv4 addresses (did `eth0` actually get its IP?), and `/proc/<pid>/net/route` raw
+///   (the hex-encoded routing table incl. the default route) as a backstop.
+/// - **SELF-TEST** — a host→container TCP connect to `ip:port`, logging the EXACT error
+///   string AND `raw_os_error()` so the failure mode is unambiguous (113 EHOSTUNREACH vs
+///   111 ECONNREFUSED vs timeout).
+///
+/// The whole `backend` module is already Linux-gated (`lib.rs`), so this lives only on
+/// Linux (the `/proc/<pid>/net/*` and netlink reads it uses are Linux-only). Every read
+/// is best-effort: any failure is logged and the launch continues.
+async fn net_debug_dump(
+    workload: &str,
+    pid: u32,
+    bridge: &str,
+    host_veth: &str,
+    ip: Ipv4Addr,
+    port: u16,
+) {
+    use futures::TryStreamExt;
+    use netlink_packet_route::link::{LinkAttribute, LinkFlag};
+
+    if !net_debug_enabled() {
+        return;
+    }
+
+    macro_rules! dbg_line {
+        ($($arg:tt)*) => {
+            tracing::info!(
+                target: "boatramp_container::net_debug",
+                "compute-net-debug: {}",
+                format_args!($($arg)*)
+            )
+        };
+    }
+
+    dbg_line!("BEGIN dump for workload {workload:?} pid {pid} container {ip}:{port}");
+
+    // --- HOST side (rtnetlink, host netns) --------------------------------
+    // A single netlink connection drives every host-side query. If it can't be opened
+    // we fall back to the /sys/class/net reads below for the up/enslaved state.
+    match rtnetlink::new_connection() {
+        Ok((conn, handle, _)) => {
+            tokio::spawn(conn);
+
+            // Fetch one link by name → (ifindex, up?, oper-state, master ifindex).
+            async fn link_facts(
+                handle: &rtnetlink::Handle,
+                name: &str,
+            ) -> Result<(u32, bool, String, Option<u32>), String> {
+                let mut stream = handle.link().get().match_name(name.to_string()).execute();
+                match stream.try_next().await {
+                    Ok(Some(msg)) => {
+                        let index = msg.header.index;
+                        let up = msg.header.flags.contains(&LinkFlag::Up);
+                        let mut oper = "unknown".to_string();
+                        let mut master = None;
+                        for attr in &msg.attributes {
+                            match attr {
+                                LinkAttribute::OperState(state) => oper = format!("{state:?}"),
+                                LinkAttribute::Controller(idx) => master = Some(*idx),
+                                _ => {}
+                            }
+                        }
+                        Ok((index, up, oper, master))
+                    }
+                    Ok(None) => Err("no such link".to_string()),
+                    Err(e) => Err(format!("netlink error: {e}")),
+                }
+            }
+
+            // Resolve an ifindex back to a name (for the veth's master → bridge compare).
+            async fn link_name(handle: &rtnetlink::Handle, index: u32) -> Option<String> {
+                let mut stream = handle.link().get().match_index(index).execute();
+                match stream.try_next().await {
+                    Ok(Some(msg)) => msg.attributes.iter().find_map(|a| match a {
+                        LinkAttribute::IfName(n) => Some(n.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                }
+            }
+
+            // Bridge link facts.
+            let bridge_idx = match link_facts(&handle, bridge).await {
+                Ok((idx, up, oper, _master)) => {
+                    dbg_line!(
+                        "host bridge {bridge} link: exists, ifindex {idx}, up={up}, oper-state={oper}"
+                    );
+                    Some(idx)
+                }
+                Err(e) => {
+                    dbg_line!("host bridge {bridge} link: {e}");
+                    None
+                }
+            };
+
+            // Host veth link facts + master (enslaved-to-bridge?) resolution.
+            match link_facts(&handle, host_veth).await {
+                Ok((idx, up, oper, master)) => {
+                    let master_desc = match master {
+                        Some(m) => {
+                            let name = link_name(&handle, m).await;
+                            let enslaved = bridge_idx == Some(m);
+                            match name {
+                                Some(n) => format!(
+                                    "master={n} (ifindex {m}), enslaved-to-{bridge}={enslaved}"
+                                ),
+                                None => {
+                                    format!("master-ifindex={m}, enslaved-to-{bridge}={enslaved}")
+                                }
+                            }
+                        }
+                        None => "master=none (NOT enslaved)".to_string(),
+                    };
+                    dbg_line!(
+                        "host veth {host_veth} link: exists, ifindex {idx}, up={up}, oper-state={oper}, {master_desc} (bridge ifindex {bridge_idx:?})"
+                    );
+                }
+                Err(e) => dbg_line!("host veth {host_veth} link: {e}"),
+            }
+
+            // Bridge IPv4 address(es) — confirm it carries the gateway `.1`.
+            match bridge_idx {
+                Some(idx) => {
+                    let mut stream = handle.address().get().set_link_index_filter(idx).execute();
+                    let mut addrs: Vec<String> = Vec::new();
+                    loop {
+                        match stream.try_next().await {
+                            Ok(Some(msg)) => {
+                                let prefix = msg.header.prefix_len;
+                                for attr in &msg.attributes {
+                                    if let netlink_packet_route::address::AddressAttribute::Address(
+                                        addr,
+                                    ) = attr
+                                    {
+                                        if addr.is_ipv4() {
+                                            addrs.push(format!("{addr}/{prefix}"));
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                addrs.push(format!("(netlink error: {e})"));
+                                break;
+                            }
+                        }
+                    }
+                    if addrs.is_empty() {
+                        dbg_line!("host bridge {bridge} IPv4 addrs: (none)");
+                    } else {
+                        dbg_line!("host bridge {bridge} IPv4 addrs: {}", addrs.join(", "));
+                    }
+                }
+                None => {
+                    dbg_line!("host bridge {bridge} IPv4 addrs: (skipped — bridge ifindex unknown)")
+                }
+            }
+        }
+        Err(e) => {
+            // Netlink unavailable: fall back to /sys/class/net for the host bridge + veth
+            // up/enslaved state (the host netns, which is correct for both).
+            dbg_line!("host rtnetlink connection failed ({e}); falling back to /sys/class/net");
+            for iface in [bridge, host_veth] {
+                let oper = std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|e| format!("(read err: {e})"));
+                let master = std::fs::read_link(format!("/sys/class/net/{iface}/master"))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "none".to_string());
+                dbg_line!("host {iface} (sysfs): operstate={oper}, master={master}");
+            }
+        }
+    }
+
+    // Host ARP/neighbour state for the container IP (decisive for EHOSTUNREACH):
+    // /proc/net/arp is plain text — `IP HWtype Flags HWaddr Mask Device`.
+    // Flags 0x2 = resolved/REACHABLE, 0x0 = incomplete/failed.
+    let ip_str = ip.to_string();
+    match std::fs::read_to_string("/proc/net/arp") {
+        Ok(arp) => {
+            let mut found = None;
+            for line in arp.lines().skip(1) {
+                let mut cols = line.split_whitespace();
+                if cols.next() == Some(ip_str.as_str()) {
+                    // remaining: HWtype Flags HWaddr Mask Device
+                    let rest: Vec<&str> = cols.collect();
+                    found = Some(rest.join(" "));
+                    break;
+                }
+            }
+            match found {
+                Some(rest) => dbg_line!(
+                    "host ARP for {ip_str}: {rest} (Flags 0x2 = resolved/REACHABLE, 0x0 = incomplete)"
+                ),
+                None => dbg_line!("host ARP for {ip_str}: no ARP entry (L2 unresolved)"),
+            }
+        }
+        Err(e) => dbg_line!("host ARP for {ip_str}: (read /proc/net/arp err: {e})"),
+    }
+
+    // --- CONTAINER side (/proc/<pid>/net/*, the container's netns) ---------
+    // Interface names present in the container netns (is eth0 there ⇒ peer moved in?).
+    match std::fs::read_to_string(format!("/proc/{pid}/net/dev")) {
+        Ok(dev) => {
+            let ifaces: Vec<String> = dev
+                .lines()
+                .skip(2) // two header lines
+                .filter_map(|l| l.split(':').next())
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect();
+            dbg_line!(
+                "container(pid {pid}) net/dev ifaces (KEY: is eth0 present?): {}",
+                if ifaces.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    ifaces.join(", ")
+                }
+            );
+        }
+        Err(e) => dbg_line!("container(pid {pid}) net/dev: (read err: {e})"),
+    }
+
+    // Container-netns LOCAL IPv4 addresses via fib_trie: the `/32 host LOCAL` leaves are
+    // the addresses actually assigned to interfaces in this netns (did eth0 get its IP?).
+    match std::fs::read_to_string(format!("/proc/{pid}/net/fib_trie")) {
+        Ok(trie) => {
+            let locals = parse_fib_trie_locals(&trie);
+            dbg_line!(
+                "container(pid {pid}) fib_trie LOCAL addrs (KEY: did eth0 come up with {ip}?): {}",
+                if locals.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    locals.join(", ")
+                }
+            );
+        }
+        Err(e) => dbg_line!("container(pid {pid}) fib_trie: (read err: {e})"),
+    }
+
+    // Raw routing table (hex-encoded) as a backstop — carries the default route too.
+    match std::fs::read_to_string(format!("/proc/{pid}/net/route")) {
+        Ok(route) => {
+            let one_line = route.lines().collect::<Vec<_>>().join(" ¦ ");
+            dbg_line!("container(pid {pid}) net/route (raw, hex-encoded): {one_line}");
+        }
+        Err(e) => dbg_line!("container(pid {pid}) net/route: (read err: {e})"),
+    }
+
+    // --- SELF-TEST: host→container TCP connect, exact error + errno --------
+    let target = format!("{ip}:{port}");
+    let connect = tokio::net::TcpStream::connect(&target);
+    let probe = match tokio::time::timeout(Duration::from_secs(2), connect).await {
+        Ok(Ok(_)) => "OK (connected)".to_string(),
+        Ok(Err(e)) => format!("FAILED: {e} (os error: {:?})", e.raw_os_error()),
+        Err(_) => "FAILED: timed out after 2s".to_string(),
+    };
+    dbg_line!("SELF-TEST host->container TCP connect {target}: {probe}");
+    dbg_line!("END dump for workload {workload:?}");
+}
+
+/// Parse the LOCAL IPv4 leaves out of a `/proc/<pid>/net/fib_trie` dump. The file is an
+/// indented tree; each leaf is a `|-- <ip>` line followed by one or more
+/// `/<plen> <type> LOCAL` (or `/<plen> universe ...`) lines. We collect the `<ip>/<plen>`
+/// pairs whose type line contains `LOCAL` — those are the addresses assigned to an
+/// interface in this netns (as opposed to routes/broadcast). Best-effort text parse.
+fn parse_fib_trie_locals(trie: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current_ip: Option<String> = None;
+    for line in trie.lines() {
+        let trimmed = line.trim_start_matches(|c| c == ' ' || c == '|' || c == '+' || c == '-');
+        let trimmed = trimmed.trim();
+        // A leaf address line: the token after the tree glyphs is a bare IPv4 literal.
+        if let Some(first) = trimmed.split_whitespace().next() {
+            if first.parse::<Ipv4Addr>().is_ok() {
+                current_ip = Some(first.to_string());
+                continue;
+            }
+        }
+        // A prefix line under the current leaf: `/<plen> <scope> <type>`.
+        if trimmed.starts_with('/') && trimmed.contains("LOCAL") {
+            if let Some(ip) = &current_ip {
+                let plen = trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                out.push(format!("{ip}/{plen}"));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
