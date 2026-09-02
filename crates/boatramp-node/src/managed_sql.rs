@@ -284,14 +284,32 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
     }
 }
 
-/// Auto-register the compute workload backing each **managed co-located** database
-/// (compute-backed, no `password_env`) that has no workload yet, so declaring the
-/// `databases` binding is enough to boot the DB — no separate `compute set` / apply
-/// step (turnkey from a stock image on a bare host). Idempotent and non-clobbering:
-/// a workload the operator declared explicitly (apply / admin API) always wins;
-/// this only fills an absent one, and re-running is a no-op. Best-effort — a write
-/// failure is logged, never fatal (serving proceeds; the reconcile simply has
-/// nothing to launch for that DB until its workload exists).
+/// Auto-register the compute workload(s) backing each **managed co-located** database
+/// (compute-backed, no `password_env`), so declaring the `databases` binding is enough
+/// to boot the DB at serve time — no separate `compute set` / apply step (turnkey from
+/// a stock image on a bare host). Idempotent and non-clobbering: a workload the
+/// operator declared explicitly (apply / admin API) always wins; this only fills an
+/// absent one, and re-running is a no-op. Best-effort — a failure is logged, never
+/// fatal (serving proceeds; the reconcile simply has nothing to launch for that DB
+/// until its workload exists).
+///
+/// **Every compute-backed managed binding is per-tenant**, so this is tenant-aware —
+/// it must never register a tenant-blind bare `<compute>`/`default` workload that would
+/// collide with the tenant-aware `<compute>-<ident>` the resolver/provisioner produce
+/// (two servers, two `initdb` passwords, auth chaos). Per isolation:
+///
+/// - **`Shared`** — one shared server hosts every tenant's per-tenant database + role,
+///   so there IS exactly one server workload: the bare `<compute>` under the reserved
+///   default project, initialized from the binding's own env. Register it (non-clobbering);
+///   per-tenant DDL stays lazy (no boot-time connection).
+/// - **`Single`** — each tenant gets a *dedicated* container `<compute>-<ident>`. There
+///   is no shared server to warm, so enumerate the tenants that have deployed resources
+///   and call [`provision_tenant`] for each — the SAME path the lazy resolver + a
+///   create hook use, so the boot-warm registration is byte-identical + non-clobbering
+///   with them (whichever runs first, the other is a no-op ⇒ exactly one workload per
+///   tenant, never a stray bare `<compute>`). Materialising the sealed credential needs
+///   the `[secrets]` envelope; without one, Single boot-warm is skipped (the lazy path
+///   surfaces the same missing-envelope error clearly at first request).
 ///
 /// The synthesized spec comes from [`managed_db_spec`](boatramp_core::compute::managed_db_spec)
 /// — the same builder the container capability gate exercises — so the shipped
@@ -300,13 +318,10 @@ impl ManagedDbEnvResolver for ManagedDbEnv {
 pub async fn auto_register_managed_db_workloads(
     deploy: &DeployStore,
     databases: &std::collections::BTreeMap<String, crate::config::ExternalDatabaseConfig>,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Option<Arc<dyn KeyEnvelope>>,
 ) {
-    use boatramp_core::compute::{
-        managed_db_spec, ComputeWorkload, ManagedDbEngine, PlacementConstraints,
-    };
-
-    /// 10 GiB — the default managed data-volume size when the config sets none.
-    const DEFAULT_VOLUME_MIB: u32 = 10 * 1024;
+    use crate::config::TenantIsolation;
 
     for db in databases.values() {
         if !db.is_managed_credential() {
@@ -315,55 +330,201 @@ pub async fn auto_register_managed_db_workloads(
         let Some(workload) = db.compute.as_deref().filter(|c| !c.is_empty()) else {
             continue;
         };
-        let engine = match ExternalSqlKind::parse(&db.kind) {
-            Some(ExternalSqlKind::Postgres) => ManagedDbEngine::Postgres,
-            Some(ExternalSqlKind::Mysql) => ManagedDbEngine::Mysql,
-            // Config validation rejects an unparsable engine before serve; skip defensively.
-            None => continue,
+        // Config validation rejects an unparsable engine before serve; skip defensively.
+        if ExternalSqlKind::parse(&db.kind).is_none() {
+            continue;
+        }
+        match db.tenant {
+            // One shared server for all tenants: register the bare `<compute>` under the
+            // reserved default project (per-tenant databases live inside it, provisioned
+            // lazily — no boot-time connection).
+            TenantIsolation::Shared => {
+                register_shared_server(deploy, db, workload).await;
+            }
+            // A dedicated container per tenant: boot-warm each tenant that has resources
+            // via `provision_tenant` (the same path the lazy resolver uses), so there is
+            // never a tenant-blind bare `<compute>`/`default` workload.
+            TenantIsolation::Single => {
+                let Some(envelope) = envelope.as_ref() else {
+                    tracing::info!(
+                        %workload,
+                        "managed sql: `Single` per-tenant DB needs a [secrets] envelope to seal \
+                         a per-tenant credential; skipping boot-warm (the lazy resolve will \
+                         surface the same error at first request)"
+                    );
+                    continue;
+                };
+                auto_warm_single_tenants(deploy, kv, envelope, db, workload).await;
+            }
+        }
+    }
+}
+
+/// Register the ONE shared server workload for a `Shared` binding: the bare `<compute>`
+/// under the reserved default project, non-clobbering (an operator-declared workload
+/// wins; a re-run is a no-op). The synthesized spec is the tested `managed_db_spec` with
+/// the historical `"data"` volume (a shared server is never per-tenant-volume-isolated).
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn register_shared_server(
+    deploy: &DeployStore,
+    db: &crate::config::ExternalDatabaseConfig,
+    workload: &str,
+) {
+    use boatramp_core::compute::{
+        managed_db_spec, ComputeWorkload, ManagedDbEngine, PlacementConstraints,
+    };
+
+    /// 10 GiB — the default managed data-volume size when the config sets none.
+    const DEFAULT_VOLUME_MIB: u32 = 10 * 1024;
+
+    let engine = match ExternalSqlKind::parse(&db.kind) {
+        Some(ExternalSqlKind::Postgres) => ManagedDbEngine::Postgres,
+        Some(ExternalSqlKind::Mysql) => ManagedDbEngine::Mysql,
+        None => return,
+    };
+    // Non-clobbering: only fill an absent workload — an operator-declared one
+    // (apply / admin API) always wins, which also makes re-runs idempotent.
+    match deploy
+        .get_compute_workload(ProjectRef::DEFAULT, workload)
+        .await
+    {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(%workload, error = %e, "managed sql: could not check for an existing compute workload; skipping auto-register");
+            return;
+        }
+    }
+    let image = db.image.as_deref();
+    let spec = managed_db_spec(
+        engine,
+        image,
+        db.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
+    );
+    let spec_id = match deploy.put_compute_spec(&spec).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(%workload, error = %e, "managed sql: could not store the auto-registered compute spec");
+            return;
+        }
+    };
+    let wl = ComputeWorkload {
+        version: 1,
+        name: workload.to_string(),
+        active: spec_id,
+        replicas: 1,
+        placement: PlacementConstraints::default(),
+    };
+    match deploy.set_compute_workload(ProjectRef::DEFAULT, &wl).await {
+        Ok(()) => tracing::info!(
+            %workload,
+            image = %image.unwrap_or_else(|| engine.default_image()),
+            "managed sql: auto-registered the shared co-located database compute workload"
+        ),
+        Err(e) => {
+            tracing::warn!(%workload, error = %e, "managed sql: could not register the auto-registered compute workload")
+        }
+    }
+}
+
+/// Boot-warm the per-tenant `Single` workloads for a binding: for every tenant with
+/// deployed resources on the binding's scope, call [`provision_tenant`] — the same path
+/// the lazy resolver + a create hook take, so the registration is byte-identical and
+/// non-clobbering with them (exactly one `<compute>-<ident>` workload per tenant, never
+/// a bare `<compute>`/`default`). Best-effort per tenant (log-and-continue).
+///
+/// # Enumeration (deliberately resource-gated)
+///
+/// - **`Project` scope** — every project with ≥1 site OR ≥1 stored function.
+///   The reserved `default` project is included **only if it likewise has resources**,
+///   so a deliberately-removed/empty default DB is *not* resurrected (the whole point:
+///   the operator removed the default `pg` on purpose).
+/// - **`Site` scope** — for each such project, each of its sites.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn auto_warm_single_tenants(
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    db: &crate::config::ExternalDatabaseConfig,
+    workload: &str,
+) {
+    use crate::config::TenantScope;
+
+    let projects = match deploy.list_projects().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%workload, error = %e, "managed sql: could not list projects for Single boot-warm; skipping");
+            return;
+        }
+    };
+
+    for project in &projects {
+        let sites = match deploy.list_sites(ProjectRef::new(&project.name)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%workload, project = %project.name, error = %e, "managed sql: could not list sites for Single boot-warm; skipping project");
+                continue;
+            }
         };
-        // Non-clobbering: only fill an absent workload — an operator-declared one
-        // (apply / admin API) always wins, which also makes re-runs idempotent.
-        match deploy
-            .get_compute_workload(ProjectRef::DEFAULT, workload)
+        // A tenant is warmed only when it actually has deployed resources — so an empty
+        // (or deliberately-removed) project, including a deliberately-empty `default`,
+        // is never resurrected into a running DB container.
+        let has_functions = match deploy
+            .list_stored_functions(ProjectRef::new(&project.name))
             .await
         {
-            Ok(Some(_)) => continue,
-            Ok(None) => {}
+            Ok(f) => !f.is_empty(),
             Err(e) => {
-                tracing::warn!(%workload, error = %e, "managed sql: could not check for an existing compute workload; skipping auto-register");
-                continue;
-            }
-        }
-        let image = db.image.as_deref();
-        let spec = managed_db_spec(
-            engine,
-            image,
-            db.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
-        );
-        let spec_id = match deploy.put_compute_spec(&spec).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(%workload, error = %e, "managed sql: could not store the auto-registered compute spec");
-                continue;
+                tracing::warn!(%workload, project = %project.name, error = %e, "managed sql: could not list functions for Single boot-warm; treating as none");
+                false
             }
         };
-        let wl = ComputeWorkload {
-            version: 1,
-            name: workload.to_string(),
-            active: spec_id,
-            replicas: 1,
-            placement: PlacementConstraints::default(),
-        };
-        match deploy.set_compute_workload(ProjectRef::DEFAULT, &wl).await {
-            Ok(()) => tracing::info!(
-                %workload,
-                image = %image.unwrap_or_else(|| engine.default_image()),
-                "managed sql: auto-registered the co-located database compute workload"
-            ),
-            Err(e) => {
-                tracing::warn!(%workload, error = %e, "managed sql: could not register the auto-registered compute workload")
+        let has_resources = !sites.is_empty() || has_functions;
+        if !has_resources {
+            continue;
+        }
+
+        match db.tenant_scope {
+            // Project scope: the tenant IS the project (empty site).
+            TenantScope::Project => {
+                warm_one(deploy, kv, envelope, db, workload, &project.name, "").await;
+            }
+            // Site scope: each site of the project is a distinct tenant.
+            TenantScope::Site => {
+                for site in &sites {
+                    warm_one(deploy, kv, envelope, db, workload, &project.name, site).await;
+                }
             }
         }
+    }
+}
+
+/// Provision one Single tenant at boot (log-and-continue on error). A thin wrapper over
+/// [`provision_tenant`] so `auto_warm_single_tenants` reads clearly.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+async fn warm_one(
+    deploy: &DeployStore,
+    kv: &Arc<dyn KvStore>,
+    envelope: &Arc<dyn KeyEnvelope>,
+    db: &crate::config::ExternalDatabaseConfig,
+    workload: &str,
+    project: &str,
+    site: &str,
+) {
+    match crate::tenant_sql::provision_tenant(deploy, kv, envelope, db, project, site).await {
+        Ok(()) => tracing::info!(
+            %workload,
+            project,
+            site,
+            "managed sql: boot-warmed the per-tenant Single database workload"
+        ),
+        Err(e) => tracing::warn!(
+            %workload,
+            project,
+            site,
+            error = %e,
+            "managed sql: could not boot-warm a per-tenant Single database workload (best-effort; the lazy resolve retries)"
+        ),
     }
 }
 
@@ -452,8 +613,16 @@ impl NodeOperatorSql {
             SqlError::other(format!("database {db:?}: unknown engine {:?}", cfg.kind))
         })?;
         let timeout = cfg.connect_timeout_secs.map(std::time::Duration::from_secs);
-        if let Some(workload) = cfg.compute.as_deref().filter(|c| !c.is_empty()) {
-            // Managed or brought-credential compute-backed database.
+        if cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+            // Managed or brought-credential compute-backed database. Every compute-backed
+            // binding is **per-tenant**, so derive the tenant the SAME way the resolver
+            // does — otherwise operator `sql exec/query` would target the tenant-blind
+            // bare `<compute>`/`default` (Bug 2's operator arm) and reach the wrong DB.
+            let target = operator_target(cfg, project, db)?;
+
+            // The password source: an operator-supplied `password_env` (brought
+            // credential) reads the env var as before; a managed credential is unsealed
+            // under EXACTLY the key the provisioner/resolver used for this tenant.
             let password = match cfg.password_env.as_deref().filter(|v| !v.is_empty()) {
                 Some(var) => std::env::var(var)
                     .map_err(|_| SqlError::other(format!("env var {var} (password) is unset")))?,
@@ -464,18 +633,22 @@ impl NodeOperatorSql {
                         ))
                     })?;
                     ManagedSqlCredentials::new(self.kv.clone(), envelope)
-                        .password(project, workload)
+                        .password(&target.cred_project, &target.cred_workload)
                         .await
                         .map_err(SqlError::other)?
                 }
             };
-            let resolver = Arc::new(DeployEndpointResolver::new(self.deploy.clone(), project));
+
+            let resolver = Arc::new(DeployEndpointResolver::new(
+                self.deploy.clone(),
+                target.endpoint_project,
+            ));
             Ok(Arc::new(ComputeResolvedSqlBackend::new(
                 resolver,
-                workload,
+                target.workload,
                 kind,
-                cfg.database.clone().unwrap_or_default(),
-                cfg.user.clone().unwrap_or_default(),
+                target.database,
+                target.user,
                 password,
                 cfg.pool_max,
                 cfg.read_only,
@@ -500,6 +673,94 @@ impl NodeOperatorSql {
             connect(kind, &opts)
         }
     }
+}
+
+/// The tenant-resolved connection target for operator SQL against a compute-backed
+/// managed binding — the SAME derivation the per-tenant resolver
+/// (`NodeTenantSqlResolver::build_backend`) uses, so `sql exec/query` reaches the
+/// tenant's OWN database + credential rather than the tenant-blind bare
+/// `<compute>`/`default`. Pure (no IO), so the derivation is unit-testable.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+#[derive(Debug)]
+pub(crate) struct OperatorTarget {
+    /// The compute workload backing the connection (per-tenant for Single).
+    pub workload: String,
+    /// The physical database to connect to (the tenant's DB).
+    pub database: String,
+    /// The role/user to connect as.
+    pub user: String,
+    /// The project scope the workload's replica endpoints live under.
+    pub endpoint_project: String,
+    /// The `<project>` segment of the sealed credential's KV key.
+    pub cred_project: String,
+    /// The `<workload>` segment of the sealed credential's KV key.
+    pub cred_workload: String,
+}
+
+/// Derive the operator-SQL connection target for a compute-backed managed binding.
+///
+/// Operator SQL is **project-level** (there is no site in a `POST /api/sql/{db}/...`
+/// request), so the tenant is the project: `tenant_key(scope, project, "")`. A
+/// **site-scoped** managed DB has no single database at the project level, so this
+/// fails with a clear error rather than silently targeting the wrong (e.g. default) DB.
+///
+/// - **Single** — target the per-tenant workload `<compute>-<ident>` (bare `<compute>`
+///   for the default tenant), connect as the configured `user` to `names.database`,
+///   credential keyed by the workload's own `(single_credential_project, workload)`.
+/// - **Shared** — target the shared `<compute>` server, connect as the configured
+///   `user` (the server superuser, so an operator migration can touch any tenant's DB)
+///   to `names.database`, credential = the superuser's under `(DEFAULT_PROJECT,
+///   <compute>)`, never a per-tenant key.
+#[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+pub(crate) fn operator_target(
+    cfg: &crate::config::ExternalDatabaseConfig,
+    project: &str,
+    db: &str,
+) -> Result<OperatorTarget, SqlError> {
+    use crate::config::{TenantIsolation, TenantScope};
+    use crate::tenant_sql::{single_credential_project, tenant_key, tenant_names};
+    use boatramp_core::project::DEFAULT_PROJECT;
+
+    let compute = cfg
+        .compute
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| SqlError::other(format!("database {db:?}: not compute-backed")))?;
+    let database = cfg.database.as_deref().unwrap_or_default();
+    let user = cfg.user.as_deref().unwrap_or_default();
+
+    if matches!(cfg.tenant_scope, TenantScope::Site) {
+        return Err(SqlError::other(format!(
+            "database {db:?} is a site-scoped managed database; operator sql exec/query is \
+             project-level and cannot target a specific site's database"
+        )));
+    }
+
+    let (tenant_ident_raw, is_default) = tenant_key(cfg.tenant_scope, project, "");
+    let names = tenant_names(cfg.tenant, compute, database, &tenant_ident_raw, is_default);
+
+    let (cred_project, cred_workload) = match cfg.tenant {
+        TenantIsolation::Single => (
+            single_credential_project(project, is_default),
+            names.workload.clone(),
+        ),
+        // Shared: the superuser credential, under the reserved default project + the
+        // bare `<compute>` (exactly the server-init key), never a per-tenant key.
+        TenantIsolation::Shared => (DEFAULT_PROJECT.to_string(), compute.to_string()),
+    };
+    let endpoint_project = match cfg.tenant {
+        TenantIsolation::Single if !is_default => project.to_string(),
+        _ => DEFAULT_PROJECT.to_string(),
+    };
+
+    Ok(OperatorTarget {
+        workload: names.workload,
+        database: names.database,
+        user: user.to_string(),
+        endpoint_project,
+        cred_project,
+        cred_workload,
+    })
 }
 
 #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
@@ -827,20 +1088,25 @@ mod tests {
         assert!(resolver.endpoints("absent").await.unwrap().is_empty());
     }
 
+    /// A `Shared` binding registers exactly ONE shared server (bare `<compute>` under
+    /// the reserved default project), idempotently + non-clobbering. Per-tenant DDL is
+    /// lazy, so no envelope is needed for Shared boot-warm.
     #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
     #[tokio::test]
-    async fn auto_register_creates_managed_workloads_idempotently_and_never_clobbers() {
+    async fn auto_register_shared_registers_one_server_idempotently_and_never_clobbers() {
+        use crate::config::TenantIsolation;
         use boatramp_core::compute::{ComputeWorkload, PlacementConstraints};
 
         let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Option<Arc<dyn KeyEnvelope>> = Some(Arc::new(ReverseEnvelope));
         let p = ProjectRef::DEFAULT;
 
+        let mut shared = db("postgres", Some("pg"), "", None);
+        shared.tenant = TenantIsolation::Shared;
+
         let mut dbs = BTreeMap::new();
-        // Managed (compute-backed, no password_env) → auto-registered.
-        dbs.insert(
-            "analytics".to_string(),
-            db("postgres", Some("pg"), "", None),
-        );
+        dbs.insert("analytics".to_string(), shared);
         // BYO credential (compute-backed WITH password_env) → NOT managed, NOT registered.
         dbs.insert(
             "byo".to_string(),
@@ -849,14 +1115,14 @@ mod tests {
         // BYO URL (not compute-backed) → NOT registered.
         dbs.insert("ext".to_string(), db("mysql", None, "MYSQL_URL", None));
 
-        auto_register_managed_db_workloads(&deploy, &dbs).await;
+        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
 
-        // Only the managed workload was registered, desired 1 replica, spec stored.
+        // The shared server workload was registered, desired 1 replica, spec stored.
         let wl = deploy
             .get_compute_workload(p, "pg")
             .await
             .unwrap()
-            .expect("managed workload `pg` auto-registered");
+            .expect("shared server workload `pg` auto-registered");
         assert_eq!(wl.replicas, 1);
         assert!(!wl.active.is_empty(), "an active spec hash was stored");
         assert!(
@@ -869,7 +1135,7 @@ mod tests {
         );
 
         // Idempotent: a second pass leaves the same active spec (no churn).
-        auto_register_managed_db_workloads(&deploy, &dbs).await;
+        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
         let wl2 = deploy.get_compute_workload(p, "pg").await.unwrap().unwrap();
         assert_eq!(wl2.active, wl.active, "re-run is a no-op");
 
@@ -882,12 +1148,274 @@ mod tests {
             placement: PlacementConstraints::default(),
         };
         deploy.set_compute_workload(p, &operator).await.unwrap();
-        auto_register_managed_db_workloads(&deploy, &dbs).await;
+        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
         let after = deploy.get_compute_workload(p, "pg").await.unwrap().unwrap();
         assert_eq!(
             after.replicas, 3,
             "auto-register must not overwrite the operator's workload"
         );
         assert_eq!(after.active, "operatorspec");
+    }
+
+    /// Seed a `project` that exists (so `list_projects` returns it) and has a deployed
+    /// `site` (so `list_sites` returns it — the "has resources" signal). The project
+    /// pointer goes through `put_project`; the site's current-deployment pointer is
+    /// written directly (`project/<proj>/current/<site>`, per `deploy::keys::current`) —
+    /// exactly what `activate` leaves behind, without needing a real blob backend.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    async fn seed_project_with_site(
+        deploy: &DeployStore,
+        kv: &Arc<dyn KvStore>,
+        project: &str,
+        site: &str,
+    ) {
+        deploy
+            .put_project(&boatramp_core::project::Project {
+                version: 1,
+                name: project.to_string(),
+                created_at: 0,
+                meta: Default::default(),
+                config: Default::default(),
+                secrets_ref: None,
+            })
+            .await
+            .expect("seed the project pointer");
+        let key = format!("project/{project}/current/{site}");
+        kv.put(&key, b"deadbeef".to_vec())
+            .await
+            .expect("seed a current site deployment pointer");
+    }
+
+    /// Fix 1 (Bug 2): a `Single` binding must NOT register a tenant-blind bare
+    /// `pg`/`default` workload. Instead it boot-warms one `pg-<ident>` per project WITH
+    /// resources, via the same `provision_tenant` path the lazy resolver uses. A
+    /// deliberately-empty `default` project is NOT resurrected. And a subsequent
+    /// `provision_tenant` for the same tenant is a no-op (exactly one workload).
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[tokio::test]
+    async fn auto_register_single_boot_warms_tenants_with_resources_only() {
+        use crate::config::{TenantIsolation, TenantScope};
+        use crate::tenant_sql::{provision_tenant, tenant_key, TenantNames};
+        use boatramp_storage::tenant_provision::sanitize_ident;
+
+        // The store's deploy-state KV is shared with the credential KV so `list_sites`
+        // and `provision_tenant` see the same world.
+        let store_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), store_kv.clone());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Option<Arc<dyn KeyEnvelope>> = Some(Arc::new(ReverseEnvelope));
+
+        // A non-empty `construens` project (has a site) + a deliberately-empty `default`
+        // (present via `list_projects`' always-there backstop, but with no resources).
+        seed_project_with_site(&deploy, &store_kv, "construens", "app").await;
+
+        let mut single = db("postgres", Some("pg"), "", None);
+        single.tenant = TenantIsolation::Single; // (the default, made explicit)
+        single.tenant_scope = TenantScope::Project;
+
+        let mut dbs = BTreeMap::new();
+        dbs.insert("main".to_string(), single.clone());
+
+        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
+
+        // The per-tenant workload `pg-<ident(construens)>` was registered under the
+        // `construens` project — NOT a bare `pg` and NOT under `default`.
+        let (raw, _is_default) = tenant_key(TenantScope::Project, "construens", "");
+        let ident = sanitize_ident(&raw);
+        let derived = format!("pg-{ident}");
+        let wl = deploy
+            .get_compute_workload(ProjectRef::new("construens"), &derived)
+            .await
+            .unwrap()
+            .expect("per-tenant Single workload registered under its project");
+        assert_eq!(wl.name, derived);
+        assert_eq!(wl.replicas, 1);
+
+        // (a) No tenant-blind bare `pg`/`default` workload exists.
+        assert!(
+            deploy
+                .get_compute_workload(ProjectRef::DEFAULT, "pg")
+                .await
+                .unwrap()
+                .is_none(),
+            "a Single binding must NOT register a tenant-blind bare `pg`/`default`"
+        );
+        // (b) The empty `default` project's DB is not resurrected — no `pg` under it.
+        assert!(
+            deploy
+                .list_compute_workloads(ProjectRef::DEFAULT)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty default project must not be warmed into a DB workload"
+        );
+
+        // Consistency with the lazy path: a subsequent `provision_tenant` for the same
+        // tenant is a no-op — exactly ONE workload, because both take `provision_tenant`.
+        let before = deploy
+            .get_compute_workload(ProjectRef::new("construens"), &derived)
+            .await
+            .unwrap()
+            .unwrap();
+        provision_tenant(
+            &deploy,
+            &kv,
+            &(Arc::new(ReverseEnvelope) as Arc<dyn KeyEnvelope>),
+            &single,
+            "construens",
+            "",
+        )
+        .await
+        .unwrap();
+        let after = deploy
+            .get_compute_workload(ProjectRef::new("construens"), &derived)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.active, before.active, "same workload, no divergence");
+
+        // The derived workload name is exactly what `tenant_names` (via provision) uses.
+        let names = TenantNames {
+            database: "analytics".into(),
+            role: String::new(),
+            workload: derived.clone(),
+        };
+        assert_eq!(names.workload, derived);
+    }
+
+    /// Fix 1: with NO `[secrets]` envelope, a `Single` binding's boot-warm is skipped
+    /// (it can't seal a per-tenant credential) — and crucially it still does NOT register
+    /// a tenant-blind bare `pg`. Shared, which needs no envelope, would still register.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[tokio::test]
+    async fn auto_register_single_without_envelope_skips_and_never_registers_bare() {
+        use crate::config::TenantIsolation;
+
+        let store_kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), store_kv.clone());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let envelope: Option<Arc<dyn KeyEnvelope>> = None;
+
+        seed_project_with_site(&deploy, &store_kv, "construens", "app").await;
+
+        let mut single = db("postgres", Some("pg"), "", None);
+        single.tenant = TenantIsolation::Single;
+
+        let mut dbs = BTreeMap::new();
+        dbs.insert("main".to_string(), single);
+
+        auto_register_managed_db_workloads(&deploy, &dbs, &kv, &envelope).await;
+
+        // No workload of any kind was registered (no bare `pg`, no per-tenant one).
+        assert!(
+            deploy
+                .list_compute_workloads_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "without an envelope, Single boot-warm is skipped and never registers a bare `pg`"
+        );
+    }
+
+    /// Fix 2 (Bug 2, operator arm): for a `Single` project-scoped binding, operator
+    /// `sql exec/query` must target the per-tenant workload `pg-<ident>` under the
+    /// tenant's project and the per-tenant credential key — NOT the tenant-blind bare
+    /// `pg`/`default`. Asserted on the pure `operator_target` derivation.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn operator_target_single_targets_per_tenant_workload_and_cred() {
+        use crate::config::{TenantIsolation, TenantScope};
+        use crate::tenant_sql::tenant_key;
+        use boatramp_storage::tenant_provision::sanitize_ident;
+
+        let mut single = db("postgres", Some("pg"), "", None);
+        single.tenant = TenantIsolation::Single;
+        single.tenant_scope = TenantScope::Project;
+        single.database = Some("appdb".into());
+        single.user = Some("app".into());
+
+        // Non-default project tenant → derived per-tenant workload under its project.
+        let (raw, is_default) = tenant_key(TenantScope::Project, "construens", "");
+        assert!(!is_default);
+        let ident = sanitize_ident(&raw);
+        let derived = format!("pg-{ident}");
+
+        let t = operator_target(&single, "construens", "main").unwrap();
+        assert_eq!(
+            t.workload, derived,
+            "targets the per-tenant workload, not bare `pg`"
+        );
+        assert_eq!(t.database, "appdb");
+        assert_eq!(t.user, "app");
+        assert_eq!(
+            t.endpoint_project, "construens",
+            "a Single per-tenant workload's replicas live under its project"
+        );
+        // The credential key is the workload's OWN `(project, workload)` — matching
+        // provision_single + the server-init env injector, so operator SQL unseals the
+        // SAME password the container was initialized with.
+        assert_eq!(t.cred_project, "construens");
+        assert_eq!(t.cred_workload, derived);
+        assert_ne!(
+            t.cred_workload, "pg",
+            "never the bare tenant-blind workload"
+        );
+
+        // The reserved default project keeps the plain names (single-tenant install).
+        let d = operator_target(&single, "default", "main").unwrap();
+        assert_eq!(d.workload, "pg");
+        assert_eq!(d.cred_project, "default");
+        assert_eq!(d.cred_workload, "pg");
+        assert_eq!(d.endpoint_project, "default");
+    }
+
+    /// Fix 2: a `Shared` binding's operator SQL targets the shared server as the
+    /// superuser (credential under the reserved default project + bare `<compute>`)
+    /// against the tenant's per-tenant database.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn operator_target_shared_uses_superuser_cred_against_tenant_db() {
+        use crate::config::{TenantIsolation, TenantScope};
+        use crate::tenant_sql::tenant_key;
+        use boatramp_core::project::DEFAULT_PROJECT;
+        use boatramp_storage::tenant_provision::{sanitize_ident, tenant_db_name};
+
+        let mut shared = db("postgres", Some("pg"), "", None);
+        shared.tenant = TenantIsolation::Shared;
+        shared.tenant_scope = TenantScope::Project;
+        shared.database = Some("appdb".into());
+        shared.user = Some("postgres".into());
+
+        let (raw, _) = tenant_key(TenantScope::Project, "construens", "");
+        let ident = sanitize_ident(&raw);
+
+        let t = operator_target(&shared, "construens", "main").unwrap();
+        // The shared server workload, the tenant's per-tenant database, superuser user.
+        assert_eq!(t.workload, "pg");
+        assert_eq!(t.database, tenant_db_name("appdb", &ident));
+        assert_eq!(t.user, "postgres");
+        // The superuser credential key — reserved default project + bare `<compute>`.
+        assert_eq!(t.cred_project, DEFAULT_PROJECT);
+        assert_eq!(t.cred_workload, "pg");
+        assert_eq!(t.endpoint_project, DEFAULT_PROJECT);
+    }
+
+    /// Fix 2: a **site-scoped** managed DB has no single project-level database, so
+    /// operator SQL fails with a clear error rather than hitting the wrong DB.
+    #[cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
+    #[test]
+    fn operator_target_site_scoped_errors_clearly() {
+        use crate::config::{TenantIsolation, TenantScope};
+
+        let mut site = db("postgres", Some("pg"), "", None);
+        site.tenant = TenantIsolation::Single;
+        site.tenant_scope = TenantScope::Site;
+
+        let err = operator_target(&site, "construens", "main").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("site-scoped"),
+            "the error explains a site-scoped DB needs a site: {msg}"
+        );
     }
 }

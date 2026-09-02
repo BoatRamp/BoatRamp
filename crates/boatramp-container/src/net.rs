@@ -22,19 +22,72 @@ pub struct VethNetwork {
 }
 
 impl VethNetwork {
-    /// veth pair names for VM id `vm_id` on `bridge`. Names are capped to the
-    /// 15-char interface-name limit (`vth-<id>` / `cth-<id>`).
+    /// veth pair names for VM id `vm_id` on `bridge`.
+    ///
+    /// The Linux interface-name limit is 15 chars (`IFNAMSIZ - 1`), so the name must
+    /// fit `vth-`/`cth-` (4) + an 11-char body. A plain `truncate(15)` was a **latent
+    /// collision**: two distinct long workload names that share a 15-char prefix — e.g.
+    /// two `Single` per-tenant containers `pg-construens_AAAA…` vs `pg-construens_BBBB…`
+    /// whose sanitized idents diverge only after char 11 — collapse to the *same*
+    /// `vth-…` / `cth-…` name, so the second container's `host_setup` fails (or worse,
+    /// silently attaches to the first's veth). Instead, derive the 11-char body from a
+    /// **stable hash of the FULL `vm_id`** (base-36, so it's dense + ifname-safe), which
+    /// is deterministic (same `vm_id` ⇒ same names, for idempotent teardown/relaunch)
+    /// and collision-resistant across distinct long names.
     pub fn for_vm(vm_id: &str, bridge: &str) -> Self {
-        let mut host_veth = format!("vth-{vm_id}");
-        host_veth.truncate(15);
-        let mut peer_veth = format!("cth-{vm_id}");
-        peer_veth.truncate(15);
+        let body = veth_body(vm_id);
         Self {
-            host_veth,
-            peer_veth,
+            host_veth: format!("vth-{body}"),
+            peer_veth: format!("cth-{body}"),
             bridge: bridge.to_string(),
         }
     }
+}
+
+/// The ≤11-char interface-name body for `vm_id`. A short-enough `vm_id` keeps its
+/// literal name (readable, and byte-identical to the historical `vth-<id>` for the
+/// common `web-0` case); a longer one is replaced by an 11-char base-36 digest of the
+/// **whole** id so distinct long names never collapse to the same interface name.
+fn veth_body(vm_id: &str) -> String {
+    /// `15 - "vth-".len()` — the body must leave room for the 4-char prefix.
+    const MAX_BODY: usize = 11;
+    if vm_id.len() <= MAX_BODY {
+        return vm_id.to_string();
+    }
+    hash_b36(vm_id, MAX_BODY)
+}
+
+/// A stable, deterministic base-36 (`[0-9a-z]`) digest of `s`, `width` chars wide.
+///
+/// Uses FNV-1a over a 64-bit accumulator (with a second, differently-seeded pass so
+/// 11 base-36 chars — ~56.9 bits — carry more than one 64-bit hash's worth of entropy
+/// mixed in). Deterministic across builds/platforms (unlike `std`'s `DefaultHasher`,
+/// whose output is explicitly not stable), so the same `vm_id` always yields the same
+/// interface names — required for idempotent teardown/relaunch. Mirrors the base-36
+/// encoding style used for SQL-identifier disambiguation in `boatramp-storage`'s
+/// `tenant_provision`; a full 128-bit SHA-256 digest is overkill for a 15-char ifname.
+fn hash_b36(s: &str, width: usize) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    // Two independently-seeded FNV-1a passes → a 128-bit accumulator, so the base-36
+    // body draws from far more entropy than its ~57 bits can represent (no truncation
+    // artifact narrows the effective space).
+    let mut lo = FNV_OFFSET;
+    let mut hi = FNV_OFFSET ^ 0x9e37_79b9_7f4a_7c15;
+    for &b in s.as_bytes() {
+        lo = (lo ^ b as u64).wrapping_mul(FNV_PRIME);
+        hi = (hi.wrapping_add(b as u64)).wrapping_mul(FNV_PRIME);
+    }
+    let mut acc = ((hi as u128) << 64) | lo as u128;
+    let mut buf = vec![b'0'; width];
+    let mut i = width;
+    while acc > 0 && i > 0 {
+        i -= 1;
+        buf[i] = DIGITS[(acc % 36) as usize];
+        acc /= 36;
+    }
+    String::from_utf8(buf).expect("base-36 digits are ASCII")
 }
 
 /// A netlink networking error.
@@ -236,9 +289,15 @@ pub async fn ensure_bridge(
         .execute()
         .await
         .map_err(NetError::Rtnetlink)?;
-    // Give a bridge we just created the gateway address so containers can route out. On a
-    // pre-existing bridge the address is likely already present (`EEXIST`) or set on
-    // purpose, so an error there is tolerated; on a fresh one it is a real failure.
+    // Give the bridge the gateway address so containers can route out. This runs on
+    // BOTH a freshly-created bridge AND a pre-existing one: a stale bridge left by a
+    // prior boot (or another node) that never got — or somehow lost — its `.1` address
+    // would otherwise leave every container with an unreachable gateway, which looks
+    // exactly like the "broken first launch" auth chaos (packets never reach the DB).
+    // So we always assert the address and tolerate ONLY a genuine "already present"
+    // (`EEXIST`) — any other failure is real. (On a bridge someone else deliberately
+    // addressed differently, the add is a harmless `EEXIST` for the same address, or a
+    // real error we must surface rather than silently swallow.)
     match handle
         .address()
         .add(idx, std::net::IpAddr::V4(gateway), prefix_len)
@@ -246,9 +305,25 @@ pub async fn ensure_bridge(
         .await
     {
         Ok(()) => Ok(()),
-        Err(e) if created => Err(NetError::Rtnetlink(e)),
-        Err(_) => Ok(()),
+        // The address is already on the bridge — the steady-state re-ensure path.
+        Err(e) if is_already_exists(&e) => Ok(()),
+        Err(e) => Err(NetError::Rtnetlink(e)),
     }
+    .inspect(|()| {
+        if !created {
+            tracing::debug!(bridge, %gateway, "ensure_bridge: asserted gateway on pre-existing bridge");
+        }
+    })
+}
+
+/// Whether an rtnetlink error is a benign `EEXIST` — the address (or object) is
+/// already present, so asserting it again is a no-op success.
+#[cfg(target_os = "linux")]
+fn is_already_exists(e: &rtnetlink::Error) -> bool {
+    matches!(
+        e,
+        rtnetlink::Error::NetlinkError(n) if n.to_io().raw_os_error() == Some(nix::libc::EEXIST)
+    )
 }
 
 #[cfg(test)]
@@ -257,6 +332,8 @@ mod tests {
 
     #[test]
     fn names_are_derived_and_length_capped() {
+        // A short id keeps its literal, readable name (byte-identical to the historical
+        // `vth-<id>` — no churn for the common case).
         let v = VethNetwork::for_vm("web-0", "br-boatramp");
         assert_eq!(v.host_veth, "vth-web-0");
         assert_eq!(v.peer_veth, "cth-web-0");
@@ -264,6 +341,42 @@ mod tests {
         assert_eq!(long.host_veth.len(), 15);
         assert!(long.host_veth.starts_with("vth-"));
         assert!(long.peer_veth.starts_with("cth-"));
+    }
+
+    /// Two long `Single` per-tenant workload names that share a 15-char prefix (so a
+    /// plain `truncate(15)` collapsed them to the same interface name) must yield
+    /// DIFFERENT host AND peer veth names, each ≤15 chars, and the same name must be
+    /// stable across calls (idempotent teardown/relaunch).
+    #[test]
+    fn long_names_sharing_a_prefix_do_not_collide() {
+        // `pg-construens_xxx…<ident>`: identical through the first 15+ chars (the whole
+        // `truncate(15)` window), diverging only in the tail — the exact shape that
+        // collapsed under a plain truncation.
+        let a_id = "pg-construens_shared_prefix_AAAAAAAAAAAA";
+        let b_id = "pg-construens_shared_prefix_BBBBBBBBBBBB";
+        assert_eq!(
+            &a_id[..15],
+            &b_id[..15],
+            "the two ids share a 15-char prefix"
+        );
+
+        let a = VethNetwork::for_vm(a_id, "br-boatramp");
+        let b = VethNetwork::for_vm(b_id, "br-boatramp");
+
+        // Each name fits the 15-char ifname limit and keeps its prefix.
+        for n in [&a.host_veth, &a.peer_veth, &b.host_veth, &b.peer_veth] {
+            assert!(n.len() <= 15, "over the 15-char ifname limit: {n:?}");
+        }
+        assert!(a.host_veth.starts_with("vth-") && a.peer_veth.starts_with("cth-"));
+
+        // Distinct ids ⇒ distinct host AND peer names (the collision the fix closes).
+        assert_ne!(a.host_veth, b.host_veth, "host veth collision!");
+        assert_ne!(a.peer_veth, b.peer_veth, "peer veth collision!");
+
+        // Deterministic: the same id yields the same names every call.
+        let a_again = VethNetwork::for_vm(a_id, "br-boatramp");
+        assert_eq!(a.host_veth, a_again.host_veth);
+        assert_eq!(a.peer_veth, a_again.peer_veth);
     }
 
     /// Live: `ensure_bridge` creates the bridge over netlink (the exact thing that makes

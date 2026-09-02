@@ -1323,13 +1323,29 @@ async fn launch_one(
             artifact,
         })
         .await?;
+    // Probe readiness right after launch instead of asserting `healthy: true`
+    // unconditionally. A stock DB image (Postgres/MySQL) takes a moment to `initdb`
+    // and open its port, and a *first* launch can also fail outright (e.g. a broken
+    // gateway, a stale volume) yet still return a handle — so a blind `true` recorded
+    // a broken replica as healthy, and nothing ever retried it: only an unrelated
+    // process restart (whose health refresh finally observed it down → Stop → relaunch)
+    // "fixed" it. Recording the *actual* readiness here means the very next reconcile
+    // tick's health refresh + plan self-heals a broken first launch, no restart needed.
+    //
+    // The probe is bounded by the backend's own `health` timeout (a couple of seconds),
+    // so it never stalls the reconcile; `Unknown`/`Unhealthy`/`Err` all record
+    // `healthy: false` (the readiness is re-confirmed on the next tick regardless). The
+    // phase stays `Running` — the replica IS launched — so the next tick treats a
+    // still-unhealthy replica as a launched-but-unready one (Stop + relaunch) rather
+    // than a missing one (spurious extra launch).
+    let healthy = matches!(backend.health(&instance.handle).await, Ok(Health::Healthy));
     Ok(ObservedInstance {
         handle: instance.handle,
         node,
         backend: backend.id().to_string(),
         endpoint: instance.endpoint,
         region: node_region,
-        healthy: true,
+        healthy,
         phase: ReplicaPhase::Running,
         snapshot: None,
     })
@@ -2137,6 +2153,113 @@ mod tests {
         backend.stop(&inst.handle).await.unwrap();
         // Default snapshot/restore: unsupported.
         assert!(backend.snapshot(&inst.handle).await.unwrap().is_none());
+    }
+
+    /// A backend whose replicas launch but are **not yet ready** — `health` returns
+    /// `Unhealthy` (a stock DB image mid-`initdb`, or a broken first launch). Used to
+    /// prove `launch_one` records the real readiness rather than a blind `true`.
+    struct NotReadyBackend;
+
+    #[async_trait]
+    impl ComputeBackend for NotReadyBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(&self, _spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+            Ok(Artifact::Image {
+                reference: "img:latest".into(),
+            })
+        }
+        async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
+            Ok(Instance {
+                handle: InstanceHandle {
+                    workload: req.workload.clone(),
+                    replica: req.replica,
+                    backend_ref: format!("fake-{}", req.replica),
+                },
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Unhealthy)
+        }
+    }
+
+    /// Fix 3: `launch_one` probes readiness post-launch. A backend that launches but is
+    /// not yet ready must be recorded `healthy: false` (phase still `Running`), so the
+    /// next reconcile tick's health refresh + plan self-heals it (Stop + relaunch) with
+    /// no process restart — where the old unconditional `healthy: true` hid it forever.
+    #[tokio::test]
+    async fn launch_one_records_probed_readiness_not_a_blind_true() {
+        let s = spec(1, 128);
+        // Not-ready backend → healthy:false, but the replica IS launched (phase Running).
+        let unready = launch_one(&NotReadyBackend, "pg", 0, 1, None, &s, &[], None)
+            .await
+            .unwrap();
+        assert!(
+            !unready.healthy,
+            "a launched-but-unready replica is recorded unhealthy so the next tick relaunches it"
+        );
+        assert_eq!(unready.phase, ReplicaPhase::Running);
+
+        // A ready backend still records healthy:true (the happy path is unchanged).
+        let ready = launch_one(&FakeBackend, "pg", 0, 1, None, &s, &[], None)
+            .await
+            .unwrap();
+        assert!(ready.healthy);
+
+        // And the plan then Stops+relaunches the unhealthy one (RestartPolicy::Always),
+        // proving the self-heal — the whole point of recording real readiness.
+        let mut always = s.clone();
+        always.restart = RestartPolicy::Always;
+        let wl = ComputeWorkload {
+            version: 1,
+            name: "pg".into(),
+            active: "spec".into(),
+            replicas: 1,
+            placement: PlacementConstraints::default(),
+        };
+        let caps: BTreeMap<String, Capabilities> =
+            [("fake".to_string(), FakeBackend.capabilities())]
+                .into_iter()
+                .collect();
+        let actions = reconcile_plan(
+            &wl,
+            &always,
+            &[fake_node()],
+            &BackendPolicy::default(),
+            &[unready],
+            WorkloadActivity::Active,
+            &caps,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 0)),
+            "the unhealthy first launch is stopped: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica: 0, .. })),
+            "and its ordinal relaunched: {actions:?}"
+        );
     }
 
     /// A do-nothing blob backend so the driver test can build a `DeployStore`

@@ -192,7 +192,7 @@ pub struct TenantNames {
 /// binding's configured database name (the base for the physical database name).
 /// `is_default` = the reserved default tenant, which keeps the plain configured
 /// names (no `_<hash>` suffix).
-fn tenant_names(
+pub(crate) fn tenant_names(
     isolation: TenantIsolation,
     compute: &str,
     database: &str,
@@ -236,7 +236,7 @@ fn tenant_names(
 /// of the underlying [`ManagedSqlCredentials::password`] key; the returned string is
 /// the `workload` argument to that call, carrying the compute workload plus the
 /// sanitized tenant identity.
-fn credential_workload_key(compute: &str, tenant_ident: &str) -> String {
+pub(crate) fn credential_workload_key(compute: &str, tenant_ident: &str) -> String {
     format!("{compute}/{tenant_ident}")
 }
 
@@ -246,7 +246,7 @@ fn credential_workload_key(compute: &str, tenant_ident: &str) -> String {
 /// per-tenant workload `<compute>-<ident>` under that project). Kept beside
 /// [`credential_workload_key`] so the provision + resolve + env-injector paths
 /// derive the identical key.
-fn single_credential_project(project: &str, is_default: bool) -> String {
+pub(crate) fn single_credential_project(project: &str, is_default: bool) -> String {
     if is_default {
         DEFAULT_PROJECT.to_string()
     } else {
