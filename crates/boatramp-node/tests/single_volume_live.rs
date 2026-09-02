@@ -440,6 +440,7 @@ async fn provision_and_launch_tenant(
         endpoint: inst.endpoint.clone(),
         region: None,
         healthy: true,
+        started_at: None,
         phase: ReplicaPhase::Running,
         snapshot: None,
     };

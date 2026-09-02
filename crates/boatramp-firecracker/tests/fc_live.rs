@@ -48,6 +48,7 @@ fn spec() -> ComputeSpec {
         env: std::collections::BTreeMap::new(),
         port: 8080,
         restart: RestartPolicy::Never,
+        startup_grace_secs: 30,
         scale_to_zero: false,
         volumes: vec![],
         writable_root: false,

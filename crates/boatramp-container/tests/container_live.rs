@@ -103,6 +103,7 @@ fn spec_for(rootfs_hash: &str) -> ComputeSpec {
         env: std::collections::BTreeMap::new(),
         port: 8080,
         restart: RestartPolicy::Always,
+        startup_grace_secs: 30,
         scale_to_zero: false,
         volumes: vec![],
         writable_root: false,

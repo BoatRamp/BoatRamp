@@ -448,6 +448,7 @@ Manage Firecracker microVM compute workloads. See
 | `--env <K=V>` | — | Environment variable (repeatable). |
 | `--restart <always\|…>` | `always` | Restart policy. |
 | `--scale-to-zero` | `false` | Snapshot + stop when idle; restore on the next request. |
+| `--startup-grace-secs <n>` | `30` | Seconds a freshly launched replica has to become healthy before a still-unhealthy one is treated as a broken launch (stop + relaunch). Raise it for a slow-initializing image (a stock database's first `initdb`). Managed databases use a larger per-engine default (Postgres 60, MySQL 120). |
 | `--isolation <trusted\|untrusted>` | `trusted` | `untrusted` forces a microVM (never a shared kernel). |
 | `--region <name>` | — | Allowed placement region (repeatable; empty = any). |
 

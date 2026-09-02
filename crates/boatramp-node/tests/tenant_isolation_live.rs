@@ -297,6 +297,7 @@ async fn tenant_isolation_shared_postgres_denies_cross_tenant() {
         endpoint: inst.endpoint.clone(),
         region: None,
         healthy: true,
+        started_at: None,
         phase: ReplicaPhase::Running,
         snapshot: None,
     };

@@ -622,6 +622,15 @@ pub struct ObservedInstance {
     pub region: Option<String>,
     /// Whether the last health check passed (always `false` while `Zero`).
     pub healthy: bool,
+    /// Wall-clock unix seconds the replica was launched, set by `launch_one`. The
+    /// reconcile loop uses it to give a freshly launched replica a startup grace (see
+    /// [`ComputeSpec::startup_grace_secs`]) before treating a `Running`-but-unhealthy
+    /// replica as a broken launch to stop + relaunch — so a slow-initializing image is
+    /// not killed mid-init. `None` (older records, or a restored replica) is treated as
+    /// past-grace, preserving the prior immediate-relaunch behavior. `#[serde(default)]`
+    /// keeps older records deserializing — schema stays v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
     /// Lifecycle phase. `#[serde(default)]` keeps older records (no field)
     /// deserializing as [`Running`](ReplicaPhase::Running) — schema stays v1.
     #[serde(default)]
@@ -702,9 +711,19 @@ pub enum WorkloadActivity {
 /// Rules: replicas are addressed by ordinal `0..replicas`. A *healthy* in-range
 /// replica is kept. An out-of-range replica (scaled down) is **stopped**. An
 /// *unhealthy* in-range replica is **stopped** and its ordinal relaunched —
-/// unless the restart policy is `Never`, in which case it is left as a terminal
-/// (completed) instance and not relaunched. Free ordinals are placed onto
-/// eligible nodes; if capacity runs out, fewer launches are emitted.
+/// unless (a) the restart policy is `Never`, in which case it is left as a terminal
+/// (completed) instance and not relaunched, or (b) it is still within its **startup
+/// grace**: a `Running`-but-unhealthy replica whose `started_at` is within
+/// [`ComputeSpec::startup_grace_secs`] of `now` is treated as **starting** — left
+/// alone (no Stop, no duplicate Launch), so a slow-initializing image (a stock
+/// database's first `initdb`) is not killed mid-init into a crash loop. A replica with
+/// `started_at == None` (older records / restored) is treated as past-grace, preserving
+/// the prior immediate stop + relaunch. Free ordinals are placed onto eligible nodes;
+/// if capacity runs out, fewer launches are emitted.
+///
+/// `now` is the current wall-clock unix seconds, compared against each replica's
+/// `started_at` for the startup-grace check.
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile_plan(
     workload: &ComputeWorkload,
     spec: &ComputeSpec,
@@ -713,6 +732,7 @@ pub fn reconcile_plan(
     observed: &[ObservedInstance],
     activity: WorkloadActivity,
     caps: &BTreeMap<String, Capabilities>,
+    now: u64,
 ) -> Vec<Action> {
     let desired = workload.replicas;
     let mut actions = Vec::new();
@@ -726,6 +746,7 @@ pub fn reconcile_plan(
     let mut healthy: BTreeSet<u32> = BTreeSet::new();
     let mut terminal: BTreeSet<u32> = BTreeSet::new(); // Never + exited → done, don't relaunch
     let mut zeroed: BTreeSet<u32> = BTreeSet::new(); // scaled-to-zero → wake on activity, never relaunch
+    let mut starting: BTreeSet<u32> = BTreeSet::new(); // launched, still within its startup grace → leave alone
     for inst in observed
         .iter()
         .filter(|i| i.handle.workload == workload.name)
@@ -759,6 +780,16 @@ pub fn reconcile_plan(
             }
         } else if matches!(spec.restart, RestartPolicy::Never) {
             terminal.insert(ord); // run-to-completion: leave it, don't replace
+        } else if inst
+            .started_at
+            .is_some_and(|t| now.saturating_sub(t) < spec.startup_grace_secs as u64)
+        {
+            // Launched but still within its startup grace: it's *starting*, not broken.
+            // Leave it alone — don't Stop it (that would kill a slow first `initdb`
+            // mid-init) and don't relaunch its ordinal (excluded from `need` below).
+            // A missing `started_at` (older record / restored) falls through to the
+            // stop + relaunch arm, preserving the prior behavior.
+            starting.insert(ord);
         } else {
             actions.push(Action::Stop {
                 handle: inst.handle.clone(),
@@ -768,9 +799,15 @@ pub fn reconcile_plan(
     }
 
     // Ordinals in range that need a (re)launch — excluding intentionally parked
-    // (Zero) replicas, which wake via Restore rather than a fresh Launch.
+    // (Zero) replicas, which wake via Restore rather than a fresh Launch, and
+    // *starting* replicas, which are converging within their startup grace.
     let need: Vec<u32> = (0..desired)
-        .filter(|ord| !healthy.contains(ord) && !terminal.contains(ord) && !zeroed.contains(ord))
+        .filter(|ord| {
+            !healthy.contains(ord)
+                && !terminal.contains(ord)
+                && !zeroed.contains(ord)
+                && !starting.contains(ord)
+        })
         .collect();
     if need.is_empty() {
         return actions;
@@ -976,6 +1013,18 @@ pub fn managed_db_spec(
     image: Option<&str>,
     volume_size_mib: u32,
 ) -> ComputeSpec {
+    // A stock database's *first* boot runs `initdb` before it opens its port, so the
+    // reconcile loop must not mistake a still-initializing container for a broken
+    // launch and kill it into a crash loop. These per-engine graces bound that window
+    // (Postgres `initdb` ~10–30s; MySQL's first-boot bootstrap is markedly slower,
+    // 60s+). Generic compute keeps the smaller `default_startup_grace_secs()` (30).
+    const POSTGRES_STARTUP_GRACE_SECS: u32 = 60;
+    const MYSQL_STARTUP_GRACE_SECS: u32 = 120;
+
+    let startup_grace_secs = match engine {
+        ManagedDbEngine::Postgres => POSTGRES_STARTUP_GRACE_SECS,
+        ManagedDbEngine::Mysql => MYSQL_STARTUP_GRACE_SECS,
+    };
     let data_dir = engine.data_dir();
     let (entrypoint, env) = match engine {
         ManagedDbEngine::Postgres => (
@@ -1018,6 +1067,7 @@ pub fn managed_db_spec(
         env,
         port: engine.port(),
         restart: RestartPolicy::Always,
+        startup_grace_secs,
         scale_to_zero: false,
         volumes: vec![VolumeRef {
             mount: data_dir.to_string(),
@@ -1111,6 +1161,7 @@ pub async fn reconcile_once(
             &observed,
             workload_activity,
             &caps,
+            crate::time::now_unix(),
         ) {
             match action {
                 Action::Launch {
@@ -1260,6 +1311,7 @@ pub async fn reconcile_once(
                                 endpoint: instance.endpoint,
                                 region: region_of_node(nodes, node),
                                 healthy: true,
+                                started_at: Some(crate::time::now_unix()),
                                 phase: ReplicaPhase::Running,
                                 snapshot: None,
                             };
@@ -1303,6 +1355,9 @@ async fn launch_one(
     extra_env: &[(String, String)],
     privilege: Option<&PrivilegeDirective>,
 ) -> Result<ObservedInstance, BackendError> {
+    // The launch wall-clock time, so the next reconcile tick can grant this replica a
+    // startup grace before treating it as a broken launch (see `reconcile_plan`).
+    let started_at = crate::time::now_unix();
     let artifact = backend.materialize(spec).await?;
     // Fold the resolved binding env into the launched spec. The workload's own env
     // wins on a collision, so a hand-set value is never clobbered by a binding.
@@ -1346,6 +1401,7 @@ async fn launch_one(
         endpoint: instance.endpoint,
         region: node_region,
         healthy,
+        started_at: Some(started_at),
         phase: ReplicaPhase::Running,
         snapshot: None,
     })
@@ -1388,6 +1444,13 @@ mod tests {
         assert_eq!(my.root, RootSource::Image("mysql:8.4".into()));
         assert_eq!(my.port, 3306);
         assert_eq!(my.volumes[0].mount, "/var/lib/mysql");
+
+        // Per-engine startup graces (slow first `initdb`): Postgres 60, MySQL 120 —
+        // both above the generic 30 a plain compute spec carries.
+        assert_eq!(pg.startup_grace_secs, 60);
+        assert_eq!(my.startup_grace_secs, 120);
+        assert_eq!(default_startup_grace_secs(), 30);
+        assert_eq!(spec(1, 64).startup_grace_secs, 30);
     }
 
     #[test]
@@ -1428,6 +1491,7 @@ mod tests {
             env: BTreeMap::new(),
             port: 80,
             restart: RestartPolicy::Always,
+            startup_grace_secs: 30,
             scale_to_zero: false,
             volumes: vec![],
             writable_root: false,
@@ -1809,6 +1873,9 @@ mod tests {
             },
             region: None,
             healthy,
+            // No launch time: treated as past-grace (the baseline behavior these
+            // helpers exercise); the startup-grace tests set `started_at` explicitly.
+            started_at: None,
             phase: ReplicaPhase::Running,
             snapshot: None,
         }
@@ -1835,6 +1902,9 @@ mod tests {
         policy: &BackendPolicy,
         observed: &[ObservedInstance],
     ) -> Vec<Action> {
+        // A `now` far past any `started_at` (the baseline helpers set `started_at:
+        // None` anyway, which is unconditionally past-grace) so the startup-grace path
+        // stays inert here — the grace tests drive `reconcile_plan` directly.
         reconcile_plan(
             wl,
             spec,
@@ -1843,6 +1913,7 @@ mod tests {
             observed,
             WorkloadActivity::Active,
             &BTreeMap::new(),
+            u64::MAX,
         )
     }
 
@@ -1882,6 +1953,7 @@ mod tests {
             &obs,
             WorkloadActivity::Idle,
             &s2z_caps(),
+            u64::MAX,
         );
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], Action::Snapshot { handle } if handle.replica == 0));
@@ -1900,6 +1972,7 @@ mod tests {
             &obs,
             WorkloadActivity::Idle,
             &BTreeMap::new(),
+            u64::MAX,
         );
         assert!(no_cap.is_empty(), "no capable backend: {no_cap:?}");
         // Capable backend, but the spec didn't opt in → no snapshot.
@@ -1911,6 +1984,7 @@ mod tests {
             &obs,
             WorkloadActivity::Idle,
             &s2z_caps(),
+            u64::MAX,
         );
         assert!(no_opt.is_empty(), "not opted in: {no_opt:?}");
     }
@@ -1927,6 +2001,7 @@ mod tests {
             &obs,
             WorkloadActivity::Active,
             &s2z_caps(),
+            u64::MAX,
         );
         assert_eq!(actions.len(), 1);
         assert!(
@@ -1946,6 +2021,7 @@ mod tests {
             &obs,
             WorkloadActivity::Idle,
             &s2z_caps(),
+            u64::MAX,
         );
         // Idle → no restore, and crucially no Launch (the parked ordinal is not
         // treated as a missing replica).
@@ -1967,6 +2043,7 @@ mod tests {
             &obs,
             WorkloadActivity::Active,
             &s2z_caps(),
+            u64::MAX,
         );
         assert!(actions
             .iter()
@@ -2049,6 +2126,130 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::Launch { replica: 1, .. })));
+    }
+
+    /// An `observed` replica with an explicit `started_at`, for the startup-grace path.
+    fn observed_started(
+        workload: &str,
+        replica: u32,
+        node: u64,
+        healthy: bool,
+        started_at: Option<u64>,
+    ) -> ObservedInstance {
+        ObservedInstance {
+            started_at,
+            ..observed(workload, replica, node, healthy)
+        }
+    }
+
+    #[test]
+    fn reconcile_leaves_a_starting_replica_within_its_startup_grace() {
+        // A Running-but-unhealthy replica launched 10s ago, grace 60s → still starting.
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let now = 1_000_000u64;
+        let mut s = spec(1, 256);
+        s.startup_grace_secs = 60;
+        let obs = vec![observed_started("w", 0, 1, false, Some(now - 10))];
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s,
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            now,
+        );
+        // Mid-init: neither stopped nor relaunched (it counts toward `desired`).
+        assert!(
+            actions.is_empty(),
+            "a replica within its startup grace is left alone: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_relaunches_a_replica_past_its_startup_grace() {
+        // Same replica, launched 120s ago, grace 60s → past grace → broken → self-heal.
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let now = 1_000_000u64;
+        let mut s = spec(1, 256);
+        s.startup_grace_secs = 60;
+        let obs = vec![observed_started("w", 0, 1, false, Some(now - 120))];
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s,
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            now,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 0)),
+            "past-grace unhealthy replica is stopped: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Launch { replica: 0, .. })),
+            "and its ordinal relaunched: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_treats_started_at_none_as_past_grace() {
+        // `started_at: None` (older record / restored) → immediate stop + relaunch,
+        // exactly the prior behavior — even with a large grace and `now`.
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let mut s = spec(1, 256);
+        s.startup_grace_secs = 3600;
+        let obs = vec![observed_started("w", 0, 1, false, None)];
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s,
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            1_000_000,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop { handle } if handle.replica == 0)),
+            "None started_at preserves the prior immediate relaunch: {actions:?}"
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Launch { replica: 0, .. })));
+    }
+
+    #[test]
+    fn a_starting_replica_counts_toward_desired_and_is_not_duplicated() {
+        // desired=1 with one starting replica → NO new Launch (it's not a missing slot).
+        let nodes = vec![vmm(1, "eu", 8, 8192)];
+        let now = 1_000_000u64;
+        let mut s = spec(1, 256);
+        s.startup_grace_secs = 60;
+        let obs = vec![observed_started("w", 0, 1, false, Some(now - 5))];
+        let actions = reconcile_plan(
+            &workload(1, Default::default()),
+            &s,
+            &nodes,
+            &BackendPolicy::default(),
+            &obs,
+            WorkloadActivity::Active,
+            &BTreeMap::new(),
+            now,
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Launch { .. })),
+            "a starting replica fills its ordinal — no duplicate Launch: {actions:?}"
+        );
     }
 
     #[test]
@@ -2239,6 +2440,10 @@ mod tests {
             [("fake".to_string(), FakeBackend.capabilities())]
                 .into_iter()
                 .collect();
+        // Advance `now` past the startup grace so the self-heal fires — this test is
+        // about a *genuinely broken* launch (still unhealthy after its grace), not a
+        // mid-init replica (which the startup-grace test covers).
+        let past_grace = unready.started_at.unwrap() + always.startup_grace_secs as u64 + 1;
         let actions = reconcile_plan(
             &wl,
             &always,
@@ -2247,6 +2452,7 @@ mod tests {
             &[unready],
             WorkloadActivity::Active,
             &caps,
+            past_grace,
         );
         assert!(
             actions

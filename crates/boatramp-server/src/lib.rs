@@ -2693,6 +2693,7 @@ mod tests {
             },
             region: None,
             healthy,
+            started_at: None,
             phase,
             snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {
                 workload: workload.into(),

@@ -246,6 +246,27 @@ privilege strategy automatically — no `--user`/`--cap-add` needed. The strateg
 against its pre-owned volume, no capabilities, any posture) or `caps` (add the minimal
 set; single-tenant only).
 
+## Startup grace (slow-starting images)
+
+A freshly launched replica gets a **startup grace**: the reconcile loop leaves a
+still-unhealthy replica alone until the grace elapses, treating it as *starting* rather
+than a broken launch to stop and relaunch. This keeps a slow-initializing image — a stock
+database doing its first `initdb` — from being killed mid-init into a crash loop. Only
+after the grace does a replica that is still unhealthy get stopped + relaunched (the
+self-heal for a genuinely broken launch).
+
+`--startup-grace-secs` sets it on any workload; omit it for the default (**30s**):
+
+```sh
+boatramp compute set worker --image acme/slow-boot:1 --port 8080 --startup-grace-secs 90
+```
+
+**Managed databases raise it automatically.** A managed co-located database uses a
+larger per-engine default — **Postgres 60s**, **MySQL 120s** — because a stock database's
+first boot runs `initdb` before it opens its port. Override it per binding with
+`startup_grace_secs` (or the env var
+`BOATRAMP_HANDLERS_SQL_DB_<NAME>_STARTUP_GRACE_SECS`); omit it for the engine default.
+
 ## Manage persistent volumes
 
 Unregistering a workload (`compute rm`) leaves its **persistent volume** on disk, so its

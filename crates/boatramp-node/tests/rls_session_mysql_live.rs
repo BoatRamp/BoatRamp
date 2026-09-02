@@ -285,6 +285,7 @@ async fn rls_session_guard_holds_live_mysql() {
         endpoint: inst.endpoint.clone(),
         region: None,
         healthy: true,
+        started_at: None,
         phase: ReplicaPhase::Running,
         snapshot: None,
     };

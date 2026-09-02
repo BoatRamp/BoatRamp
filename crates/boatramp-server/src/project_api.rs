@@ -433,6 +433,7 @@ mod tests {
             env: Default::default(),
             port: 8080,
             restart: RestartPolicy::Always,
+            startup_grace_secs: 30,
             scale_to_zero: false,
             volumes: vec![VolumeRef {
                 mount: "/data".into(),

@@ -396,11 +396,17 @@ async fn register_shared_server(
         }
     }
     let image = db.image.as_deref();
-    let spec = managed_db_spec(
+    let mut spec = managed_db_spec(
         engine,
         image,
         db.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
     );
+    // An operator-set startup grace overrides the engine default the synthesizer picked.
+    // Applied identically here and in `provision_single` so the two managed-registration
+    // paths build the byte-identical (content-addressed) spec.
+    if let Some(grace) = db.startup_grace_secs {
+        spec.startup_grace_secs = grace;
+    }
     let spec_id = match deploy.put_compute_spec(&spec).await {
         Ok(id) => id,
         Err(e) => {
@@ -1034,6 +1040,7 @@ mod tests {
             },
             region: None,
             healthy,
+            started_at: None,
             phase,
             snapshot: None,
         }

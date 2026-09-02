@@ -126,6 +126,12 @@ enum ComputeCommand {
         /// Snapshot + stop when idle; restore on the next request.
         #[arg(long)]
         scale_to_zero: bool,
+        /// Seconds a freshly launched replica has to become healthy before the reconcile
+        /// loop treats a still-unhealthy replica as a broken launch to stop + relaunch.
+        /// Raise it for a slow-initializing image (a stock database's first `initdb`) so
+        /// it isn't killed mid-init. Omit for the default (30).
+        #[arg(long)]
+        startup_grace_secs: Option<u32>,
         /// Allow a writable root filesystem (honored only under the single-tenant
         /// posture; the hardened read-only root is the default). Prefer a persistent
         /// volume for app writes.
@@ -195,6 +201,11 @@ enum ComputeCommand {
         /// Snapshot + stop when idle.
         #[arg(long)]
         scale_to_zero: bool,
+        /// Seconds a freshly launched replica has to become healthy before it's treated
+        /// as a broken launch (see `compute set --startup-grace-secs`). Omit for the
+        /// default (30).
+        #[arg(long)]
+        startup_grace_secs: Option<u32>,
         /// Allow a writable root filesystem (single-tenant posture only; the
         /// hardened read-only root is the default). Prefer a persistent volume.
         #[arg(long)]
@@ -363,6 +374,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             env,
             restart,
             scale_to_zero,
+            startup_grace_secs,
             writable_root,
             cap_add,
             user,
@@ -403,6 +415,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 env,
                 restart,
                 scale_to_zero,
+                startup_grace_secs,
                 writable_root,
                 cap_add,
                 user,
@@ -425,6 +438,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
             env,
             restart,
             scale_to_zero,
+            startup_grace_secs,
             writable_root,
             cap_add,
             user,
@@ -476,6 +490,7 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                 env,
                 restart,
                 scale_to_zero,
+                startup_grace_secs,
                 writable_root,
                 cap_add,
                 user,
@@ -618,6 +633,7 @@ fn build_spec(
     env: Vec<String>,
     restart: Restart,
     scale_to_zero: bool,
+    startup_grace_secs: Option<u32>,
     writable_root: bool,
     cap_add: Vec<String>,
     user: Option<String>,
@@ -642,6 +658,10 @@ fn build_spec(
         env: env_map,
         port,
         restart: restart.into(),
+        // Omitted ⇒ the generic spec default (30). An operator raises it for a
+        // slow-initializing image.
+        startup_grace_secs: startup_grace_secs
+            .unwrap_or_else(boatramp_core::compute::default_startup_grace_secs),
         scale_to_zero,
         volumes: vec![],
         writable_root,
@@ -752,6 +772,82 @@ mod tests {
         }
         // `rm` requires a name.
         assert!(parse(&["compute", "volume", "rm"]).is_err());
+    }
+
+    #[test]
+    fn compute_set_startup_grace_parses_and_defaults() {
+        // `--startup-grace-secs 45` parses into the field and flows into the spec.
+        match parse(&[
+            "compute",
+            "set",
+            "db",
+            "--image",
+            "pgvector/pgvector:pg16",
+            "--port",
+            "5432",
+            "--startup-grace-secs",
+            "45",
+        ]) {
+            Ok(ComputeCommand::Set {
+                startup_grace_secs, ..
+            }) => assert_eq!(startup_grace_secs, Some(45)),
+            other => panic!("expected compute set, got {other:?}"),
+        }
+        // Omitted ⇒ None ⇒ the generic spec default (30) in `build_spec`.
+        match parse(&[
+            "compute",
+            "set",
+            "db",
+            "--image",
+            "pgvector/pgvector:pg16",
+            "--port",
+            "5432",
+        ]) {
+            Ok(ComputeCommand::Set {
+                startup_grace_secs, ..
+            }) => assert_eq!(startup_grace_secs, None),
+            other => panic!("expected compute set, got {other:?}"),
+        }
+
+        // The Some(45) value lands in the built spec; None yields the default (30).
+        let with = build_spec(
+            RootSource::Image("img".into()),
+            String::new(),
+            1,
+            256,
+            5432,
+            vec![],
+            vec![],
+            Restart::Always,
+            false,
+            Some(45),
+            false,
+            vec![],
+            None,
+            Isolation::Trusted,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(with.startup_grace_secs, 45);
+        let dflt = build_spec(
+            RootSource::Image("img".into()),
+            String::new(),
+            1,
+            256,
+            5432,
+            vec![],
+            vec![],
+            Restart::Always,
+            false,
+            None,
+            false,
+            vec![],
+            None,
+            Isolation::Trusted,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(dflt.startup_grace_secs, 30);
     }
 
     #[test]

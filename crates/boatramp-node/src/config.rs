@@ -454,6 +454,9 @@ impl ServerConfig {
                 if let Some(v) = source.parse(&format!("{prefix}VOLUME_SIZE_MIB"))? {
                     db.volume_size_mib = Some(v);
                 }
+                if let Some(v) = source.parse(&format!("{prefix}STARTUP_GRACE_SECS"))? {
+                    db.startup_grace_secs = Some(v);
+                }
                 if let Some(v) = source.parse_enum(
                     &format!("{prefix}TENANT"),
                     &[
@@ -641,6 +644,7 @@ const SQL_DB_ENV_PREFIX: &str = "BOATRAMP_HANDLERS_SQL_DB_";
 /// name-isolating strip matches the **longest** suffix first (`_READ_URL_ENV`
 /// before `_URL_ENV`). Each mirrors a field of [`ExternalDatabaseConfig`].
 const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
+    "_STARTUP_GRACE_SECS",
     "_CONNECT_TIMEOUT_SECS",
     "_VOLUME_SIZE_MIB",
     "_READ_URL_ENV",
@@ -1252,6 +1256,12 @@ pub struct ExternalDatabaseConfig {
     /// The persistent data-volume size in MiB for a **managed co-located** database
     /// (default 10240 = 10 GiB). Ignored for a bring-your-own database.
     pub volume_size_mib: Option<u32>,
+    /// Startup grace (seconds) for a **managed co-located** database: how long a
+    /// freshly launched server has to finish its first `initdb` before the reconcile
+    /// loop treats a still-unhealthy replica as a broken launch to stop + relaunch.
+    /// When set it overrides the engine default the synthesizer picks (Postgres 60,
+    /// MySQL 120). Omit to use that default. Ignored for a bring-your-own database.
+    pub startup_grace_secs: Option<u32>,
     /// **Isolation mechanism** for a compute-backed managed database (2×2 axis 1).
     /// `single` (default) — a *dedicated* database server (its own container) per
     /// tenant; `shared` — *one* server hosting a permission-separated database + role
@@ -1939,6 +1949,23 @@ mod tests {
         assert_eq!(events.url_env, "EVENTS_URL");
         assert_eq!(events.read_url_env.as_deref(), Some("EVENTS_RO_URL"));
         assert!(events.read_only);
+    }
+
+    #[test]
+    fn env_sets_managed_db_startup_grace() {
+        // The per-binding startup-grace override is env-settable like the other
+        // managed scalars, discovered by the `_STARTUP_GRACE_SECS` suffix.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_COMPUTE", "pg"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "appdb"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_USER", "app"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_STARTUP_GRACE_SECS", "90"),
+        ]))
+        .expect("valid env overrides apply");
+        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases[""];
+        assert_eq!(db.startup_grace_secs, Some(90));
     }
 
     #[test]

@@ -232,6 +232,7 @@ mod tests {
             env: BTreeMap::new(),
             port: 8080,
             restart: RestartPolicy::Always,
+            startup_grace_secs: 30,
             scale_to_zero: false,
             volumes: vec![],
             writable_root: false,

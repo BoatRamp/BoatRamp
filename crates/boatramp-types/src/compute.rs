@@ -121,6 +121,14 @@ pub struct VolumeRef {
     pub size_mib: u32,
 }
 
+/// The generic default startup grace (seconds) for a compute workload — the window a
+/// freshly launched replica has to become healthy before the reconcile loop treats a
+/// still-unhealthy one as a broken launch. Generic compute + micro-VM workloads use
+/// this; the managed-database synthesizer overrides it per engine (slower `initdb`).
+pub fn default_startup_grace_secs() -> u32 {
+    30
+}
+
 /// An immutable, content-addressed compute workload version (the analogue of a
 /// deployment manifest). Stored at `computever/<hash>`; the rootfs + kernel are
 /// blob hashes in the shared blob store (deduped, cached forever).
@@ -157,6 +165,15 @@ pub struct ComputeSpec {
     /// Restart policy for the guest process.
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Seconds a freshly launched replica is given to become healthy before the
+    /// reconcile loop treats a `Running`-but-unhealthy replica as a broken launch to
+    /// stop + relaunch. Within this grace the replica is "starting" (left alone), so a
+    /// slow-initializing image — a stock database's first `initdb` — is not killed
+    /// mid-init into a crash loop. Generic default is 30s (see [`default_startup_grace_secs`]);
+    /// the managed-database synthesizer raises it per engine. `#[serde(default …)]` keeps
+    /// older stored specs (no field) deserializing with the default — schema stays v1.
+    #[serde(default = "default_startup_grace_secs")]
+    pub startup_grace_secs: u32,
     /// Snapshot + stop when idle; restore on the next request (cold start).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scale_to_zero: bool,
@@ -338,6 +355,7 @@ mod tests {
             env: BTreeMap::from([("PORT".to_string(), "8080".to_string())]),
             port: 8080,
             restart: RestartPolicy::Always,
+            startup_grace_secs: 30,
             scale_to_zero: true,
             volumes: vec![],
             writable_root: false,
@@ -418,6 +436,25 @@ mod tests {
         let a = spec();
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<ComputeSpec>(&json).unwrap(), a);
+    }
+
+    #[test]
+    fn old_spec_without_startup_grace_deserializes_with_the_default() {
+        // An additive, `#[serde(default)]` field keeps schema at v1: a spec stored
+        // before `startup_grace_secs` existed (no such key) still deserializes, taking
+        // the generic default (30). `deny_unknown_fields` is on, so this proves the
+        // field is genuinely optional on read.
+        let old = r#"{
+            "version": 1,
+            "root": { "rootfs": "aaaa" },
+            "vcpus": 1,
+            "mem_mib": 256,
+            "port": 8080
+        }"#;
+        let spec: ComputeSpec = serde_json::from_str(old).expect("old spec deserializes");
+        assert_eq!(spec.version, 1, "schema stays v1");
+        assert_eq!(spec.startup_grace_secs, default_startup_grace_secs());
+        assert_eq!(spec.startup_grace_secs, 30);
     }
 
     #[test]

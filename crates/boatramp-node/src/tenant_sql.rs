@@ -394,6 +394,12 @@ async fn provision_single(
         binding.image.as_deref(),
         binding.volume_size_mib.unwrap_or(DEFAULT_VOLUME_MIB),
     );
+    // An operator-set startup grace overrides the engine default the synthesizer picked.
+    // Applied identically here and in the shared `auto_register` path so the two
+    // managed-registration paths build the byte-identical (content-addressed) spec.
+    if let Some(grace) = binding.startup_grace_secs {
+        spec.startup_grace_secs = grace;
+    }
     // Isolate a per-tenant (non-default) Single container's data volume (see
     // [`managed_volume_name`]).
     if let Some(vol) = spec.volumes.first_mut() {
@@ -1597,6 +1603,54 @@ mod tests {
         assert!(
             kv.get(default_cred).await.unwrap().is_some(),
             "acme delete must not touch the default install's credential"
+        );
+    }
+
+    /// An operator-set per-binding `startup_grace_secs` flows into the spec
+    /// `provision_single` stores (overriding the engine default), and it matches the
+    /// same override the shared `auto_register` path applies — the two managed
+    /// registration paths build the byte-identical (content-addressed) spec.
+    #[tokio::test]
+    async fn single_startup_grace_override_flows_into_the_stored_spec() {
+        let binding = ExternalDatabaseConfig {
+            tenant: TenantIsolation::Single,
+            tenant_scope: TenantScope::Project,
+            startup_grace_secs: Some(77),
+            ..shared_binding()
+        };
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+
+        // Provision the reserved default tenant (bare `pg` workload under DEFAULT).
+        provision_tenant(&deploy, &kv, &envelope, &binding, "default", "")
+            .await
+            .unwrap();
+
+        let wl = deploy
+            .get_compute_workload(ProjectRef::DEFAULT, "pg")
+            .await
+            .unwrap()
+            .expect("default Single workload registered");
+        let stored = deploy
+            .get_compute_spec(&wl.active)
+            .await
+            .unwrap()
+            .expect("active spec stored");
+        assert_eq!(
+            stored.startup_grace_secs, 77,
+            "the operator grace overrides the engine default in the stored spec"
+        );
+
+        // The stored spec equals `managed_db_spec(...)` + the same grace override the
+        // shared auto-register path applies — proving both paths are byte-identical
+        // (the default tenant keeps the base volume name, so no per-tenant divergence).
+        let mut expected = managed_db_spec(ManagedDbEngine::Postgres, None, DEFAULT_VOLUME_MIB);
+        expected.startup_grace_secs = binding.startup_grace_secs.unwrap();
+        assert_eq!(
+            stored.id(),
+            expected.id(),
+            "both managed-registration paths build the identical content-addressed spec"
         );
     }
 
