@@ -103,7 +103,7 @@ jobs:
   # image (a test-double, not a private artifact) plus a public pgvector image pulled
   # daemonless for the co-located managed-DB seam. No secrets.
   container:
-    name: container launch (root) + co-located Postgres + cross-tenant isolation + rls_session guard + mysql rls_session + single-vol isolation + CRIU (informational)
+    name: container launch (root) + co-located Postgres + cross-tenant isolation + rls_session guard + mysql rls_session + single-vol isolation + single reconcile stability + CRIU (informational)
     # Ubuntu 24.04 (noble) dropped the `criu` package; jammy still ships it. The native
     # container backend LAUNCH (userns + veth into br-boatramp + cgroup-v2 limits under a
     # delegated /sys/fs/cgroup/boatramp subtree + serve over HTTP) runs to GREEN here and
@@ -332,6 +332,41 @@ jobs:
             || { echo "::error::single-mode volume isolation test did not pass" >&2; exit 1; }
           grep -q 'SINGLE VOLUME ISOLATION OK' single-vol.log \
             || { echo "::error::single-mode volume isolation never reached the success marker (silent skip or shared-volume regression?)" >&2; exit 1; }
+
+      - name: Single-mode reconcile stability holds live (hard gate — the v0.3.12 fixes)
+        run: |
+          set -o pipefail
+          BIN="$(realpath target/debug/boatramp)"
+          # The load-bearing proof of the v0.3.12 fixes for construens' Single per-tenant
+          # managed Postgres. Before v0.3.12 the tenant DB was (Bug 1) unreachable on lazy
+          # provision until a process restart, and (Bug 2) after a boot reconcile the
+          # credential the CONTAINER was initdb'd with drifted from the one the PROCESS
+          # connected with — a tenant-blind bare `pg`/`default` duplicate workload + a
+          # tenant-blind operator path. For a non-default `construens` Single/project binding
+          # this boot-warms the tenant through the shipped `auto_register` path, launches its
+          # dedicated container, and asserts (1) exactly ONE managed workload `pg-<ident>`
+          # under `construens` and NONE (`pg`) under `default` (no two-workload split), (2)
+          # the SHIPPED resolver's `SELECT current_user` authenticates WITHOUT a restart
+          # (reachable), (3) after a boot-style reconcile (stop + relaunch on the same volume,
+          # initdb skipped) the credential is STILL valid (the P1 == P2 core), and (4) the
+          # `NodeOperatorSql` operator path reaches the tenant's OWN database + user (not a
+          # bare `pg`/`default`). No host DB client is needed — every connect goes through
+          # boatramp's own pg backend. --test-threads=1 so the launches don't contend on the
+          # single test bridge. The `sql-postgres` feature pulls the tenant_sql/managed_sql
+          # data plane in.
+          timeout -k 30 900 sudo -E env "PATH=$PATH" "BOATRAMP_BIN=$BIN" \
+            cargo test -p boatramp-node --features sql-postgres \
+            --test single_reconcile_live \
+            -- --ignored --test-threads=1 --nocapture 2>&1 | tee single-reconcile.log
+          # A silent skip (missing BOATRAMP_BIN) still prints `test result: ok` — the exact
+          # trap the project's anti-silent-skip rule guards against. Gate on the success marker
+          # that prints ONLY after the no-split, reachable-no-restart, credential-stable, AND
+          # operator-reaches-tenant assertions all held, so a skip or a regression (Bug 1 or
+          # Bug 2) fails the job.
+          grep -qE 'test result: ok' single-reconcile.log \
+            || { echo "::error::single-mode reconcile stability test did not pass" >&2; exit 1; }
+          grep -q 'SINGLE RECONCILE OK:' single-reconcile.log \
+            || { echo "::error::single-mode reconcile stability never reached the success marker (silent skip or a v0.3.12 regression?)" >&2; exit 1; }
 
       - name: CRIU checkpoint/restore (informational — restore is kernel-sensitive)
         continue-on-error: true

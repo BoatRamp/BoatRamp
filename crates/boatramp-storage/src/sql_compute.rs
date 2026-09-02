@@ -260,9 +260,32 @@ impl ComputeResolvedSqlBackend {
             .with_max_connections(self.pool_max)
             .read_only(self.read_only)
             .with_connect_timeout(self.connect_timeout);
-        let backend = connect(self.kind, &opts)?;
+        let backend = connect(self.kind, &opts).map_err(|e| self.hint_stale_volume(e))?;
         *cached = Some((url, Arc::clone(&backend)));
         Ok(backend)
+    }
+
+    /// Turn a bare password-authentication failure into an actionable operator hint.
+    /// A managed workload's container bakes its credential at first `initdb`; if its
+    /// data volume was initialized with a *different* credential (a stale volume
+    /// re-attached — e.g. carried over from before the sealed credential rotated or a
+    /// KEK it can't be unsealed under), the container keeps the old password and every
+    /// connection fails auth. There is no way to reset a container's own superuser
+    /// password from outside, so the fix is to reclaim the volume and let it re-`initdb`
+    /// against the current credential — point the operator at `compute volume rm`.
+    fn hint_stale_volume(&self, err: SqlError) -> SqlError {
+        let msg = err.to_string();
+        if msg.contains("password authentication failed") || msg.contains("Access denied for user")
+        {
+            return SqlError::other(format!(
+                "{msg} — the managed workload `{w}`'s data volume was initialized with a \
+                 different credential than the current sealed one. Reclaim it so it \
+                 re-initializes against the current credential: `boatramp compute rm {w}` \
+                 then `boatramp compute volume rm {w}` (destroys that workload's data).",
+                w = self.workload
+            ));
+        }
+        err
     }
 }
 

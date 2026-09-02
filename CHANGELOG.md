@@ -5,6 +5,47 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.12] - 2026-09-02
+
+### Fixed
+- **A `Single` per-tenant managed database is now reachable and stably authenticated.**
+  Two bugs made a per-tenant `tenant = single` managed Postgres/MySQL unusable:
+  - **The two-workload split.** Boot-time auto-registration was tenant-blind — it
+    registered a bare `<compute>` (e.g. `pg`) workload under the `default` project (its
+    own volume + credential) *in addition to* the tenant-aware `<compute>-<ident>`
+    workload the resolver provisions under the tenant's project. Two containers were
+    launched with two different `initdb` passwords, and the operator `sql exec/query`
+    path was likewise tenant-blind, so the credential a container was initialised with no
+    longer matched the one the server connected with after a restart
+    (`password authentication failed`). Auto-registration is now **tenant-aware**: for a
+    `single` binding it boot-warms the per-tenant workload for every project that has
+    deployed resources (default or not), through the **same** provisioning path as the
+    lazy resolver — byte-identical and non-clobbering, so there is exactly one container
+    per tenant and no `default` duplicate. The operator path derives the same per-tenant
+    workload + credential. (An empty `default` project is not warmed, so a deliberately
+    removed default database is not resurrected.)
+  - **Killed mid-`initdb`.** A freshly launched replica is now health-probed instead of
+    assumed healthy, but the reconcile stopped and relaunched any not-yet-ready replica
+    with no grace — so a slow first `initdb` was killed on the next 30 s tick, into a
+    crash loop. A launched replica within its **startup grace** is now treated as
+    *starting* (never stopped or relaunched) until it comes up; only past the grace does
+    an unhealthy replica get relaunched (which also self-heals a genuinely broken launch
+    without needing a process restart).
+- **Per-tenant container networking is reliable.** The host/guest veth names are now
+  derived from a hash of the full workload id instead of a 15-character truncation (long
+  per-tenant workload names no longer collide onto one veth), and `ensure_bridge`
+  re-asserts the bridge gateway address even on a pre-existing bridge (a stale bridge from
+  a prior boot can no longer leave containers with an unreachable gateway).
+
+### Added
+- **Configurable compute startup grace — `ComputeSpec.startup_grace_secs`.** How long a
+  freshly launched replica may take to become healthy before the reconcile treats it as a
+  broken launch. Sensible per-target defaults — generic compute / micro-VM **30 s**,
+  managed **Postgres 60 s**, managed **MySQL 120 s** — overridable with
+  `compute set --startup-grace-secs <n>` or, for a managed binding,
+  `BOATRAMP_HANDLERS_SQL_DB_<name>_STARTUP_GRACE_SECS`. (Additive, schema-v1-compatible;
+  older stored specs read the default.)
+
 ## [0.3.11] - 2026-09-02
 
 ### Added
