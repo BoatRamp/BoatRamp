@@ -80,6 +80,10 @@ enum Format {
 pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
     let server = client::resolve_server(args.server, config)?;
     let http = client::http_client(client::token(config).as_deref());
+    // Honor the global `--project`: operator SQL is project-owned, so target
+    // `projects/<proj>/sql` (or bare `sql` for the default project) — otherwise a
+    // per-tenant managed DB under a non-default project can't be reached.
+    let seg = client::project_seg(&client::resolve_project(config), "sql");
 
     match args.command {
         SqlCommand::Exec { db, file } => {
@@ -93,7 +97,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
                 }
             };
             let resp = http
-                .post(format!("{server}/api/sql/{db}/exec"))
+                .post(format!("{server}/api/{seg}/{db}/exec"))
                 .json(&serde_json::json!({ "sql": sql }))
                 .send()
                 .await?;
@@ -109,7 +113,7 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
         }
         SqlCommand::Query { db, sql, format } => {
             let resp = http
-                .post(format!("{server}/api/sql/{db}/query"))
+                .post(format!("{server}/api/{seg}/{db}/query"))
                 .json(&serde_json::json!({ "sql": sql }))
                 .send()
                 .await?;

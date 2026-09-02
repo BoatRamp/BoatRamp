@@ -38,6 +38,13 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     "workflows",
     "graphql",
     "secrets",
+    // Operator SQL to a project's managed database (`/api/projects/<proj>/sql/<db>/…`).
+    // Without this, `boatramp sql exec/query --project <p>` could only ever reach the
+    // *default* project's DB, so a per-tenant (`tenant_scope = project`) managed database
+    // — e.g. `pg-<ident>` under a non-default project — was unreachable by the operator
+    // tool (it resolved to the bare `pg`/default workload). The `sql_exec`/`sql_query`
+    // handlers already honor the injected `ProjectContext`.
+    "sql",
 ];
 
 /// The tenant project a request targets, injected as a request extension by
