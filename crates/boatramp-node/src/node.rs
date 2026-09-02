@@ -249,6 +249,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         worker_exe.as_deref(),
     )
     .await;
+    // Adopt the IPs of already-running replicas into each backend's fresh-on-boot
+    // IP pool BEFORE the reconcile loop starts allocating. A backend with a per-node
+    // pool (the native container backend) rebuilds it empty each process start; without
+    // this the boot reconcile could re-hand a live address to a different workload —
+    // the container-IP collision — or move a replica's endpoint on relaunch. Feeds
+    // every persisted replica's `(workload, replica, endpoint-ip)`; each backend keeps
+    // only the IPs in its own subnet (a cheap no-op for docker/cloudflare/VMM).
+    crate::compute::adopt_running_replica_ips(&deploy, &compute_backends).await;
     // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener +
     // build the resolver when a sql provider and `compute.sql_shim_url` are both present.
     #[cfg(feature = "handlers")]

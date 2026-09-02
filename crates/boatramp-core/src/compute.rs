@@ -274,6 +274,19 @@ pub trait ComputeBackend: Send + Sync {
     /// Idempotent + content-addressed (cache/dedup by spec id).
     async fn materialize(&self, spec: &ComputeSpec) -> Result<Artifact, BackendError>;
 
+    /// **Adopt** the guest IPs already assigned to persisted/running replicas of
+    /// this backend, so a fresh-on-boot IP pool reflects addresses in use before it
+    /// hands out any new one. Called once at node startup with every known replica as
+    /// `(workload, replica, endpoint_ip)`; the backend reserves the ones it owns
+    /// (those in its own subnet), skipping the rest, and remembers each replica's
+    /// address so a relaunch reclaims the same endpoint (stable) rather than a fresh
+    /// one. Without this a backend that rebuilds its pool each process start (the
+    /// native `container` backend) could re-hand a live address to a different
+    /// workload — the container-IP collision. Backends that don't own a per-node IP
+    /// pool (docker / cloudflare delegate addressing) default to a no-op, so they are
+    /// unaffected.
+    async fn reserve_in_use(&self, _replicas: &[(String, u32, std::net::Ipv4Addr)]) {}
+
     /// Launch one replica; returns its handle + routable endpoint.
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError>;
 

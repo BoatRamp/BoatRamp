@@ -116,6 +116,119 @@ fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// The per-node guest-IP lifecycle: an [`IpPool`] plus the `(workload,replica) → ip`
+/// assignment map. The map is what keeps a replica's endpoint **stable** across a
+/// relaunch and prevents a live address being re-handed to a different workload (the
+/// container-IP collision). The allocation *decisions* are the pure, host-tested
+/// [`IpPool`] methods (`reserve_in_use`/`is_free`/`allocate`) — this struct only
+/// tracks ownership so a stop can release an IP only when it is truly the last user,
+/// and a relaunch can reclaim its own address in place. Guarded by the backend's
+/// `Mutex`, so concurrent launches each observe/commit under the lock and can never
+/// be handed the same address.
+struct IpLifecycle {
+    pool: IpPool,
+    assigned: std::collections::BTreeMap<(String, u32), Ipv4Addr>,
+}
+
+impl IpLifecycle {
+    fn new(pool: IpPool) -> Self {
+        Self {
+            pool,
+            assigned: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Adopt the endpoint IPs of already-known replicas into the fresh pool (boot
+    /// startup), keyed by `(workload,replica)` so each can later reclaim its own
+    /// address. `reserve_in_use` skips the gateway + any IP outside this pool's CIDR
+    /// (a replica on another backend/subnet), so passing the whole fleet is safe.
+    fn adopt(&mut self, replicas: &[(String, u32, Ipv4Addr)]) {
+        let ips: Vec<Ipv4Addr> = replicas.iter().map(|(_, _, ip)| *ip).collect();
+        self.pool.reserve_in_use(&ips);
+        for (w, r, ip) in replicas {
+            // Only record an address this pool manages (in-subnet, non-gateway); an
+            // out-of-subnet endpoint (another backend/subnet) isn't ours to track.
+            if self.pool.manages(*ip) {
+                self.assigned.insert((w.clone(), *r), *ip);
+            }
+        }
+    }
+
+    /// Allocate the IP for a launching replica: reclaim its own recorded address
+    /// (stable across a relaunch) when it still holds it or the address is free;
+    /// otherwise allocate a fresh, node-unique one. A pre-existing collision (the
+    /// recorded address held by another live replica) is broken here by re-homing
+    /// this replica to a unique address.
+    fn launch(&mut self, workload: &str, replica: u32) -> Result<Ipv4Addr, BackendError> {
+        let key = (workload.to_string(), replica);
+        let recorded = self.assigned.get(&key).copied();
+        let ip = match recorded {
+            // This replica's own address (no other live holder): reclaim it. Ensure
+            // it is reserved (a prior stop may have released it) — this is exactly
+            // `allocate_stable`, which reuses a free preferred address or, if it is
+            // still reserved (by this replica's adoption), leaves it held.
+            Some(ip) if self.owns(&key, ip) => {
+                self.pool.reserve(ip); // idempotent — keeps a released-then-reclaimed IP held
+                ip
+            }
+            // Recorded but held by *another* live replica (a stale collision), or no
+            // record at all: let the pool decide — reuse `recorded` iff it is free,
+            // else a fresh unique address. Never re-homes onto a live IP.
+            _ => self
+                .pool
+                .allocate_stable(recorded)
+                .map_err(|e| BackendError::Launch(e.to_string()))?,
+        };
+        self.assigned.insert(key, ip);
+        Ok(ip)
+    }
+
+    /// Free `ip` on a failed launch, but only if no live replica still holds it, and
+    /// forget the `(workload,replica)` record so a retry re-decides cleanly.
+    fn launch_failed(&mut self, workload: &str, replica: u32, ip: Ipv4Addr) {
+        self.assigned.remove(&(workload.to_string(), replica));
+        self.release_if_last(ip);
+    }
+
+    /// Stop: forget the replica and release its address — only when no other live
+    /// replica still maps to it (so tearing down one side of a stale collision can't
+    /// free the address the surviving replica holds). `backend_ref` is `<ip>:<port>`.
+    fn stop(&mut self, workload: &str, replica: u32, backend_ref: &str) {
+        let key = (workload.to_string(), replica);
+        // Prefer the recorded assignment; fall back to the handle's ref (older
+        // records, or a replica this process never launched itself).
+        let ip = self
+            .assigned
+            .remove(&key)
+            .or_else(|| backend_ref.split(':').next().and_then(|s| s.parse().ok()));
+        if let Some(ip) = ip {
+            self.release_if_last(ip);
+        }
+    }
+
+    /// Re-reserve `ip` for a scale-to-zero **restore** (the wake reuses the parked
+    /// replica's original endpoint), recording ownership.
+    fn reserve_for(&mut self, workload: &str, replica: u32, ip: Ipv4Addr) {
+        self.pool.reserve(ip);
+        self.assigned.insert((workload.to_string(), replica), ip);
+    }
+
+    /// Whether `key` is the only recorded holder of `ip`.
+    fn owns(&self, key: &(String, u32), ip: Ipv4Addr) -> bool {
+        !self
+            .assigned
+            .iter()
+            .any(|(k, &held)| k != key && held == ip)
+    }
+
+    /// Release `ip` only if no remaining assignment holds it (last-user rule).
+    fn release_if_last(&mut self, ip: Ipv4Addr) {
+        if !self.assigned.values().any(|&held| held == ip) {
+            self.pool.release(ip);
+        }
+    }
+}
+
 /// The native container backend: rootfs staging + per-node IPAM + veth wiring,
 /// re-execing this binary as the self-jail worker.
 pub struct ContainerBackend {
@@ -130,8 +243,11 @@ pub struct ContainerBackend {
     /// Path to this `boatramp` binary, re-execed as `__sandbox` (and, for a
     /// scale-to-zero wake, as `__criu-net-setup`).
     self_exe: PathBuf,
-    /// Per-node guest-IP pool.
-    ipam: Mutex<IpPool>,
+    /// Per-node guest-IP lifecycle: the pool plus the `(workload,replica) → ip`
+    /// assignment map that keeps a replica's endpoint **stable** across a relaunch
+    /// and **unique** node-wide. Adopted from persisted state at startup (see
+    /// [`ContainerBackend::reserve_in_use`]).
+    ipam: Mutex<IpLifecycle>,
     /// A usable `criu` (present + `criu check` passed) enables scale-to-zero;
     /// `None` leaves the backend without it (the scheduler routes such workloads
     /// elsewhere). Detected once at construction.
@@ -169,7 +285,7 @@ impl ContainerBackend {
             prefix: net.prefix_len(),
             gateway: ipam.gateway(),
             self_exe,
-            ipam: Mutex::new(ipam),
+            ipam: Mutex::new(IpLifecycle::new(ipam)),
             criu: crate::criu::Criu::detect(),
             cap_add_allowed: false,
             userns_base: crate::worker::USERNS_HOST_BASE,
@@ -393,6 +509,16 @@ impl ComputeBackend for ContainerBackend {
         })
     }
 
+    /// Adopt the endpoint IPs of already-known replicas at startup so this
+    /// fresh-on-boot pool reflects addresses already in use before it allocates any
+    /// new one — closing the container-IP collision — and remember each replica's
+    /// address so a relaunch reclaims the same endpoint (stable). Only the IPs in
+    /// this backend's subnet are reserved (the rest are skipped by
+    /// `IpPool::reserve_in_use`).
+    async fn reserve_in_use(&self, replicas: &[(String, u32, Ipv4Addr)]) {
+        self.ipam.lock().expect("ipam mutex").adopt(replicas);
+    }
+
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
         let rootfs = match &req.artifact {
             Artifact::Rootfs { dir } => dir.clone(),
@@ -403,10 +529,13 @@ impl ComputeBackend for ContainerBackend {
             }
         };
         let id = container_id(&req.workload, req.replica);
+        // Allocate a **stable + node-unique** IP: reclaim this replica's own recorded
+        // address across a relaunch, else a fresh one that can't collide with any live
+        // replica (adopted at startup — see `reserve_in_use`). Under the mutex, so
+        // concurrent launches each commit a distinct address.
         let ip = {
-            let mut pool = self.ipam.lock().expect("ipam mutex");
-            pool.allocate()
-                .map_err(|e| BackendError::Launch(e.to_string()))?
+            let mut ipam = self.ipam.lock().expect("ipam mutex");
+            ipam.launch(&req.workload, req.replica)?
         };
 
         // Run the launch, releasing the IP + tearing down on any failure.
@@ -415,7 +544,10 @@ impl ComputeBackend for ContainerBackend {
             Err(e) => {
                 let veth = VethNetwork::for_vm(&id, &self.bridge);
                 let _ = veth.teardown().await;
-                self.ipam.lock().expect("ipam mutex").release(ip);
+                self.ipam
+                    .lock()
+                    .expect("ipam mutex")
+                    .launch_failed(&req.workload, req.replica, ip);
                 Err(e)
             }
         }
@@ -435,11 +567,14 @@ impl ComputeBackend for ContainerBackend {
             .teardown()
             .await
             .map_err(|e| BackendError::Stop(e.to_string()))?;
-        if let Some(ip) = handle.backend_ref.split(':').next() {
-            if let Ok(addr) = ip.parse() {
-                self.ipam.lock().expect("ipam mutex").release(addr);
-            }
-        }
+        // Release the replica's IP — but only if no other live replica still holds
+        // it (the last-user rule, so tearing down one side of a stale collision can't
+        // free the surviving replica's address). Forgets the ownership record.
+        self.ipam.lock().expect("ipam mutex").stop(
+            &handle.workload,
+            handle.replica,
+            &handle.backend_ref,
+        );
         Ok(())
     }
 
@@ -533,12 +668,20 @@ impl ComputeBackend for ContainerBackend {
             .map_err(|e| BackendError::Other(format!("bad snapshot ip {ip}: {e}")))?;
         let id = container_id(&snapshot.workload, snapshot.replica);
 
-        // Re-reserve the IP and recreate the host veth (the peer lands in the
-        // restored netns via the action-script below).
-        self.ipam.lock().expect("ipam mutex").reserve(addr);
+        // Re-reserve the IP (recording ownership for this replica) and recreate the
+        // host veth (the peer lands in the restored netns via the action-script below).
+        self.ipam.lock().expect("ipam mutex").reserve_for(
+            &snapshot.workload,
+            snapshot.replica,
+            addr,
+        );
         let veth = VethNetwork::for_vm(&id, &self.bridge);
         if let Err(e) = veth.host_setup().await {
-            self.ipam.lock().expect("ipam mutex").release(addr);
+            self.ipam.lock().expect("ipam mutex").stop(
+                &snapshot.workload,
+                snapshot.replica,
+                &format!("{addr}:{port}"),
+            );
             return Err(BackendError::Launch(format!("veth host setup: {e}")));
         }
 
@@ -552,7 +695,11 @@ impl ComputeBackend for ContainerBackend {
             Ok(pid) => pid,
             Err(e) => {
                 let _ = veth.teardown().await;
-                self.ipam.lock().expect("ipam mutex").release(addr);
+                self.ipam.lock().expect("ipam mutex").stop(
+                    &snapshot.workload,
+                    snapshot.replica,
+                    &format!("{addr}:{port}"),
+                );
                 return Err(BackendError::Other(format!("criu restore: {e}")));
             }
         };
@@ -572,7 +719,11 @@ impl ComputeBackend for ContainerBackend {
             let cgroup = format!("/sys/fs/cgroup/boatramp/{id}");
             let _ = std::fs::write(format!("{cgroup}/cgroup.kill"), b"1");
             let _ = veth.teardown().await;
-            self.ipam.lock().expect("ipam mutex").release(addr);
+            self.ipam.lock().expect("ipam mutex").stop(
+                &snapshot.workload,
+                snapshot.replica,
+                &format!("{addr}:{port}"),
+            );
             return Err(BackendError::Launch(format!("restore netns setup: {e}")));
         }
 

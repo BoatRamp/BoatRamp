@@ -375,6 +375,67 @@ pub async fn build_compute(
     (backends, node)
 }
 
+/// Adopt the IPs of already-running replicas into each compute backend's
+/// fresh-on-boot IP pool, so the backend reserves live addresses before the
+/// reconcile loop allocates any new one. Reads every persisted replica across all
+/// projects, parses each endpoint's IPv4 address (from the routable endpoint host,
+/// falling back to the `<ip>:<port>` `backend_ref`), groups them by backend, and
+/// hands each backend the `(workload, replica, ip)` tuples for its own replicas.
+///
+/// Only backends with a per-node IP pool act on it (the native `container` backend);
+/// the rest default to a no-op, and any endpoint outside a backend's own subnet is
+/// skipped by the pool. This is the startup half of the container-IP collision fix:
+/// without it, a fresh pool would re-hand a live `10.0.0.x` to a different workload,
+/// and a relaunch would move a replica's endpoint. A read failure is logged and
+/// adoption is skipped (the reconcile still runs — it just can't guarantee stability
+/// this boot), so a transient KV hiccup never blocks serving.
+pub async fn adopt_running_replica_ips(
+    deploy: &boatramp_core::deploy::DeployStore,
+    backends: &boatramp_core::compute::BackendRegistry,
+) {
+    use std::collections::BTreeMap;
+    use std::net::Ipv4Addr;
+
+    let states = match deploy.list_all_replica_states().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%e, "could not read replica states for IP adoption; \
+                             the reconcile loop starts without adopting in-use IPs");
+            return;
+        }
+    };
+    // (workload, replica, ip) grouped by the backend that owns the replica. Both a
+    // Running and a parked (Zero) replica hold their endpoint address — a Zero
+    // replica's IP is reserved for its wake — so adopt them alike.
+    let mut by_backend: BTreeMap<String, Vec<(String, u32, Ipv4Addr)>> = BTreeMap::new();
+    for st in &states {
+        let ip = st.endpoint.host.parse::<Ipv4Addr>().ok().or_else(|| {
+            st.handle
+                .backend_ref
+                .split(':')
+                .next()
+                .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        });
+        if let Some(ip) = ip {
+            by_backend.entry(st.backend.clone()).or_default().push((
+                st.handle.workload.clone(),
+                st.handle.replica,
+                ip,
+            ));
+        }
+    }
+    for (backend_id, replicas) in by_backend {
+        if let Some(backend) = backends.get(&backend_id) {
+            backend.reserve_in_use(&replicas).await;
+            tracing::info!(
+                backend = %backend_id,
+                count = replicas.len(),
+                "adopted in-use compute IPs into the backend pool"
+            );
+        }
+    }
+}
+
 /// The node's [`ComputeExec`](boatramp_core::compute::ComputeExec): resolve a
 /// workload's running replica from the control-plane state, pick its backend, and
 /// run the command inside it. Backs `POST /api/compute/{name}/exec`; the API gates
@@ -761,5 +822,113 @@ mod tests {
         assert!(vols.remove("old", false).await.expect("remove orphan"));
         // Removing an absent volume reports "did not exist".
         assert!(!vols.remove("gone", false).await.expect("remove absent"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup IP adoption (container-IP collision fix): the node reads every
+    // persisted replica and hands each backend the `(workload, replica, ip)` it
+    // owns, so a fresh-on-boot pool reserves live addresses before allocating.
+    // -----------------------------------------------------------------------
+
+    /// A backend that records the `reserve_in_use` tuples it was handed (a spy for
+    /// the startup adoption wiring).
+    struct AdoptSpyBackend {
+        adopted: Mutex<Vec<(String, u32, std::net::Ipv4Addr)>>,
+    }
+    #[async_trait]
+    impl ComputeBackend for AdoptSpyBackend {
+        fn id(&self) -> &'static str {
+            "container"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: false,
+                persistent_volumes: true,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(&self, _: &ComputeSpec) -> Result<Artifact, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        async fn reserve_in_use(&self, replicas: &[(String, u32, std::net::Ipv4Addr)]) {
+            self.adopted.lock().unwrap().extend_from_slice(replicas);
+        }
+        async fn launch(&self, _: &LaunchRequest) -> Result<Instance, BackendError> {
+            Err(BackendError::Unsupported)
+        }
+        async fn stop(&self, _: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Unknown)
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_running_replica_ips_feeds_each_backends_in_use_addresses() {
+        use boatramp_core::compute::{Endpoint, ObservedInstance, ReplicaPhase, Scheme};
+        use std::net::Ipv4Addr;
+
+        let store = DeployStore::new(
+            Arc::new(NullStorage),
+            Arc::new(boatramp_core::kv::MemoryKv::new()),
+        );
+        // Two container replicas on distinct IPs, plus one on a different backend
+        // (must not be handed to the container backend's adoption).
+        let mk =
+            |wl: &str, rep: u32, backend: &str, ip: &str, phase: ReplicaPhase| ObservedInstance {
+                handle: InstanceHandle {
+                    workload: wl.into(),
+                    replica: rep,
+                    backend_ref: format!("{ip}:5432"),
+                },
+                node: 1,
+                backend: backend.into(),
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: ip.into(),
+                    port: 5432,
+                },
+                region: None,
+                healthy: true,
+                started_at: None,
+                phase,
+                snapshot: None,
+            };
+        for st in [
+            mk("pg-a", 0, "container", "10.0.0.2", ReplicaPhase::Running),
+            mk("pg-b", 0, "container", "10.0.0.3", ReplicaPhase::Zero), // parked — still holds its IP
+            mk("vm", 0, "vmm-embedded", "10.0.0.9", ReplicaPhase::Running),
+        ] {
+            store
+                .set_replica_state(ProjectRef::DEFAULT, &st)
+                .await
+                .expect("persist replica state");
+        }
+
+        let container = Arc::new(AdoptSpyBackend {
+            adopted: Mutex::new(Vec::new()),
+        });
+        let mut backends: boatramp_core::compute::BackendRegistry = BTreeMap::new();
+        backends.insert(
+            "container".into(),
+            container.clone() as Arc<dyn ComputeBackend>,
+        );
+
+        adopt_running_replica_ips(&store, &backends).await;
+
+        let got = container.adopted.lock().unwrap().clone();
+        // Only the two container replicas' addresses were handed to the container
+        // backend — the VMM replica's IP went to no container adoption.
+        assert!(got.contains(&("pg-a".into(), 0, Ipv4Addr::new(10, 0, 0, 2))));
+        assert!(got.contains(&("pg-b".into(), 0, Ipv4Addr::new(10, 0, 0, 3))));
+        assert!(
+            !got.iter()
+                .any(|(_, _, ip)| *ip == Ipv4Addr::new(10, 0, 0, 9)),
+            "another backend's replica IP must not be adopted by the container backend"
+        );
+        assert_eq!(got.len(), 2);
     }
 }
