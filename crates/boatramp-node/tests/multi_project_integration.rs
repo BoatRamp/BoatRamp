@@ -1089,6 +1089,60 @@ async fn internal_dns_refuses_cross_project() {
     );
 }
 
+// ===========================================================================
+// Regression — v0.3.12 health-persist: a recovered replica must reach the resolver.
+// ===========================================================================
+
+/// LOCKS the v0.3.12 health-persist regression. `launch_one` probes readiness BEFORE the
+/// guest binds its port and persists `healthy:false`; the reconcile's health-refresh
+/// flips it true once the guest is reachable — but a *running* replica needs no
+/// Launch/Stop action, so before the fix that recovery was never written back. The store
+/// kept `healthy:false` forever and `DeployEndpointResolver` (which reads the store)
+/// reported "no healthy replica" for a perfectly reachable DB — exactly construens'
+/// v0.3.12 symptom. DRIVES two real `reconcile_once` passes over a fake that is Unhealthy
+/// on its first probe (pre-bind) then Healthy. ASSERTS: after launch the resolver sees no
+/// healthy endpoint; after the next reconcile the recovered health is PERSISTED and the
+/// resolver returns it.
+#[tokio::test]
+async fn health_recovery_is_persisted_so_the_resolver_sees_it() {
+    let (deploy, kv, authority) = control_plane();
+    let envelope: Arc<dyn KeyEnvelope> = Arc::new(RevEnvelope);
+
+    seed_project(&deploy, "acme").await;
+    provision_tenant(
+        &deploy,
+        &kv,
+        &envelope,
+        &single_project_binding(),
+        "acme",
+        "",
+    )
+    .await
+    .expect("provision acme");
+    let wl = tenant_workload_name("acme");
+
+    // Unhealthy on the FIRST probe (launch_one, pre-bind), Healthy thereafter.
+    let backend = Arc::new(FakeComputeBackend::new(authority));
+    *backend.not_ready_polls.lock().expect("not_ready_polls") = 1;
+    let reg = registry(backend.clone());
+    let resolver = DeployEndpointResolver::new(deploy.clone(), "acme");
+
+    // Pass 1 — launch; launch_one's pre-bind probe fails → persisted healthy:false.
+    reconcile(&deploy, &reg).await;
+    assert!(
+        resolver.endpoints(&wl).await.unwrap().is_empty(),
+        "a replica whose launch-time probe failed must not resolve as healthy yet"
+    );
+
+    // Pass 2 — the guest is now reachable; the health-refresh must PERSIST the recovery.
+    reconcile(&deploy, &reg).await;
+    assert!(
+        !resolver.endpoints(&wl).await.unwrap().is_empty(),
+        "recovered health was not persisted — the resolver still reports no healthy \
+         replica for a reachable DB (the v0.3.12 regression this locks)"
+    );
+}
+
 // --- Minimal DNS wire helpers (mirroring the dns.rs test encoders) --------
 
 /// Encode a single-question DNS query datagram.

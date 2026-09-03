@@ -1203,7 +1203,25 @@ pub async fn reconcile_once(
             }
             if let Some(backend) = backends.get(&state.backend) {
                 if let Ok(health) = backend.health(&state.handle).await {
-                    state.healthy = matches!(health, Health::Healthy);
+                    let now_healthy = matches!(health, Health::Healthy);
+                    // PERSIST a health transition. The endpoint resolver reads `healthy`
+                    // from the STORE, not from this in-memory refresh — so a replica that
+                    // becomes reachable *after* launch must have that recovery written
+                    // back. `launch_one` probes readiness *before* the guest binds its
+                    // port and persists `healthy: false`; without persisting the refresh,
+                    // that pre-bind `false` sticks forever and the resolver reports "no
+                    // healthy replica" for a perfectly reachable workload (a running
+                    // healthy replica needs no Launch/Stop action, so nothing else writes
+                    // it back). Only write on a change to keep the reconcile cheap.
+                    if now_healthy != state.healthy {
+                        state.healthy = now_healthy;
+                        if let Err(e) = deploy.set_replica_state(project, state).await {
+                            report.errors.push(format!(
+                                "{}/{}: persist health: {e}",
+                                state.handle.workload, state.handle.replica
+                            ));
+                        }
+                    }
                 }
             }
         }

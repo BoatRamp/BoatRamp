@@ -41,7 +41,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.12"
+version = "0.3.13"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
@@ -78,22 +78,22 @@ semicolon_if_nothing_returned = "warn"
 result_large_err = "allow"
 
 [workspace.dependencies]
-boatramp-types = { path = "crates/boatramp-types", version = "0.3.12" }
-boatramp-core = { path = "crates/boatramp-core", version = "0.3.12" }
-boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.3.12" }
-boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.3.12" }
-boatramp-storage = { path = "crates/boatramp-storage", version = "0.3.12" }
-boatramp-server = { path = "crates/boatramp-server", version = "0.3.12" }
-boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.3.12" }
-boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.3.12" }
-boatramp-acme = { path = "crates/boatramp-acme", version = "0.3.12" }
-boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.3.12" }
-boatramp-container = { path = "crates/boatramp-container", version = "0.3.12" }
-boatramp-docker = { path = "crates/boatramp-docker", version = "0.3.12" }
-boatramp-vz = { path = "crates/boatramp-vz", version = "0.3.12" }
-boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.3.12" }
-boatramp-node = { path = "crates/boatramp-node", version = "0.3.12" }
-boatramp-http = { path = "crates/boatramp-http", version = "0.3.12" }
+boatramp-types = { path = "crates/boatramp-types", version = "0.3.13" }
+boatramp-core = { path = "crates/boatramp-core", version = "0.3.13" }
+boatramp-rpktls = { path = "crates/boatramp-rpktls", version = "0.3.13" }
+boatramp-mcp = { path = "crates/boatramp-mcp", version = "0.3.13" }
+boatramp-storage = { path = "crates/boatramp-storage", version = "0.3.13" }
+boatramp-server = { path = "crates/boatramp-server", version = "0.3.13" }
+boatramp-handlers = { path = "crates/boatramp-handlers", version = "0.3.13" }
+boatramp-cluster = { path = "crates/boatramp-cluster", version = "0.3.13" }
+boatramp-acme = { path = "crates/boatramp-acme", version = "0.3.13" }
+boatramp-firecracker = { path = "crates/boatramp-firecracker", version = "0.3.13" }
+boatramp-container = { path = "crates/boatramp-container", version = "0.3.13" }
+boatramp-docker = { path = "crates/boatramp-docker", version = "0.3.13" }
+boatramp-vz = { path = "crates/boatramp-vz", version = "0.3.13" }
+boatramp-cloudflare = { path = "crates/boatramp-cloudflare", version = "0.3.13" }
+boatramp-node = { path = "crates/boatramp-node", version = "0.3.13" }
+boatramp-http = { path = "crates/boatramp-http", version = "0.3.13" }
 
 tokio = { version = "1", features = [
   "rt-multi-thread",

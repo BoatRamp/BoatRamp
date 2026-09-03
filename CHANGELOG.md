@@ -5,6 +5,22 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.13] - 2026-09-03
+
+### Fixed
+- **A managed database that becomes reachable after launch is now marked healthy, so
+  it actually serves.** The reconcile's health refresh probes each replica and updated
+  its `healthy` flag **in memory only**; a *running* replica that recovered needed no
+  launch/stop action, so the recovery was never written back to the store. Because
+  `launch_one` probes readiness *before* the guest binds its port (v0.3.12) and persists
+  `healthy: false`, that pre-bind `false` stuck forever — and the endpoint resolver,
+  which reads `healthy` from the store, reported **"no healthy replica"** for a
+  perfectly reachable database (every `sql` call failed, indefinitely). The reconcile
+  now persists a health transition, so a replica that comes up is seen as healthy on the
+  next pass. A cross-platform fake-backend regression test
+  (`health_recovery_is_persisted_so_the_resolver_sees_it`) locks it. (Regression
+  introduced in v0.3.12 by the launch-time readiness probe.)
+
 ## [0.3.12] - 2026-09-02
 
 A managed-database regression fix and compute-networking hardening release,
