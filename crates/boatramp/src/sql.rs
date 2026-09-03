@@ -66,6 +66,15 @@ enum SqlCommand {
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
+    /// Actively probe each replica of a managed database — a TCP reachability check
+    /// that BYPASSES the stored-health gate `query` trips on. Distinguishes "the DB is
+    /// actually down" from "the DB is up but the resolver won't serve it"
+    /// (`REACHABLE=yes` + `HEALTHY=no`). Admin-scoped.
+    Ping {
+        /// The database binding name (empty = the site's default database).
+        #[arg(long, default_value = "")]
+        db: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -129,6 +138,44 @@ pub async fn run(args: SqlArgs, config: &ProjectConfig) -> Result<()> {
             match format {
                 Format::Json => println!("{}", serde_json::to_string_pretty(&out)?),
                 Format::Table => print_table(&out),
+            }
+        }
+        SqlCommand::Ping { db } => {
+            let resp = http
+                .post(format!("{server}/api/{seg}/{db}/ping"))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "sql ping failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+            let replicas: Vec<serde_json::Value> = resp.json().await?;
+            if replicas.is_empty() {
+                println!("no replicas (the managed database has no compute replicas yet)");
+                return Ok(());
+            }
+            println!(
+                "{:<21}  {:<9}  {:<7}  PHASE",
+                "ENDPOINT", "REACHABLE", "HEALTHY"
+            );
+            for r in &replicas {
+                let endpoint = r["endpoint"].as_str().unwrap_or("?");
+                let reachable = if r["tcp_reachable"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "NO"
+                };
+                let healthy = if r["healthy"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "NO"
+                };
+                let phase = r["phase"].as_str().unwrap_or("?");
+                println!("{endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase}");
             }
         }
     }

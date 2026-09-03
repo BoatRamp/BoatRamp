@@ -51,6 +51,7 @@ pub fn router_with_fast(
     let tenant_deprovisioner_cap = options.tenant_deprovisioner.clone();
     let compute_exec_cap = options.compute_exec.clone();
     let compute_volumes_cap = options.compute_volumes.clone();
+    let compute_control_cap = options.compute_control.clone();
     // The project-scoped internal secret store (`None` when no `[secrets]` envelope
     // is configured — the admin secrets endpoints then fail closed with a clear 501).
     // Rides as an `api` extension read by the secrets handlers; not handlers-gated.
@@ -242,6 +243,23 @@ pub fn router_with_fast(
             "/api/compute/volumes/{name}",
             axum::routing::delete(delete_compute_volume),
         )
+        // Compute maintenance / diagnostics — the operator "maneuvering" surface, also
+        // registered BEFORE `/api/compute/{name}` so the reserved `status`/`ipam`/
+        // `maintenance` segments win over the `{name}` param. NODE-GLOBAL: they read and
+        // override the reconcile plane across every tenant, so `Right::required` gates
+        // them at `system·admin` (`is_compute_maintenance_path`) — never the per-project
+        // right the general `/api/compute/*` mapping gives.
+        .route("/api/compute/status", get(compute_status))
+        .route("/api/compute/ipam", get(compute_ipam))
+        .route("/api/compute/dns", get(compute_dns))
+        .route("/api/compute/dns/resolve", post(compute_dns_resolve))
+        .route("/api/compute/reconcile", post(compute_reconcile))
+        .route(
+            "/api/compute/maintenance/set-health",
+            post(compute_set_health),
+        )
+        .route("/api/compute/maintenance/restart", post(compute_restart))
+        .route("/api/compute/maintenance/netdiag", post(compute_netdiag))
         .route(
             "/api/compute/{name}",
             get(get_compute).put(put_compute).delete(delete_compute),
@@ -254,7 +272,10 @@ pub fn router_with_fast(
         // single query via the sealed managed credential (resolved server-side).
         // Admin-scoped (deny-safe `Right::required` default for `/api/sql/*`).
         .route("/api/sql/{db}/exec", post(sql_exec))
-        .route("/api/sql/{db}/query", post(sql_query));
+        .route("/api/sql/{db}/query", post(sql_query))
+        // Active per-replica reachability probe (bypasses the stored-health gate).
+        // Same project-owned `sql`-family right (`/api/sql/*` → Project·Deploy).
+        .route("/api/sql/{db}/ping", post(sql_ping));
     // OIDC → token exchange: validate the IdP JWT (presented as
     // the Bearer; `Right::required` returns None so the auth middleware lets it
     // through) and mint a short-TTL token. Only with the `oidc` feature.
@@ -386,6 +407,7 @@ pub fn router_with_fast(
         .layer(Extension(tenant_deprovisioner_cap))
         .layer(Extension(compute_exec_cap))
         .layer(Extension(compute_volumes_cap))
+        .layer(Extension(compute_control_cap))
         .layer(Extension(secret_store_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]

@@ -673,6 +673,69 @@ impl boatramp_core::compute::ComputeExec for NodeComputeExec {
     }
 }
 
+/// The node's [`ComputeControl`](boatramp_core::compute::ComputeControl): restart a
+/// replica (stop it + drop its observed state so the reconcile loop relaunches it).
+/// Backs `POST /api/compute/maintenance/restart` (admin-scoped). Resolves the target
+/// replica's backend from its persisted state and calls
+/// [`ComputeBackend::stop`](boatramp_core::compute::ComputeBackend::stop); the server
+/// nudges the reconcile loop afterwards so relaunch is prompt.
+pub struct NodeComputeControl {
+    backends: boatramp_core::compute::BackendRegistry,
+    deploy: boatramp_core::deploy::DeployStore,
+}
+
+impl NodeComputeControl {
+    /// Build over this node's compute backends + the control-plane store. Clone the
+    /// registry before the reconcile loop consumes the original.
+    pub fn new(
+        backends: boatramp_core::compute::BackendRegistry,
+        deploy: boatramp_core::deploy::DeployStore,
+    ) -> Self {
+        Self { backends, deploy }
+    }
+}
+
+#[async_trait::async_trait]
+impl boatramp_core::compute::ComputeControl for NodeComputeControl {
+    async fn restart(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+    ) -> Result<bool, boatramp_core::compute::ControlError> {
+        use boatramp_core::compute::{BackendError, ControlError};
+        use boatramp_core::project::ProjectRef;
+        let pref = ProjectRef::new(project);
+        let states = self
+            .deploy
+            .list_replica_states(pref, workload)
+            .await
+            .map_err(|e| ControlError::Other(e.to_string()))?;
+        let Some(target) = states.iter().find(|s| s.handle.replica == replica) else {
+            return Ok(false);
+        };
+        let backend = self
+            .backends
+            .get(&target.backend)
+            .ok_or_else(|| ControlError::Unsupported(target.backend.clone()))?;
+        // Stop the replica, then drop its observed state so the reconcile loop sees
+        // desired > observed and launches a fresh one (re-running IPAM). `stop` is
+        // idempotent, so a half-gone replica still converges.
+        match backend.stop(&target.handle).await {
+            Ok(()) => {}
+            Err(BackendError::Unsupported) => {
+                return Err(ControlError::Unsupported(target.backend.clone()))
+            }
+            Err(e) => return Err(ControlError::Other(e.to_string())),
+        }
+        self.deploy
+            .delete_replica_state(pref, workload, replica)
+            .await
+            .map_err(|e| ControlError::Other(e.to_string()))?;
+        Ok(true)
+    }
+}
+
 /// The node's [`ComputeVolumes`](boatramp_core::compute::ComputeVolumes): list +
 /// reclaim persistent volumes. Backs `GET /api/compute/volumes` +
 /// `DELETE /api/compute/volumes/{name}` (admin-scoped). Lists every

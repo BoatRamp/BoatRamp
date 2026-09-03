@@ -42,6 +42,7 @@
 - [Orchestrate functions with workflows](./how-to/workflows.md)
 - [Run a container or microVM](./how-to/compute.md)
 - [Scale compute to zero](./how-to/scale-to-zero.md)
+- [Diagnose & work around compute issues](./how-to/diagnose-compute.md)
 - [Load-balance & proxy upstreams](./how-to/gateway.md)
 - [Control caching](./how-to/caching.md)
 - [Enable compression](./how-to/compression.md)

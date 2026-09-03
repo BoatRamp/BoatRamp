@@ -410,6 +410,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     )
         as Arc<_>);
 
+    // Operator reconcile-plane control capability (restart a replica) — backs
+    // `POST /api/compute/maintenance/restart` (admin-scoped). Clone the registry
+    // before the reconcile loop consumes the original below.
+    let compute_control: Option<Arc<dyn boatramp_core::compute::ComputeControl>> = Some(Arc::new(
+        crate::compute::NodeComputeControl::new(compute_backends.clone(), deploy.clone()),
+    )
+        as Arc<_>);
+
     let compute_reconcile = boatramp_server::spawn_compute_reconcile(
         deploy.clone(),
         compute_backends,
@@ -463,6 +471,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     options.tenant_deprovisioner = tenant_deprovisioner;
     options.compute_exec = compute_exec;
     options.compute_volumes = compute_volumes;
+    options.compute_control = compute_control;
     // The internal secret store backs the admin secrets API (set/list/delete). Not
     // handlers-gated — it must be reachable even on a lean node.
     options.secret_store = secret_store;

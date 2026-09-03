@@ -300,6 +300,37 @@ pub trait ComputeExec: Send + Sync {
     ) -> Result<ExecOutput, ExecError>;
 }
 
+/// Why an operator [`ComputeControl`] operation failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    /// The workload's backend doesn't support the operation (e.g. a platform backend
+    /// with no explicit `stop`).
+    #[error("the {0} backend does not support this operation")]
+    Unsupported(String),
+    /// Any other failure (backend error, store error, …).
+    #[error("compute control failed: {0}")]
+    Other(String),
+}
+
+/// The operator-facing "kick the reconcile plane" capability — a targeted,
+/// operator-triggered counterpart to the periodic reconcile. Backs
+/// `POST /api/compute/maintenance/restart` (admin-scoped). The node implementation
+/// resolves the replica, stops it via its backend, and drops its persisted observed
+/// state, so the next reconcile pass relaunches a fresh replica (re-running IPAM) —
+/// the live workaround for a wedged replica or a stale IP assignment.
+#[async_trait]
+pub trait ComputeControl: Send + Sync {
+    /// Restart replica `replica` of `workload` in `project`: stop it and delete its
+    /// observed state so the reconcile loop relaunches it. `Ok(false)` if no such
+    /// replica is persisted (nothing to restart).
+    async fn restart(
+        &self,
+        project: &str,
+        workload: &str,
+        replica: u32,
+    ) -> Result<bool, ControlError>;
+}
+
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
     /// Stable backend id (`"vmm"` / `"container"` / `"cloudflare"` / `"docker"`).

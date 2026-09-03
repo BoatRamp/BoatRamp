@@ -254,6 +254,93 @@ enum ComputeCommand {
     /// `compute volume rm <name>`.
     #[command(subcommand)]
     Volume(VolumeCommand),
+    /// Show observed per-replica runtime state — the reconcile plane's X-ray: stored
+    /// health, lifecycle phase, assigned IP:port, age vs startup grace, backend. This
+    /// is the record the endpoint resolver reads, so `HEALTHY=false` on a `running`,
+    /// endpoint-bearing replica is the "reachable but not served" signature. Node-global
+    /// (every tenant on the node); admin-scoped.
+    Status {
+        /// Show only this workload's replicas (default: every workload).
+        workload: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = StatusFormat::Table)]
+        format: StatusFormat,
+    },
+    /// Force one replica's stored health flag — the escape hatch when a recovered
+    /// replica is stuck `healthy=false` and the endpoint resolver therefore won't serve
+    /// it (the v0.3.12→v0.3.13 class), without waiting for a binary patch. Targets the
+    /// `--project` tenant's workload. Node-global; admin-scoped.
+    SetHealth {
+        /// Workload name.
+        workload: String,
+        /// Replica ordinal.
+        replica: u32,
+        /// The health value to persist (`--healthy true` | `--healthy false`).
+        #[arg(long, action = clap::ArgAction::Set)]
+        healthy: bool,
+    },
+    /// Inspect the compute IP plane (`ip ls`): every replica's assigned IP, with
+    /// duplicate-IP collisions flagged. Node-global; admin-scoped.
+    #[command(subcommand)]
+    Ip(IpCommand),
+    /// Force the reconcile loop to run a convergence pass now (the "kick it" lever for
+    /// a workload stuck mid-reconcile) instead of waiting for the next periodic tick.
+    /// Fire-and-forget — follow with `compute status` to see the result. Node-global;
+    /// admin-scoped.
+    Reconcile,
+    /// Restart one replica: stop it and let the reconcile loop relaunch a fresh one
+    /// (re-running IP allocation) — the live workaround for a wedged replica or a stale
+    /// IP assignment. Targets the `--project` tenant's workload. Node-global;
+    /// admin-scoped.
+    Restart {
+        /// Workload name.
+        workload: String,
+        /// Replica ordinal.
+        replica: u32,
+    },
+    /// Inspect internal service discovery (`dns ls` / `dns resolve <workload>`): the
+    /// name → healthy-replica-IP map a co-located guest resolves. Node-global;
+    /// admin-scoped.
+    #[command(subcommand)]
+    Dns(DnsCommand),
+    /// Actively probe a workload's replicas from the node — a TCP reachability check
+    /// against each replica's endpoint, alongside its stored state. Answers "can the
+    /// node actually reach this replica right now?"; `REACHABLE=yes` + `HEALTHY=no` is
+    /// the reachable-but-not-served signature. Targets the `--project` tenant's
+    /// workload. Node-global; admin-scoped.
+    Netdiag {
+        /// Workload name.
+        workload: String,
+    },
+}
+
+/// `boatramp compute ip …` — IP-plane diagnostics.
+#[derive(Debug, Subcommand)]
+enum IpCommand {
+    /// List IP assignments (IP / OWNER / HEALTHY), flagging duplicate-IP collisions.
+    Ls,
+}
+
+/// `boatramp compute dns …` — internal service-discovery diagnostics.
+#[derive(Debug, Subcommand)]
+enum DnsCommand {
+    /// List internal names and the healthy replica IPs each resolves to.
+    Ls,
+    /// Resolve one workload's internal name (in the `--project` tenant) to its healthy
+    /// replica IPs — exactly as a same-project peer's lookup would.
+    Resolve {
+        /// Workload name.
+        workload: String,
+    },
+}
+
+/// Output format for `compute status`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum StatusFormat {
+    /// A plain text table.
+    Table,
+    /// The raw JSON array of replica views.
+    Json,
 }
 
 /// `boatramp compute volume …` — persistent-volume management.
@@ -599,6 +686,294 @@ pub async fn run(args: ComputeArgs, config: &ProjectConfig) -> Result<()> {
                         text.trim()
                     )));
                 }
+            }
+        }
+        // Node-global operator tools hit the direct `/api/compute/…` maintenance surface
+        // (admin-scoped, tenant-agnostic) rather than the project-scoped `seg`.
+        ComputeCommand::Status { workload, format } => {
+            let mut states: Vec<serde_json::Value> = http
+                .get(format!("{server}/api/compute/status"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if let Some(wl) = &workload {
+                states.retain(|s| s["workload"].as_str() == Some(wl.as_str()));
+            }
+            match format {
+                StatusFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&states)?);
+                }
+                StatusFormat::Table => {
+                    if states.is_empty() {
+                        println!("no replicas");
+                        return Ok(());
+                    }
+                    println!(
+                        "{:<28}  {:>3}  {:<7}  {:<21}  {:<7}  {:>6}  BACKEND",
+                        "PROJECT/WORKLOAD", "REP", "HEALTHY", "ENDPOINT", "PHASE", "AGE"
+                    );
+                    for s in &states {
+                        let owner = format!(
+                            "{}/{}",
+                            s["project"].as_str().unwrap_or("?"),
+                            s["workload"].as_str().unwrap_or("?")
+                        );
+                        let rep = s["replica"].as_u64().unwrap_or(0);
+                        let healthy = if s["healthy"].as_bool().unwrap_or(false) {
+                            "yes"
+                        } else {
+                            "NO"
+                        };
+                        let endpoint = format!(
+                            "{}:{}",
+                            s["host"].as_str().unwrap_or("?"),
+                            s["port"].as_u64().unwrap_or(0)
+                        );
+                        let phase = s["phase"].as_str().unwrap_or("?");
+                        let age = match s["age_secs"].as_u64() {
+                            Some(a) => format!("{a}s"),
+                            None => "-".to_string(),
+                        };
+                        let backend = s["backend"].as_str().unwrap_or("?");
+                        println!(
+                            "{owner:<28}  {rep:>3}  {healthy:<7}  {endpoint:<21}  {phase:<7}  {age:>6}  {backend}"
+                        );
+                    }
+                }
+            }
+        }
+        ComputeCommand::SetHealth {
+            workload,
+            replica,
+            healthy,
+        } => {
+            let body = serde_json::json!({
+                "project": client::resolve_project(config),
+                "workload": workload,
+                "replica": replica,
+                "healthy": healthy,
+            });
+            let resp = http
+                .post(format!("{server}/api/compute/maintenance/set-health"))
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                s if s.is_success() => {
+                    let view: serde_json::Value = resp.json().await?;
+                    println!(
+                        "set {}/{} replica {} healthy={}",
+                        view["project"].as_str().unwrap_or("?"),
+                        view["workload"].as_str().unwrap_or("?"),
+                        view["replica"].as_u64().unwrap_or(0),
+                        view["healthy"].as_bool().unwrap_or(false)
+                    );
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(Error::Server(format!(
+                        "no such replica: {workload} #{replica} (in project {:?})",
+                        client::resolve_project(config)
+                    )))
+                }
+                s => {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(Error::Server(format!(
+                        "set-health failed: {s}: {}",
+                        text.trim()
+                    )));
+                }
+            }
+        }
+        ComputeCommand::Ip(IpCommand::Ls) => {
+            let view: serde_json::Value = http
+                .get(format!("{server}/api/compute/ipam"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let assignments = view["assignments"].as_array().cloned().unwrap_or_default();
+            let dups: Vec<String> = view["duplicates"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if assignments.is_empty() {
+                println!("no IP assignments");
+                return Ok(());
+            }
+            println!("{:<16}  {:<30}  {:<7}  PHASE", "IP", "OWNER", "HEALTHY");
+            for a in &assignments {
+                let ip = a["ip"].as_str().unwrap_or("?");
+                let owner = format!(
+                    "{}/{}#{}",
+                    a["project"].as_str().unwrap_or("?"),
+                    a["workload"].as_str().unwrap_or("?"),
+                    a["replica"].as_u64().unwrap_or(0)
+                );
+                let healthy = if a["healthy"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "NO"
+                };
+                let phase = a["phase"].as_str().unwrap_or("?");
+                let flag = if dups.iter().any(|d| d == ip) {
+                    "  <-- COLLISION"
+                } else {
+                    ""
+                };
+                println!("{ip:<16}  {owner:<30}  {healthy:<7}  {phase}{flag}");
+            }
+            if !dups.is_empty() {
+                println!(
+                    "\n{} duplicate IP(s) detected: {}",
+                    dups.len(),
+                    dups.join(", ")
+                );
+            }
+        }
+        ComputeCommand::Reconcile => {
+            let resp = http
+                .post(format!("{server}/api/compute/reconcile"))
+                .send()
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                println!("reconcile pass requested; run `boatramp compute status` for the result");
+            } else {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!(
+                    "reconcile request failed: {status}: {}",
+                    text.trim()
+                )));
+            }
+        }
+        ComputeCommand::Restart { workload, replica } => {
+            let body = serde_json::json!({
+                "project": client::resolve_project(config),
+                "workload": workload,
+                "replica": replica,
+            });
+            let resp = http
+                .post(format!("{server}/api/compute/maintenance/restart"))
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                s if s.is_success() => {
+                    println!("restarted {workload} replica {replica}; reconcile will relaunch it");
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(Error::Server(format!(
+                        "no such replica: {workload} #{replica} (in project {:?})",
+                        client::resolve_project(config)
+                    )))
+                }
+                s => {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(Error::Server(format!(
+                        "restart failed: {s}: {}",
+                        text.trim()
+                    )));
+                }
+            }
+        }
+        ComputeCommand::Dns(DnsCommand::Ls) => {
+            let entries: Vec<serde_json::Value> = http
+                .get(format!("{server}/api/compute/dns"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if entries.is_empty() {
+                println!("no internal names");
+                return Ok(());
+            }
+            println!("{:<32}  {:>4}  HEALTHY ADDRS", "NAME", "REPS");
+            for e in &entries {
+                let name = e["name"].as_str().unwrap_or("?");
+                let reps = e["replicas"].as_u64().unwrap_or(0);
+                let addrs: Vec<&str> = e["addrs"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let shown = if addrs.is_empty() {
+                    "(none — unresolved)".to_string()
+                } else {
+                    addrs.join(", ")
+                };
+                println!("{name:<32}  {reps:>4}  {shown}");
+            }
+        }
+        ComputeCommand::Dns(DnsCommand::Resolve { workload }) => {
+            let body = serde_json::json!({
+                "project": client::resolve_project(config),
+                "workload": workload,
+            });
+            let e: serde_json::Value = http
+                .post(format!("{server}/api/compute/dns/resolve"))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let name = e["name"].as_str().unwrap_or("?");
+            let addrs: Vec<&str> = e["addrs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if addrs.is_empty() {
+                println!("{name} resolves to nothing (no healthy replica)");
+            } else {
+                println!("{name} -> {}", addrs.join(", "));
+            }
+        }
+        ComputeCommand::Netdiag { workload } => {
+            let body = serde_json::json!({
+                "project": client::resolve_project(config),
+                "workload": workload,
+            });
+            let replicas: Vec<serde_json::Value> = http
+                .post(format!("{server}/api/compute/maintenance/netdiag"))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if replicas.is_empty() {
+                println!("no replicas for {workload}");
+                return Ok(());
+            }
+            println!(
+                "{:>3}  {:<21}  {:<9}  {:<7}  {:<7}  BACKEND",
+                "REP", "ENDPOINT", "REACHABLE", "HEALTHY", "PHASE"
+            );
+            for r in &replicas {
+                let rep = r["replica"].as_u64().unwrap_or(0);
+                let endpoint = r["endpoint"].as_str().unwrap_or("?");
+                let reachable = if r["tcp_reachable"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "NO"
+                };
+                let healthy = if r["healthy"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "NO"
+                };
+                let phase = r["phase"].as_str().unwrap_or("?");
+                let backend = r["backend"].as_str().unwrap_or("?");
+                println!(
+                    "{rep:>3}  {endpoint:<21}  {reachable:<9}  {healthy:<7}  {phase:<7}  {backend}"
+                );
             }
         }
     }

@@ -5,6 +5,37 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.14] - unreleased
+
+### Added
+- **Operator "maneuvering" surface for the compute reconcile plane** — diagnostic and
+  maintenance subcommands that give a maintainer live X-ray vision and manual levers
+  over co-located workloads/managed databases, so a bad reconcile-plane state can be
+  *seen* and *worked around* without waiting for a binary patch. All are node-global
+  operator tools gated at `system·admin` (`is_compute_maintenance_path` — never
+  reachable by a project-scoped token, in either the direct or project-scoped path
+  form); `sql ping` is project-owned like the rest of the `sql` family.
+  - `compute status` — observed per-replica runtime state (stored health, lifecycle
+    phase, assigned IP:port, age vs startup grace, backend). This is the record the
+    endpoint resolver reads, so `HEALTHY=no` on a `running`, endpoint-bearing replica
+    is the "reachable but not served" signature at a glance.
+  - `compute reconcile` — force a convergence pass now (the "kick it" lever) instead of
+    waiting for the periodic tick.
+  - `compute restart <workload> <replica>` — stop a replica and let the reconcile loop
+    relaunch a fresh one (re-running IP allocation) — the workaround for a wedged
+    replica or a stale IP assignment.
+  - `compute set-health <workload> <replica> --healthy <bool>` — force a replica's
+    stored health flag; the escape hatch when a recovered replica is stuck
+    `healthy=false` so the resolver won't serve it.
+  - `compute ip ls` — the IP-assignment view, flagging duplicate-IP collisions.
+  - `compute dns ls` / `compute dns resolve <workload>` — the internal service-discovery
+    map (name → healthy replica IPs) a co-located guest resolves.
+  - `compute netdiag <workload>` — an active node→replica TCP reachability probe per
+    replica, alongside its stored state.
+  - `sql ping` — an active per-replica reachability probe for a managed database that
+    bypasses the stored-health gate `sql query` trips on, distinguishing "the DB is
+    down" from "the DB is up but the resolver won't serve it".
+
 ## [0.3.13] - 2026-09-03
 
 ### Fixed

@@ -217,6 +217,21 @@ impl Right {
             return Some(Self::new(Resource::System, None, Action::Admin));
         }
 
+        // Compute **maintenance/diagnostic** tools (`compute status|ipam|dns|reconcile|
+        // restart|set-health|netdiag`) are NODE-GLOBAL operator instruments: they
+        // observe *and* override the reconcile plane across *every* tenant on the node
+        // (all replicas' health/state/IP, the shared IP pool, the internal-DNS fleet,
+        // and forcing/kicking replicas). Like `compute volumes`, they must be gated at
+        // `system·admin` — the general `/api/compute/*` branch and the project-scoped
+        // catch-all below would otherwise map them to a per-project `Project·Read/Deploy`
+        // right that any tenant's token satisfies, leaking cross-tenant state or letting
+        // one tenant flip another's health. Gate explicitly, above both branches,
+        // matching both the direct (`/api/compute/status…`) and project-scoped
+        // (`/api/projects/<p>/compute/status…`) forms.
+        if is_compute_maintenance_path(path) {
+            return Some(Self::new(Resource::System, None, Action::Admin));
+        }
+
         // Project-scoped endpoints: `/api/projects/<proj>/<rest...>` (0.2.0). Parsed
         // through the shared `project_api_path` so this and the request-scoping
         // middleware agree on the tenant segment.
@@ -449,6 +464,32 @@ fn is_compute_volumes_path(path: &str) -> bool {
             .and_then(|(proj, sub)| (!proj.is_empty()).then_some(sub)?.strip_prefix("compute/"))
     });
     matches!(after_compute, Some(rest) if rest == "volumes" || rest.starts_with("volumes/"))
+}
+
+/// Whether `path` targets the node-global compute **maintenance/diagnostic** surface
+/// (`compute status|ipam|dns|reconcile` and the `compute/maintenance/*` mutators —
+/// `restart`, `set-health`, `netdiag`), in either the direct (`/api/compute/status…`)
+/// or the project-scoped (`/api/projects/<proj>/compute/status…`) form. These
+/// instruments read and override the reconcile plane across every tenant on the node,
+/// so [`Right::required`] gates them at `system·admin` rather than the per-project
+/// right the surrounding `/api/compute/*` mappings give. The reserved first segments
+/// (`status`, `ipam`, `dns`, `reconcile`, `maintenance`) therefore shadow any workload
+/// of the same name on these routes — the same trade-off `volumes` already makes.
+fn is_compute_maintenance_path(path: &str) -> bool {
+    let after_compute = path.strip_prefix("/api/compute/").or_else(|| {
+        project_api_path(path)
+            .and_then(|(proj, sub)| (!proj.is_empty()).then_some(sub)?.strip_prefix("compute/"))
+    });
+    matches!(
+        after_compute,
+        Some(rest) if rest == "status"
+            || rest == "ipam"
+            || rest == "dns"
+            || rest.starts_with("dns/")
+            || rest == "reconcile"
+            || rest == "maintenance"
+            || rest.starts_with("maintenance/")
+    )
 }
 
 /// Whether a granted target covers a required target:
@@ -1290,6 +1331,54 @@ mod tests {
         // right (so this special-case didn't over-reach).
         assert_eq!(
             Right::required("GET", "/api/compute/volumesnap"),
+            Some(Right::new(
+                Resource::Project,
+                Some(crate::project::DEFAULT_PROJECT.to_string()),
+                Action::Read
+            ))
+        );
+    }
+
+    #[test]
+    fn compute_maintenance_tools_are_node_admin_only() {
+        // The compute maintenance/diagnostic surface (status/ipam/dns/reconcile +
+        // maintenance mutators) observes and overrides the reconcile plane across EVERY
+        // tenant, so it must require system·admin in both path forms — never the
+        // per-project right the general `/api/compute/*` mapping gives. Otherwise a
+        // project-scoped token could read another tenant's replica state or flip its
+        // health.
+        let admin = Right::new(Resource::System, None, Action::Admin);
+        for (method, path) in [
+            // Direct (global) form.
+            ("GET", "/api/compute/status"),
+            ("GET", "/api/compute/ipam"),
+            ("GET", "/api/compute/dns"),
+            ("POST", "/api/compute/dns/resolve"),
+            ("POST", "/api/compute/reconcile"),
+            ("POST", "/api/compute/maintenance/restart"),
+            ("POST", "/api/compute/maintenance/set-health"),
+            ("POST", "/api/compute/maintenance/netdiag"),
+            // Project-scoped form (the `project_scope` rewrite's original path).
+            ("GET", "/api/projects/acme/compute/status"),
+            ("POST", "/api/projects/acme/compute/maintenance/set-health"),
+        ] {
+            let required = Right::required(method, path).expect("route is gated");
+            assert_eq!(required, admin, "{method} {path} must need system·admin");
+            // No project grant — not even the target project's own admin — satisfies it.
+            for role in ["project_admin", "project_publisher", "project_viewer"] {
+                let granted =
+                    AuthzPolicy::default_policy().rights_for(&[GrantedRole::scoped(role, "acme")]);
+                assert!(
+                    !granted.allows(&required),
+                    "{role}:acme must be refused on {method} {path}"
+                );
+            }
+            assert!(admin.satisfies(&required));
+        }
+        // A workload whose name merely STARTS WITH a reserved word (e.g. `statuspage`)
+        // is not the maintenance surface — it keeps its per-project right.
+        assert_eq!(
+            Right::required("GET", "/api/compute/statuspage"),
             Some(Right::new(
                 Resource::Project,
                 Some(crate::project::DEFAULT_PROJECT.to_string()),

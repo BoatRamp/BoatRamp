@@ -700,6 +700,55 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
     ) -> Result<boatramp_core::sql::SqlRows, SqlError> {
         self.backend_for(project, db).await?.run_query(sql).await
     }
+
+    async fn ping(
+        &self,
+        project: &str,
+        db: &str,
+    ) -> Result<Vec<boatramp_core::sql::SqlPingReplica>, SqlError> {
+        use boatramp_core::sql::SqlPingReplica;
+        use std::time::Duration;
+        let cfg = self
+            .databases
+            .get(db)
+            .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
+        // A bring-your-own-URL binding isn't compute-backed, so there is no replica
+        // fleet to probe — ping is for managed co-located databases.
+        if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+            return Err(SqlError::other(format!(
+                "database {db:?} is not compute-backed; `sql ping` probes managed co-located \
+                 replicas only"
+            )));
+        }
+        // Derive the tenant's workload + endpoint project EXACTLY as `backend_for` does,
+        // then read ALL replicas (healthy or not) from the resolver — bypassing the
+        // healthy filter that `query` would hit — and actively TCP-probe each.
+        let target = operator_target(cfg, project, db)?;
+        let resolver = DeployEndpointResolver::new(self.deploy.clone(), target.endpoint_project);
+        let diags = resolver.replica_diagnostics(&target.workload).await;
+        let mut out = Vec::with_capacity(diags.len());
+        for d in diags {
+            let reachable = match d.endpoint.parse::<std::net::SocketAddr>() {
+                Ok(addr) => matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tokio::net::TcpStream::connect(addr),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ),
+                // An unparsable endpoint can't be probed — report it as unreachable.
+                Err(_) => false,
+            };
+            out.push(SqlPingReplica {
+                endpoint: d.endpoint,
+                healthy: d.healthy,
+                phase: d.phase,
+                tcp_reachable: reachable,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

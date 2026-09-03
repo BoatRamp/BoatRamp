@@ -487,6 +487,27 @@ pub trait OperatorSql: Send + Sync {
 
     /// Run one row-returning `sql` statement against managed database `db`.
     async fn query(&self, project: &str, db: &str, sql: &str) -> Result<SqlRows, SqlError>;
+
+    /// Probe every replica of managed database `db`'s compute workload — an **active**
+    /// TCP reachability check, independent of the stored health flag. Lets an operator
+    /// tell "the DB is actually down" (`tcp_reachable: false`) from "the DB is up but
+    /// the endpoint resolver won't serve it" (`tcp_reachable: true, healthy: false` —
+    /// the reachable-but-not-served signature). Never runs a query or presents a
+    /// credential; it only opens (and immediately drops) a TCP connection.
+    async fn ping(&self, project: &str, db: &str) -> Result<Vec<SqlPingReplica>, SqlError>;
+}
+
+/// One replica's reachability, returned by [`OperatorSql::ping`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlPingReplica {
+    /// The replica's endpoint (`host:port`).
+    pub endpoint: String,
+    /// The stored health flag (what the endpoint resolver gates serving on).
+    pub healthy: bool,
+    /// The replica's lifecycle phase (`running` / `zero`).
+    pub phase: String,
+    /// Whether a TCP connection to the endpoint succeeded just now.
+    pub tcp_reachable: bool,
 }
 
 /// Tear down a deleted tenant's **managed** databases — the delete-time counterpart
