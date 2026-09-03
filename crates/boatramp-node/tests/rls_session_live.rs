@@ -294,6 +294,7 @@ async fn rls_session_guard_holds_live_postgres() {
         .expect("register compute workload");
 
     let req = LaunchRequest {
+        project: "default".into(),
         workload: COMPUTE.to_string(),
         replica: 0,
         spec,

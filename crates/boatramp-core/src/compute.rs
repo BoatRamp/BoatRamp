@@ -93,6 +93,11 @@ pub enum Artifact {
 /// The request to launch one replica.
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
+    /// The owning project — the first dimension of the replica identity, so two
+    /// projects each with a same-named workload can't collide on the backend's
+    /// derived id/cgroup/veth/IP. `default` yields the bare, pre-project identity
+    /// (see [`compute_instance_id`]).
+    pub project: String,
     /// Workload name (for naming / teardown / logging).
     pub workload: String,
     /// Replica ordinal within the workload (`0..replicas`).
@@ -106,12 +111,39 @@ pub struct LaunchRequest {
 /// An opaque handle to a launched replica (for `stop`/`health`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceHandle {
+    /// The owning project — the first dimension of the replica identity, closing
+    /// the cross-tenant collision where two projects' same-named workloads derived
+    /// the same backend id/cgroup/veth/IP. `#[serde(default)]` keeps pre-v0.3.12
+    /// records deserializing; the reconcile/adoption **backfills** it from the
+    /// replica-state KV key (`project/<proj>/…`) when empty, so a legacy record gets
+    /// its real project — never `""` — before any id is derived. Schema stays v1.
+    #[serde(default)]
+    pub project: String,
     /// Workload name.
     pub workload: String,
     /// Replica ordinal.
     pub replica: u32,
     /// Backend-specific reference (pid / container id / CF instance id / …).
     pub backend_ref: String,
+}
+
+/// The backend-derived identity stem for a replica, unique across projects:
+/// `<project>-<workload>-<replica>` for a non-`default` project, but the bare
+/// `<workload>-<replica>` for the reserved `default` project (and for an empty
+/// project string — a not-yet-backfilled legacy handle — which is treated as
+/// `default`). This stem keys the cgroup path, the container/VM id, the hostname,
+/// the veth/tap stem, and the guest log filename; the bare default form keeps
+/// existing default-project deployments byte-identical on disk (mirroring how the
+/// managed-volume/credential names keep `default` bare). Project names carry no
+/// `/` ([`validate_resource_name`]) so the single `-` join stays unambiguous, and
+/// the components are all cgroup/interface/hostname-safe (resource names are
+/// `[a-z0-9-]`).
+pub fn compute_instance_id(project: &str, workload: &str, replica: u32) -> String {
+    if project.is_empty() || project == crate::project::DEFAULT_PROJECT {
+        format!("{workload}-{replica}")
+    } else {
+        format!("{project}-{workload}-{replica}")
+    }
 }
 
 /// URL scheme for a replica endpoint.
@@ -182,6 +214,12 @@ pub enum Health {
 /// while a replica is parked in the [`Zero`](ReplicaPhase::Zero) phase).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// The owning project, carried so a `restore` derives the same project-qualified
+    /// identity ([`compute_instance_id`]) / IPAM key the launch used. `#[serde(default)]`
+    /// keeps pre-v0.3.12 parked records deserializing (empty ⇒ treated as `default`);
+    /// backfilled alongside the handle from the replica-state key. Schema stays v1.
+    #[serde(default)]
+    pub project: String,
     /// Workload the snapshot belongs to.
     pub workload: String,
     /// Replica ordinal.
@@ -277,15 +315,16 @@ pub trait ComputeBackend: Send + Sync {
     /// **Adopt** the guest IPs already assigned to persisted/running replicas of
     /// this backend, so a fresh-on-boot IP pool reflects addresses in use before it
     /// hands out any new one. Called once at node startup with every known replica as
-    /// `(workload, replica, endpoint_ip)`; the backend reserves the ones it owns
-    /// (those in its own subnet), skipping the rest, and remembers each replica's
-    /// address so a relaunch reclaims the same endpoint (stable) rather than a fresh
-    /// one. Without this a backend that rebuilds its pool each process start (the
-    /// native `container` backend) could re-hand a live address to a different
-    /// workload — the container-IP collision. Backends that don't own a per-node IP
-    /// pool (docker / cloudflare delegate addressing) default to a no-op, so they are
-    /// unaffected.
-    async fn reserve_in_use(&self, _replicas: &[(String, u32, std::net::Ipv4Addr)]) {}
+    /// `(project, workload, replica, endpoint_ip)`; the backend reserves the ones it
+    /// owns (those in its own subnet), skipping the rest, and remembers each replica's
+    /// address — keyed by `(project, workload, replica)` so two projects' same-named
+    /// workloads never share a slot — so a relaunch reclaims the same endpoint (stable)
+    /// rather than a fresh one. Without this a backend that rebuilds its pool each
+    /// process start (the native `container` backend) could re-hand a live address to
+    /// a different workload — the container-IP collision. Backends that don't own a
+    /// per-node IP pool (docker / cloudflare delegate addressing) default to a no-op,
+    /// so they are unaffected.
+    async fn reserve_in_use(&self, _replicas: &[(String, String, u32, std::net::Ipv4Addr)]) {}
 
     /// Launch one replica; returns its handle + routable endpoint.
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError>;
@@ -1213,6 +1252,7 @@ pub async fn reconcile_once(
                         managed_db.and_then(|m| m.managed_db_privilege(&project_name, &wl));
                     match launch_one(
                         b.as_ref(),
+                        &project_name,
                         &wl,
                         replica,
                         node,
@@ -1280,7 +1320,11 @@ pub async fn reconcile_once(
                     match b.snapshot(&handle).await {
                         // Park it: persist the Zero phase carrying the snapshot
                         // (the backend's `snapshot` already stopped the replica).
-                        Ok(Some(snapshot)) => {
+                        Ok(Some(mut snapshot)) => {
+                            // Stamp the owning project on the parked snapshot so a later
+                            // `restore` derives the same project-qualified identity/IPAM
+                            // key the launch used (independent of the backend).
+                            snapshot.project = project_name.clone();
                             let parked = ObservedInstance {
                                 healthy: false,
                                 phase: ReplicaPhase::Zero,
@@ -1317,8 +1361,13 @@ pub async fn reconcile_once(
                     };
                     match b.restore(&snapshot).await {
                         Ok(instance) => {
+                            // Stamp the owning project on the restored handle so the
+                            // persisted record stays consistent (the backend's restore
+                            // works off the snapshot ref alone).
+                            let mut handle = instance.handle;
+                            handle.project = snapshot.project.clone();
                             let state = ObservedInstance {
-                                handle: instance.handle,
+                                handle,
                                 node,
                                 backend: backend.clone(),
                                 endpoint: instance.endpoint,
@@ -1360,6 +1409,7 @@ fn region_of_node(nodes: &[Node], id: u64) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 async fn launch_one(
     backend: &dyn ComputeBackend,
+    project: &str,
     workload: &str,
     replica: u32,
     node: u64,
@@ -1385,6 +1435,7 @@ async fn launch_one(
     }
     let instance = backend
         .launch(&LaunchRequest {
+            project: project.to_string(),
             workload: workload.to_string(),
             replica,
             spec: spec.clone(),
@@ -1407,8 +1458,13 @@ async fn launch_one(
     // still-unhealthy replica as a launched-but-unready one (Stop + relaunch) rather
     // than a missing one (spurious extra launch).
     let healthy = matches!(backend.health(&instance.handle).await, Ok(Health::Healthy));
+    // The reconcile is the source of truth for the owning project; stamp it on the
+    // returned handle so the persisted record always carries it (independent of the
+    // backend) and the key/state stay consistent.
+    let mut handle = instance.handle;
+    handle.project = project.to_string();
     Ok(ObservedInstance {
-        handle: instance.handle,
+        handle,
         node,
         backend: backend.id().to_string(),
         endpoint: instance.endpoint,
@@ -1423,6 +1479,32 @@ async fn launch_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_instance_id_qualifies_by_project_but_keeps_default_bare() {
+        // The default-project identity is BYTE-IDENTICAL to the pre-v0.3.12 bare
+        // `<workload>-<replica>` (so existing deployments' cgroup/veth/hostname/IP
+        // slot are undisturbed). An empty project string (a not-yet-backfilled legacy
+        // handle) is treated as `default`, so it too stays bare.
+        assert_eq!(compute_instance_id("default", "web", 0), "web-0");
+        assert_eq!(compute_instance_id("", "web", 0), "web-0");
+        assert_eq!(compute_instance_id("default", "api-v2", 3), "api-v2-3");
+
+        // A non-default project is qualified with the project prefix, so two projects'
+        // same-named workloads derive DISTINCT ids (→ distinct cgroup/veth/hostname).
+        assert_eq!(compute_instance_id("acme", "web", 0), "acme-web-0");
+        assert_eq!(compute_instance_id("beta", "web", 0), "beta-web-0");
+        assert_ne!(
+            compute_instance_id("acme", "web", 0),
+            compute_instance_id("beta", "web", 0),
+            "same-named workloads in different projects must NOT collide on id"
+        );
+        // And the qualified form never collides with the bare default form.
+        assert_ne!(
+            compute_instance_id("acme", "web", 0),
+            compute_instance_id("default", "web", 0)
+        );
+    }
 
     #[test]
     fn managed_db_spec_is_launchable_and_privilege_deferred() {
@@ -1873,6 +1955,7 @@ mod tests {
     fn observed(workload: &str, replica: u32, node: u64, healthy: bool) -> ObservedInstance {
         ObservedInstance {
             handle: InstanceHandle {
+                project: "default".into(),
                 workload: workload.into(),
                 replica,
                 backend_ref: format!("ref-{replica}"),
@@ -1899,6 +1982,7 @@ mod tests {
         let mut o = observed(workload, replica, node, false);
         o.phase = ReplicaPhase::Zero;
         o.snapshot = Some(Snapshot {
+            project: "default".into(),
             workload: workload.into(),
             replica,
             data_ref: format!("snap-{replica}"),
@@ -2328,6 +2412,7 @@ mod tests {
         async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
             Ok(Instance {
                 handle: InstanceHandle {
+                    project: req.project.clone(),
                     workload: req.workload.clone(),
                     replica: req.replica,
                     backend_ref: format!("fake-{}", req.replica),
@@ -2355,6 +2440,7 @@ mod tests {
         let artifact = backend.materialize(&s).await.unwrap();
         let inst = backend
             .launch(&LaunchRequest {
+                project: "default".into(),
                 workload: "w".into(),
                 replica: 0,
                 spec: s,
@@ -2396,6 +2482,7 @@ mod tests {
         async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
             Ok(Instance {
                 handle: InstanceHandle {
+                    project: req.project.clone(),
                     workload: req.workload.clone(),
                     replica: req.replica,
                     backend_ref: format!("fake-{}", req.replica),
@@ -2423,7 +2510,7 @@ mod tests {
     async fn launch_one_records_probed_readiness_not_a_blind_true() {
         let s = spec(1, 128);
         // Not-ready backend → healthy:false, but the replica IS launched (phase Running).
-        let unready = launch_one(&NotReadyBackend, "pg", 0, 1, None, &s, &[], None)
+        let unready = launch_one(&NotReadyBackend, "default", "pg", 0, 1, None, &s, &[], None)
             .await
             .unwrap();
         assert!(
@@ -2433,7 +2520,7 @@ mod tests {
         assert_eq!(unready.phase, ReplicaPhase::Running);
 
         // A ready backend still records healthy:true (the happy path is unchanged).
-        let ready = launch_one(&FakeBackend, "pg", 0, 1, None, &s, &[], None)
+        let ready = launch_one(&FakeBackend, "default", "pg", 0, 1, None, &s, &[], None)
             .await
             .unwrap();
         assert!(ready.healthy);
@@ -2562,6 +2649,7 @@ mod tests {
         async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
             Ok(Instance {
                 handle: InstanceHandle {
+                    project: req.project.clone(),
                     workload: req.workload.clone(),
                     replica: req.replica,
                     backend_ref: format!("fake-{}", req.replica),
@@ -2584,6 +2672,7 @@ mod tests {
             handle: &InstanceHandle,
         ) -> Result<Option<Snapshot>, BackendError> {
             Ok(Some(Snapshot {
+                project: handle.project.clone(),
                 workload: handle.workload.clone(),
                 replica: handle.replica,
                 data_ref: format!("snap-{}", handle.replica),
@@ -2592,6 +2681,7 @@ mod tests {
         async fn restore(&self, snapshot: &Snapshot) -> Result<Instance, BackendError> {
             Ok(Instance {
                 handle: InstanceHandle {
+                    project: snapshot.project.clone(),
                     workload: snapshot.workload.clone(),
                     replica: snapshot.replica,
                     backend_ref: format!("restored-{}", snapshot.replica),

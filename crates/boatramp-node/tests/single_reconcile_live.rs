@@ -558,6 +558,7 @@ async fn launch_from_registered_spec(
     let vol_dir = data_dir.join("compute").join("volumes").join(&vol_name);
 
     let req = LaunchRequest {
+        project: "default".into(),
         workload: workload.name.clone(),
         replica: 0,
         spec,

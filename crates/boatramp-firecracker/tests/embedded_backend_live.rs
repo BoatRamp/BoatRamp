@@ -143,6 +143,7 @@ async fn launches_pings_and_stops_a_microvm() {
     .expect("build backend");
 
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "web".to_string(),
         replica: 0,
         spec: sample_spec(),
@@ -282,6 +283,7 @@ async fn serves_an_oci_workload_end_to_end() {
     spec.kernel_cmdline = None;
     spec.port = APP_PORT;
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "srv".to_string(),
         replica: 0,
         spec,
@@ -398,6 +400,7 @@ async fn serves_a_shell_less_scratch_image() {
     spec.kernel_cmdline = None;
     spec.port = APP_PORT;
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "echo".to_string(),
         replica: 0,
         spec,
@@ -516,6 +519,7 @@ async fn snapshots_and_restores_a_serving_workload() {
     spec.port = APP_PORT;
     spec.mem_mib = 256;
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "snap".to_string(),
         replica: 0,
         spec,
@@ -680,6 +684,7 @@ async fn persistent_volume_survives_a_restart() {
         size_mib: 16,
     }];
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "vol".to_string(),
         replica: 0,
         spec,

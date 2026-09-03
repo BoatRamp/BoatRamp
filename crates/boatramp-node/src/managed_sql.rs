@@ -940,6 +940,7 @@ mod tests {
         use boatramp_core::compute::{Endpoint, InstanceHandle, Scheme};
         boatramp_core::compute::ObservedInstance {
             handle: InstanceHandle {
+                project: "default".into(),
                 workload: workload.into(),
                 replica,
                 backend_ref: String::new(),

@@ -1234,25 +1234,46 @@ async fn serve_resolved(
                             // once genuinely idle.
                             let (compute_backends, compute_regions) = match &upstream.compute {
                                 Some(workload) => {
+                                    // Resolve the compute upstream against the site's OWN
+                                    // project (not `default`), so a non-default tenant's
+                                    // replica state is found — closing the project-blind
+                                    // resolution that 502'd / never woke it.
+                                    let compute_project =
+                                        project.unwrap_or(ProjectRef::DEFAULT.as_str());
                                     gateway::record_activity(workload);
-                                    let mut pool = compute_endpoints(deploy, workload).await;
+                                    let mut pool =
+                                        compute_endpoints(deploy, compute_project, workload).await;
                                     // Wake-from-zero: no live replica but one
                                     // is parked → nudge the reconcile loop to restore it
                                     // and hold this request until it's serving. The cold
                                     // start is invisible to the client; only a genuine
                                     // restore failure (timeout) falls through to 502.
-                                    if pool.is_empty() && has_parked_replica(deploy, workload).await
+                                    if pool.is_empty()
+                                        && has_parked_replica(deploy, compute_project, workload)
+                                            .await
                                     {
                                         gateway::wake_reconcile();
-                                        pool = await_warm(deploy, workload, COMPUTE_WAKE_TIMEOUT)
-                                            .await;
+                                        pool = await_warm(
+                                            deploy,
+                                            compute_project,
+                                            workload,
+                                            COMPUTE_WAKE_TIMEOUT,
+                                        )
+                                        .await;
                                     }
                                     // FA-8: for a nearest-region pool, tag each replica
                                     // endpoint with its node's region (from placement).
                                     let regions = if upstream.lb
                                         == boatramp_core::gateway::LbPolicy::Nearest
                                     {
-                                        Some(compute_endpoint_regions(deploy, workload).await)
+                                        Some(
+                                            compute_endpoint_regions(
+                                                deploy,
+                                                compute_project,
+                                                workload,
+                                            )
+                                            .await,
+                                        )
                                     } else {
                                         None
                                     };

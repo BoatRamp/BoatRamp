@@ -404,10 +404,13 @@ pub async fn adopt_running_replica_ips(
             return;
         }
     };
-    // (workload, replica, ip) grouped by the backend that owns the replica. Both a
-    // Running and a parked (Zero) replica hold their endpoint address — a Zero
-    // replica's IP is reserved for its wake — so adopt them alike.
-    let mut by_backend: BTreeMap<String, Vec<(String, u32, Ipv4Addr)>> = BTreeMap::new();
+    // (project, workload, replica, ip) grouped by the backend that owns the replica.
+    // The project is the first dimension of the IPAM key, so two projects' same-named
+    // workloads never share a slot; `list_all_replica_states` already backfilled it
+    // onto the handle from the KV key. Both a Running and a parked (Zero) replica hold
+    // their endpoint address — a Zero replica's IP is reserved for its wake — so adopt
+    // them alike.
+    let mut by_backend: BTreeMap<String, Vec<(String, String, u32, Ipv4Addr)>> = BTreeMap::new();
     for st in &states {
         let ip = st.endpoint.host.parse::<Ipv4Addr>().ok().or_else(|| {
             st.handle
@@ -418,6 +421,7 @@ pub async fn adopt_running_replica_ips(
         });
         if let Some(ip) = ip {
             by_backend.entry(st.backend.clone()).or_default().push((
+                st.handle.project.clone(),
                 st.handle.workload.clone(),
                 st.handle.replica,
                 ip,
@@ -833,7 +837,7 @@ mod tests {
     /// A backend that records the `reserve_in_use` tuples it was handed (a spy for
     /// the startup adoption wiring).
     struct AdoptSpyBackend {
-        adopted: Mutex<Vec<(String, u32, std::net::Ipv4Addr)>>,
+        adopted: Mutex<Vec<(String, String, u32, std::net::Ipv4Addr)>>,
     }
     #[async_trait]
     impl ComputeBackend for AdoptSpyBackend {
@@ -852,7 +856,7 @@ mod tests {
         async fn materialize(&self, _: &ComputeSpec) -> Result<Artifact, BackendError> {
             Err(BackendError::Unsupported)
         }
-        async fn reserve_in_use(&self, replicas: &[(String, u32, std::net::Ipv4Addr)]) {
+        async fn reserve_in_use(&self, replicas: &[(String, String, u32, std::net::Ipv4Addr)]) {
             self.adopted.lock().unwrap().extend_from_slice(replicas);
         }
         async fn launch(&self, _: &LaunchRequest) -> Result<Instance, BackendError> {
@@ -875,35 +879,65 @@ mod tests {
             Arc::new(NullStorage),
             Arc::new(boatramp_core::kv::MemoryKv::new()),
         );
-        // Two container replicas on distinct IPs, plus one on a different backend
-        // (must not be handed to the container backend's adoption).
-        let mk =
-            |wl: &str, rep: u32, backend: &str, ip: &str, phase: ReplicaPhase| ObservedInstance {
-                handle: InstanceHandle {
-                    workload: wl.into(),
-                    replica: rep,
-                    backend_ref: format!("{ip}:5432"),
+        // Container replicas on distinct IPs (one in `default`, one in a non-default
+        // project — the adoption must carry the OWNING project into the tuple), a
+        // parked container replica, plus one on a different backend (must not be
+        // handed to the container backend's adoption).
+        let mk = |proj: &str, wl: &str, rep: u32, backend: &str, ip: &str, phase: ReplicaPhase| {
+            (
+                proj.to_string(),
+                ObservedInstance {
+                    handle: InstanceHandle {
+                        project: proj.into(),
+                        workload: wl.into(),
+                        replica: rep,
+                        backend_ref: format!("{ip}:5432"),
+                    },
+                    node: 1,
+                    backend: backend.into(),
+                    endpoint: Endpoint {
+                        scheme: Scheme::Http,
+                        host: ip.into(),
+                        port: 5432,
+                    },
+                    region: None,
+                    healthy: true,
+                    started_at: None,
+                    phase,
+                    snapshot: None,
                 },
-                node: 1,
-                backend: backend.into(),
-                endpoint: Endpoint {
-                    scheme: Scheme::Http,
-                    host: ip.into(),
-                    port: 5432,
-                },
-                region: None,
-                healthy: true,
-                started_at: None,
-                phase,
-                snapshot: None,
-            };
-        for st in [
-            mk("pg-a", 0, "container", "10.0.0.2", ReplicaPhase::Running),
-            mk("pg-b", 0, "container", "10.0.0.3", ReplicaPhase::Zero), // parked — still holds its IP
-            mk("vm", 0, "vmm-embedded", "10.0.0.9", ReplicaPhase::Running),
+            )
+        };
+        for (proj, st) in [
+            mk(
+                "default",
+                "pg-a",
+                0,
+                "container",
+                "10.0.0.2",
+                ReplicaPhase::Running,
+            ),
+            // A non-default project's SAME-shaped workload — its project must survive
+            // into the adoption tuple (not collapse to `default`).
+            mk(
+                "acme",
+                "web",
+                0,
+                "container",
+                "10.0.0.3",
+                ReplicaPhase::Zero,
+            ), // parked — still holds its IP
+            mk(
+                "default",
+                "vm",
+                0,
+                "vmm-embedded",
+                "10.0.0.9",
+                ReplicaPhase::Running,
+            ),
         ] {
             store
-                .set_replica_state(ProjectRef::DEFAULT, &st)
+                .set_replica_state(ProjectRef::new(&proj), &st)
                 .await
                 .expect("persist replica state");
         }
@@ -921,12 +955,18 @@ mod tests {
 
         let got = container.adopted.lock().unwrap().clone();
         // Only the two container replicas' addresses were handed to the container
-        // backend — the VMM replica's IP went to no container adoption.
-        assert!(got.contains(&("pg-a".into(), 0, Ipv4Addr::new(10, 0, 0, 2))));
-        assert!(got.contains(&("pg-b".into(), 0, Ipv4Addr::new(10, 0, 0, 3))));
+        // backend, each carrying its OWNING project — the VMM replica's IP went to
+        // no container adoption.
+        assert!(got.contains(&(
+            "default".into(),
+            "pg-a".into(),
+            0,
+            Ipv4Addr::new(10, 0, 0, 2)
+        )));
+        assert!(got.contains(&("acme".into(), "web".into(), 0, Ipv4Addr::new(10, 0, 0, 3))));
         assert!(
             !got.iter()
-                .any(|(_, _, ip)| *ip == Ipv4Addr::new(10, 0, 0, 9)),
+                .any(|(_, _, _, ip)| *ip == Ipv4Addr::new(10, 0, 0, 9)),
             "another backend's replica IP must not be adopted by the container backend"
         );
         assert_eq!(got.len(), 2);

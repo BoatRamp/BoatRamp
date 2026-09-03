@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot,
+    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
+    Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
+    Snapshot,
 };
 use boatramp_core::Storage;
 use futures::StreamExt;
@@ -37,10 +38,14 @@ fn blob_key(hash: &str) -> String {
     format!("{prefix}/{hash}")
 }
 
-/// VM id for a workload replica (`<workload>-<replica>`); also the tap-name +
-/// API-socket stem.
-fn vm_id(workload: &str, replica: u32) -> String {
-    format!("{workload}-{replica}")
+/// VM id for a workload replica; also the tap-name + API-socket stem.
+///
+/// Project-qualified (`<project>-<workload>-<replica>`) for a non-`default`
+/// project, but bare `<workload>-<replica>` for the `default` (or empty)
+/// project — byte-identical to pre-v0.3.12 ids. Delegates to the host-tested
+/// [`compute_instance_id`].
+fn vm_id(project: &str, workload: &str, replica: u32) -> String {
+    compute_instance_id(project, workload, replica)
 }
 
 /// Encode a launched VM's recovery info into the handle's `backend_ref`
@@ -185,7 +190,7 @@ impl ComputeBackend for VmmBackend {
             }
         };
 
-        let id = vm_id(&req.workload, req.replica);
+        let id = vm_id(&req.project, &req.workload, req.replica);
         let ip = {
             let mut pool = self.ipam.lock().expect("ipam mutex");
             pool.allocate()
@@ -234,6 +239,7 @@ impl ComputeBackend for VmmBackend {
         let port = req.spec.port;
         Ok(Instance {
             handle: InstanceHandle {
+                project: req.project.clone(),
                 workload: req.workload.clone(),
                 replica: req.replica,
                 backend_ref: encode_ref(running.pid.0, &ip.to_string(), port),
@@ -250,7 +256,7 @@ impl ComputeBackend for VmmBackend {
         let (pid, ip, _port) = decode_ref(&handle.backend_ref).ok_or_else(|| {
             BackendError::Stop(format!("bad handle ref {:?}", handle.backend_ref))
         })?;
-        let id = vm_id(&handle.workload, handle.replica);
+        let id = vm_id(&handle.project, &handle.workload, handle.replica);
         let tap = TapNetwork::for_vm(&id, &self.bridge);
         let running = RunningVm {
             id: id.clone(),
@@ -288,7 +294,7 @@ impl ComputeBackend for VmmBackend {
         let (pid, ip, port) = decode_ref(&handle.backend_ref).ok_or_else(|| {
             BackendError::Other(format!("bad handle ref {:?}", handle.backend_ref))
         })?;
-        let id = vm_id(&handle.workload, handle.replica);
+        let id = vm_id(&handle.project, &handle.workload, handle.replica);
         let dir = self.data_dir.join("compute").join("snapshots");
         tokio::fs::create_dir_all(&dir)
             .await
@@ -312,6 +318,7 @@ impl ComputeBackend for VmmBackend {
             .map_err(|e| BackendError::Other(e.to_string()))?;
 
         Ok(Some(Snapshot {
+            project: handle.project.clone(),
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: encode_snap(&snap_path, &mem_path, &ip, port),
@@ -322,7 +329,7 @@ impl ComputeBackend for VmmBackend {
         let (snap_path, mem_path, ip, port) = decode_snap(&snapshot.data_ref).ok_or_else(|| {
             BackendError::Other(format!("bad snapshot ref {:?}", snapshot.data_ref))
         })?;
-        let id = vm_id(&snapshot.workload, snapshot.replica);
+        let id = vm_id(&snapshot.project, &snapshot.workload, snapshot.replica);
         // Re-reserve the guest IP so the pool won't hand it to another VM while
         // this replica is (was) scaled to zero.
         if let Ok(addr) = ip.parse() {
@@ -353,6 +360,7 @@ impl ComputeBackend for VmmBackend {
 
         Ok(Instance {
             handle: InstanceHandle {
+                project: snapshot.project.clone(),
                 workload: snapshot.workload.clone(),
                 replica: snapshot.replica,
                 backend_ref: encode_ref(running.pid.0, &ip, port),
@@ -411,8 +419,12 @@ mod tests {
 
     #[test]
     fn vm_id_is_workload_dash_replica() {
-        assert_eq!(vm_id("web", 0), "web-0");
-        assert_eq!(vm_id("api-v2", 3), "api-v2-3");
+        // `default` (byte-identical to pre-v0.3.12): bare `<workload>-<replica>`.
+        assert_eq!(vm_id("default", "web", 0), "web-0");
+        assert_eq!(vm_id("default", "api-v2", 3), "api-v2-3");
+        // A non-`default` project qualifies the id, and differs per project.
+        assert_eq!(vm_id("acme", "web", 0), "acme-web-0");
+        assert_ne!(vm_id("acme", "web", 0), vm_id("beta", "web", 0));
     }
 
     #[test]

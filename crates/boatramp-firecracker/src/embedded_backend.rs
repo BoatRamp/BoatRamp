@@ -32,8 +32,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, Health, Instance,
-    InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme, Snapshot, VolumeRef,
+    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
+    Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
+    Snapshot, VolumeRef,
 };
 use boatramp_core::ipam::IpPool;
 use boatramp_core::Storage;
@@ -67,10 +68,13 @@ fn blob_key(hash: &str) -> String {
     format!("{prefix}/{hash}")
 }
 
-/// VM id for a workload replica (`<workload>-<replica>`) — the registry key + the
-/// tap-name stem.
-fn vm_id(workload: &str, replica: u32) -> String {
-    format!("{workload}-{replica}")
+/// VM id for a workload replica — the registry key + the tap-name stem.
+/// Project-qualified for a non-`default` project (so two projects' same-named
+/// workloads never share a registry slot / tap), but the bare `<workload>-<replica>`
+/// for `default` (byte-identical to pre-v0.3.12). Delegates to the host-tested
+/// [`compute_instance_id`].
+fn vm_id(project: &str, workload: &str, replica: u32) -> String {
+    compute_instance_id(project, workload, replica)
 }
 
 /// Encode a launched VM's endpoint into the handle's `backend_ref` (`<ip>:<port>`).
@@ -711,7 +715,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
             }
         };
 
-        let id = vm_id(&req.workload, req.replica);
+        let id = vm_id(&req.project, &req.workload, req.replica);
         let ip = {
             let mut pool = self.ipam.lock().expect("ipam mutex");
             pool.allocate()
@@ -783,6 +787,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
 
         Ok(Instance {
             handle: InstanceHandle {
+                project: req.project.clone(),
                 workload: req.workload.clone(),
                 replica: req.replica,
                 backend_ref: encode_ref(&ip.to_string(), port),
@@ -796,7 +801,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
-        let id = vm_id(&handle.workload, handle.replica);
+        let id = vm_id(&handle.project, &handle.workload, handle.replica);
         let running = self.running.lock().expect("running mutex").remove(&id);
         let Some(mut running) = running else {
             return Ok(()); // already stopped / never launched — idempotent
@@ -841,7 +846,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
         let (_ip, port) = decode_ref(&handle.backend_ref).ok_or_else(|| {
             BackendError::Other(format!("bad handle ref {:?}", handle.backend_ref))
         })?;
-        let id = vm_id(&handle.workload, handle.replica);
+        let id = vm_id(&handle.project, &handle.workload, handle.replica);
         let running = self.running.lock().expect("running mutex").remove(&id);
         let Some(running) = running else {
             return Ok(None); // not running — nothing to snapshot
@@ -896,6 +901,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
         .map_err(BackendError::Other)?;
 
         Ok(Some(Snapshot {
+            project: handle.project.clone(),
             workload: handle.workload.clone(),
             replica: handle.replica,
             data_ref: encode_snap(&stem, &ip.to_string(), port),
@@ -913,7 +919,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
         let addr: std::net::Ipv4Addr = ip
             .parse()
             .map_err(|e| BackendError::Other(format!("bad snapshot ip {ip}: {e}")))?;
-        let id = vm_id(&snapshot.workload, snapshot.replica);
+        let id = vm_id(&snapshot.project, &snapshot.workload, snapshot.replica);
         let snap_path = format!("{stem}.snap");
         let cfg_path = format!("{stem}.cfg");
 
@@ -962,6 +968,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
 
         Ok(Instance {
             handle: InstanceHandle {
+                project: snapshot.project.clone(),
                 workload: snapshot.workload.clone(),
                 replica: snapshot.replica,
                 backend_ref: encode_ref(&ip, port),
@@ -981,8 +988,12 @@ mod tests {
 
     #[test]
     fn vm_id_is_workload_dash_replica() {
-        assert_eq!(vm_id("web", 0), "web-0");
-        assert_eq!(vm_id("api-v2", 3), "api-v2-3");
+        // Default project keeps the bare id (byte-identical to pre-v0.3.12);
+        // a non-default project qualifies it so two projects' `web/0` never collide.
+        assert_eq!(vm_id("default", "web", 0), "web-0");
+        assert_eq!(vm_id("default", "api-v2", 3), "api-v2-3");
+        assert_eq!(vm_id("acme", "web", 0), "acme-web-0");
+        assert_ne!(vm_id("acme", "web", 0), vm_id("beta", "web", 0));
     }
 
     #[test]

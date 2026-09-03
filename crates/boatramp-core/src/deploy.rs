@@ -80,6 +80,22 @@ fn canon_host(host: &str) -> String {
     crate::host::Host::new(host).routing_key()
 }
 
+/// Backfill an observed replica record's owning `project` from the scoping key
+/// when a pre-v0.3.12 record left it empty (the `#[serde(default)]` blank). Stamps
+/// both the handle and, when parked (Zero), its snapshot, so the backend derives
+/// the *real* project's identity/IPAM key — never `""` — on adoption/reconcile. A
+/// record that already carries a project is left untouched (idempotent).
+fn backfill_replica_project(state: &mut crate::compute::ObservedInstance, project: &str) {
+    if state.handle.project.is_empty() {
+        state.handle.project = project.to_string();
+    }
+    if let Some(snap) = state.snapshot.as_mut() {
+        if snap.project.is_empty() {
+            snap.project = project.to_string();
+        }
+    }
+}
+
 /// Whether `key` is a sharded blob key (`ab/<64 hex>`). Used so GC never
 /// touches objects it did not write, even in a shared bucket.
 fn is_blob_key(key: &str) -> bool {
@@ -2330,7 +2346,10 @@ impl DeployStore {
         Ok(())
     }
 
-    /// List a workload's observed replica states.
+    /// List a workload's observed replica states. Backfills each record's
+    /// `handle.project` (and its parked snapshot's `project`) from the scoping
+    /// `project` when a pre-v0.3.12 record left it empty, so the identity/IPAM key
+    /// the backend derives always reflects the real owning project — never `""`.
     pub async fn list_replica_states(
         &self,
         project: ProjectRef<'_>,
@@ -2346,9 +2365,10 @@ impl DeployStore {
             .await?
         {
             if let Some(bytes) = self.kv.get(&key).await? {
-                if let Ok(state) =
+                if let Ok(mut state) =
                     serde_json::from_slice::<crate::compute::ObservedInstance>(&bytes)
                 {
+                    backfill_replica_project(&mut state, project.as_str());
                     out.push(state);
                 }
             }
@@ -2367,9 +2387,13 @@ impl DeployStore {
             let prefix = crate::compute::replica_states_project_prefix(&project);
             for key in self.kv.list_prefix(&prefix).await? {
                 if let Some(bytes) = self.kv.get(&key).await? {
-                    if let Ok(state) =
+                    if let Ok(mut state) =
                         serde_json::from_slice::<crate::compute::ObservedInstance>(&bytes)
                     {
+                        // Backfill the owning project from the KV key so a legacy
+                        // (pre-v0.3.12) record's identity reflects its real project —
+                        // this is the adoption/reconcile backfill point.
+                        backfill_replica_project(&mut state, &project);
                         out.push(state);
                     }
                 }
@@ -5990,5 +6014,97 @@ mod tests {
             store.purge_project("default").await,
             Err(DeployError::Conflict(_))
         ));
+    }
+
+    /// A legacy (pre-v0.3.12) replica record was persisted with NO `project` field
+    /// (it did not exist yet), so it deserializes with an empty `handle.project`.
+    /// On read, `list_replica_states` / `list_all_replica_states` must **backfill**
+    /// the project from the KV key (`project/<proj>/compute_state/…`) so the backend
+    /// derives the REAL project's identity/IPAM key — never `""`. This is the
+    /// adoption/reconcile backfill point.
+    #[tokio::test]
+    async fn read_backfills_project_into_a_legacy_replica_record() {
+        use crate::compute::{replica_state_key, Endpoint, ReplicaPhase, Scheme, Snapshot};
+        use crate::kv::MemoryKv;
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+
+        // A legacy record body: exactly what an old binary wrote — no `project` key
+        // on the handle, and a parked snapshot with no `project` key either. Written
+        // raw under the acme-scoped replica-state key.
+        let legacy = serde_json::json!({
+            "handle": { "workload": "web", "replica": 0, "backend_ref": "10.0.0.5:8080" },
+            "node": 1,
+            "backend": "container",
+            "endpoint": { "scheme": "http", "host": "10.0.0.5", "port": 8080 },
+            "healthy": false,
+            "phase": "Zero",
+            "snapshot": { "workload": "web", "replica": 0, "data_ref": "img|/rootfs|10.0.0.5|8080" }
+        });
+        // Sanity: it really has no project field (the pre-v0.3.12 shape).
+        assert!(legacy["handle"].get("project").is_none());
+        kv.put(
+            &replica_state_key("acme", "web", 0),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Per-workload read backfills the project onto the handle AND the snapshot.
+        let states = store
+            .list_replica_states(ProjectRef::new("acme"), "web")
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].handle.project, "acme",
+            "handle project backfilled"
+        );
+        assert_eq!(states[0].handle.workload, "web");
+        assert_eq!(
+            states[0].snapshot.as_ref().unwrap().project,
+            "acme",
+            "parked snapshot's project backfilled too"
+        );
+        assert_eq!(states[0].phase, ReplicaPhase::Zero);
+
+        // The cross-project read also backfills from each record's own key.
+        let all = store.list_all_replica_states().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].handle.project, "acme");
+
+        // And a freshly-written record (project already set) round-trips unchanged —
+        // the backfill is idempotent, never overwriting a real project.
+        store
+            .set_replica_state(
+                ProjectRef::new("beta"),
+                &crate::compute::ObservedInstance {
+                    handle: crate::compute::InstanceHandle {
+                        project: "beta".into(),
+                        workload: "web".into(),
+                        replica: 0,
+                        backend_ref: "10.0.0.6:8080".into(),
+                    },
+                    node: 1,
+                    backend: "container".into(),
+                    endpoint: Endpoint {
+                        scheme: Scheme::Http,
+                        host: "10.0.0.6".into(),
+                        port: 8080,
+                    },
+                    region: None,
+                    healthy: true,
+                    started_at: None,
+                    phase: ReplicaPhase::Running,
+                    snapshot: None::<Snapshot>,
+                },
+            )
+            .await
+            .unwrap();
+        let beta = store
+            .list_replica_states(ProjectRef::new("beta"), "web")
+            .await
+            .unwrap();
+        assert_eq!(beta[0].handle.project, "beta");
     }
 }

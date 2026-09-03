@@ -2671,15 +2671,19 @@ mod tests {
         }
     }
 
-    /// Build an `ObservedInstance` for the wake-from-zero helper tests.
-    fn observed_state(
+    /// Build an `ObservedInstance` for the wake-from-zero helper tests, owned by
+    /// `project` (so the project-scoped resolution can be exercised).
+    fn observed_state_in(
+        project: &str,
         workload: &str,
+        host: &str,
         healthy: bool,
         phase: boatramp_core::compute::ReplicaPhase,
     ) -> boatramp_core::compute::ObservedInstance {
         use boatramp_core::compute::{Endpoint, InstanceHandle, ReplicaPhase, Scheme, Snapshot};
         boatramp_core::compute::ObservedInstance {
             handle: InstanceHandle {
+                project: project.into(),
                 workload: workload.into(),
                 replica: 0,
                 backend_ref: "ref-0".into(),
@@ -2688,7 +2692,7 @@ mod tests {
             backend: "vmm".into(),
             endpoint: Endpoint {
                 scheme: Scheme::Http,
-                host: "10.0.0.2".into(),
+                host: host.into(),
                 port: 80,
             },
             region: None,
@@ -2696,11 +2700,21 @@ mod tests {
             started_at: None,
             phase,
             snapshot: matches!(phase, ReplicaPhase::Zero).then(|| Snapshot {
+                project: project.into(),
                 workload: workload.into(),
                 replica: 0,
                 data_ref: "snap-0".into(),
             }),
         }
+    }
+
+    /// The default-project helper the wake-from-zero tests use.
+    fn observed_state(
+        workload: &str,
+        healthy: bool,
+        phase: boatramp_core::compute::ReplicaPhase,
+    ) -> boatramp_core::compute::ObservedInstance {
+        observed_state_in("default", workload, "10.0.0.2", healthy, phase)
     }
 
     #[tokio::test]
@@ -2711,7 +2725,7 @@ mod tests {
         let deploy = DeployStore::new(storage, kv);
 
         // Nothing → false.
-        assert!(!has_parked_replica(&deploy, "w").await);
+        assert!(!has_parked_replica(&deploy, "default", "w").await);
         // A running replica → false (it's serving, not parked).
         deploy
             .set_replica_state(
@@ -2720,7 +2734,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!has_parked_replica(&deploy, "w").await);
+        assert!(!has_parked_replica(&deploy, "default", "w").await);
         // A parked (Zero) replica → true (wakeable).
         deploy
             .set_replica_state(
@@ -2729,7 +2743,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(has_parked_replica(&deploy, "w").await);
+        assert!(has_parked_replica(&deploy, "default", "w").await);
     }
 
     #[tokio::test]
@@ -2740,7 +2754,13 @@ mod tests {
         let deploy = DeployStore::new(storage, kv);
 
         // No healthy replica → times out with an empty pool (short timeout).
-        let empty = await_warm(&deploy, "w", std::time::Duration::from_millis(150)).await;
+        let empty = await_warm(
+            &deploy,
+            "default",
+            "w",
+            std::time::Duration::from_millis(150),
+        )
+        .await;
         assert!(empty.is_empty());
 
         // A healthy replica → returned promptly.
@@ -2751,8 +2771,52 @@ mod tests {
             )
             .await
             .unwrap();
-        let warm = await_warm(&deploy, "w", std::time::Duration::from_secs(5)).await;
+        let warm = await_warm(&deploy, "default", "w", std::time::Duration::from_secs(5)).await;
         assert_eq!(warm, vec!["http://10.0.0.2:80".to_string()]);
+    }
+
+    /// The project-scoped compute upstream resolution (v0.3.12): a workload named
+    /// `web` exists in BOTH the `acme` project and `default`, on different endpoints.
+    /// `compute_endpoints`/`has_parked_replica` must resolve against the project they
+    /// are asked for — a non-default tenant no longer resolves against `default` (the
+    /// project-blind bug that 502'd it / never woke it).
+    #[tokio::test]
+    async fn compute_endpoints_are_project_scoped() {
+        use boatramp_core::compute::ReplicaPhase;
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage, kv);
+
+        // Same workload name `web`, one per project, distinct endpoints.
+        deploy
+            .set_replica_state(
+                ProjectRef::new("acme"),
+                &observed_state_in("acme", "web", "10.0.0.5", true, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+        deploy
+            .set_replica_state(
+                ProjectRef::DEFAULT,
+                &observed_state_in("default", "web", "10.0.0.9", true, ReplicaPhase::Running),
+            )
+            .await
+            .unwrap();
+
+        // Asking for `acme` yields acme's endpoint — NOT default's.
+        assert_eq!(
+            compute_endpoints(&deploy, "acme", "web").await,
+            vec!["http://10.0.0.5:80".to_string()],
+            "acme's web resolves against acme, not default"
+        );
+        // Asking for `default` yields default's endpoint.
+        assert_eq!(
+            compute_endpoints(&deploy, "default", "web").await,
+            vec!["http://10.0.0.9:80".to_string()]
+        );
+        // A project with no such workload resolves empty (→ 502), not another
+        // project's replica.
+        assert!(compute_endpoints(&deploy, "beta", "web").await.is_empty());
     }
 
     /// The delivery gate: a consumer receives every published message at-least-once

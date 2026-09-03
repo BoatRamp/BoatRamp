@@ -407,6 +407,7 @@ async fn provision_and_launch_tenant(
         .map_err(|e| format!("store staged spec: {e}"))?;
 
     let req = LaunchRequest {
+        project: "default".into(),
         workload: workload.name.clone(),
         replica: 0,
         spec,

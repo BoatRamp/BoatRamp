@@ -14,9 +14,9 @@
 
 use async_trait::async_trait;
 use boatramp_core::compute::{
-    Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec, Endpoint, ExecOutput,
-    Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RestartPolicy, RootSource,
-    Scheme, VolumeRef,
+    compute_instance_id, Artifact, BackendError, Capabilities, ComputeBackend, ComputeSpec,
+    Endpoint, ExecOutput, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
+    RestartPolicy, RootSource, Scheme, VolumeRef,
 };
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StopContainerOptions,
@@ -279,9 +279,15 @@ impl DockerBackend {
     }
 }
 
-/// Container name for a workload replica (`boatramp-<workload>-<replica>`).
-fn container_name(workload: &str, replica: u32) -> String {
-    format!("boatramp-{workload}-{replica}")
+/// Container name for a workload replica (`boatramp-<id>`), where the id is
+/// project-qualified for a non-`default` project so two projects' same-named
+/// workloads never collide on the docker daemon; `default` keeps the bare
+/// `boatramp-<workload>-<replica>` name (byte-identical to pre-v0.3.12).
+fn container_name(project: &str, workload: &str, replica: u32) -> String {
+    format!(
+        "boatramp-{}",
+        compute_instance_id(project, workload, replica)
+    )
 }
 
 /// Encode `<name>@<ip>:<port>` into the handle ref so `stop`/`health` need no
@@ -454,7 +460,7 @@ impl ComputeBackend for DockerBackend {
                 ))
             }
         };
-        let name = container_name(&req.workload, req.replica);
+        let name = container_name(&req.project, &req.workload, req.replica);
         let env: Vec<String> = req
             .spec
             .env
@@ -549,6 +555,7 @@ impl ComputeBackend for DockerBackend {
         };
         Ok(Instance {
             handle: InstanceHandle {
+                project: req.project.clone(),
                 workload: req.workload.clone(),
                 replica: req.replica,
                 backend_ref: encode_ref(&name, &host, endpoint_port),
@@ -564,7 +571,7 @@ impl ComputeBackend for DockerBackend {
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), BackendError> {
         let name = decode_ref(&handle.backend_ref)
             .map(|(n, _, _)| n)
-            .unwrap_or_else(|| container_name(&handle.workload, handle.replica));
+            .unwrap_or_else(|| container_name(&handle.project, &handle.workload, handle.replica));
         // Stop (ignore "already stopped") then force-remove.
         let _ = self
             .docker
@@ -586,7 +593,7 @@ impl ComputeBackend for DockerBackend {
     async fn health(&self, handle: &InstanceHandle) -> Result<Health, BackendError> {
         let name = match decode_ref(&handle.backend_ref) {
             Some((n, _, _)) => n,
-            None => container_name(&handle.workload, handle.replica),
+            None => container_name(&handle.project, &handle.workload, handle.replica),
         };
         let info = match self.docker.inspect_container(&name, None).await {
             Ok(info) => info,
@@ -619,7 +626,7 @@ impl ComputeBackend for DockerBackend {
 
         let name = match decode_ref(&handle.backend_ref) {
             Some((n, _, _)) => n,
-            None => container_name(&handle.workload, handle.replica),
+            None => container_name(&handle.project, &handle.workload, handle.replica),
         };
         if argv.is_empty() {
             return Err(BackendError::Other("exec: empty argv".into()));
@@ -799,7 +806,14 @@ mod tests {
 
     #[test]
     fn name_and_ref_round_trip() {
-        assert_eq!(container_name("web", 0), "boatramp-web-0");
+        // Default project keeps the bare name (byte-identical to pre-v0.3.12);
+        // a non-default project qualifies it so two projects' `web/0` never collide.
+        assert_eq!(container_name("default", "web", 0), "boatramp-web-0");
+        assert_eq!(container_name("acme", "web", 0), "boatramp-acme-web-0");
+        assert_ne!(
+            container_name("acme", "web", 0),
+            container_name("beta", "web", 0)
+        );
         let r = encode_ref("boatramp-web-0", "172.17.0.3", 8080);
         assert_eq!(r, "boatramp-web-0@172.17.0.3:8080");
         assert_eq!(

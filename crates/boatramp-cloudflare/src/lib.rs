@@ -351,6 +351,7 @@ mod tests {
     fn health_url_prefers_ref_then_domain() {
         let b = CloudflareBackend::new("app.example.com");
         let h = |r: &str| InstanceHandle {
+            project: "default".into(),
             workload: "w".into(),
             replica: 0,
             backend_ref: r.into(),
@@ -388,6 +389,7 @@ mod tests {
 
         let err = b
             .launch(&LaunchRequest {
+                project: "default".into(),
                 workload: "web".into(),
                 replica: 2,
                 spec: s,
@@ -404,6 +406,7 @@ mod tests {
 
         // stop owns nothing → idempotent Ok.
         b.stop(&InstanceHandle {
+            project: "default".into(),
             workload: "web".into(),
             replica: 2,
             backend_ref: String::new(),

@@ -157,6 +157,7 @@ async fn container_live_launch_and_hold() {
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
 
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "clive".into(),
         replica: 0,
         spec,
@@ -274,6 +275,7 @@ async fn run_pg_e2e(host_root: bool) {
     assert!(matches!(artifact, Artifact::Rootfs { .. }));
 
     let req = LaunchRequest {
+        project: "default".into(),
         workload: format!("cpg{tag}"),
         replica: 0,
         spec,
@@ -422,6 +424,7 @@ async fn container_criu_roundtrip() {
     let spec = spec_for(&hash);
     let artifact = backend.materialize(&spec).await.expect("materialize");
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "ccriu".into(),
         replica: 0,
         spec,
@@ -497,6 +500,7 @@ async fn container_exec_runs_command_and_round_trips_stdin() {
     let spec = spec_for(&hash);
     let artifact = backend.materialize(&spec).await.expect("materialize");
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "cexec".into(),
         replica: 0,
         spec,

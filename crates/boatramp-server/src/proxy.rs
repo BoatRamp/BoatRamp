@@ -953,11 +953,17 @@ pub(super) async fn dispatch_gateway(
     })
 }
 
-/// The live healthy replica endpoints of a compute workload, as upstream URLs.
-/// Empty (→ 502) when no healthy replica exists.
-pub(super) async fn compute_endpoints(deploy: &DeployStore, workload: &str) -> Vec<String> {
+/// The live healthy replica endpoints of a compute workload **in `project`**, as
+/// upstream URLs. Empty (→ 502) when no healthy replica exists. Project-scoped so a
+/// non-default tenant's compute upstream resolves against its own replica state (not
+/// `default`), closing the project-blind resolution that 502'd / never woke it.
+pub(super) async fn compute_endpoints(
+    deploy: &DeployStore,
+    project: &str,
+    workload: &str,
+) -> Vec<String> {
     deploy
-        .list_replica_states(ProjectRef::DEFAULT, workload)
+        .list_replica_states(ProjectRef::new(project), workload)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -972,10 +978,11 @@ pub(super) async fn compute_endpoints(deploy: &DeployStore, workload: &str) -> V
 /// (region-neutral).
 pub(super) async fn compute_endpoint_regions(
     deploy: &DeployStore,
+    project: &str,
     workload: &str,
 ) -> std::collections::BTreeMap<String, String> {
     deploy
-        .list_replica_states(ProjectRef::DEFAULT, workload)
+        .list_replica_states(ProjectRef::new(project), workload)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -995,9 +1002,13 @@ pub(super) const COMPUTE_WAKE_TIMEOUT: std::time::Duration = std::time::Duration
 /// 502 rather than hold the request).
 ///
 /// [`Zero`]: boatramp_core::compute::ReplicaPhase::Zero
-pub(super) async fn has_parked_replica(deploy: &DeployStore, workload: &str) -> bool {
+pub(super) async fn has_parked_replica(
+    deploy: &DeployStore,
+    project: &str,
+    workload: &str,
+) -> bool {
     deploy
-        .list_replica_states(ProjectRef::DEFAULT, workload)
+        .list_replica_states(ProjectRef::new(project), workload)
         .await
         .unwrap_or_default()
         .iter()
@@ -1009,12 +1020,13 @@ pub(super) async fn has_parked_replica(deploy: &DeployStore, workload: &str) -> 
 /// Returns the (possibly still-empty, on timeout) pool.
 pub(super) async fn await_warm(
     deploy: &DeployStore,
+    project: &str,
     workload: &str,
     timeout: std::time::Duration,
 ) -> Vec<String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let pool = compute_endpoints(deploy, workload).await;
+        let pool = compute_endpoints(deploy, project, workload).await;
         if !pool.is_empty() || std::time::Instant::now() >= deadline {
             return pool;
         }

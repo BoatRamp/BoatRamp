@@ -59,6 +59,7 @@ async fn docker_round_trip() {
         .await
         .expect("materialize (pull)");
     let req = LaunchRequest {
+        project: "default".into(),
         workload: "ittest".into(),
         replica: 0,
         spec: spec.clone(),

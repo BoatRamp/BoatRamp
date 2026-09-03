@@ -214,26 +214,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A distilled stand-in for the container backend's IP lifecycle: a pool plus
-    /// the `(workload, replica) -> ip` map that the boot **adoption** step seeds
-    /// from persisted replica state, so a relaunch can reuse a replica's recorded
-    /// endpoint (stable IP) while every launch stays unique node-wide.
+    /// the `(project, workload, replica) -> ip` map that the boot **adoption** step
+    /// seeds from persisted replica state, so a relaunch can reuse a replica's
+    /// recorded endpoint (stable IP) while every launch stays unique node-wide.
+    /// Keying by **project** first (v0.3.12) is what stops two projects' same-named
+    /// workloads (`acme/web/0` vs `beta/web/0`) sharing a slot.
     struct BackendIpLifecycle {
         pool: IpPool,
-        // Persisted endpoints: (workload, replica) -> assigned ip, mirroring the
-        // backend's view of `compute_state/*` `backend_ref`s.
-        assigned: std::collections::BTreeMap<(String, u32), Ipv4Addr>,
+        // Persisted endpoints: (project, workload, replica) -> assigned ip, mirroring
+        // the backend's view of `project/<proj>/compute_state/*` `backend_ref`s.
+        assigned: std::collections::BTreeMap<(String, String, u32), Ipv4Addr>,
     }
 
     impl BackendIpLifecycle {
         /// Fresh-on-boot pool that has **adopted** the IPs of the already-known
         /// replicas (the fix). Passing `&[]` models the buggy empty-on-boot pool.
-        fn boot(cidr: &str, live: &[(&str, u32, Ipv4Addr)]) -> Self {
+        fn boot(cidr: &str, live: &[(&str, &str, u32, Ipv4Addr)]) -> Self {
             let mut pool = IpPool::new(cidr).unwrap();
-            let ips: Vec<Ipv4Addr> = live.iter().map(|(_, _, ip)| *ip).collect();
+            let ips: Vec<Ipv4Addr> = live.iter().map(|(_, _, _, ip)| *ip).collect();
             pool.reserve_in_use(&ips);
             let assigned = live
                 .iter()
-                .map(|(w, r, ip)| ((w.to_string(), *r), *ip))
+                .map(|(p, w, r, ip)| ((p.to_string(), w.to_string(), *r), *ip))
                 .collect();
             Self { pool, assigned }
         }
@@ -244,9 +246,9 @@ mod tests {
         /// adoption, in place. A replica with no record — or whose recorded IP is
         /// held by *another* live replica (a stale collision) — gets a fresh unique
         /// address. So a relaunch is stable and a launch is always node-unique.
-        fn launch(&mut self, workload: &str, replica: u32) -> Ipv4Addr {
+        fn launch(&mut self, project: &str, workload: &str, replica: u32) -> Ipv4Addr {
             // Mirrors `boatramp_container::backend::IpLifecycle::launch` exactly.
-            let key = (workload.to_string(), replica);
+            let key = (project.to_string(), workload.to_string(), replica);
             let recorded = self.assigned.get(&key).copied();
             let ip = match recorded {
                 // This replica's own address (no other live holder): reclaim it,
@@ -267,8 +269,11 @@ mod tests {
         /// other live replica still maps to that address (the "release only when
         /// truly last user" rule, so tearing down one side of a stale collision
         /// can't free the address the surviving replica still holds).
-        fn stop(&mut self, workload: &str, replica: u32) {
-            if let Some(ip) = self.assigned.remove(&(workload.to_string(), replica)) {
+        fn stop(&mut self, project: &str, workload: &str, replica: u32) {
+            if let Some(ip) =
+                self.assigned
+                    .remove(&(project.to_string(), workload.to_string(), replica))
+            {
                 if !self.assigned.values().any(|&held| held == ip) {
                     self.pool.release(ip);
                 }
@@ -277,7 +282,7 @@ mod tests {
 
         /// Whether `key` is the *only* recorded holder of `ip` (so it genuinely
         /// owns the reservation and may reclaim it in place).
-        fn owns(&self, key: &(String, u32), ip: Ipv4Addr) -> bool {
+        fn owns(&self, key: &(String, String, u32), ip: Ipv4Addr) -> bool {
             !self
                 .assigned
                 .iter()
@@ -291,15 +296,20 @@ mod tests {
         // IP. The node reboots: a fresh backend ADOPTS their IPs, then the boot
         // reconcile stops the stale replicas and relaunches each ordinal.
         let live = [
-            ("pg-construens_a1b2", 0u32, Ipv4Addr::new(10, 0, 0, 2)),
-            ("pg", 0u32, Ipv4Addr::new(10, 0, 0, 3)),
+            (
+                "default",
+                "pg-construens_a1b2",
+                0u32,
+                Ipv4Addr::new(10, 0, 0, 2),
+            ),
+            ("default", "pg", 0u32, Ipv4Addr::new(10, 0, 0, 3)),
         ];
         let mut be = BackendIpLifecycle::boot("10.0.0.0/24", &live);
 
         // The boot reconcile relaunches each still-desired ordinal; adoption lets
         // each reclaim its own recorded endpoint.
-        let a = be.launch("pg-construens_a1b2", 0);
-        let b = be.launch("pg", 0);
+        let a = be.launch("default", "pg-construens_a1b2", 0);
+        let b = be.launch("default", "pg", 0);
 
         // The core invariant: two live containers NEVER share an IP.
         assert_ne!(a, b, "two workloads' replicas must get distinct IPs");
@@ -309,17 +319,44 @@ mod tests {
     }
 
     #[test]
+    fn same_named_workloads_in_different_projects_get_distinct_ips() {
+        // The cross-tenant collision class (v0.3.12): two DIFFERENT projects each own
+        // a workload named `web`, replica 0. Pre-fix the IPAM keyed by
+        // `(workload, replica)`, so both `web/0`s collapsed to ONE slot → an IP
+        // collision (and, in the backend, a shared cgroup/veth). Keying by
+        // `(project, workload, replica)` keeps them distinct. Fresh pool (no adoption)
+        // so both are first-time launches — the multi-tenant "each admin names their
+        // own workloads" case.
+        let mut be = BackendIpLifecycle::boot("10.0.0.0/24", &[]);
+        let acme = be.launch("acme", "web", 0);
+        let beta = be.launch("beta", "web", 0);
+        assert_ne!(
+            acme, beta,
+            "same-named workloads in different projects must NOT share an IP"
+        );
+
+        // And each project's `web/0` is stable across a relaunch (its own slot).
+        assert_eq!(be.launch("acme", "web", 0), acme);
+        assert_eq!(be.launch("beta", "web", 0), beta);
+
+        // Stopping one project's `web` frees only its address; the other is untouched.
+        be.stop("acme", "web", 0);
+        assert!(be.pool.is_free(acme), "acme/web/0's IP is released");
+        assert!(!be.pool.is_free(beta), "beta/web/0's IP is still held");
+    }
+
+    #[test]
     fn interleaved_stop_launch_never_reuses_a_live_ip() {
         // The precise collision shape: within one pass, A is stopped (its IP freed)
         // and a DIFFERENT workload B is launched before A relaunches. The freed IP
         // must not be handed to B while A still intends to reclaim it — and even if
         // B does take it, A must then get a different, unique address.
-        let live = [("pg-a", 0u32, Ipv4Addr::new(10, 0, 0, 2))];
+        let live = [("default", "pg-a", 0u32, Ipv4Addr::new(10, 0, 0, 2))];
         let mut be = BackendIpLifecycle::boot("10.0.0.0/24", &live);
 
-        be.stop("pg-a", 0); // A stopped → .2 released
-        let b = be.launch("pg-b", 0); // new workload B launches
-        let a = be.launch("pg-a", 0); // A relaunches
+        be.stop("default", "pg-a", 0); // A stopped → .2 released
+        let b = be.launch("default", "pg-b", 0); // new workload B launches
+        let a = be.launch("default", "pg-a", 0); // A relaunches
 
         assert_ne!(
             a, b,
@@ -334,15 +371,15 @@ mod tests {
         // `reserve_in_use` reserves .2 once (set semantics); relaunching the second
         // replica finds its recorded .2 taken and allocates fresh.
         let live = [
-            ("pg-a", 0u32, Ipv4Addr::new(10, 0, 0, 2)),
-            ("pg-b", 0u32, Ipv4Addr::new(10, 0, 0, 2)), // collision!
+            ("default", "pg-a", 0u32, Ipv4Addr::new(10, 0, 0, 2)),
+            ("default", "pg-b", 0u32, Ipv4Addr::new(10, 0, 0, 2)), // collision!
         ];
         let mut be = BackendIpLifecycle::boot("10.0.0.0/24", &live);
 
         // The relaunch reference-counts the release: whichever launches second
         // finds .2 still held by the first and is re-homed to a fresh address.
-        let a = be.launch("pg-a", 0);
-        let b = be.launch("pg-b", 0);
+        let a = be.launch("default", "pg-a", 0);
+        let b = be.launch("default", "pg-b", 0);
 
         assert!(
             a == Ipv4Addr::new(10, 0, 0, 2) || b == Ipv4Addr::new(10, 0, 0, 2),
@@ -360,11 +397,11 @@ mod tests {
         // replica's recorded endpoint (.7); the boot reconcile relaunches that
         // ordinal, which reclaims .7 in place, so the gateway's persisted
         // `backend_ref` stays valid across the reboot.
-        let live = [("pg-a", 0u32, Ipv4Addr::new(10, 0, 0, 7))];
+        let live = [("default", "pg-a", 0u32, Ipv4Addr::new(10, 0, 0, 7))];
         let mut be = BackendIpLifecycle::boot("10.0.0.0/24", &live);
-        assert_eq!(be.launch("pg-a", 0), Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(be.launch("default", "pg-a", 0), Ipv4Addr::new(10, 0, 0, 7));
         // Idempotent across repeated reconcile passes.
-        assert_eq!(be.launch("pg-a", 0), Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(be.launch("default", "pg-a", 0), Ipv4Addr::new(10, 0, 0, 7));
     }
 
     #[test]
@@ -384,9 +421,11 @@ mod tests {
 
         // The fix restores stability: a fresh backend adopts the recorded endpoints,
         // and the launch path (release-then-`allocate_stable`) reclaims .9 exactly.
-        let mut be =
-            BackendIpLifecycle::boot("10.0.0.0/24", &[("pg", 0, Ipv4Addr::new(10, 0, 0, 9))]);
-        assert_eq!(be.launch("pg", 0), Ipv4Addr::new(10, 0, 0, 9));
+        let mut be = BackendIpLifecycle::boot(
+            "10.0.0.0/24",
+            &[("default", "pg", 0, Ipv4Addr::new(10, 0, 0, 9))],
+        );
+        assert_eq!(be.launch("default", "pg", 0), Ipv4Addr::new(10, 0, 0, 9));
     }
 
     #[test]
