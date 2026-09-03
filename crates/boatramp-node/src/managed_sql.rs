@@ -714,7 +714,7 @@ impl boatramp_core::sql::OperatorSql for NodeOperatorSql {
             .ok_or_else(|| SqlError::other(format!("no database named {db:?}")))?;
         // A bring-your-own-URL binding isn't compute-backed, so there is no replica
         // fleet to probe — ping is for managed co-located databases.
-        if !cfg.compute.as_deref().is_some_and(|c| !c.is_empty()) {
+        if cfg.compute.as_deref().is_none_or(|c| c.is_empty()) {
             return Err(SqlError::other(format!(
                 "database {db:?} is not compute-backed; `sql ping` probes managed co-located \
                  replicas only"
