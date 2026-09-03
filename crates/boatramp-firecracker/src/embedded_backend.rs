@@ -36,7 +36,7 @@ use boatramp_core::compute::{
     Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
     Snapshot, VolumeRef,
 };
-use boatramp_core::ipam::IpPool;
+use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::Storage;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -218,8 +218,11 @@ pub struct EmbeddedVmmBackend {
     bridge: String,
     /// The bridge's gateway address (guests route through it; goes in `ip=`).
     gateway: String,
-    /// Per-node guest-IP pool.
-    ipam: Mutex<IpPool>,
+    /// The guest-IP authority for this bridge/subnet — **shared** (A5) with the
+    /// co-located native `container` backend when `build_compute` injects one, so a
+    /// tap and a veth on the same L2 can never be handed the same address. Its own
+    /// `Arc<Mutex<IpPool>>` provides the interior mutability the launch/stop paths need.
+    ipam: IpAuthority,
     /// Running VMs, keyed by [`vm_id`].
     running: Mutex<HashMap<String, RunningVm>>,
     /// Verify-before-boot gate: the staged kernel must clear it before it loads.
@@ -241,17 +244,29 @@ impl EmbeddedVmmBackend {
         subnet: &str,
         verifier: Arc<dyn crate::KernelVerifier>,
     ) -> Result<Self, BackendError> {
-        let ipam = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
+        let pool = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
         Ok(Self {
             storage,
             self_exe,
             data_dir,
             bridge,
             gateway,
-            ipam: Mutex::new(ipam),
+            // A private authority by default; `with_ip_authority` swaps in the shared one.
+            ipam: IpAuthority::over(pool),
             running: Mutex::new(HashMap::new()),
             verifier,
         })
+    }
+
+    /// Use a **shared** [`IpAuthority`] instead of this backend's private pool (A5),
+    /// so the co-located native `container` backend and this VMM backend draw from and
+    /// release to ONE address pool on their shared bridge/subnet — never handing out
+    /// the same `10.0.0.x` on the same L2. `build_compute` builds one authority per
+    /// bridge/subnet and injects a clone here. The authority must be over the same
+    /// subnet this backend was constructed with.
+    pub fn with_ip_authority(mut self, authority: IpAuthority) -> Self {
+        self.ipam = authority;
+        self
     }
 
     /// Fetch blob `hash` to `<data_dir>/compute/<subdir>/<hash><ext>` (streamed;
@@ -716,11 +731,10 @@ impl ComputeBackend for EmbeddedVmmBackend {
         };
 
         let id = vm_id(&req.project, &req.workload, req.replica);
-        let ip = {
-            let mut pool = self.ipam.lock().expect("ipam mutex");
-            pool.allocate()
-                .map_err(|e| BackendError::Launch(e.to_string()))?
-        };
+        let ip = self
+            .ipam
+            .allocate()
+            .map_err(|e| BackendError::Launch(e.to_string()))?;
         let tap = TapNetwork::for_vm(&id, &self.bridge);
         let port = req.spec.port;
 
@@ -768,7 +782,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
                 for cmd in tap.teardown_commands() {
                     let _ = run_host_command(&cmd);
                 }
-                self.ipam.lock().expect("ipam mutex").release(ip);
+                self.ipam.release(ip);
                 return Err(BackendError::Launch(err));
             }
         };
@@ -818,7 +832,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
             running.ip
         })
         .await
-        .map(|ip| self.ipam.lock().expect("ipam mutex").release(ip))
+        .map(|ip| self.ipam.release(ip))
         .map_err(|e| BackendError::Stop(format!("join: {e}")))?;
         Ok(())
     }
@@ -931,7 +945,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
         cfg.restore = true;
 
         // Re-reserve the guest IP so the pool won't reissue it while restoring.
-        self.ipam.lock().expect("ipam mutex").reserve(addr);
+        self.ipam.reserve(addr);
         let tap = TapNetwork::for_vm(&id, &self.bridge);
 
         let (self_exe, tap_for_spawn, cfg_for_spawn) =
@@ -949,7 +963,7 @@ impl ComputeBackend for EmbeddedVmmBackend {
                 for cmd in tap.teardown_commands() {
                     let _ = run_host_command(&cmd);
                 }
-                self.ipam.lock().expect("ipam mutex").release(addr);
+                self.ipam.release(addr);
                 return Err(BackendError::Launch(err));
             }
         };

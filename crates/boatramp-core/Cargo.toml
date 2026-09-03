@@ -47,6 +47,10 @@ sha2.workspace = true
 hex.workspace = true
 lru.workspace = true
 getrandom.workspace = true
+# Structured logging facade (wasm-clean): the shared compute IP authority
+# (`ipam::IpAuthority`) warns on pool exhaustion / high-water so an operator sees an
+# approaching-exhaustion cliff before launches start failing.
+tracing.workspace = true
 # Dialect-aware SQL tokenizer for the guest-SQL reserved-session-key guard
 # (`sql::reject_reserved_session_writes`): comments/whitespace are normalized away
 # and casing/quoting handled, so a hostile guest cannot smuggle a reserved

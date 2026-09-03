@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 
 use ipnet::Ipv4Net;
 
@@ -141,12 +142,232 @@ impl IpPool {
         self.allocated.len()
     }
 
+    /// The total number of allocatable host addresses (every host in the CIDR
+    /// except the reserved gateway). The denominator for a utilization / high-water
+    /// calculation. A `/24` is 254 hosts − 1 gateway = 253; a `/30` is 1.
+    pub fn total_hosts(&self) -> usize {
+        // `Ipv4Net::hosts()` already excludes the network/broadcast; drop the gateway.
+        self.net.hosts().count().saturating_sub(1)
+    }
+
+    /// The subnet this pool manages, as a CIDR string — for diagnostics (e.g. the
+    /// exhaustion warning naming the subnet the operator can widen).
+    pub fn cidr(&self) -> String {
+        self.net.to_string()
+    }
+
     /// A stable, locally-administered unicast MAC derived from `ip`
     /// (`02:00:<the four IPv4 octets>`). The `02` prefix sets the
     /// locally-administered bit and clears the multicast bit.
     pub fn mac_for(ip: Ipv4Addr) -> String {
         let o = ip.octets();
         format!("02:00:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
+    }
+}
+
+/// A **shared** IP authority over one [`IpPool`], cloneable and thread-safe
+/// (`Arc<Mutex<IpPool>>`). It is the single address authority for every compute
+/// backend that places guests on the *same* bridge/subnet — the native `container`
+/// backend's veths and the embedded / macOS VMM backends' taps all live on one L2,
+/// so they must draw from and release to ONE pool or two backends could hand out the
+/// same `10.0.0.x` on the same segment (a cross-backend collision). `build_compute`
+/// builds one authority per bridge/subnet and injects a clone into each co-located
+/// backend; the container backend's `(project,workload,replica)`-keyed ownership map
+/// stays per-backend, but the address pool underneath is this shared authority.
+///
+/// Every allocation path also surfaces pressure: [`allocate`](Self::allocate) /
+/// [`allocate_stable`](Self::allocate_stable) log a `warn` on exhaustion (naming the
+/// subnet + in-use count, noting `compute.subnet` can be widened) and cross a
+/// high-water mark once, so an operator sees an approaching cliff before launches
+/// start failing.
+#[derive(Clone)]
+pub struct IpAuthority {
+    pool: Arc<Mutex<IpPool>>,
+    /// Utilization fraction (0.0–1.0) past which a single high-water warning fires.
+    high_water: f64,
+    /// One-shot latch so the high-water warning logs once per crossing, not every
+    /// allocation, and re-arms when utilization falls back below the mark.
+    warned_high: Arc<Mutex<bool>>,
+}
+
+impl std::fmt::Debug for IpAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (used, total) = self
+            .pool
+            .lock()
+            .map(|p| (p.allocated_count(), p.total_hosts()))
+            .unwrap_or((0, 0));
+        f.debug_struct("IpAuthority")
+            .field("used", &used)
+            .field("total", &total)
+            .field("high_water", &self.high_water)
+            .finish()
+    }
+}
+
+impl IpAuthority {
+    /// The default high-water utilization (90%) — an approaching-exhaustion warning
+    /// fires when the pool crosses it.
+    pub const DEFAULT_HIGH_WATER: f64 = 0.9;
+
+    /// Build a shared authority over `cidr` (e.g. `10.0.0.0/24`), warning at the
+    /// default high-water mark.
+    pub fn new(cidr: &str) -> Result<Self, IpamError> {
+        Ok(Self::over(IpPool::new(cidr)?))
+    }
+
+    /// Wrap an existing pool as the shared authority (e.g. a pool the caller already
+    /// built to read its gateway/prefix for the bridge).
+    pub fn over(pool: IpPool) -> Self {
+        Self {
+            pool: Arc::new(Mutex::new(pool)),
+            high_water: Self::DEFAULT_HIGH_WATER,
+            warned_high: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    /// The reserved gateway address (`.1`) of the shared subnet.
+    pub fn gateway(&self) -> Ipv4Addr {
+        self.pool.lock().expect("ipam authority").gateway()
+    }
+
+    /// The prefix length of the shared subnet.
+    pub fn prefix_len(&self) -> u8 {
+        self.pool.lock().expect("ipam authority").prefix_len()
+    }
+
+    /// Whether this authority's subnet is responsible for `ip` (in-CIDR, non-gateway).
+    pub fn manages(&self, ip: Ipv4Addr) -> bool {
+        self.pool.lock().expect("ipam authority").manages(ip)
+    }
+
+    /// Whether `ip` is currently free in the shared pool.
+    pub fn is_free(&self, ip: Ipv4Addr) -> bool {
+        self.pool.lock().expect("ipam authority").is_free(ip)
+    }
+
+    /// Mark `ip` as in use in the shared pool (idempotent).
+    pub fn reserve(&self, ip: Ipv4Addr) {
+        self.pool.lock().expect("ipam authority").reserve(ip);
+    }
+
+    /// Reserve every in-subnet address in `ips` (boot-time adoption), from *any*
+    /// backend — so a running VMM guest's IP is reserved before the container backend
+    /// allocates, and vice-versa. Skips the gateway + out-of-subnet addresses.
+    pub fn reserve_in_use(&self, ips: &[Ipv4Addr]) {
+        self.pool
+            .lock()
+            .expect("ipam authority")
+            .reserve_in_use(ips);
+    }
+
+    /// Return `ip` to the shared pool.
+    pub fn release(&self, ip: Ipv4Addr) {
+        self.pool.lock().expect("ipam authority").release(ip);
+    }
+
+    /// Allocate the next free address from the shared pool, surfacing pressure
+    /// (high-water + exhaustion warnings). See [`IpAuthority`].
+    pub fn allocate(&self) -> Result<Ipv4Addr, IpamError> {
+        let mut pool = self.pool.lock().expect("ipam authority");
+        let out = pool.allocate();
+        self.surface_pressure(&pool, &out);
+        out
+    }
+
+    /// Allocate a stable address (reuse `preferred` when free) from the shared pool,
+    /// surfacing the same pressure warnings as [`allocate`](Self::allocate).
+    pub fn allocate_stable(&self, preferred: Option<Ipv4Addr>) -> Result<Ipv4Addr, IpamError> {
+        let mut pool = self.pool.lock().expect("ipam authority");
+        let out = pool.allocate_stable(preferred);
+        self.surface_pressure(&pool, &out);
+        out
+    }
+
+    /// How many addresses are currently allocated across the shared pool.
+    pub fn allocated_count(&self) -> usize {
+        self.pool.lock().expect("ipam authority").allocated_count()
+    }
+
+    /// Run the pure pressure decision over the just-observed pool state and emit the
+    /// warnings it selects. Kept off the pure `IpPool` so `IpPool` stays log-free and
+    /// the decision itself ([`pressure`]) is host-testable without a tracing capture.
+    fn surface_pressure(&self, pool: &IpPool, outcome: &Result<Ipv4Addr, IpamError>) {
+        let total = pool.total_hosts();
+        let used = pool.allocated_count();
+        let cidr = pool.cidr();
+        let mut warned = self.warned_high.lock().expect("ipam high-water latch");
+        match pressure(used, total, self.high_water, *warned, outcome.is_err()) {
+            Pressure::Exhausted => {
+                tracing::warn!(
+                    subnet = %cidr,
+                    in_use = used,
+                    capacity = total,
+                    "compute IPAM pool exhausted: no free guest IP remains — widen `compute.subnet` \
+                     (e.g. a /23 or /22) to grow the pool"
+                );
+            }
+            Pressure::CrossedHighWater => {
+                *warned = true;
+                tracing::warn!(
+                    subnet = %cidr,
+                    in_use = used,
+                    capacity = total,
+                    high_water_pct = (self.high_water * 100.0) as u32,
+                    "compute IPAM pool utilization is high — consider widening `compute.subnet` \
+                     before it exhausts"
+                );
+            }
+            Pressure::BelowHighWater => *warned = false,
+            Pressure::Nominal => {}
+        }
+    }
+}
+
+/// The pressure signal an allocation attempt produced — the pure decision behind
+/// [`IpAuthority::surface_pressure`], so the warning logic is host-testable without a
+/// tracing subscriber. `already_warned` is the caller's one-shot latch (so the
+/// high-water warning fires once per crossing); `alloc_failed` is whether the
+/// allocation returned [`IpamError::Exhausted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pressure {
+    /// Allocation failed because the pool is full — always warn.
+    Exhausted,
+    /// Utilization just crossed the high-water mark (and hadn't been warned) — warn once.
+    CrossedHighWater,
+    /// Utilization is at/above the mark but was already warned — stay quiet (latched).
+    Nominal,
+    /// Utilization fell back below the mark — clear the latch so a later crossing re-warns.
+    BelowHighWater,
+}
+
+/// Decide which pressure warning (if any) an allocation should emit. Pure so it is
+/// unit-testable: an exhausted allocation always warns; otherwise the first crossing
+/// of `high_water` (as `used/total`) warns once, and dropping back below it re-arms.
+fn pressure(
+    used: usize,
+    total: usize,
+    high_water: f64,
+    already_warned: bool,
+    alloc_failed: bool,
+) -> Pressure {
+    if alloc_failed {
+        return Pressure::Exhausted;
+    }
+    if total == 0 {
+        return Pressure::Nominal;
+    }
+    let util = used as f64 / total as f64;
+    if util >= high_water {
+        if already_warned {
+            Pressure::Nominal
+        } else {
+            Pressure::CrossedHighWater
+        }
+    } else if already_warned {
+        Pressure::BelowHighWater
+    } else {
+        Pressure::Nominal
     }
 }
 
@@ -467,5 +688,99 @@ mod tests {
             IpPool::new("not-a-cidr"),
             Err(IpamError::BadCidr(_))
         ));
+    }
+
+    #[test]
+    fn total_hosts_excludes_gateway() {
+        // /24: 254 hosts (RFC network/broadcast excluded by `hosts()`), minus the gateway.
+        assert_eq!(IpPool::new("10.0.0.0/24").unwrap().total_hosts(), 253);
+        // /30: hosts .1,.2 → minus the .1 gateway → 1 allocatable.
+        assert_eq!(IpPool::new("10.0.0.0/30").unwrap().total_hosts(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // A1: pool-pressure decision (exhaustion + high-water). Pure so the warning
+    // policy is host-testable without a tracing subscriber.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pressure_exhaustion_always_warns() {
+        // A failed allocation is Exhausted regardless of the latch or utilization.
+        assert_eq!(pressure(253, 253, 0.9, false, true), Pressure::Exhausted);
+        assert_eq!(pressure(0, 253, 0.9, true, true), Pressure::Exhausted);
+    }
+
+    #[test]
+    fn pressure_high_water_warns_once_then_latches_and_rearms() {
+        let hw = 0.9;
+        let total = 100;
+        // Below the mark, unwarned: nominal.
+        assert_eq!(pressure(80, total, hw, false, false), Pressure::Nominal);
+        // First crossing (>=90%): warn once.
+        assert_eq!(
+            pressure(90, total, hw, false, false),
+            Pressure::CrossedHighWater
+        );
+        // Still above the mark but already warned: stay quiet (latched).
+        assert_eq!(pressure(95, total, hw, true, false), Pressure::Nominal);
+        // Fell back below the mark while latched: re-arm (clear the latch).
+        assert_eq!(
+            pressure(50, total, hw, true, false),
+            Pressure::BelowHighWater
+        );
+    }
+
+    #[test]
+    fn pressure_zero_capacity_is_nominal() {
+        assert_eq!(pressure(0, 0, 0.9, false, false), Pressure::Nominal);
+    }
+
+    // -----------------------------------------------------------------------
+    // A5: a shared IpAuthority is ONE address pool. Two backends drawing from the
+    // same authority (co-located on one bridge/subnet) can never be handed the same
+    // address — the cross-backend collision the shared authority prevents.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shared_authority_never_hands_two_backends_the_same_address() {
+        // One authority injected into two backends (a clone each) — the container
+        // veth pool and a VMM tap pool are the same underlying pool.
+        let container_view = IpAuthority::new("10.0.0.0/24").unwrap();
+        let vmm_view = container_view.clone();
+
+        // Interleave allocations across the two views, as two co-located backends
+        // launching guests on the same L2 would.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..10 {
+            let c = container_view.allocate().unwrap();
+            let v = vmm_view.allocate().unwrap();
+            assert!(
+                seen.insert(c),
+                "container view re-handed a live address {c}"
+            );
+            assert!(seen.insert(v), "vmm view re-handed a live address {v}");
+            assert_ne!(c, v, "the two backends must never share an address");
+        }
+        // The shared pool counts every allocation from both views.
+        assert_eq!(container_view.allocated_count(), 20);
+        assert_eq!(vmm_view.allocated_count(), 20);
+    }
+
+    #[test]
+    fn shared_authority_adoption_from_one_backend_blocks_another() {
+        // A running VMM guest's IP, adopted at boot, must be reserved before the
+        // container backend allocates — even though the container backend did the
+        // adopting-via its own clone (they share the pool).
+        let vmm_view = IpAuthority::new("10.0.0.0/24").unwrap();
+        let container_view = vmm_view.clone();
+        // The VMM guest already holds .2 (adopted through either view).
+        vmm_view.reserve_in_use(&[Ipv4Addr::new(10, 0, 0, 2)]);
+        // The container backend now allocates: it must skip the VMM's .2.
+        let got = container_view.allocate().unwrap();
+        assert_ne!(got, Ipv4Addr::new(10, 0, 0, 2));
+        assert!(!vmm_view.is_free(Ipv4Addr::new(10, 0, 0, 2)));
+        // And a release through either view frees it in the one pool.
+        container_view.release(got);
+        assert!(vmm_view.is_free(got));
     }
 }

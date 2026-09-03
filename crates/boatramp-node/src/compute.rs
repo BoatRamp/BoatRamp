@@ -210,11 +210,30 @@ pub async fn build_compute(
     // rather than requiring the operator to pre-create it — so a stock image on a fresh
     // host is turnkey. If it can't be created, the container + embedded-VMM backends are
     // skipped rather than advertised and then failing at launch on the missing bridge.
+    // The SINGLE shared IP authority for the compute bridge/subnet (A5): every backend
+    // that places a guest on `cfg.bridge` (the native container backend's veths + the
+    // embedded-VMM backend's taps) draws from and releases to this ONE pool, so two
+    // backends on the same L2 can never be handed the same address. Built once here and
+    // injected (a clone) into each. `None` if the subnet is malformed (both backends are
+    // then skipped, same as before).
     #[cfg(target_os = "linux")]
-    let bridge_ready = match boatramp_core::ipam::IpPool::new(&cfg.subnet) {
-        Ok(pool) => {
-            match boatramp_container::ensure_bridge(&cfg.bridge, pool.gateway(), pool.prefix_len())
-                .await
+    let shared_ip_authority: Option<boatramp_core::ipam::IpAuthority> =
+        match boatramp_core::ipam::IpAuthority::new(&cfg.subnet) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::warn!(%e, subnet = %cfg.subnet, "bad compute subnet; container + embedded-VMM backends disabled");
+                None
+            }
+        };
+    #[cfg(target_os = "linux")]
+    let bridge_ready = match &shared_ip_authority {
+        Some(authority) => {
+            match boatramp_container::ensure_bridge(
+                &cfg.bridge,
+                authority.gateway(),
+                authority.prefix_len(),
+            )
+            .await
             {
                 Ok(()) => true,
                 Err(e) => {
@@ -223,10 +242,7 @@ pub async fn build_compute(
                 }
             }
         }
-        Err(e) => {
-            tracing::warn!(%e, subnet = %cfg.subnet, "bad compute subnet; container + embedded-VMM backends disabled");
-            false
-        }
+        None => false,
     };
 
     // Native container backend (Linux only).
@@ -249,6 +265,12 @@ pub async fn build_compute(
                     // node starts the resolver task (see `spawn_internal_dns`); the
                     // two must agree on the domain, so both read `compute.dns_domain`.
                     let c = c.with_internal_dns(cfg.internal_dns.then(|| cfg.dns_domain.clone()));
+                    // Share the ONE bridge/subnet IP authority (A5) so a co-located
+                    // embedded-VMM guest and a container can never get the same address.
+                    let c = match &shared_ip_authority {
+                        Some(a) => c.with_ip_authority(a.clone()),
+                        None => c,
+                    };
                     backends.insert("container".to_string(), std::sync::Arc::new(c));
                 }
                 Err(e) => tracing::warn!(%e, "container backend unavailable"),
@@ -288,6 +310,13 @@ pub async fn build_compute(
                     verifier,
                 ) {
                     Ok(vmm) => {
+                        // Share the ONE bridge/subnet IP authority with the co-located
+                        // container backend (A5): both draw from and release to one pool,
+                        // so a tap and a veth on the same L2 never collide on an address.
+                        let vmm = match &shared_ip_authority {
+                            Some(a) => vmm.with_ip_authority(a.clone()),
+                            None => vmm,
+                        };
                         backends.insert("vmm-embedded".to_string(), std::sync::Arc::new(vmm));
                     }
                     Err(e) => tracing::warn!(%e, "embedded VMM backend unavailable"),
@@ -328,6 +357,11 @@ pub async fn build_compute(
                 ) {
                     // `writable_root` honored only under the single-tenant posture.
                     Ok(vz) => {
+                        // The vz backend keeps its own private IP authority (A5): on macOS
+                        // it is the sole compute backend on the vmnet segment (no native
+                        // container / KVM backend to share with), so there is nothing to
+                        // collide with. It still accepts a shared authority via
+                        // `with_ip_authority` for a uniform surface.
                         let vz = vz.with_writable_root_allowed(!strict);
                         backends.insert("vmm-vz".to_string(), std::sync::Arc::new(vz));
                     }

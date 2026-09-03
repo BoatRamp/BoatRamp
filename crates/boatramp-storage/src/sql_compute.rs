@@ -28,6 +28,12 @@ use boatramp_core::sql::{SqlBackend, SqlError, SqlTransaction, SqlValue};
 
 use crate::sql_sqlx::{connect, ExternalSqlKind, ExternalSqlOptions};
 
+/// Fallback timeout for the C1 managed-DB readiness probe (`SELECT 1` on a
+/// freshly-built pool) when the binding sets no `connect_timeout`. Short by design: a
+/// listening-but-not-answering DB (recovery / initializing / overloaded) should be
+/// reported not-ready quickly rather than block the caller.
+const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// A logical session-context key injected at every transaction start when the
 /// binding opts into RLS session-injection (`rls_session = true`). The two
 /// recognised keys mirror the request's tenant identity so hand-written **native
@@ -309,21 +315,69 @@ impl ComputeResolvedSqlBackend {
     }
 
     /// The current sqlx backend, (re)built when the resolved URL changed.
+    ///
+    /// C1 managed-DB **readiness gate**: sqlx's `connect` builds a *lazy* pool — it
+    /// succeeds against a broken-but-listening database (mid-recovery, auth-broken, or
+    /// still initializing), so a bare TCP-liveness health check would treat it as
+    /// usable. Before this backend caches + hands out a freshly-built pool it runs one
+    /// real `SELECT 1` (the driver's ping): a database that can't answer is reported as
+    /// **not ready** rather than handed to the caller. The probe runs only on a
+    /// (re)build — the cached hot path (same URL) skips it, so there is no per-statement
+    /// cost. A probe failure is NOT cached, so the next call re-resolves + re-probes as
+    /// the DB finishes coming up.
     async fn pool(&self) -> Result<Arc<dyn SqlBackend>, SqlError> {
         let url = self.resolve_url().await?;
-        let mut cached = self.cached.lock().expect("sql-compute pool cache poisoned");
-        if let Some((cached_url, backend)) = cached.as_ref() {
-            if *cached_url == url {
-                return Ok(Arc::clone(backend));
+        // Fast path: reuse the cached pool for an unchanged endpoint (already probed
+        // ready when it was built). The guard is not held across an await.
+        {
+            let cached = self.cached.lock().expect("sql-compute pool cache poisoned");
+            if let Some((cached_url, backend)) = cached.as_ref() {
+                if *cached_url == url {
+                    return Ok(Arc::clone(backend));
+                }
             }
         }
+        // (Re)build the pool for a new endpoint, then gate it on a real readiness probe
+        // before caching. `connect` itself is synchronous (a lazy pool); the probe is
+        // the async part, which is why the cache guard is dropped above / re-taken below.
         let opts = ExternalSqlOptions::new(url.clone())
             .with_max_connections(self.pool_max)
             .read_only(self.read_only)
             .with_connect_timeout(self.connect_timeout);
         let backend = connect(self.kind, &opts).map_err(|e| self.hint_stale_volume(e))?;
+        self.probe_ready(&backend).await?;
+        let mut cached = self.cached.lock().expect("sql-compute pool cache poisoned");
         *cached = Some((url, Arc::clone(&backend)));
         Ok(backend)
+    }
+
+    /// Run the C1 readiness probe against a freshly-built `backend`: one real
+    /// `SELECT 1` in a short-lived read-only transaction (the driver actually opens a
+    /// connection + round-trips, unlike the lazy pool build). Bounded by
+    /// `connect_timeout` (a `DEFAULT_READINESS_TIMEOUT` fallback) so a hung/recovering
+    /// DB fails fast rather than blocking the caller. A stale-volume auth failure is
+    /// still surfaced with the reclaim hint; any other failure is reported as a
+    /// not-ready condition naming the workload.
+    async fn probe_ready(&self, backend: &Arc<dyn SqlBackend>) -> Result<(), SqlError> {
+        let timeout = self.connect_timeout.unwrap_or(DEFAULT_READINESS_TIMEOUT);
+        let probe = backend.run_query("SELECT 1");
+        match tokio::time::timeout(timeout, probe).await {
+            Ok(Ok(_)) => Ok(()),
+            // The DB answered with an error — surface auth-vs-other via the existing hint.
+            Ok(Err(e)) => Err(self.hint_stale_volume(SqlError::other(format!(
+                "managed sql `{}` is not ready: its readiness probe (`SELECT 1`) failed: {e}",
+                self.workload
+            )))),
+            // The probe did not return within the timeout — the DB is listening but not
+            // answering queries (recovery / initializing / overloaded): not ready.
+            Err(_) => Err(SqlError::other(format!(
+                "managed sql `{}` is not ready: its readiness probe (`SELECT 1`) did not \
+                 complete within {}s — the database is listening but not answering queries \
+                 (still initializing, in recovery, or overloaded)",
+                self.workload,
+                timeout.as_secs().max(1)
+            ))),
+        }
     }
 
     /// Turn a bare password-authentication failure into an actionable operator hint.
@@ -791,5 +845,109 @@ mod tests {
         // MySQL without a session context: also unchanged.
         let mysql_no_ctx = backend_with_ctx(ExternalSqlKind::Mysql, Vec::new());
         assert_eq!(mysql_no_ctx.mysql_reset_prefixed("SELECT 1"), "SELECT 1");
+    }
+
+    // ---- C1: managed-DB readiness gate -----------------------------------
+
+    /// How a fake DB responds to the readiness probe's `SELECT 1`.
+    enum ProbeBehavior {
+        Ready,
+        Errors(&'static str),
+        Hangs,
+    }
+
+    /// A `SqlBackend` whose `run_query` models a managed DB's readiness: it answers
+    /// `SELECT 1` (ready), errors (broken/auth), or never returns (recovery/overload).
+    /// Only `run_query` matters here; `begin` is unused by the probe.
+    struct ProbeBackend(ProbeBehavior);
+    #[async_trait]
+    impl SqlBackend for ProbeBackend {
+        async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
+            Err(SqlError::other("unused"))
+        }
+        async fn run_query(&self, _sql: &str) -> Result<boatramp_core::sql::SqlRows, SqlError> {
+            match self.0 {
+                ProbeBehavior::Ready => Ok(boatramp_core::sql::SqlRows {
+                    columns: vec!["?column?".into()],
+                    rows: vec![vec![SqlValue::Integer(1)]],
+                }),
+                ProbeBehavior::Errors(msg) => Err(SqlError::other(msg)),
+                // Sleep well past any test timeout so `probe_ready`'s timeout fires.
+                ProbeBehavior::Hangs => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    unreachable!()
+                }
+            }
+        }
+    }
+
+    /// A backend with a short readiness timeout, for driving `probe_ready` directly.
+    fn probe_backend() -> ComputeResolvedSqlBackend {
+        let mock = Arc::new(MockResolver(Mutex::new(vec![("h".into(), 1)])));
+        ComputeResolvedSqlBackend::new(
+            mock,
+            "pg",
+            ExternalSqlKind::Postgres,
+            "db",
+            "u",
+            "p",
+            None,
+            false,
+            Some(Duration::from_millis(150)), // short probe timeout
+        )
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_passes_a_ready_db() {
+        let be = probe_backend();
+        let db: Arc<dyn SqlBackend> = Arc::new(ProbeBackend(ProbeBehavior::Ready));
+        assert!(
+            be.probe_ready(&db).await.is_ok(),
+            "a DB that answers SELECT 1 is ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_fails_a_broken_but_listening_db() {
+        // The exact C1 case: sqlx's lazy `connect` would have succeeded, but the DB
+        // can't actually serve a query (in recovery / auth-broken) — not ready.
+        let be = probe_backend();
+        let db: Arc<dyn SqlBackend> = Arc::new(ProbeBackend(ProbeBehavior::Errors(
+            "the database system is in recovery mode",
+        )));
+        let err = be.probe_ready(&db).await.expect_err("must be not-ready");
+        let msg = err.to_string();
+        assert!(msg.contains("not ready"), "surfaces not-ready: {msg}");
+        assert!(msg.contains("pg"), "names the workload: {msg}");
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_auth_failure_gets_the_stale_volume_hint() {
+        // A password-auth failure on the probe is surfaced with the reclaim hint (the
+        // stale-volume path), so the operator gets the actionable message.
+        let be = probe_backend();
+        let db: Arc<dyn SqlBackend> = Arc::new(ProbeBackend(ProbeBehavior::Errors(
+            "password authentication failed for user \"app\"",
+        )));
+        let msg = be.probe_ready(&db).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("compute volume rm"),
+            "auth failure carries the stale-volume reclaim hint: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_times_out_a_hung_db() {
+        // Listening but not answering (the TCP check would pass): the probe's timeout
+        // fires and reports not-ready rather than blocking the caller forever. The
+        // fake's "hang" future is cancelled when `probe_ready`'s (150ms) timeout wins,
+        // so this resolves quickly without a real long sleep.
+        let be = probe_backend();
+        let db: Arc<dyn SqlBackend> = Arc::new(ProbeBackend(ProbeBehavior::Hangs));
+        let msg = be.probe_ready(&db).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("did not complete within"),
+            "a hung DB times out as not-ready: {msg}"
+        );
     }
 }

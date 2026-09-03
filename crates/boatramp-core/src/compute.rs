@@ -326,6 +326,19 @@ pub trait ComputeBackend: Send + Sync {
     /// so they are unaffected.
     async fn reserve_in_use(&self, _replicas: &[(String, String, u32, std::net::Ipv4Addr)]) {}
 
+    /// **Reconcile the IP pool against reality** (A2): reclaim addresses this backend
+    /// still holds for replicas whose container is actually gone. Adoption reserves the
+    /// IP of every persisted replica at boot; a replica whose container has since
+    /// crashed (or whose state was removed out-of-band) would otherwise keep its IP
+    /// reserved for the life of the process, slowly leaking the pool. This is called
+    /// periodically with `parked` — the `(project, workload, replica)` keys that are
+    /// intentionally down (scale-to-zero `Zero`) and MUST keep their IP for the wake —
+    /// so the backend releases only the addresses it holds for a key that is **neither**
+    /// live (no running container) **nor** parked. Backends without a per-node IP pool
+    /// default to a no-op. Conservative by construction: a key is reclaimed only when
+    /// the backend is sure the container is gone.
+    async fn gc_ip_pool(&self, _parked: &[(String, String, u32)]) {}
+
     /// Launch one replica; returns its handle + routable endpoint.
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError>;
 
@@ -1159,6 +1172,11 @@ pub async fn reconcile_once(
         .iter()
         .map(|(id, b)| (id.clone(), b.capabilities()))
         .collect();
+    // The `(project, workload, replica)` keys that are intentionally **parked**
+    // (scale-to-zero `Zero`), accumulated across every project. A parked replica keeps
+    // its IP reserved for the wake, so the post-loop pool-vs-reality GC (A2) must never
+    // reclaim it — it feeds this set to each backend's `gc_ip_pool`.
+    let mut parked_keys: Vec<(String, String, u32)> = Vec::new();
     // Fan out over every project's workloads (compute is project-scoped in 0.2.0).
     // The owning project threads through every replica-state read/write below.
     for (project_name, workload) in deploy.list_compute_workloads_all().await? {
@@ -1175,6 +1193,12 @@ pub async fn reconcile_once(
         let mut observed = deploy.list_replica_states(project, &workload.name).await?;
         for state in &mut observed {
             if state.phase == ReplicaPhase::Zero {
+                // Record the parked replica so the A2 GC keeps its IP reserved.
+                parked_keys.push((
+                    project_name.clone(),
+                    state.handle.workload.clone(),
+                    state.handle.replica,
+                ));
                 continue;
             }
             if let Some(backend) = backends.get(&state.backend) {
@@ -1394,6 +1418,19 @@ pub async fn reconcile_once(
             }
         }
     }
+
+    // A2 pool-vs-reality reconciliation: after converging every workload, ask each
+    // backend to reclaim any IP it still holds for a replica whose container is gone
+    // (crashed, or state removed out-of-band) and that is NOT intentionally parked
+    // (`parked_keys`). Adoption reserves every persisted replica's IP at boot, and a
+    // stop releases on the reconcile path — but a crash between reconciles would leak
+    // the address until the backend restarts; this sweeps those. Conservative: a
+    // backend reclaims only when it is sure the container is gone, and never a parked
+    // replica (whose IP is held for its wake). Backends without a per-node pool no-op.
+    for backend in backends.values() {
+        backend.gc_ip_pool(&parked_keys).await;
+    }
+
     Ok(report)
 }
 
@@ -2895,5 +2932,135 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A2: a backend that records the `gc_ip_pool` parked-key set it was handed, so we
+    /// can assert the reconcile loop runs the pool-vs-reality GC and passes it exactly
+    /// the intentionally-parked (`Zero`) replicas (whose IPs must be kept).
+    struct GcSpyBackend {
+        gc_parked: std::sync::Mutex<Option<Vec<(String, String, u32)>>>,
+    }
+    #[async_trait]
+    impl ComputeBackend for GcSpyBackend {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                isolation: IsolationClass::Namespace,
+                scale_to_zero: true, // so a Zero replica is left parked, not stopped
+                persistent_volumes: false,
+                max_vcpus: None,
+                max_mem_mib: None,
+            }
+        }
+        async fn materialize(&self, _spec: &ComputeSpec) -> Result<Artifact, BackendError> {
+            Ok(Artifact::Image {
+                reference: "img:latest".into(),
+            })
+        }
+        async fn gc_ip_pool(&self, parked: &[(String, String, u32)]) {
+            *self.gc_parked.lock().unwrap() = Some(parked.to_vec());
+        }
+        async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
+            Ok(Instance {
+                handle: InstanceHandle {
+                    project: req.project.clone(),
+                    workload: req.workload.clone(),
+                    replica: req.replica,
+                    backend_ref: format!("fake-{}", req.replica),
+                },
+                endpoint: Endpoint {
+                    scheme: Scheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                },
+            })
+        }
+        async fn stop(&self, _handle: &InstanceHandle) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn health(&self, _handle: &InstanceHandle) -> Result<Health, BackendError> {
+            Ok(Health::Healthy)
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_ip_gc_with_the_parked_replicas() {
+        // One workload with a persisted **parked** (Zero) replica: the reconcile's IP
+        // GC must run and be told that replica is parked (so its IP is preserved).
+        let deploy = DeployStore::new(Arc::new(NullStorage), Arc::new(crate::kv::MemoryKv::new()));
+        let s = spec(1, 128);
+        let hash = deploy.put_compute_spec(&s).await.unwrap();
+        deploy
+            .set_compute_workload(
+                crate::project::ProjectRef::DEFAULT,
+                &ComputeWorkload {
+                    version: 1,
+                    name: "w".into(),
+                    active: hash,
+                    replicas: 1,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        // Persist replica 0 as parked (Zero) with a snapshot, so the planner leaves it.
+        let parked = ObservedInstance {
+            handle: InstanceHandle {
+                project: "default".into(),
+                workload: "w".into(),
+                replica: 0,
+                backend_ref: "10.0.0.2:8080".into(),
+            },
+            node: 1,
+            backend: "fake".into(),
+            endpoint: Endpoint {
+                scheme: Scheme::Http,
+                host: "10.0.0.2".into(),
+                port: 8080,
+            },
+            region: None,
+            healthy: false,
+            started_at: None,
+            phase: ReplicaPhase::Zero,
+            snapshot: Some(Snapshot {
+                project: "default".into(),
+                workload: "w".into(),
+                replica: 0,
+                data_ref: "snap".into(),
+            }),
+        };
+        deploy
+            .set_replica_state(crate::project::ProjectRef::DEFAULT, &parked)
+            .await
+            .unwrap();
+
+        let nodes = vec![fake_node()];
+        let mut backends: BackendRegistry = BTreeMap::new();
+        let spy = Arc::new(GcSpyBackend {
+            gc_parked: std::sync::Mutex::new(None),
+        });
+        backends.insert("fake".into(), spy.clone());
+        let policy = BackendPolicy::default();
+
+        reconcile_once(
+            &deploy,
+            &backends,
+            &nodes,
+            &policy,
+            &FixedActivity(WorkloadActivity::Idle), // idle → the Zero replica stays parked
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let got = spy.gc_parked.lock().unwrap().clone();
+        let got = got.expect("gc_ip_pool was called during the reconcile");
+        assert!(
+            got.contains(&("default".to_string(), "w".to_string(), 0)),
+            "the parked (Zero) replica must be handed to gc_ip_pool so its IP is kept, got {got:?}"
+        );
     }
 }

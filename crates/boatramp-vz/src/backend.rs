@@ -32,7 +32,7 @@ use boatramp_core::compute::{
     Endpoint, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest, RootSource, Scheme,
     Snapshot, VolumeRef,
 };
-use boatramp_core::ipam::IpPool;
+use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::Storage;
 use futures::StreamExt;
 
@@ -150,8 +150,11 @@ pub struct VzBackend {
     data_dir: PathBuf,
     /// The vmnet gateway guests route through (the `.1` of `subnet`), in `ip=`.
     gateway: String,
-    /// Per-node guest-IP pool.
-    ipam: Mutex<IpPool>,
+    /// The guest-IP authority for this vmnet subnet. On macOS this backend is the
+    /// only compute backend on the segment (no native container / KVM backend), so its
+    /// authority is effectively private; it still takes an [`IpAuthority`] for a uniform
+    /// shared-authority surface across backends (A5).
+    ipam: IpAuthority,
     /// Running VMs, keyed by [`vm_id`].
     running: Mutex<HashMap<String, RunningVm>>,
     /// Verify-before-boot gate: the staged kernel clears it before it loads.
@@ -172,18 +175,29 @@ impl VzBackend {
         subnet: &str,
         verifier: Arc<dyn KernelVerifier>,
     ) -> Result<Self, BackendError> {
-        let ipam = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
-        let gateway = ipam.gateway().to_string();
+        let pool = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
+        let gateway = pool.gateway().to_string();
         Ok(Self {
             storage,
             self_exe,
             data_dir,
             gateway,
-            ipam: Mutex::new(ipam),
+            // A private authority by default; `with_ip_authority` swaps in a shared one.
+            ipam: IpAuthority::over(pool),
             running: Mutex::new(HashMap::new()),
             verifier,
             writable_root_allowed: false,
         })
+    }
+
+    /// Use a **shared** [`IpAuthority`] instead of this backend's private pool (A5).
+    /// On macOS this backend is the sole compute backend on the vmnet segment, so this
+    /// is provided for a uniform cross-backend surface; `build_compute` injects the
+    /// per-bridge/subnet authority. The authority must be over the same subnet this
+    /// backend was constructed with.
+    pub fn with_ip_authority(mut self, authority: IpAuthority) -> Self {
+        self.ipam = authority;
+        self
     }
 
     /// Allow a spec's `writable_root` to relax the read-only root (single-tenant
@@ -356,11 +370,10 @@ impl ComputeBackend for VzBackend {
         };
 
         let id = vm_id(&req.project, &req.workload, req.replica);
-        let ip = {
-            let mut pool = self.ipam.lock().expect("ipam mutex");
-            pool.allocate()
-                .map_err(|e| BackendError::Launch(e.to_string()))?
-        };
+        let ip = self
+            .ipam
+            .allocate()
+            .map_err(|e| BackendError::Launch(e.to_string()))?;
         let port = req.spec.port;
 
         // Materialize persistent volumes off the async runtime, before spawn.
@@ -383,7 +396,7 @@ impl ComputeBackend for VzBackend {
         let child = match spawn_result {
             Ok(child) => child,
             Err(err) => {
-                self.ipam.lock().expect("ipam mutex").release(ip);
+                self.ipam.release(ip);
                 return Err(BackendError::Launch(err));
             }
         };
@@ -419,7 +432,7 @@ impl ComputeBackend for VzBackend {
         drop(running.child.stdin.take());
         let _ = running.child.kill().await;
         let _ = running.child.wait().await;
-        self.ipam.lock().expect("ipam mutex").release(running.ip);
+        self.ipam.release(running.ip);
         Ok(())
     }
 
@@ -497,7 +510,7 @@ impl ComputeBackend for VzBackend {
         if !status.success() {
             // Save failed; the VM is gone, so reclaim the IP and report the error
             // (the reconcile then relaunches rather than parking).
-            self.ipam.lock().expect("ipam mutex").release(ip);
+            self.ipam.release(ip);
             return Err(BackendError::Other(format!(
                 "worker exited {status} during snapshot"
             )));
@@ -538,12 +551,12 @@ impl ComputeBackend for VzBackend {
         cfg.restore_path = Some(state_path);
 
         // Re-reserve the guest IP so the pool won't reissue it while restoring.
-        self.ipam.lock().expect("ipam mutex").reserve(addr);
+        self.ipam.reserve(addr);
 
         let child = match spawn_worker(&self.self_exe, &cfg) {
             Ok(child) => child,
             Err(err) => {
-                self.ipam.lock().expect("ipam mutex").release(addr);
+                self.ipam.release(addr);
                 return Err(BackendError::Launch(err));
             }
         };

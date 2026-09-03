@@ -22,7 +22,7 @@ use boatramp_core::compute::{
     Endpoint, ExecOutput, Health, Instance, InstanceHandle, IsolationClass, LaunchRequest,
     RootSource, Scheme, Snapshot, VolumeInfo,
 };
-use boatramp_core::ipam::IpPool;
+use boatramp_core::ipam::{IpAuthority, IpPool};
 use boatramp_core::Storage;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -67,6 +67,50 @@ fn blob_key(hash: &str) -> String {
 /// Delegates to the host-tested [`compute_instance_id`].
 fn container_id(project: &str, workload: &str, replica: u32) -> String {
     compute_instance_id(project, workload, replica)
+}
+
+/// The pure A2 GC decision: given the `(project,workload,replica)` keys this
+/// backend still holds an IP for (`tracked`), the keys that are intentionally
+/// **parked** (scale-to-zero `Zero`, which MUST keep their IP for the wake), and a
+/// `container_alive` predicate (does a live container exist for this key), return the
+/// keys whose IP should be reclaimed — those that are neither parked nor backed by a
+/// live container. Conservative: a key is reclaimed only when the predicate says the
+/// container is gone. Kept pure so it is host-testable (the cgroup probe is Linux-only).
+fn gc_reclaim_keys(
+    tracked: &[(String, String, u32)],
+    parked: &std::collections::BTreeSet<(String, String, u32)>,
+    container_alive: impl Fn(&(String, String, u32)) -> bool,
+) -> Vec<(String, String, u32)> {
+    tracked
+        .iter()
+        .filter(|k| !parked.contains(*k) && !container_alive(*k))
+        .cloned()
+        .collect()
+}
+
+/// Whether a live container exists for cgroup id `id` (the A2 GC's "is it gone?"
+/// probe). A launched container has a `/sys/fs/cgroup/boatramp/<id>` cgroup whose
+/// `cgroup.procs` lists at least one live pid; `stop`/`snapshot` remove the cgroup
+/// (and a crashed init's cgroup empties). So the container is considered **alive**
+/// iff the cgroup dir exists AND `cgroup.procs` is non-empty. On a non-Linux host
+/// (no cgroups) the probe can't decide, so it returns `true` — the GC then never
+/// reclaims, staying conservative (the backend itself is Linux-only in practice).
+#[cfg(target_os = "linux")]
+fn container_cgroup_alive(id: &str) -> bool {
+    let procs = format!("/sys/fs/cgroup/boatramp/{id}/cgroup.procs");
+    match std::fs::read_to_string(&procs) {
+        // A live cgroup has at least one pid; an empty file ⇒ the tree exited.
+        Ok(contents) => contents.split_whitespace().next().is_some(),
+        // No cgroup dir / file ⇒ stopped or never launched ⇒ not alive.
+        Err(_) => false,
+    }
+}
+
+/// Non-Linux stub: no cgroups to probe, so treat every container as alive (the GC
+/// never reclaims off-Linux — the container backend only truly runs on Linux).
+#[cfg(not(target_os = "linux"))]
+fn container_cgroup_alive(_id: &str) -> bool {
+    true
 }
 
 /// Decode a running instance's `backend_ref` (`<ip>:<port>`).
@@ -132,30 +176,38 @@ fn validate_volume(name: &str, mount: &str) -> Result<(), BackendError> {
 /// launches each observe/commit under the lock and can never be handed the same
 /// address.
 struct IpLifecycle {
-    pool: IpPool,
+    /// The **shared** address authority for this bridge/subnet (A5). Every co-located
+    /// backend (container veths + embedded/macOS VMM taps) holds a clone of the SAME
+    /// authority, so an address handed to one is never re-handed to another on the same
+    /// L2. The `(project,workload,replica)` ownership map below stays per-backend (it is
+    /// the container backend's stable-endpoint / last-user bookkeeping); only the pool
+    /// underneath is shared.
+    authority: IpAuthority,
     assigned: std::collections::BTreeMap<(String, String, u32), Ipv4Addr>,
 }
 
 impl IpLifecycle {
-    fn new(pool: IpPool) -> Self {
+    fn new(authority: IpAuthority) -> Self {
         Self {
-            pool,
+            authority,
             assigned: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Adopt the endpoint IPs of already-known replicas into the fresh pool (boot
+    /// Adopt the endpoint IPs of already-known replicas into the shared pool (boot
     /// startup), keyed by `(project,workload,replica)` so each can later reclaim its
     /// own address (and two projects' same-named workloads stay distinct).
     /// `reserve_in_use` skips the gateway + any IP outside this pool's CIDR (a replica
-    /// on another backend/subnet), so passing the whole fleet is safe.
+    /// on another backend/subnet), so passing the whole fleet is safe. Feeding the
+    /// SHARED authority is what reserves a running VMM guest's IP before the container
+    /// backend allocates (and vice-versa).
     fn adopt(&mut self, replicas: &[(String, String, u32, Ipv4Addr)]) {
         let ips: Vec<Ipv4Addr> = replicas.iter().map(|(_, _, _, ip)| *ip).collect();
-        self.pool.reserve_in_use(&ips);
+        self.authority.reserve_in_use(&ips);
         for (p, w, r, ip) in replicas {
             // Only record an address this pool manages (in-subnet, non-gateway); an
             // out-of-subnet endpoint (another backend/subnet) isn't ours to track.
-            if self.pool.manages(*ip) {
+            if self.authority.manages(*ip) {
                 self.assigned.insert((p.clone(), w.clone(), *r), *ip);
             }
         }
@@ -180,14 +232,14 @@ impl IpLifecycle {
             // `allocate_stable`, which reuses a free preferred address or, if it is
             // still reserved (by this replica's adoption), leaves it held.
             Some(ip) if self.owns(&key, ip) => {
-                self.pool.reserve(ip); // idempotent — keeps a released-then-reclaimed IP held
+                self.authority.reserve(ip); // idempotent — keeps a released-then-reclaimed IP held
                 ip
             }
             // Recorded but held by *another* live replica (a stale collision), or no
             // record at all: let the pool decide — reuse `recorded` iff it is free,
             // else a fresh unique address. Never re-homes onto a live IP.
             _ => self
-                .pool
+                .authority
                 .allocate_stable(recorded)
                 .map_err(|e| BackendError::Launch(e.to_string()))?,
         };
@@ -222,7 +274,7 @@ impl IpLifecycle {
     /// Re-reserve `ip` for a scale-to-zero **restore** (the wake reuses the parked
     /// replica's original endpoint), recording ownership.
     fn reserve_for(&mut self, project: &str, workload: &str, replica: u32, ip: Ipv4Addr) {
-        self.pool.reserve(ip);
+        self.authority.reserve(ip);
         self.assigned
             .insert((project.to_string(), workload.to_string(), replica), ip);
     }
@@ -238,8 +290,26 @@ impl IpLifecycle {
     /// Release `ip` only if no remaining assignment holds it (last-user rule).
     fn release_if_last(&mut self, ip: Ipv4Addr) {
         if !self.assigned.values().any(|&held| held == ip) {
-            self.pool.release(ip);
+            self.authority.release(ip);
         }
+    }
+
+    /// The `(project,workload,replica)` keys this backend currently tracks as holding
+    /// an address — the input to the A2 pool-vs-reality GC (which of them still have a
+    /// live container). Cheap clone under the backend mutex.
+    fn assigned_keys(&self) -> Vec<(String, String, u32)> {
+        self.assigned.keys().cloned().collect()
+    }
+
+    /// Release the address recorded for `key` (unconditionally forgetting the record),
+    /// used by the A2 GC once it has decided the container is gone and the replica is
+    /// not intentionally parked. Applies the same last-user rule so tearing down one
+    /// side of a stale collision can't free the surviving holder's address. Returns the
+    /// address that was recorded (whether or not it was actually released), for logging.
+    fn gc_release(&mut self, key: &(String, String, u32)) -> Option<Ipv4Addr> {
+        let ip = self.assigned.remove(key)?;
+        self.release_if_last(ip);
+        Some(ip)
     }
 }
 
@@ -297,15 +367,19 @@ impl ContainerBackend {
         let net: ipnet::Ipv4Net = subnet
             .parse()
             .map_err(|_| BackendError::Other(format!("bad subnet {subnet}")))?;
-        let ipam = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
+        let pool = IpPool::new(subnet).map_err(|e| BackendError::Other(e.to_string()))?;
+        let gateway = pool.gateway();
+        // Default to a private authority over `subnet`; `with_ip_authority` replaces it
+        // with the shared one so co-located VMM backends draw from the same pool (A5).
+        let authority = IpAuthority::over(pool);
         Ok(Self {
             storage,
             data_dir,
             bridge,
             prefix: net.prefix_len(),
-            gateway: ipam.gateway(),
+            gateway,
             self_exe,
-            ipam: Mutex::new(IpLifecycle::new(ipam)),
+            ipam: Mutex::new(IpLifecycle::new(authority)),
             criu: crate::criu::Criu::detect(),
             cap_add_allowed: false,
             userns_base: crate::worker::USERNS_HOST_BASE,
@@ -320,6 +394,20 @@ impl ContainerBackend {
     /// internal resolver is active.
     pub fn with_internal_dns(mut self, domain: Option<String>) -> Self {
         self.internal_dns_domain = domain;
+        self
+    }
+
+    /// Replace this backend's private IP pool with a **shared** [`IpAuthority`] (A5),
+    /// so every backend placing guests on the same bridge/subnet (this container
+    /// backend + the embedded / macOS VMM backends) draws from and releases to ONE
+    /// address pool and can never hand out the same `10.0.0.x` on the same L2. The
+    /// `(project,workload,replica)` ownership map is reset (empty at construction, so
+    /// this loses nothing) and rebuilt over the shared authority. `build_compute`
+    /// builds one authority per bridge/subnet and calls this on the container backend
+    /// with a clone of it. The authority MUST be over the same subnet this backend was
+    /// constructed with (they share `cfg.subnet`); the gateway/prefix are unchanged.
+    pub fn with_ip_authority(mut self, authority: IpAuthority) -> Self {
+        self.ipam = Mutex::new(IpLifecycle::new(authority));
         self
     }
 
@@ -548,6 +636,42 @@ impl ComputeBackend for ContainerBackend {
     /// `IpPool::reserve_in_use`).
     async fn reserve_in_use(&self, replicas: &[(String, String, u32, Ipv4Addr)]) {
         self.ipam.lock().expect("ipam mutex").adopt(replicas);
+    }
+
+    /// Reclaim pool addresses whose container is actually gone (A2). Snapshots the
+    /// `(project,workload,replica)` keys this backend still holds an IP for, keeps every
+    /// **parked** (`Zero`) key untouched, probes the cgroup for the rest (a live
+    /// container has a `/sys/fs/cgroup/boatramp/<id>` directory with a non-empty
+    /// `cgroup.procs`), and releases the address of any key with no live container. The
+    /// decision is the pure, host-tested [`gc_reclaim_keys`]; only the cgroup probe is
+    /// the Linux seam. Runs entirely under the ipam mutex snapshot + a cheap fs stat, so
+    /// it never blocks a launch for long.
+    async fn gc_ip_pool(&self, parked: &[(String, String, u32)]) {
+        let tracked = self.ipam.lock().expect("ipam mutex").assigned_keys();
+        if tracked.is_empty() {
+            return;
+        }
+        let parked: std::collections::BTreeSet<(String, String, u32)> =
+            parked.iter().cloned().collect();
+        let reclaim = gc_reclaim_keys(&tracked, &parked, |k| {
+            container_cgroup_alive(&container_id(&k.0, &k.1, k.2))
+        });
+        if reclaim.is_empty() {
+            return;
+        }
+        let mut ipam = self.ipam.lock().expect("ipam mutex");
+        for key in reclaim {
+            if let Some(ip) = ipam.gc_release(&key) {
+                tracing::warn!(
+                    project = %key.0,
+                    workload = %key.1,
+                    replica = key.2,
+                    ip = %ip,
+                    "compute IPAM GC: reclaimed a stale-reserved address — no live container \
+                     and the replica is not parked (its container is gone)"
+                );
+            }
+        }
     }
 
     async fn launch(&self, req: &LaunchRequest) -> Result<Instance, BackendError> {
@@ -2298,5 +2422,96 @@ mod tests {
         drop(file);
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 10);
         let _ = std::fs::remove_file(&p);
+    }
+
+    // -----------------------------------------------------------------------
+    // A2: pool-vs-reality GC. The pure `gc_reclaim_keys` decides which tracked keys
+    // to reclaim given a parked set + a container-alive predicate; the
+    // `IpLifecycle::gc_release` wiring then applies the last-user rule. The cgroup
+    // probe itself is the Linux seam (`container_cgroup_alive`), verified by review.
+    // -----------------------------------------------------------------------
+
+    fn key(p: &str, w: &str, r: u32) -> (String, String, u32) {
+        (p.to_string(), w.to_string(), r)
+    }
+
+    #[test]
+    fn gc_reclaims_only_dead_and_not_parked() {
+        let tracked = vec![
+            key("default", "pg", 0),  // alive → keep
+            key("default", "web", 0), // dead + not parked → RECLAIM
+            key("acme", "cache", 0),  // dead but PARKED → keep (its IP is held for the wake)
+        ];
+        let parked: std::collections::BTreeSet<_> = [key("acme", "cache", 0)].into_iter().collect();
+        // Only default/pg/0 has a "live container".
+        let alive = |k: &(String, String, u32)| *k == key("default", "pg", 0);
+
+        let reclaim = gc_reclaim_keys(&tracked, &parked, alive);
+        assert_eq!(
+            reclaim,
+            vec![key("default", "web", 0)],
+            "reclaim only the dead, non-parked replica"
+        );
+    }
+
+    #[test]
+    fn gc_reclaims_nothing_when_all_alive_or_parked() {
+        let tracked = vec![key("default", "a", 0), key("default", "b", 0)];
+        let parked: std::collections::BTreeSet<_> = [key("default", "b", 0)].into_iter().collect();
+        // a is alive; b is parked → nothing to reclaim.
+        let alive = |k: &(String, String, u32)| *k == key("default", "a", 0);
+        assert!(gc_reclaim_keys(&tracked, &parked, alive).is_empty());
+    }
+
+    #[test]
+    fn gc_release_frees_a_dead_replicas_ip_but_respects_last_user() {
+        // Two replicas share .2 (a stale collision on disk). GC-releasing the first
+        // must NOT free .2 while the second still holds it (last-user rule); releasing
+        // the second then frees it.
+        let mut life = IpLifecycle::new(IpAuthority::new("10.0.0.0/24").unwrap());
+        life.reserve_for("default", "a", 0, Ipv4Addr::new(10, 0, 0, 2));
+        life.reserve_for("default", "b", 0, Ipv4Addr::new(10, 0, 0, 2));
+
+        let freed_a = life.gc_release(&key("default", "a", 0));
+        assert_eq!(freed_a, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert!(
+            !life.authority.is_free(Ipv4Addr::new(10, 0, 0, 2)),
+            ".2 still held by b (last-user rule)"
+        );
+        let freed_b = life.gc_release(&key("default", "b", 0));
+        assert_eq!(freed_b, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert!(
+            life.authority.is_free(Ipv4Addr::new(10, 0, 0, 2)),
+            ".2 freed once its last holder is reclaimed"
+        );
+        // Reclaiming an untracked key is a no-op (returns None).
+        assert_eq!(life.gc_release(&key("default", "gone", 9)), None);
+    }
+
+    #[tokio::test]
+    async fn container_backend_shares_the_injected_ip_authority() {
+        // A5 wiring at the backend seam: a ContainerBackend built with a shared
+        // authority reserves into THAT pool, so a peer view (another backend's clone)
+        // sees the reservation — proving the container backend no longer owns a private
+        // pool once `with_ip_authority` is used.
+        let shared = IpAuthority::new("10.0.0.0/24").unwrap();
+        let backend = ContainerBackend::new(
+            Arc::new(OneBlob(Vec::new())),
+            unique_dir("ipauth"),
+            "br-test".into(),
+            "10.0.0.0/24",
+            std::path::PathBuf::from("/bin/true"),
+        )
+        .unwrap()
+        .with_ip_authority(shared.clone());
+        // Adopt a running replica through the backend (feeds the shared pool).
+        backend
+            .reserve_in_use(&[("default".into(), "pg".into(), 0, Ipv4Addr::new(10, 0, 0, 2))])
+            .await;
+        // The peer view (a co-located VMM backend would hold this clone) sees .2 taken.
+        assert!(
+            !shared.is_free(Ipv4Addr::new(10, 0, 0, 2)),
+            "the container backend reserved into the SHARED pool"
+        );
     }
 }
