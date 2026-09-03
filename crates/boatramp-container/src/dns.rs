@@ -426,11 +426,13 @@ mod tests {
         out
     }
 
+    /// Source IP → (project, workload).
+    type OwnerMap = BTreeMap<Ipv4Addr, (String, String)>;
+    /// (project, workload) → v4 addrs.
+    type AddrMap = BTreeMap<(String, String), Vec<Ipv4Addr>>;
+
     /// A fleet: source IP → (project, workload), and (project, workload) → v4 addrs.
-    fn fleet() -> (
-        BTreeMap<Ipv4Addr, (String, String)>,
-        BTreeMap<(String, String), Vec<Ipv4Addr>>,
-    ) {
+    fn fleet() -> (OwnerMap, AddrMap) {
         let mut owners = BTreeMap::new();
         // project "a": a "web" container at .2 and a "db" workload at .3.
         owners.insert(
@@ -462,9 +464,10 @@ mod tests {
         (owners, addrs)
     }
 
+    #[allow(clippy::type_complexity)]
     fn resolver(
-        owners: BTreeMap<Ipv4Addr, (String, String)>,
-        addrs: BTreeMap<(String, String), Vec<Ipv4Addr>>,
+        owners: OwnerMap,
+        addrs: AddrMap,
     ) -> Resolver<impl Fn(Ipv4Addr) -> Option<(String, String)>, impl Fn(&str, &str) -> ResolvedAddrs>
     {
         Resolver::new(
