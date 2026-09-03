@@ -83,7 +83,7 @@ fn gc_reclaim_keys(
 ) -> Vec<(String, String, u32)> {
     tracked
         .iter()
-        .filter(|k| !parked.contains(*k) && !container_alive(*k))
+        .filter(|k| !parked.contains(*k) && !container_alive(k))
         .cloned()
         .collect()
 }
@@ -1892,7 +1892,7 @@ fn parse_fib_trie_locals(trie: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current_ip: Option<String> = None;
     for line in trie.lines() {
-        let trimmed = line.trim_start_matches(|c| c == ' ' || c == '|' || c == '+' || c == '-');
+        let trimmed = line.trim_start_matches([' ', '|', '+', '-']);
         let trimmed = trimmed.trim();
         // A leaf address line: the token after the tree glyphs is a bare IPv4 literal.
         if let Some(first) = trimmed.split_whitespace().next() {
