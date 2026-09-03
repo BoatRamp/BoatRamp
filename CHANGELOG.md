@@ -7,9 +7,52 @@ versions.
 
 ## [0.3.12] - 2026-09-02
 
+A managed-database regression fix and compute-networking hardening release,
+driven by a real per-tenant `Single` Postgres deployment that surfaced an
+IP-collision class the CI (which only ever launched one container) never hit.
+
 ### Fixed
+- **Two containers can no longer be handed the same bridge IP.** The container
+  backend's in-memory IP pool was rebuilt **empty on every boot** and never
+  reserved the addresses already held by persisted replicas, while `launch`
+  allocated fresh and `stop` released by backend ref — so a boot reconcile could
+  hand one `10.0.0.x` to two containers. On a real node with two managed-Postgres
+  containers this left one unreachable (host ARP unresolved → *"no healthy
+  replica"*) and, on v0.3.11, routed the host to the **wrong** Postgres →
+  `password authentication failed`. Bridge IPs are now **node-unique and
+  reboot-stable**: node startup reserves every live replica's IP from persisted
+  state before any allocation (reserve-on-adoption), each `(project, workload,
+  replica)` keeps a stable address that `launch` reclaims in place (or, if a stale
+  record collided, reallocates to a fresh unique one), and `stop` releases an IP
+  only when no other live replica still holds it (last-user rule). Regression
+  tests reproduce the two-containers-one-IP collision and prove distinct, stable
+  addresses and that adoption converges a pre-existing collision.
+- **Cross-tenant compute-identity collision.** The backend derived a workload's
+  `container_id`, cgroup, veth, hostname, and IPAM key from `(workload, replica)`
+  with the **project stripped**, so two projects' same-named workloads collided
+  onto one identity — one project's `compute rm`/stop could `cgroup.kill`
+  *another* project's container. Compute identity is now scoped to
+  `(project, workload, replica)`: the default project keeps its bare
+  `<workload>-<replica>` on-disk identity **unchanged**, and a non-default project
+  gets `<project>-<workload>-<replica>` from a single source of truth for
+  id/cgroup/veth/hostname/log stems. Legacy replica records are backfilled with
+  their project from the scoping KV key on read.
+- **Compute HTTP-upstream resolution honors the project.** The serving path
+  resolved a `compute:`-backed upstream against `ProjectRef::DEFAULT` even though
+  it held the site's project, so a non-default project's workload was unreachable
+  as an upstream. It now threads the site's project through endpoint / region /
+  parked-replica / warm resolution.
+- **The operator `sql` tool reaches the target project's database.** `sql` was
+  missing from the project-scoped families and the CLI built the global
+  `/api/sql/{db}/…` path, so `boatramp sql exec/query --project <p>` always hit
+  the **default** project's managed DB (workload `pg`) — a per-tenant
+  (`tenant_scope = project`) DB under a non-default project was unreachable by the
+  operator tool (its very error named `pg`), so a tenant couldn't load its schema.
+  `sql` is now project-scoped on both the server (`/api/projects/<p>/sql/<db>/…`
+  rewrites to the DB handler under that project's context) and the CLI (`--project`
+  is honored; bare `sql` still targets the default project).
 - **A `Single` per-tenant managed database is now reachable and stably authenticated.**
-  Two bugs made a per-tenant `tenant = single` managed Postgres/MySQL unusable:
+  Two further bugs made a per-tenant `tenant = single` managed Postgres/MySQL unusable:
   - **The two-workload split.** Boot-time auto-registration was tenant-blind — it
     registered a bare `<compute>` (e.g. `pg`) workload under the `default` project (its
     own volume + credential) *in addition to* the tenant-aware `<compute>-<ident>`
@@ -17,13 +60,13 @@ versions.
     launched with two different `initdb` passwords, and the operator `sql exec/query`
     path was likewise tenant-blind, so the credential a container was initialised with no
     longer matched the one the server connected with after a restart
-    (`password authentication failed`). Auto-registration is now **tenant-aware**: for a
-    `single` binding it boot-warms the per-tenant workload for every project that has
-    deployed resources (default or not), through the **same** provisioning path as the
-    lazy resolver — byte-identical and non-clobbering, so there is exactly one container
-    per tenant and no `default` duplicate. The operator path derives the same per-tenant
-    workload + credential. (An empty `default` project is not warmed, so a deliberately
-    removed default database is not resurrected.)
+    (`password authentication failed`). The over-warm is now gone: for a `single` binding
+    boot-time `auto_register` **no-ops** — the per-tenant workload is created lazily and
+    durably by the resolver on first `sql` resolve and relaunched by the reconcile each
+    boot, so a project that uses the DB stays warm while a project with no `sql` gets no
+    spurious container (a static-only `default` no longer sprouts a `pg`). `shared` still
+    registers its one shared server. The operator path derives the same per-tenant
+    workload + credential.
   - **Killed mid-`initdb`.** A freshly launched replica is now health-probed instead of
     assumed healthy, but the reconcile stopped and relaunched any not-yet-ready replica
     with no grace — so a slow first `initdb` was killed on the next 30 s tick, into a
@@ -31,20 +74,74 @@ versions.
     *starting* (never stopped or relaunched) until it comes up; only past the grace does
     an unhealthy replica get relaunched (which also self-heals a genuinely broken launch
     without needing a process restart).
+- **Managed-DB health does a real readiness probe.** A managed-SQL pool (re)build now
+  runs a `SELECT 1` (short timeout) so a broken-but-listening database is reported
+  *not ready* rather than handed out; the cached fast path skips it (no per-query cost).
+  A password-auth failure still carries the stale-managed-volume hint (reclaim with
+  `compute rm` + `compute volume rm`). A *"no healthy replica"* now distinguishes a
+  missing workload from a running-but-unreachable one and names the last probe target,
+  and a container's TCP-connect failure is logged with its errno rather than discarded.
 - **Per-tenant container networking is reliable.** The host/guest veth names are now
   derived from a hash of the full workload id instead of a 15-character truncation (long
   per-tenant workload names no longer collide onto one veth), and `ensure_bridge`
   re-asserts the bridge gateway address even on a pre-existing bridge (a stale bridge from
   a prior boot can no longer leave containers with an unreachable gateway).
+- **IP-pool lifecycle hardening.** One shared **IP authority** is now injected into every
+  backend on a bridge (container + embedded-VMM + `vmm-vz`), so two backends sharing
+  `br-boatramp` can never hand out the same address. After each reconcile pass the pool is
+  reconciled against live containers — an IP whose `(project, workload, replica)` has no
+  live container is reclaimed (a scale-to-zero *parked* replica keeps its address) — and
+  pool exhaustion is surfaced (a warning naming the subnet + in-use count, and at a 90 %
+  high-water mark, with the fix: widen `compute.subnet`).
 
 ### Added
+- **Internal name resolution — per-project service discovery on the compute bridge.**
+  boatramp runs a small DNS responder on the compute bridge gateway
+  (`<gateway>:53`) so a container / handler / function can reach a sibling
+  workload — or its managed database — **by name within its own project**, instead
+  of relying on a control-plane-injected numeric endpoint. A guest resolves
+  `<workload>` (bare) or `<workload>.<project>.boatramp.internal` to that
+  workload's live, healthy replica IP. Resolution is **source-IP-scoped**: the
+  querying container's bridge IP maps to its `(project, workload)`, so a tenant can
+  only ever be told an address in **its own** project — a cross-project FQDN lookup
+  is `REFUSED`, and a query from an unknown source is forward-only (internal names
+  never leak). External names, non-`A`/`AAAA` queries, and everything else forward
+  to a configurable upstream. Every container now gets an `/etc/resolv.conf`
+  pointing its single `nameserver` at the gateway with `search
+  <project>.boatramp.internal` (so bare short names resolve), which also closes the
+  container backend's previously missing resolv.conf (VMM parity). Configured by
+  `compute.internal_dns` (default **on**), `compute.dns_upstream` (default
+  `1.1.1.1:53`), and `compute.dns_domain` (default `boatramp.internal`) — all
+  env-settable. See [Run a container or microVM](docs/src/how-to/compute.md).
 - **Configurable compute startup grace — `ComputeSpec.startup_grace_secs`.** How long a
   freshly launched replica may take to become healthy before the reconcile treats it as a
   broken launch. Sensible per-target defaults — generic compute / micro-VM **30 s**,
   managed **Postgres 60 s**, managed **MySQL 120 s** — overridable with
-  `compute set --startup-grace-secs <n>` or, for a managed binding,
-  `BOATRAMP_HANDLERS_SQL_DB_<name>_STARTUP_GRACE_SECS`. (Additive, schema-v1-compatible;
-  older stored specs read the default.)
+  `compute set --startup-grace-secs <n>` (also on `compute build`) or, for a managed
+  binding, `BOATRAMP_HANDLERS_SQL_DB_<NAME>_STARTUP_GRACE_SECS`. (Additive,
+  schema-v1-compatible; older stored specs read the default.)
+
+### Upgrade notes
+- **Default single-tenant install:** no action. The default project's compute
+  identity (bare `<workload>-<replica>`), its `"data"` volume, and its bridge IPs
+  are unchanged, so nothing re-provisions and no data moves.
+- **Per-tenant `Single` managed DB (the construens class):** on upgrade the boot
+  reconcile now brings up exactly one container per tenant at a distinct, stable IP
+  with a matching credential — the `password authentication failed` / *"no healthy
+  replica"* failure clears with no manual step. If a prior broken run left a
+  stale managed volume whose baked superuser password no longer matches, the
+  auth-failure hint points at reclaiming it (`compute rm <workload>` then
+  `compute volume rm <workload>`); see the [0.3.11] volume-isolation note.
+- **Internal DNS is on by default.** A container's staged `/etc/resolv.conf` is now
+  overwritten at launch to point at the bridge gateway. If an image needs its own
+  resolver configuration untouched, set `compute.internal_dns = false` (or
+  `BOATRAMP_COMPUTE_INTERNAL_DNS=false`). This is Linux + container-backend only; it
+  has no effect where there is no bridge.
+- **Known constraints (unchanged, called out here for the first time):** compute
+  and managed databases are currently **leader-node-only** — a workload's replicas
+  do not yet span cluster nodes (its endpoints are node-local bridge IPs); and
+  internal name resolution is **within a project** by design (there is no
+  cross-project resolution — that is the isolation boundary).
 
 ## [0.3.11] - 2026-09-02
 

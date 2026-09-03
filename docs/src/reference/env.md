@@ -107,6 +107,9 @@ over its file value; an unset one defers to the file/default). See
 | `BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE` | `compute.docker_volume_mode` | Remote-Docker volume mode: `named` (default) or `bind`. |
 | `BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS` | `compute.kernel_signing_pubkeys` | Comma-separated `<alg>:<hex>` kernel-signing trust anchors (replaces, not appends to, the defaults). |
 | `BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES` | `compute.kernel_allowed_hashes` | Comma-separated sha256-hex allow-list of kernel content hashes (replaces the defaults). |
+| `BOATRAMP_COMPUTE_INTERNAL_DNS` | `compute.internal_dns` | Run the per-project internal DNS resolver on the bridge gateway so a guest resolves a sibling workload by name (default `true`; Linux + container backend). See [internal name resolution](../how-to/compute.md#reach-a-sibling-workload-by-name-internal-dns). |
+| `BOATRAMP_COMPUTE_DNS_UPSTREAM` | `compute.dns_upstream` | Upstream resolver (`host:port`) the internal DNS forwards external names to (default `1.1.1.1:53`). |
+| `BOATRAMP_COMPUTE_DNS_DOMAIN` | `compute.dns_domain` | Internal DNS suffix names live under, `<workload>.<project>.<domain>` (default `boatramp.internal`). |
 
 **Security-critical:** `BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS` and
 `BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES` are the kernel trust anchors for the
@@ -186,8 +189,12 @@ addressed by the reserved name token **`DEFAULT`**:
 
 `<FIELD>` is one of `KIND`, `URL_ENV`, `READ_URL_ENV`, `COMPUTE`, `DATABASE`,
 `USER`, `PASSWORD_ENV`, `POOL_MAX`, `READ_ONLY`, `ALLOW_PREVIEW`,
-`CONNECT_TIMEOUT_SECS`, `IMAGE`, `VOLUME_SIZE_MIB` (each mirrors a field of the RON
-`databases` entry; secrets stay indirected via the `*_ENV` names). Example — a
+`CONNECT_TIMEOUT_SECS`, `IMAGE`, `VOLUME_SIZE_MIB`, `STARTUP_GRACE_SECS` (each
+mirrors a field of the RON `databases` entry; secrets stay indirected via the
+`*_ENV` names). `STARTUP_GRACE_SECS` sets how long a freshly launched managed-DB
+replica may take to become healthy before the reconcile treats it as a broken
+launch; omit it for the per-engine default (Postgres 60 s, MySQL 120 s). See
+[Startup grace](../how-to/compute.md#startup-grace-slow-starting-images). Example — a
 managed Postgres as the default database, with boatramp managing the credential (no
 `PASSWORD_ENV`):
 

@@ -235,6 +235,9 @@ differs by backend — the environment difference lives behind the backend.
 | `region` | string | — | This node's region tag (FA-8). Advertised on the node so a gateway routing to a `compute:`-backed workload with `--lb nearest` sends each request to the nearest replica by its node's region — no manual `--region` map. See [Route to the nearest region](../how-to/gateway.md#route-to-the-nearest-region). |
 | `kernel_signing_pubkeys` | list | boatramp's built-in key | **Static** trust anchors (`"<alg>:<hex>"`) for the strict-posture kernel bar; a signed default kernel must verify against one. |
 | `kernel_allowed_hashes` | list | the released `boatramp-vmlinux` hash | **Static** allow-list of kernel content hashes a dynamic default may select under `multi-tenant`. Ships pre-seeded with the first-party signed release so it verifies out of the box; replace it to allow only your own kernels. |
+| `internal_dns` | bool | `true` | Run the per-project **internal DNS** resolver on the bridge gateway so a container resolves a sibling workload — or its managed DB — by name within its project. Every container's `/etc/resolv.conf` is pointed at the gateway; resolution is source-IP-scoped (a tenant sees only its own project's names). Linux + container backend only. See [Reach a sibling workload by name](../how-to/compute.md#reach-a-sibling-workload-by-name-internal-dns). |
+| `dns_upstream` | string | `1.1.1.1:53` | Upstream resolver (`host:port`) the internal DNS forwards external names (and anything outside a project's namespace) to. |
+| `dns_domain` | string | `boatramp.internal` | The internal DNS suffix names live under: a workload `web` in project `acme` answers to both bare `web` and `web.acme.boatramp.internal`. |
 
 The kernel-signing keys and hash allow-list are static (host-access-gated) trust
 anchors — the fleet **default kernel** itself is a

@@ -267,6 +267,62 @@ first boot runs `initdb` before it opens its port. Override it per binding with
 `startup_grace_secs` (or the env var
 `BOATRAMP_HANDLERS_SQL_DB_<NAME>_STARTUP_GRACE_SECS`); omit it for the engine default.
 
+## Reach a sibling workload by name (internal DNS)
+
+A workload can reach another workload **in the same project** — or that project's
+managed database — **by name**, without the control plane injecting a numeric
+`ip:port`. boatramp runs a small DNS resolver on the compute bridge gateway and
+points every container's `/etc/resolv.conf` at it, so a guest resolves a peer with
+either the bare short name or its fully-qualified internal name:
+
+- `web` — the bare workload name (the `search <project>.boatramp.internal` line in
+  the container's resolv.conf completes it), or
+- `web.acme.boatramp.internal` — the FQDN, `<workload>.<project>.<domain>`.
+
+Either form resolves to the workload's **live, healthy replica IP** from the
+current reconcile state. A managed database is a workload too, so an app container
+in project `acme` can reach its co-located Postgres as `pg-<ident>` (or by the
+short name of whatever `compute` its `sql` binding names) — the same address the
+`sql` binding injects, now reachable by name.
+
+Resolution is **isolated per project**. The resolver maps the querying container's
+bridge IP to its `(project, workload)`, so a tenant is only ever told an address in
+**its own** project:
+
+- an internal name in another project → refused (never resolved across the tenant
+  boundary),
+- an internal name that currently has no healthy replica → `NXDOMAIN`,
+- an external name (or a query from a source that is not a known co-located
+  container) → forwarded to the upstream resolver.
+
+External DNS keeps working: anything outside a project's internal namespace is
+forwarded to `compute.dns_upstream` (default `1.1.1.1:53`).
+
+It is **on by default** on the Linux container backend. Turn it off, point external
+lookups at your own resolver, or rename the internal suffix with three knobs (all
+[env-settable](../reference/env.md#compute-backend)):
+
+```ron
+// boatramp.cfg
+compute: (
+    internal_dns: true,             // default; false leaves the image's resolv.conf untouched
+    dns_upstream: "1.1.1.1:53",     // where external names are forwarded
+    dns_domain:   "boatramp.internal",
+)
+```
+
+## Known constraints
+
+- **Compute is leader-node-only for now.** The control plane schedules and
+  reconciles workloads, but a workload's replicas and its managed database do not
+  yet span cluster nodes — a workload's endpoints are node-local bridge IPs on the
+  node that runs it. Run compute (and managed databases) on a single node, or on
+  the cluster leader, until multi-node replica spreading lands.
+- **Internal name resolution is within a project.** By design, a name resolves only
+  inside the querying container's own project — there is no cross-project name
+  resolution. That is the tenant-isolation boundary, not a limitation to work
+  around; to share a service between projects, front it with a route.
+
 ## Manage persistent volumes
 
 Unregistering a workload (`compute rm`) leaves its **persistent volume** on disk, so its
