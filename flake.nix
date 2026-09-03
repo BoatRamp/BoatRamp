@@ -499,6 +499,14 @@
               pkgs.cargo-watch
               pkgs.cargo-nextest
               pkgs.cargo-deny
+              # cargo-zigbuild + zig: cross-compile / cross-clippy the workspace to
+              # the `*-unknown-linux-musl` targets (the shipped OCI images + Linux
+              # release binaries) from any host, and reproduce the CI `musl-clippy`
+              # gate locally — `cargo-zigbuild clippy --all-features --target
+              # x86_64-unknown-linux-musl` — so Linux-gated (`#[cfg(target_os = "linux")]`)
+              # code is lintable on macOS instead of surfacing only in nightly CI.
+              pkgs.cargo-zigbuild
+              pkgs.zig
               pkgs.taplo
               pkgs.nixfmt
               # WebAssembly component tooling for the `handlers` engine.
@@ -536,13 +544,13 @@
             # it must not be in the cross-platform set or `nix develop` breaks on
             # macOS.
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iproute2 ]
-            # macOS `compute build` for the `vmm-vz` backend: `zig` cross-compiles
-            # the aarch64 guest `vminit` (boatramp-firecracker `build.rs`), and
-            # `e2fsprogs` provides the `mke2fs -d` the OCI→ext4 rootfs build shells
-            # out to. (Linux builds the init with native `cc` and ships its own
-            # `mke2fs`, so neither is needed there.)
+            # macOS `compute build` for the `vmm-vz` backend: `e2fsprogs` provides
+            # the `mke2fs -d` the OCI→ext4 rootfs build shells out to. (`zig` — also
+            # used here to cross-compile the aarch64 guest `vminit`,
+            # boatramp-firecracker `build.rs` — is now in the cross-platform set above
+            # for cargo-zigbuild.) Linux builds the init with native `cc` and ships
+            # its own `mke2fs`, so neither is needed there.
             ++ lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.zig
               pkgs.e2fsprogs
             ];
 
