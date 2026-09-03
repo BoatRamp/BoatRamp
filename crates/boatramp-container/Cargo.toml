@@ -54,6 +54,11 @@ futures = "0.3"
 # target-linux deps rather than behind a portable feature.
 boatramp-core.workspace = true
 async-trait.workspace = true
+# The internal-DNS socket seam (`dns_server`) binds a UDP listener on the bridge
+# gateway and forwards to the upstream resolver — Linux-only (where the bridge is),
+# so `net` is added to the Linux-target tokio features (the cross-platform base has
+# only `sync`/`time`).
+tokio = { workspace = true, features = ["net"] }
 tar.workspace = true
 flate2.workspace = true
 serde_json.workspace = true
@@ -70,6 +75,8 @@ boatramp-firecracker = { workspace = true, features = ["build"] }
 serde_json.workspace = true
 # Build an in-memory rootfs blob stream for the `materialize` staging test.
 bytes.workspace = true
+# A temp rootfs dir for the resolv.conf-writer test (`resolvconf`).
+tempfile = "3"
 # The privileged `container_live` seam drives a real launch (+ later CRIU
 # checkpoint/restore) on a multi-thread runtime so the log-pump tasks drain the
 # worker's pipes while the probe loop blocks. Linux-only, `#[ignore]`d by default.

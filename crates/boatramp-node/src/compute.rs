@@ -244,6 +244,11 @@ pub async fn build_compute(
                     // Single-tenant posture (`!strict`) may honor `cap_add`; multi-tenant
                     // keeps every capability dropped.
                     let c = c.with_cap_add_allowed(!strict);
+                    // Point each container's resolv.conf at the internal DNS on the
+                    // bridge gateway when the resolver is enabled (default on). The
+                    // node starts the resolver task (see `spawn_internal_dns`); the
+                    // two must agree on the domain, so both read `compute.dns_domain`.
+                    let c = c.with_internal_dns(cfg.internal_dns.then(|| cfg.dns_domain.clone()));
                     backends.insert("container".to_string(), std::sync::Arc::new(c));
                 }
                 Err(e) => tracing::warn!(%e, "container backend unavailable"),
@@ -437,6 +442,141 @@ pub async fn adopt_running_replica_ips(
                 "adopted in-use compute IPs into the backend pool"
             );
         }
+    }
+}
+
+/// Start the per-project **internal DNS** resolver task when it is enabled and the
+/// container backend + bridge are active. Binds UDP `gateway:53` (the bridge
+/// gateway the container backend assigns), forwarding non-internal queries to
+/// `compute.dns_upstream`. Returns the detached task handle, or `None` when the
+/// resolver is off, the container backend isn't present (nothing to serve names
+/// for), or the subnet/upstream is malformed. Linux-only: it binds a socket and is
+/// meaningful only where the container/bridge code runs; a non-Linux node returns
+/// `None` (the seam is compiled out).
+#[cfg(target_os = "linux")]
+pub fn spawn_internal_dns(
+    cfg: Option<&crate::config::ComputeConfig>,
+    backends: &boatramp_core::compute::BackendRegistry,
+    deploy: &boatramp_core::deploy::DeployStore,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let cfg = cfg?;
+    // Off by config, or no container backend on this node (the resolver only serves
+    // names for co-located containers).
+    if !cfg.internal_dns || !backends.contains_key("container") {
+        return None;
+    }
+    let gateway = match boatramp_core::ipam::IpPool::new(&cfg.subnet) {
+        Ok(pool) => pool.gateway(),
+        Err(e) => {
+            tracing::warn!(%e, subnet = %cfg.subnet, "internal DNS: bad compute subnet; resolver not started");
+            return None;
+        }
+    };
+    let upstream: std::net::SocketAddr = match cfg.dns_upstream.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(%e, upstream = %cfg.dns_upstream, "internal DNS: bad dns_upstream (want host:port); resolver not started");
+            return None;
+        }
+    };
+    let source: std::sync::Arc<dyn boatramp_container::dns_server::InternalDnsSource> =
+        std::sync::Arc::new(DeployDnsSource::new(deploy.clone()));
+    let domain = cfg.dns_domain.clone();
+    Some(tokio::spawn(async move {
+        if let Err(e) =
+            boatramp_container::dns_server::serve(gateway, upstream, domain, source).await
+        {
+            tracing::warn!(%e, "internal DNS resolver exited (bind/setup error); \
+                                guests keep their static resolv.conf peers");
+        }
+    }))
+}
+
+/// Non-Linux stub: no internal DNS resolver (the container/bridge seam is Linux-only).
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_internal_dns(
+    _cfg: Option<&crate::config::ComputeConfig>,
+    _backends: &boatramp_core::compute::BackendRegistry,
+    _deploy: &boatramp_core::deploy::DeployStore,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
+/// The internal-DNS control-plane source (Linux): snapshots the co-located fleet
+/// from the [`DeployStore`](boatramp_core::deploy::DeployStore) replica state into
+/// the two maps the resolver needs — IP → `(project, workload)` (the source-IP
+/// reverse map, from **every** replica so an unknown source is recognised as such)
+/// and `(project, workload)` → healthy replica IPs (the name → IP forward map,
+/// mirroring [`DeployEndpointResolver`](crate::managed_sql::DeployEndpointResolver)'s
+/// healthy-running filter). A workload resolves ONLY to its own project's healthy
+/// replicas; the isolation scoping itself lives in the pure resolver, which keys
+/// its answer by the source IP's project.
+#[cfg(target_os = "linux")]
+pub struct DeployDnsSource {
+    deploy: boatramp_core::deploy::DeployStore,
+}
+
+#[cfg(target_os = "linux")]
+impl DeployDnsSource {
+    /// Build over the control-plane store.
+    pub fn new(deploy: boatramp_core::deploy::DeployStore) -> Self {
+        Self { deploy }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl boatramp_container::dns_server::InternalDnsSource for DeployDnsSource {
+    async fn snapshot(&self) -> boatramp_container::dns_server::DnsFleet {
+        use boatramp_container::dns::ResolvedAddrs;
+        use boatramp_container::dns_server::DnsFleet;
+        use boatramp_core::compute::ReplicaPhase;
+        use std::net::Ipv4Addr;
+
+        let mut fleet = DnsFleet::default();
+        let states = match self.deploy.list_all_replica_states().await {
+            Ok(s) => s,
+            Err(e) => {
+                // A transient KV hiccup ⇒ an empty snapshot: every query is then
+                // forward-only (no internal answer, no cross-tenant leak) — fail safe.
+                tracing::warn!(%e, "internal DNS: could not read replica states; \
+                                    answering forward-only this query");
+                return fleet;
+            }
+        };
+        for st in &states {
+            // Parse the replica's bridge IP from its endpoint host (fall back to the
+            // `<ip>:<port>` backend_ref, like the IP-adoption path).
+            let v4 = st.endpoint.host.parse::<Ipv4Addr>().ok().or_else(|| {
+                st.handle
+                    .backend_ref
+                    .split(':')
+                    .next()
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            });
+            let Some(ip) = v4 else { continue };
+            let key = (st.handle.project.clone(), st.handle.workload.clone());
+            // Reverse map: EVERY replica (running or parked) owns its IP, so a source
+            // that is a real container is always recognised (never treated as unknown
+            // and answered internal names it shouldn't be — the isolation depends on
+            // this being complete).
+            fleet.owners.insert(ip, key.clone());
+            // Forward map: only a healthy, running replica is a valid answer target
+            // (matches DeployEndpointResolver — a parked/unhealthy replica is not a
+            // live endpoint). Ordered by replica index (primary-first) via the KV
+            // list order that `list_all_replica_states` preserves per workload. The
+            // compute bridge is IPv4 today, so every endpoint is an `A` record; a
+            // future v6 bridge would populate `ResolvedAddrs::v6` here.
+            if st.phase == ReplicaPhase::Running && st.healthy {
+                fleet
+                    .addrs
+                    .entry(key)
+                    .or_insert_with(ResolvedAddrs::default)
+                    .v4
+                    .push(ip);
+            }
+        }
+        fleet
     }
 }
 

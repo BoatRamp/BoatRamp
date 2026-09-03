@@ -39,6 +39,13 @@ pub mod backend;
 /// `criu` dump/restore drivers.
 #[cfg(target_os = "linux")]
 pub mod criu;
+/// Per-project internal DNS — the pure, host-testable query-handling core
+/// (parse question → decide answer/NXDOMAIN/refused/forward). Cross-platform.
+pub mod dns;
+/// The Linux socket seam for the internal DNS resolver: binds `gateway:53`, reads
+/// the query source IP, and drives [`dns::Resolver`]. Linux-only (binds a socket).
+#[cfg(target_os = "linux")]
+pub mod dns_server;
 /// `docker exec`-style re-entry into a running container (Linux): join the
 /// container's namespaces + `execvp` a one-shot command, capturing its output.
 #[cfg(target_os = "linux")]
@@ -47,6 +54,9 @@ pub mod exec;
 /// + a per-container log file. Cross-platform + unit-tested.
 pub mod logsink;
 pub mod net;
+/// Writing a container's `/etc/resolv.conf` (points the guest at the internal
+/// resolver on the bridge gateway). Pure filesystem work; cross-platform + tested.
+pub mod resolvconf;
 pub mod sandbox;
 pub mod seccomp;
 #[cfg(target_os = "linux")]

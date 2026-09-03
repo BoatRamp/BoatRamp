@@ -257,6 +257,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // every persisted replica's `(workload, replica, endpoint-ip)`; each backend keeps
     // only the IPs in its own subnet (a cheap no-op for docker/cloudflare/VMM).
     crate::compute::adopt_running_replica_ips(&deploy, &compute_backends).await;
+    // Per-project internal DNS (service discovery): start the resolver on the bridge
+    // gateway so a guest resolves peers by name within its project. On by default;
+    // starts only when the container backend + bridge are up (Linux). Detached for
+    // the node's serving life (pushed into `reconcile` below). Started before the
+    // reconcile loop consumes `compute_backends` — it borrows the registry to check
+    // the container backend is present.
+    let internal_dns =
+        crate::compute::spawn_internal_dns(config.compute.as_ref(), &compute_backends, &deploy);
     // Activate the compute sql-shim (PLAN-compute-bindings): bind its listener +
     // build the resolver when a sql provider and `compute.sql_shim_url` are both present.
     #[cfg(feature = "handlers")]
@@ -464,6 +472,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let mut reconcile = vec![compute_reconcile, dv_reconcile];
     if let Some(reaper) = tombstone_reaper {
         reconcile.push(reaper);
+    }
+    if let Some(dns) = internal_dns {
+        reconcile.push(dns);
     }
 
     Ok(RunningNode {

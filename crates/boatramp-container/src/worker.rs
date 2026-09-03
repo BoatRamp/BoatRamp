@@ -239,6 +239,17 @@ fn jail_and_exec(plan: &SandboxPlan) -> Result<Infallible, WorkerError> {
 
     sethostname(&plan.hostname).map_err(|e| WorkerError::Syscall("sethostname", e))?;
 
+    // Point the guest at boatramp's internal DNS resolver on the bridge gateway by
+    // writing `/etc/resolv.conf` into the (now-pivoted) container rootfs. Done here,
+    // per-container while we are still namespace-root (so `/etc` is writable), rather
+    // than into the shared staged rootfs — several projects' containers reuse the same
+    // staged image, and each needs its OWN project's `search` domain. `None` ⇒ leave
+    // whatever the image shipped (the internal-DNS feature is disabled).
+    if let Some(body) = &plan.resolv_conf {
+        fs::create_dir_all("/etc").map_err(|e| WorkerError::Io("create /etc", e))?;
+        fs::write("/etc/resolv.conf", body).map_err(|e| WorkerError::Io("write resolv.conf", e))?;
+    }
+
     // Persistent volumes are already owned by the guest's uid/gid: the host-root launcher
     // pre-chowns each backing dir to `USERNS_HOST_BASE + guest_uid` (see
     // `ContainerBackend::stage_volumes`). Chowning here in the user namespace can't work —

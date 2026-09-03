@@ -130,6 +130,15 @@ pub struct SandboxPlan {
     /// filter installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp_allow: Option<Vec<String>>,
+    /// The `/etc/resolv.conf` body to write into the jail (after `pivot_root`, into
+    /// the container rootfs) so the guest resolves through boatramp's internal DNS on
+    /// the bridge gateway. Populated by the backend from the container's project +
+    /// the gateway (see [`crate::resolvconf::render`]). Written **per-container** by
+    /// the worker (not into the shared staged rootfs, which several projects' same
+    /// image reuse), so each container gets its own project's `search` domain. `None`
+    /// ⇒ leave whatever the image shipped (the internal-DNS feature disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolv_conf: Option<String>,
     /// Namespaces to unshare.
     pub namespaces: Namespaces,
 }
@@ -191,6 +200,7 @@ impl SandboxPlan {
             cgroup,
             cap_add: Vec::new(),
             seccomp_allow: Some(crate::seccomp::default_allowlist()),
+            resolv_conf: None,
             namespaces: Namespaces::default(),
         }
     }

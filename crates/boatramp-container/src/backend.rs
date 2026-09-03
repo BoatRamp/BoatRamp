@@ -275,6 +275,12 @@ pub struct ContainerBackend {
     /// into `0` (in-container root = host root) via [`Self::with_host_root`]. Governs the
     /// userns map, the volume pre-chown, and the rootfs ownership shift.
     userns_base: u32,
+    /// The internal-DNS suffix to write into each container's `/etc/resolv.conf`
+    /// (`nameserver <gateway>` + `search <project>.<domain>`), pointing the guest at
+    /// the resolver on the bridge gateway. `Some(domain)` ⇒ write it at launch
+    /// (internal DNS on); `None` ⇒ leave the image's resolv.conf (feature off). Set by
+    /// [`Self::with_internal_dns`] from `compute.internal_dns` / `compute.dns_domain`.
+    internal_dns_domain: Option<String>,
 }
 
 impl ContainerBackend {
@@ -303,7 +309,18 @@ impl ContainerBackend {
             criu: crate::criu::Criu::detect(),
             cap_add_allowed: false,
             userns_base: crate::worker::USERNS_HOST_BASE,
+            internal_dns_domain: None,
         })
+    }
+
+    /// Enable writing each container's `/etc/resolv.conf` to point at the internal
+    /// DNS resolver on the bridge gateway, with a `search <project>.<domain>` suffix
+    /// (`compute.internal_dns` on). `None` (the default) leaves the image's resolv.conf
+    /// untouched. The node passes the effective `compute.dns_domain` here when the
+    /// internal resolver is active.
+    pub fn with_internal_dns(mut self, domain: Option<String>) -> Self {
+        self.internal_dns_domain = domain;
+        self
     }
 
     /// Allow a spec's `cap_add` to retain capabilities on top of the dropped-`ALL`
@@ -956,6 +973,17 @@ impl ContainerBackend {
         let (uid, gid) = spec_uid_gid(&req.spec);
         let mut plan = SandboxPlan::for_spec(&req.spec, rootfs, id, uid, gid);
         plan.volumes = self.stage_volumes(&req.spec).await?;
+        // Point the guest at boatramp's internal DNS on the bridge gateway (when the
+        // resolver is enabled), scoped to this container's project so a bare peer name
+        // resolves within the tenant. Written per-container by the worker (the staged
+        // rootfs is shared across projects). `None` ⇒ leave the image's resolv.conf.
+        if let Some(domain) = &self.internal_dns_domain {
+            plan.resolv_conf = Some(crate::resolvconf::render(
+                self.gateway,
+                &req.project,
+                domain,
+            ));
+        }
         // Honor `cap_add` only where the posture allows it (single-tenant); otherwise
         // the dropped-`ALL` default stands. Bounded by the worker's user namespace.
         if self.cap_add_allowed {

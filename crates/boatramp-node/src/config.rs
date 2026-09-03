@@ -275,6 +275,16 @@ impl ServerConfig {
             if let Some(v) = source.parse_list("BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES") {
                 compute.kernel_allowed_hashes = v;
             }
+            // Internal DNS (per-project service discovery on the bridge gateway).
+            if let Some(v) = source.parse_bool("BOATRAMP_COMPUTE_INTERNAL_DNS")? {
+                compute.internal_dns = v;
+            }
+            if let Some(v) = source.get("BOATRAMP_COMPUTE_DNS_UPSTREAM") {
+                compute.dns_upstream = v;
+            }
+            if let Some(v) = source.get("BOATRAMP_COMPUTE_DNS_DOMAIN") {
+                compute.dns_domain = v;
+            }
         }
 
         // --- security --------------------------------------------------------
@@ -596,6 +606,9 @@ const COMPUTE_ENV_VARS: &[&str] = &[
     "BOATRAMP_COMPUTE_DOCKER_VOLUME_MODE",
     "BOATRAMP_COMPUTE_KERNEL_SIGNING_PUBKEYS",
     "BOATRAMP_COMPUTE_KERNEL_ALLOWED_HASHES",
+    "BOATRAMP_COMPUTE_INTERNAL_DNS",
+    "BOATRAMP_COMPUTE_DNS_UPSTREAM",
+    "BOATRAMP_COMPUTE_DNS_DOMAIN",
 ];
 
 /// The `BOATRAMP_*` variables that populate the `[security]` section.
@@ -930,6 +943,40 @@ pub struct ComputeConfig {
     #[serde(default)]
     #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     pub managed_db_privilege: ManagedDbPrivilege,
+    /// Per-project **internal DNS** (service discovery): run a lightweight resolver
+    /// on the bridge gateway so a guest can reach peers by name (`<workload>` /
+    /// `<workload>.<project>.<dns_domain>`) instead of a numeric IP, scoped to its
+    /// own project. Default **on** — it activates only when the container backend +
+    /// bridge come up, so a node without them is unaffected. `false` disables it and
+    /// leaves each image's own `/etc/resolv.conf`.
+    #[serde(default = "default_internal_dns")]
+    pub internal_dns: bool,
+    /// The upstream resolver the internal DNS forwards non-internal queries to
+    /// (external names + non-`A`/`AAAA` types), so the resolver is the guest's single
+    /// nameserver. `"host:port"`; default `1.1.1.1:53`.
+    #[serde(default = "default_dns_upstream")]
+    pub dns_upstream: String,
+    /// The internal DNS suffix names live under (`<workload>.<project>.<dns_domain>`);
+    /// also the `search` domain written into each container's resolv.conf. Default
+    /// `boatramp.internal`.
+    #[serde(default = "default_dns_domain")]
+    pub dns_domain: String,
+}
+
+/// Default for [`ComputeConfig::internal_dns`] — on (activates only with the
+/// container backend + bridge).
+fn default_internal_dns() -> bool {
+    true
+}
+
+/// Default upstream resolver for [`ComputeConfig::dns_upstream`].
+fn default_dns_upstream() -> String {
+    "1.1.1.1:53".to_string()
+}
+
+/// Default internal DNS suffix for [`ComputeConfig::dns_domain`].
+fn default_dns_domain() -> String {
+    boatramp_container::dns::DEFAULT_INTERNAL_DOMAIN.to_string()
 }
 
 /// The built-in **boatramp kernel-signing public key** (`es256:…`), whose private
@@ -1006,6 +1053,9 @@ impl Default for ComputeConfig {
             docker_volume_mode: boatramp_docker::DockerVolumeMode::default(),
             sql_shim_url: None,
             managed_db_privilege: ManagedDbPrivilege::default(),
+            internal_dns: default_internal_dns(),
+            dns_upstream: default_dns_upstream(),
+            dns_domain: default_dns_domain(),
         }
     }
 }
@@ -1716,6 +1766,47 @@ mod tests {
             .expect("sql binding materialised from env");
         assert_eq!(sql.url.as_deref(), Some("http://sqld:8080"));
         assert_eq!(sql.admin_url.as_deref(), Some("http://sqld:9090"));
+    }
+
+    #[test]
+    fn internal_dns_defaults_on_with_the_standard_upstream_and_domain() {
+        // The `[compute]` defaults: internal DNS on, forwarding to 1.1.1.1:53, names
+        // under `boatramp.internal`.
+        let compute = ComputeConfig::default();
+        assert!(compute.internal_dns, "internal DNS is on by default");
+        assert_eq!(compute.dns_upstream, "1.1.1.1:53");
+        assert_eq!(compute.dns_domain, "boatramp.internal");
+    }
+
+    #[test]
+    fn internal_dns_knobs_parse_from_a_file() {
+        // A file can turn it off and override the upstream + domain.
+        let cfg = server(
+            r#"(
+                compute: ( internal_dns: false, dns_upstream: "10.0.0.53:53", dns_domain: "svc.internal" ),
+            )"#,
+        );
+        let compute = cfg.compute.expect("compute section");
+        assert!(!compute.internal_dns);
+        assert_eq!(compute.dns_upstream, "10.0.0.53:53");
+        assert_eq!(compute.dns_domain, "svc.internal");
+    }
+
+    #[test]
+    fn internal_dns_knobs_are_env_settable() {
+        // Env alone materialises `[compute]` and sets each internal-DNS knob (and an
+        // unrecognised bool spelling is a clear error, exercised by parse_bool).
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_COMPUTE_INTERNAL_DNS", "off"),
+            ("BOATRAMP_COMPUTE_DNS_UPSTREAM", "9.9.9.9:53"),
+            ("BOATRAMP_COMPUTE_DNS_DOMAIN", "corp.internal"),
+        ]))
+        .expect("valid env overrides apply");
+        let compute = cfg.compute.expect("compute materialised from env");
+        assert!(!compute.internal_dns, "env `off` disables internal DNS");
+        assert_eq!(compute.dns_upstream, "9.9.9.9:53");
+        assert_eq!(compute.dns_domain, "corp.internal");
     }
 
     #[test]

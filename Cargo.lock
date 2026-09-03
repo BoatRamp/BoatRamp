@@ -1676,6 +1676,7 @@ dependencies = [
  "serde_json",
  "syscalls",
  "tar",
+ "tempfile",
  "tokio",
  "tracing",
 ]
