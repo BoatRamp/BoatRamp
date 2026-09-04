@@ -73,6 +73,51 @@ boatramp dns configure-domain docs.example.com --provider cloudflare --target ap
 pointed CNAME docs.example.com -> app.fly.dev (proxied)
 ```
 
+## Wildcard on Cloudflare: disable Universal SSL first
+
+If you point a **wildcard** (`*.example.com`) at a Cloudflare **DNS-only** (grey-cloud)
+zone and let something else terminate TLS with a wildcard certificate validated over
+**DNS-01** — for example a fly wildcard cert — Cloudflare's **Universal SSL** will
+silently block issuance.
+
+Universal SSL (on by default for a newly-added zone) runs Cloudflare's own
+domain-control validation, whose managed `TXT` records at `_acme-challenge.example.com`
+**clobber the DNS-01 challenge delegation**. The ACME CA reads Cloudflare's tokens
+instead of the delegated challenge, so the wildcard certificate never validates and sits
+"Not verified" indefinitely. The failure is sneaky:
+
+- It hits the **wildcard only**. An exact host (`console.example.com`) validates over
+  HTTP-01 and issues fine — so wildcard TLS hangs while exact-host TLS works, which looks
+  like a fluke.
+- It is worst on **new zones** (Universal SSL still actively validating), and can recur
+  at the external CA's **renewal** time even on an established zone.
+
+For a DNS-only zone the Cloudflare edge certificate is never served, so the fix is to
+disable Universal SSL. `boatramp dns configure-domain` detects this: when you point a
+wildcard at a Cloudflare DNS-only zone it checks the setting and, if enabled, prints a
+warning. Pass `--disable-cf-universal-ssl` to turn it off in the same step (needs a token
+with `Zone.SSL and Certificates:Edit`):
+
+```sh
+boatramp dns configure-domain '*.example.com' --provider cloudflare \
+  --target app.fly.dev --disable-cf-universal-ssl
+```
+
+Then re-trigger the wildcard cert so DNS-01 can validate against the now-unobstructed
+delegation, e.g.:
+
+```sh
+fly certs remove '*.example.com' && fly certs add '*.example.com'
+```
+
+Equivalent manual steps: dashboard **SSL/TLS → Edge Certificates → Universal SSL →
+Disable**, or `PATCH /zones/<id>/ssl/universal/settings {"enabled": false}`.
+
+For a **proxied** (orange-cloud) zone the edge certificate *is* served, so don't disable
+Universal SSL — use a [Cloudflare Origin CA
+certificate](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/) for
+the origin instead.
+
 ## Reference
 
 - Provider names and credential variables:

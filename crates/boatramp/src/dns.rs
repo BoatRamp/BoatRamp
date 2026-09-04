@@ -9,7 +9,9 @@ use std::time::Duration;
 use boatramp_acme::acme::CertRequest;
 use boatramp_acme::{domain_record, preview_record, preview_wildcard, PreviewTarget};
 
-use crate::acme_dns::{build_provider, build_provider_opts, obtain_or_load, DnsProviderKind};
+use crate::acme_dns::{
+    build_provider, build_provider_opts, cloudflare_dns_from_env, obtain_or_load, DnsProviderKind,
+};
 use crate::config::ProjectConfig;
 
 /// A failure in the `dns` subcommand.
@@ -74,6 +76,14 @@ enum DnsCommand {
         /// Cloudflare-only; ignored by other providers, and forces automatic TTL.
         #[arg(long)]
         proxied: bool,
+        /// Cloudflare + wildcard host only: if the zone's **Universal SSL** is enabled,
+        /// disable it. Its ACME domain-control-validation TXT at `_acme-challenge.<zone>`
+        /// otherwise clobbers a wildcard's DNS-01 delegation (e.g. a fly wildcard cert),
+        /// so the wildcard never issues. Safe on a **DNS-only** (not `--proxied`) zone
+        /// whose edge cert is unused; needs a token with `Zone.SSL and Certificates:Edit`.
+        /// Without this flag, a clear warning is printed instead.
+        #[arg(long)]
+        disable_cf_universal_ssl: bool,
     },
     /// Issue (or renew) the `*.deploy.<host>` wildcard certificate via ACME
     /// DNS-01, into the cert cache `boatramp serve --tls acme-dns` reads.
@@ -120,7 +130,17 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
             target,
             ttl,
             proxied,
+            disable_cf_universal_ssl,
         } => {
+            // Preflight: pointing a **wildcard** at a Cloudflare **DNS-only** zone whose
+            // Universal SSL is enabled can silently block a wildcard cert validated over
+            // DNS-01 (its managed DCV TXT clobbers the `_acme-challenge` delegation).
+            // Best-effort: warn (or disable with the flag), but NEVER block the record
+            // upsert that is this command's actual job.
+            if matches!(provider, DnsProviderKind::Cloudflare) && host.starts_with("*.") && !proxied
+            {
+                cloudflare_wildcard_ssl_preflight(disable_cf_universal_ssl).await;
+            }
             let provider = build_provider_opts(provider, proxied).await?;
             let record = domain_record(&host, &parse_target(&target), ttl);
             provider.upsert(&record).await?;
@@ -154,6 +174,54 @@ pub async fn run(args: DnsArgs, _config: &ProjectConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Cloudflare + wildcard + DNS-only preflight: check the zone's **Universal SSL** and
+/// either disable it (`disable = true`) or print a clear warning. Best-effort — every
+/// path returns without error so it can never block the record upsert; a token that
+/// lacks `Zone.SSL` permission just yields a "couldn't check" hint.
+///
+/// See [`CloudflareDns::universal_ssl_enabled`](boatramp_acme::cloudflare::CloudflareDns::universal_ssl_enabled)
+/// for why Universal SSL breaks a wildcard's DNS-01 validation.
+async fn cloudflare_wildcard_ssl_preflight(disable: bool) {
+    let cf = match cloudflare_dns_from_env(false) {
+        Ok(cf) => cf,
+        // No CF creds in the env — nothing to check (the upsert below will report the
+        // missing credential itself).
+        Err(_) => return,
+    };
+    match cf.universal_ssl_enabled().await {
+        Ok(true) if disable => match cf.set_universal_ssl(false).await {
+            Ok(()) => eprintln!(
+                "cloudflare: disabled Universal SSL on this zone (DNS-only) — now re-trigger the \
+                 wildcard cert so DNS-01 can validate, e.g. `fly certs remove '*.<domain>'` then \
+                 `fly certs add '*.<domain>'`."
+            ),
+            Err(e) => eprintln!(
+                "cloudflare: could not disable Universal SSL ({e}) — the token needs `Zone.SSL \
+                 and Certificates:Edit`. Disable it in the dashboard (SSL/TLS → Edge \
+                 Certificates) or via `PATCH /zones/<id>/ssl/universal/settings {{\"enabled\":false}}`."
+            ),
+        },
+        Ok(true) => eprintln!(
+            "cloudflare: WARNING — Universal SSL is ENABLED on this zone. A wildcard cert \
+             validated over DNS-01 (e.g. a fly wildcard) can be blocked: Cloudflare's own \
+             domain-control-validation TXT records at `_acme-challenge.<domain>` clobber the \
+             DNS-01 delegation, so the wildcard sits \"Not verified\" (exact-host certs over \
+             HTTP-01 are unaffected — a confusing asymmetric failure). This zone is DNS-only, so \
+             its Cloudflare edge cert is unused: disable Universal SSL — re-run with \
+             `--disable-cf-universal-ssl`, or via the dashboard / `PATCH \
+             /zones/<id>/ssl/universal/settings {{\"enabled\":false}}` — then re-trigger the \
+             wildcard cert. See the wildcard-domain runbook."
+        ),
+        Ok(false) => {} // Universal SSL off — no conflict.
+        Err(e) => eprintln!(
+            "cloudflare: could not check Universal SSL ({e}) — the record-upsert token may lack \
+             `Zone.SSL and Certificates:Read`. If a wildcard cert won't validate (stuck \"Not \
+             verified\"), an enabled Universal SSL is the likely cause; see the wildcard-domain \
+             runbook."
+        ),
+    }
 }
 
 /// An IPv4/IPv6 literal becomes an address record; anything else a `CNAME`.

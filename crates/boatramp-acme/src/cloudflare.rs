@@ -56,6 +56,68 @@ impl CloudflareDns {
         format!("{}/zones/{}/dns_records", self.api_base, self.zone_id)
     }
 
+    /// `…/zones/{zone}/ssl/universal/settings` — the zone-wide **Universal SSL**
+    /// toggle (Cloudflare's own edge certificate plus the ACME domain-control-validation
+    /// TXT records it manages at `_acme-challenge.<zone>`).
+    fn universal_ssl_url(&self) -> String {
+        format!(
+            "{}/zones/{}/ssl/universal/settings",
+            self.api_base, self.zone_id
+        )
+    }
+
+    /// Whether **Universal SSL** is enabled on this zone.
+    ///
+    /// Why this matters for a wildcard: even on a **DNS-only** (grey-cloud) zone whose
+    /// edge certificate is never served, an enabled Universal SSL keeps running its own
+    /// domain-control validation, whose managed TXT records at `_acme-challenge.<zone>`
+    /// **clobber a wildcard's DNS-01 delegation** (e.g. a fly wildcard cert's
+    /// `_acme-challenge.<zone>` CNAME to the ACME provider's nameservers). Let's Encrypt
+    /// then reads Cloudflare's tokens instead of the delegated challenge, so the wildcard
+    /// never validates and sits "Not verified". Exact-host certs over HTTP-01 are
+    /// unaffected — hence a confusing asymmetric failure.
+    ///
+    /// `GET` → `result.enabled`. Needs a token with **Zone.SSL and Certificates:Read**
+    /// (the `Zone.DNS:Edit` token used for record upserts may not carry it — the caller
+    /// treats an error as "couldn't check" rather than fatal).
+    pub async fn universal_ssl_enabled(&self) -> Result<bool, DnsError> {
+        let resp = self
+            .client
+            .get(self.universal_ssl_url())
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        let body: UniversalSslResponse = resp
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(body.result.enabled)
+    }
+
+    /// Enable or disable **Universal SSL** on this zone. `PATCH {"enabled": <b>}`.
+    ///
+    /// For a DNS-only zone that terminates TLS elsewhere (e.g. fly), the edge
+    /// certificate is unused, so disabling Universal SSL is safe and stops its DCV TXT
+    /// from conflicting with a wildcard's DNS-01 delegation. (A **proxied** / orange-cloud
+    /// zone *does* serve the edge cert — there the answer is a Cloudflare Origin CA cert,
+    /// not disabling Universal SSL.) Needs a token with **Zone.SSL and
+    /// Certificates:Edit**.
+    pub async fn set_universal_ssl(&self, enabled: bool) -> Result<(), DnsError> {
+        self.client
+            .patch(self.universal_ssl_url())
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await
+            .map_err(|e| DnsError::Backend(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| DnsError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     /// The JSON body for a create/replace of `record`. When this instance is
     /// `proxied`, address/CNAME records get `proxied: true` (and the automatic
     /// TTL Cloudflare requires for proxied records); TXT is never proxied.
@@ -120,6 +182,16 @@ struct ListRecord {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct UniversalSslResponse {
+    result: UniversalSslResult,
+}
+
+#[derive(Deserialize)]
+struct UniversalSslResult {
+    enabled: bool,
+}
+
 #[async_trait]
 impl DnsProvider for CloudflareDns {
     async fn upsert(&self, record: &DnsRecord) -> Result<(), DnsError> {
@@ -178,6 +250,29 @@ mod tests {
             cf.records_url(),
             "https://example.test/v4/zones/zone123/dns_records"
         );
+    }
+
+    #[test]
+    fn universal_ssl_url_targets_the_zone_setting() {
+        let cf = CloudflareDns::new("zone123", "tok").with_api_base("https://example.test/v4");
+        assert_eq!(
+            cf.universal_ssl_url(),
+            "https://example.test/v4/zones/zone123/ssl/universal/settings"
+        );
+    }
+
+    #[test]
+    fn universal_ssl_response_parses_enabled_flag() {
+        // Cloudflare's `GET /zones/{id}/ssl/universal/settings` wire shape.
+        let on: UniversalSslResponse = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "result": { "enabled": true }
+        }))
+        .unwrap();
+        assert!(on.result.enabled);
+        let off: UniversalSslResponse =
+            serde_json::from_value(serde_json::json!({ "result": { "enabled": false } })).unwrap();
+        assert!(!off.result.enabled);
     }
 
     #[test]

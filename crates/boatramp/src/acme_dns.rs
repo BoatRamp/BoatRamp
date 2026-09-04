@@ -96,6 +96,18 @@ pub async fn build_provider(kind: DnsProviderKind) -> Result<Box<dyn DnsProvider
     build_provider_opts(kind, false).await
 }
 
+/// Build a **concrete** Cloudflare provider from the environment (the same
+/// construction [`build_provider_opts`] uses for [`DnsProviderKind::Cloudflare`]).
+/// Returned unboxed so Cloudflare-specific preflights (e.g. the wildcard Universal-SSL
+/// check) can reach methods not on the generic `DnsProvider` trait.
+pub fn cloudflare_dns_from_env(proxied: bool) -> Result<boatramp_acme::cloudflare::CloudflareDns> {
+    Ok(boatramp_acme::cloudflare::CloudflareDns::new(
+        env("CLOUDFLARE_ZONE_ID")?,
+        env("CLOUDFLARE_API_TOKEN")?,
+    )
+    .with_proxied(proxied))
+}
+
 /// Like [`build_provider`], but sets Cloudflare's per-record proxy flag
 /// (orange-cloud). `proxied` is Cloudflare-specific — every other provider
 /// ignores it. Used by `dns configure-domain --proxied`, so proxying is chosen
@@ -106,13 +118,7 @@ pub async fn build_provider_opts(
 ) -> Result<Box<dyn DnsProvider>> {
     Ok(match kind {
         DnsProviderKind::Manual => Box::new(ManualDnsProvider::new()),
-        DnsProviderKind::Cloudflare => Box::new(
-            boatramp_acme::cloudflare::CloudflareDns::new(
-                env("CLOUDFLARE_ZONE_ID")?,
-                env("CLOUDFLARE_API_TOKEN")?,
-            )
-            .with_proxied(proxied),
-        ),
+        DnsProviderKind::Cloudflare => Box::new(cloudflare_dns_from_env(proxied)?),
         DnsProviderKind::Route53 => Box::new(
             boatramp_acme::route53::Route53Dns::from_env(env("ROUTE53_HOSTED_ZONE_ID")?).await,
         ),
