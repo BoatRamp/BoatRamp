@@ -66,7 +66,10 @@ fn veth_body(vm_id: &str) -> String {
 /// interface names — required for idempotent teardown/relaunch. Mirrors the base-36
 /// encoding style used for SQL-identifier disambiguation in `boatramp-storage`'s
 /// `tenant_provision`; a full 128-bit SHA-256 digest is overkill for a 15-char ifname.
-fn hash_b36(s: &str, width: usize) -> String {
+///
+/// `pub(crate)` so the container backend can reuse it to clamp an over-long container
+/// id to the UTS hostname limit with the same collision-resistant digest.
+pub(crate) fn hash_b36(s: &str, width: usize) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";

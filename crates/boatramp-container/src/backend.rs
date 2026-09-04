@@ -60,13 +60,54 @@ fn blob_key(hash: &str) -> String {
     format!("{prefix}/{hash}")
 }
 
-/// Container id for a workload replica: the veth-name + cgroup + hostname stem.
+/// The Linux UTS nodename limit (`__NEW_UTS_LEN`): `sethostname(2)` rejects a name
+/// longer than this with `EINVAL`. Because the container id IS the hostname
+/// ([`SandboxPlan::for_spec`] passes it to the UTS namespace), an id over this length
+/// aborts container init before the guest binds — a silent crash-loop. 64 is the exact
+/// kernel bound (a 64-byte name is accepted; 65+ is not).
+const HOSTNAME_MAX: usize = 64;
+
+/// Container id for a workload replica: the veth-name + cgroup + hostname + log stem.
 /// Project-qualified for a non-`default` project (so two projects' same-named
 /// workloads never share a cgroup/veth/hostname), but the bare `<workload>-<replica>`
 /// for `default` — preserving existing default-project deployments byte-identical.
-/// Delegates to the host-tested [`compute_instance_id`].
+/// Delegates to the host-tested [`compute_instance_id`], then clamps to the UTS
+/// hostname limit so a long id can't fail `sethostname`.
 fn container_id(project: &str, workload: &str, replica: u32) -> String {
-    compute_instance_id(project, workload, replica)
+    clamp_container_id(compute_instance_id(project, workload, replica))
+}
+
+/// Clamp a container id to [`HOSTNAME_MAX`] so it is always a legal UTS hostname. A
+/// per-tenant `Single` id embeds the project twice (`<project>-<compute>-<project>_<hash>-<replica>`
+/// — the qualifier prefix plus the project-derived tenant ident), which overruns 64
+/// bytes for a long project name. A short id is returned verbatim (readable, and
+/// byte-identical to every currently-working deployment); a longer one keeps a readable
+/// head and appends a stable base-36 digest of the **whole** id, so distinct long ids
+/// never collapse to the same hostname/cgroup/veth (the same reasoning + digest the
+/// veth-name derivation uses — see [`crate::net`]). Deterministic: the same id always
+/// clamps identically, so teardown/relaunch/GC stay idempotent. Every consumer derives
+/// from `container_id`, so hostname, cgroup path, veth input, and log path clamp
+/// together and stay consistent.
+fn clamp_container_id(id: String) -> String {
+    if id.len() <= HOSTNAME_MAX {
+        return id;
+    }
+    // A base-36 digest of the full id (11 chars ≈ 57 bits — collision-resistant across
+    // distinct long ids), joined to a readable head that fills the rest of the budget.
+    const DIGEST: usize = 11;
+    let head = HOSTNAME_MAX - 1 - DIGEST; // room for "-" + the digest
+                                          // Ids are validated ASCII (`[a-z0-9-_]`), so a byte slice is a char boundary; guard
+                                          // anyway so a surprise multi-byte char can't panic.
+    let head = id
+        .get(..head)
+        .unwrap_or_else(|| id.get(..head.min(id.len())).unwrap_or(&id));
+    let clamped = format!("{head}-{}", crate::net::hash_b36(&id, DIGEST));
+    tracing::debug!(
+        original = %id,
+        clamped = %clamped,
+        "container id exceeded the UTS hostname limit; clamped with a stable digest"
+    );
+    clamped
 }
 
 /// The pure A2 GC decision: given the `(project,workload,replica)` keys this
@@ -2433,6 +2474,46 @@ mod tests {
 
     fn key(p: &str, w: &str, r: u32) -> (String, String, u32) {
         (p.to_string(), w.to_string(), r)
+    }
+
+    #[test]
+    fn container_id_is_clamped_to_the_uts_hostname_limit() {
+        // A short id (every currently-working deployment, incl. the 52-byte construens
+        // case) is byte-identical — no digest, fully readable.
+        assert_eq!(container_id("default", "web", 0), "web-0");
+        assert_eq!(container_id("acme", "pg", 0), "acme-pg-0");
+
+        // The construens-preview case: a long project makes the per-tenant Single id
+        // embed the project twice and overrun 64 bytes → it must be clamped, not passed
+        // to `sethostname` verbatim (which EINVALs and crash-loops the container). The
+        // tenant ident tail is padded here so the raw id comfortably exceeds the limit.
+        let project = "construens-preview";
+        let workload = "pg-construens_preview_enzr6qk3m2p8x7v9w1y3z5"; // 44-char tenant ident
+        let raw = compute_instance_id(project, workload, 0);
+        assert!(
+            raw.len() > HOSTNAME_MAX,
+            "precondition: the raw id must overrun (got {})",
+            raw.len()
+        );
+        let clamped = container_id(project, workload, 0);
+        assert!(
+            clamped.len() <= HOSTNAME_MAX,
+            "clamped id must be a legal hostname (got {})",
+            clamped.len()
+        );
+        // Deterministic: idempotent teardown/relaunch/GC depend on it.
+        assert_eq!(clamped, container_id(project, workload, 0));
+        // The readable head is preserved (a prefix of the raw id).
+        assert!(raw.starts_with(&clamped[..20]));
+
+        // Collision-resistant: two long ids sharing a >52-char prefix but diverging only
+        // in the tail must NOT collapse to the same hostname (a plain truncate would).
+        let pad = "pg-construens_preview_commonprefixpaddddddddd_"; // 46 chars, shared
+        let a = container_id(project, &format!("{pad}aaaa"), 0);
+        let b = container_id(project, &format!("{pad}bbbb"), 0);
+        assert!(a.len() <= HOSTNAME_MAX && b.len() <= HOSTNAME_MAX);
+        assert_eq!(a[..20], b[..20], "shared readable head");
+        assert_ne!(a, b, "distinct long ids must clamp to distinct hostnames");
     }
 
     #[test]

@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.15] - 2026-09-04
+
+### Fixed
+- **A managed database (or any container workload) under a long project name now starts
+  instead of crash-looping.** The native container backend derives the container's
+  hostname (and cgroup / veth / log stem) from `container_id` = `compute_instance_id`,
+  which for a per-tenant `Single` database embeds the project name twice
+  (`<project>-<compute>-<project>_<hash>-<replica>` — the tenant qualifier plus the
+  project-derived tenant ident). For a long project this overran Linux's 64-byte UTS
+  nodename limit, so `sethostname(2)` failed with `EINVAL` and container init aborted
+  **before Postgres bound its port** — the reconcile loop then crash-looped it
+  (`launched=1 stopped=1` every tick) while the resolver reported "running but none
+  healthy". `container_id` is now clamped to 64 bytes: a short id is unchanged
+  (byte-identical to every working deployment), and a longer one keeps a readable head
+  plus a stable base-36 digest of the whole id (the same collision-resistant scheme the
+  veth names use), so hostname, cgroup, veth, and log stem stay consistent and distinct
+  long ids never collide. (Regression surfaced on construens-preview, a 68-byte
+  hostname; construens, at 52 bytes, was unaffected.)
+
 ## [0.3.14] - 2026-09-03
 
 ### Added
