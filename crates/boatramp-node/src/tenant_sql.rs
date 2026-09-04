@@ -92,8 +92,8 @@ use boatramp_storage::sql_compute::{
 };
 use boatramp_storage::sql_sqlx::PerTenantSqlResolver;
 use boatramp_storage::tenant_provision::{
-    provision_ddl, recover_soft_deprovision_ddl, sanitize_ident, soft_deprovision_ddl,
-    tenant_db_name, tenant_role_name,
+    grant_app_role_ddl, provision_ddl, recover_soft_deprovision_ddl, sanitize_ident,
+    soft_deprovision_ddl, tenant_db_name, tenant_role_name,
 };
 use boatramp_storage::ExternalSqlKind;
 
@@ -462,7 +462,7 @@ async fn provision_shared(
         kind,
         maintenance_database(kind),
         superuser,
-        superuser_pw,
+        superuser_pw.clone(),
         Some(1),
         false,
         Some(Duration::from_secs(10)),
@@ -483,6 +483,38 @@ async fn provision_shared(
                 continue;
             }
             return Err(format!("provision {}: {e}", names.database));
+        }
+    }
+
+    // Grant the tenant's non-superuser login role the everyday app privileges on the
+    // objects in its OWN database (Postgres `Shared` only — the schema is loaded by the
+    // superuser, so without this the role can't touch its tables; `grant_app_role_ddl`
+    // is empty for MySQL, whose `db.*` grant already covers it). Runs INSIDE the tenant
+    // database — schema grants + `ALTER DEFAULT PRIVILEGES` are database-local, so this
+    // needs its own connection (the loop above is on the maintenance database). The
+    // superuser reaches the locked-down database because superusers bypass the
+    // `CONNECT` gate. Idempotent, so a re-provision (incl. the lazy per-resolve one that
+    // heals a tenant provisioned by an older version) is safe.
+    let grants = grant_app_role_ddl(kind, &names.role, superuser);
+    if !grants.is_empty() {
+        let tenant_resolver =
+            Arc::new(DeployEndpointResolver::new(deploy.clone(), DEFAULT_PROJECT));
+        let tenant_admin = ComputeResolvedSqlBackend::new(
+            tenant_resolver,
+            compute,
+            kind,
+            names.database.clone(),
+            superuser,
+            superuser_pw,
+            Some(1),
+            false,
+            Some(Duration::from_secs(10)),
+        );
+        for stmt in grants {
+            tenant_admin
+                .run_script(&stmt)
+                .await
+                .map_err(|e| format!("grant app role on {}: {e}", names.database))?;
         }
     }
     Ok(())

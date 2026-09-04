@@ -5,6 +5,26 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.16] - 2026-09-04
+
+### Fixed
+- **A `shared`-mode managed Postgres tenant can now write its own schema.** In `shared`
+  isolation the schema is loaded as the server superuser (one connection has to reach
+  every tenant's database), so the tables are superuser-owned — and Postgres's
+  database-level `GRANT ALL PRIVILEGES ON DATABASE` confers only `CONNECT`/`CREATE`/
+  `TEMP`, **not** table privileges. The tenant's non-superuser login role (kept
+  non-superuser so the app's row-level security is actually enforced) therefore had no
+  rights on those tables, and the first guest write failed with `permission denied for
+  table …`. Provisioning now grants that role the everyday application privileges
+  (`USAGE` on `public`; `SELECT/INSERT/UPDATE/DELETE` on tables; `USAGE/SELECT/UPDATE`
+  on sequences; `EXECUTE` on functions) on its **own** database, plus `ALTER DEFAULT
+  PRIVILEGES` so objects created by later migrations are covered too — handling either
+  order of provision vs. schema-load. Idempotent, and the lazy per-resolve
+  re-provisioning heals a tenant that a pre-0.3.16 server provisioned. Scoped to the
+  tenant's own database, and the role stays non-superuser, so tenant isolation and RLS
+  are unchanged. (`shared`+MySQL was unaffected — its `GRANT … ON <db>.*` already covers
+  every table; `single` was unaffected — its migrations run as the owning role.)
+
 ## [0.3.15] - 2026-09-04
 
 ### Fixed

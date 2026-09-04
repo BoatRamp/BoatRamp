@@ -316,6 +316,70 @@ pub fn provision_ddl(kind: ExternalSqlKind, db: &str, role: &str, password: &str
     }
 }
 
+/// Ordered, **idempotent** DDL granting a tenant's login `role` the everyday
+/// application privileges on the objects in its **own** database's `public` schema —
+/// run (as the schema-owning superuser, `owner`) *inside the tenant database* after
+/// [`provision_ddl`].
+///
+/// # Why this is needed (Postgres `Shared` only)
+///
+/// A `Shared` tenant's schema is loaded by the **superuser** (operator `sql exec`
+/// connects as the server superuser, since one connection must be able to reach every
+/// tenant's database). Those objects are therefore superuser-owned, and Postgres's
+/// database-level `GRANT ALL PRIVILEGES ON DATABASE` confers only `CONNECT`/`CREATE`/
+/// `TEMP` — **not** table privileges. So the tenant's non-superuser login role (kept
+/// non-superuser precisely so the app's row-level security is enforced) can't read or
+/// write the tables, and the first guest query fails with `permission denied`. This
+/// grants the role the standard app rights and sets `ALTER DEFAULT PRIVILEGES` so
+/// objects a later migration creates are covered too — handling either order (provision
+/// before or after the schema load). Idempotent: every `GRANT`/`ALTER DEFAULT
+/// PRIVILEGES` re-runs harmlessly.
+///
+/// - **`GRANT … ON ALL TABLES/SEQUENCES/FUNCTIONS IN SCHEMA public`** — existing objects
+///   (a schema already loaded before this ran, or a re-provision).
+/// - **`ALTER DEFAULT PRIVILEGES FOR ROLE <owner> IN SCHEMA public GRANT …`** — future
+///   objects the `owner` (the migration superuser) creates.
+///
+/// Scoped to the tenant's own database + `public` schema, so it grants nothing
+/// cross-tenant (the role can `CONNECT` only to its own database — [`provision_ddl`]'s
+/// `REVOKE CONNECT … FROM PUBLIC`), and the role stays non-superuser (RLS still applies).
+///
+/// # MySQL
+///
+/// Empty — [`provision_ddl`]'s `GRANT ALL PRIVILEGES ON <db>.*` already covers every
+/// current and future table in the tenant's database, so there is no gap.
+pub fn grant_app_role_ddl(kind: ExternalSqlKind, role: &str, owner: &str) -> Vec<String> {
+    match kind {
+        ExternalSqlKind::Postgres => {
+            let role_id = quote_ident(kind, role);
+            let owner_id = quote_ident(kind, owner);
+            vec![
+                format!("GRANT USAGE ON SCHEMA public TO {role_id};"),
+                format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role_id};"
+                ),
+                format!(
+                    "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {role_id};"
+                ),
+                format!("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role_id};"),
+                format!(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {owner_id} IN SCHEMA public \
+                     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role_id};"
+                ),
+                format!(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {owner_id} IN SCHEMA public \
+                     GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO {role_id};"
+                ),
+                format!(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {owner_id} IN SCHEMA public \
+                     GRANT EXECUTE ON FUNCTIONS TO {role_id};"
+                ),
+            ]
+        }
+        ExternalSqlKind::Mysql => Vec::new(),
+    }
+}
+
 /// Ordered DDL to drop a tenant cleanly. Every statement is `IF EXISTS`-guarded,
 /// so deprovisioning a never-provisioned or already-deprovisioned tenant is a
 /// no-op rather than an error.
@@ -755,6 +819,40 @@ mod tests {
         ] {
             assert!(n.len() <= MAX_IDENT_LEN, "over cap: {n}");
         }
+    }
+
+    // ---- grant_app_role_ddl ----------------------------------------------
+
+    /// Postgres grants the role the app privileges on existing objects AND sets default
+    /// privileges (owned by the schema-loading superuser) for future ones — so the
+    /// tenant role can use a superuser-loaded schema regardless of provision/load order.
+    #[test]
+    fn grant_app_role_ddl_postgres_covers_existing_and_future() {
+        let stmts = grant_app_role_ddl(ExternalSqlKind::Postgres, "t_pg_acme_role", "pgadmin");
+        let all = stmts.join("\n");
+        // Every statement targets the tenant role, quoted.
+        assert!(stmts.iter().all(|s| s.contains("\"t_pg_acme_role\"")));
+        // Existing objects: GRANT ON ALL … IN SCHEMA public.
+        assert!(all.contains("GRANT USAGE ON SCHEMA public"));
+        assert!(all.contains("ON ALL TABLES IN SCHEMA public"));
+        assert!(all.contains("ON ALL SEQUENCES IN SCHEMA public"));
+        // Future objects: ALTER DEFAULT PRIVILEGES FOR ROLE <owner>.
+        assert!(all.contains("ALTER DEFAULT PRIVILEGES FOR ROLE \"pgadmin\" IN SCHEMA public"));
+        // Read+write DML (the reported bug was an INSERT).
+        assert!(all.contains("INSERT"));
+        assert!(all.contains("UPDATE"));
+        assert!(all.contains("DELETE"));
+        // Least privilege: no superuser/ownership escalation, no TRUNCATE.
+        assert!(!all.to_ascii_uppercase().contains("SUPERUSER"));
+        assert!(!all.to_ascii_uppercase().contains("TRUNCATE"));
+        assert!(!all.to_ascii_uppercase().contains("OWNER TO"));
+    }
+
+    /// MySQL has no gap — `provision_ddl`'s `db.*` grant already covers every current +
+    /// future table — so the grant DDL is empty (nothing extra to run).
+    #[test]
+    fn grant_app_role_ddl_mysql_is_empty() {
+        assert!(grant_app_role_ddl(ExternalSqlKind::Mysql, "role", "owner").is_empty());
     }
 
     // ---- quoting ---------------------------------------------------------
