@@ -201,6 +201,32 @@ mod tests {
     }
 
     #[test]
+    fn function_and_site_scopes_are_independent_in_the_shared_store() {
+        // One store serves both sites and functions, keyed by scope — the exact scope
+        // strings the writer (function_runtime `project.qualified("fn/<name>")`) and the
+        // reader (`operator_function_logs`) both compute. A function tail must return
+        // only that function's lines, never a site's; and two tenants' same-named
+        // functions must not share a namespace.
+        let store = store_with(100, 1_000_000);
+        store.append("console", LogStream::Stdout, "site line"); // a site
+        store.append("fn/identity", LogStream::Stdout, "default fn line"); // default-project fn
+        store.append("acme/fn/identity", LogStream::Stdout, "acme fn line"); // tenant fn
+
+        let fn_default = store.tail("fn/identity", 100, 0, None).0;
+        assert_eq!(fn_default.len(), 1);
+        assert_eq!(fn_default[0].line, "default fn line");
+
+        let fn_acme = store.tail("acme/fn/identity", 100, 0, None).0;
+        assert_eq!(fn_acme.len(), 1);
+        assert_eq!(fn_acme[0].line, "acme fn line");
+
+        // The site tail is unchanged and never leaks a function's lines.
+        let site = store.tail("console", 100, 0, None).0;
+        assert_eq!(site.len(), 1);
+        assert_eq!(site[0].line, "site line");
+    }
+
+    #[test]
     fn ring_keeps_most_recent_within_capacity() {
         let store = store_with(3, 1_000_000); // effectively uncapped rate
         for i in 0..5 {

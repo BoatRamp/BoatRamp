@@ -27,9 +27,17 @@ pub struct LogsArgs {
     #[arg(long, env = "BOATRAMP_SERVER", global = true)]
     server: Option<String>,
 
-    /// Site whose guest logs to tail (overrides [deploy].site).
+    /// Site whose guest logs to tail (overrides [deploy].site). Mutually exclusive
+    /// with `--function`.
     #[arg(long, env = "BOATRAMP_SITE", global = true)]
     site: Option<String>,
+
+    /// Function whose captured guest stdout/stderr to tail — a standalone component
+    /// (GraphQL subgraph, auth function, worker) invoked via `emit::invoke`. Its
+    /// `println!`/`eprintln!` output is otherwise unreadable. Scoped to `--project`;
+    /// takes precedence over `--site`.
+    #[arg(long)]
+    function: Option<String>,
 
     /// Only show one stream: `stdout` or `stderr`.
     #[arg(long)]
@@ -44,18 +52,55 @@ pub struct LogsArgs {
     follow: bool,
 }
 
+/// What `logs` is tailing: a site's or a function's captured guest output. Both read
+/// the same control-plane log store; only the endpoint differs.
+enum Target {
+    Site(String),
+    Function(String),
+}
+
+/// One fetch against the control plane for either target — so the initial pull and the
+/// `--follow` poll share exactly one code path.
+async fn fetch(
+    cp: &client::ControlPlane,
+    target: &Target,
+    limit: usize,
+    after: u64,
+    stream: Option<&str>,
+) -> Result<client::LogsResponse> {
+    Ok(match target {
+        Target::Site(site) => cp.fetch_logs(site, limit, after, stream).await?,
+        Target::Function(function) => {
+            cp.fetch_function_logs(function, limit, after, stream)
+                .await?
+        }
+    })
+}
+
 /// Entry point for `boatramp logs`.
 pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
-    let (server, site) = client::resolve_target(args.server, args.site, config)?;
-    let cp = client::ControlPlane::new(
-        server,
-        client::http_client(client::token(config).as_deref()),
-        client::resolve_project(config),
-    );
     let stream = args.stream.as_deref();
+    let http = client::http_client(client::token(config).as_deref());
+    let project = client::resolve_project(config);
+
+    // A `--function` selector takes precedence over the (env/config-backed) `--site`,
+    // so `BOATRAMP_SITE` in the environment never blocks tailing a function.
+    let (cp, target) = if let Some(function) = args.function {
+        let server = client::resolve_server(args.server, config)?;
+        (
+            client::ControlPlane::new(server, http, project),
+            Target::Function(function),
+        )
+    } else {
+        let (server, site) = client::resolve_target(args.server, args.site, config)?;
+        (
+            client::ControlPlane::new(server, http, project),
+            Target::Site(site),
+        )
+    };
 
     // Initial fetch: the most recent `limit` lines.
-    let first = cp.fetch_logs(&site, args.limit, 0, stream).await?;
+    let first = fetch(&cp, &target, args.limit, 0, stream).await?;
     let mut cursor = first.entries.last().map(|e| e.seq).unwrap_or(0);
     for entry in &first.entries {
         print_line(entry);
@@ -74,9 +119,7 @@ pub async fn run(args: LogsArgs, config: &ProjectConfig) -> Result<()> {
     // no duplicates and no gaps across polls).
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let next = cp
-            .fetch_logs(&site, args.limit.max(1000), cursor, stream)
-            .await?;
+        let next = fetch(&cp, &target, args.limit.max(1000), cursor, stream).await?;
         for entry in &next.entries {
             print_line(entry);
             cursor = cursor.max(entry.seq);

@@ -784,6 +784,40 @@ impl ControlPlane {
             .await?)
     }
 
+    /// Fetch captured guest logs for a **function** (symmetric to [`fetch_logs`]): the
+    /// most recent `limit` lines with `seq > after`, optionally filtered to one `stream`.
+    /// Honors `--project` via `functions_seg` (`functions` for the default project, else
+    /// `projects/<proj>/functions`), so a per-tenant function's logs are reachable.
+    ///
+    /// [`fetch_logs`]: Self::fetch_logs
+    pub async fn fetch_function_logs(
+        &self,
+        function: &str,
+        limit: usize,
+        after: u64,
+        stream: Option<&str>,
+    ) -> Result<LogsResponse> {
+        let seg = self.functions_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        let mut url =
+            format!("{server}/api/{seg}/{function}/_boatramp/logs?limit={limit}&after={after}");
+        if let Some(stream) = stream {
+            url.push_str("&stream=");
+            url.push_str(stream);
+        }
+        Ok(client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Fetch a site's operator handler stats (raw JSON: handler invocation counters,
     /// consumer backlog/dead-letters, live stream connections).
     pub async fn fetch_handler_stats(&self, site: &str) -> Result<serde_json::Value> {

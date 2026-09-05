@@ -300,6 +300,14 @@ pub fn router_with_fast(
             get(operator_logs_stream),
         )
         .route("/api/sites/{site}/_boatramp/dlq", post(operator_dlq))
+        // Captured guest logs for a function — symmetric to the per-site logs endpoint,
+        // reading the same store under the function's project-qualified scope. Project-
+        // owned read (the `/api/functions/*` authz mapping), so a project token reaches
+        // only its own functions' logs.
+        .route(
+            "/api/functions/{name}/_boatramp/logs",
+            get(operator_function_logs),
+        )
         // The function **invoke** surface (FA-3) needs the engine, so it is
         // registered only with the handlers feature.
         .route("/api/functions/{name}/invoke", post(invoke_function))

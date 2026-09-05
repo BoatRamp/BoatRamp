@@ -140,7 +140,8 @@ mod operator;
 pub(crate) use operator::prometheus_metrics;
 #[cfg(feature = "handlers")]
 pub(crate) use operator::{
-    operator_dlq, operator_handler_stats, operator_logs, operator_logs_stream,
+    operator_dlq, operator_function_logs, operator_handler_stats, operator_logs,
+    operator_logs_stream,
 };
 mod proxy;
 pub use proxy::spawn_compute_reconcile;

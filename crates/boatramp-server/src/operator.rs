@@ -233,6 +233,45 @@ pub(super) async fn operator_logs(
     Json(LogsResponse { entries, dropped }).into_response()
 }
 
+/// Authenticated captured guest logs for a **function** (`GET
+/// /api/functions/{name}/_boatramp/logs`) — the symmetric counterpart to
+/// [`operator_logs`] for standalone functions (GraphQL subgraphs, auth functions,
+/// workers) whose `println!`/`eprintln!` output is otherwise unreadable. Reads the
+/// SAME [`LogStore`] the capture already writes to (see
+/// `function_runtime::build_function_bindings`), under the function's project-qualified
+/// scope `<project>/fn/<name>` (bare `fn/<name>` for the default project) — so this is
+/// pure exposure, no new capture. Project-owned + operator-gated by the surrounding
+/// `/api/functions/*` authz (Project·Read); multi-tenant safe (the scope is
+/// project-qualified, and the token must hold read on that project).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_function_logs(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Path(name): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return Json(LogsResponse {
+            entries: Vec::new(),
+            dropped: 0,
+        })
+        .into_response();
+    };
+    let stream = match query.stream.as_deref() {
+        Some("stdout") => Some(boatramp_handlers::LogStream::Stdout),
+        Some("stderr") => Some(boatramp_handlers::LogStream::Stderr),
+        _ => None,
+    };
+    let limit = query.limit.unwrap_or(200).min(1000);
+    // The exact scope the function runtime tags its guest lines with — must match
+    // `function_runtime`'s `project.qualified("fn/<name>")` or the tail finds nothing.
+    let scope = project.as_ref().qualified(&format!("fn/{name}"));
+    let (entries, dropped) = inner
+        .logs
+        .tail(&scope, limit, query.after.unwrap_or(0), stream);
+    Json(LogsResponse { entries, dropped }).into_response()
+}
+
 /// Live log tail over SSE (`GET …/_boatramp/logs/stream`): subscribe to the
 /// capture feed, filter to this site, and emit each line as an SSE `log` event
 /// (the `id` is the line seq, so a reconnect can resume). The console uses this

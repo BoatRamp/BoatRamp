@@ -1714,4 +1714,47 @@ mod tests {
             ))
         );
     }
+
+    /// A function's captured-guest-logs endpoint is a project-owned READ — it reuses the
+    /// `/api/functions/*` mapping (no dedicated right), so a project token reaches only
+    /// its own functions' logs. Both the legacy default-project form and the
+    /// project-scoped form resolve to `Project·Read` on the right project.
+    #[test]
+    fn function_logs_are_a_project_read() {
+        // Legacy/default-project form.
+        assert_eq!(
+            Right::required("GET", "/api/functions/identity/_boatramp/logs"),
+            Some(Right::new(
+                Resource::Project,
+                Some("default".into()),
+                Action::Read
+            ))
+        );
+        // Project-scoped form (the request the CLI sends under `--project acme`, before
+        // `project_scope` rewrites it).
+        assert_eq!(
+            Right::required(
+                "GET",
+                "/api/projects/acme/functions/identity/_boatramp/logs"
+            ),
+            Some(Right::new(
+                Resource::Project,
+                Some("acme".into()),
+                Action::Read
+            ))
+        );
+        // Multi-tenant boundary: an `acme` project grant does not satisfy reading
+        // `globex`'s function logs.
+        let acme_read = AuthzPolicy::default_policy()
+            .rights_for(&[GrantedRole::scoped("project_viewer", "acme")]);
+        let globex_fn_logs = Right::required(
+            "GET",
+            "/api/projects/globex/functions/identity/_boatramp/logs",
+        )
+        .expect("gated");
+        assert!(
+            !acme_read.allows(&globex_fn_logs),
+            "acme token must not read globex fn logs"
+        );
+    }
 }

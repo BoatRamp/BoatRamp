@@ -5,6 +5,23 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.17] - 2026-09-05
+
+### Added
+- **`boatramp logs --function <name>` — tail a function's captured guest stdout/stderr.**
+  Standalone functions (GraphQL subgraphs, auth functions, workers) invoked via
+  `emit::invoke` write `println!`/`eprintln!` from inside the guest, but that output was
+  exposed nowhere — `logs --site` only covers a site's own handlers, not the functions
+  they invoke — so operators were blind to all function-side logging. The output was
+  already captured into the same log store as sites (under the function's
+  project-qualified scope); this exposes it symmetrically. `--function` honors the same
+  options as `--site` (`--stream`, `--limit`, `--follow`, `--project`, `--server`, and the
+  same control-plane auth), takes precedence over the env/config-backed `--site`, and is
+  served by a new `GET /api/functions/{name}/_boatramp/logs`. Project-owned + operator-
+  gated (`Project·Read`, the existing `/api/functions/*` mapping — no new right), so a
+  project token reaches only its own functions' logs. `--site` behavior and output format
+  are unchanged.
+
 ## [0.3.16] - 2026-09-04
 
 ### Fixed
