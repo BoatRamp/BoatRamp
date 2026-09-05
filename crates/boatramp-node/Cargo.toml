@@ -81,6 +81,10 @@ handlers = [
 # External bring-your-own SQL for the handler `sql` binding (each implies handlers).
 sql-postgres = ["handlers", "boatramp-storage/sql-postgres"]
 sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
+# The per-project SMTP email gateway (`boatramp:handlers/email`): wires the profile
+# store + delivery spool into the handler runtime. Enables the server's `email`
+# feature (which pulls `boatramp-handlers/email` + lettre); implies handlers.
+email = ["handlers", "boatramp-server/email"]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []

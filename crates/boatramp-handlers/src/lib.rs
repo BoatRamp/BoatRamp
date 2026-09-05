@@ -13,6 +13,8 @@ mod engine;
 #[cfg(feature = "engine")]
 pub mod logging;
 
+#[cfg(feature = "email")]
+pub use bindings::email::{EmailSpool, LettreBackend, OutboundEmail, SmtpBackend};
 #[cfg(feature = "graphql")]
 pub use bindings::graphql::{GraphqlRequest, SupergraphRunError, SupergraphRunner};
 #[cfg(feature = "invoke")]

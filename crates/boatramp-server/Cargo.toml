@@ -34,6 +34,12 @@ handlers = [
 # binding). On in batteries-included builds, off if you drop it from the feature set.
 orm-subquery = ["handlers", "boatramp-handlers/orm-subquery"]
 
+# The per-project SMTP email gateway (`boatramp:handlers/email`): a guest submits a
+# finished message; the host holds the SMTP credentials and delivers via lettre.
+# Implies `handlers` (it rides the wasm engine). On in batteries-included builds,
+# off in the lean build (which then also skips the lettre dependency).
+email = ["handlers", "boatramp-handlers/email"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

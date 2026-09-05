@@ -646,6 +646,17 @@ pub(super) async fn precheck_component(
                 "{label} requests `wasi:messaging` but this server has no messaging backend"
             ));
         }
+        // `email` needs a delivery spool; unset means the operator's
+        // `allow_guest_email` posture disabled guest email (or none was wired). Fail
+        // at activation with a clear message rather than deploying a handler whose
+        // every `send` would return `access-denied`.
+        #[cfg(feature = "email")]
+        if import == "email" && inner.email_spool.get().is_none() {
+            return Err(format!(
+                "{label} requests `email` but this server does not offer guest email \
+                 (no SMTP spool configured, or the `allow_guest_email` posture is off)"
+            ));
+        }
     }
     let entry = manifest
         .files
@@ -965,6 +976,30 @@ pub(super) async fn build_bindings(
     if granted("graphql") {
         if let Some(runner) = inner.federation_runner.get() {
             bindings = bindings.with_graphql(runner.scoped(project), depth);
+        }
+    }
+    // Per-project SMTP email gateway: a handler may submit a finished message to one
+    // of the project's SMTP profiles. Granted when the site allows `email`, the
+    // handler imports it, and the runtime offers email (a spool + profile store are
+    // set — gated at startup by the `allow_guest_email` posture). The SMTP
+    // credentials are resolved host-side and never exposed to the guest.
+    #[cfg(feature = "email")]
+    if granted("email") {
+        if let (Some(store), Some(spool)) =
+            (inner.email_profile_store.get(), inner.email_spool.get())
+        {
+            match store.resolve_all(project).await {
+                Ok(profiles) => {
+                    bindings = bindings.with_email(
+                        project.as_str(),
+                        std::sync::Arc::new(profiles),
+                        spool.clone(),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(site, %err, "resolving email profiles failed; email not granted");
+                }
+            }
         }
     }
     // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested

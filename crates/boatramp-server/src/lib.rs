@@ -59,6 +59,10 @@ mod auth;
 pub mod console;
 mod content;
 mod control_api;
+/// The node-side email delivery spool (best-effort + durable) backing the `email`
+/// guest capability.
+#[cfg(feature = "email")]
+mod email_spool;
 #[cfg(feature = "compression")]
 pub(crate) use content::maybe_compress;
 pub(crate) use content::multipart_byteranges;
@@ -67,12 +71,15 @@ pub(crate) use content::{
 };
 pub(crate) use control_api::{
     add_root_anchor, auth_whoami, bootstrap_token, cluster_join, cluster_members, cluster_promote,
-    cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_secret,
-    get_authz_policy, list_root_anchors, list_secrets, list_tokens, put_authz_policy,
-    remove_root_anchor, revoke_token, set_secret,
+    cluster_revoke, cluster_rotate_key, create_join_token, create_token, delete_email_profile,
+    delete_secret, get_authz_policy, list_email_profiles, list_root_anchors, list_secrets,
+    list_tokens, put_authz_policy, remove_root_anchor, revoke_token, set_email_profile, set_secret,
+    show_email_profile,
 };
 #[cfg(all(test, feature = "handlers"))]
 use control_api::{BootstrapRequest, CreateJoinTokenRequest, JoinRequest};
+#[cfg(feature = "email")]
+pub use email_spool::NodeEmailSpool;
 mod domain_verify;
 pub use domain_verify::{spawn_domain_verify_reconcile, verification_pending_page};
 pub mod envelope;
@@ -340,6 +347,18 @@ struct HandlerRuntimeInner {
     /// the invoke path). Set once at startup alongside [`invoker`](Self::invoker); unset ⇒ the
     /// `graphql` capability is not offered. Project-scoped per grant, like the invoker.
     federation_runner: std::sync::OnceLock<Arc<graphql_gateway::FederationRunner>>,
+    /// The per-project SMTP email-profile store backing the `email` capability's
+    /// host-side profile resolution (sealed with the `[secrets]` envelope, like
+    /// [`secret_store`](Self::secret_store)). Set via
+    /// [`HandlerRuntime::set_email_profile_store`]; unset ⇒ no profile resolves.
+    #[cfg(feature = "email")]
+    email_profile_store: std::sync::OnceLock<Arc<boatramp_core::email_config::EmailProfileStore>>,
+    /// The shared node email delivery spool backing the `email` capability. Set via
+    /// [`HandlerRuntime::set_email_spool`] at startup **only when the
+    /// `allow_guest_email` posture permits guest email**; unset ⇒ email is not
+    /// offered (a guest granted `email` gets `access-denied`).
+    #[cfg(feature = "email")]
+    email_spool: std::sync::OnceLock<Arc<dyn boatramp_handlers::EmailSpool>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -394,6 +413,10 @@ impl HandlerRuntime {
                 provision_tier: std::sync::OnceLock::new(),
                 invoker: std::sync::OnceLock::new(),
                 federation_runner: std::sync::OnceLock::new(),
+                #[cfg(feature = "email")]
+                email_profile_store: std::sync::OnceLock::new(),
+                #[cfg(feature = "email")]
+                email_spool: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -531,6 +554,30 @@ impl HandlerRuntime {
     pub fn set_secret_store(&self, store: Arc<boatramp_core::secret_store::SecretStore>) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.secret_store.set(store);
+        }
+    }
+
+    /// Wire the per-project SMTP email-profile store that backs the `email`
+    /// capability's host-side profile resolution (same sealed store the admin API
+    /// exposes redacted). Set once at startup; unset ⇒ no profile resolves.
+    #[cfg(feature = "email")]
+    pub fn set_email_profile_store(
+        &self,
+        store: Arc<boatramp_core::email_config::EmailProfileStore>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.email_profile_store.set(store);
+        }
+    }
+
+    /// Wire the shared node email delivery spool backing the `email` capability.
+    /// Called at startup **only when the `allow_guest_email` posture permits guest
+    /// email**, so leaving it unset (posture off, or no spool) makes email
+    /// unavailable and a granted guest's `send` returns `access-denied`.
+    #[cfg(feature = "email")]
+    pub fn set_email_spool(&self, spool: Arc<dyn boatramp_handlers::EmailSpool>) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.email_spool.set(spool);
         }
     }
 
@@ -827,6 +874,14 @@ pub struct ServerOptions {
     /// panic. Not `handlers`-gated: `SecretStore` lives in boatramp-core, so the admin
     /// API works on a lean node too. Wired by the node alongside the envelope.
     pub secret_store: Option<Arc<boatramp_core::secret_store::SecretStore>>,
+    /// The per-project SMTP email-profile store backing the admin API
+    /// (`/api/email/profiles{,/{name}}`) — set/list/show/delete of a profile's
+    /// **redacted** config (the password is never returned). `None` ⇒ no
+    /// `[secrets]` envelope was configured, and the email endpoints fail closed with
+    /// a clear `501`. Not `handlers`-gated: `EmailProfileStore` lives in
+    /// boatramp-core, so the admin API works on a lean node. Wired by the node
+    /// alongside the envelope, like [`secret_store`](Self::secret_store).
+    pub email_profile_store: Option<Arc<boatramp_core::email_config::EmailProfileStore>>,
     /// The embedded web-console mount (`[serve.console]`), when the operator
     /// enabled it and the binary was built with the `console` feature. `None` ⇒
     /// not served. The static SPA is served unauthenticated at this host+path.

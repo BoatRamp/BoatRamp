@@ -27,6 +27,9 @@ pub mod envelope;
 // and the reconcile logic.
 pub mod compute;
 pub mod deploy;
+/// Per-project SMTP email-profile store (sealed password) backing the `email`
+/// guest capability — credentials host-held, config admin-reconfigurable.
+pub mod email_config;
 pub mod error;
 /// Per-node guest-IP pool shared by the VMM (tap) + container (veth) backends.
 pub mod ipam;

@@ -54,6 +54,7 @@ default = [
   "bundler",
   "handlers",
   "orm-subquery",
+  "email",
   "cluster",
   "operator",
   "mcp",
@@ -166,6 +167,11 @@ handlers = [
 # `handlers`; in the default (batteries-included) feature set. Drop it to ship a host that
 # refuses correlated subqueries.
 orm-subquery = ["handlers", "boatramp-server/orm-subquery"]
+# The per-project SMTP email gateway (`boatramp:handlers/email`) + the `boatramp
+# email` admin subcommand. Implies `handlers` (the binding rides the engine);
+# forwards to the node + server `email` features (which pull lettre). In the
+# batteries-included default set; drop it for a build with no SMTP client.
+email = ["handlers", "boatramp-node/email", "boatramp-server/email"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

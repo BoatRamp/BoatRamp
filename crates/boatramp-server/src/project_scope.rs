@@ -8,7 +8,7 @@
 //! The rewrite is the one place a project-scoped URL becomes a global handler URL, so
 //! it is **whitelisted**: only the genuinely project-owned resource families
 //! ([`PROJECT_SCOPED_FAMILIES`] — `sites`, `functions`, `compute`, `workflows`,
-//! `graphql`, `secrets`) are rewritten. A `/api/projects/<proj>/tokens` (or any non-family
+//! `graphql`, `secrets`, `sql`, `email`) are rewritten. A `/api/projects/<proj>/tokens` (or any non-family
 //! sub-path) is **not**
 //! rewritten, so it never reaches the global `/api/tokens` handler with mere
 //! project authority — it simply 404s. The project-entity paths (`/api/projects` and
@@ -38,6 +38,9 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     "workflows",
     "graphql",
     "secrets",
+    // The project's SMTP email profiles (`/api/projects/<proj>/email/profiles…`),
+    // so `boatramp email set/ls/rm --project <p>` reaches the right tenant.
+    "email",
     // Operator SQL to a project's managed database (`/api/projects/<proj>/sql/<db>/…`).
     // Without this, `boatramp sql exec/query --project <p>` could only ever reach the
     // *default* project's DB, so a per-tenant (`tenant_scope = project`) managed database

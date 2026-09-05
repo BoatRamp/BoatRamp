@@ -70,6 +70,8 @@ mod workflow;
 // Joiner-side dynamic cluster join (CJ-2/CJ-3): the ticket codec, root-anchored
 // verification, founding decision, and `join_cluster` orchestration wired into
 // the cluster runtime's join-at-startup path (`run_cluster`).
+#[cfg(feature = "email")]
+mod email;
 #[cfg(feature = "cluster")]
 mod join;
 mod logs;
@@ -158,6 +160,9 @@ enum Command {
     Token(token::TokenArgs),
     /// Manage a project's internal, sealed secret store (`secrets set|ls|rm|rotate`).
     Secrets(secrets::SecretsArgs),
+    /// Manage a project's SMTP delivery profiles (`email set|ls|show|rm`).
+    #[cfg(feature = "email")]
+    Email(email::EmailArgs),
     /// Operate a self-hosted cluster's mesh membership (mint join tokens).
     Cluster(cluster::ClusterArgs),
     /// Inspect the operator security posture (`security explain`).
@@ -471,6 +476,8 @@ async fn async_main() -> Result<(), CliError> {
         Command::Graphql(args) => graphql::run(args, &config).await?,
         Command::Token(args) => token::run(args, &config).await?,
         Command::Secrets(args) => secrets::run(args, &config).await?,
+        #[cfg(feature = "email")]
+        Command::Email(args) => email::run(args, &config).await?,
         Command::Cluster(args) => cluster::run(args, &config).await?,
         Command::Auth(args) => authcmd::run(args, &config).await?,
         Command::Gateway(args) => gateway::run(args, &config).await?,

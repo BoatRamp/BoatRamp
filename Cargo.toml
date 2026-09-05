@@ -169,6 +169,21 @@ reqwest = { version = "0.12", default-features = false, features = [
   "multipart",
 ] }
 
+# SMTP client for the per-project `email` guest capability (compiled only with
+# `--features email`). `default-features = false` is REQUIRED — lettre's defaults
+# pull `native-tls`/OpenSSL, which breaks the fully-static musl build; this set is
+# pure-rustls (`aws-lc-rs`, matching the workspace's primary rustls provider) with
+# webpki roots (no native cert store), plus the MIME `Message` builder and the
+# async Tokio SMTP transport. See `boatramp-handlers`' `email` feature.
+lettre = { version = "0.11", default-features = false, features = [
+  "tokio1",
+  "tokio1-rustls",
+  "aws-lc-rs",
+  "webpki-roots",
+  "smtp-transport",
+  "builder",
+] }
+
 # S3 backend (compiled only with `--features s3`).
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }

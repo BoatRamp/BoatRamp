@@ -72,6 +72,10 @@ pub enum CliError {
     /// The `secrets` command.
     #[error(transparent)]
     Secrets(#[from] crate::secrets::Error),
+    /// The `email` command.
+    #[cfg(feature = "email")]
+    #[error(transparent)]
+    Email(#[from] crate::email::Error),
     /// The `cluster` command.
     #[error(transparent)]
     Cluster(#[from] crate::cluster::Error),

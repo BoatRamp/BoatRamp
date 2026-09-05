@@ -58,6 +58,12 @@ invoke = ["engine", "dep:async-trait"]
 # supergraph in-process via the server's `SupergraphRunner` (registry + planner +
 # executor + safelist live a layer up). Shares the invoke depth cap.
 graphql = ["engine", "invoke", "dep:async-trait"]
+# The `email` binding: a guest submits a finished message to the per-project SMTP
+# gateway (`boatramp:handlers/email`). The host holds the SMTP credentials
+# (resolved from `boatramp_core::email_config`) and delivers via `lettre`; the
+# guest only ever calls `send`. Needs async-trait for the object-safe `EmailSpool`
+# / `SmtpBackend` seams and serde to (de)serialize a message onto the durable spool.
+email = ["engine", "dep:lettre", "dep:async-trait", "dep:serde"]
 
 [dependencies]
 boatramp-core.workspace = true
@@ -79,6 +85,11 @@ tracing = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 # For the object-safe `Invoker` trait behind the `invoke` feature.
 async-trait = { workspace = true, optional = true }
+# SMTP client behind the `email` feature (pure-rustls, no OpenSSL — see the
+# workspace dep for the feature rationale).
+lettre = { workspace = true, optional = true }
+# (De)serialize an outbound email onto the durable spool, behind `email`.
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -119,6 +119,7 @@ impl SecurityProfile {
                 require_pop: false,
                 require_domain_verification: true,
                 allow_env_secret_refs: false,
+                allow_guest_email: false,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -139,6 +140,7 @@ impl SecurityProfile {
                 require_pop: false,
                 require_domain_verification: true,
                 allow_env_secret_refs: true,
+                allow_guest_email: true,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -160,6 +162,7 @@ impl SecurityProfile {
                 // Dev serves arbitrary test hosts locally; the gate is off.
                 require_domain_verification: false,
                 allow_env_secret_refs: true,
+                allow_guest_email: true,
             },
         }
     }
@@ -233,6 +236,9 @@ pub struct PostureOverrides {
     /// permitted bare ref would let them exfiltrate any host env var (another
     /// tenant's DB password, a cloud key) into their guest.
     pub allow_env_secret_refs: Option<bool>,
+    /// Permit a guest handler/function's `email` capability to send. Off under
+    /// `multi-tenant`; on under `single-tenant`/`dev`.
+    pub allow_guest_email: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -364,6 +370,11 @@ impl SecurityConfig {
             p.allow_env_secret_refs.to_string(),
             o.allow_env_secret_refs.is_some(),
         );
+        row(
+            "allow_guest_email",
+            p.allow_guest_email.to_string(),
+            o.allow_guest_email.is_some(),
+        );
         Ok(out)
     }
 }
@@ -439,6 +450,16 @@ pub struct SecurityPosture {
     /// instead of injecting the host value, so an untrusted tenant can't name an
     /// arbitrary host env var to exfiltrate it across the tenant boundary.
     pub allow_env_secret_refs: bool,
+    /// Permit a **guest** handler/function's `email` capability to actually send
+    /// (bind the `send` verb). Off under `multi-tenant` — an untrusted tenant can't
+    /// use the shared node's SMTP egress until the operator opts in — and on under
+    /// `single-tenant`/`dev`. Independent of the guest-HTTP egress knobs: email is a
+    /// host-mediated SMTP connection whose credentials the guest never sees (a
+    /// separate path), so it is gated separately. When off, the binding is absent
+    /// and `send` returns `access-denied`. The SMTP relay host is additionally held
+    /// to the SSRF rule (a private/loopback relay is refused unless
+    /// [`allow_guest_private_egress`](Self::allow_guest_private_egress) is on).
+    pub allow_guest_email: bool,
 }
 
 impl Default for SecurityPosture {
@@ -503,6 +524,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.allow_env_secret_refs {
         base.allow_env_secret_refs = v;
     }
+    if let Some(v) = o.allow_guest_email {
+        base.allow_guest_email = v;
+    }
     base
 }
 
@@ -560,6 +584,31 @@ mod tests {
             .unwrap()
             .lines()
             .any(|l| l.contains("allow_env_secret_refs")
+                && l.contains("true")
+                && l.contains("override")));
+    }
+
+    #[test]
+    fn allow_guest_email_follows_the_trust_model() {
+        // Multi-tenant: untrusted tenants can't use the shared SMTP egress by default.
+        assert!(!SecurityProfile::MultiTenant.preset().allow_guest_email);
+        // Single-tenant / dev: the operator owns everything, so it is on.
+        assert!(SecurityProfile::SingleTenant.preset().allow_guest_email);
+        assert!(SecurityProfile::Dev.preset().allow_guest_email);
+        // An explicit override wins (opt a multi-tenant fleet in).
+        let cfg = SecurityConfig {
+            overrides: PostureOverrides {
+                allow_guest_email: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.resolve().unwrap().allow_guest_email);
+        assert!(cfg
+            .explain()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains("allow_guest_email")
                 && l.contains("true")
                 && l.contains("override")));
     }

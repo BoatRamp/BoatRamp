@@ -275,6 +275,21 @@ pub(crate) mod keys {
         format!("project/{project}/secret/")
     }
 
+    /// A project-scoped SMTP email profile: `project/<proj>/email/<name>` → the
+    /// clear connection config plus an envelope-sealed password. Project-scoped so
+    /// the `email` guest capability resolves only within its own project's
+    /// profiles — never another tenant's. The password is sealed at rest and
+    /// unsealed only host-side at handler/function instantiation; it never leaves
+    /// over the API (the admin surface returns a password-redacted view).
+    pub fn email_profile(project: ProjectRef<'_>, name: &str) -> String {
+        format!("project/{project}/email/{name}")
+    }
+
+    /// The prefix listing a project's SMTP email profiles (for `email ls`).
+    pub fn email_profile_prefix(project: ProjectRef<'_>) -> String {
+        format!("project/{project}/email/")
+    }
+
     /// The prefix under which a project's GraphQL **safelist** (persisted trusted
     /// operations, `hapq/<proj>/<hash>`) lives. Note it is **not** under the
     /// `project/<proj>/…` resource prefix — the residual sweep in

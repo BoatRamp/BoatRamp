@@ -274,6 +274,16 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Write },
                 ),
+                // The project's SMTP email profiles are credential config (a sealed
+                // password + relay config), so — like `secrets` — they are gated with
+                // `Resource::Secrets` rather than the general project mapping: list/show
+                // with `Read`, set/delete with `Write` (both satisfied by a
+                // `Secrets·Admin` grant); target = the project.
+                Some((&"email", _)) => Self::new(
+                    Resource::Secrets,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Write },
+                ),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -1254,6 +1264,35 @@ mod tests {
             (
                 "DELETE",
                 "/api/projects/acme/secrets/db-password",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Write,
+                )),
+            ),
+            // Project-scoped SMTP email profiles are credential config → the same
+            // `Resource::Secrets` mapping as secrets (list/show Read, set/delete Write).
+            (
+                "GET",
+                "/api/projects/acme/email/profiles",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Read,
+                )),
+            ),
+            (
+                "PUT",
+                "/api/projects/acme/email/profiles/default",
+                Some(Right::new(
+                    Resource::Secrets,
+                    Some("acme".into()),
+                    Action::Write,
+                )),
+            ),
+            (
+                "DELETE",
+                "/api/projects/acme/email/profiles/default",
                 Some(Right::new(
                     Resource::Secrets,
                     Some("acme".into()),

@@ -21,6 +21,8 @@ use boatramp_core::sql::SqlBackend;
 use boatramp_core::Storage;
 
 pub mod blobstore;
+#[cfg(feature = "email")]
+pub mod email;
 #[cfg(feature = "graphql")]
 pub mod graphql;
 #[cfg(feature = "invoke")]
@@ -58,6 +60,11 @@ pub struct Bindings {
     /// runner + this invocation's call depth. `None` = graphql not granted.
     #[cfg(feature = "graphql")]
     graphql: Option<graphql::GraphqlBinding>,
+    /// The `email` grant (submit a message to the per-project SMTP gateway): the
+    /// project, its host-held SMTP profiles, and the shared node spool. `None` =
+    /// email not granted.
+    #[cfg(feature = "email")]
+    email: Option<email::EmailBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -230,5 +237,33 @@ impl Bindings {
     #[cfg(feature = "graphql")]
     pub(crate) fn graphql(&self) -> Option<&graphql::GraphqlBinding> {
         self.graphql.as_ref()
+    }
+
+    /// Grant the `email` capability: `project` owns the profiles, `profiles` are the
+    /// host-resolved SMTP profiles (credentials held host-side, never exposed to the
+    /// guest), and `spool` is the shared node delivery spool. The guest picks a
+    /// profile by name and calls `send`; it can neither read nor reconfigure a
+    /// profile (that is the control-plane's job).
+    #[cfg(feature = "email")]
+    pub fn with_email(
+        mut self,
+        project: impl Into<String>,
+        profiles: std::sync::Arc<
+            std::collections::BTreeMap<String, boatramp_core::email_config::EmailProfile>,
+        >,
+        spool: Arc<dyn email::EmailSpool>,
+    ) -> Self {
+        self.email = Some(email::EmailBinding {
+            project: project.into(),
+            profiles,
+            spool,
+        });
+        self
+    }
+
+    /// The granted email binding, if any.
+    #[cfg(feature = "email")]
+    pub(crate) fn email(&self) -> Option<&email::EmailBinding> {
+        self.email.as_ref()
     }
 }

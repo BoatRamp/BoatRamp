@@ -157,6 +157,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     let max_component_bytes = options.posture.max_component_bytes;
     let allow_guest_private_egress = options.posture.allow_guest_private_egress;
     let allow_env_secret_refs = options.posture.allow_env_secret_refs;
+    let allow_guest_email = options.posture.allow_guest_email;
     // The instance's own serve socket(s) a guest self-call may reach, when the posture allows
     // it: a wildcard bind (`0.0.0.0`/`::`) is reachable on loopback, so normalize to
     // `127.0.0.1`/`::1`; a specific bind is itself.
@@ -184,6 +185,18 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
             envelope,
         ))
     });
+    // The project-scoped SMTP email-profile store, built from the same KV + envelope
+    // (the password is sealed at rest). Backs the admin API (`options` below,
+    // unconditionally, so it works on a lean node) and — when the `email` feature +
+    // `allow_guest_email` posture permit — the runtime's host-side profile
+    // resolution (wired inside `build_handler_runtime`). `None` with no envelope, so
+    // the admin email endpoints fail closed with a clear 501.
+    let email_profile_store = secrets_envelope.clone().map(|envelope| {
+        Arc::new(boatramp_core::email_config::EmailProfileStore::new(
+            kv.clone(),
+            envelope,
+        ))
+    });
 
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
@@ -199,6 +212,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         allow_guest_private_egress,
         self_egress_addrs,
         allow_env_secret_refs,
+        allow_guest_email,
         &deploy,
         secrets_envelope.clone(),
     )
@@ -475,6 +489,9 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     // The internal secret store backs the admin secrets API (set/list/delete). Not
     // handlers-gated — it must be reachable even on a lean node.
     options.secret_store = secret_store;
+    // The email-profile store backs the admin API (`/api/email/profiles`); like the
+    // secret store it is not handlers-gated, so it works on a lean node.
+    options.email_profile_store = email_profile_store;
 
     // The detached reconcile loops: the always-present compute + domain-verify ones,
     // plus the optional tenant-tombstone reaper (only when a managed DB is configured).

@@ -32,6 +32,7 @@
 - [Choose & inspect a security posture](./how-to/security-posture.md)
 - [Encrypt secrets at rest](./how-to/secrets-at-rest.md)
 - [Give handlers & functions secrets](./how-to/secrets.md)
+- [Send email from a function or handler](./how-to/send-email.md)
 - [Enable the embedded web console](./how-to/web-console.md)
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Compose components into one handler](./how-to/compose.md)

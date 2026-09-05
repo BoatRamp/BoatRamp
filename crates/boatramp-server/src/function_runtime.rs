@@ -513,6 +513,31 @@ async fn build_function_bindings(
             bindings = bindings.with_graphql(runner.scoped(project), depth);
         }
     }
+    // Per-project SMTP email gateway: a function may submit a finished message to
+    // one of the project's SMTP profiles. Granted when it imports `email` and the
+    // runtime offers email — a spool + profile store are set, which the operator's
+    // `allow_guest_email` posture gates at startup (spool unset ⇒ not granted ⇒
+    // `access-denied`). The SMTP credentials are resolved host-side and never
+    // exposed to the guest.
+    #[cfg(feature = "email")]
+    if granted("email") {
+        if let (Some(store), Some(spool)) =
+            (inner.email_profile_store.get(), inner.email_spool.get())
+        {
+            match store.resolve_all(project).await {
+                Ok(profiles) => {
+                    bindings = bindings.with_email(
+                        project.as_str(),
+                        std::sync::Arc::new(profiles),
+                        spool.clone(),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(scope, %err, "resolving email profiles failed; email not granted");
+                }
+            }
+        }
+    }
     inner.logs.configure(scope, None);
     // A function invocation (API or in-process subgraph fetch) does not thread a request id
     // through the invoke path yet; its logs are scope-tagged but not request-correlated.

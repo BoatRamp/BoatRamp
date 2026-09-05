@@ -56,6 +56,10 @@ pub fn router_with_fast(
     // is configured — the admin secrets endpoints then fail closed with a clear 501).
     // Rides as an `api` extension read by the secrets handlers; not handlers-gated.
     let secret_store_cap = options.secret_store.clone();
+    // The project-scoped SMTP email-profile store (`None` when no `[secrets]`
+    // envelope is configured — the admin email endpoints then fail closed with a
+    // clear 501). Rides as an `api` extension read by the email handlers.
+    let email_store_cap = options.email_profile_store.clone();
     // Bind the auth layer's per-request PoP enforcement: the fleet's canonical
     // origin (the proof's required `aud`) and whether every token must be
     // holder-bound (`require_pop`). A holder-bound (`cnf`) token always requires a
@@ -179,6 +183,21 @@ pub fn router_with_fast(
                 .layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
         )
         .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
+        // Project-scoped SMTP email profiles (rewritten from
+        // `/api/projects/<proj>/email/profiles{,/{name}}`). The `PUT` body is a small
+        // profile config; bound it like the secrets route. Same `Resource::Secrets`
+        // authz (credential config); the store returns only the redacted view.
+        .route(
+            "/api/email/profiles",
+            axum::routing::get(list_email_profiles),
+        )
+        .route(
+            "/api/email/profiles/{name}",
+            axum::routing::put(set_email_profile)
+                .get(show_email_profile)
+                .delete(delete_email_profile)
+                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
+        )
         .route("/api/tokens", post(create_token).get(list_tokens))
         // First-token bootstrap: RBAC-exempt (`Right::required` → None for exactly
         // this path); the handler verifies a single-use operator-set secret. The
@@ -421,6 +440,7 @@ pub fn router_with_fast(
         .layer(Extension(compute_volumes_cap))
         .layer(Extension(compute_control_cap))
         .layer(Extension(secret_store_cap))
+        .layer(Extension(email_store_cap))
         .layer(Extension(upload_guard));
     #[cfg(feature = "oidc")]
     let api = api.layer(Extension(oidc_state));
@@ -718,5 +738,128 @@ mod secrets_api_tests {
             text.contains("no [secrets] key envelope configured"),
             "{text}"
         );
+    }
+
+    fn router_with_email_store(
+        store: Option<Arc<boatramp_core::email_config::EmailProfileStore>>,
+    ) -> axum::Router {
+        let deploy = DeployStore::new(
+            Arc::new(boatramp_storage::FsStorage::new(std::env::temp_dir())),
+            Arc::new(MemoryKv::new()),
+        );
+        let options = ServerOptions {
+            email_profile_store: store,
+            ..Default::default()
+        };
+        crate::router_with_fast(
+            deploy,
+            Auth::disabled(),
+            HandlerRuntime::disabled(),
+            options,
+        )
+        .0
+    }
+
+    #[tokio::test]
+    async fn email_profiles_round_trip_and_never_return_the_password() {
+        use boatramp_core::email_config::{EmailProfileInfo, EmailProfileStore};
+        let store = Arc::new(EmailProfileStore::new(
+            Arc::new(MemoryKv::new()),
+            Arc::new(XorEnvelope),
+        ));
+        let app = router_with_email_store(Some(store));
+
+        // PUT a profile → 201 + redacted EmailProfileInfo (no password).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/projects/default/email/profiles/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"host":"smtp.example.com","port":587,"security":"starttls","username":"apikey","password":"s3cr3t","from":"no-reply@example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_bytes(resp).await;
+        let info: EmailProfileInfo = serde_json::from_slice(&created).unwrap();
+        assert_eq!(info.name, "default");
+        assert_eq!(info.host, "smtp.example.com");
+        assert!(info.has_password);
+        assert!(
+            !String::from_utf8(created).unwrap().contains("s3cr3t"),
+            "the create response must never echo the password"
+        );
+
+        // GET list → one redacted profile, password-free.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/projects/default/email/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = body_bytes(resp).await;
+        let infos: Vec<EmailProfileInfo> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert!(
+            !String::from_utf8(raw).unwrap().contains("s3cr3t"),
+            "the email profile list must never carry the password"
+        );
+
+        // GET one → redacted; a missing one → 404.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/projects/default/email/profiles/default")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // DELETE → 204 first, 404 second (idempotent existence).
+        let del = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/projects/default/email/profiles/default")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(del().await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(del().await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn email_no_envelope_wiring_fails_closed_with_a_clear_501() {
+        let app = router_with_email_store(None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/projects/default/email/profiles/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"host":"h","security":"starttls","from":"a@b.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

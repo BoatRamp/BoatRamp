@@ -737,6 +737,10 @@ impl HandlerEngine {
         bindings::graphql::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::graphql::GraphqlHost::new(state.bindings.graphql())
         })?;
+        #[cfg(feature = "email")]
+        bindings::email::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::email::EmailHost::new(state.bindings.email())
+        })?;
         Ok(linker)
     }
 

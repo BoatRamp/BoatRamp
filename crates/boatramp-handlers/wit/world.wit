@@ -428,6 +428,72 @@ world graphql-host {
   import graphql;
 }
 
+/// Value types for the `email` capability: a first-class **per-project SMTP
+/// gateway**. The guest hands the host a *finished* message — it renders its own
+/// HTML/plaintext, boatramp does NO templating — and the host delivers it through
+/// one of the project's operator-configured SMTP profiles, whose credentials the
+/// guest never sees (host-held; the guest can only invoke the verb). `send` is
+/// **accepted-for-delivery**: the host spools the message and delivers it
+/// asynchronously (in-memory best-effort by default, or a durable persisted +
+/// retried queue when `durable` is set).
+interface email-types {
+  /// One outbound message. At least one of `text`/`html` must be present.
+  record email-message {
+    /// Which of the project's SMTP profiles to send through; `none` = "default".
+    profile: option<string>,
+    /// Envelope recipients. `to` must be non-empty; `cc`/`bcc` may be empty.
+    to: list<string>,
+    cc: list<string>,
+    bcc: list<string>,
+    /// The `From` address. Must be permitted by the chosen profile (a guest can't
+    /// spoof an arbitrary sender); `none` uses the profile's configured default.
+    /// (`from` is a WIT keyword, so it is escaped `%from`; the field is `from`.)
+    %from: option<string>,
+    reply-to: option<string>,
+    subject: string,
+    /// The `text/plain` body.
+    text: option<string>,
+    /// The `text/html` body (guest-rendered; boatramp does no templating).
+    html: option<string>,
+    /// Opt into the durable spool (persisted + retried, survives a restart)
+    /// instead of the default in-memory best-effort delivery; `none` = the
+    /// profile's default.
+    durable: option<bool>,
+  }
+
+  /// Why a send was refused.
+  variant email-error {
+    /// The `email` capability was not granted to this handler/function.
+    access-denied,
+    /// No SMTP profile is configured under the requested name. Carries the name.
+    unknown-profile(string),
+    /// The message was rejected before spooling (empty recipients/subject, no
+    /// body, or a `from` the profile does not permit). Carries a reason.
+    invalid-message(string),
+    /// The message could not be enqueued for delivery. Carries a reason.
+    spool-failed(string),
+    /// Any other backend error.
+    other(string),
+  }
+}
+
+/// The `email` capability: submit a finished message for delivery through one of
+/// the project's SMTP profiles. Deny-by-default (an ungranted guest has no binding
+/// and `send` returns `access-denied`); the SMTP credentials live host-side and
+/// are never exposed to the guest.
+interface email-sender {
+  use email-types.{email-message, email-error};
+
+  /// Submit `message` for delivery. Returns once the message is **accepted for
+  /// delivery** (spooled) — not once it is actually delivered.
+  send: func(message: email-message) -> result<_, email-error>;
+}
+
+/// The email capability world (imported into request handlers / functions).
+world email-host {
+  import email-sender;
+}
+
 /// The `wasi:logging` capability world. A guest that imports `wasi:logging/logging`
 /// gets its structured `log(level, context, message)` messages captured into the same
 /// host sink as stdout/stderr, with the level preserved. Like stdio capture (and unlike

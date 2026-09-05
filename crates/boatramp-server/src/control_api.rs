@@ -735,3 +735,155 @@ pub(super) async fn delete_secret(
         Err(err) => secret_error_response(err),
     }
 }
+
+// ---- Project-scoped SMTP email profiles (admin API) ----------------------
+//
+// The `/api/projects/{proj}/email/profiles{,/{name}}` surface is rewritten by
+// `project_scope` onto the global `/api/email/profiles{,/{name}}` handlers below,
+// reading the tenant from the `ProjectContext`. Authorization is enforced upstream
+// against the original project-scoped path with the same `Resource::Secrets` right
+// as the secret store (email profiles are credential config).
+//
+// The store seals every profile's **password** with the `[secrets]` envelope; these
+// handlers return only the **redacted** config (host/port/from/…, never the
+// password). There is no password-GET endpoint — the password leaves the store only
+// host-side, into the send binding at instantiation, never over the API.
+
+/// When no `[secrets]` key envelope is configured there is no sealed store, so
+/// every email-profile endpoint returns this clear `501` — never a panic or `500`.
+fn no_email_store_response() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "no [secrets] key envelope configured; email profiles seal their SMTP \
+         password at rest (set [secrets] envelope = \"local\" or \"vault\" in boatramp.cfg)\n",
+    )
+        .into_response()
+}
+
+/// Map an [`EmailProfileError`](boatramp_core::email_config::EmailProfileError) to a
+/// response without disclosing backend internals: a client error (invalid name /
+/// config) returns `400` with the message; a backend error is logged and returned
+/// as a generic `500`.
+fn email_error_response(err: boatramp_core::email_config::EmailProfileError) -> Response {
+    if err.is_client_error() {
+        (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response()
+    } else {
+        tracing::warn!(%err, "email profile store backend error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "email profile store error\n",
+        )
+            .into_response()
+    }
+}
+
+/// The email-profile store, injected as an extension by the node when a `[secrets]`
+/// envelope is present. `None` ⇒ the endpoints fail closed with a clear `501`.
+type EmailStoreExt = Option<Arc<boatramp_core::email_config::EmailProfileStore>>;
+
+#[derive(Deserialize)]
+pub(super) struct SetEmailProfileRequest {
+    /// SMTP relay hostname.
+    host: String,
+    /// SMTP relay port; omitted ⇒ the conventional port for `security`.
+    #[serde(default)]
+    port: Option<u16>,
+    /// Transport security: `starttls` | `tls` | `plaintext`.
+    security: String,
+    /// SMTP AUTH username (omit for an unauthenticated relay).
+    #[serde(default)]
+    username: Option<String>,
+    /// SMTP AUTH password — sealed server-side; never stored clear, logged, or
+    /// returned.
+    #[serde(default)]
+    password: Option<String>,
+    /// The default (and only permitted) `From` address.
+    from: String,
+    /// Whether sends through this profile default to the durable spool.
+    #[serde(default)]
+    durable: bool,
+}
+
+/// `PUT /api/projects/{proj}/email/profiles/{name}` — set/reconfigure a profile
+/// (sealing its password server-side) and return the **redacted**
+/// [`EmailProfileInfo`](boatramp_core::email_config::EmailProfileInfo) as `201`.
+/// Never echoes the password. `501` with no envelope; `400` on invalid name/config.
+pub(super) async fn set_email_profile(
+    Extension(store): Extension<EmailStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path(name): Path<String>,
+    Json(request): Json<SetEmailProfileRequest>,
+) -> Response {
+    let Some(store) = store else {
+        return no_email_store_response();
+    };
+    let security = match request
+        .security
+        .parse::<boatramp_core::email_config::SmtpSecurity>()
+    {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    };
+    let profile = boatramp_core::email_config::EmailProfile {
+        host: request.host,
+        port: request.port.unwrap_or_else(|| security.default_port()),
+        security,
+        username: request.username,
+        password: request.password,
+        from: request.from,
+        durable: request.durable,
+    };
+    match store.set(project.as_ref(), &name, &profile).await {
+        Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
+        Err(err) => email_error_response(err),
+    }
+}
+
+/// `GET /api/projects/{proj}/email/profiles` — list every profile's **redacted**
+/// config (sorted), never the password. `501` with no envelope.
+pub(super) async fn list_email_profiles(
+    Extension(store): Extension<EmailStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+) -> Response {
+    let Some(store) = store else {
+        return no_email_store_response();
+    };
+    match store.list(project.as_ref()).await {
+        Ok(infos) => Json(infos).into_response(),
+        Err(err) => email_error_response(err),
+    }
+}
+
+/// `GET /api/projects/{proj}/email/profiles/{name}` — one profile's **redacted**
+/// config; `404` if absent. `501` with no envelope.
+pub(super) async fn show_email_profile(
+    Extension(store): Extension<EmailStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    let Some(store) = store else {
+        return no_email_store_response();
+    };
+    match store.get_info(project.as_ref(), &name).await {
+        Ok(Some(info)) => Json(info).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no matching email profile\n").into_response(),
+        Err(err) => email_error_response(err),
+    }
+}
+
+/// `DELETE /api/projects/{proj}/email/profiles/{name}` — remove a profile; `204` if
+/// it existed, `404` if not. `501` with no envelope; `400` on an invalid name.
+pub(super) async fn delete_email_profile(
+    Extension(store): Extension<EmailStoreExt>,
+    Extension(project): Extension<ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    let Some(store) = store else {
+        return no_email_store_response();
+    };
+    match store.delete(project.as_ref(), &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no matching email profile\n").into_response(),
+        Err(err) => email_error_response(err),
+    }
+}

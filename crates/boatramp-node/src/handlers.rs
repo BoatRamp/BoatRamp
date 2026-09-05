@@ -61,11 +61,19 @@ pub async fn build_handler_runtime(
     // `env:` reference against the serve process's own environment (on under single-tenant/
     // dev, off under multi-tenant — an untrusted tenant must not name arbitrary host env vars).
     allow_env_secret_refs: bool,
+    // Posture: whether a guest's `email` capability may send (bind the SMTP gateway).
+    // Off under multi-tenant; when off, email is simply not offered (a granted guest
+    // gets `access-denied`). Only consulted with the `email` feature compiled in.
+    allow_guest_email: bool,
     // The deploy store (for a managed compute-backed `sql` database's endpoint
     // resolution) and the `[secrets]` envelope (to seal a managed credential).
     deploy: &DeployStore,
     secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {
+    // `allow_guest_email` is only consulted when the `email` feature wires the
+    // gateway below; keep it from tripping unused-variable in a no-email build.
+    #[cfg(not(feature = "email"))]
+    let _ = allow_guest_email;
     // Two engine ceilings by lane. The **sync** ceiling bounds connection-bearing
     // requests (site handlers, synchronous invokes) — kept tight so a slow
     // handler can't pin a client, a proxy, and the shared request pool; default
@@ -141,6 +149,15 @@ pub async fn build_handler_runtime(
     // Keep a KV handle for the internal secret store before `kv` is moved into the
     // runtime below.
     let kv_for_secrets = kv.clone();
+    // Handles for the `email` gateway, captured before `kv` / `messaging` are moved
+    // into the runtime. The durable spool reuses the messaging fabric; the store +
+    // envelope back host-side credential resolution.
+    #[cfg(feature = "email")]
+    let kv_for_email = kv.clone();
+    #[cfg(feature = "email")]
+    let messaging_for_email = messaging.clone();
+    #[cfg(feature = "email")]
+    let email_envelope = secrets_envelope.clone();
     let runtime =
         boatramp_server::HandlerRuntime::new(engine, kv, storage, Some(sql), Some(messaging));
     // Apply the posture's host-side blob cap + component-size cap.
@@ -156,6 +173,32 @@ pub async fn build_handler_runtime(
             kv_for_secrets,
             envelope,
         )));
+    }
+    // Wire the per-project SMTP email gateway when the `allow_guest_email` posture
+    // permits it and a `[secrets]` envelope seals the profiles' passwords. The store
+    // backs host-side profile resolution; the spool delivers (best-effort in-memory,
+    // plus a durable path over the messaging fabric) via lettre, applying the SSRF
+    // relay gate under the same private-egress posture. Left unwired (no store/spool)
+    // when the posture is off or no envelope exists, so a granted guest's `send`
+    // returns `access-denied` rather than reaching an unconfigured relay.
+    #[cfg(feature = "email")]
+    if allow_guest_email {
+        if let Some(envelope) = email_envelope {
+            let store = Arc::new(boatramp_core::email_config::EmailProfileStore::new(
+                kv_for_email,
+                envelope,
+            ));
+            let backend = Arc::new(boatramp_handlers::LettreBackend::new(
+                allow_guest_private_egress,
+            ));
+            let spool = boatramp_server::NodeEmailSpool::spawn(
+                backend,
+                Some(messaging_for_email),
+                store.clone(),
+            );
+            runtime.set_email_profile_store(store);
+            runtime.set_email_spool(spool);
+        }
     }
     Ok(runtime)
 }
@@ -360,6 +403,7 @@ pub async fn build_handler_runtime(
     // node.rs caller (the caller passes the posture value unconditionally); a lean
     // node has no guest to gate, so it is ignored.
     _allow_env_secret_refs: bool,
+    _allow_guest_email: bool,
     _deploy: &DeployStore,
     _secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {
