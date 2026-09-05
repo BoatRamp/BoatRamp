@@ -1,13 +1,25 @@
 name: Cache
 
-# Build the boatramp binary and push it to the public boatramp.cachix.org cache,
-# so downstream consumers (contributors, and the boatramp.dev website CI) pull it
-# in seconds instead of rebuilding from source. Additive — it does not touch the
-# existing CI/nightly/release workflows.
+# Build the boatramp binary and push it (plus its full Nix closure) to the public
+# boatramp.cachix.org cache, so downstream consumers (contributors, the
+# boatramp.dev website CI, and end users running `nix build github:BoatRamp/...`)
+# pull it in seconds instead of rebuilding from source. Additive — it does not
+# touch the existing CI/nightly/release workflows.
 #
-# Pushing needs the `CACHIX_AUTH_TOKEN` repo secret (the push token for the
-# `boatramp` cache). Until it's set, this still runs green: cachix-action adds the
-# cache as a substituter and simply skips the push.
+# Cross-platform coverage is data-driven: the `matrix.include` list below pairs
+# each Nix `system` with the GitHub runner that can build it natively. Today we
+# populate the cache for Linux **and** Apple Silicon (macOS `aarch64-darwin`), so
+# a fresh Apple-Silicon machine substitutes the whole `.#default` closure —
+# including the `boatramp-console-trunk` wasm/Trunk bundle it depends on — instead
+# of compiling. Add `x86_64-darwin` / `aarch64-linux` by uncommenting the entries
+# below (a native runner is the only requirement); no job needs copy-pasting.
+#
+# Pushing needs the `CACHIX_AUTH_TOKEN` repo secret (the push token / signing key
+# for the `boatramp` cache) — the SAME secret every other workflow uses; there is
+# no second auth path. cachix-action adds the cache as a substituter and, after
+# the build steps, pushes every store path realized during the job (the built
+# closure, not just the CLI leaf) using that token. Until the secret is set this
+# still runs green: cachix-action simply skips the push.
 on:
   push:
     branches: [main]
@@ -15,22 +27,49 @@ on:
     - cron: "0 5 * * *" # nightly — keep the cache warm against nixpkgs drift
   workflow_dispatch:
 
-concurrency:
-  group: cache-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
 jobs:
   push:
-    runs-on: ubuntu-latest
+    name: build + cache (${{ matrix.system }})
+    runs-on: ${{ matrix.runs-on }}
+    # Keyed on the system too, so the Linux and macOS pushes for the same ref
+    # don't cancel each other (they run on different runners and populate
+    # different per-system store paths). `concurrency` lives on the job — the
+    # workflow-level block can't see the `matrix` context.
+    concurrency:
+      group: cache-${{ github.ref }}-${{ matrix.system }}
+      cancel-in-progress: true
+    strategy:
+      # A hiccup building one platform must not abort the others' cache push.
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runs-on: ubuntu-latest
+          - system: aarch64-darwin
+            runs-on: macos-14 # GitHub's Apple-Silicon runner
+          # Toggle either of these on by uncommenting — each just needs a native
+          # runner; the steps below are already system-agnostic:
+          # - system: x86_64-darwin
+          #   runs-on: macos-13 # Intel macOS runner
+          # - system: aarch64-linux
+          #   runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: cachix/cachix-action@v15
         with:
           name: boatramp
+          # The one shared push token/signing key for the boatramp cache — reused
+          # verbatim across every workflow. No per-platform or second auth path.
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - name: Build + cache the boatramp binary
-        run: nix build .#default --print-build-logs
+      # Build the batteries-included boatramp binary for THIS matrix system. Its
+      # closure pulls in the `boatramp-console-trunk` bundle (the `console`
+      # default feature stages that Trunk `dist` into the binary), so a single
+      # `.#default` build covers the console output too. cachix-action's post-step
+      # then pushes the whole realized closure — every store path built in this
+      # job — to the cache, not just the CLI leaf.
+      - name: Build + cache the boatramp closure
+        run: nix build .#packages.${{ matrix.system }}.default --print-build-logs --print-out-paths
