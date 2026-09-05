@@ -5,6 +5,43 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.18] - 2026-09-05
+
+### Added
+- **Per-project SMTP email for functions & handlers (`boatramp:handlers/email`).** A
+  guest imports `email` and calls `send(message)` with a finished message; the host
+  delivers it through one of the project's operator-configured SMTP profiles. boatramp
+  is the **gateway**, not a templating engine — the guest renders its own HTML/plaintext
+  (e.g. with the `mrml` MJML crate) and hands over a ready message. **Credentials are
+  host-held and never reach the guest:** they're resolved server-side from a sealed
+  per-project store and kept in the host binding — never injected into the guest
+  environment, returned by the API, or written to the durable queue. Reading or
+  reconfiguring a profile is a control-plane action (`boatramp email set|ls|show|rm`),
+  gated by the same `Secrets` right as the internal secret store. A guest picks a
+  profile by name (`default` if unset) and cannot spoof the `From` (it must match the
+  profile's configured sender). `send` is **accepted-for-delivery**: it returns as soon
+  as the message is spooled, so a slow relay never blocks a handler — delivery is
+  asynchronous, **best-effort** (in-memory) by default or **durable** (persisted +
+  retried + dead-lettered over the messaging fabric, surviving a restart) per-message or
+  per-profile. Manage profiles with the new `boatramp email` subcommand; the admin API
+  is `PUT/GET/DELETE /api/projects/{p}/email/profiles[/{name}]` (always redacted —
+  the password is never returned). Off by default under the `multi-tenant` posture (the
+  new `allow_guest_email` knob; on under `single-tenant`/`dev`); the SMTP relay host is
+  held to the SSRF rule (a private/loopback relay is refused unless
+  `allow_guest_private_egress`). Abuse-bounded: **≤ 100 recipients / ≤ 2 MiB** per
+  message and a **per-project send-rate quota** (5 msg/s, burst 50) across both delivery
+  paths. New feature `email` (in the batteries-included default; pulls the pure-rustls
+  `lettre` SMTP client). See the how-to: "Send email from a function or handler".
+
+### Changed
+- **CI now caches Apple-Silicon (`aarch64-darwin`) build artifacts.** The flake advertises
+  `boatramp.cachix.org`, but the cache-push job was Linux-only, so Apple-Silicon consumers
+  recompiled the whole closure (wasmtime, sqlx, the `boatramp-console-trunk` wasm bundle)
+  on every release. The push job is now a data-driven platform matrix that also builds and
+  pushes the full `aarch64-darwin` `.#default` closure (console-trunk included) on a
+  `macos-14` runner, reusing the existing cachix key; `x86_64-darwin` / `aarch64-linux` are
+  one uncomment away.
+
 ## [0.3.17] - 2026-09-05
 
 ### Added
