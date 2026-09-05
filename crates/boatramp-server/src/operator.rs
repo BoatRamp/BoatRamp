@@ -313,6 +313,51 @@ pub(super) async fn operator_logs_stream(
         .into_response()
 }
 
+/// Live function-log tail over SSE (`GET /api/functions/{name}/_boatramp/logs/stream`)
+/// — the counterpart to [`operator_logs_stream`] for the web console's function view.
+/// Subscribes to the same capture feed and filters to the function's project-qualified
+/// scope (`<project>/fn/<name>`; bare `fn/<name>` for the default project), matching
+/// what [`operator_function_logs`] tails and what the function runtime writes. Same
+/// `/api/functions/*` project-owned read gating.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_function_logs_stream(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Extension(project): Extension<crate::project_scope::ProjectContext>,
+    Path(name): Path<String>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let Some(inner) = handlers.inner.as_ref() else {
+        return (StatusCode::NOT_FOUND, "handlers disabled\n").into_response();
+    };
+    let want = project.as_ref().qualified(&format!("fn/{name}"));
+    let rx = inner.logs.subscribe();
+    let stream = futures::stream::unfold(rx, move |mut rx| {
+        let want = want.clone();
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok((scope, entry)) if scope == want => {
+                        let data = serde_json::to_string(&entry).unwrap_or_default();
+                        let event = Event::default()
+                            .id(entry.seq.to_string())
+                            .event("log")
+                            .data(data);
+                        return Some((Ok::<_, std::convert::Infallible>(event), rx));
+                    }
+                    // Another scope's line — keep waiting.
+                    Ok(_) => continue,
+                    // Fell behind: skip the gap and resume.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 /// Admin-scoped Prometheus text exporter (`*` scope via the API auth
 /// middleware). Always renders the process-wide serving + lifecycle counters
 /// (request status classes / cache results / bytes, deploys, activations, cert

@@ -75,10 +75,24 @@ pub struct SiteObservabilityProps {
 pub fn site_observability(props: &SiteObservabilityProps) -> Html {
     html! {
         <div class="space-y-8">
-            <LogTail site={props.site.clone()} />
+            <LogTail base={format!("/api/sites/{}", props.site)} />
             <HandlerStats site={props.site.clone()} />
         </div>
     }
+}
+
+/// The live guest logs for a **function** — the same [`LogTail`] pointed at the
+/// function's log endpoints, for the console's function view. Symmetric to
+/// [`SiteObservability`]'s log tail (functions have no handler stats).
+#[derive(Properties, PartialEq)]
+pub struct FunctionLogsProps {
+    /// The (top-level) function name — the `{name}` in `/api/functions/{name}/…`.
+    pub name: String,
+}
+
+#[function_component(FunctionLogs)]
+pub fn function_logs(props: &FunctionLogsProps) -> Html {
+    html! { <LogTail base={format!("/api/functions/{}", props.name)} /> }
 }
 
 #[derive(Properties, PartialEq)]
@@ -86,13 +100,22 @@ struct SiteProp {
     site: String,
 }
 
+/// The resource whose logs a [`LogTail`] tails, as an API base path
+/// (`/api/sites/<site>` or `/api/functions/<name>`). The two log endpoints hang off
+/// it: `<base>/_boatramp/logs` (poll seed) and `<base>/_boatramp/logs/stream` (SSE).
+#[derive(Properties, PartialEq)]
+struct LogTailProps {
+    base: String,
+}
+
 /// A live log tail: seed the recent backlog from the poll endpoint (which also
 /// surfaces 404 → feature-disabled / 401 → sign-out), then stream new lines over
-/// SSE (`…/logs/stream`) via fetch (so the Bearer token rides along).
+/// SSE (`…/logs/stream`) via fetch (so the Bearer token rides along). Works for any
+/// log-bearing resource (a site or a function) via its `base` path.
 #[function_component(LogTail)]
-fn log_tail(props: &SiteProp) -> Html {
+fn log_tail(props: &LogTailProps) -> Html {
     let session = use_session();
-    let site = props.site.clone();
+    let site = props.base.clone();
     // Interior-mutable buffer so the long-lived SSE callback always appends to
     // the latest; `force` re-renders when it changes.
     let buffer = use_mut_ref(Vec::<String>::new);
@@ -123,7 +146,7 @@ fn log_tail(props: &SiteProp) -> Html {
                     let error = error.clone();
                     let force = force.clone();
                     spawn_local(async move {
-                        let path = format!("/api/sites/{site}/_boatramp/logs?limit=200");
+                        let path = format!("{site}/_boatramp/logs?limit=200");
                         match client.get_json::<LogsResponse>(&path).await {
                             Ok(resp) => {
                                 {
@@ -143,10 +166,10 @@ fn log_tail(props: &SiteProp) -> Html {
                 }
                 // 2. Live tail over SSE (fetch streaming carries the Bearer).
                 if let Some(token) = session.bearer() {
-                    let base = session.api_base();
+                    let api_base = session.api_base();
                     let url = format!(
-                        "{}/api/sites/{site}/_boatramp/logs/stream",
-                        base.trim_end_matches('/')
+                        "{}{site}/_boatramp/logs/stream",
+                        api_base.trim_end_matches('/')
                     );
                     let buffer = buffer.clone();
                     let force = force.clone();

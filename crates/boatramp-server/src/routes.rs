@@ -308,6 +308,10 @@ pub fn router_with_fast(
             "/api/functions/{name}/_boatramp/logs",
             get(operator_function_logs),
         )
+        .route(
+            "/api/functions/{name}/_boatramp/logs/stream",
+            get(operator_function_logs_stream),
+        )
         // The function **invoke** surface (FA-3) needs the engine, so it is
         // registered only with the handlers feature.
         .route("/api/functions/{name}/invoke", post(invoke_function))

@@ -28,10 +28,11 @@ use dashboard::Dashboard;
 use deploy_ops::DeployOps;
 use hooks::{use_api, Fetch};
 use maintenance::Maintenance;
-use models::WhoAmI;
-use observability::{Metrics, SiteObservability};
+use models::{FunctionSummary, WhoAmI};
+use observability::{FunctionLogs, Metrics, SiteObservability};
 use tokens::Tokens;
 use wasm_bindgen_futures::spawn_local;
+use widgets::{ErrorBanner, Spinner};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -76,6 +77,12 @@ enum Route {
     /// A single site's management view (deploy ops / config / observability).
     #[at("/sites/:name")]
     Site { name: String },
+    /// The project's top-level functions (log viewer).
+    #[at("/functions")]
+    Functions,
+    /// A single function's live guest logs.
+    #[at("/functions/:name")]
+    Function { name: String },
     /// Cluster-wide maintenance (prune / scrub / certs).
     #[at("/maintenance")]
     Maintenance,
@@ -96,10 +103,11 @@ enum Route {
 fn nav_group(route: &Route) -> u8 {
     match route {
         Route::Sites | Route::Site { .. } => 0,
-        Route::Maintenance => 1,
-        Route::Tokens => 2,
-        Route::Metrics => 3,
-        Route::NotFound => 4,
+        Route::Functions | Route::Function { .. } => 1,
+        Route::Maintenance => 2,
+        Route::Tokens => 3,
+        Route::Metrics => 4,
+        Route::NotFound => 5,
     }
 }
 
@@ -108,6 +116,8 @@ fn switch(route: Route) -> Html {
     match route {
         Route::Sites => html! { <SitesPage /> },
         Route::Site { name } => html! { <SitePage name={name} /> },
+        Route::Functions => html! { <FunctionsPage /> },
+        Route::Function { name } => html! { <FunctionPage name={name} /> },
         Route::Maintenance => html! { <Maintenance /> },
         Route::Tokens => html! { <Tokens /> },
         Route::Metrics => html! { <Metrics /> },
@@ -167,6 +177,7 @@ fn shell() -> Html {
                         <h1 class="text-lg font-semibold tracking-tight">{ "boatramp console" }</h1>
                         <nav class="flex items-center gap-1">
                             <NavItem to={Route::Sites} label="Sites" />
+                            <NavItem to={Route::Functions} label="Functions" />
                             <NavItem to={Route::Maintenance} label="Maintenance" />
                             <NavItem to={Route::Tokens} label="Tokens" />
                             <NavItem to={Route::Metrics} label="Metrics" />
@@ -239,6 +250,94 @@ fn site_page(props: &SitePageProps) -> Html {
                 { "← All sites" }
             </Link<Route>>
             <SiteDetail site={props.name.clone()} />
+        </div>
+    }
+}
+
+/// The functions overview: the project's **top-level** functions (GraphQL subgraphs,
+/// auth functions, workers) — the ones whose guest output is otherwise unreadable.
+/// Selecting one opens its live log view. `GET /api/functions` returns both top-level
+/// and site-derived summaries; the latter are named `"<site>/<fn>"` and their output is
+/// the site's, so they are filtered out here (a function log view is meaningful only for
+/// a bare-named, invoke-addressable top-level function).
+#[function_component(FunctionsPage)]
+fn functions_page() -> Html {
+    let navigator = use_navigator().expect("console is rendered inside a Router");
+    let functions = use_api(|client| async move {
+        client
+            .get_json::<Vec<FunctionSummary>>("/api/functions")
+            .await
+    });
+
+    match &functions.state {
+        Fetch::Loading => html! { <Spinner label="Loading functions…" /> },
+        Fetch::Failed(err) => html! {
+            <ErrorBanner message={err.to_string()} on_retry={Some(functions.reload.clone())} />
+        },
+        Fetch::Ready(list) => {
+            let top_level: Vec<&FunctionSummary> =
+                list.iter().filter(|f| !f.name.contains('/')).collect();
+            if top_level.is_empty() {
+                return html! {
+                    <div class="rounded-lg border border-dashed border-slate-300 bg-white p-10 text-center">
+                        <p class="text-slate-500">{ "No top-level functions. Deploy one with " }
+                            <code class="rounded bg-slate-100 px-1.5 py-0.5 text-sm">{ "boatramp function" }</code>
+                            { "." }
+                        </p>
+                    </div>
+                };
+            }
+            html! {
+                <div>
+                    <div class="mb-6 flex items-center justify-between">
+                        <h2 class="text-lg font-semibold text-slate-900">{ "Functions" }</h2>
+                        <span class="text-sm text-slate-500">
+                            { format!("{} function{}", top_level.len(),
+                                      if top_level.len() == 1 { "" } else { "s" }) }
+                        </span>
+                    </div>
+                    <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                        { for top_level.into_iter().map(|f| {
+                            let name = f.name.clone();
+                            let navigator = navigator.clone();
+                            let onclick = Callback::from(move |_: MouseEvent| {
+                                navigator.push(&Route::Function { name: name.clone() });
+                            });
+                            html! {
+                                <button key={f.name.clone()} {onclick}
+                                        class="rounded-xl border border-slate-200 bg-white p-5 text-left \
+                                               shadow-sm hover:border-slate-300 hover:shadow">
+                                    <div class="font-medium text-slate-900">{ &f.name }</div>
+                                    if !f.runtime.is_empty() {
+                                        <div class="mt-1 text-xs text-slate-500">{ &f.runtime }</div>
+                                    }
+                                    <div class="mt-3 text-sm text-slate-500">{ "View live logs →" }</div>
+                                </button>
+                            }
+                        }) }
+                    </div>
+                </div>
+            }
+        }
+    }
+}
+
+/// A single function's page: a back link plus its live guest-log tail.
+#[derive(Properties, PartialEq)]
+struct FunctionPageProps {
+    name: String,
+}
+
+#[function_component(FunctionPage)]
+fn function_page(props: &FunctionPageProps) -> Html {
+    html! {
+        <div>
+            <Link<Route> to={Route::Functions}
+                classes={classes!("mb-4", "inline-block", "text-sm", "text-slate-500", "hover:text-slate-800")}>
+                { "← All functions" }
+            </Link<Route>>
+            <h2 class="mb-6 text-lg font-semibold text-slate-900">{ &props.name }</h2>
+            <FunctionLogs name={props.name.clone()} />
         </div>
     }
 }

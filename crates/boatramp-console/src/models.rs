@@ -69,3 +69,17 @@ pub struct InvalidateRequest {
 /// The captured guest log line and the logs endpoint response, shared with the
 /// server and CLI (`boatramp_types::logs`).
 pub use boatramp_types::logs::{LogEntry, LogsResponse};
+
+/// One entry from `GET /api/functions` (server:
+/// `boatramp_core::function::FunctionSummary`). Only the fields the console renders are
+/// modeled; serde ignores the rest. A **top-level** function has a bare `name` (its
+/// invoke + logs path segment); a site-derived one is `"<site>/<fn>"` (its output is the
+/// site's), so the console lists only the top-level ones.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct FunctionSummary {
+    /// The function name — the `{name}` in `/api/functions/{name}/…` for a top-level one.
+    pub name: String,
+    /// The guest runtime (e.g. `wasm`), for display.
+    #[serde(default)]
+    pub runtime: String,
+}
