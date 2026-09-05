@@ -427,26 +427,37 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_persists_then_reopens() {
-        with_fresh_slatedb_dir("flush", |dir| async move {
-            // A long flush interval so the periodic timer won't auto-persist; the
-            // explicit `flush()` (SHUT-1) must be what makes the write durable.
-            let kv = SlateKv::open_local_settings(
-                &dir,
-                test_settings(Some(std::time::Duration::from_secs(3600))),
-            )
+        // Durability is a property of the object store, not the local disk: SlateDB
+        // writes the WAL / L0 SSTs / manifest to the `ObjectStore`, and a reopen replays
+        // them from it. So this exercises the exact flush → close (memtable → L0) →
+        // reopen-replay path against a **shared in-memory** store (the same instance for
+        // both opens, so the reopen reads exactly what close persisted) — with ZERO disk
+        // I/O. That removes this test's historical flake: `close()` flushes memtables to
+        // L0 and the reopen replays, and on the contended shared musl CI runner that
+        // real `LocalFileSystem` I/O occasionally stalled past the timeout (it was the
+        // only test that reopened). In-memory it is deterministic and needs no timeout
+        // harness. `slatedb_round_trips` keeps the on-disk `LocalFileSystem` path.
+        use slatedb::object_store::memory::InMemory;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // A long flush interval so the periodic timer won't auto-persist; the explicit
+        // `flush()` (SHUT-1) must be what makes the write durable before close.
+        let kv = SlateKv::open_with(
+            store.clone(),
+            "kv",
+            test_settings(Some(std::time::Duration::from_secs(3600))),
+        )
+        .await
+        .unwrap();
+        kv.put("k", b"v".to_vec()).await.unwrap();
+        kv.flush().await.unwrap(); // force durability now, not on the timer
+        kv.close().await.unwrap();
+
+        let reopened = SlateKv::open_with(store.clone(), "kv", test_settings(None))
             .await
             .unwrap();
-            kv.put("k", b"v".to_vec()).await.unwrap();
-            kv.flush().await.unwrap(); // force durability now, not on the timer
-            kv.close().await.unwrap();
-
-            let reopened = SlateKv::open_local_settings(&dir, test_settings(None))
-                .await
-                .unwrap();
-            assert_eq!(reopened.get("k").await.unwrap(), Some(b"v".to_vec()));
-            reopened.close().await.unwrap();
-        })
-        .await;
+        assert_eq!(reopened.get("k").await.unwrap(), Some(b"v".to_vec()));
+        reopened.close().await.unwrap();
     }
 
     #[serial_test::serial]
