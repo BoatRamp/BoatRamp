@@ -13,6 +13,8 @@ mod engine;
 #[cfg(feature = "engine")]
 pub mod logging;
 
+#[cfg(feature = "admin")]
+pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
 #[cfg(feature = "email")]
 pub use bindings::email::{EmailSpool, LettreBackend, OutboundEmail, SmtpBackend};
 #[cfg(feature = "graphql")]

@@ -741,6 +741,10 @@ impl HandlerEngine {
         bindings::email::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::email::EmailHost::new(state.bindings.email())
         })?;
+        #[cfg(feature = "admin")]
+        bindings::admin::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::admin::AdminHost::new(state.bindings.admin())
+        })?;
         Ok(linker)
     }
 

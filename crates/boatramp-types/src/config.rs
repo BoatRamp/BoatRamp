@@ -321,12 +321,27 @@ fn is_named_sql_import(import: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
 }
 
+/// Whether `import` is a **guest project-admin surface** grant: `admin:<surface>` for one of
+/// the config surfaces the `boatramp:handlers/admin` capability exposes. A bare `admin` is
+/// deliberately NOT a grant — a guest must name the specific surface (deny-by-default,
+/// least-privilege), and there is no `admin:*`. The surface set is closed; a new surface is an
+/// explicit addition here + in the host.
+pub fn is_named_admin_import(import: &str) -> bool {
+    matches!(
+        import,
+        "admin:domains" | "admin:email" | "admin:site" | "admin:secrets"
+    )
+}
+
 fn check_import(import: &str) -> Result<(), ConfigError> {
-    if KNOWN_IMPORTS.contains(&import) || is_named_sql_import(import) {
+    if KNOWN_IMPORTS.contains(&import)
+        || is_named_sql_import(import)
+        || is_named_admin_import(import)
+    {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, or a named SQL binding `sql:<name>` / `sql:*`",
+            "unknown handler import {import:?}; allowed: {}, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }

@@ -494,6 +494,103 @@ world email-host {
   import email-sender;
 }
 
+/// Value types for the `admin` capability: a guest **reconfigures its own project** (add a
+/// domain, set an SMTP profile, write site config, write a secret) without a boatramp token.
+/// The grant is conferred at deploy time (per-surface `admin:<surface>` import + the operator's
+/// posture), intrinsically scoped to the guest's OWN project (host-stamped), and strictly less
+/// than a project-admin token: no cross-project reach, no critical/node ops. Deny-by-default:
+/// an ungranted verb (or a posture-off surface) returns `access-denied`.
+interface admin-types {
+  /// A pending domain-ownership challenge the guest must satisfy before `domain-verify`.
+  record domain-challenge {
+    host: string,
+    method: string,       // "http" | "dns"
+    /// The token to publish at the challenge location (`/.well-known/…` for http, a TXT record
+    /// for dns). The host verifies it with a real network probe on `domain-verify`.
+    token: string,
+  }
+
+  /// A create-or-update to an SMTP profile (partial: an unset field keeps the stored value,
+  /// mirroring the admin API's merge semantics). The password is sealed host-side.
+  record email-profile {
+    host: option<string>,
+    port: option<u16>,
+    security: option<string>,   // "starttls" | "tls" | "plaintext"
+    username: option<string>,
+    password: option<string>,
+    %from: option<string>,
+    durable: option<bool>,
+    /// Drop username + password (an unauthenticated relay).
+    clear-auth: bool,
+  }
+
+  /// Why an admin operation was refused.
+  variant admin-error {
+    /// The capability, or this specific surface, was not granted (or the operator posture
+    /// disables it).
+    access-denied,
+    /// The input was rejected (bad name/config/serialized-config).
+    invalid-input(string),
+    /// A domain attach was attempted before its ownership was proven.
+    not-verified(string),
+    /// The named resource does not exist.
+    not-found(string),
+    /// The per-project admin rate quota was exceeded.
+    rate-limited,
+    /// Any other backend error.
+    other(string),
+  }
+}
+
+/// The `admin` capability: per-surface project self-configuration. Each verb is gated on its
+/// surface grant (`admin:domains` / `:email` / `:site` / `:secrets`); every mutation is
+/// rate-limited per project and audited. Reads return **redacted** views only (never a
+/// password/secret value).
+interface admin {
+  use admin-types.{domain-challenge, email-profile, admin-error};
+
+  // --- admin:domains --- (site-scoped: `site` must be one of the guest's own project's sites)
+  /// Begin verifying ownership of `host` for `site` (`method` = "http" | "dns"); returns the
+  /// challenge to publish. Does not attach — call `domain-verify` after publishing the token.
+  domain-add: func(site: string, host: string, method: string) -> result<domain-challenge, admin-error>;
+  /// Run the real ownership probe for `host` on `site`; on success mark it verified + attach it
+  /// so routing serves it. `ok(true)` = verified+attached, `ok(false)` = not proven yet.
+  domain-verify: func(site: string, host: string) -> result<bool, admin-error>;
+  /// Detach `host` from `site` (destructive; the site stops serving it).
+  domain-remove: func(site: string, host: string) -> result<_, admin-error>;
+  /// List `site`'s attached/verifying domains.
+  domain-list: func(site: string) -> result<list<string>, admin-error>;
+
+  // --- admin:email ---
+  /// Create-or-merge the SMTP profile `name` (unset fields keep the stored value; a supplied
+  /// password is sealed host-side and never returned).
+  email-set: func(name: string, profile: email-profile) -> result<_, admin-error>;
+  /// Delete the SMTP profile `name` (destructive).
+  email-delete: func(name: string) -> result<_, admin-error>;
+  /// List the project's SMTP profile names (redacted — no config/password).
+  email-list: func() -> result<list<string>, admin-error>;
+
+  // --- admin:site ---
+  /// The site's current serialized config (the same RON the admin API returns).
+  site-config-get: func(site: string) -> result<string, admin-error>;
+  /// Replace the site's config with `config` (serialized RON). A newly-referenced domain must
+  /// already be verified (the guest can't attach an unverified domain via a config write).
+  site-config-put: func(site: string, config: string) -> result<_, admin-error>;
+
+  // --- admin:secrets (write-only; never reads a value back) ---
+  /// Set/rotate the sealed secret `name` (the value is sealed host-side; there is no read).
+  secret-set: func(name: string, value: string) -> result<_, admin-error>;
+  /// Delete the sealed secret `name` (destructive).
+  secret-delete: func(name: string) -> result<_, admin-error>;
+  /// List the project's secret names (never values).
+  secret-list: func() -> result<list<string>, admin-error>;
+}
+
+/// The admin capability world (imported into request handlers / functions).
+world admin-host {
+  import admin;
+}
+
 /// The `wasi:logging` capability world. A guest that imports `wasi:logging/logging`
 /// gets its structured `log(level, context, message)` messages captured into the same
 /// host sink as stdout/stderr, with the level preserved. Like stdio capture (and unlike

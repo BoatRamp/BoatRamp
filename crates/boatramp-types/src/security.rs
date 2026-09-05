@@ -120,6 +120,10 @@ impl SecurityProfile {
                 require_domain_verification: true,
                 allow_env_secret_refs: false,
                 allow_guest_email: false,
+                allow_guest_admin_domains: false,
+                allow_guest_admin_email: false,
+                allow_guest_admin_site: false,
+                allow_guest_admin_secrets: false,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -141,6 +145,10 @@ impl SecurityProfile {
                 require_domain_verification: true,
                 allow_env_secret_refs: true,
                 allow_guest_email: true,
+                allow_guest_admin_domains: true,
+                allow_guest_admin_email: true,
+                allow_guest_admin_site: true,
+                allow_guest_admin_secrets: true,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -163,6 +171,10 @@ impl SecurityProfile {
                 require_domain_verification: false,
                 allow_env_secret_refs: true,
                 allow_guest_email: true,
+                allow_guest_admin_domains: true,
+                allow_guest_admin_email: true,
+                allow_guest_admin_site: true,
+                allow_guest_admin_secrets: true,
             },
         }
     }
@@ -239,6 +251,14 @@ pub struct PostureOverrides {
     /// Permit a guest handler/function's `email` capability to send. Off under
     /// `multi-tenant`; on under `single-tenant`/`dev`.
     pub allow_guest_email: Option<bool>,
+    /// Permit a guest's `admin` capability to manage the project's domains.
+    pub allow_guest_admin_domains: Option<bool>,
+    /// Permit a guest's `admin` capability to manage the project's SMTP email profiles.
+    pub allow_guest_admin_email: Option<bool>,
+    /// Permit a guest's `admin` capability to write the project's site config + aliases.
+    pub allow_guest_admin_site: Option<bool>,
+    /// Permit a guest's `admin` capability to write the project's sealed secrets.
+    pub allow_guest_admin_secrets: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -375,6 +395,26 @@ impl SecurityConfig {
             p.allow_guest_email.to_string(),
             o.allow_guest_email.is_some(),
         );
+        row(
+            "allow_guest_admin_domains",
+            p.allow_guest_admin_domains.to_string(),
+            o.allow_guest_admin_domains.is_some(),
+        );
+        row(
+            "allow_guest_admin_email",
+            p.allow_guest_admin_email.to_string(),
+            o.allow_guest_admin_email.is_some(),
+        );
+        row(
+            "allow_guest_admin_site",
+            p.allow_guest_admin_site.to_string(),
+            o.allow_guest_admin_site.is_some(),
+        );
+        row(
+            "allow_guest_admin_secrets",
+            p.allow_guest_admin_secrets.to_string(),
+            o.allow_guest_admin_secrets.is_some(),
+        );
         Ok(out)
     }
 }
@@ -460,6 +500,23 @@ pub struct SecurityPosture {
     /// to the SSRF rule (a private/loopback relay is refused unless
     /// [`allow_guest_private_egress`](Self::allow_guest_private_egress) is on).
     pub allow_guest_email: bool,
+    /// Permit a **guest**'s `admin` capability to manage the project's **domains** (add /
+    /// verify / attach-verified / remove) via `boatramp:handlers/admin`. Off under
+    /// `multi-tenant`, on under `single-tenant`/`dev`. Per-surface + operator-set (a tenant
+    /// can't turn it on via site config); domain attach still runs the real ownership probe,
+    /// and there is no guest path to the unverified-attach admin route.
+    pub allow_guest_admin_domains: bool,
+    /// Permit a guest's `admin` capability to manage the project's **SMTP email profiles**
+    /// (set / delete). Passwords stay sealed and are never returned to the guest.
+    pub allow_guest_admin_email: bool,
+    /// Permit a guest's `admin` capability to write **site config + aliases** (routing,
+    /// headers, cache). A config write can't attach an unverified domain (the verified-domain
+    /// guard is shared with the HTTP path).
+    pub allow_guest_admin_site: bool,
+    /// Permit a guest's `admin` capability to write the project's **sealed secrets** (set /
+    /// rotate / delete — write-only, redacted). The most sensitive surface: an operator can
+    /// withhold it while still allowing domains/email/site self-service.
+    pub allow_guest_admin_secrets: bool,
 }
 
 impl Default for SecurityPosture {
@@ -526,6 +583,18 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_email {
         base.allow_guest_email = v;
+    }
+    if let Some(v) = o.allow_guest_admin_domains {
+        base.allow_guest_admin_domains = v;
+    }
+    if let Some(v) = o.allow_guest_admin_email {
+        base.allow_guest_admin_email = v;
+    }
+    if let Some(v) = o.allow_guest_admin_site {
+        base.allow_guest_admin_site = v;
+    }
+    if let Some(v) = o.allow_guest_admin_secrets {
+        base.allow_guest_admin_secrets = v;
     }
     base
 }
@@ -609,6 +678,44 @@ mod tests {
             .unwrap()
             .lines()
             .any(|l| l.contains("allow_guest_email")
+                && l.contains("true")
+                && l.contains("override")));
+    }
+
+    #[test]
+    fn allow_guest_admin_is_per_surface_and_follows_the_trust_model() {
+        // All four surfaces off under multi-tenant, on under single-tenant/dev.
+        let mt = SecurityProfile::MultiTenant.preset();
+        assert!(
+            !mt.allow_guest_admin_domains
+                && !mt.allow_guest_admin_email
+                && !mt.allow_guest_admin_site
+                && !mt.allow_guest_admin_secrets
+        );
+        let st = SecurityProfile::SingleTenant.preset();
+        assert!(
+            st.allow_guest_admin_domains
+                && st.allow_guest_admin_email
+                && st.allow_guest_admin_site
+                && st.allow_guest_admin_secrets
+        );
+        // Per-surface override: an operator enables domains fleet-wide but keeps the sensitive
+        // secrets surface OFF — the whole point of per-surface knobs.
+        let cfg = SecurityConfig {
+            overrides: PostureOverrides {
+                allow_guest_admin_domains: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let p = cfg.resolve().unwrap();
+        assert!(p.allow_guest_admin_domains);
+        assert!(!p.allow_guest_admin_secrets, "other surfaces stay off");
+        assert!(cfg
+            .explain()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains("allow_guest_admin_domains")
                 && l.contains("true")
                 && l.contains("override")));
     }

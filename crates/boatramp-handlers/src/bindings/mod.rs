@@ -20,6 +20,8 @@ use boatramp_core::messaging::Messaging;
 use boatramp_core::sql::SqlBackend;
 use boatramp_core::Storage;
 
+#[cfg(feature = "admin")]
+pub mod admin;
 pub mod blobstore;
 #[cfg(feature = "email")]
 pub mod email;
@@ -65,6 +67,10 @@ pub struct Bindings {
     /// email not granted.
     #[cfg(feature = "email")]
     email: Option<email::EmailBinding>,
+    /// The `admin` grant (reconfigure the guest's own project): a project-scoped controller +
+    /// the granted config surfaces. `None` = admin not granted.
+    #[cfg(feature = "admin")]
+    admin: Option<admin::AdminBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -265,5 +271,28 @@ impl Bindings {
     #[cfg(feature = "email")]
     pub(crate) fn email(&self) -> Option<&email::EmailBinding> {
         self.email.as_ref()
+    }
+
+    /// Grant the `admin` capability: a project-scoped [`AdminController`](admin::AdminController)
+    /// and the set of config [`Surface`](admin::Surface)s the guest may touch (granted imports
+    /// ∩ the site allowlist ∩ the operator posture). The guest reconfigures only its own
+    /// project; each verb is gated on its surface, and reads are redacted.
+    #[cfg(feature = "admin")]
+    pub fn with_admin(
+        mut self,
+        controller: Arc<dyn admin::AdminController>,
+        surfaces: std::collections::BTreeSet<admin::Surface>,
+    ) -> Self {
+        self.admin = Some(admin::AdminBinding {
+            controller,
+            surfaces,
+        });
+        self
+    }
+
+    /// The granted admin binding, if any.
+    #[cfg(feature = "admin")]
+    pub(crate) fn admin(&self) -> Option<&admin::AdminBinding> {
+        self.admin.as_ref()
     }
 }

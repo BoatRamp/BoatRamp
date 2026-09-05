@@ -64,6 +64,10 @@ graphql = ["engine", "invoke", "dep:async-trait"]
 # guest only ever calls `send`. Needs async-trait for the object-safe `EmailSpool`
 # / `SmtpBackend` seams and serde to (de)serialize a message onto the durable spool.
 email = ["engine", "dep:lettre", "dep:async-trait", "dep:serde"]
+# The `admin` binding: a guest reconfigures its own project (domains / email profiles / site
+# config / secrets) via the server's `AdminController` (the mutation logic, per-project rate
+# quota, and audit live a layer up). Needs async-trait for the object-safe controller trait.
+admin = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true
