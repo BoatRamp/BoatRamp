@@ -124,6 +124,26 @@ impl EmailProfile {
     }
 }
 
+/// A **partial** update to a profile: every field optional, so an operator can change one
+/// parameter without re-sending the rest — crucially the sealed password, which stays put
+/// unless a new one is supplied here. Applied by [`EmailProfileStore::patch`] onto the stored
+/// profile (unset field = keep). `clear_auth` drops the username + password (make it an
+/// unauthenticated relay) — the one intent bare omission can't express under keep-on-omit.
+#[derive(Debug, Clone, Default)]
+pub struct EmailProfilePatch {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub security: Option<SmtpSecurity>,
+    pub username: Option<String>,
+    /// A new AUTH password to seal; `None` = keep the stored one (unless `clear_auth`).
+    pub password: Option<String>,
+    pub from: Option<String>,
+    pub durable: Option<bool>,
+    /// Drop the username + password entirely (an unauthenticated relay). Wins over
+    /// `username`/`password` if both are set.
+    pub clear_auth: bool,
+}
+
 /// A password-redacted view of a profile for the admin API / `email ls|show`. The
 /// sealed password is **never** carried here, so it is safe to return.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +295,107 @@ impl EmailProfileStore {
                 from: profile.from.clone(),
                 durable: profile.durable,
             },
+            sealed_password,
+        };
+        let bytes =
+            serde_json::to_vec(&record).map_err(|e| EmailProfileError::Backend(e.to_string()))?;
+        self.kv
+            .put(&key, bytes)
+            .await
+            .map_err(|e| EmailProfileError::Backend(e.to_string()))?;
+        Ok(record.info(name))
+    }
+
+    /// Apply a **partial** update, merging onto the stored profile: an unset field keeps its
+    /// current value, and the sealed password is preserved unless a new one is supplied (or
+    /// `clear_auth` drops it). Creates the profile if absent — required fields (host + from)
+    /// must then be present post-merge. Preserves `created_at`, bumps `revision`, returns the
+    /// **redacted** [`EmailProfileInfo`]. This backs the admin API/CLI so an operator can change
+    /// one parameter without re-declaring (and re-transmitting) the whole profile — in
+    /// particular, changing the host never silently drops SMTP auth.
+    pub async fn patch(
+        &self,
+        project: ProjectRef<'_>,
+        name: &str,
+        patch: &EmailProfilePatch,
+    ) -> Result<EmailProfileInfo, EmailProfileError> {
+        validate_name(name)?;
+        if let Some(pw) = &patch.password {
+            validate_password_len(pw)?;
+        }
+        let key = crate::deploy::keys::email_profile(project, name);
+        let now = crate::time::now_unix();
+        let prev = self.load_record(&key).await?;
+        let created_at = prev.as_ref().map_or(now, |r| r.created_at);
+        let revision = prev.as_ref().map_or(0, |r| r.revision) + 1;
+
+        // Start from the stored clear config (or blank defaults for a new profile), then apply
+        // only the fields the patch sets.
+        let mut config = prev.as_ref().map_or_else(
+            || ClearConfig {
+                host: String::new(),
+                port: 0,
+                security: SmtpSecurity::StartTls,
+                username: None,
+                from: String::new(),
+                durable: false,
+            },
+            |r| r.config.clone(),
+        );
+        let mut sealed_password = prev.as_ref().and_then(|r| r.sealed_password.clone());
+
+        if let Some(s) = patch.security {
+            config.security = s;
+        }
+        if let Some(h) = &patch.host {
+            config.host = h.clone();
+        }
+        if let Some(f) = &patch.from {
+            config.from = f.clone();
+        }
+        if let Some(d) = patch.durable {
+            config.durable = d;
+        }
+        // Port: an explicit value wins; otherwise a *new* profile takes the conventional port
+        // for its (merged) security, and an existing one keeps its stored port.
+        if let Some(p) = patch.port {
+            config.port = p;
+        } else if prev.is_none() {
+            config.port = config.security.default_port();
+        }
+        // Auth: `clear_auth` wins; else set username/password independently, keeping the stored
+        // ones when unset — so a host/from edit never silently downgrades to an open relay.
+        if patch.clear_auth {
+            config.username = None;
+            sealed_password = None;
+        } else {
+            if let Some(u) = &patch.username {
+                config.username = Some(u.clone());
+            }
+            if let Some(pw) = &patch.password {
+                sealed_password = Some(
+                    self.envelope
+                        .wrap(pw.as_bytes())
+                        .await
+                        .map_err(|e| EmailProfileError::Backend(e.to_string()))?,
+                );
+            }
+        }
+
+        // Validate the composite fail-closed (e.g. a create that never set host/from).
+        validate_fields(
+            &config.host,
+            config.port,
+            &config.from,
+            config.username.as_deref(),
+        )?;
+
+        let record = EmailRecord {
+            version: 1,
+            created_at,
+            updated_at: now,
+            revision,
+            config,
             sealed_password,
         };
         let bytes =
@@ -470,6 +591,27 @@ fn validate_name(name: &str) -> Result<(), EmailProfileError> {
 
 /// Validate the connection config fail-closed before sealing/storing.
 fn validate_config(profile: &EmailProfile) -> Result<(), EmailProfileError> {
+    validate_fields(
+        &profile.host,
+        profile.port,
+        &profile.from,
+        profile.username.as_deref(),
+    )?;
+    if let Some(p) = &profile.password {
+        validate_password_len(p)?;
+    }
+    Ok(())
+}
+
+/// Validate the non-secret connection fields fail-closed. Shared by the full
+/// [`EmailProfileStore::set`] and the merge [`EmailProfileStore::patch`] (which validates the
+/// *composite* after merging a partial onto the stored profile).
+fn validate_fields(
+    host: &str,
+    port: u16,
+    from: &str,
+    username: Option<&str>,
+) -> Result<(), EmailProfileError> {
     let bounded = |field: &str, value: &str| -> Result<(), EmailProfileError> {
         if value.is_empty() {
             return Err(EmailProfileError::InvalidConfig(format!(
@@ -483,16 +625,16 @@ fn validate_config(profile: &EmailProfile) -> Result<(), EmailProfileError> {
         }
         Ok(())
     };
-    bounded("host", &profile.host)?;
-    bounded("from", &profile.from)?;
-    if profile.port == 0 {
+    bounded("host", host)?;
+    bounded("from", from)?;
+    if port == 0 {
         return Err(EmailProfileError::InvalidConfig(
             "port must be non-zero".into(),
         ));
     }
     // A minimal sanity check on the sender: a single `@` with non-empty local/domain
     // parts. Not full RFC 5322 — just enough to reject an obviously-wrong value.
-    match profile.from.split_once('@') {
+    match from.split_once('@') {
         Some((local, domain)) if !local.is_empty() && domain.contains('.') => {}
         _ => {
             return Err(EmailProfileError::InvalidConfig(
@@ -500,15 +642,18 @@ fn validate_config(profile: &EmailProfile) -> Result<(), EmailProfileError> {
             ))
         }
     }
-    if let Some(u) = &profile.username {
+    if let Some(u) = username {
         bounded("username", u)?;
     }
-    if let Some(p) = &profile.password {
-        if p.len() > MAX_FIELD_LEN {
-            return Err(EmailProfileError::InvalidConfig(format!(
-                "password exceeds {MAX_FIELD_LEN} bytes"
-            )));
-        }
+    Ok(())
+}
+
+/// Reject an over-long password before sealing.
+fn validate_password_len(password: &str) -> Result<(), EmailProfileError> {
+    if password.len() > MAX_FIELD_LEN {
+        return Err(EmailProfileError::InvalidConfig(format!(
+            "password exceeds {MAX_FIELD_LEN} bytes"
+        )));
     }
     Ok(())
 }
@@ -608,6 +753,110 @@ mod tests {
             s.get(p, "default").await.unwrap().unwrap().host,
             "smtp2.example.com"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_changes_one_field_and_keeps_the_rest_including_the_password() {
+        let s = store();
+        let p = ProjectRef::new("acme");
+        s.set(p, "default", &profile()).await.unwrap();
+        // Change only the host — everything else, incl. the sealed password, is preserved.
+        let info = s
+            .patch(
+                p,
+                "default",
+                &EmailProfilePatch {
+                    host: Some("smtp2.example.com".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.revision, 2);
+        assert!(info.has_password, "password must survive a host-only edit");
+        let got = s.get(p, "default").await.unwrap().unwrap();
+        assert_eq!(got.host, "smtp2.example.com");
+        assert_eq!(got.port, 587); // kept
+        assert_eq!(got.from, "no-reply@example.com"); // kept
+        assert_eq!(got.username.as_deref(), Some("apikey")); // kept
+        assert_eq!(got.password.as_deref(), Some("s3cr3t")); // kept — the whole point
+    }
+
+    #[tokio::test]
+    async fn patch_rotates_only_the_password() {
+        let s = store();
+        let p = ProjectRef::new("acme");
+        s.set(p, "default", &profile()).await.unwrap();
+        s.patch(
+            p,
+            "default",
+            &EmailProfilePatch {
+                password: Some("rotated".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let got = s.get(p, "default").await.unwrap().unwrap();
+        assert_eq!(got.password.as_deref(), Some("rotated"));
+        assert_eq!(got.host, "smtp.example.com"); // untouched
+    }
+
+    #[tokio::test]
+    async fn patch_clear_auth_drops_username_and_password() {
+        let s = store();
+        let p = ProjectRef::new("acme");
+        s.set(p, "default", &profile()).await.unwrap();
+        let info = s
+            .patch(
+                p,
+                "default",
+                &EmailProfilePatch {
+                    clear_auth: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!info.has_password);
+        let got = s.get(p, "default").await.unwrap().unwrap();
+        assert_eq!(got.username, None);
+        assert_eq!(got.password, None);
+    }
+
+    #[tokio::test]
+    async fn patch_creates_when_absent_but_requires_host_and_from() {
+        let s = store();
+        let p = ProjectRef::new("acme");
+        // A create-patch missing `from` is refused (composite validation).
+        assert!(s
+            .patch(
+                p,
+                "new",
+                &EmailProfilePatch {
+                    host: Some("smtp.example.com".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err());
+        // With host + from it creates, defaulting the port from the (default starttls) security.
+        let info = s
+            .patch(
+                p,
+                "new",
+                &EmailProfilePatch {
+                    host: Some("smtp.example.com".into()),
+                    from: Some("hi@example.com".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.revision, 1);
+        let got = s.get(p, "new").await.unwrap().unwrap();
+        assert_eq!(got.port, 587); // starttls default
+        assert_eq!(got.password, None); // no auth given
     }
 
     #[tokio::test]

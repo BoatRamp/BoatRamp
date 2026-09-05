@@ -33,6 +33,18 @@ trusted local relay only); `--port` overrides the conventional port. Omit
 `--username`/`--password` for an unauthenticated relay. Add `--durable` to make
 this profile's sends default to the durable spool (below).
 
+**Updates merge — change one field at a time.** `email set` on an existing profile
+overwrites only the fields you pass and **keeps the rest, including the sealed
+password** (so a tweak never re-transmits or accidentally wipes your credentials):
+
+```sh
+boatramp email set default --from 'noreply@example.com'   # just the From; auth untouched
+boatramp email set default --host smtp2.example.com        # just the host
+printf '%s' "$NEW" | boatramp email set default --password-stdin   # rotate only the password
+boatramp email set default --no-auth                       # drop username + password (open relay)
+boatramp email set default --durable false                 # flip the durable default off
+```
+
 List and inspect (redacted — **the password is never returned**), and remove:
 
 ```sh

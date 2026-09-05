@@ -65,36 +65,40 @@ struct PasswordSource {
 
 #[derive(Debug, Subcommand)]
 enum EmailCommand {
-    /// Set (or reconfigure) an SMTP profile: seal its password server-side under
-    /// `name`. Setting an existing name reconfigures it in place (a new revision,
-    /// same `created_at`).
+    /// Create or **update** an SMTP profile. Fields you pass overwrite; fields you omit keep
+    /// their stored value — so you can change one parameter (e.g. `--from`) without re-sending
+    /// the rest, and the sealed password is preserved unless you pass a new one. On create,
+    /// `--host` and `--from` are required.
     Set {
         /// The profile name (a guest selects it via the message's `profile`; omit in
         /// the guest to use `default`).
         name: String,
-        /// SMTP relay hostname.
+        /// SMTP relay hostname (required on create; omit to keep on update).
         #[arg(long)]
-        host: String,
-        /// SMTP relay port; omit for the conventional port of `--security`
-        /// (587 starttls / 465 tls / 25 plaintext).
+        host: Option<String>,
+        /// SMTP relay port; omit to keep (on create, the conventional port for `--security`:
+        /// 587 starttls / 465 tls / 25 plaintext).
         #[arg(long)]
         port: Option<u16>,
-        /// Transport security: `starttls` (587), `tls` (implicit, 465), or
-        /// `plaintext` (a trusted local relay only).
-        #[arg(long, default_value = "starttls")]
-        security: String,
-        /// SMTP AUTH username (omit for an unauthenticated relay).
+        /// Transport security: `starttls` (587), `tls` (implicit, 465), or `plaintext` (a
+        /// trusted local relay only). Omit to keep (defaults to `starttls` on create).
+        #[arg(long)]
+        security: Option<String>,
+        /// SMTP AUTH username. Omit to keep; use `--no-auth` to drop it.
         #[arg(long)]
         username: Option<String>,
         #[command(flatten)]
         password: PasswordSource,
-        /// The default (and only permitted) `From` address for this profile.
+        /// Drop the username + password (an unauthenticated relay).
         #[arg(long)]
-        from: String,
-        /// Default sends through this profile to the durable spool (persisted +
-        /// retried); a guest can still opt in/out per message.
+        no_auth: bool,
+        /// The default (and only permitted) `From` address (required on create; omit to keep).
         #[arg(long)]
-        durable: bool,
+        from: Option<String>,
+        /// Default sends through this profile to the durable spool (`--durable` = on,
+        /// `--durable false` = off); omit to keep. A guest can still opt in/out per message.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        durable: Option<bool>,
     },
     /// List the project's SMTP profiles (redacted — never the password).
     Ls,
@@ -126,6 +130,7 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
             security,
             username,
             password,
+            no_auth,
             from,
             durable,
         } => {
@@ -133,13 +138,14 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
             let resp = http
                 .put(format!("{server}/api/{seg}/profiles/{name}"))
                 .json(&SetProfileRequest {
-                    host: &host,
+                    host: host.as_deref(),
                     port,
-                    security: &security,
+                    security: security.as_deref(),
                     username: username.as_deref(),
                     password,
-                    from: &from,
+                    from: from.as_deref(),
                     durable,
+                    clear_auth: no_auth,
                 })
                 .send()
                 .await?;
@@ -215,16 +221,22 @@ pub async fn run(args: EmailArgs, config: &ProjectConfig) -> Result<()> {
 /// server seals `password` and stores the profile under the path `name`.
 #[derive(serde::Serialize)]
 struct SetProfileRequest<'a> {
-    host: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
-    security: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
-    from: &'a str,
-    durable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    durable: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    clear_auth: bool,
 }
 
 /// Read the password from stdin / inline / neither (an unauthenticated relay).
@@ -345,6 +357,12 @@ mod tests {
             "--password-stdin",
         ])
         .is_err());
+        // Partial update: a single field, no host/from (they're optional now — kept on update).
+        assert!(parse(&["email", "set", "default", "--from", "new@b.com"]).is_ok());
+        // `--no-auth` (drop credentials) and the tri-state `--durable` (bare = on) parse.
+        assert!(parse(&["email", "set", "default", "--no-auth"]).is_ok());
+        assert!(parse(&["email", "set", "default", "--durable"]).is_ok());
+        assert!(parse(&["email", "set", "default", "--durable", "false"]).is_ok());
     }
 
     #[test]

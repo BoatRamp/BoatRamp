@@ -795,6 +795,30 @@ mod secrets_api_tests {
             "the create response must never echo the password"
         );
 
+        // PARTIAL update: PUT only the host — everything else (incl. the sealed password) is
+        // kept, so a one-field edit can't silently wipe auth.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/projects/default/email/profiles/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host":"smtp2.example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let patched: EmailProfileInfo = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(patched.host, "smtp2.example.com"); // changed
+        assert_eq!(patched.from, "no-reply@example.com"); // kept
+        assert!(
+            patched.has_password,
+            "a host-only edit must keep the password"
+        );
+        assert_eq!(patched.revision, 2);
+
         // GET list → one redacted profile, password-free.
         let resp = app
             .clone()

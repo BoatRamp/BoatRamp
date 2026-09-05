@@ -783,31 +783,41 @@ type EmailStoreExt = Option<Arc<boatramp_core::email_config::EmailProfileStore>>
 
 #[derive(Deserialize)]
 pub(super) struct SetEmailProfileRequest {
-    /// SMTP relay hostname.
-    host: String,
-    /// SMTP relay port; omitted ⇒ the conventional port for `security`.
+    /// SMTP relay hostname. Required on create; **omit to keep** the stored value on update.
+    #[serde(default)]
+    host: Option<String>,
+    /// SMTP relay port; omitted ⇒ kept (or, on create, the conventional port for `security`).
     #[serde(default)]
     port: Option<u16>,
-    /// Transport security: `starttls` | `tls` | `plaintext`.
-    security: String,
-    /// SMTP AUTH username (omit for an unauthenticated relay).
+    /// Transport security: `starttls` | `tls` | `plaintext`. Omitted ⇒ kept.
+    #[serde(default)]
+    security: Option<String>,
+    /// SMTP AUTH username. Omitted ⇒ kept; use `clear_auth` to drop it.
     #[serde(default)]
     username: Option<String>,
-    /// SMTP AUTH password — sealed server-side; never stored clear, logged, or
-    /// returned.
+    /// SMTP AUTH password — sealed server-side; never stored clear, logged, or returned.
+    /// **Omitted ⇒ the stored password is kept** (so a host/from edit can't silently wipe
+    /// auth); provide it only to rotate. `clear_auth` drops it.
     #[serde(default)]
     password: Option<String>,
-    /// The default (and only permitted) `From` address.
-    from: String,
-    /// Whether sends through this profile default to the durable spool.
+    /// The default (and only permitted) `From` address. Required on create; omit to keep.
     #[serde(default)]
-    durable: bool,
+    from: Option<String>,
+    /// Whether sends through this profile default to the durable spool. Omitted ⇒ kept.
+    #[serde(default)]
+    durable: Option<bool>,
+    /// Drop the username + password entirely (an unauthenticated relay).
+    #[serde(default)]
+    clear_auth: bool,
 }
 
-/// `PUT /api/projects/{proj}/email/profiles/{name}` — set/reconfigure a profile
-/// (sealing its password server-side) and return the **redacted**
-/// [`EmailProfileInfo`](boatramp_core::email_config::EmailProfileInfo) as `201`.
-/// Never echoes the password. `501` with no envelope; `400` on invalid name/config.
+/// `PUT /api/projects/{proj}/email/profiles/{name}` — create-or-**merge** a profile. Fields
+/// present overwrite; fields omitted keep their stored value (the sealed password included, so
+/// changing one parameter never re-transmits or wipes it); `clear_auth` drops the credentials.
+/// Seals any supplied password server-side and returns the **redacted**
+/// [`EmailProfileInfo`](boatramp_core::email_config::EmailProfileInfo) as `201`. On create,
+/// host + from must be present. Never echoes the password. `501` with no envelope; `400` on an
+/// invalid name/config.
 pub(super) async fn set_email_profile(
     Extension(store): Extension<EmailStoreExt>,
     Extension(project): Extension<ProjectContext>,
@@ -817,23 +827,24 @@ pub(super) async fn set_email_profile(
     let Some(store) = store else {
         return no_email_store_response();
     };
-    let security = match request
-        .security
-        .parse::<boatramp_core::email_config::SmtpSecurity>()
-    {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    let security = match &request.security {
+        Some(s) => match s.parse::<boatramp_core::email_config::SmtpSecurity>() {
+            Ok(s) => Some(s),
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+        },
+        None => None,
     };
-    let profile = boatramp_core::email_config::EmailProfile {
+    let patch = boatramp_core::email_config::EmailProfilePatch {
         host: request.host,
-        port: request.port.unwrap_or_else(|| security.default_port()),
+        port: request.port,
         security,
         username: request.username,
         password: request.password,
         from: request.from,
         durable: request.durable,
+        clear_auth: request.clear_auth,
     };
-    match store.set(project.as_ref(), &name, &profile).await {
+    match store.patch(project.as_ref(), &name, &patch).await {
         Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
         Err(err) => email_error_response(err),
     }
