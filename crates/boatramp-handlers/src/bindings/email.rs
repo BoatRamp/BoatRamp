@@ -89,6 +89,15 @@ pub struct EmailBinding {
     pub(crate) spool: Arc<dyn EmailSpool>,
 }
 
+/// Max envelope recipients (`to` + `cc` + `bcc`) per message. Bounds a granted
+/// guest's fan-out abuse of the operator's shared SMTP egress (mass mail is the
+/// residual risk once the guest is trusted to send at all — it still can't read
+/// the credentials). Generous for transactional mail; well below relay limits.
+const MAX_RECIPIENTS: usize = 100;
+/// Max total message size (`subject` + `text` + `html`) in bytes. Bounds relay
+/// abuse and durable-spool amplification. 2 MiB is far above any real HTML email.
+const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Per-invocation view over the (optional) email grant.
 pub struct EmailHost<'a> {
     binding: Option<&'a EmailBinding>,
@@ -133,6 +142,25 @@ impl email_sender::Host for EmailHost<'_> {
             return Err(E::InvalidMessage(
                 "a text or html body is required".to_string(),
             ));
+        }
+        // Bound fan-out + size per message: a guest can't *read* the shared relay's
+        // credentials, but an unbounded `send` would still let a granted tenant
+        // weaponize the operator's SMTP egress (mass mail, reputation/quota burn) —
+        // and, on the durable path, amplify into the shared messaging fabric. Cap
+        // both fail-closed, applied here so BOTH spool paths inherit the bound.
+        let recipients = message.to.len() + message.cc.len() + message.bcc.len();
+        if recipients > MAX_RECIPIENTS {
+            return Err(E::InvalidMessage(format!(
+                "too many recipients ({recipients}); the maximum is {MAX_RECIPIENTS}"
+            )));
+        }
+        let body_bytes = message.subject.len()
+            + message.text.as_deref().map_or(0, str::len)
+            + message.html.as_deref().map_or(0, str::len);
+        if body_bytes > MAX_MESSAGE_BYTES {
+            return Err(E::InvalidMessage(format!(
+                "message is {body_bytes} bytes; the maximum is {MAX_MESSAGE_BYTES}"
+            )));
         }
 
         // The sender must be permitted by the profile — a guest can't spoof an
@@ -389,6 +417,38 @@ mod tests {
         // No guest `from` → the profile default.
         assert_eq!(m.from, "no-reply@example.com");
         assert!(!m.durable);
+    }
+
+    #[tokio::test]
+    async fn oversized_recipients_or_body_are_refused_before_spooling() {
+        let spool = Arc::new(FakeSpool::default());
+        let binding = binding(spool.clone());
+        let mut host = EmailHost::new(Some(&binding));
+        // Too many recipients (spread across to/cc/bcc) is refused.
+        let mut many = message();
+        many.to = (0..MAX_RECIPIENTS + 1)
+            .map(|i| format!("r{i}@example.org"))
+            .collect();
+        assert!(matches!(
+            host.send(many).await.unwrap_err(),
+            email_types::EmailError::InvalidMessage(_)
+        ));
+        // An oversized body is refused.
+        let mut big = message();
+        big.html = Some("x".repeat(MAX_MESSAGE_BYTES + 1));
+        assert!(matches!(
+            host.send(big).await.unwrap_err(),
+            email_types::EmailError::InvalidMessage(_)
+        ));
+        // Nothing over-limit was ever spooled.
+        assert!(spool.enqueued.lock().unwrap().is_empty());
+        // A message at the recipient ceiling is accepted.
+        let mut at_limit = message();
+        at_limit.to = (0..MAX_RECIPIENTS)
+            .map(|i| format!("r{i}@example.org"))
+            .collect();
+        host.send(at_limit).await.unwrap();
+        assert_eq!(spool.enqueued.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
