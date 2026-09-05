@@ -26,6 +26,9 @@ Hashi = "Hashi"
 # `clen` = a content-length local in the HTTP/2 codec + its proxy examples; a
 # deliberate abbreviation, not a typo of "clean".
 clen = "clen"
+# `HELO` = the SMTP greeting verb (RFC 5321), matched in the email capability's
+# live SMTP-sink test. Not a typo of "hello".
+HELO = "HELO"
 
 [files]
 # Lockfiles and vendored third-party WIT (upstream WASI definitions, copied

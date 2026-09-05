@@ -512,3 +512,32 @@ jobs:
             -- --ignored --nocapture 2>&1 | tee azure.log
           grep -qE 'test result: ok. 1 passed' azure.log \
             || { echo "::error::azure notify emulator test did not pass" >&2; exit 1; }
+
+  # Tier G — the per-project SMTP `email` capability: prove a message actually
+  # DELIVERS over SMTP through the real `lettre` backend + the node spool, on BOTH the
+  # best-effort and the durable (messaging-fabric → worker re-resolves creds host-side)
+  # paths. The catcher is an in-process loopback SMTP **sink** (a test-double) — no
+  # relay account, no network egress, no secrets; the sink is gone with the runner.
+  email:
+    name: email delivery (SMTP sink)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-email
+
+      - name: Deliver best-effort + durable over a loopback SMTP sink (hard gate)
+        run: |
+          set -o pipefail
+          # Drives the real spool + lettre transport (plaintext, no AUTH) against an
+          # in-process SMTP sink and asserts the message arrived on both delivery paths.
+          cargo test -p boatramp-server --features email --test email_live \
+            -- --ignored --nocapture 2>&1 | tee email.log
+          # A silent skip still prints `test result: ok`; gate on the success marker that
+          # prints ONLY after BOTH paths delivered to the sink (the anti-silent-skip rule).
+          grep -qE 'test result: ok' email.log \
+            || { echo "::error::email live-delivery test did not pass" >&2; exit 1; }
+          grep -q 'EMAIL LIVE SEND OK' email.log \
+            || { echo "::error::email live delivery never reached the success marker (silent skip?)" >&2; exit 1; }
