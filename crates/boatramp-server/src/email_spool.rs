@@ -17,17 +17,36 @@
 //! the spool through the host `send` path, which stamps the correct project on each
 //! message), so a tenant can't inject into another tenant's outbound mail.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use boatramp_core::access::RateLimit;
 use boatramp_core::email_config::{EmailProfile, EmailProfileStore};
 use boatramp_core::messaging::Messaging;
 use boatramp_core::project::ProjectRef;
 use boatramp_handlers::{EmailSpool, OutboundEmail, SmtpBackend};
 
+use crate::ratelimit::RateLimiter;
+
 /// The reserved node-internal messaging topic the durable spool uses. Not a project
 /// bus topic — a guest can't name it; only the host `send` path publishes here.
 const DURABLE_TOPIC: &str = "_boatramp/email/outbound";
+
+/// Sustained per-project send rate (messages/second) enforced across BOTH the
+/// best-effort and durable paths. A granted (credential-isolated) guest can still
+/// loop `send`; without a per-project quota that floods the operator's shared relay
+/// and — on the durable path — the shared messaging fabric + dead-letter store. The
+/// per-message caps (`MAX_RECIPIENTS`/`MAX_MESSAGE_BYTES` in the binding) bound each
+/// message; this bounds the *rate*. Per-node (like the default visitor limiter);
+/// generous for transactional bursts, but a runaway loop is throttled ~1000x.
+const EMAIL_SENDS_PER_SEC: u32 = 5;
+/// Burst capacity for the per-project send bucket (a signup wave, a batch).
+const EMAIL_SEND_BURST: u32 = 50;
+/// Fixed key-suffix for the per-project token bucket (the limiter keys on
+/// `(project, ip)`; email has no client IP, so a constant stands in and the bucket
+/// is effectively per-project).
+const EMAIL_RL_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 /// Best-effort in-memory queue capacity (messages awaiting the SMTP put).
 const BEST_EFFORT_CAPACITY: usize = 1024;
@@ -47,6 +66,10 @@ const DURABLE_MAX_ATTEMPTS: u32 = 5;
 pub struct NodeEmailSpool {
     tx: tokio::sync::mpsc::Sender<(EmailProfile, OutboundEmail)>,
     messaging: Option<Arc<dyn Messaging>>,
+    /// Per-project send-rate token buckets (keyed on the project name).
+    rate: RateLimiter,
+    /// The per-project send budget applied to every `enqueue`.
+    limit: RateLimit,
 }
 
 impl NodeEmailSpool {
@@ -78,13 +101,31 @@ impl NodeEmailSpool {
             let store = store.clone();
             tokio::spawn(async move { durable_worker(backend, messaging, store).await });
         }
-        Arc::new(Self { tx, messaging })
+        Arc::new(Self {
+            tx,
+            messaging,
+            rate: RateLimiter::new(),
+            limit: RateLimit {
+                rps: EMAIL_SENDS_PER_SEC,
+                burst: EMAIL_SEND_BURST,
+            },
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl EmailSpool for NodeEmailSpool {
     async fn enqueue(&self, profile: EmailProfile, message: OutboundEmail) -> Result<(), String> {
+        // Per-project send-rate quota, charged once per `send` BEFORE routing — so a
+        // runaway guest loop can't flood the shared relay or the durable fabric,
+        // whichever path it picks. The project is stamped host-side (a guest can't
+        // forge it), so the bucket is genuinely per-tenant.
+        if !self.rate.check(&message.project, EMAIL_RL_IP, &self.limit) {
+            return Err(format!(
+                "per-project email send rate exceeded (limit {} msg/s, burst {}); slow down",
+                self.limit.rps, self.limit.burst
+            ));
+        }
         if message.durable {
             let Some(messaging) = &self.messaging else {
                 return Err(
@@ -231,5 +272,102 @@ async fn durable_worker(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boatramp_core::email_config::SmtpSecurity;
+    use boatramp_core::envelope::{EnvelopeError, KeyEnvelope};
+    use boatramp_core::kv::MemoryKv;
+    use std::sync::Mutex;
+
+    /// An identity "envelope" — the store needs one; sealing isn't under test here.
+    struct NoopEnvelope;
+    #[async_trait::async_trait]
+    impl KeyEnvelope for NoopEnvelope {
+        async fn wrap(&self, p: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(p.to_vec())
+        }
+        async fn unwrap(&self, c: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+            Ok(c.to_vec())
+        }
+    }
+
+    /// A backend that just counts (and always succeeds) — the drain calls it.
+    #[derive(Default)]
+    struct CountingBackend {
+        sent: Mutex<usize>,
+    }
+    #[async_trait::async_trait]
+    impl SmtpBackend for CountingBackend {
+        async fn send(&self, _p: &EmailProfile, _m: &OutboundEmail) -> Result<(), String> {
+            *self.sent.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn outbound(project: &str) -> OutboundEmail {
+        OutboundEmail {
+            project: project.into(),
+            profile: "default".into(),
+            to: vec!["d@example.org".into()],
+            cc: vec![],
+            bcc: vec![],
+            from: "no-reply@example.com".into(),
+            reply_to: None,
+            subject: "hi".into(),
+            text: Some("x".into()),
+            html: None,
+            durable: false,
+        }
+    }
+
+    fn profile() -> EmailProfile {
+        EmailProfile {
+            host: "localhost".into(),
+            port: 25,
+            security: SmtpSecurity::Plaintext,
+            username: None,
+            password: None,
+            from: "no-reply@example.com".into(),
+            durable: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn per_project_send_rate_is_enforced_and_is_per_project() {
+        let store = Arc::new(EmailProfileStore::new(
+            Arc::new(MemoryKv::new()),
+            Arc::new(NoopEnvelope),
+        ));
+        let spool = NodeEmailSpool::spawn(Arc::new(CountingBackend::default()), None, store);
+        // The token bucket starts full at the burst; the first ~burst sends pass and
+        // then (with sub-second elapsed, so no meaningful refill) the next is rejected.
+        let mut ok = 0usize;
+        let mut limited = false;
+        for _ in 0..(EMAIL_SEND_BURST + 5) {
+            match spool.enqueue(profile(), outbound("acme")).await {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    assert!(e.contains("rate exceeded"), "unexpected error: {e}");
+                    limited = true;
+                }
+            }
+        }
+        assert!(
+            (EMAIL_SEND_BURST as usize..=EMAIL_SEND_BURST as usize + 1).contains(&ok),
+            "expected ~{EMAIL_SEND_BURST} to pass, got {ok}"
+        );
+        assert!(
+            limited,
+            "a runaway send loop must eventually be rate-limited"
+        );
+        // A different project has its own bucket — acme's spend doesn't throttle it.
+        assert!(
+            spool.enqueue(profile(), outbound("globex")).await.is_ok(),
+            "the rate limit must be per-project, not global"
+        );
     }
 }

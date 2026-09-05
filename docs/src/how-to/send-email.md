@@ -100,6 +100,21 @@ refused on a host that doesn't offer `email`, rather than failing at first send.
   where you can inspect and redrive it with [`boatramp dlq`](./background-work.md).
   The durable path needs a messaging backend (always present on a normal node).
 
+## Limits
+
+Because a guest that can send at all could otherwise weaponize the operator's
+shared relay, every send is bounded (fail-closed, before it is spooled):
+
+- **≤ 100 recipients** per message (`to` + `cc` + `bcc`) and **≤ 2 MiB** total body
+  (`subject` + `text` + `html`) — over either and `send` returns `invalid-message`.
+- **A per-project send rate** (sustained 5 msg/s, burst 50), enforced across both
+  the best-effort and durable paths — over it and `send` returns `spool-failed`
+  ("rate exceeded"). The budget is per project (a busy tenant can't throttle
+  another) and per node.
+
+These bound mass-mail abuse and durable-queue amplification without getting in the
+way of normal transactional bursts (a signup wave, a batch of receipts).
+
 ## Security posture
 
 Guest email is governed by the `allow_guest_email`
