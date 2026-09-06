@@ -571,10 +571,11 @@ interface admin {
   email-list: func() -> result<list<string>, admin-error>;
 
   // --- admin:site ---
-  /// The site's current serialized config (the same RON the admin API returns).
+  /// The site's current config as a JSON string (the `SiteConfig` wire form).
   site-config-get: func(site: string) -> result<string, admin-error>;
-  /// Replace the site's config with `config` (serialized RON). A newly-referenced domain must
-  /// already be verified (the guest can't attach an unverified domain via a config write).
+  /// Replace the site's config with `config` (a JSON `SiteConfig`). A newly-referenced domain
+  /// must already be verified (the guest can't attach an unverified domain via a config write),
+  /// and any `allow_imports` entry must be a known capability name.
   site-config-put: func(site: string, config: string) -> result<_, admin-error>;
 
   // --- admin:secrets (write-only; never reads a value back) ---

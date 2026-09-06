@@ -54,6 +54,9 @@ pub(crate) use admin_api::{
     list_graphql_safelist, put_graphql_function_subgraph, put_graphql_sql_subgraph,
     put_graphql_subgraph, register_graphql_safelist,
 };
+/// The server-side controller backing the guest `admin` capability (project self-config).
+#[cfg(feature = "admin")]
+mod admin_controller;
 mod auth;
 #[cfg(feature = "console")]
 pub mod console;
@@ -63,6 +66,8 @@ mod control_api;
 /// guest capability.
 #[cfg(feature = "email")]
 mod email_spool;
+#[cfg(feature = "admin")]
+pub use admin_controller::ServerAdminController;
 #[cfg(feature = "compression")]
 pub(crate) use content::maybe_compress;
 pub(crate) use content::multipart_byteranges;
@@ -359,6 +364,17 @@ struct HandlerRuntimeInner {
     /// offered (a guest granted `email` gets `access-denied`).
     #[cfg(feature = "email")]
     email_spool: std::sync::OnceLock<Arc<dyn boatramp_handlers::EmailSpool>>,
+    /// The server-side controller backing the guest `admin` capability. Set at startup via
+    /// [`HandlerRuntime::set_admin`]; unset ⇒ admin is not offered (a granted guest gets
+    /// `access-denied`). `.scoped(project)` per grant.
+    #[cfg(feature = "admin")]
+    admin_controller: std::sync::OnceLock<Arc<admin_controller::ServerAdminController>>,
+    /// The config surfaces the operator posture enables for guest admin (the posture-on subset
+    /// of {domains,email,site,secrets}); a guest's grant is intersected with this. Empty/unset ⇒
+    /// no surface is offered.
+    #[cfg(feature = "admin")]
+    admin_surfaces:
+        std::sync::OnceLock<std::collections::BTreeSet<boatramp_handlers::AdminSurface>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -417,6 +433,10 @@ impl HandlerRuntime {
                 email_profile_store: std::sync::OnceLock::new(),
                 #[cfg(feature = "email")]
                 email_spool: std::sync::OnceLock::new(),
+                #[cfg(feature = "admin")]
+                admin_controller: std::sync::OnceLock::new(),
+                #[cfg(feature = "admin")]
+                admin_surfaces: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -578,6 +598,22 @@ impl HandlerRuntime {
     pub fn set_email_spool(&self, spool: Arc<dyn boatramp_handlers::EmailSpool>) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.email_spool.set(spool);
+        }
+    }
+
+    /// Wire the guest `admin` capability: the server controller + the operator-enabled surface
+    /// set (the posture-on subset). Called at startup only when at least one
+    /// `allow_guest_admin_*` posture bit is on; unset ⇒ admin is not offered and a granted
+    /// guest's calls return `access-denied`. A guest's grant is intersected with `surfaces`.
+    #[cfg(feature = "admin")]
+    pub fn set_admin(
+        &self,
+        controller: Arc<admin_controller::ServerAdminController>,
+        surfaces: std::collections::BTreeSet<boatramp_handlers::AdminSurface>,
+    ) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.admin_controller.set(controller);
+            let _ = inner.admin_surfaces.set(surfaces);
         }
     }
 

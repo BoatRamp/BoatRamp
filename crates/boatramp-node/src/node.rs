@@ -217,6 +217,37 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         secrets_envelope.clone(),
     )
     .await?;
+    // Wire the guest project self-config capability (`boatramp:handlers/admin`) when the
+    // operator posture enables at least one surface. The controller reuses the same in-process
+    // domain-verify / email-profile / secret / site-config subsystems + the real domain probe;
+    // it's project-scoped per grant and rate-limited + audited. Posture-off ⇒ not offered.
+    #[cfg(feature = "admin")]
+    {
+        use boatramp_handlers::AdminSurface;
+        let p = &options.posture;
+        let mut surfaces = std::collections::BTreeSet::new();
+        if p.allow_guest_admin_domains {
+            surfaces.insert(AdminSurface::Domains);
+        }
+        if p.allow_guest_admin_email {
+            surfaces.insert(AdminSurface::Email);
+        }
+        if p.allow_guest_admin_site {
+            surfaces.insert(AdminSurface::Site);
+        }
+        if p.allow_guest_admin_secrets {
+            surfaces.insert(AdminSurface::Secrets);
+        }
+        if !surfaces.is_empty() {
+            let controller = Arc::new(boatramp_server::ServerAdminController::with_server_probe(
+                deploy.clone(),
+                email_profile_store.clone(),
+                secret_store.clone(),
+                p.domain_verify_allow_private,
+            ));
+            handlers.set_admin(controller, surfaces);
+        }
+    }
     // Leader-gate cron firing (cluster: only the Raft leader fires; single-node: an
     // always-true gate, equivalent to the unset default). The same gate drives the
     // reconcile loops below, so all three converge on one leader per fleet. Only the

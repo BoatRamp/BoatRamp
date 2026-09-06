@@ -1002,6 +1002,29 @@ pub(super) async fn build_bindings(
             }
         }
     }
+    // Guest project self-config (`boatramp:handlers/admin`): grant the surfaces the site allows,
+    // the handler imports, AND the operator posture enables — project-scoped host-side.
+    // Deny-by-default; an unenabled/ungranted surface's verbs return `access-denied`.
+    #[cfg(feature = "admin")]
+    if let (Some(controller), Some(enabled)) =
+        (inner.admin_controller.get(), inner.admin_surfaces.get())
+    {
+        use boatramp_handlers::AdminSurface;
+        let mut surfaces = std::collections::BTreeSet::new();
+        for (imp, surface) in [
+            ("admin:domains", AdminSurface::Domains),
+            ("admin:email", AdminSurface::Email),
+            ("admin:site", AdminSurface::Site),
+            ("admin:secrets", AdminSurface::Secrets),
+        ] {
+            if enabled.contains(&surface) && granted(imp) {
+                surfaces.insert(surface);
+            }
+        }
+        if !surfaces.is_empty() {
+            bindings = bindings.with_admin(controller.scoped(project), surfaces);
+        }
+    }
     // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested
     // import, but host-side observability. Tagged by `site` (so a site's live + preview output
     // aggregates under it), rate-capped per the site's `maxLogRate`, and correlated with the

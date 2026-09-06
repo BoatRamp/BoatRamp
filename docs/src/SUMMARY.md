@@ -33,6 +33,7 @@
 - [Encrypt secrets at rest](./how-to/secrets-at-rest.md)
 - [Give handlers & functions secrets](./how-to/secrets.md)
 - [Send email from a function or handler](./how-to/send-email.md)
+- [Let an app configure its own project](./how-to/self-configure.md)
 - [Enable the embedded web console](./how-to/web-console.md)
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Compose components into one handler](./how-to/compose.md)

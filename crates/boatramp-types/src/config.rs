@@ -915,6 +915,22 @@ impl SiteConfig {
     pub fn to_json(&self) -> Result<Vec<u8>, ConfigError> {
         serde_json::to_vec(self).map_err(|err| ConfigError::parse(err.to_string()))
     }
+
+    /// Validate the site-level handler import allowlist: every entry in
+    /// [`HandlersSiteConfig::allow_imports`] must be a recognized import name (a
+    /// `KNOWN_IMPORTS` interface, a named SQL binding `sql:<name>`/`sql:*`, or an admin
+    /// surface `admin:<surface>`). Called on the guest `admin:site` config-write path so a
+    /// self-configuring guest can't stash an unknown/typo'd capability name in the allowlist.
+    /// Defense-in-depth: the effective runtime grant is still the deploy-pinned manifest
+    /// `imports` ∩ this list ∩ posture, so a bogus entry can't escalate — this rejects it early.
+    pub fn validate_allow_imports(&self) -> Result<(), ConfigError> {
+        if let Some(handlers) = &self.handlers {
+            for import in &handlers.allow_imports {
+                check_import(import)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The hostnames a site answers to.

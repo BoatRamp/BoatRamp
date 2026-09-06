@@ -40,6 +40,11 @@ orm-subquery = ["handlers", "boatramp-handlers/orm-subquery"]
 # off in the lean build (which then also skips the lettre dependency).
 email = ["handlers", "boatramp-handlers/email"]
 
+# The guest project self-config capability (`boatramp:handlers/admin`): a guest reconfigures
+# its own project (domains / email profiles / site config / secrets) in-process via the
+# `ServerAdminController`. Implies `handlers`. On in batteries-included builds, off in lean.
+admin = ["handlers", "boatramp-handlers/admin"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

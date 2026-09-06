@@ -541,3 +541,35 @@ jobs:
             || { echo "::error::email live-delivery test did not pass" >&2; exit 1; }
           grep -q 'EMAIL LIVE SEND OK' email.log \
             || { echo "::error::email live delivery never reached the success marker (silent skip?)" >&2; exit 1; }
+
+  # Tier H — the guest project self-config capability (`boatramp:handlers/admin`). Every
+  # admin invariant is host-side authz, so the gate proves them ADVERSARIALLY against a
+  # single shared, flat control-plane keyspace holding two tenants: a guest scoped to one
+  # project can never read the other's secrets/email/site-config, a crafted `site` string
+  # can't escape the host-stamped `project/<proj>/…` prefix, credentials are write-only,
+  # multi-tenant posture enables NO surface, and a runaway is rate-limited. No privileges,
+  # no secrets, no egress — the isolation under test is the keyspace prefix, not the runner.
+  admin:
+    name: admin capability tenant invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-admin
+
+      - name: Prove cross-tenant isolation + multi-tenant lockdown (hard gate)
+        run: |
+          set -o pipefail
+          # Drives the real ServerAdminController with two tenants sharing one KV and asserts
+          # the full invariant set (cross-tenant read impossible, site-string escapes blocked,
+          # write-only creds, multi-tenant → no surface, rate-limited).
+          cargo test -p boatramp-server --features admin --test admin_live \
+            -- --ignored --nocapture 2>&1 | tee admin.log
+          # A silent skip still prints `test result: ok`; gate on the success marker that prints
+          # ONLY after every invariant held (the anti-silent-skip rule).
+          grep -qE 'test result: ok' admin.log \
+            || { echo "::error::admin capability test did not pass" >&2; exit 1; }
+          grep -q 'ADMIN CAPABILITY GATE OK' admin.log \
+            || { echo "::error::admin capability never reached the success marker (silent skip or tenant breach?)" >&2; exit 1; }

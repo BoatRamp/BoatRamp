@@ -85,6 +85,10 @@ sql-mysql = ["handlers", "boatramp-storage/sql-mysql"]
 # store + delivery spool into the handler runtime. Enables the server's `email`
 # feature (which pulls `boatramp-handlers/email` + lettre); implies handlers.
 email = ["handlers", "boatramp-server/email"]
+# The guest project self-config capability (`boatramp:handlers/admin`): wires the
+# ServerAdminController at startup for the posture-enabled surfaces. Enables the server's
+# `admin` feature (which pulls `boatramp-handlers/admin`); implies handlers.
+admin = ["handlers", "boatramp-server/admin", "boatramp-handlers/admin"]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []

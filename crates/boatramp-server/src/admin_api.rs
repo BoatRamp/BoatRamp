@@ -252,23 +252,28 @@ fn canon_domain_entry(host: &str) -> String {
 /// squat an unowned host by simply listing it. Hosts already on the site — and
 /// any non-domain edit — pass untouched, so the ordinary `access`/`gateway`
 /// config edits (which read-modify-write the current config) are unaffected.
-pub(super) async fn put_site_config(
-    State(deploy): State<DeployStore>,
-    Extension(project): axum::extract::Extension<ProjectContext>,
-    Path(site): Path<String>,
-    Json(config): Json<SiteConfig>,
-) -> Response {
-    if let Some(resp) = reject_invalid_name("site", &site) {
-        return resp;
-    }
-    let current = match deploy.get_site_config(project.as_ref(), &site).await {
-        Ok(c) => c.unwrap_or_default(),
-        Err(err) => return deploy_error_response(err),
-    };
-    // Diff on the *canonical* host form (case/trailing-dot folded, wildcard `*.`
-    // preserved) so it agrees with the normalizing verification lookup — else a
-    // case-variant of an already-attached host reads as "newly added" and a
-    // never-verified variant could be laundered in.
+/// Outcome of the added-domain verification guard: either every newly-added domain is
+/// ownership-verified, or one isn't (with a human reason).
+pub(super) enum DomainGuard {
+    Ok,
+    Unverified(String),
+}
+
+/// For a site-config write, ensure every **newly-added** domain is already ownership-verified
+/// (and a wildcard via DNS). Shared by the HTTP [`put_site_config`] and the guest `admin`
+/// site-config path so **neither** can attach an unverified domain — the routing-hijack guard.
+/// Diffs on the *canonical* host form (case/trailing-dot folded, wildcard `*.` preserved) so it
+/// agrees with the normalizing verification lookup and a case-variant can't launder a host in.
+pub(super) async fn check_added_domains_verified(
+    deploy: &DeployStore,
+    project: boatramp_core::project::ProjectRef<'_>,
+    site: &str,
+    next: &SiteConfig,
+) -> Result<DomainGuard, boatramp_core::error::DeployError> {
+    let current = deploy
+        .get_site_config(project, site)
+        .await?
+        .unwrap_or_default();
     let existing: std::collections::BTreeSet<String> = current
         .domains
         .exact_hosts()
@@ -281,52 +286,50 @@ pub(super) async fn put_site_config(
                 .map(|w| canon_domain_entry(w)),
         )
         .collect();
-    let added: Vec<String> = config
+    let added: Vec<String> = next
         .domains
         .exact_hosts()
         .map(canon_domain_entry)
-        .chain(
-            config
-                .domains
-                .wildcards
-                .iter()
-                .map(|w| canon_domain_entry(w)),
-        )
+        .chain(next.domains.wildcards.iter().map(|w| canon_domain_entry(w)))
         .filter(|host| !existing.contains(host))
         .collect();
     for host in added {
-        let verification = match deploy
-            .get_domain_verification(
-                project.as_ref(),
-                &boatramp_core::site::SiteName::new(site.as_str()),
-                &host,
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => return deploy_error_response(err),
-        };
+        let verification = deploy
+            .get_domain_verification(project, &boatramp_core::site::SiteName::new(site), &host)
+            .await?;
         if !verification.as_ref().is_some_and(|v| v.verified) {
-            return (
-                StatusCode::FORBIDDEN,
-                format!(
-                    "{host} is not verified for {site}; run \
-                     `boatramp domain add {host} --site {site}` first\n"
-                ),
-            )
-                .into_response();
+            return Ok(DomainGuard::Unverified(format!(
+                "{host} is not verified for {site}; verify it (`boatramp domain add {host} --site {site}`, or the admin `domain-verify`) first"
+            )));
         }
         // A wildcard needs DNS proof (parity with `attach_verified_domain`).
         if host.starts_with("*.")
             && verification.as_ref().map(|v| v.method)
                 != Some(boatramp_core::domain_verify::VerificationMethod::Dns)
         {
-            return (
-                StatusCode::FORBIDDEN,
-                format!("wildcard {host} must be verified via DNS (an HTTP token proves only the base host)\n"),
-            )
-                .into_response();
+            return Ok(DomainGuard::Unverified(format!(
+                "wildcard {host} must be verified via DNS (an HTTP token proves only the base host)"
+            )));
         }
+    }
+    Ok(DomainGuard::Ok)
+}
+
+pub(super) async fn put_site_config(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path(site): Path<String>,
+    Json(config): Json<SiteConfig>,
+) -> Response {
+    if let Some(resp) = reject_invalid_name("site", &site) {
+        return resp;
+    }
+    match check_added_domains_verified(&deploy, project.as_ref(), &site, &config).await {
+        Ok(DomainGuard::Ok) => {}
+        Ok(DomainGuard::Unverified(reason)) => {
+            return (StatusCode::FORBIDDEN, format!("{reason}\n")).into_response()
+        }
+        Err(err) => return deploy_error_response(err),
     }
     match deploy
         .set_site_config(project.as_ref(), &site, &config)

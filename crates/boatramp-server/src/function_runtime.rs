@@ -538,6 +538,29 @@ async fn build_function_bindings(
             }
         }
     }
+    // Guest project self-config (`boatramp:handlers/admin`): grant the surfaces this function
+    // imports AND the operator posture enables, project-scoped host-side. Deny-by-default — an
+    // unenabled/ungranted surface is simply absent (its verbs return `access-denied`).
+    #[cfg(feature = "admin")]
+    if let (Some(controller), Some(enabled)) =
+        (inner.admin_controller.get(), inner.admin_surfaces.get())
+    {
+        use boatramp_handlers::AdminSurface;
+        let mut surfaces = std::collections::BTreeSet::new();
+        for (imp, surface) in [
+            ("admin:domains", AdminSurface::Domains),
+            ("admin:email", AdminSurface::Email),
+            ("admin:site", AdminSurface::Site),
+            ("admin:secrets", AdminSurface::Secrets),
+        ] {
+            if enabled.contains(&surface) && granted(imp) {
+                surfaces.insert(surface);
+            }
+        }
+        if !surfaces.is_empty() {
+            bindings = bindings.with_admin(controller.scoped(project), surfaces);
+        }
+    }
     inner.logs.configure(scope, None);
     // A function invocation (API or in-process subgraph fetch) does not thread a request id
     // through the invoke path yet; its logs are scope-tagged but not request-correlated.
