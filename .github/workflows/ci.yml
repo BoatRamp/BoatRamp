@@ -274,19 +274,26 @@ jobs:
   # is `sql`-feature-gated, so the workspace lane (which enables only `boatramp/fs,slatedb`) would
   # silently skip it — a skip is not evidence — so this lane runs it explicitly with `sql` and
   # asserts a success marker, so a silent skip OR a cross-tenant regression fails the merge.
+  #
+  # Runs on the **host** toolchain (glibc), NOT the musl cross-target: the tenant-scope SQL
+  # semantics are libc-independent (a compiled `WHERE`/stamp the engine applies), and a
+  # cross-compiled-musl *test binary* + libsql-local's bundled SQLite has a runtime quirk under the
+  # static-musl test harness that the production musl binary doesn't hit (managed libsql is proven
+  # on musl by the container capability gate + real deployments). Matching the nightly, which runs
+  # target-agnostic logic tests on the host toolchain.
   test-orm-tenancy:
     name: test (ORM in-site tenant isolation)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-musl
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-orm-tenancy-musl
+          key: test-orm-tenancy-host
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
-          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
+          cargo test -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --nocapture 2>&1 | tee orm-tenancy.log
           grep -qE 'test result: ok\. 1 passed' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation test did not pass (silent skip or failure?)" >&2; exit 1; }

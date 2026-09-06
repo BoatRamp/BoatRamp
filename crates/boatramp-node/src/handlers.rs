@@ -411,6 +411,8 @@ pub async fn build_handler_runtime(
     // node has no guest to gate, so it is ignored.
     _allow_env_secret_refs: bool,
     _allow_guest_email: bool,
+    _require_tenancy_declaration: bool,
+    _allow_cross_tenant_db: bool,
     _deploy: &DeployStore,
     _secrets_envelope: Option<Arc<dyn KeyEnvelope>>,
 ) -> Result<boatramp_server::HandlerRuntime> {

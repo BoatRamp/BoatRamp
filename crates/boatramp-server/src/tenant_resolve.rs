@@ -167,7 +167,15 @@ async fn resolve_value(
             }
             #[cfg(not(feature = "oidc"))]
             {
-                let _ = (claim, inputs);
+                // Without `oidc` the token source can't verify — reference the token-only fields so
+                // they aren't flagged dead in a handlers-without-oidc build (the domain/none
+                // sources don't use them).
+                let _ = (
+                    claim,
+                    inputs.bearer,
+                    inputs.token_cfg,
+                    inputs.domain_context,
+                );
                 None
             }
         }
@@ -184,7 +192,8 @@ async fn resolve_value(
 }
 
 /// Convert a verified JSON claim scalar into a bound SQL value. Non-scalars (arrays/objects/null)
-/// are rejected — a tenant id is always a scalar.
+/// are rejected — a tenant id is always a scalar. Only reached from the `oidc` token branch.
+#[cfg(feature = "oidc")]
 fn scalar_to_sql(v: &serde_json::Value) -> Option<boatramp_core::sql::SqlValue> {
     use boatramp_core::sql::SqlValue;
     match v {
