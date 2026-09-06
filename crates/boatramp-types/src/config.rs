@@ -954,6 +954,16 @@ pub struct DomainConfig {
     /// (apex↔www canonicalization). Only exact aliases redirect — wildcard hosts
     /// serve as-is. Off by default.
     pub canonical_redirect: bool,
+    /// Per-host **tenant context tag** (Stage 0 in-site tenancy): host-or-wildcard-pattern → an
+    /// opaque tag the host binds as the in-site tenant when a function/site resolves "own" via
+    /// [`crate::tenancy::TenantSource::Domain`]. This is what lets ONE deployment serve many
+    /// customer storefronts, each on its own domain = its own tenant. An exact host with no own
+    /// entry inherits [`primary`](Self::primary)'s tag (apex↔www share a tenant); a subdomain
+    /// inherits its matching wildcard's tag. A host with no resolvable tag makes the domain source
+    /// fail closed (no cross-tenant read). The tag is bound as a parameter, never formatted into
+    /// SQL.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub contexts: BTreeMap<String, String>,
 }
 
 impl DomainConfig {
