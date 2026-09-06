@@ -375,15 +375,28 @@ pub struct Scope {
 
 impl Scope {
     /// The scope as a `WHERE`/`HAVING` predicate for the resolved mode, or `None` for
-    /// [`ScopeMode::All`] (cross-tenant — no tenant predicate at all).
+    /// [`ScopeMode::All`] (cross-tenant — no tenant predicate at all). Unqualified column.
     fn as_predicate(&self) -> Option<Predicate> {
+        self.as_predicate_for(None)
+    }
+
+    /// Like [`Scope::as_predicate`] but the tenant column is optionally qualified `<qualifier>.col`
+    /// — so the predicate binds to a specific table in a multi-table (join) or subquery context,
+    /// never accidentally to an outer/other table with the same column name (a scoping leak).
+    fn as_predicate_for(&self, qualifier: Option<&str>) -> Option<Predicate> {
+        let col = || {
+            Expr::Column(match qualifier {
+                Some(q) => format!("{q}.{}", self.column),
+                None => self.column.clone(),
+            })
+        };
         let eq = || Predicate::Cmp {
-            left: Expr::Column(self.column.clone()),
+            left: col(),
             op: CmpOp::Eq,
             right: Expr::Value(self.value.clone()),
         };
         let is_null = || Predicate::Null {
-            expr: Expr::Column(self.column.clone()),
+            expr: col(),
             negated: false,
         };
         match self.mode {
@@ -500,6 +513,7 @@ impl Select {
     /// injection point for reads; the guest never sets a scope of its own.
     pub fn force_scope(&mut self, scope: &Scope) {
         self.scope = Some(scope.clone());
+        self.inject_subquery_scope(scope);
         if let Some(u) = self.union.as_mut() {
             u.query.force_scope(scope);
         }
@@ -517,6 +531,20 @@ impl Insert {
     /// that axis, by design (an `all` write's `stamp_value()` is `None`, so nothing is forced).
     pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
         self.scope = write.cloned();
+        // A subquery embedded in a row cell or an upsert `SET` expr is a READ of another table —
+        // scope it to that table so it can't read cross-tenant.
+        if let Some(r) = read {
+            for row in &mut self.rows {
+                for cell in &mut row.cells {
+                    inject_scope_expr(r, &mut cell.value);
+                }
+            }
+            if let Some(c) = self.conflict.as_mut() {
+                for a in &mut c.update {
+                    inject_scope_expr(r, &mut a.value);
+                }
+            }
+        }
         if let Some((cols, src)) = self.from_select.as_mut() {
             match read {
                 Some(r) => src.force_scope(r),
@@ -564,17 +592,139 @@ fn push_projection(s: &mut Select, item: SelectItem) {
     }
 }
 
+/// Conjoin `add` (if any) as the FIRST conjunct of `filter` (`filter := add AND filter`). A
+/// no-op empty-`AND` existing filter is replaced outright, so the scope doesn't trail a spurious
+/// `AND 1 = 1`.
+fn conjoin_front(filter: &mut Predicate, add: Option<Predicate>) {
+    let Some(a) = add else { return };
+    if matches!(filter, Predicate::And(v) if v.is_empty()) {
+        *filter = a;
+    } else {
+        let existing = std::mem::replace(filter, Predicate::And(Vec::new()));
+        *filter = Predicate::And(vec![a, existing]);
+    }
+}
+
+/// Walk an expression and inject the tenant scope into every **narrow subquery**'s inner filter,
+/// qualified to that subquery's own table (`<subtable>.col`), so a subquery can't read another
+/// tenant's rows. Recurses into a subquery's filter first (nested subqueries scope their own
+/// tables). The correctness twin of [`Select::scope_where_pred`] for the subquery surface.
+fn inject_scope_expr(scope: &Scope, e: &mut Expr) {
+    match e {
+        Expr::RelatedAggregate { table, filter, .. }
+        | Expr::RelatedScalar { table, filter, .. } => {
+            inject_scope_pred(scope, filter);
+            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+        }
+        Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner),
+        Expr::Binary(_, l, r) | Expr::JsonExtractDyn(l, r) | Expr::JsonConcat(l, r) => {
+            inject_scope_expr(scope, l);
+            inject_scope_expr(scope, r);
+        }
+        Expr::Distance { left, right, .. } => {
+            inject_scope_expr(scope, left);
+            inject_scope_expr(scope, right);
+        }
+        Expr::Func(_, args) => args.iter_mut().for_each(|a| inject_scope_expr(scope, a)),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (when, then) in branches {
+                inject_scope_pred(scope, when);
+                inject_scope_expr(scope, then);
+            }
+            if let Some(e) = otherwise {
+                inject_scope_expr(scope, e);
+            }
+        }
+        Expr::Column(_) | Expr::Value(_) | Expr::Star | Expr::VectorLiteral(_) => {}
+    }
+}
+
+/// Walk a predicate and inject the tenant scope into every narrow subquery (see
+/// [`inject_scope_expr`]).
+fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
+    match p {
+        Predicate::InSubquery {
+            expr,
+            table,
+            filter,
+            ..
+        } => {
+            inject_scope_expr(scope, expr);
+            inject_scope_pred(scope, filter);
+            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+        }
+        Predicate::And(v) | Predicate::Or(v) => {
+            v.iter_mut().for_each(|c| inject_scope_pred(scope, c))
+        }
+        Predicate::Not(inner) => inject_scope_pred(scope, inner),
+        Predicate::Cmp { left, right, .. } => {
+            inject_scope_expr(scope, left);
+            inject_scope_expr(scope, right);
+        }
+        Predicate::Between {
+            expr, low, high, ..
+        } => {
+            inject_scope_expr(scope, expr);
+            inject_scope_expr(scope, low);
+            inject_scope_expr(scope, high);
+        }
+        Predicate::In { expr, values, .. } => {
+            inject_scope_expr(scope, expr);
+            values.iter_mut().for_each(|v| inject_scope_expr(scope, v));
+        }
+        Predicate::Like { expr, .. } | Predicate::Null { expr, .. } => {
+            inject_scope_expr(scope, expr)
+        }
+    }
+}
+
+impl Select {
+    /// Inject the tenant scope into every narrow subquery this SELECT embeds (its projection,
+    /// filter, having, group-by, order, and join `ON`s) so a subquery's own table is scoped — not
+    /// just the outer FROM. Called by [`Select::force_scope`] after setting the scope.
+    fn inject_subquery_scope(&mut self, scope: &Scope) {
+        for it in &mut self.columns {
+            inject_scope_expr(scope, &mut it.expr);
+        }
+        if let Some(f) = self.filter.as_mut() {
+            inject_scope_pred(scope, f);
+        }
+        if let Some(h) = self.having.as_mut() {
+            inject_scope_pred(scope, h);
+        }
+        for e in &mut self.group_by {
+            inject_scope_expr(scope, e);
+        }
+        for o in &mut self.order {
+            inject_scope_expr(scope, &mut o.expr);
+        }
+        for j in &mut self.joins {
+            inject_scope_pred(scope, &mut j.on);
+        }
+    }
+}
+
 impl Update {
-    /// Force a host-resolved write `scope` (conjoined into `WHERE`). Overwrites any prior scope.
+    /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
+    /// the `SET` exprs / filter. Overwrites any prior scope.
     pub fn force_scope(&mut self, scope: &Scope) {
         self.scope = Some(scope.clone());
+        for a in &mut self.set {
+            inject_scope_expr(scope, &mut a.value);
+        }
+        inject_scope_pred(scope, &mut self.filter);
     }
 }
 
 impl Delete {
-    /// Force a host-resolved write `scope` (conjoined into `WHERE`). Overwrites any prior scope.
+    /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
+    /// the filter. Overwrites any prior scope.
     pub fn force_scope(&mut self, scope: &Scope) {
         self.scope = Some(scope.clone());
+        inject_scope_pred(scope, &mut self.filter);
     }
 }
 
@@ -943,22 +1093,16 @@ fn render_pred(
     })
 }
 
-/// Render the `WHERE` body from an optional scope + optional predicate (scope conjoined first).
+/// Render the `WHERE` body from a pre-built scope predicate + optional filter (scope conjoined
+/// first). The scope predicate is built by the caller — single-table for UPDATE/DELETE
+/// ([`single_scope_pred`]), multi-table-qualified for a SELECT with joins
+/// ([`Select::scope_where_pred`]).
 fn render_where(
-    scope: Option<&Scope>,
+    scope_pred: Option<Predicate>,
     filter: Option<&Predicate>,
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<Option<String>, OrmError> {
-    // Validate the scope column eagerly (its predicate is rendered below). A `ScopeMode::All`
-    // scope contributes no predicate (cross-tenant), so it renders exactly like no scope.
-    let scope_pred = match scope {
-        Some(s) => {
-            ident(&s.column)?;
-            s.as_predicate()
-        }
-        None => None,
-    };
     // An empty `AND` filter is a no-op (always true) — drop it so it never adds a spurious
     // `AND 1 = 1`. (An empty `OR` means "match nothing" and is kept.)
     let filter = filter.filter(|f| !matches!(f, Predicate::And(v) if v.is_empty()));
@@ -971,6 +1115,17 @@ fn render_where(
         (Some(s), Some(f)) => Predicate::And(vec![s, f.clone()]),
     };
     Ok(Some(render_pred(&combined, params, false, dialect)?))
+}
+
+/// The single-table scope predicate for an UPDATE/DELETE (validates the column, unqualified).
+fn single_scope_pred(scope: Option<&Scope>) -> Result<Option<Predicate>, OrmError> {
+    match scope {
+        Some(s) => {
+            ident(&s.column)?;
+            Ok(s.as_predicate())
+        }
+        None => Ok(None),
+    }
 }
 
 /// Render a select list (empty ⇒ `*`).
@@ -1040,6 +1195,35 @@ impl Select {
         Ok((sql, params.0))
     }
 
+    /// The scope predicate to conjoin into this SELECT's `WHERE`. With **no joins** it's the
+    /// single-table (unqualified) predicate. With joins, the per-mode predicate is applied to
+    /// **every** table reference — the FROM table plus each join, qualified by its alias-or-name —
+    /// so a guest can't read a joined table's cross-tenant rows through the projection (a
+    /// join to a table lacking the tenant column then fails closed at the DB, not leaks).
+    /// `all`/no-scope ⇒ `None`.
+    fn scope_where_pred(&self) -> Result<Option<Predicate>, OrmError> {
+        let Some(scope) = &self.scope else {
+            return Ok(None);
+        };
+        ident(&scope.column)?;
+        if self.joins.is_empty() {
+            return Ok(scope.as_predicate());
+        }
+        let mut refs: Vec<&str> = Vec::with_capacity(self.joins.len() + 1);
+        refs.push(self.table_alias.as_deref().unwrap_or(&self.table));
+        for j in &self.joins {
+            refs.push(j.alias.as_deref().unwrap_or(&j.table));
+        }
+        let mut parts: Vec<Predicate> = Vec::with_capacity(refs.len());
+        for r in refs {
+            ident(r)?;
+            if let Some(p) = scope.as_predicate_for(Some(r)) {
+                parts.push(p);
+            }
+        }
+        Ok((!parts.is_empty()).then(|| Predicate::And(parts)))
+    }
+
     /// Render the full SELECT (body + any UNION branch) into the shared `params`. Reused by
     /// `INSERT … SELECT` so a source select shares the outer placeholder sequence. Module-private
     /// because `Params` is (Insert::compile, same module, is the other caller).
@@ -1096,7 +1280,7 @@ impl Select {
         }
 
         if let Some(w) = render_where(
-            self.scope.as_ref(),
+            self.scope_where_pred()?,
             self.filter.as_ref(),
             &mut *params,
             dialect,
@@ -1364,7 +1548,7 @@ impl Update {
         let set_sql = sets.join(", ");
 
         let where_sql = render_where(
-            self.scope.as_ref(),
+            single_scope_pred(self.scope.as_ref())?,
             Some(&self.filter),
             &mut params,
             dialect,
@@ -1394,7 +1578,7 @@ impl Delete {
         let table = ident(&self.table)?;
         let mut params = Params::default();
         let where_sql = render_where(
-            self.scope.as_ref(),
+            single_scope_pred(self.scope.as_ref())?,
             Some(&self.filter),
             &mut params,
             dialect,
@@ -1536,6 +1720,67 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM party WHERE tenant_id = ?1 UNION SELECT * FROM archived_party WHERE tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn scoped_select_scopes_every_joined_table() {
+        // A guest joins a victim table hoping to read its cross-tenant rows via the projection.
+        // force_scope must scope the FROM table AND every joined table (qualified by alias/name).
+        let mut q = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("v.secret"))],
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "victim".into(),
+                alias: Some("v".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("v.order_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("o.id"),
+                },
+            }],
+            ..Select::from("orders")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT v.secret FROM orders AS o LEFT JOIN victim AS v ON v.order_id = o.id \
+             WHERE o.tenant_id = ?1 AND v.tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn scoped_select_scopes_a_subquerys_inner_table() {
+        // A guest embeds a scalar subquery over another table; force_scope must scope the
+        // subquery's OWN table so it can't read cross-tenant.
+        let mut q = Select {
+            columns: vec![item(Expr::RelatedScalar {
+                column: "balance".into(),
+                table: "victim".into(),
+                filter: Box::new(Predicate::And(Vec::new())), // guest filter: none
+            })],
+            ..Select::from("orders")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        // The subquery's WHERE is scoped to victim.tenant_id; the outer to orders (single table).
+        assert_eq!(
+            sql,
+            "SELECT (SELECT balance FROM victim WHERE victim.tenant_id = ?1) \
+             FROM orders WHERE tenant_id = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
     }
