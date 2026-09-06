@@ -244,6 +244,12 @@ fn build_expr(
                 otherwise,
             }
         }
+        wit::ExprNode::JsonExtractDyn(p) => {
+            core::Expr::JsonExtractDyn(Box::new(child(p.left)?), Box::new(child(p.right)?))
+        }
+        wit::ExprNode::JsonConcat(p) => {
+            core::Expr::JsonConcat(Box::new(child(p.left)?), Box::new(child(p.right)?))
+        }
     })
 }
 

@@ -147,6 +147,9 @@ interface orm {
   // `otherwise` indexes the pred/expr arena and must stay strictly below this node (acyclic).
   record case-branch { when: u32, then: u32 }
   record case-node { branches: list<case-branch>, otherwise: option<u32> }
+  // A pair of expr indices (both strictly below the parent): used by the JSON dynamic-key
+  // extract `(exprs[left] ->> exprs[right])` and jsonb concat `(exprs[left] || exprs[right])`.
+  record json-pair { left: u32, right: u32 }
   variant expr-node {
     column(string),
     literal(value),
@@ -163,6 +166,8 @@ interface orm {
     vector-literal(string),     // a bracketed float list, bound + rendered `?N::vector`
     related-aggregate(related-aggregate-node),
     case-expr(case-node),
+    json-extract-dyn(json-pair),   // (exprs[left] ->> exprs[right]); PG+SQLite, MySQL fails closed
+    json-concat(json-pair),        // (exprs[left] || exprs[right]); Postgres-only
   }
 
   // ---- predicate arena -----------------------------------------------------

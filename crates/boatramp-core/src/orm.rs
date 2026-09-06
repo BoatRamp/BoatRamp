@@ -196,6 +196,13 @@ pub enum Expr {
         branches: Vec<(Predicate, Expr)>,
         otherwise: Option<Box<Expr>>,
     },
+    /// Extract a JSON value by a **dynamic/bound key**: `(base ->> key)` (key is an expression,
+    /// e.g. a bound param — `labels ->> ?`). Postgres + SQLite; MySQL fails closed (its `->>`
+    /// needs a `$.path`). Distinct from [`Expr::JsonExtract`], which takes a static key path.
+    JsonExtractDyn(Box<Self>, Box<Self>),
+    /// jsonb concat/merge `(left || right)` — **Postgres-only** (elsewhere `||` is string concat,
+    /// so it fails closed). Used for `col = col || ?::jsonb` merge updates.
+    JsonConcat(Box<Self>, Box<Self>),
 }
 
 impl Expr {
@@ -561,6 +568,28 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
             format!(
                 "(SELECT {}({arg_sql}) FROM {table_sql} WHERE {where_sql})",
                 agg.keyword()
+            )
+        }
+        Expr::JsonExtractDyn(base, key) => {
+            if matches!(dialect, Dialect::Mysql) {
+                return Err(OrmError::BadExpr(
+                    "dynamic-key json extract (->> <bound>) is not supported on MySQL",
+                ));
+            }
+            format!(
+                "({} ->> {})",
+                render_expr(base, params, dialect)?,
+                render_expr(key, params, dialect)?,
+            )
+        }
+        Expr::JsonConcat(left, right) => {
+            if dialect != Dialect::Postgres {
+                return Err(OrmError::BadExpr("json concat (||) is Postgres-only"));
+            }
+            format!(
+                "({} || {})",
+                render_expr(left, params, dialect)?,
+                render_expr(right, params, dialect)?,
             )
         }
         Expr::Case {
@@ -1617,6 +1646,54 @@ mod tests {
             })],
             ..Select::from("t")
         };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn json_extract_dyn_binds_the_key() {
+        // labels ->> ?  (bound key). Postgres + SQLite render `->>`; MySQL fails closed.
+        let q = Select {
+            columns: vec![item(Expr::JsonExtractDyn(
+                Box::new(Expr::col("labels")),
+                Box::new(Expr::val(t("en"))),
+            ))],
+            ..Select::from("vocabulary_term")
+        };
+        for d in [Dialect::Postgres, Dialect::Sqlite] {
+            assert_eq!(
+                q.compile(d).unwrap().0,
+                "SELECT (labels ->> ?1) FROM vocabulary_term"
+            );
+        }
+        assert!(matches!(
+            q.compile(Dialect::Mysql),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn json_concat_merge_is_postgres_only() {
+        // UPDATE request SET brief_state = brief_state || ?::jsonb WHERE id = ?
+        let q = Update {
+            table: "request".into(),
+            set: vec![Assignment {
+                column: "brief_state".into(),
+                value: Expr::JsonConcat(
+                    Box::new(Expr::col("brief_state")),
+                    Box::new(Expr::val(SqlValue::Json("{\"a\":1}".into()))),
+                ),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("req_1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert_eq!(
+            q.compile(Dialect::Postgres).unwrap().0,
+            "UPDATE request SET brief_state = (brief_state || ?1) WHERE id = ?2"
+        );
         assert!(matches!(
             q.compile(Dialect::Sqlite),
             Err(OrmError::BadExpr(_))
