@@ -203,6 +203,15 @@ pub enum Expr {
     /// jsonb concat/merge `(left || right)` — **Postgres-only** (elsewhere `||` is string concat,
     /// so it fails closed). Used for `col = col || ?::jsonb` merge updates.
     JsonConcat(Box<Self>, Box<Self>),
+    /// A **scalar subquery over a named table**: `(SELECT <column> FROM <table> WHERE <filter>)`.
+    /// The narrow non-aggregate sibling of [`Expr::RelatedAggregate`] (single named table + a
+    /// bound-parameter predicate — mechanically scopable, no arbitrary nested FROM). Used as the
+    /// RHS of a comparison, e.g. `id = (SELECT head_version FROM pack WHERE …)`.
+    RelatedScalar {
+        column: String,
+        table: String,
+        filter: Box<Predicate>,
+    },
 }
 
 impl Expr {
@@ -277,6 +286,15 @@ pub enum Predicate {
     },
     /// `<expr> IS [NOT] NULL`.
     Null { expr: Expr, negated: bool },
+    /// `<expr> [NOT] IN (SELECT <column> FROM <table> WHERE <filter>)` — a narrow single-named-
+    /// table IN-subquery (the sibling of [`Expr::RelatedScalar`]; same safe-by-construction shape).
+    InSubquery {
+        expr: Expr,
+        column: String,
+        table: String,
+        filter: Box<Predicate>,
+        negated: bool,
+    },
 }
 
 /// Build an `AND` of the given predicates.
@@ -584,6 +602,16 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
                 agg.keyword()
             )
         }
+        Expr::RelatedScalar {
+            column,
+            table,
+            filter,
+        } => {
+            let col_sql = ident(column)?;
+            let table_sql = ident(table)?;
+            let where_sql = render_pred(filter, params, false, dialect)?;
+            format!("(SELECT {col_sql} FROM {table_sql} WHERE {where_sql})")
+        }
         Expr::JsonExtractDyn(base, key) => {
             if matches!(dialect, Dialect::Mysql) {
                 return Err(OrmError::BadExpr(
@@ -760,6 +788,20 @@ fn render_pred(
             render_expr(expr, params, dialect)?,
             if *negated { "NOT " } else { "" }
         ),
+        Predicate::InSubquery {
+            expr,
+            column,
+            table,
+            filter,
+            negated,
+        } => {
+            let lhs = render_expr(expr, params, dialect)?;
+            let col_sql = ident(column)?;
+            let table_sql = ident(table)?;
+            let where_sql = render_pred(filter, params, false, dialect)?;
+            let not = if *negated { "NOT " } else { "" };
+            format!("{lhs} {not}IN (SELECT {col_sql} FROM {table_sql} WHERE {where_sql})")
+        }
     })
 }
 
@@ -1817,6 +1859,45 @@ mod tests {
             "INSERT INTO portfolio_ref (a, b) SELECT x, y FROM portfolio_item WHERE id = ?1"
         );
         assert_eq!(params, vec![t("pi_1")]);
+    }
+
+    #[test]
+    fn related_scalar_and_in_subquery_render() {
+        // id = (SELECT head_version FROM pack WHERE id = ?1)
+        let q = Select {
+            columns: vec![item(Expr::col("id"))],
+            filter: Some(Predicate::Cmp {
+                left: Expr::col("id"),
+                op: CmpOp::Eq,
+                right: Expr::RelatedScalar {
+                    column: "head_version".into(),
+                    table: "pack".into(),
+                    filter: Box::new(cmp("id", CmpOp::Eq, t("pk_1"))),
+                },
+            }),
+            ..Select::from("pack_version")
+        };
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap().0,
+            "SELECT id FROM pack_version WHERE id = (SELECT head_version FROM pack WHERE id = ?1)"
+        );
+
+        // doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)
+        let q2 = Select {
+            columns: vec![item(Expr::col("x"))],
+            filter: Some(Predicate::InSubquery {
+                expr: Expr::col("doc_id"),
+                column: "id".into(),
+                table: "document".into(),
+                filter: Box::new(cmp("tenant_id", CmpOp::Eq, t("ten_1"))),
+                negated: false,
+            }),
+            ..Select::from("access")
+        };
+        assert_eq!(
+            q2.compile(Dialect::Sqlite).unwrap().0,
+            "SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)"
+        );
     }
 
     #[test]

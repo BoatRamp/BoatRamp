@@ -250,7 +250,37 @@ fn build_expr(
         wit::ExprNode::JsonConcat(p) => {
             core::Expr::JsonConcat(Box::new(child(p.left)?), Box::new(child(p.right)?))
         }
+        // The filter is bounded by this node's index `i` (no self/forward reference).
+        wit::ExprNode::RelatedScalar(r) => build_related_scalar(exprs, preds, r, i)?,
     })
+}
+
+/// Rebuild a narrow scalar subquery. Gated on `orm-subquery` (same isolation surface + the only
+/// subquery forms as [`build_related_aggregate`]).
+#[cfg(feature = "orm-subquery")]
+fn build_related_scalar(
+    exprs: &[wit::ExprNode],
+    preds: &[wit::PredNode],
+    r: &wit::RelatedScalarNode,
+    upper: usize,
+) -> Result<core::Expr, wit::Error> {
+    Ok(core::Expr::RelatedScalar {
+        column: r.column.clone(),
+        table: r.table.clone(),
+        filter: Box::new(build_pred(preds, exprs, r.filter, upper)?),
+    })
+}
+
+#[cfg(not(feature = "orm-subquery"))]
+fn build_related_scalar(
+    _exprs: &[wit::ExprNode],
+    _preds: &[wit::PredNode],
+    _r: &wit::RelatedScalarNode,
+    _upper: usize,
+) -> Result<core::Expr, wit::Error> {
+    Err(bad_arena(
+        "related-scalar requires the host's orm-subquery feature",
+    ))
 }
 
 /// Rebuild a correlated roll-up. Gated on the host's `orm-subquery` feature: it is the only
@@ -346,7 +376,45 @@ fn build_pred(
             expr: pexpr(n.expr)?,
             negated: n.negated,
         },
+        // The subquery filter is a pred child (must be < this node's index) whose expressions
+        // stay bounded by `expr_upper` — same acyclic rule as any nested predicate.
+        wit::PredNode::InSubquery(n) => build_in_subquery(preds, exprs, n, i, expr_upper)?,
     })
+}
+
+/// Rebuild a narrow IN-subquery. Gated on `orm-subquery` (same isolation surface as the other
+/// subquery forms).
+#[cfg(feature = "orm-subquery")]
+fn build_in_subquery(
+    preds: &[wit::PredNode],
+    exprs: &[wit::ExprNode],
+    n: &wit::InSubqueryNode,
+    pred_i: usize,
+    expr_upper: usize,
+) -> Result<core::Predicate, wit::Error> {
+    if n.filter as usize >= pred_i {
+        return Err(bad_arena("in-subquery filter index must be < its parent"));
+    }
+    Ok(core::Predicate::InSubquery {
+        expr: build_expr(exprs, preds, n.expr, expr_upper)?,
+        column: n.column.clone(),
+        table: n.table.clone(),
+        filter: Box::new(build_pred(preds, exprs, n.filter, expr_upper)?),
+        negated: n.negated,
+    })
+}
+
+#[cfg(not(feature = "orm-subquery"))]
+fn build_in_subquery(
+    _preds: &[wit::PredNode],
+    _exprs: &[wit::ExprNode],
+    _n: &wit::InSubqueryNode,
+    _pred_i: usize,
+    _expr_upper: usize,
+) -> Result<core::Predicate, wit::Error> {
+    Err(bad_arena(
+        "in-subquery requires the host's orm-subquery feature",
+    ))
 }
 
 fn to_sqlvalue(v: wit::Value) -> SqlValue {
@@ -970,6 +1038,42 @@ mod tests {
             )),
             "got: {log:?}"
         );
+    }
+
+    #[cfg(feature = "orm-subquery")]
+    #[tokio::test]
+    async fn in_subquery_rebuilds_from_the_arena() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        // SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)
+        let sel = wit::SelectQuery {
+            exprs: vec![
+                col("doc_id"),      // 0
+                col("tenant_id"),   // 1
+                lit(text("ten_1")), // 2
+                col("x"),           // 3
+            ],
+            preds: vec![
+                cmp(1, wit::CmpOp::Eq, 2), // 0: the subquery filter
+                wit::PredNode::InSubquery(wit::InSubqueryNode {
+                    expr: 0,
+                    column: "id".into(),
+                    table: "document".into(),
+                    filter: 0,
+                    negated: false,
+                }), // 1
+            ],
+            columns: vec![item(3)],
+            filter: Some(1),
+            ..empty_select("access")
+        };
+        host.select(db, sel).await.unwrap();
+        assert!(log.lock().unwrap().iter().any(|l| l.starts_with(
+            "query|SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)|"
+        )));
     }
 
     #[cfg(feature = "orm-subquery")]
