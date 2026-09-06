@@ -79,6 +79,14 @@ impl HostTenancy {
         }
     }
 
+    /// The resolved tenant value, if any. Used by the host to **propagate** the caller's tenant
+    /// down an in-project invoke chain (host-carried — never read from a guest-supplied invoke
+    /// request), so an invoked sibling inherits the caller's tenant identity while applying its
+    /// own grant.
+    pub fn value(&self) -> Option<&SqlValue> {
+        self.value.as_ref()
+    }
+
     fn mode(&self, axis: Axis) -> AccessMode {
         match axis {
             Axis::Read => self.read,

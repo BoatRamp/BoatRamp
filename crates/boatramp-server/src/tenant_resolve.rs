@@ -90,6 +90,43 @@ pub(crate) async fn resolve_host_tenancy(
     }
 }
 
+/// Resolve tenancy for an **in-project invoke** (a function/handler calling a sibling): the tenant
+/// **value** is inherited from the caller (host-carried, not from the guest's invoke request), and
+/// the callee applies its OWN declared column + modes. Same Dimension-0 refusal + posture cap as
+/// [`resolve_host_tenancy`]; the only difference is the value comes from the caller, not a source.
+pub(crate) fn resolve_inherited_tenancy(
+    decision: Option<&Tenancy>,
+    imports_db: bool,
+    posture: TenantPosture,
+    inherited: Option<boatramp_core::sql::SqlValue>,
+) -> Result<Option<HostTenancy>, TenancyUndeclared> {
+    match decision {
+        None => {
+            if imports_db && posture.require_declaration {
+                Err(TenancyUndeclared)
+            } else {
+                Ok(None)
+            }
+        }
+        Some(Tenancy::Disabled) => Ok(None),
+        Some(Tenancy::Scoped {
+            column,
+            read,
+            write,
+            ..
+        }) => {
+            let read = cap(*read, posture.allow_cross_tenant);
+            let write = normalize_write(cap(*write, posture.allow_cross_tenant));
+            Ok(Some(HostTenancy::new(
+                column.clone(),
+                inherited,
+                read,
+                write,
+            )))
+        }
+    }
+}
+
 /// Cap a cross-tenant `all` grant to `own` unless the posture permits crossing tenants.
 fn cap(mode: AccessMode, allow_cross_tenant: bool) -> AccessMode {
     if mode == AccessMode::All && !allow_cross_tenant {
@@ -170,6 +207,44 @@ mod tests {
             require_declaration: require,
             allow_cross_tenant: cross,
         }
+    }
+
+    #[test]
+    fn inherited_invoke_uses_the_caller_value_with_the_callee_grant() {
+        // A sibling invoked with `read: own_or_null, write: all` inherits the caller's tenant
+        // VALUE but applies its OWN modes (write `all` capped to own under the strict posture,
+        // own+null-write degraded to own).
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            source: TenantSource::None, // irrelevant on the invoke path — the value is inherited
+            read: AccessMode::OwnOrNull,
+            write: AccessMode::All,
+        };
+        let ht = resolve_inherited_tenancy(
+            Some(&decision),
+            true,
+            posture(true, false),
+            Some(SqlValue::Text("caller-tenant".into())),
+        )
+        .unwrap()
+        .unwrap();
+        let read = ht
+            .orm_scope(boatramp_handlers::TenantAxis::Read)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.value, SqlValue::Text("caller-tenant".into()));
+        assert_eq!(read.mode, boatramp_core::orm::ScopeMode::OwnOrNull);
+        // write: all capped to own (posture closed) → a concrete predicate, bound to the caller's value.
+        let write = ht
+            .orm_scope(boatramp_handlers::TenantAxis::Write)
+            .unwrap()
+            .unwrap();
+        assert_eq!(write.mode, boatramp_core::orm::ScopeMode::Own);
+        // A sibling with no inherited value + an own grant fails closed.
+        let ht = resolve_inherited_tenancy(Some(&decision), true, posture(true, false), None)
+            .unwrap()
+            .unwrap();
+        assert!(ht.orm_scope(boatramp_handlers::TenantAxis::Read).is_err());
     }
 
     #[tokio::test]

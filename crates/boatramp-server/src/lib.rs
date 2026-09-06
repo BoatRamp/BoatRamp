@@ -3697,6 +3697,7 @@ mod tests {
                 request(),
                 0,
                 boatramp_handlers::Lane::Sync,
+                crate::function_runtime::FnTenant::Request,
             )
             .await;
             assert!(response.status().is_success(), "invocation should succeed");

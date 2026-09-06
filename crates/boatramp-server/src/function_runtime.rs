@@ -8,6 +8,20 @@ use super::*;
 
 use boatramp_core::project::ProjectRef;
 
+/// How the in-site tenant is sourced for one function invocation (Stage 0). Chosen by the entry
+/// point: an HTTP invoke trusts its inbound request; an in-project invoke inherits the caller's
+/// host-resolved tenant (never the guest's invoke request); background triggers have no trusted
+/// source (an `own` op then fails closed).
+#[cfg(feature = "handlers")]
+pub(super) enum FnTenant {
+    /// A trusted inbound HTTP request — resolve from its verified bearer + routed domain tag.
+    Request,
+    /// Inherit the caller's host-resolved tenant value down an in-project invoke chain.
+    Inherited(Option<boatramp_core::sql::SqlValue>),
+    /// No trusted source (cron / consumer / webhook / durable drain).
+    Background,
+}
+
 /// The authority the engine sees for an invoked function. `wasi:http` needs a
 /// scheme + authority; the public control-plane path is the host's concern, so
 /// every function is invoked at `http://function.invoke/`.
@@ -165,6 +179,9 @@ async fn execute_sync(
         request,
         0,
         boatramp_handlers::Lane::Sync,
+        // Top-level HTTP invoke (depth 0): trust the inbound request's verified bearer + routed
+        // domain tag as the tenant source. Sibling invokes go through FunctionInvoker (inherited).
+        FnTenant::Request,
     )
     .await;
     let Some(key) = idem_key else {
@@ -336,6 +353,8 @@ pub(super) async fn execute_function(
     // (tight ceiling, shared pool), `Async` for the durable drain / workflow
     // step (large ceiling, isolated pool). See [`boatramp_handlers::Lane`].
     lane: boatramp_handlers::Lane,
+    // How the in-site tenant is sourced for this invocation (Stage 0).
+    tenant: FnTenant,
 ) -> (Response, u64) {
     // Concurrency quota (held through the head, mirroring the site permit).
     // Keyed by the **project-qualified** function identity so a same-named
@@ -367,19 +386,48 @@ pub(super) async fn execute_function(
     // takes the *raw* `fn/<name>` identity (it composes the same `default →
     // fn/<name>`, `non-default → {project}/fn/<name>` the `scope` above carries)
     // — never the already-qualified `scope`, to avoid double-qualifying.
-    let bindings =
-        match build_function_bindings(inner, project, &scope, &fn_ident, &function.config, depth)
-            .await
-        {
-            Ok(bindings) => bindings,
-            // A refused secret ref (a host-env ref under the multi-tenant posture, or
-            // an unsupported scheme) fails the invocation closed — the function never
-            // runs with a leaked or missing value.
-            Err(err) => {
-                tracing::warn!(function = %function.name, %err, "function bindings refused");
-                return (handler_unavailable(), 0);
-            }
-        };
+    // Stage 0 tenant source: a trusted HTTP request contributes its verified bearer + routed
+    // domain tag; an in-project invoke carries the caller's resolved value; background has none.
+    let (bearer, domain_context) = match tenant {
+        FnTenant::Request => (
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    s.strip_prefix("Bearer ")
+                        .or_else(|| s.strip_prefix("bearer "))
+                })
+                .map(str::to_string),
+            request
+                .extensions()
+                .get::<crate::DomainContext>()
+                .map(|c| c.0.clone()),
+        ),
+        _ => (None, None),
+    };
+    let bindings = match build_function_bindings(
+        inner,
+        project,
+        &scope,
+        &fn_ident,
+        &function.config,
+        depth,
+        &tenant,
+        bearer.as_deref(),
+        domain_context.as_deref(),
+    )
+    .await
+    {
+        Ok(bindings) => bindings,
+        // A refused secret ref (a host-env ref under the multi-tenant posture, or
+        // an unsupported scheme) fails the invocation closed — the function never
+        // runs with a leaked or missing value.
+        Err(err) => {
+            tracing::warn!(function = %function.name, %err, "function bindings refused");
+            return (handler_unavailable(), 0);
+        }
+    };
     let limits = function_limits(function.config.limits.as_ref());
     let request = prepare_invoke_request(request);
     let start = std::time::Instant::now();
@@ -433,6 +481,7 @@ pub(super) async fn execute_function(
 /// its declared `imports` **are** its grants — served under its own `fn/<name>`
 /// scope so kv/blob/messaging/sql land in an isolated namespace.
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
 async fn build_function_bindings(
     inner: &HandlerRuntimeInner,
     project: ProjectRef<'_>,
@@ -440,6 +489,9 @@ async fn build_function_bindings(
     sql_site: &str,
     config: &boatramp_core::function::FunctionConfig,
     depth: u32,
+    tenant: &FnTenant,
+    bearer: Option<&str>,
+    domain_context: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| config.imports.iter().any(|i| i == name);
     let mut bindings = boatramp_handlers::Bindings::new(scope);
@@ -481,12 +533,12 @@ async fn build_function_bindings(
             }
         }
     }
-    // Stage 0: resolve the in-site tenant scope (applied to both sql + orm). An undeclared
-    // sql/orm importer is refused under the strict posture (Dimension 0); an `all` grant is
-    // capped to `own` unless the posture opens cross-tenant. A top-level function currently
-    // carries no request context, so a token/domain source resolves no value (an `own` op then
-    // fails closed) — threading the invoke bearer/domain to functions is a follow-up.
-    {
+    // Stage 0: resolve the in-site tenant scope (applied to both sql + orm), by source: a trusted
+    // HTTP request (bearer/domain), an inherited invoke-chain value, or none. An undeclared
+    // sql/orm importer is refused under the strict posture (Dimension 0); an `all` grant is capped
+    // to `own` unless the posture opens cross-tenant. The resolved value is also carried into the
+    // `invoke` binding below so a sibling this function calls inherits the same tenant.
+    let host_tenancy = {
         let imports_db = granted("sql") || config.imports.iter().any(|i| i.starts_with("sql:"));
         let posture = crate::tenant_resolve::TenantPosture {
             require_declaration: inner
@@ -496,16 +548,40 @@ async fn build_function_bindings(
                 .unwrap_or(true),
             allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
         };
-        let tenancy = crate::tenant_resolve::resolve_host_tenancy(
-            config.tenancy.as_ref(),
-            imports_db,
-            posture,
-            crate::tenant_resolve::TenantSourceInputs::default(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        bindings = bindings.with_tenancy(tenancy);
-    }
+        let resolved = match tenant {
+            FnTenant::Request => crate::tenant_resolve::resolve_host_tenancy(
+                config.tenancy.as_ref(),
+                imports_db,
+                posture,
+                crate::tenant_resolve::TenantSourceInputs {
+                    bearer,
+                    domain_context,
+                    token_cfg: config.token_claims.as_ref(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+            FnTenant::Inherited(value) => crate::tenant_resolve::resolve_inherited_tenancy(
+                config.tenancy.as_ref(),
+                imports_db,
+                posture,
+                value.clone(),
+            )
+            .map_err(|e| e.to_string())?,
+            FnTenant::Background => crate::tenant_resolve::resolve_host_tenancy(
+                config.tenancy.as_ref(),
+                imports_db,
+                posture,
+                crate::tenant_resolve::TenantSourceInputs::default(),
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        };
+        bindings = bindings.with_tenancy(resolved.clone());
+        resolved
+    };
+    // The tenant value to propagate down an in-project invoke chain (host-carried).
+    let caller_tenant = host_tenancy.as_ref().and_then(|h| h.value().cloned());
     if granted("wasi:messaging") {
         if let Some(messaging) = &inner.messaging {
             // Private topics namespace under the function's own scope; `bus:<topic>`
@@ -524,7 +600,7 @@ async fn build_function_bindings(
     if granted("invoke") && !config.invoke_targets.is_empty() {
         if let Some(invoker) = inner.invoker.get() {
             bindings = bindings.with_invoke(
-                invoker.scoped(project),
+                invoker.scoped(project, caller_tenant.clone()),
                 config.invoke_targets.clone(),
                 depth,
             );
@@ -670,6 +746,11 @@ pub(crate) struct FunctionInvoker {
     /// project, never across the tenant boundary. The startup template carries
     /// `default`; [`scoped`](Self::scoped) rebinds it per caller.
     project: String,
+    /// The caller's host-resolved **in-site tenant value** (Stage 0), carried so an invoked sibling
+    /// inherits the caller's tenant identity — host-propagated, never read from the guest's invoke
+    /// request. `None` when the caller has no resolved tenant (plain / anonymous). Set per binding
+    /// by [`scoped`](Self::scoped).
+    caller_tenant: Option<boatramp_core::sql::SqlValue>,
 }
 
 #[cfg(feature = "handlers")]
@@ -679,17 +760,24 @@ impl FunctionInvoker {
             deploy,
             runtime,
             project: ProjectRef::DEFAULT.as_str().to_string(),
+            caller_tenant: None,
         }
     }
 
-    /// Derive a project-scoped invoker: the same store + runtime, but resolving
-    /// the caller's siblings within `project`. Built per binding (a site handler
-    /// or a top-level function) so the `invoke` capability never crosses tenants.
-    pub(crate) fn scoped(&self, project: ProjectRef<'_>) -> Arc<dyn boatramp_handlers::Invoker> {
+    /// Derive a project-scoped invoker: the same store + runtime, but resolving the caller's
+    /// siblings within `project`, carrying the caller's host-resolved `caller_tenant` so an invoked
+    /// sibling inherits it (Stage 0). Built per binding (a site handler or a top-level function) so
+    /// the `invoke` capability never crosses tenants.
+    pub(crate) fn scoped(
+        &self,
+        project: ProjectRef<'_>,
+        caller_tenant: Option<boatramp_core::sql::SqlValue>,
+    ) -> Arc<dyn boatramp_handlers::Invoker> {
         Arc::new(Self {
             deploy: self.deploy.clone(),
             runtime: self.runtime.clone(),
             project: project.as_str().to_string(),
+            caller_tenant,
         })
     }
 }
@@ -740,6 +828,9 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             axum_request,
             depth,
             boatramp_handlers::Lane::Sync,
+            // In-project invoke: the sibling inherits the caller's host-resolved tenant (never the
+            // guest's invoke request), applying its own declared grant.
+            FnTenant::Inherited(self.caller_tenant.clone()),
         )
         .await;
         let invoke_response = buffer_invoke_response(response).await;
@@ -792,6 +883,7 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             axum_request,
             depth,
             boatramp_handlers::Lane::Sync,
+            FnTenant::Inherited(self.caller_tenant.clone()),
         )
         .await;
         let stream_response = stream_invoke_response(response);
@@ -913,6 +1005,8 @@ pub(super) async fn introspect_service_sdl(
             request,
             0,
             boatramp_handlers::Lane::Sync,
+            // Host-initiated subgraph SDL fetch — no tenant source (introspection).
+            FnTenant::Background,
         ),
     )
     .await;
@@ -1137,6 +1231,9 @@ async fn run_claimed_invocation(
         request,
         0,
         boatramp_handlers::Lane::Async,
+        // Durable drain (stored-request replay): no live request; the original tenant isn't
+        // persisted, so an `own` op fails closed (safe).
+        FnTenant::Background,
     )
     .await;
     let (status, content_type, body) = capture_response(response).await;
@@ -1634,6 +1731,8 @@ async fn dispatch_function_queue(
             request,
             0,
             boatramp_handlers::Lane::Async,
+            // Queue-drained webhook (background): no tenant source.
+            FnTenant::Background,
         )
         .await;
         let (status, _content_type, body) = capture_response(response).await;
@@ -1767,6 +1866,9 @@ pub(super) async fn webhook_ingress(
         request,
         0,
         boatramp_handlers::Lane::Sync,
+        // Inbound webhook: the signed-context tenant source is reserved (unwired), so no source
+        // yet — an `own` op fails closed.
+        FnTenant::Background,
     )
     .await;
     let sample = boatramp_core::function::MeteringSample {

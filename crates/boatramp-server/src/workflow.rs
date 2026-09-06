@@ -241,6 +241,8 @@ async fn run_workflow_step(
         request,
         0,
         boatramp_handlers::Lane::Async,
+        // A workflow step is durable background work — no live tenant source (fail-closed for own).
+        crate::function_runtime::FnTenant::Background,
     )
     .await;
     let (status, _content_type, body) = capture_response(response).await;
@@ -281,6 +283,8 @@ async fn compensate_run(
                         request,
                         0,
                         boatramp_handlers::Lane::Async,
+                        // Compensation step: durable background work, no live tenant source.
+                        crate::function_runtime::FnTenant::Background,
                     )
                     .await;
                 }
