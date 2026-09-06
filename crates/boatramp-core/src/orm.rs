@@ -468,8 +468,9 @@ pub struct Insert {
     /// `RETURNING <items>` (empty ⇒ none). Not supported by every engine (e.g. MySQL).
     pub returning: Vec<SelectItem>,
     /// `INSERT INTO t (<columns>) <select>` — when set, rows come from a SELECT (`rows` ignored).
-    /// The scope is **not** auto-stamped here (the source select governs which rows are read;
-    /// include the tenant column in `columns` + the select's projection if the target needs it).
+    /// Under a scoped write, [`Insert::force_scope`] read-scopes the source **and** host-forces the
+    /// target tenant column (dropping any guest projection of it), so the written tenant can't be
+    /// forged; without a scope (or `all`) the columns/projection are taken verbatim.
     pub from_select: Option<(Vec<String>, Box<Select>)>,
 }
 
@@ -509,17 +510,57 @@ impl Insert {
     /// Force the host-resolved tenant scope. `write` stamps the tenant column on a
     /// `VALUES`-based insert (per [`ScopeMode`]); for an `INSERT … SELECT`, the `read` scope is
     /// forced onto the source query (and its nested unions) so the selected rows stay
-    /// tenant-isolated (the target columns are still taken verbatim — no auto-stamp on that path).
+    /// tenant-isolated, **and** the target tenant column is host-forced too — any guest-supplied
+    /// tenant column + its projection is dropped and re-appended bound to the resolved value, so a
+    /// guest can't project another tenant's id into the write (a cross-tenant write forgery).
     /// `None` for an axis (cross-tenant `all`) clears that scope — the operation runs unscoped on
-    /// that axis, by design.
+    /// that axis, by design (an `all` write's `stamp_value()` is `None`, so nothing is forced).
     pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
         self.scope = write.cloned();
-        if let Some((_, src)) = self.from_select.as_mut() {
+        if let Some((cols, src)) = self.from_select.as_mut() {
             match read {
                 Some(r) => src.force_scope(r),
                 None => src.scope = None,
             }
+            // A scoped write owns the tenant column written — never trust the guest's target
+            // projection. Drop any guest-supplied tenant column (+ its aligned projection, in the
+            // source and every union branch) and re-append it bound to the host value.
+            if let Some(v) = write.and_then(Scope::stamp_value) {
+                let column = write.expect("stamp implies write").column.clone();
+                if let Some(i) = cols.iter().position(|c| c == &column) {
+                    cols.remove(i);
+                    drop_projection_at(src, i);
+                }
+                cols.push(column);
+                push_projection(
+                    src,
+                    SelectItem {
+                        expr: Expr::Value(v),
+                        alias: None,
+                    },
+                );
+            }
         }
+    }
+}
+
+/// Remove the projection at index `i` from a `SELECT` and every one-level `UNION` branch, keeping
+/// the branches' column counts aligned (used by [`Insert::force_scope`]).
+fn drop_projection_at(s: &mut Select, i: usize) {
+    if i < s.columns.len() {
+        s.columns.remove(i);
+    }
+    if let Some(u) = s.union.as_mut() {
+        drop_projection_at(&mut u.query, i);
+    }
+}
+
+/// Append `item` to a `SELECT`'s projection and every one-level `UNION` branch (so both sides of
+/// a union source stamp the same host tenant value).
+fn push_projection(s: &mut Select, item: SelectItem) {
+    s.columns.push(item.clone());
+    if let Some(u) = s.union.as_mut() {
+        push_projection(&mut u.query, item);
     }
 }
 
@@ -1435,6 +1476,44 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 UNION SELECT * FROM archived_party WHERE tenant_id = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn insert_select_cannot_forge_the_target_tenant() {
+        // A guest projects a chosen tenant id into the target `tenant_id` column. force_scope must
+        // drop that projection and re-bind the host-resolved own value — no cross-tenant forgery.
+        let source = Select {
+            columns: vec![
+                item(Expr::val(t("VICTIM"))), // guest-chosen tenant id
+                item(Expr::col("total")),
+            ],
+            ..Select::from("orders")
+        };
+        let mut ins = Insert {
+            table: "orders".into(),
+            rows: vec![],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: Some((vec!["tenant_id".into(), "total".into()], Box::new(source))),
+        };
+        let own = Scope {
+            column: "tenant_id".into(),
+            value: t("OWN"),
+            mode: ScopeMode::Own,
+        };
+        ins.force_scope(Some(&own), Some(&own));
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        // The tenant column is re-appended last, bound to OWN; the source is read-scoped to OWN.
+        assert_eq!(
+            sql,
+            "INSERT INTO orders (total, tenant_id) SELECT total, ?1 FROM orders WHERE tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("OWN"), t("OWN")]);
+        assert!(
+            !params.contains(&t("VICTIM")),
+            "the forged tenant never binds"
+        );
     }
 
     #[test]

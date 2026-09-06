@@ -1008,9 +1008,11 @@ mod tests {
         assert!(log.iter().any(|l| l.starts_with(
             "query|SELECT * FROM live WHERE tenant_id = ?1 UNION SELECT * FROM archived WHERE tenant_id = ?2|"
         )));
-        // The INSERT…SELECT source is read-scoped.
-        assert!(log.iter().any(|l| l
-            .starts_with("execute|INSERT INTO dst (id) SELECT id FROM src WHERE tenant_id = ?1|")));
+        // The INSERT…SELECT source is read-scoped AND the target tenant column is host-forced
+        // (appended, bound to the resolved tenant) — the guest can't forge the written tenant.
+        assert!(log.iter().any(|l| l.starts_with(
+            "execute|INSERT INTO dst (id, tenant_id) SELECT id, ?1 FROM src WHERE tenant_id = ?2|"
+        ) && l.contains("ten_1")));
     }
 
     #[tokio::test]

@@ -84,7 +84,7 @@ pub(crate) async fn resolve_host_tenancy(
         }) => {
             let value = resolve_value(source, &inputs).await;
             let read = cap(*read, posture.allow_cross_tenant);
-            let write = cap(*write, posture.allow_cross_tenant);
+            let write = normalize_write(cap(*write, posture.allow_cross_tenant));
             Ok(Some(HostTenancy::new(column.clone(), value, read, write)))
         }
     }
@@ -93,6 +93,19 @@ pub(crate) async fn resolve_host_tenancy(
 /// Cap a cross-tenant `all` grant to `own` unless the posture permits crossing tenants.
 fn cap(mode: AccessMode, allow_cross_tenant: bool) -> AccessMode {
     if mode == AccessMode::All && !allow_cross_tenant {
+        AccessMode::Own
+    } else {
+        mode
+    }
+}
+
+/// Normalize the **write** axis: `own+null` degrades to `own`. Widening a *read* to the shared
+/// NULL baseline is a sensible pattern, but *writing/deleting* the baseline is a cross-tenant blast
+/// (every tenant reads those rows), so `own+null` never grants baseline writes — a write reaches
+/// only the resolved tenant. (`null` stays: it's an explicit, deny-by-default "write the shared
+/// baseline" grant; `all` is posture-gated above.)
+fn normalize_write(mode: AccessMode) -> AccessMode {
+    if mode == AccessMode::OwnOrNull {
         AccessMode::Own
     } else {
         mode
@@ -261,6 +274,35 @@ mod tests {
             .orm_scope(boatramp_handlers::TenantAxis::Read)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn own_plus_null_write_degrades_to_own_never_the_shared_baseline() {
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            source: TenantSource::Domain,
+            read: AccessMode::OwnOrNull,
+            write: AccessMode::OwnOrNull,
+        };
+        let inputs = TenantSourceInputs {
+            domain_context: Some("acme"),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        // Read keeps own+null; write is degraded to own (no baseline mutation).
+        let read = ht
+            .orm_scope(boatramp_handlers::TenantAxis::Read)
+            .unwrap()
+            .unwrap();
+        let write = ht
+            .orm_scope(boatramp_handlers::TenantAxis::Write)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.mode, boatramp_core::orm::ScopeMode::OwnOrNull);
+        assert_eq!(write.mode, boatramp_core::orm::ScopeMode::Own);
     }
 
     #[tokio::test]
