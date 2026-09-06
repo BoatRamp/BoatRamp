@@ -391,6 +391,15 @@ pub struct Update {
     pub returning: Vec<SelectItem>,
 }
 
+/// A `DELETE`; `filter` is required (an unbounded delete is refused, mirroring [`Update`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    pub table: String,
+    pub filter: Predicate,
+    pub scope: Option<Scope>,
+    pub returning: Vec<SelectItem>,
+}
+
 /// Why compilation failed.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum OrmError {
@@ -979,6 +988,35 @@ impl Update {
     }
 }
 
+impl Delete {
+    /// Compile to `?N` SQL + bound parameters. An empty `filter` with no scope is refused
+    /// (no unbounded delete), exactly as [`Update::compile`]. A scope keeps it bounded, so an
+    /// empty filter + scope is allowed.
+    pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
+        let empty_filter =
+            matches!(&self.filter, Predicate::And(v) | Predicate::Or(v) if v.is_empty());
+        if empty_filter && self.scope.is_none() {
+            return Err(OrmError::Empty(
+                "delete has an empty filter (unbounded delete refused)",
+            ));
+        }
+        let table = ident(&self.table)?;
+        let mut params = Params::default();
+        let where_sql = render_where(
+            self.scope.as_ref(),
+            Some(&self.filter),
+            &mut params,
+            dialect,
+        )?
+        .ok_or(OrmError::Empty(
+            "delete has an empty filter (unbounded delete refused)",
+        ))?;
+        let mut sql = format!("DELETE FROM {table} WHERE {where_sql}");
+        sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
+        Ok((sql, params.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,6 +1440,82 @@ mod tests {
             q.compile(Dialect::Sqlite).unwrap().0,
             "UPDATE t SET x = ?1 WHERE tenant_id = ?2"
         );
+    }
+
+    #[test]
+    fn delete_by_predicate_compiles() {
+        let q = Delete {
+            table: "payment".into(),
+            filter: cmp("id", CmpOp::Eq, t("pay_1")),
+            scope: None,
+            returning: vec![],
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "DELETE FROM payment WHERE id = ?1");
+        assert_eq!(params, vec![t("pay_1")]);
+    }
+
+    #[test]
+    fn delete_returning_renders() {
+        // The one DELETE … RETURNING shape (consume-and-read a pending signup). `?N` is emitted
+        // for every dialect — the backend rewrites to the engine's native placeholder.
+        let q = Delete {
+            table: "pending_signup".into(),
+            filter: cmp("slug", CmpOp::Eq, t("acme")),
+            scope: None,
+            returning: vec![item(Expr::col("name")), item(Expr::col("password_hash"))],
+        };
+        assert_eq!(
+            q.compile(Dialect::Postgres).unwrap().0,
+            "DELETE FROM pending_signup WHERE slug = ?1 RETURNING name, password_hash"
+        );
+    }
+
+    #[test]
+    fn delete_with_empty_filter_is_refused() {
+        // Empty filter, no scope → effectively-unbounded delete → refused (mirrors UPDATE).
+        let q = Delete {
+            table: "t".into(),
+            filter: Predicate::And(vec![]),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::Empty(_))
+        ));
+    }
+
+    #[test]
+    fn delete_empty_filter_with_scope_is_allowed() {
+        // A scope keeps it bounded, so an empty filter + scope compiles (bulk clear within tenant).
+        let q = Delete {
+            table: "t".into(),
+            filter: Predicate::And(vec![]),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+            }),
+            returning: vec![],
+        };
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap().0,
+            "DELETE FROM t WHERE tenant_id = ?1"
+        );
+    }
+
+    #[test]
+    fn delete_rejects_identifier_injection_in_table() {
+        let q = Delete {
+            table: "t; DROP TABLE users".into(),
+            filter: cmp("id", CmpOp::Eq, t("x")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::InvalidIdentifier(_))
+        ));
     }
 
     #[test]

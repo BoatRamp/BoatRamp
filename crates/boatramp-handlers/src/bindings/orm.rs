@@ -25,6 +25,8 @@ mod generated {
                 "[method]database.select",
                 "[method]database.insert",
                 "[method]database.update",
+                "[method]database.delete",
+                "[method]database.delete-returning",
             ],
         },
         with: {
@@ -113,6 +115,42 @@ impl wit::HostDatabase for OrmHost<'_> {
         let (sql, params) = to_core_update(&q)?.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
+    }
+
+    async fn delete(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        q: wit::DeleteQuery,
+    ) -> Result<u64, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        let (sql, params) = to_core_delete(&q)?.compile(dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        txn.execute(&sql, &params).await.map_err(backend_err)
+    }
+
+    async fn delete_returning(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        q: wit::DeleteQuery,
+    ) -> Result<wit::QueryResult, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        // The unbounded-delete guard + RETURNING render live in the core compiler; here we run it
+        // through the query path so the deleted rows come back (consume-and-read).
+        let (sql, params) = to_core_delete(&q)?.compile(dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
+        Ok(wit::QueryResult {
+            columns: rows.columns,
+            rows: rows
+                .rows
+                .into_iter()
+                .map(|row| sql_types::Row {
+                    values: row.into_iter().map(to_wit_value).collect(),
+                })
+                .collect(),
+        })
     }
 
     fn drop(&mut self, db: Resource<OrmDatabase>) -> wasmtime::Result<()> {
@@ -497,6 +535,22 @@ fn to_core_update(q: &wit::UpdateQuery) -> Result<core::Update, wit::Error> {
             .iter()
             .map(|a| to_core_assignment(exprs, preds, a))
             .collect::<Result<_, _>>()?,
+        filter: build_pred(preds, exprs, q.filter, upper)?,
+        scope: q.scope.clone().map(to_core_scope),
+        returning: q
+            .returning
+            .iter()
+            .map(|it| to_core_item(exprs, preds, it))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn to_core_delete(q: &wit::DeleteQuery) -> Result<core::Delete, wit::Error> {
+    let exprs = &q.exprs;
+    let preds = &q.preds;
+    let upper = exprs.len();
+    Ok(core::Delete {
+        table: q.table.clone(),
         filter: build_pred(preds, exprs, q.filter, upper)?,
         scope: q.scope.clone().map(to_core_scope),
         returning: q
@@ -938,6 +992,81 @@ mod tests {
         let err = host.update(db, upd).await.unwrap_err();
         assert!(matches!(err, wit::Error::Syntax(_)));
         // Refused at compile time — the backend was never opened.
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_compiles_and_reaches_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // DELETE FROM payment WHERE id = ?1
+            let del = wit::DeleteQuery {
+                exprs: vec![col("id"), lit(text("pay_1"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                table: "payment".into(),
+                filter: 0,
+                scope: None,
+                returning: vec![],
+            };
+            assert_eq!(host.delete(db, del).await.unwrap(), 1);
+        }
+        sess.finalize(true).await;
+        let log = log.lock().unwrap();
+        assert!(log
+            .iter()
+            .any(|l| l.starts_with("execute|DELETE FROM payment WHERE id = ?1|")));
+    }
+
+    #[tokio::test]
+    async fn delete_returning_runs_via_the_query_path() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug (consume-and-read)
+            let del = wit::DeleteQuery {
+                exprs: vec![col("slug"), lit(text("acme"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                table: "pending_signup".into(),
+                filter: 0,
+                scope: None,
+                returning: vec![item(0)],
+            };
+            // Runs through the query path so the RETURNING rows come back.
+            let res = host.delete_returning(db, del).await.unwrap();
+            assert_eq!(res.columns, vec!["id".to_string()]); // fake backend's canned rows
+        }
+        sess.finalize(true).await;
+        let log = log.lock().unwrap();
+        assert!(log
+            .iter()
+            .any(|l| l
+                .starts_with("query|DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug|")));
+    }
+
+    #[tokio::test]
+    async fn unbounded_delete_is_refused_before_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let del = wit::DeleteQuery {
+            exprs: vec![],
+            preds: vec![wit::PredNode::Conj(vec![])], // empty AND, no scope
+            table: "t".into(),
+            filter: 0,
+            scope: None,
+            returning: vec![],
+        };
+        let err = host.delete(db, del).await.unwrap_err();
+        assert!(matches!(err, wit::Error::Syntax(_)));
         assert!(log.lock().unwrap().is_empty());
     }
 

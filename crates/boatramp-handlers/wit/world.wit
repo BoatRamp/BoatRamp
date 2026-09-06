@@ -226,12 +226,26 @@ interface orm {
     scope: option<scope>,
     returning: list<select-item>,
   }
+  /// `filter` is required — an unbounded delete is refused (mirrors update-query, minus `set`).
+  record delete-query {
+    exprs: list<expr-node>,
+    preds: list<pred-node>,
+    table: string,
+    filter: u32,                  // pred index
+    scope: option<scope>,
+    returning: list<select-item>,
+  }
 
   /// A handle to one of the site's named databases (same model as `sql-query`).
   resource database {
     select: func(q: select-query) -> result<query-result, error>;
     insert: func(q: insert-query) -> result<u64, error>;
     update: func(q: update-query) -> result<u64, error>;
+    /// Affected-row count. Use `delete-returning` when the query has a RETURNING clause and the
+    /// caller needs the deleted rows (consume-and-read).
+    delete: func(q: delete-query) -> result<u64, error>;
+    /// Run a DELETE and return its RETURNING rows (the `returning` list must be non-empty).
+    delete-returning: func(q: delete-query) -> result<query-result, error>;
   }
 
   open: func(name: string) -> result<database, error>;
