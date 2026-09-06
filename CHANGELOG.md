@@ -5,6 +5,50 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.3.19] - 2026-09-06
+
+### Added
+- **Guest project self-configuration (`boatramp:handlers/admin`).** A function or handler
+  can now reconfigure **its own project** from inside the sandbox — add a custom domain,
+  set an SMTP profile, edit its site config, rotate a secret — **without holding a boatramp
+  bearer token**. An app that self-configures (a SaaS attaching a customer's domain, a setup
+  wizard writing its own email profile) previously needed a standing, over-broad,
+  rotation-burdened `project_admin` token embedded in the app; this grant-based capability
+  replaces it: the power is conferred at **deploy time** and is strictly **less** than a
+  project-admin token — no cross-project reach, no critical/node ops, verb-scoped. Four
+  independently-grantable surfaces — `admin:domains`, `admin:email`, `admin:site`,
+  `admin:secrets` (a bare `admin` grants nothing; deny-by-default). The invariants that make
+  it safe to hand config power to untrusted code: **project-scoped, host-stamped** (the
+  controller is bound to the guest's own project at instantiation, never from guest input —
+  cross-tenant configuration is *structurally impossible*, the project being the un-escapable
+  KV key prefix); **domain ownership stays proven** (`domain-verify` runs the same real
+  network probe as the normal flow, wildcards still need DNS-01, and there is no guest path to
+  attach an unverified domain — directly or via a site-config write); **write-only
+  credentials** (a guest may *set* an SMTP password or secret, but no verb ever returns a
+  value — reads are redacted name lists); **rate-limited + audited** (a per-project token-
+  bucket quota + a structured audit record per mutation on the `boatramp::audit` tracing
+  target, never the rate-capped guest log stream). Project create/delete, tokens, authz,
+  root anchors, cluster, blobs, cache purge, prune/scrub, daemon config, `compute exec`,
+  `sql exec/query`, and all node-global compute are **never** guest-reachable — no verb, no
+  binding. Governed per surface by the new `allow_guest_admin_domains|email|site|secrets`
+  posture knobs — **all off under `multi-tenant`** (an untrusted tenant can't self-configure
+  until the operator opts in), on under `single-tenant`/`dev`. New feature `admin` (in the
+  batteries-included default). A live capability gate asserts the tenant invariants
+  (cross-tenant isolation, site-string escape-blocking, write-only creds, multi-tenant
+  lockdown, rate-limiting) on an ephemeral runner. See the how-to: "Let an app configure its
+  own project".
+
+### Changed
+- **SMTP email profiles now update field-by-field (partial/merge semantics).** `boatramp
+  email set <name>` on an existing profile previously required re-specifying every field —
+  omitting `--password` silently wiped the stored credential. It now **merges**: only the
+  fields you pass change, and the rest (including the sealed password) are kept. Rotate just
+  the password (`--password-stdin`), change just the `From` or host, flip `--durable`, or drop
+  auth with the new `--no-auth` — each without disturbing the others. Creating a fresh profile
+  still requires the mandatory fields. Mirrored in the admin API (`PUT
+  /api/projects/{p}/email/profiles/{name}`, all fields optional + `clear_auth`) and the guest
+  `admin:email` surface.
+
 ## [0.3.18] - 2026-09-05
 
 ### Added
