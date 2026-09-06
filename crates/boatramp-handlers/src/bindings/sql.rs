@@ -59,6 +59,9 @@ pub struct SqlDatabase {
 pub struct SqlSession {
     backends: HashMap<String, Arc<dyn SqlBackend>>,
     txns: HashMap<(String, bool), Box<dyn SqlTransaction>>,
+    /// The host-resolved in-site tenancy applied to **both** this `sql` binding and the sibling
+    /// `orm` binding (they share the session). `None` ⇒ plain queries (no row scoping).
+    tenancy: Option<crate::tenant::HostTenancy>,
 }
 
 impl SqlSession {
@@ -67,7 +70,21 @@ impl SqlSession {
         Self {
             backends,
             txns: HashMap::new(),
+            tenancy: None,
         }
+    }
+
+    /// Set the host-resolved tenancy for this invocation (see [`crate::tenant::HostTenancy`]).
+    #[must_use]
+    pub fn with_tenancy(mut self, tenancy: Option<crate::tenant::HostTenancy>) -> Self {
+        self.tenancy = tenancy;
+        self
+    }
+
+    /// The host-resolved tenancy, if any. `pub(super)` so the sibling `orm` binding (sharing this
+    /// session) forces the same scope.
+    pub(super) fn tenancy(&self) -> Option<&crate::tenant::HostTenancy> {
+        self.tenancy.as_ref()
     }
 
     /// Whether a database is granted under `name`. `pub(super)` so the sibling `orm`
@@ -195,7 +212,17 @@ impl sql_query::HostDatabase for SqlHost<'_> {
         if self.session.injects_session_context(&name) {
             reject_reserved_session_writes(&statement).map_err(to_wit_error)?;
         }
-        let params = to_values(params);
+        let mut params = to_values(params);
+        // Stage 0: fill the `{scope}` marker with the host predicate for the axis the STATEMENT
+        // exercises (a `DELETE` via `query()` is a write, not a read). Fail-closed: an unmarked
+        // scoped statement, or one the axis grant denies, is refused before the backend.
+        let statement = apply_scope_marker(
+            self.session.tenancy(),
+            stmt_axis(&statement),
+            statement,
+            &mut params,
+        )
+        .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)
@@ -229,7 +256,17 @@ impl sql_query::HostDatabase for SqlHost<'_> {
         if self.session.injects_session_context(&name) {
             reject_reserved_session_writes(&statement).map_err(to_wit_error)?;
         }
-        let params = to_values(params);
+        let mut params = to_values(params);
+        // Stage 0: fill the `{scope}` marker with the host predicate for the axis the STATEMENT
+        // exercises (a bare `SELECT` via `execute()` is still a read). Fail-closed on a missing
+        // marker or a denied axis.
+        let statement = apply_scope_marker(
+            self.session.tenancy(),
+            stmt_axis(&statement),
+            statement,
+            &mut params,
+        )
+        .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)
@@ -248,6 +285,71 @@ impl sql_query::HostDatabase for SqlHost<'_> {
 
 fn not_granted(name: &str) -> sql_types::Error {
     sql_types::Error::Other(format!("sql database {name:?} not granted"))
+}
+
+/// The tenancy axis a raw statement exercises. A statement whose first keyword is `SELECT` reads
+/// (the read grant); **everything else** — `INSERT`/`UPDATE`/`DELETE`, DDL, or a `WITH …` CTE that
+/// may end in a write — takes the **write** grant (fail-closed). This is deliberately driven by
+/// the statement, not by which method the guest called: `query()` can run DML on a read-write
+/// handle, so keying the axis off `query`-vs-`execute` would let a `DELETE` slip through under the
+/// weaker read grant. A leading `WITH` is treated as a write (a read CTE must carry the write
+/// grant, or use the typed `orm` surface).
+fn stmt_axis(statement: &str) -> crate::tenant::Axis {
+    let mut s = statement.trim_start();
+    // Skip leading `-- line` and `/* block */` comments before the first keyword.
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
+        } else {
+            break;
+        }
+    }
+    let word = &s[..s
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len())];
+    if word.eq_ignore_ascii_case("select") {
+        crate::tenant::Axis::Read
+    } else {
+        crate::tenant::Axis::Write
+    }
+}
+
+/// Fill the raw-SQL `{scope}` marker for a scoped-tenancy invocation (Stage 0). Returns the
+/// statement to run, appending the tenant value to `params` when the mode binds one.
+///
+/// - **No tenancy** (plain): a stray marker is neutralised to `1 = 1` (a scoped app never lands
+///   here; this only guards against an accidental marker on an unscoped function).
+/// - **Scoped**: the axis grant is consulted first (a `none` grant is refused outright), then the
+///   marker is **required** — an unmarked scoped statement is refused (fail-closed) rather than
+///   run across tenants — and substituted with the host predicate. The predicate references the
+///   appended value as `?<N+1>`, so it is correct wherever the marker sits; the value is appended
+///   once even if the marker repeats.
+fn apply_scope_marker(
+    tenancy: Option<&crate::tenant::HostTenancy>,
+    axis: crate::tenant::Axis,
+    statement: String,
+    params: &mut Vec<SqlValue>,
+) -> Result<String, SqlError> {
+    use crate::tenant::SCOPE_MARKER;
+    let Some(ht) = tenancy else {
+        // Unscoped: neutralise any stray marker so the statement still parses.
+        return Ok(statement.replace(SCOPE_MARKER, "1 = 1"));
+    };
+    let (pred, value) = ht
+        .sql_marker(axis, params.len())
+        .map_err(|d| SqlError::Other(d.reason().to_string()))?;
+    if ht.requires_marker(axis) && !statement.contains(SCOPE_MARKER) {
+        return Err(SqlError::Other(format!(
+            "tenancy: a scoped raw-SQL statement must contain the {SCOPE_MARKER} marker \
+             (the host injects the tenant predicate there); none found"
+        )));
+    }
+    if let Some(v) = value {
+        params.push(v);
+    }
+    Ok(statement.replace(SCOPE_MARKER, &pred))
 }
 
 /// Map guest parameter values to backend values (libsql, SQLite-family, binds a
@@ -668,5 +770,125 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.contains("boatramp.project")));
+    }
+
+    fn scoped_session(
+        log: Log,
+        read: boatramp_core::tenancy::AccessMode,
+        write: boatramp_core::tenancy::AccessMode,
+    ) -> SqlSession {
+        session(&[("", "db", log)]).with_tenancy(Some(crate::tenant::HostTenancy::new(
+            "tenant_id",
+            Some(SqlValue::Text("ten_1".into())),
+            read,
+            write,
+        )))
+    }
+
+    #[tokio::test]
+    async fn scoped_raw_sql_without_the_marker_is_refused() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::Own);
+        let mut table = ResourceTable::new();
+        let mut host = SqlHost::new(&mut table, &mut session);
+        let db = host.open(String::new()).unwrap();
+        // No `{scope}` marker on a scoped read ⇒ refused before the backend (fail-closed).
+        let err = host
+            .query(db, "SELECT * FROM orders".into(), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sql_types::Error::Other(m) if m.contains("{scope}")));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing reached the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_raw_sql_marker_is_filled_with_the_host_tenant() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::Own);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = SqlHost::new(&mut table, &mut session);
+            let db = host.open(String::new()).unwrap();
+            // One guest param (?1); the injected predicate binds the appended ?2 = "ten_1".
+            host.query(
+                db,
+                "SELECT * FROM orders WHERE status = ?1 AND {scope}".into(),
+                vec![sql_types::Value::Text("open".into())],
+            )
+            .await
+            .unwrap();
+        }
+        let log = log.lock().unwrap();
+        assert!(log.iter().any(|l| l
+            .contains("SELECT * FROM orders WHERE status = ?1 AND tenant_id = ?2")
+            && l.contains("ten_1")));
+    }
+
+    #[tokio::test]
+    async fn dml_via_query_is_scoped_by_the_write_axis_not_read() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // read: own, write: NONE — a read-only grant.
+        let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::None);
+        let mut table = ResourceTable::new();
+        let mut host = SqlHost::new(&mut table, &mut session);
+        let db = host.open(String::new()).unwrap();
+        // A DELETE routed through query() must be judged a WRITE (write: none) and refused —
+        // it must NOT run under the read grant.
+        let err = host
+            .query(db, "DELETE FROM orders WHERE {scope}".into(), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sql_types::Error::Other(m) if m.contains("not granted access")));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the DELETE never reached the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_via_execute_is_still_a_read() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // read: own, write: none — a SELECT is a read regardless of the entry method.
+        let mut session = scoped_session(log.clone(), AccessMode::Own, AccessMode::None);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = SqlHost::new(&mut table, &mut session);
+            let db = host.open(String::new()).unwrap();
+            host.execute(db, "SELECT 1 FROM t WHERE {scope}".into(), vec![])
+                .await
+                .unwrap();
+        }
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("SELECT 1 FROM t WHERE tenant_id = ?1")));
+    }
+
+    #[tokio::test]
+    async fn unscoped_raw_sql_neutralizes_a_stray_marker() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // No tenancy configured (plain function).
+        let mut session = session(&[("", "db", log.clone())]);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = SqlHost::new(&mut table, &mut session);
+            let db = host.open(String::new()).unwrap();
+            host.query(db, "SELECT 1 WHERE {scope}".into(), vec![])
+                .await
+                .unwrap();
+        }
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("SELECT 1 WHERE 1 = 1")));
     }
 }

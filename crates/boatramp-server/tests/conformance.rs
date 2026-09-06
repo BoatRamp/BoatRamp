@@ -1595,6 +1595,7 @@ async fn handler_route_dispatches_through_engine() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3202,6 +3203,7 @@ async fn activation_during_traffic_drops_no_requests() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3341,6 +3343,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3455,6 +3458,7 @@ async fn activation_refuses_broken_component() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3560,6 +3564,7 @@ async fn activation_refuses_a_non_consumer_component() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3671,6 +3676,7 @@ async fn activation_refuses_disallowed_import() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3769,6 +3775,7 @@ async fn activation_refuses_oversized_component() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },
@@ -3869,6 +3876,8 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    // A sql importer declares tenancy (this test isn't about tenancy).
+                    tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
                 }),
                 ..Default::default()
             },
@@ -3987,6 +3996,9 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
                         "sql:product".into(),
                         "sql:privileged".into(),
                     ],
+                    // A sql importer must declare tenancy under the fail-closed default posture;
+                    // this test is about named-sql least-privilege, not tenancy.
+                    tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -4115,6 +4127,7 @@ async fn per_site_timeout_cap_applies() {
                     cache: None,
                     graphql: None,
                     cookie_auth: None,
+                    tenancy: None,
                 }),
                 ..Default::default()
             },

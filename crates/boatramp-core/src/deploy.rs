@@ -864,15 +864,35 @@ impl DeployStore {
             hash.into_bytes(),
         ));
 
-        // The domain-routing index value carries the owning `(project, site)` so a
-        // request `Host` resolves to both (the key stays global — hosts are unique).
-        let owner_bytes = owner.to_bytes();
+        // The domain-routing index value carries the owning `(project, site)` so a request `Host`
+        // resolves to both (the key stays global — hosts are unique), plus the per-host **tenant
+        // context tag** (Stage 0): a host's own `contexts` entry, else the primary's (apex↔www
+        // share a tenant), else none. A wildcard carries its own pattern's tag; matching
+        // subdomains inherit it via resolution. This is the declarative domain tenant source.
+        let contexts = &config.domains.contexts;
+        let primary_ctx = config
+            .domains
+            .primary
+            .as_deref()
+            .and_then(|p| contexts.get(p));
+        let owner_for = |key: &str| -> Vec<u8> {
+            let ctx = contexts.get(key).or(primary_ctx);
+            match ctx {
+                Some(tag) => owner.clone().with_context(tag.clone()).to_bytes(),
+                None => owner.to_bytes(),
+            }
+        };
         for host in config.domains.exact_hosts() {
-            ops.push(WriteOp::Put(keys::domain(host), owner_bytes.clone()));
+            ops.push(WriteOp::Put(keys::domain(host), owner_for(host)));
         }
         for wildcard in &config.domains.wildcards {
             if let Some(suffix) = wildcard.strip_prefix("*.") {
-                ops.push(WriteOp::Put(keys::wildcard(suffix), owner_bytes.clone()));
+                // The wildcard's own tag only (a wildcard is not an "alias" of the primary).
+                let bytes = match contexts.get(wildcard) {
+                    Some(tag) => owner.clone().with_context(tag.clone()).to_bytes(),
+                    None => owner.to_bytes(),
+                };
+                ops.push(WriteOp::Put(keys::wildcard(suffix), bytes));
             }
         }
         self.kv.write_batch(ops).await?;
@@ -4792,6 +4812,52 @@ mod tests {
                 .map(|o| o.site)
                 .as_deref(),
             Some("a")
+        );
+    }
+
+    /// The declarative domain tenant source (Stage 0): a per-host `contexts` tag is written into
+    /// the routing index and resolved back, an exact alias inherits the primary's tag, and a
+    /// wildcard carries its own — so one deployment serves many storefronts, each domain a tenant.
+    #[tokio::test]
+    async fn domain_context_tag_is_written_and_inherited() {
+        use crate::config::{DomainConfig, SiteConfig};
+
+        let store = store();
+        let cfg = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("acme-store.com".into()),
+                aliases: vec!["www.acme-store.com".into()],
+                wildcards: vec!["*.globex-store.com".into()],
+                contexts: std::collections::BTreeMap::from([
+                    ("acme-store.com".into(), "acme".into()),
+                    ("*.globex-store.com".into(), "globex".into()),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config(ProjectRef::DEFAULT, "shop", &cfg)
+            .await
+            .unwrap();
+
+        async fn ctx(store: &DeployStore, host: &str) -> Option<String> {
+            store
+                .resolve_site_by_host(host)
+                .await
+                .unwrap()
+                .and_then(|o| o.context)
+        }
+        // The primary carries its tag; the alias inherits the primary's; a subdomain inherits the
+        // wildcard's — three distinct hosts, the right tenant on each.
+        assert_eq!(ctx(&store, "acme-store.com").await.as_deref(), Some("acme"));
+        assert_eq!(
+            ctx(&store, "www.acme-store.com").await.as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            ctx(&store, "tenant7.globex-store.com").await.as_deref(),
+            Some("globex")
         );
     }
 

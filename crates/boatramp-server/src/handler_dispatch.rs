@@ -299,6 +299,22 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::RequestId>()
         .map(|r| r.0.clone());
+    // Stage 0 tenant-source inputs: the request's app bearer (verified downstream for a token
+    // source) and the routed domain's context tag (for a domain source), the latter stashed in
+    // the request extensions at host routing.
+    let bearer = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .map(str::to_string);
+    let domain_context = request
+        .extensions()
+        .get::<crate::DomainContext>()
+        .map(|c| c.0.clone());
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -313,6 +329,8 @@ pub(super) async fn dispatch_handler(
         // invokes siblings at depth 0; the host caps each subsequent hop.
         0,
         request_id.as_deref(),
+        bearer.as_deref(),
+        domain_context.as_deref(),
     )
     .await
     {
@@ -458,7 +476,9 @@ async fn federation_gateway(
     // subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
     let sql_subgraphs = (*cached.sql_subgraphs).clone();
     let runner = crate::graphql_gateway::BackendRouter::new(
-        invoker.scoped(boatramp_core::project::ProjectRef::new(project)),
+        // A federated sub-fetch to a sibling doesn't propagate an in-site tenant (the GDC's own
+        // row policy governs data access); a scoped sibling fail-closes for an `own` op.
+        invoker.scoped(boatramp_core::project::ProjectRef::new(project), None),
         project.to_string(),
         inner.sql.clone(),
         sql_subgraphs,
@@ -542,7 +562,7 @@ async fn data_connector_serve(
         let invoker = inner
             .invoker
             .get()
-            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project)));
+            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project), None));
         crate::graphql_data::runner::execute(
             backend.as_ref(),
             &dialect,
@@ -903,6 +923,10 @@ pub(super) async fn build_bindings(
     invoke_targets: &[String],
     depth: u32,
     request_id: Option<&str>,
+    // Stage 0 tenant-source inputs (the verified bearer for a token source; the routed domain's
+    // context tag for a domain source). Background triggers pass `None` for both.
+    bearer: Option<&str>,
+    domain_context: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -940,6 +964,42 @@ pub(super) async fn build_bindings(
             }
         }
     }
+    // Stage 0: resolve the in-site tenant scope for this invocation (applied to BOTH sql + orm).
+    // A sql/orm importer that declares no tenancy is refused under the strict posture (Dimension
+    // 0); an `all` grant is capped to `own` unless the posture opens cross-tenant access. The
+    // resolved value is carried into the `invoke` binding below so a sibling inherits it.
+    let handler_caller_tenant = {
+        let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
+        let posture = crate::tenant_resolve::TenantPosture {
+            require_declaration: inner
+                .require_tenancy_declaration
+                .get()
+                .copied()
+                .unwrap_or(true),
+            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+        };
+        let token_cfg = site_handlers
+            .graphql
+            .as_ref()
+            .and_then(|g| g.data.as_ref())
+            .and_then(|d| d.claims_from_token.as_ref());
+        let inputs = crate::tenant_resolve::TenantSourceInputs {
+            bearer,
+            domain_context,
+            token_cfg,
+        };
+        let tenancy = crate::tenant_resolve::resolve_host_tenancy(
+            site_handlers.tenancy.as_ref(),
+            imports_db,
+            posture,
+            inputs,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        bindings = bindings.with_tenancy(tenancy.clone());
+        // Carry the resolved tenant value so a sibling this handler invokes inherits it.
+        tenancy.and_then(|h| h.value().cloned())
+    };
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the
         // preview scope), so a guest publishes only into its own namespace and
@@ -963,9 +1023,13 @@ pub(super) async fn build_bindings(
     // bearer forwarding reaches it unchanged.
     if granted("invoke") && !invoke_targets.is_empty() {
         if let Some(invoker) = inner.invoker.get() {
-            // A site handler invokes siblings within its own tenant project.
-            bindings =
-                bindings.with_invoke(invoker.scoped(project), invoke_targets.to_vec(), depth);
+            // A site handler invokes siblings within its own tenant project, propagating its
+            // resolved in-site tenant so the sibling inherits it (host-carried, not guest-set).
+            bindings = bindings.with_invoke(
+                invoker.scoped(project, handler_caller_tenant.clone()),
+                invoke_targets.to_vec(),
+                depth,
+            );
         }
     }
     // GraphQL supergraph capability: a handler may run a GraphQL operation against the project's

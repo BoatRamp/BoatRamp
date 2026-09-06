@@ -50,6 +50,10 @@ pub struct Bindings {
     /// via `sql.open(name)`. Empty = SQL not granted.
     #[cfg(feature = "sql")]
     sql: HashMap<String, Arc<dyn SqlBackend>>,
+    /// The host-resolved in-site tenancy for this invocation, applied to **both** the `sql` and
+    /// `orm` bindings (Stage 0). `None` ⇒ plain queries (no row scoping).
+    #[cfg(feature = "sql")]
+    tenancy: Option<crate::tenant::HostTenancy>,
     /// The `wasi:messaging` producer grant (backend + topic-namespace prefix).
     /// `None` = messaging not granted.
     #[cfg(feature = "messaging")]
@@ -121,6 +125,22 @@ impl Bindings {
     pub fn with_sql(mut self, name: impl Into<String>, backend: Arc<dyn SqlBackend>) -> Self {
         self.sql.insert(name.into(), backend);
         self
+    }
+
+    /// Set the host-resolved in-site tenancy applied to this invocation's `sql` + `orm` bindings.
+    /// The server builds it from the function/site tenancy decision + the verified tenant source;
+    /// the guest can neither see nor override it. `None` ⇒ plain queries.
+    #[cfg(feature = "sql")]
+    pub fn with_tenancy(mut self, tenancy: Option<crate::tenant::HostTenancy>) -> Self {
+        self.tenancy = tenancy;
+        self
+    }
+
+    /// The host-resolved tenancy for this invocation (consumed by the engine when building the
+    /// shared SQL session).
+    #[cfg(feature = "sql")]
+    pub(crate) fn tenancy(&self) -> Option<crate::tenant::HostTenancy> {
+        self.tenancy.clone()
     }
 
     /// The granted blob binding, if any.

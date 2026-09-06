@@ -25,6 +25,8 @@ mod generated {
                 "[method]database.select",
                 "[method]database.insert",
                 "[method]database.update",
+                "[method]database.delete",
+                "[method]database.delete-returning",
             ],
         },
         with: {
@@ -76,7 +78,14 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<wit::QueryResult, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_select(&q)?.compile(dialect).map_err(compile_err)?;
+        // Force the host-resolved read scope onto the query + every nested read node (union
+        // branch), fail-closed. A guest-supplied scope was already dropped in `to_core_select`.
+        let read = self.scope_for(crate::tenant::Axis::Read)?;
+        let mut core = to_core_select(&q)?;
+        if let Some(s) = &read {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
         Ok(wit::QueryResult {
@@ -98,7 +107,16 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_insert(&q)?.compile(dialect).map_err(compile_err)?;
+        // Write-scope the stamp; read-scope an INSERT…SELECT source (its rows are a read).
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let read = self.scope_for(crate::tenant::Axis::Read)?;
+        let mut core = to_core_insert(&q)?;
+        // Only force when in-site tenancy is active (either axis resolved a scope); otherwise the
+        // insert stays plain. `all` on an axis resolves to `None`, correctly clearing that axis.
+        if self.session.tenancy().is_some() {
+            core.force_scope(write.as_ref(), read.as_ref());
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
@@ -110,9 +128,61 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_update(&q)?.compile(dialect).map_err(compile_err)?;
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let mut core = to_core_update(&q)?;
+        if let Some(s) = &write {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
+    }
+
+    async fn delete(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        q: wit::DeleteQuery,
+    ) -> Result<u64, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let mut core = to_core_delete(&q)?;
+        if let Some(s) = &write {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        txn.execute(&sql, &params).await.map_err(backend_err)
+    }
+
+    async fn delete_returning(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        q: wit::DeleteQuery,
+    ) -> Result<wit::QueryResult, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        // The unbounded-delete guard + RETURNING render live in the core compiler; here we run it
+        // through the query path so the deleted rows come back (consume-and-read). A delete is a
+        // write, so it is bounded by the write scope.
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let mut core = to_core_delete(&q)?;
+        if let Some(s) = &write {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
+        Ok(wit::QueryResult {
+            columns: rows.columns,
+            rows: rows
+                .rows
+                .into_iter()
+                .map(|row| sql_types::Row {
+                    values: row.into_iter().map(to_wit_value).collect(),
+                })
+                .collect(),
+        })
     }
 
     fn drop(&mut self, db: Resource<OrmDatabase>) -> wasmtime::Result<()> {
@@ -130,6 +200,21 @@ impl OrmHost<'_> {
             .map(|h| h.name.clone())
             .map_err(|e| wit::Error::Other(e.to_string()))
     }
+
+    /// The host-forced tenant [`Scope`](core::Scope) for `axis`, or a fail-closed error. `Ok(None)`
+    /// means run unscoped — either no in-site tenancy is configured, or the axis grant is
+    /// cross-tenant `all` (posture-vetted upstream).
+    fn scope_for(&self, axis: crate::tenant::Axis) -> Result<Option<core::Scope>, wit::Error> {
+        match self.session.tenancy() {
+            Some(ht) => ht.orm_scope(axis).map_err(deny_err),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Map a fail-closed tenancy denial to the guest-visible orm error (no tenant values leaked).
+fn deny_err(d: crate::tenant::TenantDenied) -> wit::Error {
+    wit::Error::Other(d.reason().to_string())
 }
 
 // ---- arena → core tree -----------------------------------------------------
@@ -184,7 +269,65 @@ fn build_expr(
         wit::ExprNode::VectorLiteral(s) => core::Expr::VectorLiteral(s.clone()),
         // The filter — and everything it reaches — is bounded by this node's own index `i`.
         wit::ExprNode::RelatedAggregate(r) => build_related_aggregate(exprs, preds, r, i)?,
+        wit::ExprNode::CaseExpr(c) => {
+            if c.branches.is_empty() {
+                return Err(bad_arena("case has no branches"));
+            }
+            // Each `when` predicate's expressions and each `then`/`otherwise` expr are bounded by
+            // this node's index `i` (acyclic — a branch can't reference the CASE itself or later).
+            let branches = c
+                .branches
+                .iter()
+                .map(|b| {
+                    Ok::<_, wit::Error>((build_pred(preds, exprs, b.when, i)?, child(b.then)?))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let otherwise = match c.otherwise {
+                Some(e) => Some(Box::new(child(e)?)),
+                None => None,
+            };
+            core::Expr::Case {
+                branches,
+                otherwise,
+            }
+        }
+        wit::ExprNode::JsonExtractDyn(p) => {
+            core::Expr::JsonExtractDyn(Box::new(child(p.left)?), Box::new(child(p.right)?))
+        }
+        wit::ExprNode::JsonConcat(p) => {
+            core::Expr::JsonConcat(Box::new(child(p.left)?), Box::new(child(p.right)?))
+        }
+        // The filter is bounded by this node's index `i` (no self/forward reference).
+        wit::ExprNode::RelatedScalar(r) => build_related_scalar(exprs, preds, r, i)?,
     })
+}
+
+/// Rebuild a narrow scalar subquery. Gated on `orm-subquery` (same isolation surface + the only
+/// subquery forms as [`build_related_aggregate`]).
+#[cfg(feature = "orm-subquery")]
+fn build_related_scalar(
+    exprs: &[wit::ExprNode],
+    preds: &[wit::PredNode],
+    r: &wit::RelatedScalarNode,
+    upper: usize,
+) -> Result<core::Expr, wit::Error> {
+    Ok(core::Expr::RelatedScalar {
+        column: r.column.clone(),
+        table: r.table.clone(),
+        filter: Box::new(build_pred(preds, exprs, r.filter, upper)?),
+    })
+}
+
+#[cfg(not(feature = "orm-subquery"))]
+fn build_related_scalar(
+    _exprs: &[wit::ExprNode],
+    _preds: &[wit::PredNode],
+    _r: &wit::RelatedScalarNode,
+    _upper: usize,
+) -> Result<core::Expr, wit::Error> {
+    Err(bad_arena(
+        "related-scalar requires the host's orm-subquery feature",
+    ))
 }
 
 /// Rebuild a correlated roll-up. Gated on the host's `orm-subquery` feature: it is the only
@@ -280,7 +423,45 @@ fn build_pred(
             expr: pexpr(n.expr)?,
             negated: n.negated,
         },
+        // The subquery filter is a pred child (must be < this node's index) whose expressions
+        // stay bounded by `expr_upper` — same acyclic rule as any nested predicate.
+        wit::PredNode::InSubquery(n) => build_in_subquery(preds, exprs, n, i, expr_upper)?,
     })
+}
+
+/// Rebuild a narrow IN-subquery. Gated on `orm-subquery` (same isolation surface as the other
+/// subquery forms).
+#[cfg(feature = "orm-subquery")]
+fn build_in_subquery(
+    preds: &[wit::PredNode],
+    exprs: &[wit::ExprNode],
+    n: &wit::InSubqueryNode,
+    pred_i: usize,
+    expr_upper: usize,
+) -> Result<core::Predicate, wit::Error> {
+    if n.filter as usize >= pred_i {
+        return Err(bad_arena("in-subquery filter index must be < its parent"));
+    }
+    Ok(core::Predicate::InSubquery {
+        expr: build_expr(exprs, preds, n.expr, expr_upper)?,
+        column: n.column.clone(),
+        table: n.table.clone(),
+        filter: Box::new(build_pred(preds, exprs, n.filter, expr_upper)?),
+        negated: n.negated,
+    })
+}
+
+#[cfg(not(feature = "orm-subquery"))]
+fn build_in_subquery(
+    _preds: &[wit::PredNode],
+    _exprs: &[wit::ExprNode],
+    _n: &wit::InSubqueryNode,
+    _pred_i: usize,
+    _expr_upper: usize,
+) -> Result<core::Predicate, wit::Error> {
+    Err(bad_arena(
+        "in-subquery requires the host's orm-subquery feature",
+    ))
 }
 
 fn to_sqlvalue(v: wit::Value) -> SqlValue {
@@ -360,13 +541,6 @@ fn to_core_dir(d: wit::Direction) -> core::Direction {
     }
 }
 
-fn to_core_scope(s: wit::Scope) -> core::Scope {
-    core::Scope {
-        column: s.column,
-        value: to_sqlvalue(s.value),
-    }
-}
-
 fn to_core_item(
     exprs: &[wit::ExprNode],
     preds: &[wit::PredNode],
@@ -389,58 +563,88 @@ fn to_core_assignment(
     })
 }
 
+/// The shared `SelectQuery`/`SelectBody` → `core::Select` field mapping (both WIT records have the
+/// same field names; `select-query` merely adds `union`). Used with `?`, so invoke inside a fn
+/// returning `Result<_, wit::Error>`. Sets `union: None` — the caller attaches any union branch.
+macro_rules! core_select_common {
+    ($q:expr) => {{
+        let q = $q;
+        let exprs = &q.exprs;
+        let preds = &q.preds;
+        let upper = exprs.len();
+        core::Select {
+            table: q.table.clone(),
+            table_alias: q.table_alias.clone(),
+            columns: q
+                .columns
+                .iter()
+                .map(|it| to_core_item(exprs, preds, it))
+                .collect::<Result<_, _>>()?,
+            joins: q
+                .joins
+                .iter()
+                .map(|j| {
+                    Ok::<_, wit::Error>(core::Join {
+                        kind: to_core_joinkind(j.kind),
+                        table: j.table.clone(),
+                        alias: j.alias.clone(),
+                        on: build_pred(preds, exprs, j.on, upper)?,
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            filter: q
+                .filter
+                .map(|f| build_pred(preds, exprs, f, upper))
+                .transpose()?,
+            // Stage 0: the guest never sets the tenant scope — the host forces it after
+            // rebuild (see `OrmHost::scope_for`). Any guest-supplied `q.scope` is ignored.
+            scope: None,
+            group_by: q
+                .group_by
+                .iter()
+                .map(|&g| build_expr(exprs, preds, g, upper))
+                .collect::<Result<_, _>>()?,
+            having: q
+                .having
+                .map(|h| build_pred(preds, exprs, h, upper))
+                .transpose()?,
+            distinct: q.distinct,
+            distinct_on: q
+                .distinct_on
+                .iter()
+                .map(|&e| build_expr(exprs, preds, e, upper))
+                .collect::<Result<_, _>>()?,
+            order: q
+                .order
+                .iter()
+                .map(|o| {
+                    Ok::<_, wit::Error>(core::OrderBy {
+                        expr: build_expr(exprs, preds, o.expr, upper)?,
+                        dir: to_core_dir(o.dir),
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            limit: q.limit,
+            offset: q.offset,
+            union: None,
+        }
+    }};
+}
+
 fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
-    let exprs = &q.exprs;
-    let preds = &q.preds;
-    let upper = exprs.len();
-    Ok(core::Select {
-        table: q.table.clone(),
-        table_alias: q.table_alias.clone(),
-        columns: q
-            .columns
-            .iter()
-            .map(|it| to_core_item(exprs, preds, it))
-            .collect::<Result<_, _>>()?,
-        joins: q
-            .joins
-            .iter()
-            .map(|j| {
-                Ok::<_, wit::Error>(core::Join {
-                    kind: to_core_joinkind(j.kind),
-                    table: j.table.clone(),
-                    alias: j.alias.clone(),
-                    on: build_pred(preds, exprs, j.on, upper)?,
-                })
-            })
-            .collect::<Result<_, _>>()?,
-        filter: q
-            .filter
-            .map(|f| build_pred(preds, exprs, f, upper))
-            .transpose()?,
-        scope: q.scope.clone().map(to_core_scope),
-        group_by: q
-            .group_by
-            .iter()
-            .map(|&g| build_expr(exprs, preds, g, upper))
-            .collect::<Result<_, _>>()?,
-        having: q
-            .having
-            .map(|h| build_pred(preds, exprs, h, upper))
-            .transpose()?,
-        distinct: q.distinct,
-        order: q
-            .order
-            .iter()
-            .map(|o| {
-                Ok::<_, wit::Error>(core::OrderBy {
-                    expr: build_expr(exprs, preds, o.expr, upper)?,
-                    dir: to_core_dir(o.dir),
-                })
-            })
-            .collect::<Result<_, _>>()?,
-        limit: q.limit,
-        offset: q.offset,
-    })
+    let mut s = core_select_common!(q);
+    if let Some(arm) = &q.union {
+        s.union = Some(Box::new(core::Union {
+            all: arm.all,
+            query: to_core_select_body(&arm.body)?,
+        }));
+    }
+    Ok(s)
+}
+
+/// A UNION branch / INSERT…SELECT source (no nested union of its own).
+fn to_core_select_body(b: &wit::SelectBody) -> Result<core::Select, wit::Error> {
+    Ok(core_select_common!(b))
 }
 
 fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
@@ -477,12 +681,20 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
                 })
             })
             .transpose()?,
-        scope: q.scope.clone().map(to_core_scope),
+        // Stage 0: host-forced (see `OrmHost::scope_for`) — the guest scope is ignored.
+        scope: None,
         returning: q
             .returning
             .iter()
             .map(|it| to_core_item(exprs, preds, it))
             .collect::<Result<_, _>>()?,
+        from_select: q
+            .select_source
+            .as_ref()
+            .map(|s| {
+                Ok::<_, wit::Error>((s.columns.clone(), Box::new(to_core_select_body(&s.source)?)))
+            })
+            .transpose()?,
     })
 }
 
@@ -498,7 +710,25 @@ fn to_core_update(q: &wit::UpdateQuery) -> Result<core::Update, wit::Error> {
             .map(|a| to_core_assignment(exprs, preds, a))
             .collect::<Result<_, _>>()?,
         filter: build_pred(preds, exprs, q.filter, upper)?,
-        scope: q.scope.clone().map(to_core_scope),
+        // Stage 0: host-forced (see `OrmHost::scope_for`) — the guest scope is ignored.
+        scope: None,
+        returning: q
+            .returning
+            .iter()
+            .map(|it| to_core_item(exprs, preds, it))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn to_core_delete(q: &wit::DeleteQuery) -> Result<core::Delete, wit::Error> {
+    let exprs = &q.exprs;
+    let preds = &q.preds;
+    let upper = exprs.len();
+    Ok(core::Delete {
+        table: q.table.clone(),
+        filter: build_pred(preds, exprs, q.filter, upper)?,
+        // Stage 0: host-forced (see `OrmHost::scope_for`) — the guest scope is ignored.
+        scope: None,
         returning: q
             .returning
             .iter()
@@ -609,6 +839,21 @@ mod tests {
         SqlSession::for_backends([(String::new(), backend)].into_iter().collect())
     }
 
+    /// A session with a host-resolved tenancy (`tenant_id = "ten_1"`), the same grant on both
+    /// axes. This is how Stage 0 scopes every ORM op — the guest never supplies the value.
+    fn scoped_session(
+        log: &Log,
+        read: boatramp_core::tenancy::AccessMode,
+        write: boatramp_core::tenancy::AccessMode,
+    ) -> SqlSession {
+        session(log).with_tenancy(Some(crate::tenant::HostTenancy::new(
+            "tenant_id",
+            Some(SqlValue::Text("ten_1".into())),
+            read,
+            write,
+        )))
+    }
+
     fn text(s: &str) -> wit::Value {
         wit::Value::Text(s.to_string())
     }
@@ -647,6 +892,28 @@ mod tests {
             group_by: vec![],
             having: None,
             distinct: false,
+            distinct_on: vec![],
+            order: vec![],
+            limit: None,
+            offset: None,
+            union: None,
+        }
+    }
+
+    fn empty_body(table: &str) -> wit::SelectBody {
+        wit::SelectBody {
+            exprs: vec![],
+            preds: vec![],
+            table: table.to_string(),
+            table_alias: None,
+            columns: vec![],
+            joins: vec![],
+            filter: None,
+            scope: None,
+            group_by: vec![],
+            having: None,
+            distinct: false,
+            distinct_on: vec![],
             order: vec![],
             limit: None,
             offset: None,
@@ -654,9 +921,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_insert_update_compile_and_reach_the_backend() {
+    async fn read_own_without_a_resolved_source_fails_closed() {
+        use boatramp_core::tenancy::AccessMode;
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut sess = session(&log);
+        // Own read grant, but no resolved tenant value (anonymous request): must refuse, never run.
+        let mut sess = session(&log).with_tenancy(Some(crate::tenant::HostTenancy::new(
+            "tenant_id",
+            None,
+            AccessMode::Own,
+            AccessMode::None,
+        )));
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let err = host
+            .select(db, empty_select("work_order"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, wit::Error::Other(m) if m.contains("no verified tenant source")));
+        // Nothing reached the backend.
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_mode_read_runs_unscoped() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = scoped_session(&log, AccessMode::All, AccessMode::None);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            host.select(db, empty_select("work_order")).await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        // `all` injects no tenant predicate — the select is unscoped by design.
+        assert!(log
+            .iter()
+            .any(|l| l.starts_with("query|SELECT * FROM work_order|")));
+        assert!(!log.iter().any(|l| l.contains("tenant_id")));
+    }
+
+    #[tokio::test]
+    async fn a_union_branch_and_insert_select_source_are_both_scoped() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = scoped_session(&log, AccessMode::Own, AccessMode::Own);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            let rep = db.rep();
+
+            // SELECT * FROM live UNION SELECT * FROM archived — BOTH sides must be scoped.
+            let sel = wit::SelectQuery {
+                union: Some(wit::UnionArm {
+                    all: false,
+                    body: empty_body("archived"),
+                }),
+                ..empty_select("live")
+            };
+            host.select(db, sel).await.unwrap();
+
+            // INSERT INTO dst (id) SELECT id FROM src — the source read must be scoped.
+            let ins = wit::InsertQuery {
+                exprs: vec![],
+                table: "dst".into(),
+                rows: vec![],
+                conflict: None,
+                scope: None,
+                returning: vec![],
+                select_source: Some(wit::InsertSelect {
+                    columns: vec!["id".into()],
+                    source: {
+                        let mut b = empty_body("src");
+                        b.exprs = vec![col("id")];
+                        b.columns = vec![item(0)];
+                        b
+                    },
+                }),
+            };
+            host.insert(Resource::new_own(rep), ins).await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        // Both union arms carry the tenant predicate — no branch leaks across tenants.
+        assert!(log.iter().any(|l| l.starts_with(
+            "query|SELECT * FROM live WHERE tenant_id = ?1 UNION SELECT * FROM archived WHERE tenant_id = ?2|"
+        )));
+        // The INSERT…SELECT source is read-scoped AND the target tenant column is host-forced
+        // (appended, bound to the resolved tenant) — the guest can't forge the written tenant.
+        assert!(log.iter().any(|l| l.starts_with(
+            "execute|INSERT INTO dst (id, tenant_id) SELECT id, ?1 FROM src WHERE tenant_id = ?2|"
+        ) && l.contains("ten_1")));
+    }
+
+    #[tokio::test]
+    async fn select_insert_update_compile_and_reach_the_backend() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // Host-resolved tenancy scopes every op to `tenant_id = "ten_1"`. Each query below also
+        // carries a *guest-supplied* scope naming a DIFFERENT tenant ("ATTACKER") — the host must
+        // ignore it entirely and inject its own resolved value (the Stage 0 invariant).
+        let mut sess = scoped_session(&log, AccessMode::Own, AccessMode::Own);
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
@@ -674,7 +1040,7 @@ mod tests {
                 preds: vec![cmp(1, wit::CmpOp::Eq, 2)], // 0
                 columns: vec![item(0)],
                 filter: Some(0),
-                scope: Some(scope("tenant_id", text("ten_1"))),
+                scope: Some(scope("tenant_id", text("ATTACKER"))),
                 order: vec![wit::OrderTerm {
                     expr: 3,
                     dir: wit::Direction::Desc,
@@ -686,7 +1052,7 @@ mod tests {
             assert_eq!(res.columns, vec!["id".to_string()]);
             assert!(matches!(&res.rows[0].values[0], wit::Value::Text(s) if s == "row1"));
 
-            // INSERT INTO work_area (id, tenant_id) VALUES (?, ?)
+            // INSERT INTO work_area (id) VALUES (?) — the host stamps tenant_id itself.
             let ins = wit::InsertQuery {
                 exprs: vec![lit(text("wa_1"))],
                 table: "work_area".into(),
@@ -697,12 +1063,13 @@ mod tests {
                     }],
                 }],
                 conflict: None,
-                scope: Some(scope("tenant_id", text("ten_1"))),
+                scope: Some(scope("tenant_id", text("ATTACKER"))),
                 returning: vec![],
+                select_source: None,
             };
             assert_eq!(host.insert(Resource::new_own(rep), ins).await.unwrap(), 1);
 
-            // UPDATE supplier_invoice SET payment_gate=? WHERE id=?
+            // UPDATE supplier_invoice SET payment_gate=? WHERE id=? — the host conjoins the scope.
             let upd = wit::UpdateQuery {
                 exprs: vec![lit(text("paid")), col("id"), lit(text("inv_1"))],
                 preds: vec![cmp(1, wit::CmpOp::Eq, 2)],
@@ -721,14 +1088,20 @@ mod tests {
 
         let log = log.lock().unwrap();
         assert_eq!(log[0], "begin");
+        // The guest's "ATTACKER" tenant never reaches the backend — only the host's "ten_1".
+        assert!(
+            !log.iter().any(|l| l.contains("ATTACKER")),
+            "guest-supplied scope must be ignored"
+        );
         assert!(log.iter().any(|l| l.starts_with(
             "query|SELECT id FROM work_order WHERE tenant_id = ?1 AND project_id = ?2 ORDER BY created_at DESC LIMIT 10|"
-        )));
-        assert!(log.iter().any(
-            |l| l.starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
-        ));
+        ) && l.contains("ten_1")));
         assert!(log.iter().any(|l| l
-            .starts_with("execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE id = ?2|")));
+            .starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
+            && l.contains("ten_1")));
+        assert!(log.iter().any(|l| l.starts_with(
+            "execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE tenant_id = ?2 AND id = ?3|"
+        )));
         assert_eq!(log.last().unwrap(), "commit");
     }
 
@@ -882,6 +1255,42 @@ mod tests {
 
     #[cfg(feature = "orm-subquery")]
     #[tokio::test]
+    async fn in_subquery_rebuilds_from_the_arena() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        // SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)
+        let sel = wit::SelectQuery {
+            exprs: vec![
+                col("doc_id"),      // 0
+                col("tenant_id"),   // 1
+                lit(text("ten_1")), // 2
+                col("x"),           // 3
+            ],
+            preds: vec![
+                cmp(1, wit::CmpOp::Eq, 2), // 0: the subquery filter
+                wit::PredNode::InSubquery(wit::InSubqueryNode {
+                    expr: 0,
+                    column: "id".into(),
+                    table: "document".into(),
+                    filter: 0,
+                    negated: false,
+                }), // 1
+            ],
+            columns: vec![item(3)],
+            filter: Some(1),
+            ..empty_select("access")
+        };
+        host.select(db, sel).await.unwrap();
+        assert!(log.lock().unwrap().iter().any(|l| l.starts_with(
+            "query|SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)|"
+        )));
+    }
+
+    #[cfg(feature = "orm-subquery")]
+    #[tokio::test]
     async fn related_aggregate_filter_cannot_reference_the_rollup_itself() {
         // The filter pred compares against expr 2 — the roll-up itself. The expr upper-bound
         // (the roll-up's own index) rejects the self/forward reference, so the cross-arena
@@ -938,6 +1347,211 @@ mod tests {
         let err = host.update(db, upd).await.unwrap_err();
         assert!(matches!(err, wit::Error::Syntax(_)));
         // Refused at compile time — the backend was never opened.
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_compiles_and_reaches_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // DELETE FROM payment WHERE id = ?1
+            let del = wit::DeleteQuery {
+                exprs: vec![col("id"), lit(text("pay_1"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                table: "payment".into(),
+                filter: 0,
+                scope: None,
+                returning: vec![],
+            };
+            assert_eq!(host.delete(db, del).await.unwrap(), 1);
+        }
+        sess.finalize(true).await;
+        let log = log.lock().unwrap();
+        assert!(log
+            .iter()
+            .any(|l| l.starts_with("execute|DELETE FROM payment WHERE id = ?1|")));
+    }
+
+    #[tokio::test]
+    async fn delete_returning_runs_via_the_query_path() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug (consume-and-read)
+            let del = wit::DeleteQuery {
+                exprs: vec![col("slug"), lit(text("acme"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                table: "pending_signup".into(),
+                filter: 0,
+                scope: None,
+                returning: vec![item(0)],
+            };
+            // Runs through the query path so the RETURNING rows come back.
+            let res = host.delete_returning(db, del).await.unwrap();
+            assert_eq!(res.columns, vec!["id".to_string()]); // fake backend's canned rows
+        }
+        sess.finalize(true).await;
+        let log = log.lock().unwrap();
+        assert!(log
+            .iter()
+            .any(|l| l
+                .starts_with("query|DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug|")));
+    }
+
+    #[tokio::test]
+    async fn case_expression_rebuilds_from_the_arena() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t
+            let sel = wit::SelectQuery {
+                exprs: vec![
+                    col("state"),                // 0
+                    lit(text("open")),           // 1
+                    lit(wit::Value::Integer(1)), // 2
+                    lit(wit::Value::Integer(0)), // 3
+                    wit::ExprNode::CaseExpr(wit::CaseNode {
+                        branches: vec![wit::CaseBranch { when: 0, then: 2 }],
+                        otherwise: Some(3),
+                    }), // 4
+                ],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)], // pred 0
+                columns: vec![item(4)],
+                ..empty_select("t")
+            };
+            let _ = host.select(db, sel).await.unwrap();
+        }
+        sess.finalize(true).await;
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l
+                .starts_with("query|SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t|")));
+    }
+
+    #[tokio::test]
+    async fn union_rebuilds_from_the_nested_body() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // SELECT slug FROM pending_signup WHERE slug=?1 UNION SELECT slug FROM reserved WHERE slug=?2
+            let branch = wit::SelectBody {
+                exprs: vec![col("slug"), lit(text("acme"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                table: "reserved".into(),
+                table_alias: None,
+                columns: vec![item(0)],
+                joins: vec![],
+                filter: Some(0),
+                scope: None,
+                group_by: vec![],
+                having: None,
+                distinct: false,
+                distinct_on: vec![],
+                order: vec![],
+                limit: None,
+                offset: None,
+            };
+            let sel = wit::SelectQuery {
+                exprs: vec![col("slug"), lit(text("acme"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                columns: vec![item(0)],
+                filter: Some(0),
+                union: Some(wit::UnionArm {
+                    all: false,
+                    body: branch,
+                }),
+                ..empty_select("pending_signup")
+            };
+            host.select(db, sel).await.unwrap();
+        }
+        sess.finalize(true).await;
+        assert!(log.lock().unwrap().iter().any(|l| l.starts_with(
+            "query|SELECT slug FROM pending_signup WHERE slug = ?1 UNION SELECT slug FROM reserved WHERE slug = ?2|"
+        )));
+    }
+
+    #[tokio::test]
+    async fn insert_from_select_rebuilds_from_the_nested_body() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1
+            let source = wit::SelectBody {
+                exprs: vec![col("x"), col("id"), lit(text("s1"))],
+                preds: vec![cmp(1, wit::CmpOp::Eq, 2)],
+                table: "src".into(),
+                table_alias: None,
+                columns: vec![item(0)],
+                joins: vec![],
+                filter: Some(0),
+                scope: None,
+                group_by: vec![],
+                having: None,
+                distinct: false,
+                distinct_on: vec![],
+                order: vec![],
+                limit: None,
+                offset: None,
+            };
+            let ins = wit::InsertQuery {
+                exprs: vec![],
+                table: "ref".into(),
+                rows: vec![],
+                conflict: None,
+                scope: None,
+                returning: vec![],
+                select_source: Some(wit::InsertSelect {
+                    columns: vec!["a".into()],
+                    source,
+                }),
+            };
+            assert_eq!(host.insert(db, ins).await.unwrap(), 1);
+        }
+        sess.finalize(true).await;
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l
+                    .starts_with("execute|INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1|"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_delete_is_refused_before_the_backend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let del = wit::DeleteQuery {
+            exprs: vec![],
+            preds: vec![wit::PredNode::Conj(vec![])], // empty AND, no scope
+            table: "t".into(),
+            filter: 0,
+            scope: None,
+            returning: vec![],
+        };
+        let err = host.delete(db, del).await.unwrap_err();
+        assert!(matches!(err, wit::Error::Syntax(_)));
         assert!(log.lock().unwrap().is_empty());
     }
 

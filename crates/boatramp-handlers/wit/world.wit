@@ -143,6 +143,15 @@ interface orm {
   // reference reachable from it — must stay strictly below this node so the whole thing is
   // acyclic. Only accepted when the host has the `orm-subquery` feature.
   record related-aggregate-node { agg: agg, arg: option<string>, table: string, filter: u32 }
+  // A scalar subquery `(SELECT column FROM table WHERE preds[filter])`; `filter` strictly below.
+  record related-scalar-node { column: string, table: string, filter: u32 }
+  // `CASE WHEN preds[when] THEN exprs[then] … [ELSE exprs[otherwise]] END`. Each `when`/`then`/
+  // `otherwise` indexes the pred/expr arena and must stay strictly below this node (acyclic).
+  record case-branch { when: u32, then: u32 }
+  record case-node { branches: list<case-branch>, otherwise: option<u32> }
+  // A pair of expr indices (both strictly below the parent): used by the JSON dynamic-key
+  // extract `(exprs[left] ->> exprs[right])` and jsonb concat `(exprs[left] || exprs[right])`.
+  record json-pair { left: u32, right: u32 }
   variant expr-node {
     column(string),
     literal(value),
@@ -158,6 +167,10 @@ interface orm {
     distance(distance-node),
     vector-literal(string),     // a bracketed float list, bound + rendered `?N::vector`
     related-aggregate(related-aggregate-node),
+    case-expr(case-node),
+    json-extract-dyn(json-pair),   // (exprs[left] ->> exprs[right]); PG+SQLite, MySQL fails closed
+    json-concat(json-pair),        // (exprs[left] || exprs[right]); Postgres-only
+    related-scalar(related-scalar-node),
   }
 
   // ---- predicate arena -----------------------------------------------------
@@ -167,6 +180,9 @@ interface orm {
   record between-node { expr: u32, low: u32, high: u32, negated: bool }
   record in-node { expr: u32, values: list<u32>, negated: bool }
   record like-node { expr: u32, pattern: string, insensitive: bool, negated: bool }
+  // `exprs[expr] [NOT] IN (SELECT column FROM table WHERE preds[filter])` — narrow single-table
+  // IN-subquery; `filter` indexes `preds` strictly below this node (acyclic). `orm-subquery`.
+  record in-subquery-node { expr: u32, column: string, table: string, filter: u32, negated: bool }
   record null-node { expr: u32, negated: bool }
   variant pred-node {
     conj(list<u32>),            // AND
@@ -177,6 +193,7 @@ interface orm {
     within(in-node),            // IN
     matches(like-node),         // LIKE
     is-null(null-node),
+    in-subquery(in-subquery-node),
   }
 
   record select-item { expr: u32, alias: option<string> }
@@ -187,6 +204,28 @@ interface orm {
   /// forced on insert). The project/database boundary is separate (the opened database).
   record scope { column: string, value: value }
 
+  // A SELECT with no UNION — its own arena bundle. Used both as a top-level query body and as a
+  // UNION branch / INSERT…SELECT source (WIT records can't self-reference, so `select-query`
+  // can't hold a `select-query`; it holds this instead, one level deep).
+  record select-body {
+    exprs: list<expr-node>,
+    preds: list<pred-node>,
+    table: string,
+    table-alias: option<string>,
+    columns: list<select-item>,
+    joins: list<join>,
+    filter: option<u32>,
+    scope: option<scope>,
+    group-by: list<u32>,
+    having: option<u32>,
+    distinct: bool,
+    distinct-on: list<u32>,
+    order: list<order-term>,
+    limit: option<u32>,
+    offset: option<u32>,
+  }
+  // `<body> UNION [ALL] <branch>`. Each side carries its own scope, so both stay tenant-isolated.
+  record union-arm { all: bool, body: select-body }
   record select-query {
     exprs: list<expr-node>,
     preds: list<pred-node>,
@@ -199,15 +238,19 @@ interface orm {
     group-by: list<u32>,          // expr indices
     having: option<u32>,          // pred index
     distinct: bool,
+    distinct-on: list<u32>,       // expr indices; DISTINCT ON (...), Postgres-only
     order: list<order-term>,
     limit: option<u32>,
     offset: option<u32>,
+    union: option<union-arm>,
   }
 
   record assignment { column: string, value: u32 }   // value = expr index
   record row-values { cells: list<assignment> }
   /// ON CONFLICT (<conflict-columns>) DO UPDATE SET <update> (empty update => DO NOTHING).
   record on-conflict { conflict-columns: list<string>, update: list<assignment> }
+  // `INSERT INTO t (columns) <source>` — the inserted rows come from a SELECT.
+  record insert-select { columns: list<string>, source: select-body }
   record insert-query {
     exprs: list<expr-node>,       // insert has no predicates, only cell/upsert expressions
     table: string,
@@ -215,6 +258,7 @@ interface orm {
     conflict: option<on-conflict>,
     scope: option<scope>,
     returning: list<select-item>,
+    select-source: option<insert-select>,
   }
   /// `filter` is required — an unbounded update is refused.
   record update-query {
@@ -226,12 +270,26 @@ interface orm {
     scope: option<scope>,
     returning: list<select-item>,
   }
+  /// `filter` is required — an unbounded delete is refused (mirrors update-query, minus `set`).
+  record delete-query {
+    exprs: list<expr-node>,
+    preds: list<pred-node>,
+    table: string,
+    filter: u32,                  // pred index
+    scope: option<scope>,
+    returning: list<select-item>,
+  }
 
   /// A handle to one of the site's named databases (same model as `sql-query`).
   resource database {
     select: func(q: select-query) -> result<query-result, error>;
     insert: func(q: insert-query) -> result<u64, error>;
     update: func(q: update-query) -> result<u64, error>;
+    /// Affected-row count. Use `delete-returning` when the query has a RETURNING clause and the
+    /// caller needs the deleted rows (consume-and-read).
+    delete: func(q: delete-query) -> result<u64, error>;
+    /// Run a DELETE and return its RETURNING rows (the `returning` list must be non-empty).
+    delete-returning: func(q: delete-query) -> result<query-result, error>;
   }
 
   open: func(name: string) -> result<database, error>;

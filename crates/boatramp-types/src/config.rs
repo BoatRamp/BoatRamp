@@ -741,6 +741,13 @@ pub struct HandlersSiteConfig {
     /// CSRF-checked: same-origin always passes, and `allowed_origins` adds any cross-origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie_auth: Option<CookieAuthConfig>,
+    /// Site-level in-site tenancy decision (Dimension 0) — the **ceiling** for this site's
+    /// handlers' `sql`/`orm` access. A per-function [`crate::function::FunctionConfig::tenancy`]
+    /// may narrow within it but not widen it (e.g. a site pinned to `read: own` can't be raised
+    /// to `all` by a function). Absent ⇒ *undeclared* (refused under `multi-tenant`, treated as
+    /// `Disabled` under single-tenant/dev).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
 }
 
 /// Browser cookie session auth for a site (see [`HandlersSiteConfig::cookie_auth`]). boatramp
@@ -947,6 +954,16 @@ pub struct DomainConfig {
     /// (apex↔www canonicalization). Only exact aliases redirect — wildcard hosts
     /// serve as-is. Off by default.
     pub canonical_redirect: bool,
+    /// Per-host **tenant context tag** (Stage 0 in-site tenancy): host-or-wildcard-pattern → an
+    /// opaque tag the host binds as the in-site tenant when a function/site resolves "own" via
+    /// [`crate::tenancy::TenantSource::Domain`]. This is what lets ONE deployment serve many
+    /// customer storefronts, each on its own domain = its own tenant. An exact host with no own
+    /// entry inherits [`primary`](Self::primary)'s tag (apex↔www share a tenant); a subdomain
+    /// inherits its matching wildcard's tag. A host with no resolvable tag makes the domain source
+    /// fail closed (no cross-tenant read). The tag is bound as a parameter, never formatted into
+    /// SQL.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub contexts: BTreeMap<String, String>,
 }
 
 impl DomainConfig {

@@ -189,6 +189,29 @@ pub enum Expr {
         table: String,
         filter: Box<Predicate>,
     },
+    /// A `CASE WHEN <pred> THEN <expr> … [ELSE <expr>] END` (parenthesized). Each branch's
+    /// condition reuses the predicate compiler (bound params). A boolean/comparison `ORDER BY`
+    /// term is expressed portably as `ORDER BY CASE WHEN <cond> THEN 0 ELSE 1 END`.
+    Case {
+        branches: Vec<(Predicate, Self)>,
+        otherwise: Option<Box<Self>>,
+    },
+    /// Extract a JSON value by a **dynamic/bound key**: `(base ->> key)` (key is an expression,
+    /// e.g. a bound param — `labels ->> ?`). Postgres + SQLite; MySQL fails closed (its `->>`
+    /// needs a `$.path`). Distinct from [`Expr::JsonExtract`], which takes a static key path.
+    JsonExtractDyn(Box<Self>, Box<Self>),
+    /// jsonb concat/merge `(left || right)` — **Postgres-only** (elsewhere `||` is string concat,
+    /// so it fails closed). Used for `col = col || ?::jsonb` merge updates.
+    JsonConcat(Box<Self>, Box<Self>),
+    /// A **scalar subquery over a named table**: `(SELECT <column> FROM <table> WHERE <filter>)`.
+    /// The narrow non-aggregate sibling of [`Expr::RelatedAggregate`] (single named table + a
+    /// bound-parameter predicate — mechanically scopable, no arbitrary nested FROM). Used as the
+    /// RHS of a comparison, e.g. `id = (SELECT head_version FROM pack WHERE …)`.
+    RelatedScalar {
+        column: String,
+        table: String,
+        filter: Box<Predicate>,
+    },
 }
 
 impl Expr {
@@ -263,6 +286,15 @@ pub enum Predicate {
     },
     /// `<expr> IS [NOT] NULL`.
     Null { expr: Expr, negated: bool },
+    /// `<expr> [NOT] IN (SELECT <column> FROM <table> WHERE <filter>)` — a narrow single-named-
+    /// table IN-subquery (the sibling of [`Expr::RelatedScalar`]; same safe-by-construction shape).
+    InSubquery {
+        expr: Expr,
+        column: String,
+        table: String,
+        filter: Box<Self>,
+        negated: bool,
+    },
 }
 
 /// Build an `AND` of the given predicates.
@@ -313,20 +345,76 @@ pub struct SelectItem {
     pub alias: Option<String>,
 }
 
-/// An optional in-site row-tenancy scope: `column = value`.
+/// How a tenant [`Scope`] restricts rows for one operation. The host resolves this from the
+/// per-function/site `db.read`/`db.write` grant (read modes on `SELECT`, write modes on
+/// `INSERT`/`UPDATE`/`DELETE`); a guest never chooses it. `None`-grant (deny) is handled above
+/// the compiler — a compiled query always carries a concrete mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScopeMode {
+    /// `column = value` — the resolved tenant only.
+    #[default]
+    Own,
+    /// `(column = value OR column IS NULL)` — the resolved tenant plus the shared/`NULL` baseline.
+    OwnOrNull,
+    /// `column IS NULL` — the shared/`NULL` baseline only (no tenant rows).
+    NullOnly,
+    /// No tenant predicate — cross-tenant. Only reachable with an explicit `all` grant under the
+    /// operator posture ceiling (both enforced host-side, above this compiler).
+    All,
+}
+
+/// A host-resolved in-site row-tenancy scope. The `value` is the resolved tenant (from the
+/// verified source); `mode` decides how it restricts the operation. Injected by the host on
+/// **every** query node (top-level, `UNION` branch, `INSERT … SELECT` source), never guest-set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scope {
     pub column: String,
     pub value: SqlValue,
+    pub mode: ScopeMode,
 }
 
 impl Scope {
-    /// The scope as a predicate (`column = value`), conjoined into `WHERE`.
-    fn as_predicate(&self) -> Predicate {
-        Predicate::Cmp {
-            left: Expr::Column(self.column.clone()),
+    /// The scope as a `WHERE`/`HAVING` predicate for the resolved mode, or `None` for
+    /// [`ScopeMode::All`] (cross-tenant — no tenant predicate at all). Unqualified column.
+    fn as_predicate(&self) -> Option<Predicate> {
+        self.as_predicate_for(None)
+    }
+
+    /// Like [`Scope::as_predicate`] but the tenant column is optionally qualified `<qualifier>.col`
+    /// — so the predicate binds to a specific table in a multi-table (join) or subquery context,
+    /// never accidentally to an outer/other table with the same column name (a scoping leak).
+    fn as_predicate_for(&self, qualifier: Option<&str>) -> Option<Predicate> {
+        let col = || {
+            Expr::Column(match qualifier {
+                Some(q) => format!("{q}.{}", self.column),
+                None => self.column.clone(),
+            })
+        };
+        let eq = || Predicate::Cmp {
+            left: col(),
             op: CmpOp::Eq,
             right: Expr::Value(self.value.clone()),
+        };
+        let is_null = || Predicate::Null {
+            expr: col(),
+            negated: false,
+        };
+        match self.mode {
+            ScopeMode::Own => Some(eq()),
+            ScopeMode::OwnOrNull => Some(Predicate::Or(vec![eq(), is_null()])),
+            ScopeMode::NullOnly => Some(is_null()),
+            ScopeMode::All => None,
+        }
+    }
+
+    /// The value the scope stamps into a scoped `INSERT`'s tenant column for this mode, or `None`
+    /// when the mode forces no column (`all` — the guest supplies the value; a cross-tenant write).
+    /// `own`/`own+null` stamp the resolved tenant; `null` stamps `NULL` (the shared baseline).
+    fn stamp_value(&self) -> Option<SqlValue> {
+        match self.mode {
+            ScopeMode::Own | ScopeMode::OwnOrNull => Some(self.value.clone()),
+            ScopeMode::NullOnly => Some(SqlValue::Null),
+            ScopeMode::All => None,
         }
     }
 }
@@ -344,9 +432,22 @@ pub struct Select {
     pub group_by: Vec<Expr>,
     pub having: Option<Predicate>,
     pub distinct: bool,
+    /// `DISTINCT ON (<exprs>)` — **Postgres-only** (fails closed elsewhere). Non-empty takes
+    /// precedence over `distinct`; empty ⇒ inactive.
+    pub distinct_on: Vec<Expr>,
     pub order: Vec<OrderBy>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// `UNION [ALL] <query>` — one level (the branch's own `union` is not rendered). Each side
+    /// carries its own scope/filter, so both stay tenant-isolated.
+    pub union: Option<Box<Union>>,
+}
+
+/// A `UNION [ALL]` branch of a [`Select`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Union {
+    pub all: bool,
+    pub query: Select,
 }
 
 /// A `column = <expr>` assignment (an INSERT cell or an UPDATE SET).
@@ -379,6 +480,11 @@ pub struct Insert {
     pub scope: Option<Scope>,
     /// `RETURNING <items>` (empty ⇒ none). Not supported by every engine (e.g. MySQL).
     pub returning: Vec<SelectItem>,
+    /// `INSERT INTO t (<columns>) <select>` — when set, rows come from a SELECT (`rows` ignored).
+    /// Under a scoped write, [`Insert::force_scope`] read-scopes the source **and** host-forces the
+    /// target tenant column (dropping any guest projection of it), so the written tenant can't be
+    /// forged; without a scope (or `all`) the columns/projection are taken verbatim.
+    pub from_select: Option<(Vec<String>, Box<Select>)>,
 }
 
 /// An `UPDATE`; `filter` is required (an unbounded update is refused).
@@ -389,6 +495,251 @@ pub struct Update {
     pub filter: Predicate,
     pub scope: Option<Scope>,
     pub returning: Vec<SelectItem>,
+}
+
+/// A `DELETE`; `filter` is required (an unbounded delete is refused, mirroring [`Update`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    pub table: String,
+    pub filter: Predicate,
+    pub scope: Option<Scope>,
+    pub returning: Vec<SelectItem>,
+}
+
+impl Select {
+    /// Force a host-resolved `scope` onto this `SELECT` **and every nested read node** — its
+    /// `UNION` branch — so a tenant scope reaches every row source (a union branch left unscoped
+    /// would leak across tenants). Overwrites any pre-existing scope. This is the host's tenant
+    /// injection point for reads; the guest never sets a scope of its own.
+    pub fn force_scope(&mut self, scope: &Scope) {
+        self.scope = Some(scope.clone());
+        self.inject_subquery_scope(scope);
+        if let Some(u) = self.union.as_mut() {
+            u.query.force_scope(scope);
+        }
+    }
+}
+
+impl Insert {
+    /// Force the host-resolved tenant scope. `write` stamps the tenant column on a
+    /// `VALUES`-based insert (per [`ScopeMode`]); for an `INSERT … SELECT`, the `read` scope is
+    /// forced onto the source query (and its nested unions) so the selected rows stay
+    /// tenant-isolated, **and** the target tenant column is host-forced too — any guest-supplied
+    /// tenant column + its projection is dropped and re-appended bound to the resolved value, so a
+    /// guest can't project another tenant's id into the write (a cross-tenant write forgery).
+    /// `None` for an axis (cross-tenant `all`) clears that scope — the operation runs unscoped on
+    /// that axis, by design (an `all` write's `stamp_value()` is `None`, so nothing is forced).
+    pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
+        self.scope = write.cloned();
+        // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
+        // of another table — scope it to that table so it can't read cross-tenant.
+        if let Some(r) = read {
+            for row in &mut self.rows {
+                for cell in &mut row.cells {
+                    inject_scope_expr(r, &mut cell.value);
+                }
+            }
+            if let Some(c) = self.conflict.as_mut() {
+                for a in &mut c.update {
+                    inject_scope_expr(r, &mut a.value);
+                }
+            }
+            for it in &mut self.returning {
+                inject_scope_expr(r, &mut it.expr);
+            }
+        }
+        if let Some((cols, src)) = self.from_select.as_mut() {
+            match read {
+                Some(r) => src.force_scope(r),
+                None => src.scope = None,
+            }
+            // A scoped write owns the tenant column written — never trust the guest's target
+            // projection. Drop any guest-supplied tenant column (+ its aligned projection, in the
+            // source and every union branch) and re-append it bound to the host value.
+            if let Some(v) = write.and_then(Scope::stamp_value) {
+                let column = write.expect("stamp implies write").column.clone();
+                if let Some(i) = cols.iter().position(|c| same_col(c, &column)) {
+                    cols.remove(i);
+                    drop_projection_at(src, i);
+                }
+                cols.push(column);
+                push_projection(
+                    src,
+                    SelectItem {
+                        expr: Expr::Value(v),
+                        alias: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Remove the projection at index `i` from a `SELECT` and every one-level `UNION` branch, keeping
+/// the branches' column counts aligned (used by [`Insert::force_scope`]).
+fn drop_projection_at(s: &mut Select, i: usize) {
+    if i < s.columns.len() {
+        s.columns.remove(i);
+    }
+    if let Some(u) = s.union.as_mut() {
+        drop_projection_at(&mut u.query, i);
+    }
+}
+
+/// Append `item` to a `SELECT`'s projection and every one-level `UNION` branch (so both sides of
+/// a union source stamp the same host tenant value).
+fn push_projection(s: &mut Select, item: SelectItem) {
+    s.columns.push(item.clone());
+    if let Some(u) = s.union.as_mut() {
+        push_projection(&mut u.query, item);
+    }
+}
+
+/// Conjoin `add` (if any) as the FIRST conjunct of `filter` (`filter := add AND filter`). A
+/// no-op empty-`AND` existing filter is replaced outright, so the scope doesn't trail a spurious
+/// `AND 1 = 1`.
+fn conjoin_front(filter: &mut Predicate, add: Option<Predicate>) {
+    let Some(a) = add else { return };
+    if matches!(filter, Predicate::And(v) if v.is_empty()) {
+        *filter = a;
+    } else {
+        let existing = std::mem::replace(filter, Predicate::And(Vec::new()));
+        *filter = Predicate::And(vec![a, existing]);
+    }
+}
+
+/// Walk an expression and inject the tenant scope into every **narrow subquery**'s inner filter,
+/// qualified to that subquery's own table (`<subtable>.col`), so a subquery can't read another
+/// tenant's rows. Recurses into a subquery's filter first (nested subqueries scope their own
+/// tables). The correctness twin of [`Select::scope_where_pred`] for the subquery surface.
+fn inject_scope_expr(scope: &Scope, e: &mut Expr) {
+    match e {
+        Expr::RelatedAggregate { table, filter, .. }
+        | Expr::RelatedScalar { table, filter, .. } => {
+            inject_scope_pred(scope, filter);
+            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+        }
+        Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner),
+        Expr::Binary(_, l, r) | Expr::JsonExtractDyn(l, r) | Expr::JsonConcat(l, r) => {
+            inject_scope_expr(scope, l);
+            inject_scope_expr(scope, r);
+        }
+        Expr::Distance { left, right, .. } => {
+            inject_scope_expr(scope, left);
+            inject_scope_expr(scope, right);
+        }
+        Expr::Func(_, args) => args.iter_mut().for_each(|a| inject_scope_expr(scope, a)),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (when, then) in branches {
+                inject_scope_pred(scope, when);
+                inject_scope_expr(scope, then);
+            }
+            if let Some(e) = otherwise {
+                inject_scope_expr(scope, e);
+            }
+        }
+        Expr::Column(_) | Expr::Value(_) | Expr::Star | Expr::VectorLiteral(_) => {}
+    }
+}
+
+/// Walk a predicate and inject the tenant scope into every narrow subquery (see
+/// [`inject_scope_expr`]).
+fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
+    match p {
+        Predicate::InSubquery {
+            expr,
+            table,
+            filter,
+            ..
+        } => {
+            inject_scope_expr(scope, expr);
+            inject_scope_pred(scope, filter);
+            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+        }
+        Predicate::And(v) | Predicate::Or(v) => {
+            v.iter_mut().for_each(|c| inject_scope_pred(scope, c));
+        }
+        Predicate::Not(inner) => inject_scope_pred(scope, inner),
+        Predicate::Cmp { left, right, .. } => {
+            inject_scope_expr(scope, left);
+            inject_scope_expr(scope, right);
+        }
+        Predicate::Between {
+            expr, low, high, ..
+        } => {
+            inject_scope_expr(scope, expr);
+            inject_scope_expr(scope, low);
+            inject_scope_expr(scope, high);
+        }
+        Predicate::In { expr, values, .. } => {
+            inject_scope_expr(scope, expr);
+            values.iter_mut().for_each(|v| inject_scope_expr(scope, v));
+        }
+        Predicate::Like { expr, .. } | Predicate::Null { expr, .. } => {
+            inject_scope_expr(scope, expr);
+        }
+    }
+}
+
+impl Select {
+    /// Inject the tenant scope into every narrow subquery this SELECT embeds — across ALL of its
+    /// expr/pred-bearing fields (projection, `DISTINCT ON`, filter, having, group-by, order, and
+    /// join `ON`s) — so a subquery's own table is scoped, not just the outer FROM. Called by
+    /// [`Select::force_scope`] after setting the scope. Must stay exhaustive over the Expr/Predicate
+    /// fields: a missed field is a cross-tenant subquery leak.
+    fn inject_subquery_scope(&mut self, scope: &Scope) {
+        for it in &mut self.columns {
+            inject_scope_expr(scope, &mut it.expr);
+        }
+        for e in &mut self.distinct_on {
+            inject_scope_expr(scope, e);
+        }
+        if let Some(f) = self.filter.as_mut() {
+            inject_scope_pred(scope, f);
+        }
+        if let Some(h) = self.having.as_mut() {
+            inject_scope_pred(scope, h);
+        }
+        for e in &mut self.group_by {
+            inject_scope_expr(scope, e);
+        }
+        for o in &mut self.order {
+            inject_scope_expr(scope, &mut o.expr);
+        }
+        for j in &mut self.joins {
+            inject_scope_pred(scope, &mut j.on);
+        }
+    }
+}
+
+impl Update {
+    /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
+    /// the `SET` exprs, filter, and `RETURNING` items. Overwrites any prior scope.
+    pub fn force_scope(&mut self, scope: &Scope) {
+        self.scope = Some(scope.clone());
+        for a in &mut self.set {
+            inject_scope_expr(scope, &mut a.value);
+        }
+        inject_scope_pred(scope, &mut self.filter);
+        for it in &mut self.returning {
+            inject_scope_expr(scope, &mut it.expr);
+        }
+    }
+}
+
+impl Delete {
+    /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
+    /// the filter and `RETURNING` items. Overwrites any prior scope.
+    pub fn force_scope(&mut self, scope: &Scope) {
+        self.scope = Some(scope.clone());
+        inject_scope_pred(scope, &mut self.filter);
+        for it in &mut self.returning {
+            inject_scope_expr(scope, &mut it.expr);
+        }
+    }
 }
 
 /// Why compilation failed.
@@ -426,6 +777,15 @@ fn ident(name: &str) -> Result<&str, OrmError> {
     } else {
         Err(OrmError::InvalidIdentifier(name.to_string()))
     }
+}
+
+/// Whether two identifiers name the **same column** the way the engines resolve unquoted names:
+/// ASCII-case-insensitively, ignoring a leading `table.` qualifier. Used by the tenant-scope
+/// guards so a guest can't dodge them by re-spelling the tenant column (`TENANT_ID`, `t.tenant_id`)
+/// — the DB would still resolve it to the tenant column, but a naive `==` would miss it.
+fn same_col(a: &str, b: &str) -> bool {
+    let base = |s: &str| s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase();
+    base(a) == base(b)
 }
 
 /// Accumulates the parameter list and mints `?N` placeholders in order.
@@ -543,6 +903,60 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
                 "(SELECT {}({arg_sql}) FROM {table_sql} WHERE {where_sql})",
                 agg.keyword()
             )
+        }
+        Expr::RelatedScalar {
+            column,
+            table,
+            filter,
+        } => {
+            let col_sql = ident(column)?;
+            let table_sql = ident(table)?;
+            let where_sql = render_pred(filter, params, false, dialect)?;
+            format!("(SELECT {col_sql} FROM {table_sql} WHERE {where_sql})")
+        }
+        Expr::JsonExtractDyn(base, key) => {
+            if matches!(dialect, Dialect::Mysql) {
+                return Err(OrmError::BadExpr(
+                    "dynamic-key json extract (->> <bound>) is not supported on MySQL",
+                ));
+            }
+            format!(
+                "({} ->> {})",
+                render_expr(base, params, dialect)?,
+                render_expr(key, params, dialect)?,
+            )
+        }
+        Expr::JsonConcat(left, right) => {
+            if dialect != Dialect::Postgres {
+                return Err(OrmError::BadExpr("json concat (||) is Postgres-only"));
+            }
+            format!(
+                "({} || {})",
+                render_expr(left, params, dialect)?,
+                render_expr(right, params, dialect)?,
+            )
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            if branches.is_empty() {
+                return Err(OrmError::BadExpr("CASE has no WHEN branches"));
+            }
+            let mut s = String::from("CASE");
+            for (when, then) in branches {
+                // Params bind in textual order: each WHEN before its THEN, branches in order,
+                // ELSE last — matching how `render_pred`/`render_expr` push placeholders.
+                let w = render_pred(when, params, false, dialect)?;
+                let t = render_expr(then, params, dialect)?;
+                s.push_str(&format!(" WHEN {w} THEN {t}"));
+            }
+            if let Some(e) = otherwise {
+                let e = render_expr(e, params, dialect)?;
+                s.push_str(&format!(" ELSE {e}"));
+            }
+            s.push_str(" END");
+            format!("({s})")
         }
     })
 }
@@ -676,32 +1090,56 @@ fn render_pred(
             render_expr(expr, params, dialect)?,
             if *negated { "NOT " } else { "" }
         ),
+        Predicate::InSubquery {
+            expr,
+            column,
+            table,
+            filter,
+            negated,
+        } => {
+            let lhs = render_expr(expr, params, dialect)?;
+            let col_sql = ident(column)?;
+            let table_sql = ident(table)?;
+            let where_sql = render_pred(filter, params, false, dialect)?;
+            let not = if *negated { "NOT " } else { "" };
+            format!("{lhs} {not}IN (SELECT {col_sql} FROM {table_sql} WHERE {where_sql})")
+        }
     })
 }
 
-/// Render the `WHERE` body from an optional scope + optional predicate (scope conjoined first).
+/// Render the `WHERE` body from a pre-built scope predicate + optional filter (scope conjoined
+/// first). The scope predicate is built by the caller — single-table for UPDATE/DELETE
+/// ([`single_scope_pred`]), multi-table-qualified for a SELECT with joins
+/// ([`Select::scope_where_pred`]).
 fn render_where(
-    scope: Option<&Scope>,
+    scope_pred: Option<Predicate>,
     filter: Option<&Predicate>,
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<Option<String>, OrmError> {
-    // Validate the scope column eagerly (its predicate is rendered below).
-    if let Some(s) = scope {
-        ident(&s.column)?;
-    }
     // An empty `AND` filter is a no-op (always true) — drop it so it never adds a spurious
     // `AND 1 = 1`. (An empty `OR` means "match nothing" and is kept.)
     let filter = filter.filter(|f| !matches!(f, Predicate::And(v) if v.is_empty()));
     // A lone clause renders directly (no wrapping `AND`, so a top-level `AND`/`OR` filter
     // isn't spuriously parenthesized); scope + filter conjoin as `scope AND (filter)`.
-    let combined = match (scope, filter) {
+    let combined = match (scope_pred, filter) {
         (None, None) => return Ok(None),
-        (Some(s), None) => s.as_predicate(),
+        (Some(s), None) => s,
         (None, Some(f)) => f.clone(),
-        (Some(s), Some(f)) => Predicate::And(vec![s.as_predicate(), f.clone()]),
+        (Some(s), Some(f)) => Predicate::And(vec![s, f.clone()]),
     };
     Ok(Some(render_pred(&combined, params, false, dialect)?))
+}
+
+/// The single-table scope predicate for an UPDATE/DELETE (validates the column, unqualified).
+fn single_scope_pred(scope: Option<&Scope>) -> Result<Option<Predicate>, OrmError> {
+    match scope {
+        Some(s) => {
+            ident(&s.column)?;
+            Ok(s.as_predicate())
+        }
+        None => Ok(None),
+    }
 }
 
 /// Render a select list (empty ⇒ `*`).
@@ -755,19 +1193,85 @@ impl Select {
             group_by: Vec::new(),
             having: None,
             distinct: false,
+            distinct_on: Vec::new(),
             order: Vec::new(),
             limit: None,
             offset: None,
+            union: None,
         }
     }
 
-    /// Compile to `?N` SQL + bound parameters for the given dialect.
+    /// Compile to `?N` SQL + bound parameters for the given dialect. A `UNION` branch renders
+    /// after the body, sharing the placeholder sequence (so binds stay in textual order).
     pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
         let mut params = Params::default();
+        let sql = self.render_into(&mut params, dialect)?;
+        Ok((sql, params.0))
+    }
+
+    /// The scope predicate to conjoin into this SELECT's `WHERE`. With **no joins** it's the
+    /// single-table (unqualified) predicate. With joins, the per-mode predicate is applied to
+    /// **every** table reference — the FROM table plus each join, qualified by its alias-or-name —
+    /// so a guest can't read a joined table's cross-tenant rows through the projection (a
+    /// join to a table lacking the tenant column then fails closed at the DB, not leaks).
+    /// `all`/no-scope ⇒ `None`.
+    fn scope_where_pred(&self) -> Result<Option<Predicate>, OrmError> {
+        let Some(scope) = &self.scope else {
+            return Ok(None);
+        };
+        ident(&scope.column)?;
+        if self.joins.is_empty() {
+            return Ok(scope.as_predicate());
+        }
+        let mut refs: Vec<&str> = Vec::with_capacity(self.joins.len() + 1);
+        refs.push(self.table_alias.as_deref().unwrap_or(&self.table));
+        for j in &self.joins {
+            refs.push(j.alias.as_deref().unwrap_or(&j.table));
+        }
+        let mut parts: Vec<Predicate> = Vec::with_capacity(refs.len());
+        for r in refs {
+            ident(r)?;
+            if let Some(p) = scope.as_predicate_for(Some(r)) {
+                parts.push(p);
+            }
+        }
+        Ok((!parts.is_empty()).then_some(Predicate::And(parts)))
+    }
+
+    /// Render the full SELECT (body + any UNION branch) into the shared `params`. Reused by
+    /// `INSERT … SELECT` so a source select shares the outer placeholder sequence. Module-private
+    /// because `Params` is (Insert::compile, same module, is the other caller).
+    fn render_into(&self, params: &mut Params, dialect: Dialect) -> Result<String, OrmError> {
+        let mut sql = self.render_body(params, dialect)?;
+        if let Some(u) = &self.union {
+            let kw = if u.all { "UNION ALL" } else { "UNION" };
+            let branch = u.query.render_body(params, dialect)?;
+            sql.push_str(&format!(" {kw} {branch}"));
+        }
+        Ok(sql)
+    }
+
+    /// Render one SELECT body (no UNION) into the shared `params`.
+    fn render_body(&self, params: &mut Params, dialect: Dialect) -> Result<String, OrmError> {
         let table = ident(&self.table)?;
 
-        let select_list = render_select_items(&self.columns, &mut params, dialect)?;
-        let distinct = if self.distinct { "DISTINCT " } else { "" };
+        // The DISTINCT clause renders before the select list so any bound params order correctly.
+        let distinct = if !self.distinct_on.is_empty() {
+            if dialect != Dialect::Postgres {
+                return Err(OrmError::BadExpr("DISTINCT ON is Postgres-only"));
+            }
+            let cols = self
+                .distinct_on
+                .iter()
+                .map(|e| render_expr(e, &mut *params, dialect))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("DISTINCT ON ({}) ", cols.join(", "))
+        } else if self.distinct {
+            "DISTINCT ".to_string()
+        } else {
+            String::new()
+        };
+        let select_list = render_select_items(&self.columns, &mut *params, dialect)?;
         let mut sql = format!("SELECT {distinct}{select_list} FROM {table}");
         if let Some(a) = &self.table_alias {
             sql.push_str(&format!(" AS {}", ident(a)?));
@@ -785,14 +1289,14 @@ impl Select {
             }
             sql.push_str(&format!(
                 " ON {}",
-                render_pred(&j.on, &mut params, false, dialect)?
+                render_pred(&j.on, &mut *params, false, dialect)?
             ));
         }
 
         if let Some(w) = render_where(
-            self.scope.as_ref(),
+            self.scope_where_pred()?,
             self.filter.as_ref(),
-            &mut params,
+            &mut *params,
             dialect,
         )? {
             sql.push_str(&format!(" WHERE {w}"));
@@ -802,7 +1306,7 @@ impl Select {
             let terms: Result<Vec<String>, _> = self
                 .group_by
                 .iter()
-                .map(|e| render_expr(e, &mut params, dialect))
+                .map(|e| render_expr(e, &mut *params, dialect))
                 .collect();
             sql.push_str(&format!(" GROUP BY {}", terms?.join(", ")));
         }
@@ -810,7 +1314,7 @@ impl Select {
         if let Some(h) = &self.having {
             sql.push_str(&format!(
                 " HAVING {}",
-                render_pred(h, &mut params, false, dialect)?
+                render_pred(h, &mut *params, false, dialect)?
             ));
         }
 
@@ -819,7 +1323,7 @@ impl Select {
                 .order
                 .iter()
                 .map(|o| {
-                    let e = render_expr(&o.expr, &mut params, dialect)?;
+                    let e = render_expr(&o.expr, &mut *params, dialect)?;
                     let d = match o.dir {
                         Direction::Asc => "ASC",
                         Direction::Desc => "DESC",
@@ -837,18 +1341,40 @@ impl Select {
             sql.push_str(&format!(" OFFSET {n}"));
         }
 
-        Ok((sql, params.0))
+        Ok(sql)
     }
 }
 
 impl Insert {
     /// Compile to `?N` SQL + bound parameters for the given dialect.
     pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
+        let table = ident(&self.table)?;
+        let mut params = Params::default();
+
+        // INSERT … SELECT: rows come from a source query sharing the placeholder sequence.
+        if let Some((cols, select)) = &self.from_select {
+            let col_sql = cols
+                .iter()
+                .map(|c| ident(c).map(str::to_string))
+                .collect::<Result<Vec<_>, _>>()?;
+            if col_sql.is_empty() {
+                return Err(OrmError::Empty("insert-select has no columns"));
+            }
+            let select_sql = select.render_into(&mut params, dialect)?;
+            let mut sql = format!("INSERT INTO {table} ({}) {select_sql}", col_sql.join(", "));
+            sql.push_str(&render_conflict(
+                self.conflict.as_ref(),
+                self.scope.as_ref(),
+                &mut params,
+                dialect,
+            )?);
+            sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
+            return Ok((sql, params.0));
+        }
+
         if self.rows.is_empty() {
             return Err(OrmError::Empty("insert has no rows"));
         }
-        let table = ident(&self.table)?;
-        let mut params = Params::default();
 
         // Column set: from the first row (+ the scope column if forced), in a stable order.
         // Every row is coerced to exactly these columns; the scope value overrides.
@@ -859,9 +1385,18 @@ impl Insert {
                 columns.push(c);
             }
         }
-        if let Some(s) = &self.scope {
-            let c = ident(&s.column)?.to_string();
-            if !columns.contains(&c) {
+        // A scope with a stampable value (own/own+null → the tenant, null → NULL) forces its
+        // column into every row. `all` mode stamps nothing (the guest supplies the value —
+        // a cross-tenant write), so it behaves like no scope here. The column match is
+        // case/qualifier-insensitive (`same_col`) so a guest can't smuggle its own value into the
+        // tenant column by re-spelling it (`TENANT_ID`, `t.tenant_id`).
+        let stamp = self
+            .scope
+            .as_ref()
+            .and_then(|s| s.stamp_value().map(|v| (s.column.as_str(), v)));
+        if let Some((column, _)) = &stamp {
+            let c = ident(column)?.to_string();
+            if !columns.iter().any(|existing| same_col(existing, &c)) {
                 columns.push(c);
             }
         }
@@ -873,14 +1408,17 @@ impl Insert {
         for row in &self.rows {
             let mut ph: Vec<String> = Vec::with_capacity(columns.len());
             for col in &columns {
-                // Scope forces its column; otherwise take the row's cell expr, else NULL.
-                if self.scope.as_ref().is_some_and(|s| &s.column == col) {
-                    ph.push(params.bind(self.scope.as_ref().unwrap().value.clone()));
-                } else {
-                    match row.cells.iter().find(|a| &a.column == col) {
-                        Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
-                        None => ph.push(params.bind(SqlValue::Null)),
+                // The scope forces its column to the resolved stamp; otherwise take the row's
+                // cell expr, else NULL.
+                if let Some((column, value)) = &stamp {
+                    if same_col(column, col) {
+                        ph.push(params.bind(value.clone()));
+                        continue;
                     }
+                }
+                match row.cells.iter().find(|a| same_col(&a.column, col)) {
+                    Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
+                    None => ph.push(params.bind(SqlValue::Null)),
                 }
             }
             value_groups.push(format!("({})", ph.join(", ")));
@@ -892,41 +1430,81 @@ impl Insert {
             value_groups.join(", ")
         );
 
-        if let Some(oc) = &self.conflict {
-            let conflict_cols: Result<Vec<String>, _> = oc
-                .conflict_columns
-                .iter()
-                .map(|c| ident(c).map(str::to_string))
-                .collect();
-            let conflict_cols = conflict_cols?;
-            if oc.update.is_empty() {
-                sql.push_str(&format!(
-                    " ON CONFLICT ({}) DO NOTHING",
-                    conflict_cols.join(", ")
-                ));
-            } else {
-                let sets: Result<Vec<String>, _> = oc
-                    .update
-                    .iter()
-                    .map(|a| {
-                        let c = ident(&a.column)?;
-                        Ok::<String, OrmError>(format!(
-                            "{c} = {}",
-                            render_expr(&a.value, &mut params, dialect)?
-                        ))
-                    })
-                    .collect();
-                sql.push_str(&format!(
-                    " ON CONFLICT ({}) DO UPDATE SET {}",
-                    conflict_cols.join(", "),
-                    sets?.join(", ")
-                ));
-            }
-        }
-
+        sql.push_str(&render_conflict(
+            self.conflict.as_ref(),
+            self.scope.as_ref(),
+            &mut params,
+            dialect,
+        )?);
         sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
         Ok((sql, params.0))
     }
+}
+
+/// Render an `ON CONFLICT (...) DO NOTHING|UPDATE SET ...` clause (empty when `None`). The
+/// DO UPDATE assignments bind params, so it takes the shared [`Params`].
+///
+/// Under a tenant scope with a stampable value (own/null — `all` bounds nothing), the DO UPDATE is
+/// **bounded to the tenant's own rows** so a guest upsert can't overwrite another tenant's row via
+/// a conflict on a non-tenant-partitioned key, and any assignment targeting the scope column is
+/// **dropped** so the tenant of an existing row is never reassigned. MySQL's `ON DUPLICATE KEY
+/// UPDATE` can't carry that bound, so a scoped upsert on MySQL is refused (fail-closed).
+fn render_conflict(
+    conflict: Option<&OnConflict>,
+    scope: Option<&Scope>,
+    params: &mut Params,
+    dialect: Dialect,
+) -> Result<String, OrmError> {
+    let Some(oc) = conflict else {
+        return Ok(String::new());
+    };
+    let conflict_cols = oc
+        .conflict_columns
+        .iter()
+        .map(|c| ident(c).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing).
+    let guard = scope.filter(|s| s.stamp_value().is_some());
+    let do_nothing = || format!(" ON CONFLICT ({}) DO NOTHING", conflict_cols.join(", "));
+    if oc.update.is_empty() {
+        return Ok(do_nothing());
+    }
+    if guard.is_some() && matches!(dialect, Dialect::Mysql) {
+        return Err(OrmError::BadExpr(
+            "a tenant-scoped upsert (ON CONFLICT DO UPDATE) is unsupported on MySQL \
+             (ON DUPLICATE KEY UPDATE cannot be bounded to the tenant's rows)",
+        ));
+    }
+    // Drop any assignment to the scope column: a guest upsert never reassigns an existing row's
+    // tenant. If that leaves nothing to update, degrade to DO NOTHING.
+    let sets = oc
+        .update
+        .iter()
+        .filter(|a| guard.is_none_or(|s| !same_col(&a.column, &s.column)))
+        .map(|a| {
+            let c = ident(&a.column)?;
+            Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if sets.is_empty() {
+        return Ok(do_nothing());
+    }
+    let mut clause = format!(
+        " ON CONFLICT ({}) DO UPDATE SET {}",
+        conflict_cols.join(", "),
+        sets.join(", ")
+    );
+    if let Some(s) = guard {
+        // Bound the DO UPDATE to the tenant's own rows (Postgres/SQLite support a trailing WHERE).
+        let pred = s
+            .as_predicate()
+            .expect("a stampable scope always has a predicate");
+        clause.push_str(&format!(
+            " WHERE {}",
+            render_pred(&pred, params, false, dialect)?
+        ));
+    }
+    Ok(clause)
 }
 
 impl Update {
@@ -949,10 +1527,24 @@ impl Update {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
+        // A scoped write never reassigns the tenant column: drop any `SET <scope column> = …`
+        // (case/qualifier-insensitively) so a guest can't donate its own rows into another
+        // tenant's partition (mirrors the ON CONFLICT DO UPDATE guard). The WHERE still bounds the
+        // update to own rows; this bounds what it may *change*.
+        let scope_col = self
+            .scope
+            .as_ref()
+            .filter(|s| s.stamp_value().is_some())
+            .map(|s| s.column.clone());
         // SET binds before WHERE so placeholder order matches the parameter order.
         let sets: Result<Vec<String>, _> = self
             .set
             .iter()
+            .filter(|a| {
+                scope_col
+                    .as_deref()
+                    .is_none_or(|col| !same_col(&a.column, col))
+            })
             .map(|a| {
                 let c = ident(&a.column)?;
                 Ok::<String, OrmError>(format!(
@@ -961,10 +1553,16 @@ impl Update {
                 ))
             })
             .collect();
-        let set_sql = sets?.join(", ");
+        let sets = sets?;
+        if sets.is_empty() {
+            return Err(OrmError::Empty(
+                "update has no assignments left after dropping the tenant column",
+            ));
+        }
+        let set_sql = sets.join(", ");
 
         let where_sql = render_where(
-            self.scope.as_ref(),
+            single_scope_pred(self.scope.as_ref())?,
             Some(&self.filter),
             &mut params,
             dialect,
@@ -974,6 +1572,35 @@ impl Update {
         ))?;
 
         let mut sql = format!("UPDATE {table} SET {set_sql} WHERE {where_sql}");
+        sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
+        Ok((sql, params.0))
+    }
+}
+
+impl Delete {
+    /// Compile to `?N` SQL + bound parameters. An empty `filter` with no scope is refused
+    /// (no unbounded delete), exactly as [`Update::compile`]. A scope keeps it bounded, so an
+    /// empty filter + scope is allowed.
+    pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
+        let empty_filter =
+            matches!(&self.filter, Predicate::And(v) | Predicate::Or(v) if v.is_empty());
+        if empty_filter && self.scope.is_none() {
+            return Err(OrmError::Empty(
+                "delete has an empty filter (unbounded delete refused)",
+            ));
+        }
+        let table = ident(&self.table)?;
+        let mut params = Params::default();
+        let where_sql = render_where(
+            single_scope_pred(self.scope.as_ref())?,
+            Some(&self.filter),
+            &mut params,
+            dialect,
+        )?
+        .ok_or(OrmError::Empty(
+            "delete has an empty filter (unbounded delete refused)",
+        ))?;
+        let mut sql = format!("DELETE FROM {table} WHERE {where_sql}");
         sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
         Ok((sql, params.0))
     }
@@ -1027,6 +1654,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             ..Select::from("party")
         };
@@ -1036,6 +1664,339 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    fn scoped_select(mode: ScopeMode) -> Select {
+        Select {
+            filter: Some(cmp("kind", CmpOp::Eq, t("supplier"))),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+                mode,
+            }),
+            ..Select::from("party")
+        }
+    }
+
+    #[test]
+    fn scope_mode_own_or_null_admits_the_shared_baseline() {
+        let (sql, params) = scoped_select(ScopeMode::OwnOrNull)
+            .compile(Dialect::Sqlite)
+            .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE (tenant_id = ?1 OR tenant_id IS NULL) AND kind = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    #[test]
+    fn scope_mode_null_only_sees_only_the_baseline() {
+        let (sql, params) = scoped_select(ScopeMode::NullOnly)
+            .compile(Dialect::Sqlite)
+            .unwrap();
+        // The resolved tenant value is not bound at all — NULL-only never references it.
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE tenant_id IS NULL AND kind = ?1"
+        );
+        assert_eq!(params, vec![t("supplier")]);
+    }
+
+    #[test]
+    fn scope_mode_all_injects_no_tenant_predicate() {
+        let (sql, params) = scoped_select(ScopeMode::All)
+            .compile(Dialect::Sqlite)
+            .unwrap();
+        // `all` (cross-tenant) renders exactly as if unscoped — only the guest filter remains.
+        assert_eq!(sql, "SELECT * FROM party WHERE kind = ?1");
+        assert_eq!(params, vec![t("supplier")]);
+    }
+
+    #[test]
+    fn force_scope_reaches_every_union_branch() {
+        // A union whose branches start unscoped: force_scope must scope BOTH sides, or the
+        // branch would leak across tenants.
+        let branch = Select::from("archived_party");
+        let mut q = Select {
+            union: Some(Box::new(Union {
+                all: false,
+                query: branch,
+            })),
+            ..Select::from("party")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE tenant_id = ?1 UNION SELECT * FROM archived_party WHERE tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn scoped_select_scopes_every_joined_table() {
+        // A guest joins a victim table hoping to read its cross-tenant rows via the projection.
+        // force_scope must scope the FROM table AND every joined table (qualified by alias/name).
+        let mut q = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("v.secret"))],
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "victim".into(),
+                alias: Some("v".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("v.order_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("o.id"),
+                },
+            }],
+            ..Select::from("orders")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT v.secret FROM orders AS o LEFT JOIN victim AS v ON v.order_id = o.id \
+             WHERE o.tenant_id = ?1 AND v.tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn scoped_returning_and_distinct_on_subqueries_are_scoped() {
+        let sub = || Expr::RelatedScalar {
+            column: "balance".into(),
+            table: "victim".into(),
+            filter: Box::new(Predicate::And(Vec::new())),
+        };
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        };
+        // DELETE … RETURNING (subquery) — the RETURNING read must be scoped to victim.
+        let mut del = Delete {
+            table: "orders".into(),
+            filter: cmp("id", CmpOp::Eq, t("o_1")),
+            scope: None,
+            returning: vec![item(sub())],
+        };
+        del.force_scope(&scope);
+        let (sql, _) = del.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("RETURNING (SELECT balance FROM victim WHERE victim.tenant_id = ?"),
+            "RETURNING subquery unscoped: {sql}"
+        );
+        // SELECT DISTINCT ON ((subquery)) — the DISTINCT ON read must be scoped too (PG).
+        let mut sel = Select {
+            columns: vec![item(Expr::col("id"))],
+            distinct_on: vec![sub()],
+            ..Select::from("orders")
+        };
+        sel.force_scope(&scope);
+        // The compiler emits portable `?N` placeholders (the backend rewrites to `$N` on PG).
+        let (sql, _) = sel.compile(Dialect::Postgres).unwrap();
+        assert!(
+            sql.contains("DISTINCT ON ((SELECT balance FROM victim WHERE victim.tenant_id = ?"),
+            "DISTINCT ON subquery unscoped: {sql}"
+        );
+    }
+
+    #[test]
+    fn scoped_select_scopes_a_subquerys_inner_table() {
+        // A guest embeds a scalar subquery over another table; force_scope must scope the
+        // subquery's OWN table so it can't read cross-tenant.
+        let mut q = Select {
+            columns: vec![item(Expr::RelatedScalar {
+                column: "balance".into(),
+                table: "victim".into(),
+                filter: Box::new(Predicate::And(Vec::new())), // guest filter: none
+            })],
+            ..Select::from("orders")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        // The subquery's WHERE is scoped to victim.tenant_id; the outer to orders (single table).
+        assert_eq!(
+            sql,
+            "SELECT (SELECT balance FROM victim WHERE victim.tenant_id = ?1) \
+             FROM orders WHERE tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn insert_select_cannot_forge_the_target_tenant() {
+        // A guest projects a chosen tenant id into the target `tenant_id` column. force_scope must
+        // drop that projection and re-bind the host-resolved own value — no cross-tenant forgery.
+        let source = Select {
+            columns: vec![
+                item(Expr::val(t("VICTIM"))), // guest-chosen tenant id
+                item(Expr::col("total")),
+            ],
+            ..Select::from("orders")
+        };
+        let mut ins = Insert {
+            table: "orders".into(),
+            rows: vec![],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            // `TENANT_ID` (case variant) must still be recognized as the tenant column + dropped.
+            from_select: Some((vec!["TENANT_ID".into(), "total".into()], Box::new(source))),
+        };
+        let own = Scope {
+            column: "tenant_id".into(),
+            value: t("OWN"),
+            mode: ScopeMode::Own,
+        };
+        ins.force_scope(Some(&own), Some(&own));
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        // The tenant column is re-appended last, bound to OWN; the source is read-scoped to OWN.
+        assert_eq!(
+            sql,
+            "INSERT INTO orders (total, tenant_id) SELECT total, ?1 FROM orders WHERE tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("OWN"), t("OWN")]);
+        assert!(
+            !params.contains(&t("VICTIM")),
+            "the forged tenant never binds"
+        );
+    }
+
+    #[test]
+    fn scoped_update_cannot_reassign_the_tenant() {
+        // A guest tries to donate its own rows to another tenant: SET tenant_id = VICTIM. The
+        // scope guard drops that assignment (case-insensitively) while the WHERE stays own-bound.
+        let q = Update {
+            table: "orders".into(),
+            set: vec![
+                Assignment {
+                    column: "TENANT_ID".into(),
+                    value: Expr::val(t("VICTIM")),
+                },
+                Assignment {
+                    column: "status".into(),
+                    value: Expr::val(t("paid")),
+                },
+            ],
+            filter: cmp("id", CmpOp::Eq, t("o_1")),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("OWN"),
+                mode: ScopeMode::Own,
+            }),
+            returning: vec![],
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE orders SET status = ?1 WHERE tenant_id = ?2 AND id = ?3"
+        );
+        assert_eq!(params, vec![t("paid"), t("OWN"), t("o_1")]);
+        assert!(!params.contains(&t("VICTIM")));
+    }
+
+    #[test]
+    fn scoped_upsert_drops_tenant_reassignment_and_bounds_the_do_update() {
+        // A guest upsert tries to (a) reassign tenant_id to VICTIM on conflict and (b) overwrite
+        // another tenant's row via a conflict on a non-tenant key. The scope guard must drop the
+        // tenant reassignment and bound the DO UPDATE to own rows.
+        let mut ins = Insert {
+            table: "orders".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "id".into(),
+                    value: Expr::val(t("k")),
+                }],
+            }],
+            conflict: Some(OnConflict {
+                conflict_columns: vec!["id".into()],
+                update: vec![
+                    // Case/qualifier-respelled to dodge the drop — must still be caught.
+                    Assignment {
+                        column: "TENANT_ID".into(),
+                        value: Expr::val(t("VICTIM")),
+                    },
+                    Assignment {
+                        column: "total".into(),
+                        value: Expr::val(SqlValue::Integer(999)),
+                    },
+                ],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        let own = Scope {
+            column: "tenant_id".into(),
+            value: t("OWN"),
+            mode: ScopeMode::Own,
+        };
+        ins.force_scope(Some(&own), Some(&own));
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO orders (id, tenant_id) VALUES (?1, ?2) \
+             ON CONFLICT (id) DO UPDATE SET total = ?3 WHERE tenant_id = ?4"
+        );
+        // The inserted row stamps OWN; the DO UPDATE is bounded to OWN; VICTIM never binds.
+        assert_eq!(
+            params,
+            vec![t("k"), t("OWN"), SqlValue::Integer(999), t("OWN")]
+        );
+        assert!(!params.contains(&t("VICTIM")));
+        // The same scoped upsert is refused on MySQL (no bounded DO UPDATE).
+        assert!(matches!(
+            ins.compile(Dialect::Mysql),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn insert_null_mode_stamps_null_all_mode_stamps_nothing() {
+        let base = |mode| Insert {
+            table: "audit_event".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "detail".into(),
+                    value: Expr::val(t("x")),
+                }],
+            }],
+            conflict: None,
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+                mode,
+            }),
+            returning: vec![],
+            from_select: None,
+        };
+        // null-only write stamps NULL into the tenant column.
+        let (sql, params) = base(ScopeMode::NullOnly).compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO audit_event (detail, tenant_id) VALUES (?1, ?2)"
+        );
+        assert_eq!(params, vec![t("x"), SqlValue::Null]);
+        // all-mode write forces no tenant column — the guest's columns stand verbatim.
+        let (sql, params) = base(ScopeMode::All).compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "INSERT INTO audit_event (detail) VALUES (?1)");
+        assert_eq!(params, vec![t("x")]);
     }
 
     #[test]
@@ -1061,6 +2022,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             ..Select::from("order_to_network")
         };
@@ -1252,8 +2214,10 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![item(Expr::col("id"))],
+            from_select: None,
         };
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
@@ -1285,6 +2249,7 @@ mod tests {
             }),
             scope: None,
             returning: vec![],
+            from_select: None,
         };
         let (sql_do, _) = base(vec![Assignment {
             column: "currency".into(),
@@ -1319,6 +2284,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![],
         };
@@ -1395,12 +2361,285 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![],
         };
         assert_eq!(
             q.compile(Dialect::Sqlite).unwrap().0,
             "UPDATE t SET x = ?1 WHERE tenant_id = ?2"
+        );
+    }
+
+    #[test]
+    fn delete_by_predicate_compiles() {
+        let q = Delete {
+            table: "payment".into(),
+            filter: cmp("id", CmpOp::Eq, t("pay_1")),
+            scope: None,
+            returning: vec![],
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "DELETE FROM payment WHERE id = ?1");
+        assert_eq!(params, vec![t("pay_1")]);
+    }
+
+    #[test]
+    fn delete_returning_renders() {
+        // The one DELETE … RETURNING shape (consume-and-read a pending signup). `?N` is emitted
+        // for every dialect — the backend rewrites to the engine's native placeholder.
+        let q = Delete {
+            table: "pending_signup".into(),
+            filter: cmp("slug", CmpOp::Eq, t("acme")),
+            scope: None,
+            returning: vec![item(Expr::col("name")), item(Expr::col("password_hash"))],
+        };
+        assert_eq!(
+            q.compile(Dialect::Postgres).unwrap().0,
+            "DELETE FROM pending_signup WHERE slug = ?1 RETURNING name, password_hash"
+        );
+    }
+
+    #[test]
+    fn delete_with_empty_filter_is_refused() {
+        // Empty filter, no scope → effectively-unbounded delete → refused (mirrors UPDATE).
+        let q = Delete {
+            table: "t".into(),
+            filter: Predicate::And(vec![]),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::Empty(_))
+        ));
+    }
+
+    #[test]
+    fn delete_empty_filter_with_scope_is_allowed() {
+        // A scope keeps it bounded, so an empty filter + scope compiles (bulk clear within tenant).
+        let q = Delete {
+            table: "t".into(),
+            filter: Predicate::And(vec![]),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+                mode: ScopeMode::Own,
+            }),
+            returning: vec![],
+        };
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap().0,
+            "DELETE FROM t WHERE tenant_id = ?1"
+        );
+    }
+
+    #[test]
+    fn delete_rejects_identifier_injection_in_table() {
+        let q = Delete {
+            table: "t; DROP TABLE users".into(),
+            filter: cmp("id", CmpOp::Eq, t("x")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::InvalidIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn case_expression_renders_with_bound_params() {
+        // CASE WHEN state = ? THEN 1 ELSE 0 END as a select item; params bind in textual order.
+        let q = Select {
+            columns: vec![item(Expr::Case {
+                branches: vec![(
+                    cmp("state", CmpOp::Eq, t("open")),
+                    Expr::val(SqlValue::Integer(1)),
+                )],
+                otherwise: Some(Box::new(Expr::val(SqlValue::Integer(0)))),
+            })],
+            ..Select::from("t")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t"
+        );
+        assert_eq!(
+            params,
+            vec![t("open"), SqlValue::Integer(1), SqlValue::Integer(0)]
+        );
+    }
+
+    #[test]
+    fn distinct_on_renders_on_postgres_and_fails_closed_elsewhere() {
+        let q = Select {
+            distinct_on: vec![Expr::col("key")],
+            columns: vec![item(Expr::col("key")), item(Expr::col("val"))],
+            ..Select::from("consent_state")
+        };
+        assert_eq!(
+            q.compile(Dialect::Postgres).unwrap().0,
+            "SELECT DISTINCT ON (key) key, val FROM consent_state"
+        );
+        // No portable rewrite on SQLite/MySQL — fail closed.
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn empty_case_is_rejected() {
+        let q = Select {
+            columns: vec![item(Expr::Case {
+                branches: vec![],
+                otherwise: None,
+            })],
+            ..Select::from("t")
+        };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn json_extract_dyn_binds_the_key() {
+        // labels ->> ?  (bound key). Postgres + SQLite render `->>`; MySQL fails closed.
+        let q = Select {
+            columns: vec![item(Expr::JsonExtractDyn(
+                Box::new(Expr::col("labels")),
+                Box::new(Expr::val(t("en"))),
+            ))],
+            ..Select::from("vocabulary_term")
+        };
+        for d in [Dialect::Postgres, Dialect::Sqlite] {
+            assert_eq!(
+                q.compile(d).unwrap().0,
+                "SELECT (labels ->> ?1) FROM vocabulary_term"
+            );
+        }
+        assert!(matches!(
+            q.compile(Dialect::Mysql),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn json_concat_merge_is_postgres_only() {
+        // UPDATE request SET brief_state = brief_state || ?::jsonb WHERE id = ?
+        let q = Update {
+            table: "request".into(),
+            set: vec![Assignment {
+                column: "brief_state".into(),
+                value: Expr::JsonConcat(
+                    Box::new(Expr::col("brief_state")),
+                    Box::new(Expr::val(SqlValue::Json("{\"a\":1}".into()))),
+                ),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("req_1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert_eq!(
+            q.compile(Dialect::Postgres).unwrap().0,
+            "UPDATE request SET brief_state = (brief_state || ?1) WHERE id = ?2"
+        );
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
+    }
+
+    #[test]
+    fn union_renders_both_bodies_with_shared_params() {
+        // slug-reservation check across two tables; the branches share the ?N sequence.
+        let q = Select {
+            columns: vec![item(Expr::col("slug"))],
+            filter: Some(cmp("slug", CmpOp::Eq, t("acme"))),
+            union: Some(Box::new(Union {
+                all: false,
+                query: Select {
+                    columns: vec![item(Expr::col("slug"))],
+                    filter: Some(cmp("slug", CmpOp::Eq, t("acme"))),
+                    ..Select::from("reserved_slug")
+                },
+            })),
+            ..Select::from("pending_signup")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT slug FROM pending_signup WHERE slug = ?1 \
+             UNION SELECT slug FROM reserved_slug WHERE slug = ?2"
+        );
+        assert_eq!(params, vec![t("acme"), t("acme")]);
+    }
+
+    #[test]
+    fn insert_from_select_shares_params_and_carries_no_auto_scope() {
+        // INSERT INTO ref (a, b) SELECT x, y FROM src WHERE id = ? (attach_reference shape).
+        let q = Insert {
+            table: "portfolio_ref".into(),
+            rows: vec![],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: Some((
+                vec!["a".into(), "b".into()],
+                Box::new(Select {
+                    columns: vec![item(Expr::col("x")), item(Expr::col("y"))],
+                    filter: Some(cmp("id", CmpOp::Eq, t("pi_1"))),
+                    ..Select::from("portfolio_item")
+                }),
+            )),
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO portfolio_ref (a, b) SELECT x, y FROM portfolio_item WHERE id = ?1"
+        );
+        assert_eq!(params, vec![t("pi_1")]);
+    }
+
+    #[test]
+    fn related_scalar_and_in_subquery_render() {
+        // id = (SELECT head_version FROM pack WHERE id = ?1)
+        let q = Select {
+            columns: vec![item(Expr::col("id"))],
+            filter: Some(Predicate::Cmp {
+                left: Expr::col("id"),
+                op: CmpOp::Eq,
+                right: Expr::RelatedScalar {
+                    column: "head_version".into(),
+                    table: "pack".into(),
+                    filter: Box::new(cmp("id", CmpOp::Eq, t("pk_1"))),
+                },
+            }),
+            ..Select::from("pack_version")
+        };
+        assert_eq!(
+            q.compile(Dialect::Sqlite).unwrap().0,
+            "SELECT id FROM pack_version WHERE id = (SELECT head_version FROM pack WHERE id = ?1)"
+        );
+
+        // doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)
+        let q2 = Select {
+            columns: vec![item(Expr::col("x"))],
+            filter: Some(Predicate::InSubquery {
+                expr: Expr::col("doc_id"),
+                column: "id".into(),
+                table: "document".into(),
+                filter: Box::new(cmp("tenant_id", CmpOp::Eq, t("ten_1"))),
+                negated: false,
+            }),
+            ..Select::from("access")
+        };
+        assert_eq!(
+            q2.compile(Dialect::Sqlite).unwrap().0,
+            "SELECT x FROM access WHERE doc_id IN (SELECT id FROM document WHERE tenant_id = ?1)"
         );
     }
 
