@@ -351,6 +351,9 @@ pub struct Select {
     pub group_by: Vec<Expr>,
     pub having: Option<Predicate>,
     pub distinct: bool,
+    /// `DISTINCT ON (<exprs>)` — **Postgres-only** (fails closed elsewhere). Non-empty takes
+    /// precedence over `distinct`; empty ⇒ inactive.
+    pub distinct_on: Vec<Expr>,
     pub order: Vec<OrderBy>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -793,6 +796,7 @@ impl Select {
             group_by: Vec::new(),
             having: None,
             distinct: false,
+            distinct_on: Vec::new(),
             order: Vec::new(),
             limit: None,
             offset: None,
@@ -804,8 +808,23 @@ impl Select {
         let mut params = Params::default();
         let table = ident(&self.table)?;
 
+        // The DISTINCT clause renders before the select list so any bound params order correctly.
+        let distinct = if !self.distinct_on.is_empty() {
+            if dialect != Dialect::Postgres {
+                return Err(OrmError::BadExpr("DISTINCT ON is Postgres-only"));
+            }
+            let cols = self
+                .distinct_on
+                .iter()
+                .map(|e| render_expr(e, &mut params, dialect))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("DISTINCT ON ({}) ", cols.join(", "))
+        } else if self.distinct {
+            "DISTINCT ".to_string()
+        } else {
+            String::new()
+        };
         let select_list = render_select_items(&self.columns, &mut params, dialect)?;
-        let distinct = if self.distinct { "DISTINCT " } else { "" };
         let mut sql = format!("SELECT {distinct}{select_list} FROM {table}");
         if let Some(a) = &self.table_alias {
             sql.push_str(&format!(" AS {}", ident(a)?));
@@ -1569,6 +1588,24 @@ mod tests {
             params,
             vec![t("open"), SqlValue::Integer(1), SqlValue::Integer(0)]
         );
+    }
+
+    #[test]
+    fn distinct_on_renders_on_postgres_and_fails_closed_elsewhere() {
+        let q = Select {
+            distinct_on: vec![Expr::col("key")],
+            columns: vec![item(Expr::col("key")), item(Expr::col("val"))],
+            ..Select::from("consent_state")
+        };
+        assert_eq!(
+            q.compile(Dialect::Postgres).unwrap().0,
+            "SELECT DISTINCT ON (key) key, val FROM consent_state"
+        );
+        // No portable rewrite on SQLite/MySQL — fail closed.
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
+        ));
     }
 
     #[test]

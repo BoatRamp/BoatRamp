@@ -204,6 +204,7 @@ interface orm {
     group-by: list<u32>,          // expr indices
     having: option<u32>,          // pred index
     distinct: bool,
+    distinct-on: list<u32>,       // expr indices; DISTINCT ON (...), Postgres-only
     order: list<order-term>,
     limit: option<u32>,
     offset: option<u32>,

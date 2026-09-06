@@ -488,6 +488,11 @@ fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
             .map(|h| build_pred(preds, exprs, h, upper))
             .transpose()?,
         distinct: q.distinct,
+        distinct_on: q
+            .distinct_on
+            .iter()
+            .map(|&e| build_expr(exprs, preds, e, upper))
+            .collect::<Result<_, _>>()?,
         order: q
             .order
             .iter()
@@ -723,6 +728,7 @@ mod tests {
             group_by: vec![],
             having: None,
             distinct: false,
+            distinct_on: vec![],
             order: vec![],
             limit: None,
             offset: None,
