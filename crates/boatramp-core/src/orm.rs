@@ -1329,10 +1329,24 @@ impl Update {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
+        // A scoped write never reassigns the tenant column: drop any `SET <scope column> = …`
+        // (case/qualifier-insensitively) so a guest can't donate its own rows into another
+        // tenant's partition (mirrors the ON CONFLICT DO UPDATE guard). The WHERE still bounds the
+        // update to own rows; this bounds what it may *change*.
+        let scope_col = self
+            .scope
+            .as_ref()
+            .filter(|s| s.stamp_value().is_some())
+            .map(|s| s.column.clone());
         // SET binds before WHERE so placeholder order matches the parameter order.
         let sets: Result<Vec<String>, _> = self
             .set
             .iter()
+            .filter(|a| {
+                scope_col
+                    .as_deref()
+                    .is_none_or(|col| !same_col(&a.column, col))
+            })
             .map(|a| {
                 let c = ident(&a.column)?;
                 Ok::<String, OrmError>(format!(
@@ -1341,7 +1355,13 @@ impl Update {
                 ))
             })
             .collect();
-        let set_sql = sets?.join(", ");
+        let sets = sets?;
+        if sets.is_empty() {
+            return Err(OrmError::Empty(
+                "update has no assignments left after dropping the tenant column",
+            ));
+        }
+        let set_sql = sets.join(", ");
 
         let where_sql = render_where(
             self.scope.as_ref(),
@@ -1557,6 +1577,39 @@ mod tests {
             !params.contains(&t("VICTIM")),
             "the forged tenant never binds"
         );
+    }
+
+    #[test]
+    fn scoped_update_cannot_reassign_the_tenant() {
+        // A guest tries to donate its own rows to another tenant: SET tenant_id = VICTIM. The
+        // scope guard drops that assignment (case-insensitively) while the WHERE stays own-bound.
+        let q = Update {
+            table: "orders".into(),
+            set: vec![
+                Assignment {
+                    column: "TENANT_ID".into(),
+                    value: Expr::val(t("VICTIM")),
+                },
+                Assignment {
+                    column: "status".into(),
+                    value: Expr::val(t("paid")),
+                },
+            ],
+            filter: cmp("id", CmpOp::Eq, t("o_1")),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("OWN"),
+                mode: ScopeMode::Own,
+            }),
+            returning: vec![],
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE orders SET status = ?1 WHERE tenant_id = ?2 AND id = ?3"
+        );
+        assert_eq!(params, vec![t("paid"), t("OWN"), t("o_1")]);
+        assert!(!params.contains(&t("VICTIM")));
     }
 
     #[test]
