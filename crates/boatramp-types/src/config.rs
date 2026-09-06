@@ -741,6 +741,13 @@ pub struct HandlersSiteConfig {
     /// CSRF-checked: same-origin always passes, and `allowed_origins` adds any cross-origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie_auth: Option<CookieAuthConfig>,
+    /// Site-level in-site tenancy decision (Dimension 0) — the **ceiling** for this site's
+    /// handlers' `sql`/`orm` access. A per-function [`crate::function::FunctionConfig::tenancy`]
+    /// may narrow within it but not widen it (e.g. a site pinned to `read: own` can't be raised
+    /// to `all` by a function). Absent ⇒ *undeclared* (refused under `multi-tenant`, treated as
+    /// `Disabled` under single-tenant/dev).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
 }
 
 /// Browser cookie session auth for a site (see [`HandlersSiteConfig::cookie_auth`]). boatramp

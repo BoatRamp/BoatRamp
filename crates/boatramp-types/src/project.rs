@@ -145,15 +145,32 @@ pub struct DomainOwner {
     pub project: String,
     /// The site within the project.
     pub site: String,
+    /// An opaque per-domain **tenant context tag** — the value the host binds as the in-site
+    /// tenant when a function/site resolves "own" via [`crate::tenancy::TenantSource::Domain`]
+    /// (storefronts: 1 domain : 1 tenant). Set at domain attach via the domain admin API;
+    /// wildcards/aliases inherit the base's tag. `None` ⇒ this domain carries no tenant context
+    /// (a domain source then fails closed). Omitted from the serialized form when absent, so a
+    /// pre-existing `{project, site}` value still reads (and round-trips) unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl DomainOwner {
-    /// A `(project, site)` owner.
+    /// A `(project, site)` owner with no tenant context tag.
     pub fn new(project: impl Into<String>, site: impl Into<String>) -> Self {
         Self {
             project: project.into(),
             site: site.into(),
+            context: None,
         }
+    }
+
+    /// Attach an opaque tenant context tag (the [`TenantSource::Domain`](crate::tenancy::TenantSource::Domain)
+    /// value). An empty tag is treated as none.
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        let c = context.into();
+        self.context = (!c.is_empty()).then_some(c);
+        self
     }
 
     /// The canonical stored form of a domain-index value: the `{project, site}`
@@ -187,15 +204,29 @@ impl<'de> Deserialize<'de> for DomainOwner {
         enum Raw {
             /// Layout 1: a bare site name.
             Bare(String),
-            /// Layout 2: `{project, site}`.
-            Full { project: String, site: String },
+            /// Layout 2: `{project, site}` (+ optional `context`, appended in v0.4.0).
+            Full {
+                project: String,
+                site: String,
+                #[serde(default)]
+                context: Option<String>,
+            },
         }
         Ok(match Raw::deserialize(deserializer)? {
             Raw::Bare(site) => Self {
                 project: DEFAULT_PROJECT.to_string(),
                 site,
+                context: None,
             },
-            Raw::Full { project, site } => Self { project, site },
+            Raw::Full {
+                project,
+                site,
+                context,
+            } => Self {
+                project,
+                site,
+                context,
+            },
         })
     }
 }
@@ -273,6 +304,28 @@ mod tests {
         assert_eq!(
             DomainOwner::from_bytes(b"123"),
             DomainOwner::new(DEFAULT_PROJECT, "123")
+        );
+    }
+
+    #[test]
+    fn domain_owner_context_tag_round_trips_and_stays_back_compatible() {
+        // A pre-v0.4.0 value with no context reads with context None and re-serializes WITHOUT a
+        // context key (so it stays byte-compatible with old readers).
+        let legacy: DomainOwner =
+            serde_json::from_str(r#"{"project":"acme","site":"shop"}"#).unwrap();
+        assert_eq!(legacy.context, None);
+        assert_eq!(
+            String::from_utf8(legacy.to_bytes()).unwrap(),
+            r#"{"project":"acme","site":"shop"}"#
+        );
+        // A tagged value round-trips the tenant context.
+        let tagged = DomainOwner::new("acme", "shop").with_context("acme-store");
+        assert_eq!(tagged.context.as_deref(), Some("acme-store"));
+        assert_eq!(DomainOwner::from_bytes(&tagged.to_bytes()), tagged);
+        // An empty tag is treated as none (never binds an empty-string tenant).
+        assert_eq!(
+            DomainOwner::new("acme", "shop").with_context("").context,
+            None
         );
     }
 }

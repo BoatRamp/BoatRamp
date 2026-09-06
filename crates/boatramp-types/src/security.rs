@@ -124,6 +124,8 @@ impl SecurityProfile {
                 allow_guest_admin_email: false,
                 allow_guest_admin_site: false,
                 allow_guest_admin_secrets: false,
+                require_tenancy_declaration: true,
+                allow_cross_tenant_db: false,
             },
             Self::SingleTenant => SecurityPosture {
                 allow_unauthenticated_public_bind: false,
@@ -149,6 +151,8 @@ impl SecurityProfile {
                 allow_guest_admin_email: true,
                 allow_guest_admin_site: true,
                 allow_guest_admin_secrets: true,
+                require_tenancy_declaration: false,
+                allow_cross_tenant_db: true,
             },
             Self::Dev => SecurityPosture {
                 allow_unauthenticated_public_bind: true,
@@ -175,6 +179,8 @@ impl SecurityProfile {
                 allow_guest_admin_email: true,
                 allow_guest_admin_site: true,
                 allow_guest_admin_secrets: true,
+                require_tenancy_declaration: false,
+                allow_cross_tenant_db: true,
             },
         }
     }
@@ -259,6 +265,10 @@ pub struct PostureOverrides {
     pub allow_guest_admin_site: Option<bool>,
     /// Permit a guest's `admin` capability to write the project's sealed secrets.
     pub allow_guest_admin_secrets: Option<bool>,
+    /// Require an explicit in-site tenancy decision from sql/orm importers.
+    pub require_tenancy_declaration: Option<bool>,
+    /// Permit an in-site tenancy grant to reach across tenants (`all`).
+    pub allow_cross_tenant_db: Option<bool>,
 }
 
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
@@ -415,6 +425,16 @@ impl SecurityConfig {
             p.allow_guest_admin_secrets.to_string(),
             o.allow_guest_admin_secrets.is_some(),
         );
+        row(
+            "require_tenancy_declaration",
+            p.require_tenancy_declaration.to_string(),
+            o.require_tenancy_declaration.is_some(),
+        );
+        row(
+            "allow_cross_tenant_db",
+            p.allow_cross_tenant_db.to_string(),
+            o.allow_cross_tenant_db.is_some(),
+        );
         Ok(out)
     }
 }
@@ -517,6 +537,19 @@ pub struct SecurityPosture {
     /// rotate / delete — write-only, redacted). The most sensitive surface: an operator can
     /// withhold it while still allowing domains/email/site self-service.
     pub allow_guest_admin_secrets: bool,
+    /// Require an **explicit in-site tenancy decision** (Dimension 0) from any site/function that
+    /// imports `sql`/`orm`: it must declare either `tenancy: disabled` (deliberately plain) or a
+    /// `scoped` config. On under `multi-tenant` — so running a query unscoped on an
+    /// untrusted-tenant fleet is a reviewed choice, never an accidental omission — and **off**
+    /// under `single-tenant`/`dev` (one operator; *undeclared* silently means plain). When on, an
+    /// undeclared sql/orm importer is refused at activation.
+    pub require_tenancy_declaration: bool,
+    /// Permit an in-site tenancy grant to reach **across tenants** (`read`/`write: all`) — the
+    /// operator ceiling on the cross-tenant mode. **Off** under `multi-tenant` (an `all` grant is
+    /// refused until the operator opts in) and on under `single-tenant`/`dev`. Independent of the
+    /// per-function grant: even a function that declares `all` is capped to `own` (its resolved
+    /// tenant) while this is off, so a compromised/mis-declared tenant can't read the fleet.
+    pub allow_cross_tenant_db: bool,
 }
 
 impl Default for SecurityPosture {
@@ -595,6 +628,12 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_admin_secrets {
         base.allow_guest_admin_secrets = v;
+    }
+    if let Some(v) = o.require_tenancy_declaration {
+        base.require_tenancy_declaration = v;
+    }
+    if let Some(v) = o.allow_cross_tenant_db {
+        base.allow_cross_tenant_db = v;
     }
     base
 }
@@ -716,6 +755,43 @@ mod tests {
             .unwrap()
             .lines()
             .any(|l| l.contains("allow_guest_admin_domains")
+                && l.contains("true")
+                && l.contains("override")));
+    }
+
+    #[test]
+    fn tenancy_knobs_follow_the_trust_model() {
+        // Multi-tenant demands an explicit tenancy decision and forbids cross-tenant `all`.
+        let mt = SecurityProfile::MultiTenant.preset();
+        assert!(mt.require_tenancy_declaration);
+        assert!(!mt.allow_cross_tenant_db);
+        // Single-tenant / dev: one operator — undeclared is fine, cross-tenant is allowed.
+        for p in [
+            SecurityProfile::SingleTenant.preset(),
+            SecurityProfile::Dev.preset(),
+        ] {
+            assert!(!p.require_tenancy_declaration);
+            assert!(p.allow_cross_tenant_db);
+        }
+        // An operator can open cross-tenant on a multi-tenant fleet explicitly.
+        let cfg = SecurityConfig {
+            overrides: PostureOverrides {
+                allow_cross_tenant_db: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let p = cfg.resolve().unwrap();
+        assert!(p.allow_cross_tenant_db);
+        assert!(
+            p.require_tenancy_declaration,
+            "the declaration gate stays on"
+        );
+        assert!(cfg
+            .explain()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains("allow_cross_tenant_db")
                 && l.contains("true")
                 && l.contains("override")));
     }

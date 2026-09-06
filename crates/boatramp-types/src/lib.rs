@@ -33,6 +33,7 @@ pub mod project;
 pub mod route;
 pub mod security;
 pub mod site;
+pub mod tenancy;
 pub mod waf;
 pub mod workflow;
 

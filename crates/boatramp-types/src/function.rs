@@ -118,6 +118,11 @@ pub struct FunctionConfig {
     /// `invoke`. Only consulted when `imports` contains `invoke`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
+    /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
+    /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
+    /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
 }
 
 /// The signature scheme a webhook is verified under (FA-5).
@@ -184,6 +189,8 @@ impl FunctionConfig {
             quota: FunctionQuota::default(),
             webhook: None,
             invoke_targets: Vec::new(),
+            // A desugared handler-function inherits its tenancy from the site config.
+            tenancy: None,
         }
     }
     fn from_consumer(c: &ConsumerConfig) -> Self {
