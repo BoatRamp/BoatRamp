@@ -531,8 +531,8 @@ impl Insert {
     /// that axis, by design (an `all` write's `stamp_value()` is `None`, so nothing is forced).
     pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
         self.scope = write.cloned();
-        // A subquery embedded in a row cell or an upsert `SET` expr is a READ of another table —
-        // scope it to that table so it can't read cross-tenant.
+        // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
+        // of another table — scope it to that table so it can't read cross-tenant.
         if let Some(r) = read {
             for row in &mut self.rows {
                 for cell in &mut row.cells {
@@ -543,6 +543,9 @@ impl Insert {
                 for a in &mut c.update {
                     inject_scope_expr(r, &mut a.value);
                 }
+            }
+            for it in &mut self.returning {
+                inject_scope_expr(r, &mut it.expr);
             }
         }
         if let Some((cols, src)) = self.from_select.as_mut() {
@@ -682,12 +685,17 @@ fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
 }
 
 impl Select {
-    /// Inject the tenant scope into every narrow subquery this SELECT embeds (its projection,
-    /// filter, having, group-by, order, and join `ON`s) so a subquery's own table is scoped — not
-    /// just the outer FROM. Called by [`Select::force_scope`] after setting the scope.
+    /// Inject the tenant scope into every narrow subquery this SELECT embeds — across ALL of its
+    /// expr/pred-bearing fields (projection, `DISTINCT ON`, filter, having, group-by, order, and
+    /// join `ON`s) — so a subquery's own table is scoped, not just the outer FROM. Called by
+    /// [`Select::force_scope`] after setting the scope. Must stay exhaustive over the Expr/Predicate
+    /// fields: a missed field is a cross-tenant subquery leak.
     fn inject_subquery_scope(&mut self, scope: &Scope) {
         for it in &mut self.columns {
             inject_scope_expr(scope, &mut it.expr);
+        }
+        for e in &mut self.distinct_on {
+            inject_scope_expr(scope, e);
         }
         if let Some(f) = self.filter.as_mut() {
             inject_scope_pred(scope, f);
@@ -709,22 +717,28 @@ impl Select {
 
 impl Update {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
-    /// the `SET` exprs / filter. Overwrites any prior scope.
+    /// the `SET` exprs, filter, and `RETURNING` items. Overwrites any prior scope.
     pub fn force_scope(&mut self, scope: &Scope) {
         self.scope = Some(scope.clone());
         for a in &mut self.set {
             inject_scope_expr(scope, &mut a.value);
         }
         inject_scope_pred(scope, &mut self.filter);
+        for it in &mut self.returning {
+            inject_scope_expr(scope, &mut it.expr);
+        }
     }
 }
 
 impl Delete {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
-    /// the filter. Overwrites any prior scope.
+    /// the filter and `RETURNING` items. Overwrites any prior scope.
     pub fn force_scope(&mut self, scope: &Scope) {
         self.scope = Some(scope.clone());
         inject_scope_pred(scope, &mut self.filter);
+        for it in &mut self.returning {
+            inject_scope_expr(scope, &mut it.expr);
+        }
     }
 }
 
@@ -1756,6 +1770,46 @@ mod tests {
              WHERE o.tenant_id = ?1 AND v.tenant_id = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn scoped_returning_and_distinct_on_subqueries_are_scoped() {
+        let sub = || Expr::RelatedScalar {
+            column: "balance".into(),
+            table: "victim".into(),
+            filter: Box::new(Predicate::And(Vec::new())),
+        };
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        };
+        // DELETE … RETURNING (subquery) — the RETURNING read must be scoped to victim.
+        let mut del = Delete {
+            table: "orders".into(),
+            filter: cmp("id", CmpOp::Eq, t("o_1")),
+            scope: None,
+            returning: vec![item(sub())],
+        };
+        del.force_scope(&scope);
+        let (sql, _) = del.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("RETURNING (SELECT balance FROM victim WHERE victim.tenant_id = ?"),
+            "RETURNING subquery unscoped: {sql}"
+        );
+        // SELECT DISTINCT ON ((subquery)) — the DISTINCT ON read must be scoped too (PG).
+        let mut sel = Select {
+            columns: vec![item(Expr::col("id"))],
+            distinct_on: vec![sub()],
+            ..Select::from("orders")
+        };
+        sel.force_scope(&scope);
+        // The compiler emits portable `?N` placeholders (the backend rewrites to `$N` on PG).
+        let (sql, _) = sel.compile(Dialect::Postgres).unwrap();
+        assert!(
+            sql.contains("DISTINCT ON ((SELECT balance FROM victim WHERE victim.tenant_id = ?"),
+            "DISTINCT ON subquery unscoped: {sql}"
+        );
     }
 
     #[test]
