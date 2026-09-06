@@ -193,8 +193,8 @@ pub enum Expr {
     /// condition reuses the predicate compiler (bound params). A boolean/comparison `ORDER BY`
     /// term is expressed portably as `ORDER BY CASE WHEN <cond> THEN 0 ELSE 1 END`.
     Case {
-        branches: Vec<(Predicate, Expr)>,
-        otherwise: Option<Box<Expr>>,
+        branches: Vec<(Predicate, Self)>,
+        otherwise: Option<Box<Self>>,
     },
     /// Extract a JSON value by a **dynamic/bound key**: `(base ->> key)` (key is an expression,
     /// e.g. a bound param — `labels ->> ?`). Postgres + SQLite; MySQL fails closed (its `->>`
@@ -292,7 +292,7 @@ pub enum Predicate {
         expr: Expr,
         column: String,
         table: String,
-        filter: Box<Predicate>,
+        filter: Box<Self>,
         negated: bool,
     },
 }
@@ -660,7 +660,7 @@ fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
             conjoin_front(filter, scope.as_predicate_for(Some(table)));
         }
         Predicate::And(v) | Predicate::Or(v) => {
-            v.iter_mut().for_each(|c| inject_scope_pred(scope, c))
+            v.iter_mut().for_each(|c| inject_scope_pred(scope, c));
         }
         Predicate::Not(inner) => inject_scope_pred(scope, inner),
         Predicate::Cmp { left, right, .. } => {
@@ -679,7 +679,7 @@ fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
             values.iter_mut().for_each(|v| inject_scope_expr(scope, v));
         }
         Predicate::Like { expr, .. } | Predicate::Null { expr, .. } => {
-            inject_scope_expr(scope, expr)
+            inject_scope_expr(scope, expr);
         }
     }
 }
@@ -1235,7 +1235,7 @@ impl Select {
                 parts.push(p);
             }
         }
-        Ok((!parts.is_empty()).then(|| Predicate::And(parts)))
+        Ok((!parts.is_empty()).then_some(Predicate::And(parts)))
     }
 
     /// Render the full SELECT (body + any UNION branch) into the shared `params`. Reused by

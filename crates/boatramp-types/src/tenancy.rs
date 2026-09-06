@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// **host-verified** and bound once per invocation; a guest never supplies the tenant value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TenantSource {
     /// The verified JWT claim named `claim` (default `tid`), via the same JWKS/issuer machinery
     /// the GraphQL data connector uses. Authenticated console/portal paths.
@@ -35,17 +36,12 @@ pub enum TenantSource {
     SignedContext,
     /// Truly anonymous / non-token auth (funnel reads, HMAC webhooks): there is no "own" tenant,
     /// so only the `null`/`all` access modes are meaningful (an "own" mode fails closed).
+    #[default]
     None,
 }
 
 fn default_tid_claim() -> String {
     "tid".to_string()
-}
-
-impl Default for TenantSource {
-    fn default() -> Self {
-        TenantSource::None
-    }
 }
 
 /// Which tenant-set one axis (read or write) of a function may reach. **Default-deny** on
@@ -69,11 +65,11 @@ pub enum AccessMode {
 impl AccessMode {
     /// Whether this mode crosses tenants (so it needs the operator ceiling to be permitted).
     pub fn is_cross_tenant(self) -> bool {
-        matches!(self, AccessMode::All)
+        matches!(self, Self::All)
     }
     /// Whether this mode needs a resolved "own" tenant value (so an unresolvable source ⇒ deny).
     pub fn needs_own_value(self) -> bool {
-        matches!(self, AccessMode::Own | AccessMode::OwnOrNull)
+        matches!(self, Self::Own | Self::OwnOrNull)
     }
 }
 
@@ -110,7 +106,7 @@ pub enum Tenancy {
 impl Tenancy {
     /// Whether this decision enables in-site row scoping (`Scoped`), vs. plain queries.
     pub fn is_scoped(&self) -> bool {
-        matches!(self, Tenancy::Scoped { .. })
+        matches!(self, Self::Scoped { .. })
     }
 }
 

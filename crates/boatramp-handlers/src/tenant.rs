@@ -43,9 +43,9 @@ impl TenantDenied {
     /// A short, guest-safe reason string (no tenant values leaked).
     pub fn reason(self) -> &'static str {
         match self {
-            TenantDenied::NoAccess => "tenancy: this function is not granted access on this axis",
-            TenantDenied::NoSource => "tenancy: no verified tenant source for this request",
-            TenantDenied::BadColumn => "tenancy: misconfigured tenant column",
+            Self::NoAccess => "tenancy: this function is not granted access on this axis",
+            Self::NoSource => "tenancy: no verified tenant source for this request",
+            Self::BadColumn => "tenancy: misconfigured tenant column",
         }
     }
 }
