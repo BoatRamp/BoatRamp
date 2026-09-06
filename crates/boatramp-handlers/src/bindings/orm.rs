@@ -523,65 +523,86 @@ fn to_core_assignment(
     })
 }
 
+/// The shared `SelectQuery`/`SelectBody` → `core::Select` field mapping (both WIT records have the
+/// same field names; `select-query` merely adds `union`). Used with `?`, so invoke inside a fn
+/// returning `Result<_, wit::Error>`. Sets `union: None` — the caller attaches any union branch.
+macro_rules! core_select_common {
+    ($q:expr) => {{
+        let q = $q;
+        let exprs = &q.exprs;
+        let preds = &q.preds;
+        let upper = exprs.len();
+        core::Select {
+            table: q.table.clone(),
+            table_alias: q.table_alias.clone(),
+            columns: q
+                .columns
+                .iter()
+                .map(|it| to_core_item(exprs, preds, it))
+                .collect::<Result<_, _>>()?,
+            joins: q
+                .joins
+                .iter()
+                .map(|j| {
+                    Ok::<_, wit::Error>(core::Join {
+                        kind: to_core_joinkind(j.kind),
+                        table: j.table.clone(),
+                        alias: j.alias.clone(),
+                        on: build_pred(preds, exprs, j.on, upper)?,
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            filter: q
+                .filter
+                .map(|f| build_pred(preds, exprs, f, upper))
+                .transpose()?,
+            scope: q.scope.clone().map(to_core_scope),
+            group_by: q
+                .group_by
+                .iter()
+                .map(|&g| build_expr(exprs, preds, g, upper))
+                .collect::<Result<_, _>>()?,
+            having: q
+                .having
+                .map(|h| build_pred(preds, exprs, h, upper))
+                .transpose()?,
+            distinct: q.distinct,
+            distinct_on: q
+                .distinct_on
+                .iter()
+                .map(|&e| build_expr(exprs, preds, e, upper))
+                .collect::<Result<_, _>>()?,
+            order: q
+                .order
+                .iter()
+                .map(|o| {
+                    Ok::<_, wit::Error>(core::OrderBy {
+                        expr: build_expr(exprs, preds, o.expr, upper)?,
+                        dir: to_core_dir(o.dir),
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            limit: q.limit,
+            offset: q.offset,
+            union: None,
+        }
+    }};
+}
+
 fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
-    let exprs = &q.exprs;
-    let preds = &q.preds;
-    let upper = exprs.len();
-    Ok(core::Select {
-        table: q.table.clone(),
-        table_alias: q.table_alias.clone(),
-        columns: q
-            .columns
-            .iter()
-            .map(|it| to_core_item(exprs, preds, it))
-            .collect::<Result<_, _>>()?,
-        joins: q
-            .joins
-            .iter()
-            .map(|j| {
-                Ok::<_, wit::Error>(core::Join {
-                    kind: to_core_joinkind(j.kind),
-                    table: j.table.clone(),
-                    alias: j.alias.clone(),
-                    on: build_pred(preds, exprs, j.on, upper)?,
-                })
-            })
-            .collect::<Result<_, _>>()?,
-        filter: q
-            .filter
-            .map(|f| build_pred(preds, exprs, f, upper))
-            .transpose()?,
-        scope: q.scope.clone().map(to_core_scope),
-        group_by: q
-            .group_by
-            .iter()
-            .map(|&g| build_expr(exprs, preds, g, upper))
-            .collect::<Result<_, _>>()?,
-        having: q
-            .having
-            .map(|h| build_pred(preds, exprs, h, upper))
-            .transpose()?,
-        distinct: q.distinct,
-        distinct_on: q
-            .distinct_on
-            .iter()
-            .map(|&e| build_expr(exprs, preds, e, upper))
-            .collect::<Result<_, _>>()?,
-        order: q
-            .order
-            .iter()
-            .map(|o| {
-                Ok::<_, wit::Error>(core::OrderBy {
-                    expr: build_expr(exprs, preds, o.expr, upper)?,
-                    dir: to_core_dir(o.dir),
-                })
-            })
-            .collect::<Result<_, _>>()?,
-        limit: q.limit,
-        offset: q.offset,
-        // UNION is wired via a dedicated nested-body WIT shape (not yet exposed here).
-        union: None,
-    })
+    let mut s = core_select_common!(q);
+    if let Some(arm) = &q.union {
+        s.union = Some(Box::new(core::Union {
+            all: arm.all,
+            query: to_core_select_body(&arm.body)?,
+        }));
+    }
+    Ok(s)
+}
+
+/// A UNION branch / INSERT…SELECT source (no nested union of its own).
+fn to_core_select_body(b: &wit::SelectBody) -> Result<core::Select, wit::Error> {
+    Ok(core_select_common!(b))
 }
 
 fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
@@ -624,8 +645,13 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
             .iter()
             .map(|it| to_core_item(exprs, preds, it))
             .collect::<Result<_, _>>()?,
-        // INSERT … SELECT is wired via a dedicated nested-body WIT shape (not yet exposed here).
-        from_select: None,
+        from_select: q
+            .select_source
+            .as_ref()
+            .map(|s| {
+                Ok::<_, wit::Error>((s.columns.clone(), Box::new(to_core_select_body(&s.source)?)))
+            })
+            .transpose()?,
     })
 }
 
@@ -810,6 +836,7 @@ mod tests {
             order: vec![],
             limit: None,
             offset: None,
+            union: None,
         }
     }
 
@@ -859,6 +886,7 @@ mod tests {
                 conflict: None,
                 scope: Some(scope("tenant_id", text("ten_1"))),
                 returning: vec![],
+                select_source: None,
             };
             assert_eq!(host.insert(Resource::new_own(rep), ins).await.unwrap(), 1);
 
@@ -1225,6 +1253,101 @@ mod tests {
             .iter()
             .any(|l| l
                 .starts_with("query|SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t|")));
+    }
+
+    #[tokio::test]
+    async fn union_rebuilds_from_the_nested_body() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // SELECT slug FROM pending_signup WHERE slug=?1 UNION SELECT slug FROM reserved WHERE slug=?2
+            let branch = wit::SelectBody {
+                exprs: vec![col("slug"), lit(text("acme"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                table: "reserved".into(),
+                table_alias: None,
+                columns: vec![item(0)],
+                joins: vec![],
+                filter: Some(0),
+                scope: None,
+                group_by: vec![],
+                having: None,
+                distinct: false,
+                distinct_on: vec![],
+                order: vec![],
+                limit: None,
+                offset: None,
+            };
+            let sel = wit::SelectQuery {
+                exprs: vec![col("slug"), lit(text("acme"))],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+                columns: vec![item(0)],
+                filter: Some(0),
+                union: Some(wit::UnionArm {
+                    all: false,
+                    body: branch,
+                }),
+                ..empty_select("pending_signup")
+            };
+            host.select(db, sel).await.unwrap();
+        }
+        sess.finalize(true).await;
+        assert!(log.lock().unwrap().iter().any(|l| l.starts_with(
+            "query|SELECT slug FROM pending_signup WHERE slug = ?1 UNION SELECT slug FROM reserved WHERE slug = ?2|"
+        )));
+    }
+
+    #[tokio::test]
+    async fn insert_from_select_rebuilds_from_the_nested_body() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1
+            let source = wit::SelectBody {
+                exprs: vec![col("x"), col("id"), lit(text("s1"))],
+                preds: vec![cmp(1, wit::CmpOp::Eq, 2)],
+                table: "src".into(),
+                table_alias: None,
+                columns: vec![item(0)],
+                joins: vec![],
+                filter: Some(0),
+                scope: None,
+                group_by: vec![],
+                having: None,
+                distinct: false,
+                distinct_on: vec![],
+                order: vec![],
+                limit: None,
+                offset: None,
+            };
+            let ins = wit::InsertQuery {
+                exprs: vec![],
+                table: "ref".into(),
+                rows: vec![],
+                conflict: None,
+                scope: None,
+                returning: vec![],
+                select_source: Some(wit::InsertSelect {
+                    columns: vec!["a".into()],
+                    source,
+                }),
+            };
+            assert_eq!(host.insert(db, ins).await.unwrap(), 1);
+        }
+        sess.finalize(true).await;
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l
+                    .starts_with("execute|INSERT INTO ref (a) SELECT x FROM src WHERE id = ?1|"))
+        );
     }
 
     #[tokio::test]

@@ -204,6 +204,28 @@ interface orm {
   /// forced on insert). The project/database boundary is separate (the opened database).
   record scope { column: string, value: value }
 
+  // A SELECT with no UNION — its own arena bundle. Used both as a top-level query body and as a
+  // UNION branch / INSERT…SELECT source (WIT records can't self-reference, so `select-query`
+  // can't hold a `select-query`; it holds this instead, one level deep).
+  record select-body {
+    exprs: list<expr-node>,
+    preds: list<pred-node>,
+    table: string,
+    table-alias: option<string>,
+    columns: list<select-item>,
+    joins: list<join>,
+    filter: option<u32>,
+    scope: option<scope>,
+    group-by: list<u32>,
+    having: option<u32>,
+    distinct: bool,
+    distinct-on: list<u32>,
+    order: list<order-term>,
+    limit: option<u32>,
+    offset: option<u32>,
+  }
+  // `<body> UNION [ALL] <branch>`. Each side carries its own scope, so both stay tenant-isolated.
+  record union-arm { all: bool, body: select-body }
   record select-query {
     exprs: list<expr-node>,
     preds: list<pred-node>,
@@ -220,12 +242,15 @@ interface orm {
     order: list<order-term>,
     limit: option<u32>,
     offset: option<u32>,
+    union: option<union-arm>,
   }
 
   record assignment { column: string, value: u32 }   // value = expr index
   record row-values { cells: list<assignment> }
   /// ON CONFLICT (<conflict-columns>) DO UPDATE SET <update> (empty update => DO NOTHING).
   record on-conflict { conflict-columns: list<string>, update: list<assignment> }
+  // `INSERT INTO t (columns) <source>` — the inserted rows come from a SELECT.
+  record insert-select { columns: list<string>, source: select-body }
   record insert-query {
     exprs: list<expr-node>,       // insert has no predicates, only cell/upsert expressions
     table: string,
@@ -233,6 +258,7 @@ interface orm {
     conflict: option<on-conflict>,
     scope: option<scope>,
     returning: list<select-item>,
+    select-source: option<insert-select>,
   }
   /// `filter` is required — an unbounded update is refused.
   record update-query {
