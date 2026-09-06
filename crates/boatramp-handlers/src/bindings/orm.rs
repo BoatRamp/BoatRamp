@@ -511,6 +511,8 @@ fn to_core_select(q: &wit::SelectQuery) -> Result<core::Select, wit::Error> {
             .collect::<Result<_, _>>()?,
         limit: q.limit,
         offset: q.offset,
+        // UNION is wired via a dedicated nested-body WIT shape (not yet exposed here).
+        union: None,
     })
 }
 
@@ -554,6 +556,8 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
             .iter()
             .map(|it| to_core_item(exprs, preds, it))
             .collect::<Result<_, _>>()?,
+        // INSERT … SELECT is wired via a dedicated nested-body WIT shape (not yet exposed here).
+        from_select: None,
     })
 }
 

@@ -364,6 +364,16 @@ pub struct Select {
     pub order: Vec<OrderBy>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    /// `UNION [ALL] <query>` — one level (the branch's own `union` is not rendered). Each side
+    /// carries its own scope/filter, so both stay tenant-isolated.
+    pub union: Option<Box<Union>>,
+}
+
+/// A `UNION [ALL]` branch of a [`Select`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Union {
+    pub all: bool,
+    pub query: Select,
 }
 
 /// A `column = <expr>` assignment (an INSERT cell or an UPDATE SET).
@@ -396,6 +406,10 @@ pub struct Insert {
     pub scope: Option<Scope>,
     /// `RETURNING <items>` (empty ⇒ none). Not supported by every engine (e.g. MySQL).
     pub returning: Vec<SelectItem>,
+    /// `INSERT INTO t (<columns>) <select>` — when set, rows come from a SELECT (`rows` ignored).
+    /// The scope is **not** auto-stamped here (the source select governs which rows are read;
+    /// include the tenant column in `columns` + the select's projection if the target needs it).
+    pub from_select: Option<(Vec<String>, Box<Select>)>,
 }
 
 /// An `UPDATE`; `filter` is required (an unbounded update is refused).
@@ -829,12 +843,33 @@ impl Select {
             order: Vec::new(),
             limit: None,
             offset: None,
+            union: None,
         }
     }
 
-    /// Compile to `?N` SQL + bound parameters for the given dialect.
+    /// Compile to `?N` SQL + bound parameters for the given dialect. A `UNION` branch renders
+    /// after the body, sharing the placeholder sequence (so binds stay in textual order).
     pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
         let mut params = Params::default();
+        let sql = self.render_into(&mut params, dialect)?;
+        Ok((sql, params.0))
+    }
+
+    /// Render the full SELECT (body + any UNION branch) into the shared `params`. Reused by
+    /// `INSERT … SELECT` so a source select shares the outer placeholder sequence. Module-private
+    /// because `Params` is (Insert::compile, same module, is the other caller).
+    fn render_into(&self, params: &mut Params, dialect: Dialect) -> Result<String, OrmError> {
+        let mut sql = self.render_body(params, dialect)?;
+        if let Some(u) = &self.union {
+            let kw = if u.all { "UNION ALL" } else { "UNION" };
+            let branch = u.query.render_body(params, dialect)?;
+            sql.push_str(&format!(" {kw} {branch}"));
+        }
+        Ok(sql)
+    }
+
+    /// Render one SELECT body (no UNION) into the shared `params`.
+    fn render_body(&self, params: &mut Params, dialect: Dialect) -> Result<String, OrmError> {
         let table = ident(&self.table)?;
 
         // The DISTINCT clause renders before the select list so any bound params order correctly.
@@ -845,7 +880,7 @@ impl Select {
             let cols = self
                 .distinct_on
                 .iter()
-                .map(|e| render_expr(e, &mut params, dialect))
+                .map(|e| render_expr(e, &mut *params, dialect))
                 .collect::<Result<Vec<_>, _>>()?;
             format!("DISTINCT ON ({}) ", cols.join(", "))
         } else if self.distinct {
@@ -853,7 +888,7 @@ impl Select {
         } else {
             String::new()
         };
-        let select_list = render_select_items(&self.columns, &mut params, dialect)?;
+        let select_list = render_select_items(&self.columns, &mut *params, dialect)?;
         let mut sql = format!("SELECT {distinct}{select_list} FROM {table}");
         if let Some(a) = &self.table_alias {
             sql.push_str(&format!(" AS {}", ident(a)?));
@@ -871,14 +906,14 @@ impl Select {
             }
             sql.push_str(&format!(
                 " ON {}",
-                render_pred(&j.on, &mut params, false, dialect)?
+                render_pred(&j.on, &mut *params, false, dialect)?
             ));
         }
 
         if let Some(w) = render_where(
             self.scope.as_ref(),
             self.filter.as_ref(),
-            &mut params,
+            &mut *params,
             dialect,
         )? {
             sql.push_str(&format!(" WHERE {w}"));
@@ -888,7 +923,7 @@ impl Select {
             let terms: Result<Vec<String>, _> = self
                 .group_by
                 .iter()
-                .map(|e| render_expr(e, &mut params, dialect))
+                .map(|e| render_expr(e, &mut *params, dialect))
                 .collect();
             sql.push_str(&format!(" GROUP BY {}", terms?.join(", ")));
         }
@@ -896,7 +931,7 @@ impl Select {
         if let Some(h) = &self.having {
             sql.push_str(&format!(
                 " HAVING {}",
-                render_pred(h, &mut params, false, dialect)?
+                render_pred(h, &mut *params, false, dialect)?
             ));
         }
 
@@ -905,7 +940,7 @@ impl Select {
                 .order
                 .iter()
                 .map(|o| {
-                    let e = render_expr(&o.expr, &mut params, dialect)?;
+                    let e = render_expr(&o.expr, &mut *params, dialect)?;
                     let d = match o.dir {
                         Direction::Asc => "ASC",
                         Direction::Desc => "DESC",
@@ -923,18 +958,39 @@ impl Select {
             sql.push_str(&format!(" OFFSET {n}"));
         }
 
-        Ok((sql, params.0))
+        Ok(sql)
     }
 }
 
 impl Insert {
     /// Compile to `?N` SQL + bound parameters for the given dialect.
     pub fn compile(&self, dialect: Dialect) -> Result<Compiled, OrmError> {
+        let table = ident(&self.table)?;
+        let mut params = Params::default();
+
+        // INSERT … SELECT: rows come from a source query sharing the placeholder sequence.
+        if let Some((cols, select)) = &self.from_select {
+            let col_sql = cols
+                .iter()
+                .map(|c| ident(c).map(str::to_string))
+                .collect::<Result<Vec<_>, _>>()?;
+            if col_sql.is_empty() {
+                return Err(OrmError::Empty("insert-select has no columns"));
+            }
+            let select_sql = select.render_into(&mut params, dialect)?;
+            let mut sql = format!("INSERT INTO {table} ({}) {select_sql}", col_sql.join(", "));
+            sql.push_str(&render_conflict(
+                self.conflict.as_ref(),
+                &mut params,
+                dialect,
+            )?);
+            sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
+            return Ok((sql, params.0));
+        }
+
         if self.rows.is_empty() {
             return Err(OrmError::Empty("insert has no rows"));
         }
-        let table = ident(&self.table)?;
-        let mut params = Params::default();
 
         // Column set: from the first row (+ the scope column if forced), in a stable order.
         // Every row is coerced to exactly these columns; the scope value overrides.
@@ -978,40 +1034,50 @@ impl Insert {
             value_groups.join(", ")
         );
 
-        if let Some(oc) = &self.conflict {
-            let conflict_cols: Result<Vec<String>, _> = oc
-                .conflict_columns
-                .iter()
-                .map(|c| ident(c).map(str::to_string))
-                .collect();
-            let conflict_cols = conflict_cols?;
-            if oc.update.is_empty() {
-                sql.push_str(&format!(
-                    " ON CONFLICT ({}) DO NOTHING",
-                    conflict_cols.join(", ")
-                ));
-            } else {
-                let sets: Result<Vec<String>, _> = oc
-                    .update
-                    .iter()
-                    .map(|a| {
-                        let c = ident(&a.column)?;
-                        Ok::<String, OrmError>(format!(
-                            "{c} = {}",
-                            render_expr(&a.value, &mut params, dialect)?
-                        ))
-                    })
-                    .collect();
-                sql.push_str(&format!(
-                    " ON CONFLICT ({}) DO UPDATE SET {}",
-                    conflict_cols.join(", "),
-                    sets?.join(", ")
-                ));
-            }
-        }
-
+        sql.push_str(&render_conflict(
+            self.conflict.as_ref(),
+            &mut params,
+            dialect,
+        )?);
         sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
         Ok((sql, params.0))
+    }
+}
+
+/// Render an `ON CONFLICT (...) DO NOTHING|UPDATE SET ...` clause (empty when `None`). The
+/// DO UPDATE assignments bind params, so it takes the shared [`Params`].
+fn render_conflict(
+    conflict: Option<&OnConflict>,
+    params: &mut Params,
+    dialect: Dialect,
+) -> Result<String, OrmError> {
+    let Some(oc) = conflict else {
+        return Ok(String::new());
+    };
+    let conflict_cols = oc
+        .conflict_columns
+        .iter()
+        .map(|c| ident(c).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    if oc.update.is_empty() {
+        Ok(format!(
+            " ON CONFLICT ({}) DO NOTHING",
+            conflict_cols.join(", ")
+        ))
+    } else {
+        let sets = oc
+            .update
+            .iter()
+            .map(|a| {
+                let c = ident(&a.column)?;
+                Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(format!(
+            " ON CONFLICT ({}) DO UPDATE SET {}",
+            conflict_cols.join(", "),
+            sets.join(", ")
+        ))
     }
 }
 
@@ -1369,6 +1435,7 @@ mod tests {
                 value: t("ten_1"),
             }),
             returning: vec![item(Expr::col("id"))],
+            from_select: None,
         };
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
@@ -1400,6 +1467,7 @@ mod tests {
             }),
             scope: None,
             returning: vec![],
+            from_select: None,
         };
         let (sql_do, _) = base(vec![Assignment {
             column: "currency".into(),
@@ -1698,6 +1766,57 @@ mod tests {
             q.compile(Dialect::Sqlite),
             Err(OrmError::BadExpr(_))
         ));
+    }
+
+    #[test]
+    fn union_renders_both_bodies_with_shared_params() {
+        // slug-reservation check across two tables; the branches share the ?N sequence.
+        let q = Select {
+            columns: vec![item(Expr::col("slug"))],
+            filter: Some(cmp("slug", CmpOp::Eq, t("acme"))),
+            union: Some(Box::new(Union {
+                all: false,
+                query: Select {
+                    columns: vec![item(Expr::col("slug"))],
+                    filter: Some(cmp("slug", CmpOp::Eq, t("acme"))),
+                    ..Select::from("reserved_slug")
+                },
+            })),
+            ..Select::from("pending_signup")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT slug FROM pending_signup WHERE slug = ?1 \
+             UNION SELECT slug FROM reserved_slug WHERE slug = ?2"
+        );
+        assert_eq!(params, vec![t("acme"), t("acme")]);
+    }
+
+    #[test]
+    fn insert_from_select_shares_params_and_carries_no_auto_scope() {
+        // INSERT INTO ref (a, b) SELECT x, y FROM src WHERE id = ? (attach_reference shape).
+        let q = Insert {
+            table: "portfolio_ref".into(),
+            rows: vec![],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: Some((
+                vec!["a".into(), "b".into()],
+                Box::new(Select {
+                    columns: vec![item(Expr::col("x")), item(Expr::col("y"))],
+                    filter: Some(cmp("id", CmpOp::Eq, t("pi_1"))),
+                    ..Select::from("portfolio_item")
+                }),
+            )),
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO portfolio_ref (a, b) SELECT x, y FROM portfolio_item WHERE id = ?1"
+        );
+        assert_eq!(params, vec![t("pi_1")]);
     }
 
     #[test]
