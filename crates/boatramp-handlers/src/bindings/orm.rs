@@ -222,6 +222,28 @@ fn build_expr(
         wit::ExprNode::VectorLiteral(s) => core::Expr::VectorLiteral(s.clone()),
         // The filter — and everything it reaches — is bounded by this node's own index `i`.
         wit::ExprNode::RelatedAggregate(r) => build_related_aggregate(exprs, preds, r, i)?,
+        wit::ExprNode::CaseExpr(c) => {
+            if c.branches.is_empty() {
+                return Err(bad_arena("case has no branches"));
+            }
+            // Each `when` predicate's expressions and each `then`/`otherwise` expr are bounded by
+            // this node's index `i` (acyclic — a branch can't reference the CASE itself or later).
+            let branches = c
+                .branches
+                .iter()
+                .map(|b| {
+                    Ok::<_, wit::Error>((build_pred(preds, exprs, b.when, i)?, child(b.then)?))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let otherwise = match c.otherwise {
+                Some(e) => Some(Box::new(child(e)?)),
+                None => None,
+            };
+            core::Expr::Case {
+                branches,
+                otherwise,
+            }
+        }
     })
 }
 
@@ -1048,6 +1070,41 @@ mod tests {
             .iter()
             .any(|l| l
                 .starts_with("query|DELETE FROM pending_signup WHERE slug = ?1 RETURNING slug|")));
+    }
+
+    #[tokio::test]
+    async fn case_expression_rebuilds_from_the_arena() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = session(&log);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            // SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t
+            let sel = wit::SelectQuery {
+                exprs: vec![
+                    col("state"),                // 0
+                    lit(text("open")),           // 1
+                    lit(wit::Value::Integer(1)), // 2
+                    lit(wit::Value::Integer(0)), // 3
+                    wit::ExprNode::CaseExpr(wit::CaseNode {
+                        branches: vec![wit::CaseBranch { when: 0, then: 2 }],
+                        otherwise: Some(3),
+                    }), // 4
+                ],
+                preds: vec![cmp(0, wit::CmpOp::Eq, 1)], // pred 0
+                columns: vec![item(4)],
+                ..empty_select("t")
+            };
+            let _ = host.select(db, sel).await.unwrap();
+        }
+        sess.finalize(true).await;
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l
+                .starts_with("query|SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t|")));
     }
 
     #[tokio::test]

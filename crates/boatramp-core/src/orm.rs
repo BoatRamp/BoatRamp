@@ -189,6 +189,13 @@ pub enum Expr {
         table: String,
         filter: Box<Predicate>,
     },
+    /// A `CASE WHEN <pred> THEN <expr> … [ELSE <expr>] END` (parenthesized). Each branch's
+    /// condition reuses the predicate compiler (bound params). A boolean/comparison `ORDER BY`
+    /// term is expressed portably as `ORDER BY CASE WHEN <cond> THEN 0 ELSE 1 END`.
+    Case {
+        branches: Vec<(Predicate, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
 }
 
 impl Expr {
@@ -552,6 +559,28 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
                 "(SELECT {}({arg_sql}) FROM {table_sql} WHERE {where_sql})",
                 agg.keyword()
             )
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            if branches.is_empty() {
+                return Err(OrmError::BadExpr("CASE has no WHEN branches"));
+            }
+            let mut s = String::from("CASE");
+            for (when, then) in branches {
+                // Params bind in textual order: each WHEN before its THEN, branches in order,
+                // ELSE last — matching how `render_pred`/`render_expr` push placeholders.
+                let w = render_pred(when, params, false, dialect)?;
+                let t = render_expr(then, params, dialect)?;
+                s.push_str(&format!(" WHEN {w} THEN {t}"));
+            }
+            if let Some(e) = otherwise {
+                let e = render_expr(e, params, dialect)?;
+                s.push_str(&format!(" ELSE {e}"));
+            }
+            s.push_str(" END");
+            format!("({s})")
         }
     })
 }
@@ -1515,6 +1544,45 @@ mod tests {
         assert!(matches!(
             q.compile(Dialect::Sqlite),
             Err(OrmError::InvalidIdentifier(_))
+        ));
+    }
+
+    #[test]
+    fn case_expression_renders_with_bound_params() {
+        // CASE WHEN state = ? THEN 1 ELSE 0 END as a select item; params bind in textual order.
+        let q = Select {
+            columns: vec![item(Expr::Case {
+                branches: vec![(
+                    cmp("state", CmpOp::Eq, t("open")),
+                    Expr::val(SqlValue::Integer(1)),
+                )],
+                otherwise: Some(Box::new(Expr::val(SqlValue::Integer(0)))),
+            })],
+            ..Select::from("t")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (CASE WHEN state = ?1 THEN ?2 ELSE ?3 END) FROM t"
+        );
+        assert_eq!(
+            params,
+            vec![t("open"), SqlValue::Integer(1), SqlValue::Integer(0)]
+        );
+    }
+
+    #[test]
+    fn empty_case_is_rejected() {
+        let q = Select {
+            columns: vec![item(Expr::Case {
+                branches: vec![],
+                otherwise: None,
+            })],
+            ..Select::from("t")
+        };
+        assert!(matches!(
+            q.compile(Dialect::Sqlite),
+            Err(OrmError::BadExpr(_))
         ));
     }
 

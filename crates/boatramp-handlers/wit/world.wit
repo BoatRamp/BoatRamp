@@ -143,6 +143,10 @@ interface orm {
   // reference reachable from it — must stay strictly below this node so the whole thing is
   // acyclic. Only accepted when the host has the `orm-subquery` feature.
   record related-aggregate-node { agg: agg, arg: option<string>, table: string, filter: u32 }
+  // `CASE WHEN preds[when] THEN exprs[then] … [ELSE exprs[otherwise]] END`. Each `when`/`then`/
+  // `otherwise` indexes the pred/expr arena and must stay strictly below this node (acyclic).
+  record case-branch { when: u32, then: u32 }
+  record case-node { branches: list<case-branch>, otherwise: option<u32> }
   variant expr-node {
     column(string),
     literal(value),
@@ -158,6 +162,7 @@ interface orm {
     distance(distance-node),
     vector-literal(string),     // a bracketed float list, bound + rendered `?N::vector`
     related-aggregate(related-aggregate-node),
+    case-expr(case-node),
   }
 
   // ---- predicate arena -----------------------------------------------------
