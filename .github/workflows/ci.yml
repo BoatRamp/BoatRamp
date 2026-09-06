@@ -17,6 +17,9 @@ name: CI
 #                      is how two total failures shipped through green CI, so it gates now.
 #   • test-cluster   — the embedded-Raft cluster tests (consensus + leader-loss failover),
 #                      behind the `raft`/`http` features — also nightly-only before, now gated.
+#   • test-orm-tenancy — the Stage 0 in-site tenant-isolation proof on a REAL libsql engine
+#                      (`sql`-feature-gated, so the lean `test` lane skips it); asserts a success
+#                      marker so a silent skip or a cross-tenant regression fails the merge.
 #   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
 # clippy and test are the two full workspace compiles; running them as separate
 # jobs lets them build concurrently on separate runners instead of one after the
@@ -265,6 +268,30 @@ jobs:
             echo "::error::server-features test count $live dropped below the floor $SERVER_FEATURES_MIN — a feature-gate mistake may have silently dropped tests. If the drop is intentional, lower .github/test-count-baseline deliberately."
             exit 1
           fi
+
+  # Stage 0 in-site tenant isolation HARD GATE. The ORM/`sql` tenant scope must isolate tenants
+  # on a REAL SQL engine (embedded libsql), not merely in the compiler's string output. The test
+  # is `sql`-feature-gated, so the workspace lane (which enables only `boatramp/fs,slatedb`) would
+  # silently skip it — a skip is not evidence — so this lane runs it explicitly with `sql` and
+  # asserts a success marker, so a silent skip OR a cross-tenant regression fails the merge.
+  test-orm-tenancy:
+    name: test (ORM in-site tenant isolation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-orm-tenancy-musl
+      - name: Live in-site tenant isolation on a real libsql engine
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-storage \
+            --features sql --test orm_tenant_isolation -- --nocapture 2>&1 | tee orm-tenancy.log
+          grep -qE 'test result: ok\. 1 passed' orm-tenancy.log \
+            || { echo "::error::ORM tenant isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
+            || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
