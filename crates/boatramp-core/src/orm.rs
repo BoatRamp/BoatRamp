@@ -1157,6 +1157,7 @@ impl Insert {
             let mut sql = format!("INSERT INTO {table} ({}) {select_sql}", col_sql.join(", "));
             sql.push_str(&render_conflict(
                 self.conflict.as_ref(),
+                self.scope.as_ref(),
                 &mut params,
                 dialect,
             )?);
@@ -1222,6 +1223,7 @@ impl Insert {
 
         sql.push_str(&render_conflict(
             self.conflict.as_ref(),
+            self.scope.as_ref(),
             &mut params,
             dialect,
         )?);
@@ -1232,8 +1234,15 @@ impl Insert {
 
 /// Render an `ON CONFLICT (...) DO NOTHING|UPDATE SET ...` clause (empty when `None`). The
 /// DO UPDATE assignments bind params, so it takes the shared [`Params`].
+///
+/// Under a tenant scope with a stampable value (own/null — `all` bounds nothing), the DO UPDATE is
+/// **bounded to the tenant's own rows** so a guest upsert can't overwrite another tenant's row via
+/// a conflict on a non-tenant-partitioned key, and any assignment targeting the scope column is
+/// **dropped** so the tenant of an existing row is never reassigned. MySQL's `ON DUPLICATE KEY
+/// UPDATE` can't carry that bound, so a scoped upsert on MySQL is refused (fail-closed).
 fn render_conflict(
     conflict: Option<&OnConflict>,
+    scope: Option<&Scope>,
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<String, OrmError> {
@@ -1245,26 +1254,48 @@ fn render_conflict(
         .iter()
         .map(|c| ident(c).map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
+    // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing).
+    let guard = scope.filter(|s| s.stamp_value().is_some());
+    let do_nothing = || format!(" ON CONFLICT ({}) DO NOTHING", conflict_cols.join(", "));
     if oc.update.is_empty() {
-        Ok(format!(
-            " ON CONFLICT ({}) DO NOTHING",
-            conflict_cols.join(", ")
-        ))
-    } else {
-        let sets = oc
-            .update
-            .iter()
-            .map(|a| {
-                let c = ident(&a.column)?;
-                Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(format!(
-            " ON CONFLICT ({}) DO UPDATE SET {}",
-            conflict_cols.join(", "),
-            sets.join(", ")
-        ))
+        return Ok(do_nothing());
     }
+    if guard.is_some() && matches!(dialect, Dialect::Mysql) {
+        return Err(OrmError::BadExpr(
+            "a tenant-scoped upsert (ON CONFLICT DO UPDATE) is unsupported on MySQL \
+             (ON DUPLICATE KEY UPDATE cannot be bounded to the tenant's rows)",
+        ));
+    }
+    // Drop any assignment to the scope column: a guest upsert never reassigns an existing row's
+    // tenant. If that leaves nothing to update, degrade to DO NOTHING.
+    let sets = oc
+        .update
+        .iter()
+        .filter(|a| guard.is_none_or(|s| a.column != s.column))
+        .map(|a| {
+            let c = ident(&a.column)?;
+            Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if sets.is_empty() {
+        return Ok(do_nothing());
+    }
+    let mut clause = format!(
+        " ON CONFLICT ({}) DO UPDATE SET {}",
+        conflict_cols.join(", "),
+        sets.join(", ")
+    );
+    if let Some(s) = guard {
+        // Bound the DO UPDATE to the tenant's own rows (Postgres/SQLite support a trailing WHERE).
+        let pred = s
+            .as_predicate()
+            .expect("a stampable scope always has a predicate");
+        clause.push_str(&format!(
+            " WHERE {}",
+            render_pred(&pred, params, false, dialect)?
+        ));
+    }
+    Ok(clause)
 }
 
 impl Update {
@@ -1514,6 +1545,61 @@ mod tests {
             !params.contains(&t("VICTIM")),
             "the forged tenant never binds"
         );
+    }
+
+    #[test]
+    fn scoped_upsert_drops_tenant_reassignment_and_bounds_the_do_update() {
+        // A guest upsert tries to (a) reassign tenant_id to VICTIM on conflict and (b) overwrite
+        // another tenant's row via a conflict on a non-tenant key. The scope guard must drop the
+        // tenant reassignment and bound the DO UPDATE to own rows.
+        let mut ins = Insert {
+            table: "orders".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "id".into(),
+                    value: Expr::val(t("k")),
+                }],
+            }],
+            conflict: Some(OnConflict {
+                conflict_columns: vec!["id".into()],
+                update: vec![
+                    Assignment {
+                        column: "tenant_id".into(),
+                        value: Expr::val(t("VICTIM")),
+                    },
+                    Assignment {
+                        column: "total".into(),
+                        value: Expr::val(SqlValue::Integer(999)),
+                    },
+                ],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        let own = Scope {
+            column: "tenant_id".into(),
+            value: t("OWN"),
+            mode: ScopeMode::Own,
+        };
+        ins.force_scope(Some(&own), Some(&own));
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO orders (id, tenant_id) VALUES (?1, ?2) \
+             ON CONFLICT (id) DO UPDATE SET total = ?3 WHERE tenant_id = ?4"
+        );
+        // The inserted row stamps OWN; the DO UPDATE is bounded to OWN; VICTIM never binds.
+        assert_eq!(
+            params,
+            vec![t("k"), t("OWN"), SqlValue::Integer(999), t("OWN")]
+        );
+        assert!(!params.contains(&t("VICTIM")));
+        // The same scoped upsert is refused on MySQL (no bounded DO UPDATE).
+        assert!(matches!(
+            ins.compile(Dialect::Mysql),
+            Err(OrmError::BadExpr(_))
+        ));
     }
 
     #[test]
