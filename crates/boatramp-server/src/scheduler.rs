@@ -351,6 +351,11 @@ pub(super) async fn run_scheduler_tick(
                             0,
                             // Background consumers have no request context to correlate with.
                             None,
+                            // No HTTP request ⇒ no token/domain tenant source; an `own` scope
+                            // fails closed (a consumer uses `null`/`all`, or signed-context once
+                            // wired).
+                            None,
+                            None,
                         )
                         .await
                         {
@@ -554,6 +559,9 @@ async fn fire_cron(
         &handler.invoke_targets,
         0,
         // A cron trigger has no inbound request to correlate with.
+        None,
+        // No HTTP request ⇒ no token/domain tenant source (an `own` scope fails closed).
+        None,
         None,
     )
     .await

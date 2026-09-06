@@ -548,7 +548,7 @@ pub struct SecurityPosture {
     /// operator ceiling on the cross-tenant mode. **Off** under `multi-tenant` (an `all` grant is
     /// refused until the operator opts in) and on under `single-tenant`/`dev`. Independent of the
     /// per-function grant: even a function that declares `all` is capped to `own` (its resolved
-    /// tenant) while this is off, so a compromised/mis-declared tenant can't read the fleet.
+    /// tenant) while this is off, so a compromised/misconfigured tenant can't read the fleet.
     pub allow_cross_tenant_db: bool,
 }
 

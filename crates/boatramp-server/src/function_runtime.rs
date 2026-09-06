@@ -481,6 +481,31 @@ async fn build_function_bindings(
             }
         }
     }
+    // Stage 0: resolve the in-site tenant scope (applied to both sql + orm). An undeclared
+    // sql/orm importer is refused under the strict posture (Dimension 0); an `all` grant is
+    // capped to `own` unless the posture opens cross-tenant. A top-level function currently
+    // carries no request context, so a token/domain source resolves no value (an `own` op then
+    // fails closed) — threading the invoke bearer/domain to functions is a follow-up.
+    {
+        let imports_db = granted("sql") || config.imports.iter().any(|i| i.starts_with("sql:"));
+        let posture = crate::tenant_resolve::TenantPosture {
+            require_declaration: inner
+                .require_tenancy_declaration
+                .get()
+                .copied()
+                .unwrap_or(true),
+            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+        };
+        let tenancy = crate::tenant_resolve::resolve_host_tenancy(
+            config.tenancy.as_ref(),
+            imports_db,
+            posture,
+            crate::tenant_resolve::TenantSourceInputs::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        bindings = bindings.with_tenancy(tenancy);
+    }
     if granted("wasi:messaging") {
         if let Some(messaging) = &inner.messaging {
             // Private topics namespace under the function's own scope; `bus:<topic>`

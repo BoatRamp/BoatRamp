@@ -213,6 +213,8 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         self_egress_addrs,
         allow_env_secret_refs,
         allow_guest_email,
+        options.posture.require_tenancy_declaration,
+        options.posture.allow_cross_tenant_db,
         &deploy,
         secrets_envelope.clone(),
     )

@@ -369,6 +369,17 @@ pub(crate) async fn serve_by_host_inner(
                 peer: peer.ip(),
                 limiter: limiter.as_ref(),
             };
+            // Stage 0: stash the routed domain's tenant context tag in the request extensions so
+            // the handler-dispatch path can resolve a domain-sourced in-site tenant scope without
+            // re-reading the routing index. Only set when the domain carries one.
+            #[cfg(feature = "handlers")]
+            let mut request = request;
+            #[cfg(feature = "handlers")]
+            if let Some(context) = owner.context.clone() {
+                request
+                    .extensions_mut()
+                    .insert(crate::DomainContext(context));
+            }
             // Host-routed: transport/canonical redirects + HSTS apply.
             serve_request(
                 &deploy,

@@ -65,6 +65,11 @@ pub async fn build_handler_runtime(
     // Off under multi-tenant; when off, email is simply not offered (a granted guest
     // gets `access-denied`). Only consulted with the `email` feature compiled in.
     allow_guest_email: bool,
+    // Posture: whether a sql/orm importer must declare an explicit in-site tenancy decision
+    // (on under multi-tenant — Dimension 0) and whether an `all` tenancy grant may cross tenants
+    // (off under multi-tenant — the cross-tenant ceiling).
+    require_tenancy_declaration: bool,
+    allow_cross_tenant_db: bool,
     // The deploy store (for a managed compute-backed `sql` database's endpoint
     // resolution) and the `[secrets]` envelope (to seal a managed credential).
     deploy: &DeployStore,
@@ -165,6 +170,8 @@ pub async fn build_handler_runtime(
     runtime.set_max_component_bytes(max_component_bytes);
     // Apply the posture's host-env secret-ref gate (fail-closed if never set).
     runtime.set_allow_env_secret_refs(allow_env_secret_refs);
+    // Apply the posture's in-site tenancy knobs (Stage 0; fail-closed if never set).
+    runtime.set_tenancy_posture(require_tenancy_declaration, allow_cross_tenant_db);
     // Wire the project-scoped internal secret store when a `[secrets]` envelope is
     // configured, so `boatramp:<name>` refs resolve (sealed at rest). Without an
     // envelope there is no sealed store and such refs stay fail-closed.

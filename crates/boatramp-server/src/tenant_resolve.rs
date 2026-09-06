@@ -1,0 +1,286 @@
+//! Server-side resolution of a function/site's declared [`Tenancy`] into the host-applied
+//! [`HostTenancy`] the `sql`/`orm` bindings enforce (Stage 0).
+//!
+//! Crate layering: the JWT/JWKS verifier lives here in `boatramp-server` (it pulls
+//! `jsonwebtoken`/`reqwest`), so we resolve the tenant **value** here and hand the binding a
+//! ready [`HostTenancy`] — the binding never learns how the value was sourced. The verifier is
+//! reused from the GraphQL data connector ([`crate::graphql_data::token`]).
+//!
+//! Two things are enforced here, above the compiler:
+//! - **Dimension 0** — a sql/orm importer with an *undeclared* tenancy is **refused** under a
+//!   posture that `require_tenancy_declaration` (multi-tenant), so running plain is always a
+//!   reviewed decision.
+//! - **The cross-tenant ceiling** — an `all` grant is **capped to `own`** unless the posture
+//!   `allow_cross_tenant_db`, so a misconfigured or compromised tenant can't read the fleet even
+//!   if its config asks to.
+
+use boatramp_core::config::HandlerGraphqlTokenClaims;
+use boatramp_core::tenancy::{AccessMode, Tenancy, TenantSource};
+use boatramp_handlers::HostTenancy;
+
+/// Everything needed to resolve the tenant value for one invocation. Each caller fills what its
+/// trigger has: an HTTP request has a `bearer` and a `domain_context`; a background consumer/cron
+/// has neither (so an "own" source fails closed).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct TenantSourceInputs<'a> {
+    /// The request's verified-app bearer (for [`TenantSource::Token`]).
+    pub bearer: Option<&'a str>,
+    /// The routed domain's context tag (for [`TenantSource::Domain`]).
+    pub domain_context: Option<&'a str>,
+    /// The JWKS/issuer config used to verify the bearer (reused from the GDC's `claims_from_token`).
+    /// Absent ⇒ the token source can't verify, so it resolves to no value (fail-closed).
+    pub token_cfg: Option<&'a HandlerGraphqlTokenClaims>,
+}
+
+/// The posture knobs that bound tenancy (read from the runtime's resolved [`SecurityPosture`]).
+#[derive(Clone, Copy)]
+pub(crate) struct TenantPosture {
+    /// Refuse an undeclared sql/orm importer (multi-tenant).
+    pub require_declaration: bool,
+    /// Permit an `all` grant to actually cross tenants; else it's capped to `own`.
+    pub allow_cross_tenant: bool,
+}
+
+/// Refusal to activate a guest because its tenancy declaration is missing where the posture
+/// requires one (Dimension 0). Surfaces as a "bindings refused" activation failure.
+#[derive(Debug, Clone)]
+pub(crate) struct TenancyUndeclared;
+
+impl std::fmt::Display for TenancyUndeclared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "tenancy: this function imports sql/orm but declares no tenancy decision; the \
+             multi-tenant posture requires an explicit `tenancy` (disabled or scoped)",
+        )
+    }
+}
+impl std::error::Error for TenancyUndeclared {}
+
+/// Resolve the effective [`Tenancy`] `decision` into a [`HostTenancy`] (or `None` = plain
+/// queries). `imports_db` is whether the guest imports `sql`/`orm` at all (only then does the
+/// Dimension-0 requirement bite). Async because the token source verifies a JWT.
+pub(crate) async fn resolve_host_tenancy(
+    decision: Option<&Tenancy>,
+    imports_db: bool,
+    posture: TenantPosture,
+    inputs: TenantSourceInputs<'_>,
+) -> Result<Option<HostTenancy>, TenancyUndeclared> {
+    match decision {
+        // Undeclared: refuse a db-importing guest under the strict posture; otherwise run plain.
+        None => {
+            if imports_db && posture.require_declaration {
+                Err(TenancyUndeclared)
+            } else {
+                Ok(None)
+            }
+        }
+        // Deliberately no in-site tenancy — plain queries.
+        Some(Tenancy::Disabled) => Ok(None),
+        Some(Tenancy::Scoped {
+            column,
+            source,
+            read,
+            write,
+        }) => {
+            let value = resolve_value(source, &inputs).await;
+            let read = cap(*read, posture.allow_cross_tenant);
+            let write = cap(*write, posture.allow_cross_tenant);
+            Ok(Some(HostTenancy::new(column.clone(), value, read, write)))
+        }
+    }
+}
+
+/// Cap a cross-tenant `all` grant to `own` unless the posture permits crossing tenants.
+fn cap(mode: AccessMode, allow_cross_tenant: bool) -> AccessMode {
+    if mode == AccessMode::All && !allow_cross_tenant {
+        AccessMode::Own
+    } else {
+        mode
+    }
+}
+
+/// Resolve the tenant value from the verified source. `None` for anonymous / not-yet-wired
+/// sources — the binding then fails an "own" operation closed.
+async fn resolve_value(
+    source: &TenantSource,
+    inputs: &TenantSourceInputs<'_>,
+) -> Option<boatramp_core::sql::SqlValue> {
+    match source {
+        TenantSource::Token { claim } => {
+            // The verifier lives behind `oidc` (it pulls `jsonwebtoken`). Without that feature the
+            // token source can't verify, so it sources no value (fail-closed) — mirroring the GDC.
+            #[cfg(feature = "oidc")]
+            {
+                let (cfg, bearer) = (inputs.token_cfg?, inputs.bearer?);
+                let claims = crate::graphql_data::token::verified_claims(cfg, bearer).await?;
+                claims.get(claim).and_then(scalar_to_sql)
+            }
+            #[cfg(not(feature = "oidc"))]
+            {
+                let _ = (claim, inputs);
+                None
+            }
+        }
+        TenantSource::Domain => inputs
+            .domain_context
+            .filter(|c| !c.is_empty())
+            .map(|c| boatramp_core::sql::SqlValue::Text(c.to_string())),
+        // Reserved: async worker signed-context isn't wired yet, so it resolves to no value —
+        // an "own" op then fails closed rather than running unscoped.
+        TenantSource::SignedContext => None,
+        // Truly anonymous — no "own" tenant.
+        TenantSource::None => None,
+    }
+}
+
+/// Convert a verified JSON claim scalar into a bound SQL value. Non-scalars (arrays/objects/null)
+/// are rejected — a tenant id is always a scalar.
+fn scalar_to_sql(v: &serde_json::Value) -> Option<boatramp_core::sql::SqlValue> {
+    use boatramp_core::sql::SqlValue;
+    match v {
+        serde_json::Value::String(s) => Some(SqlValue::Text(s.clone())),
+        serde_json::Value::Bool(b) => Some(SqlValue::Boolean(*b)),
+        serde_json::Value::Number(n) if n.is_i64() => Some(SqlValue::Integer(n.as_i64().unwrap())),
+        // A non-integer number is unusual for a tenant id; bind it as text to avoid float keys.
+        serde_json::Value::Number(n) => Some(SqlValue::Text(n.to_string())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boatramp_core::sql::SqlValue;
+
+    fn posture(require: bool, cross: bool) -> TenantPosture {
+        TenantPosture {
+            require_declaration: require,
+            allow_cross_tenant: cross,
+        }
+    }
+
+    #[tokio::test]
+    async fn undeclared_db_importer_is_refused_only_under_the_strict_posture() {
+        // Strict posture + imports db + undeclared ⇒ refused.
+        assert!(resolve_host_tenancy(
+            None,
+            true,
+            posture(true, false),
+            TenantSourceInputs::default()
+        )
+        .await
+        .is_err());
+        // Same, but doesn't import db ⇒ fine (plain).
+        assert!(matches!(
+            resolve_host_tenancy(
+                None,
+                false,
+                posture(true, false),
+                TenantSourceInputs::default()
+            )
+            .await,
+            Ok(None)
+        ));
+        // Relaxed posture ⇒ undeclared is fine (plain).
+        assert!(matches!(
+            resolve_host_tenancy(
+                None,
+                true,
+                posture(false, true),
+                TenantSourceInputs::default()
+            )
+            .await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_is_plain() {
+        let out = resolve_host_tenancy(
+            Some(&Tenancy::Disabled),
+            true,
+            posture(true, false),
+            TenantSourceInputs::default(),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_source_binds_the_context_tag() {
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            source: TenantSource::Domain,
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        let inputs = TenantSourceInputs {
+            domain_context: Some("acme-store"),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        // The resolved value scopes reads to the domain's tenant.
+        let scope = ht
+            .orm_scope(boatramp_handlers::TenantAxis::Read)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.value, SqlValue::Text("acme-store".into()));
+    }
+
+    #[tokio::test]
+    async fn all_is_capped_to_own_unless_the_posture_opens_it() {
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            source: TenantSource::Domain,
+            read: AccessMode::All,
+            write: AccessMode::All,
+        };
+        let inputs = TenantSourceInputs {
+            domain_context: Some("acme"),
+            ..Default::default()
+        };
+        // Ceiling closed: `all` capped to `own` ⇒ the read carries a tenant predicate.
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ht
+            .orm_scope(boatramp_handlers::TenantAxis::Read)
+            .unwrap()
+            .is_some());
+        // Ceiling open: `all` stands ⇒ no scope (unscoped, cross-tenant).
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, true), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ht
+            .orm_scope(boatramp_handlers::TenantAxis::Read)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn own_source_without_inputs_resolves_to_no_value_then_fails_closed() {
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            source: TenantSource::Domain,
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        // No domain context supplied ⇒ no value; the binding will deny an own op.
+        let ht = resolve_host_tenancy(
+            Some(&decision),
+            true,
+            posture(true, false),
+            TenantSourceInputs::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ht.orm_scope(boatramp_handlers::TenantAxis::Read).is_err());
+    }
+}

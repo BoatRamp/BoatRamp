@@ -186,6 +186,8 @@ mod mcp_http;
 #[cfg(feature = "handlers")]
 mod scheduler;
 mod serve_pipeline;
+#[cfg(feature = "handlers")]
+mod tenant_resolve;
 pub use serve_pipeline::{http_redirect_router, FastServe};
 #[cfg(test)]
 mod hotpath_test;
@@ -315,6 +317,17 @@ struct HandlerRuntimeInner {
     /// refuses such a ref instead of injecting the host value, closing the
     /// cross-tenant host-env exfiltration path under the multi-tenant posture.
     allow_env_secret_refs: std::sync::OnceLock<bool>,
+    /// Whether a site/function that imports `sql`/`orm` must declare an explicit in-site tenancy
+    /// decision (Dimension 0), from the posture's `require_tenancy_declaration`. Set at startup
+    /// via [`HandlerRuntime::set_tenancy_posture`]; **unset reads as `true`** (fail-closed — a
+    /// runtime that never wired the posture refuses an undeclared db importer rather than running
+    /// it plain).
+    require_tenancy_declaration: std::sync::OnceLock<bool>,
+    /// Whether an in-site tenancy `all` grant may actually reach across tenants, from the
+    /// posture's `allow_cross_tenant_db`. Set via [`HandlerRuntime::set_tenancy_posture`];
+    /// **unset reads as `false`** (fail-closed — an `all` grant is capped to `own` until the
+    /// posture is wired to permit crossing tenants).
+    allow_cross_tenant_db: std::sync::OnceLock<bool>,
     /// The project-scoped internal secret store (sealed with the `[secrets]`
     /// envelope). Backs the `boatramp:<name>` secret-ref scheme — the
     /// multi-tenant-safe alternative to a host-env ref. Set once at startup via
@@ -422,6 +435,8 @@ impl HandlerRuntime {
                 max_blob_bytes: std::sync::OnceLock::new(),
                 max_component_bytes: std::sync::OnceLock::new(),
                 allow_env_secret_refs: std::sync::OnceLock::new(),
+                require_tenancy_declaration: std::sync::OnceLock::new(),
+                allow_cross_tenant_db: std::sync::OnceLock::new(),
                 secret_store: std::sync::OnceLock::new(),
                 function_meter_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 function_semaphores: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -563,6 +578,18 @@ impl HandlerRuntime {
     pub fn set_allow_env_secret_refs(&self, allow: bool) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.allow_env_secret_refs.set(allow);
+        }
+    }
+
+    /// Wire the in-site tenancy posture (Stage 0): `require_declaration` (a sql/orm importer must
+    /// declare an explicit tenancy decision) and `allow_cross_tenant` (an `all` grant may reach
+    /// across tenants). Set once at startup; **unset reads fail-closed** (`require = true`,
+    /// `allow_cross_tenant = false`).
+    #[cfg(feature = "handlers")]
+    pub fn set_tenancy_posture(&self, require_declaration: bool, allow_cross_tenant: bool) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.require_tenancy_declaration.set(require_declaration);
+            let _ = inner.allow_cross_tenant_db.set(allow_cross_tenant);
         }
     }
 
@@ -1463,6 +1490,15 @@ async fn readyz(State(deploy): State<DeployStore>) -> Response {
 /// its own id into the request extensions.
 #[derive(Clone)]
 pub struct RequestId(pub String);
+
+/// The routed domain's opaque **tenant context tag** ([`boatramp_core::project::DomainOwner`]'s
+/// `context`), stashed in the request extensions at host routing time so the handler-dispatch path
+/// can resolve a [`boatramp_core::tenancy::TenantSource::Domain`] scope without re-reading the
+/// routing index. Present only on the host-routed serving path; absent elsewhere (a domain source
+/// then fails closed).
+#[cfg(feature = "handlers")]
+#[derive(Clone)]
+pub struct DomainContext(pub String);
 
 /// The correlation id for a request: an upstream proxy's `X-Request-Id` when present (sanitized,
 /// length-capped), else a generated time-ordered, per-process-unique id.
@@ -3944,10 +3980,13 @@ mod tests {
         let rt = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
         let inner = rt.inner.as_ref().unwrap();
 
-        // The site exposes the default + two named databases — the ceiling.
+        // The site exposes the default + two named databases — the ceiling. It declares tenancy
+        // Disabled (this test is about named-sql dispatch, not tenancy) so the fail-closed
+        // default posture (require a declaration) admits it.
         let site = HandlersSiteConfig {
             enabled: true,
             allow_imports: vec!["sql".into(), "sql:product".into(), "sql:privileged".into()],
+            tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
             ..Default::default()
         };
         let env = std::collections::BTreeMap::new();
@@ -3967,6 +4006,8 @@ mod tests {
                     env,
                     &[],
                     0,
+                    None,
+                    None,
                     None,
                 )
                 .await

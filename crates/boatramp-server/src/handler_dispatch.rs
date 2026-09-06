@@ -299,6 +299,22 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::RequestId>()
         .map(|r| r.0.clone());
+    // Stage 0 tenant-source inputs: the request's app bearer (verified downstream for a token
+    // source) and the routed domain's context tag (for a domain source), the latter stashed in
+    // the request extensions at host routing.
+    let bearer = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .map(str::to_string);
+    let domain_context = request
+        .extensions()
+        .get::<crate::DomainContext>()
+        .map(|c| c.0.clone());
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -313,6 +329,8 @@ pub(super) async fn dispatch_handler(
         // invokes siblings at depth 0; the host caps each subsequent hop.
         0,
         request_id.as_deref(),
+        bearer.as_deref(),
+        domain_context.as_deref(),
     )
     .await
     {
@@ -903,6 +921,10 @@ pub(super) async fn build_bindings(
     invoke_targets: &[String],
     depth: u32,
     request_id: Option<&str>,
+    // Stage 0 tenant-source inputs (the verified bearer for a token source; the routed domain's
+    // context tag for a domain source). Background triggers pass `None` for both.
+    bearer: Option<&str>,
+    domain_context: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -939,6 +961,39 @@ pub(super) async fn build_bindings(
                 }
             }
         }
+    }
+    // Stage 0: resolve the in-site tenant scope for this invocation (applied to BOTH sql + orm).
+    // A sql/orm importer that declares no tenancy is refused under the strict posture (Dimension
+    // 0); an `all` grant is capped to `own` unless the posture opens cross-tenant access.
+    {
+        let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
+        let posture = crate::tenant_resolve::TenantPosture {
+            require_declaration: inner
+                .require_tenancy_declaration
+                .get()
+                .copied()
+                .unwrap_or(true),
+            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+        };
+        let token_cfg = site_handlers
+            .graphql
+            .as_ref()
+            .and_then(|g| g.data.as_ref())
+            .and_then(|d| d.claims_from_token.as_ref());
+        let inputs = crate::tenant_resolve::TenantSourceInputs {
+            bearer,
+            domain_context,
+            token_cfg,
+        };
+        let tenancy = crate::tenant_resolve::resolve_host_tenancy(
+            site_handlers.tenancy.as_ref(),
+            imports_db,
+            posture,
+            inputs,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        bindings = bindings.with_tenancy(tenancy);
     }
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the
