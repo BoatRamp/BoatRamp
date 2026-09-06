@@ -345,20 +345,63 @@ pub struct SelectItem {
     pub alias: Option<String>,
 }
 
-/// An optional in-site row-tenancy scope: `column = value`.
+/// How a tenant [`Scope`] restricts rows for one operation. The host resolves this from the
+/// per-function/site `db.read`/`db.write` grant (read modes on `SELECT`, write modes on
+/// `INSERT`/`UPDATE`/`DELETE`); a guest never chooses it. `None`-grant (deny) is handled above
+/// the compiler — a compiled query always carries a concrete mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScopeMode {
+    /// `column = value` — the resolved tenant only.
+    #[default]
+    Own,
+    /// `(column = value OR column IS NULL)` — the resolved tenant plus the shared/`NULL` baseline.
+    OwnOrNull,
+    /// `column IS NULL` — the shared/`NULL` baseline only (no tenant rows).
+    NullOnly,
+    /// No tenant predicate — cross-tenant. Only reachable with an explicit `all` grant under the
+    /// operator posture ceiling (both enforced host-side, above this compiler).
+    All,
+}
+
+/// A host-resolved in-site row-tenancy scope. The `value` is the resolved tenant (from the
+/// verified source); `mode` decides how it restricts the operation. Injected by the host on
+/// **every** query node (top-level, `UNION` branch, `INSERT … SELECT` source), never guest-set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scope {
     pub column: String,
     pub value: SqlValue,
+    pub mode: ScopeMode,
 }
 
 impl Scope {
-    /// The scope as a predicate (`column = value`), conjoined into `WHERE`.
-    fn as_predicate(&self) -> Predicate {
-        Predicate::Cmp {
+    /// The scope as a `WHERE`/`HAVING` predicate for the resolved mode, or `None` for
+    /// [`ScopeMode::All`] (cross-tenant — no tenant predicate at all).
+    fn as_predicate(&self) -> Option<Predicate> {
+        let eq = || Predicate::Cmp {
             left: Expr::Column(self.column.clone()),
             op: CmpOp::Eq,
             right: Expr::Value(self.value.clone()),
+        };
+        let is_null = || Predicate::Null {
+            expr: Expr::Column(self.column.clone()),
+            negated: false,
+        };
+        match self.mode {
+            ScopeMode::Own => Some(eq()),
+            ScopeMode::OwnOrNull => Some(Predicate::Or(vec![eq(), is_null()])),
+            ScopeMode::NullOnly => Some(is_null()),
+            ScopeMode::All => None,
+        }
+    }
+
+    /// The value the scope stamps into a scoped `INSERT`'s tenant column for this mode, or `None`
+    /// when the mode forces no column (`all` — the guest supplies the value; a cross-tenant write).
+    /// `own`/`own+null` stamp the resolved tenant; `null` stamps `NULL` (the shared baseline).
+    fn stamp_value(&self) -> Option<SqlValue> {
+        match self.mode {
+            ScopeMode::Own | ScopeMode::OwnOrNull => Some(self.value.clone()),
+            ScopeMode::NullOnly => Some(SqlValue::Null),
+            ScopeMode::All => None,
         }
     }
 }
@@ -447,6 +490,46 @@ pub struct Delete {
     pub filter: Predicate,
     pub scope: Option<Scope>,
     pub returning: Vec<SelectItem>,
+}
+
+impl Select {
+    /// Force a host-resolved `scope` onto this `SELECT` **and every nested read node** — its
+    /// `UNION` branch — so a tenant scope reaches every row source (a union branch left unscoped
+    /// would leak across tenants). Overwrites any pre-existing scope. This is the host's tenant
+    /// injection point for reads; the guest never sets a scope of its own.
+    pub fn force_scope(&mut self, scope: &Scope) {
+        self.scope = Some(scope.clone());
+        if let Some(u) = self.union.as_mut() {
+            u.query.force_scope(scope);
+        }
+    }
+}
+
+impl Insert {
+    /// Force the host-resolved tenant scope. `write` stamps the tenant column on a
+    /// `VALUES`-based insert (per [`ScopeMode`]); for an `INSERT … SELECT`, the `read` scope is
+    /// forced onto the source query so the selected rows stay tenant-isolated (the target columns
+    /// are still taken verbatim — no auto-stamp on that path).
+    pub fn force_scope(&mut self, write: &Scope, read: &Scope) {
+        self.scope = Some(write.clone());
+        if let Some((_, src)) = self.from_select.as_mut() {
+            src.force_scope(read);
+        }
+    }
+}
+
+impl Update {
+    /// Force a host-resolved write `scope` (conjoined into `WHERE`). Overwrites any prior scope.
+    pub fn force_scope(&mut self, scope: &Scope) {
+        self.scope = Some(scope.clone());
+    }
+}
+
+impl Delete {
+    /// Force a host-resolved write `scope` (conjoined into `WHERE`). Overwrites any prior scope.
+    pub fn force_scope(&mut self, scope: &Scope) {
+        self.scope = Some(scope.clone());
+    }
 }
 
 /// Why compilation failed.
@@ -812,20 +895,25 @@ fn render_where(
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<Option<String>, OrmError> {
-    // Validate the scope column eagerly (its predicate is rendered below).
-    if let Some(s) = scope {
-        ident(&s.column)?;
-    }
+    // Validate the scope column eagerly (its predicate is rendered below). A `ScopeMode::All`
+    // scope contributes no predicate (cross-tenant), so it renders exactly like no scope.
+    let scope_pred = match scope {
+        Some(s) => {
+            ident(&s.column)?;
+            s.as_predicate()
+        }
+        None => None,
+    };
     // An empty `AND` filter is a no-op (always true) — drop it so it never adds a spurious
     // `AND 1 = 1`. (An empty `OR` means "match nothing" and is kept.)
     let filter = filter.filter(|f| !matches!(f, Predicate::And(v) if v.is_empty()));
     // A lone clause renders directly (no wrapping `AND`, so a top-level `AND`/`OR` filter
     // isn't spuriously parenthesized); scope + filter conjoin as `scope AND (filter)`.
-    let combined = match (scope, filter) {
+    let combined = match (scope_pred, filter) {
         (None, None) => return Ok(None),
-        (Some(s), None) => s.as_predicate(),
+        (Some(s), None) => s,
         (None, Some(f)) => f.clone(),
-        (Some(s), Some(f)) => Predicate::And(vec![s.as_predicate(), f.clone()]),
+        (Some(s), Some(f)) => Predicate::And(vec![s, f.clone()]),
     };
     Ok(Some(render_pred(&combined, params, false, dialect)?))
 }
@@ -1043,8 +1131,15 @@ impl Insert {
                 columns.push(c);
             }
         }
-        if let Some(s) = &self.scope {
-            let c = ident(&s.column)?.to_string();
+        // A scope with a stampable value (own/own+null → the tenant, null → NULL) forces its
+        // column into every row. `all` mode stamps nothing (the guest supplies the value —
+        // a cross-tenant write), so it behaves like no scope here.
+        let stamp = self
+            .scope
+            .as_ref()
+            .and_then(|s| s.stamp_value().map(|v| (s.column.as_str(), v)));
+        if let Some((column, _)) = &stamp {
+            let c = ident(column)?.to_string();
             if !columns.contains(&c) {
                 columns.push(c);
             }
@@ -1057,14 +1152,17 @@ impl Insert {
         for row in &self.rows {
             let mut ph: Vec<String> = Vec::with_capacity(columns.len());
             for col in &columns {
-                // Scope forces its column; otherwise take the row's cell expr, else NULL.
-                if self.scope.as_ref().is_some_and(|s| &s.column == col) {
-                    ph.push(params.bind(self.scope.as_ref().unwrap().value.clone()));
-                } else {
-                    match row.cells.iter().find(|a| &a.column == col) {
-                        Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
-                        None => ph.push(params.bind(SqlValue::Null)),
+                // The scope forces its column to the resolved stamp; otherwise take the row's
+                // cell expr, else NULL.
+                if let Some((column, value)) = &stamp {
+                    if column == col {
+                        ph.push(params.bind(value.clone()));
+                        continue;
                     }
+                }
+                match row.cells.iter().find(|a| &a.column == col) {
+                    Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
+                    None => ph.push(params.bind(SqlValue::Null)),
                 }
             }
             value_groups.push(format!("({})", ph.join(", ")));
@@ -1250,6 +1348,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             ..Select::from("party")
         };
@@ -1259,6 +1358,110 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    fn scoped_select(mode: ScopeMode) -> Select {
+        Select {
+            filter: Some(cmp("kind", CmpOp::Eq, t("supplier"))),
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+                mode,
+            }),
+            ..Select::from("party")
+        }
+    }
+
+    #[test]
+    fn scope_mode_own_or_null_admits_the_shared_baseline() {
+        let (sql, params) = scoped_select(ScopeMode::OwnOrNull)
+            .compile(Dialect::Sqlite)
+            .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE (tenant_id = ?1 OR tenant_id IS NULL) AND kind = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    #[test]
+    fn scope_mode_null_only_sees_only_the_baseline() {
+        let (sql, params) = scoped_select(ScopeMode::NullOnly)
+            .compile(Dialect::Sqlite)
+            .unwrap();
+        // The resolved tenant value is not bound at all — NULL-only never references it.
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE tenant_id IS NULL AND kind = ?1"
+        );
+        assert_eq!(params, vec![t("supplier")]);
+    }
+
+    #[test]
+    fn scope_mode_all_injects_no_tenant_predicate() {
+        let (sql, params) = scoped_select(ScopeMode::All)
+            .compile(Dialect::Sqlite)
+            .unwrap();
+        // `all` (cross-tenant) renders exactly as if unscoped — only the guest filter remains.
+        assert_eq!(sql, "SELECT * FROM party WHERE kind = ?1");
+        assert_eq!(params, vec![t("supplier")]);
+    }
+
+    #[test]
+    fn force_scope_reaches_every_union_branch() {
+        // A union whose branches start unscoped: force_scope must scope BOTH sides, or the
+        // branch would leak across tenants.
+        let branch = Select::from("archived_party");
+        let mut q = Select {
+            union: Some(Box::new(Union {
+                all: false,
+                query: branch,
+            })),
+            ..Select::from("party")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("ten_1"),
+            mode: ScopeMode::Own,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM party WHERE tenant_id = ?1 UNION SELECT * FROM archived_party WHERE tenant_id = ?2"
+        );
+        assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
+    }
+
+    #[test]
+    fn insert_null_mode_stamps_null_all_mode_stamps_nothing() {
+        let base = |mode| Insert {
+            table: "audit_event".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "detail".into(),
+                    value: Expr::val(t("x")),
+                }],
+            }],
+            conflict: None,
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("ten_1"),
+                mode,
+            }),
+            returning: vec![],
+            from_select: None,
+        };
+        // null-only write stamps NULL into the tenant column.
+        let (sql, params) = base(ScopeMode::NullOnly).compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO audit_event (detail, tenant_id) VALUES (?1, ?2)"
+        );
+        assert_eq!(params, vec![t("x"), SqlValue::Null]);
+        // all-mode write forces no tenant column — the guest's columns stand verbatim.
+        let (sql, params) = base(ScopeMode::All).compile(Dialect::Sqlite).unwrap();
+        assert_eq!(sql, "INSERT INTO audit_event (detail) VALUES (?1)");
+        assert_eq!(params, vec![t("x")]);
     }
 
     #[test]
@@ -1284,6 +1487,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             ..Select::from("order_to_network")
         };
@@ -1475,6 +1679,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![item(Expr::col("id"))],
             from_select: None,
@@ -1544,6 +1749,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![],
         };
@@ -1620,6 +1826,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![],
         };
@@ -1682,6 +1889,7 @@ mod tests {
             scope: Some(Scope {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
+                mode: ScopeMode::Own,
             }),
             returning: vec![],
         };

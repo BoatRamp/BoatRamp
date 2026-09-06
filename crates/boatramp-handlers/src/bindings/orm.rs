@@ -498,6 +498,9 @@ fn to_core_scope(s: wit::Scope) -> core::Scope {
     core::Scope {
         column: s.column,
         value: to_sqlvalue(s.value),
+        // Stage 0 (host-forced scope) replaces this guest-supplied mapping; until then the
+        // legacy guest scope keeps its `column = value` meaning.
+        mode: core::ScopeMode::Own,
     }
 }
 
