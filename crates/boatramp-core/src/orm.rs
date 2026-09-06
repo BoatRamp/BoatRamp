@@ -508,12 +508,17 @@ impl Select {
 impl Insert {
     /// Force the host-resolved tenant scope. `write` stamps the tenant column on a
     /// `VALUES`-based insert (per [`ScopeMode`]); for an `INSERT … SELECT`, the `read` scope is
-    /// forced onto the source query so the selected rows stay tenant-isolated (the target columns
-    /// are still taken verbatim — no auto-stamp on that path).
-    pub fn force_scope(&mut self, write: &Scope, read: &Scope) {
-        self.scope = Some(write.clone());
+    /// forced onto the source query (and its nested unions) so the selected rows stay
+    /// tenant-isolated (the target columns are still taken verbatim — no auto-stamp on that path).
+    /// `None` for an axis (cross-tenant `all`) clears that scope — the operation runs unscoped on
+    /// that axis, by design.
+    pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
+        self.scope = write.cloned();
         if let Some((_, src)) = self.from_select.as_mut() {
-            src.force_scope(read);
+            match read {
+                Some(r) => src.force_scope(r),
+                None => src.scope = None,
+            }
         }
     }
 }

@@ -78,7 +78,14 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<wit::QueryResult, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_select(&q)?.compile(dialect).map_err(compile_err)?;
+        // Force the host-resolved read scope onto the query + every nested read node (union
+        // branch), fail-closed. A guest-supplied scope was already dropped in `to_core_select`.
+        let read = self.scope_for(crate::tenant::Axis::Read)?;
+        let mut core = to_core_select(&q)?;
+        if let Some(s) = &read {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
         Ok(wit::QueryResult {
@@ -100,7 +107,16 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_insert(&q)?.compile(dialect).map_err(compile_err)?;
+        // Write-scope the stamp; read-scope an INSERT…SELECT source (its rows are a read).
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let read = self.scope_for(crate::tenant::Axis::Read)?;
+        let mut core = to_core_insert(&q)?;
+        // Only force when in-site tenancy is active (either axis resolved a scope); otherwise the
+        // insert stays plain. `all` on an axis resolves to `None`, correctly clearing that axis.
+        if self.session.tenancy().is_some() {
+            core.force_scope(write.as_ref(), read.as_ref());
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
@@ -112,7 +128,12 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_update(&q)?.compile(dialect).map_err(compile_err)?;
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let mut core = to_core_update(&q)?;
+        if let Some(s) = &write {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
@@ -124,7 +145,12 @@ impl wit::HostDatabase for OrmHost<'_> {
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
-        let (sql, params) = to_core_delete(&q)?.compile(dialect).map_err(compile_err)?;
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let mut core = to_core_delete(&q)?;
+        if let Some(s) = &write {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
@@ -137,8 +163,14 @@ impl wit::HostDatabase for OrmHost<'_> {
         let name = self.name_of(&db)?;
         let dialect = self.session.dialect(&name);
         // The unbounded-delete guard + RETURNING render live in the core compiler; here we run it
-        // through the query path so the deleted rows come back (consume-and-read).
-        let (sql, params) = to_core_delete(&q)?.compile(dialect).map_err(compile_err)?;
+        // through the query path so the deleted rows come back (consume-and-read). A delete is a
+        // write, so it is bounded by the write scope.
+        let write = self.scope_for(crate::tenant::Axis::Write)?;
+        let mut core = to_core_delete(&q)?;
+        if let Some(s) = &write {
+            core.force_scope(s);
+        }
+        let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
         Ok(wit::QueryResult {
@@ -168,6 +200,21 @@ impl OrmHost<'_> {
             .map(|h| h.name.clone())
             .map_err(|e| wit::Error::Other(e.to_string()))
     }
+
+    /// The host-forced tenant [`Scope`](core::Scope) for `axis`, or a fail-closed error. `Ok(None)`
+    /// means run unscoped — either no in-site tenancy is configured, or the axis grant is
+    /// cross-tenant `all` (posture-vetted upstream).
+    fn scope_for(&self, axis: crate::tenant::Axis) -> Result<Option<core::Scope>, wit::Error> {
+        match self.session.tenancy() {
+            Some(ht) => ht.orm_scope(axis).map_err(deny_err),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Map a fail-closed tenancy denial to the guest-visible orm error (no tenant values leaked).
+fn deny_err(d: crate::tenant::TenantDenied) -> wit::Error {
+    wit::Error::Other(d.reason().to_string())
 }
 
 // ---- arena → core tree -----------------------------------------------------
@@ -494,16 +541,6 @@ fn to_core_dir(d: wit::Direction) -> core::Direction {
     }
 }
 
-fn to_core_scope(s: wit::Scope) -> core::Scope {
-    core::Scope {
-        column: s.column,
-        value: to_sqlvalue(s.value),
-        // Stage 0 (host-forced scope) replaces this guest-supplied mapping; until then the
-        // legacy guest scope keeps its `column = value` meaning.
-        mode: core::ScopeMode::Own,
-    }
-}
-
 fn to_core_item(
     exprs: &[wit::ExprNode],
     preds: &[wit::PredNode],
@@ -559,7 +596,9 @@ macro_rules! core_select_common {
                 .filter
                 .map(|f| build_pred(preds, exprs, f, upper))
                 .transpose()?,
-            scope: q.scope.clone().map(to_core_scope),
+            // Stage 0: the guest never sets the tenant scope — the host forces it after
+            // rebuild (see `OrmHost::scope_for`). Any guest-supplied `q.scope` is ignored.
+            scope: None,
             group_by: q
                 .group_by
                 .iter()
@@ -642,7 +681,8 @@ fn to_core_insert(q: &wit::InsertQuery) -> Result<core::Insert, wit::Error> {
                 })
             })
             .transpose()?,
-        scope: q.scope.clone().map(to_core_scope),
+        // Stage 0: host-forced (see `OrmHost::scope_for`) — the guest scope is ignored.
+        scope: None,
         returning: q
             .returning
             .iter()
@@ -670,7 +710,8 @@ fn to_core_update(q: &wit::UpdateQuery) -> Result<core::Update, wit::Error> {
             .map(|a| to_core_assignment(exprs, preds, a))
             .collect::<Result<_, _>>()?,
         filter: build_pred(preds, exprs, q.filter, upper)?,
-        scope: q.scope.clone().map(to_core_scope),
+        // Stage 0: host-forced (see `OrmHost::scope_for`) — the guest scope is ignored.
+        scope: None,
         returning: q
             .returning
             .iter()
@@ -686,7 +727,8 @@ fn to_core_delete(q: &wit::DeleteQuery) -> Result<core::Delete, wit::Error> {
     Ok(core::Delete {
         table: q.table.clone(),
         filter: build_pred(preds, exprs, q.filter, upper)?,
-        scope: q.scope.clone().map(to_core_scope),
+        // Stage 0: host-forced (see `OrmHost::scope_for`) — the guest scope is ignored.
+        scope: None,
         returning: q
             .returning
             .iter()
@@ -797,6 +839,21 @@ mod tests {
         SqlSession::for_backends([(String::new(), backend)].into_iter().collect())
     }
 
+    /// A session with a host-resolved tenancy (`tenant_id = "ten_1"`), the same grant on both
+    /// axes. This is how Stage 0 scopes every ORM op — the guest never supplies the value.
+    fn scoped_session(
+        log: &Log,
+        read: boatramp_core::tenancy::AccessMode,
+        write: boatramp_core::tenancy::AccessMode,
+    ) -> SqlSession {
+        session(log).with_tenancy(Some(crate::tenant::HostTenancy::new(
+            "tenant_id",
+            Some(SqlValue::Text("ten_1".into())),
+            read,
+            write,
+        )))
+    }
+
     fn text(s: &str) -> wit::Value {
         wit::Value::Text(s.to_string())
     }
@@ -843,10 +900,127 @@ mod tests {
         }
     }
 
+    fn empty_body(table: &str) -> wit::SelectBody {
+        wit::SelectBody {
+            exprs: vec![],
+            preds: vec![],
+            table: table.to_string(),
+            table_alias: None,
+            columns: vec![],
+            joins: vec![],
+            filter: None,
+            scope: None,
+            group_by: vec![],
+            having: None,
+            distinct: false,
+            distinct_on: vec![],
+            order: vec![],
+            limit: None,
+            offset: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_own_without_a_resolved_source_fails_closed() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // Own read grant, but no resolved tenant value (anonymous request): must refuse, never run.
+        let mut sess = session(&log).with_tenancy(Some(crate::tenant::HostTenancy::new(
+            "tenant_id",
+            None,
+            AccessMode::Own,
+            AccessMode::None,
+        )));
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let err = host
+            .select(db, empty_select("work_order"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, wit::Error::Other(m) if m.contains("no verified tenant source")));
+        // Nothing reached the backend.
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_mode_read_runs_unscoped() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = scoped_session(&log, AccessMode::All, AccessMode::None);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            host.select(db, empty_select("work_order")).await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        // `all` injects no tenant predicate — the select is unscoped by design.
+        assert!(log
+            .iter()
+            .any(|l| l.starts_with("query|SELECT * FROM work_order|")));
+        assert!(!log.iter().any(|l| l.contains("tenant_id")));
+    }
+
+    #[tokio::test]
+    async fn a_union_branch_and_insert_select_source_are_both_scoped() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = scoped_session(&log, AccessMode::Own, AccessMode::Own);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            let rep = db.rep();
+
+            // SELECT * FROM live UNION SELECT * FROM archived — BOTH sides must be scoped.
+            let sel = wit::SelectQuery {
+                union: Some(wit::UnionArm {
+                    all: false,
+                    body: empty_body("archived"),
+                }),
+                ..empty_select("live")
+            };
+            host.select(db, sel).await.unwrap();
+
+            // INSERT INTO dst (id) SELECT id FROM src — the source read must be scoped.
+            let ins = wit::InsertQuery {
+                exprs: vec![],
+                table: "dst".into(),
+                rows: vec![],
+                conflict: None,
+                scope: None,
+                returning: vec![],
+                select_source: Some(wit::InsertSelect {
+                    columns: vec!["id".into()],
+                    source: {
+                        let mut b = empty_body("src");
+                        b.exprs = vec![col("id")];
+                        b.columns = vec![item(0)];
+                        b
+                    },
+                }),
+            };
+            host.insert(Resource::new_own(rep), ins).await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        // Both union arms carry the tenant predicate — no branch leaks across tenants.
+        assert!(log.iter().any(|l| l.starts_with(
+            "query|SELECT * FROM live WHERE tenant_id = ?1 UNION SELECT * FROM archived WHERE tenant_id = ?2|"
+        )));
+        // The INSERT…SELECT source is read-scoped.
+        assert!(log.iter().any(|l| l
+            .starts_with("execute|INSERT INTO dst (id) SELECT id FROM src WHERE tenant_id = ?1|")));
+    }
+
     #[tokio::test]
     async fn select_insert_update_compile_and_reach_the_backend() {
+        use boatramp_core::tenancy::AccessMode;
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut sess = session(&log);
+        // Host-resolved tenancy scopes every op to `tenant_id = "ten_1"`. Each query below also
+        // carries a *guest-supplied* scope naming a DIFFERENT tenant ("ATTACKER") — the host must
+        // ignore it entirely and inject its own resolved value (the Stage 0 invariant).
+        let mut sess = scoped_session(&log, AccessMode::Own, AccessMode::Own);
         let mut table = ResourceTable::new();
         {
             let mut host = OrmHost::new(&mut table, &mut sess);
@@ -864,7 +1038,7 @@ mod tests {
                 preds: vec![cmp(1, wit::CmpOp::Eq, 2)], // 0
                 columns: vec![item(0)],
                 filter: Some(0),
-                scope: Some(scope("tenant_id", text("ten_1"))),
+                scope: Some(scope("tenant_id", text("ATTACKER"))),
                 order: vec![wit::OrderTerm {
                     expr: 3,
                     dir: wit::Direction::Desc,
@@ -876,7 +1050,7 @@ mod tests {
             assert_eq!(res.columns, vec!["id".to_string()]);
             assert!(matches!(&res.rows[0].values[0], wit::Value::Text(s) if s == "row1"));
 
-            // INSERT INTO work_area (id, tenant_id) VALUES (?, ?)
+            // INSERT INTO work_area (id) VALUES (?) — the host stamps tenant_id itself.
             let ins = wit::InsertQuery {
                 exprs: vec![lit(text("wa_1"))],
                 table: "work_area".into(),
@@ -887,13 +1061,13 @@ mod tests {
                     }],
                 }],
                 conflict: None,
-                scope: Some(scope("tenant_id", text("ten_1"))),
+                scope: Some(scope("tenant_id", text("ATTACKER"))),
                 returning: vec![],
                 select_source: None,
             };
             assert_eq!(host.insert(Resource::new_own(rep), ins).await.unwrap(), 1);
 
-            // UPDATE supplier_invoice SET payment_gate=? WHERE id=?
+            // UPDATE supplier_invoice SET payment_gate=? WHERE id=? — the host conjoins the scope.
             let upd = wit::UpdateQuery {
                 exprs: vec![lit(text("paid")), col("id"), lit(text("inv_1"))],
                 preds: vec![cmp(1, wit::CmpOp::Eq, 2)],
@@ -912,14 +1086,20 @@ mod tests {
 
         let log = log.lock().unwrap();
         assert_eq!(log[0], "begin");
+        // The guest's "ATTACKER" tenant never reaches the backend — only the host's "ten_1".
+        assert!(
+            !log.iter().any(|l| l.contains("ATTACKER")),
+            "guest-supplied scope must be ignored"
+        );
         assert!(log.iter().any(|l| l.starts_with(
             "query|SELECT id FROM work_order WHERE tenant_id = ?1 AND project_id = ?2 ORDER BY created_at DESC LIMIT 10|"
-        )));
-        assert!(log.iter().any(
-            |l| l.starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
-        ));
+        ) && l.contains("ten_1")));
         assert!(log.iter().any(|l| l
-            .starts_with("execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE id = ?2|")));
+            .starts_with("execute|INSERT INTO work_area (id, tenant_id) VALUES (?1, ?2)|")
+            && l.contains("ten_1")));
+        assert!(log.iter().any(|l| l.starts_with(
+            "execute|UPDATE supplier_invoice SET payment_gate = ?1 WHERE tenant_id = ?2 AND id = ?3|"
+        )));
         assert_eq!(log.last().unwrap(), "commit");
     }
 

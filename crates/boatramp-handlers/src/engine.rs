@@ -805,7 +805,8 @@ impl HandlerEngine {
             .memory_size(limits.memory_bytes)
             .build();
         #[cfg(feature = "sql")]
-        let sql = bindings::sql::SqlSession::for_backends(bindings.sql());
+        let sql = bindings::sql::SqlSession::for_backends(bindings.sql())
+            .with_tenancy(bindings.tenancy());
         let state = HostState {
             table: ResourceTable::new(),
             wasi,

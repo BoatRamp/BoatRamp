@@ -12,6 +12,9 @@ mod bindings;
 mod engine;
 #[cfg(feature = "engine")]
 pub mod logging;
+/// Host-resolved in-site tenancy applied to the `sql` + `orm` bindings (Stage 0).
+#[cfg(feature = "sql")]
+pub mod tenant;
 
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
@@ -33,6 +36,8 @@ pub use engine::{
 };
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};
+#[cfg(feature = "sql")]
+pub use tenant::{Axis as TenantAxis, HostTenancy, TenantDenied};
 
 /// Contract-evolution invariants checked against the host WIT text itself, so a
 /// mistake in `wit/world.wit` fails a fast unit test rather than a deployed guest.
