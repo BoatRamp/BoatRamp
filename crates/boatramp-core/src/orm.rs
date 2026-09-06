@@ -527,7 +527,7 @@ impl Insert {
             // source and every union branch) and re-append it bound to the host value.
             if let Some(v) = write.and_then(Scope::stamp_value) {
                 let column = write.expect("stamp implies write").column.clone();
-                if let Some(i) = cols.iter().position(|c| c == &column) {
+                if let Some(i) = cols.iter().position(|c| same_col(c, &column)) {
                     cols.remove(i);
                     drop_projection_at(src, i);
                 }
@@ -613,6 +613,15 @@ fn ident(name: &str) -> Result<&str, OrmError> {
     } else {
         Err(OrmError::InvalidIdentifier(name.to_string()))
     }
+}
+
+/// Whether two identifiers name the **same column** the way the engines resolve unquoted names:
+/// ASCII-case-insensitively, ignoring a leading `table.` qualifier. Used by the tenant-scope
+/// guards so a guest can't dodge them by re-spelling the tenant column (`TENANT_ID`, `t.tenant_id`)
+/// — the DB would still resolve it to the tenant column, but a naive `==` would miss it.
+fn same_col(a: &str, b: &str) -> bool {
+    let base = |s: &str| s.rsplit('.').next().unwrap_or(s).to_ascii_lowercase();
+    base(a) == base(b)
 }
 
 /// Accumulates the parameter list and mints `?N` placeholders in order.
@@ -1180,14 +1189,16 @@ impl Insert {
         }
         // A scope with a stampable value (own/own+null → the tenant, null → NULL) forces its
         // column into every row. `all` mode stamps nothing (the guest supplies the value —
-        // a cross-tenant write), so it behaves like no scope here.
+        // a cross-tenant write), so it behaves like no scope here. The column match is
+        // case/qualifier-insensitive (`same_col`) so a guest can't smuggle its own value into the
+        // tenant column by re-spelling it (`TENANT_ID`, `t.tenant_id`).
         let stamp = self
             .scope
             .as_ref()
             .and_then(|s| s.stamp_value().map(|v| (s.column.as_str(), v)));
         if let Some((column, _)) = &stamp {
             let c = ident(column)?.to_string();
-            if !columns.contains(&c) {
+            if !columns.iter().any(|existing| same_col(existing, &c)) {
                 columns.push(c);
             }
         }
@@ -1202,12 +1213,12 @@ impl Insert {
                 // The scope forces its column to the resolved stamp; otherwise take the row's
                 // cell expr, else NULL.
                 if let Some((column, value)) = &stamp {
-                    if column == col {
+                    if same_col(column, col) {
                         ph.push(params.bind(value.clone()));
                         continue;
                     }
                 }
-                match row.cells.iter().find(|a| &a.column == col) {
+                match row.cells.iter().find(|a| same_col(&a.column, col)) {
                     Some(a) => ph.push(render_expr(&a.value, &mut params, dialect)?),
                     None => ph.push(params.bind(SqlValue::Null)),
                 }
@@ -1271,7 +1282,7 @@ fn render_conflict(
     let sets = oc
         .update
         .iter()
-        .filter(|a| guard.is_none_or(|s| a.column != s.column))
+        .filter(|a| guard.is_none_or(|s| !same_col(&a.column, &s.column)))
         .map(|a| {
             let c = ident(&a.column)?;
             Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
@@ -1526,7 +1537,8 @@ mod tests {
             conflict: None,
             scope: None,
             returning: vec![],
-            from_select: Some((vec!["tenant_id".into(), "total".into()], Box::new(source))),
+            // `TENANT_ID` (case variant) must still be recognized as the tenant column + dropped.
+            from_select: Some((vec!["TENANT_ID".into(), "total".into()], Box::new(source))),
         };
         let own = Scope {
             column: "tenant_id".into(),
@@ -1563,8 +1575,9 @@ mod tests {
             conflict: Some(OnConflict {
                 conflict_columns: vec!["id".into()],
                 update: vec![
+                    // Case/qualifier-respelled to dodge the drop — must still be caught.
                     Assignment {
-                        column: "tenant_id".into(),
+                        column: "TENANT_ID".into(),
                         value: Expr::val(t("VICTIM")),
                     },
                     Assignment {
