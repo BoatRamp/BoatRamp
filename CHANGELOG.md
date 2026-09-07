@@ -5,6 +5,26 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.1] - 2026-09-07
+
+### Added
+- **Typed `orm` builder: an own-vs-base preference for base-vs-override reads (`own_first()` /
+  `is_own()`).** On an `own+null` read of a two-layer table — a shared base row (`tenant_id IS
+  NULL`) plus an optional per-tenant override — an app often wants *the tenant's own row if present,
+  else the base*. Under host-forced tenancy the guest can't name the (hidden, host-injected) tenant
+  column, so `ORDER BY (tenant_id IS NOT NULL)` was inexpressible in the builder. `own_first()` now
+  sorts own rows ahead of base ones without naming the column (the base-vs-override lookup is
+  `db.query(t).filter(key_pred).own_first().limit(1)`), and `is_own()` is the underlying `0`/`1`
+  expression (usable in `select`, or `is_own().eq(1)` to keep only overrides). The host lowers it,
+  using the **same** resolved tenant it injects for the scope predicate, to `CASE WHEN (<col> IS NOT
+  NULL AND <col> = <own>) THEN 1 ELSE 0 END` — so it only *labels/orders/narrows* within the
+  already-scoped row set and can never widen access or name a tenant value; it **fails closed**
+  without an own-tenant (`own`/`own+null`) read. New experimental capability `orm-own-pref` (always
+  compiled — a pure AST lowering, no cargo feature); a guest declares `requires = ["orm-own-pref"]`.
+  Cross-tenant isolation with the new ranking is proven live on libsql, Postgres, and MySQL, and a
+  focused Security Engineer review of the feature returned a clean pass. Requested by a downstream
+  app to move its last base-vs-override reads off raw SQL.
+
 ## [0.4.0] - 2026-09-07
 
 ### Added

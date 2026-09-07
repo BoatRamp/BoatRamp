@@ -212,6 +212,16 @@ pub enum Expr {
         table: String,
         filter: Box<Predicate>,
     },
+    /// A host-resolved **"is this row the caller's own tenant?"** marker — a `0`/`1`-valued
+    /// expression the guest builds *without naming the tenant column* (which is host-injected and
+    /// hidden). During [`Select::force_scope`] it is lowered, using the same resolved scope the
+    /// tenant predicate uses, to `CASE WHEN (<col> IS NOT NULL AND <col> = <own>) THEN 1 ELSE 0 END`
+    /// — `1` for the tenant's own rows, `0` for the shared (`NULL`) baseline (or another tenant
+    /// under a cross-tenant `all` read). Its purpose is the base-vs-override read: sort the tenant's
+    /// override ahead of the shared base (`ORDER BY is_own DESC`) or select/filter on own-ness,
+    /// without a raw `ORDER BY (tenant_id IS NOT NULL)`. **Fails closed:** if no own-tenant scope is
+    /// applied (an unscoped/`disabled` function), it is never lowered and rendering it is an error.
+    IsOwn,
 }
 
 impl Expr {
@@ -608,12 +618,40 @@ fn conjoin_front(filter: &mut Predicate, add: Option<Predicate>) {
     }
 }
 
+/// Lower an [`Expr::IsOwn`] marker to a concrete `0`/`1` rank using the resolved `scope` — the
+/// same host-resolved tenant `value` the scope predicate uses. `CASE WHEN (<col> IS NOT NULL AND
+/// <col> = <own>) THEN 1 ELSE 0 END`: `1` for the caller's own rows, `0` for the shared `NULL`
+/// baseline (and for other tenants under a cross-tenant `all` read). The `IS NOT NULL` guard keeps
+/// it a proper boolean (never `NULL`) so `ORDER BY … DESC` is portable (own sorts first) across
+/// every dialect. The column is unqualified — the base-vs-override read this serves is single-table.
+fn own_rank_expr(scope: &Scope) -> Expr {
+    let col = || Expr::Column(scope.column.clone());
+    let own = Predicate::And(vec![
+        Predicate::Null {
+            expr: col(),
+            negated: true,
+        },
+        Predicate::Cmp {
+            left: col(),
+            op: CmpOp::Eq,
+            right: Expr::Value(scope.value.clone()),
+        },
+    ]);
+    Expr::Case {
+        branches: vec![(own, Expr::Value(SqlValue::Integer(1)))],
+        otherwise: Some(Box::new(Expr::Value(SqlValue::Integer(0)))),
+    }
+}
+
 /// Walk an expression and inject the tenant scope into every **narrow subquery**'s inner filter,
 /// qualified to that subquery's own table (`<subtable>.col`), so a subquery can't read another
 /// tenant's rows. Recurses into a subquery's filter first (nested subqueries scope their own
-/// tables). The correctness twin of [`Select::scope_where_pred`] for the subquery surface.
+/// tables). The correctness twin of [`Select::scope_where_pred`] for the subquery surface. Also
+/// lowers any [`Expr::IsOwn`] marker here (where the resolved `scope` is in hand) — so an
+/// unlowered `IsOwn` reaching the renderer means no scope was applied, and it fails closed.
 fn inject_scope_expr(scope: &Scope, e: &mut Expr) {
     match e {
+        Expr::IsOwn => *e = own_rank_expr(scope),
         Expr::RelatedAggregate { table, filter, .. }
         | Expr::RelatedScalar { table, filter, .. } => {
             inject_scope_pred(scope, filter);
@@ -957,6 +995,14 @@ fn render_expr(e: &Expr, params: &mut Params, dialect: Dialect) -> Result<String
             }
             s.push_str(" END");
             format!("({s})")
+        }
+        // Reaching here means the marker was never lowered — i.e. no own-tenant scope was applied
+        // to this query (an unscoped / `disabled` / cross-tenant-`all`-without-value function). Fail
+        // closed rather than emit an unscoped ranking.
+        Expr::IsOwn => {
+            return Err(OrmError::BadExpr(
+                "is_own()/own_first() requires an own-tenant (own or own+null) read scope",
+            ))
         }
     })
 }
@@ -1664,6 +1710,115 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    #[test]
+    fn is_own_lowers_to_a_case_rank_and_orders_own_first() {
+        // The base-vs-override read: `own+null` + `ORDER BY is_own DESC LIMIT 1` — the tenant's
+        // override (own) sorts ahead of the shared base (NULL), without the guest naming tenant_id.
+        let mut q = Select {
+            columns: vec![item(Expr::col("body"))],
+            filter: Some(cmp("key_name", CmpOp::Eq, t("k"))),
+            order: vec![OrderBy {
+                expr: Expr::IsOwn,
+                dir: Direction::Desc,
+            }],
+            limit: Some(1),
+            ..Select::from("knowledge_entry")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("acme"),
+            mode: ScopeMode::OwnOrNull,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT body FROM knowledge_entry WHERE (tenant_id = ?1 OR tenant_id IS NULL) \
+             AND key_name = ?2 ORDER BY (CASE WHEN tenant_id IS NOT NULL AND tenant_id = ?3 \
+             THEN ?4 ELSE ?5 END) DESC LIMIT 1"
+        );
+        // Scope value (own+null), filter, then the is_own rank (own value + 1/0), in textual order.
+        assert_eq!(
+            params,
+            vec![
+                t("acme"),
+                t("k"),
+                t("acme"),
+                SqlValue::Integer(1),
+                SqlValue::Integer(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn is_own_in_select_under_all_uses_the_resolved_own_value() {
+        // Under a cross-tenant `all` read is_own means "MY own" (col = <own>), not "any non-base".
+        let mut q = Select {
+            columns: vec![item(Expr::IsOwn)],
+            ..Select::from("t")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("acme"),
+            mode: ScopeMode::All,
+        });
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (CASE WHEN tenant_id IS NOT NULL AND tenant_id = ?1 THEN ?2 ELSE ?3 END) FROM t"
+        );
+        assert_eq!(
+            params,
+            vec![t("acme"), SqlValue::Integer(1), SqlValue::Integer(0)]
+        );
+    }
+
+    #[test]
+    fn is_own_without_a_scope_is_rejected() {
+        // No force_scope ⇒ the marker is never lowered ⇒ fail closed at compile (never an unscoped
+        // ranking that could leak whether other tenants exist).
+        let q = Select {
+            order: vec![OrderBy {
+                expr: Expr::IsOwn,
+                dir: Direction::Desc,
+            }],
+            ..Select::from("t")
+        };
+        let err = q.compile(Dialect::Sqlite).unwrap_err();
+        assert!(
+            matches!(err, OrmError::BadExpr(m) if m.contains("is_own")),
+            "expected a fail-closed is_own error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_own_in_a_filter_does_not_subtract_the_scope_predicate() {
+        // Using is_own() as a label in WHERE (`WHERE is_own() = 1`, "only my overrides") must keep
+        // the independent host tenant predicate — the label can never remove a scope conjunct.
+        let mut q = Select {
+            filter: Some(Predicate::Cmp {
+                left: Expr::IsOwn,
+                op: CmpOp::Eq,
+                right: Expr::Value(SqlValue::Integer(1)),
+            }),
+            ..Select::from("notes")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("acme"),
+            mode: ScopeMode::OwnOrNull,
+        });
+        let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
+        // The host scope predicate is conjoined in FRONT, independent of the is_own label.
+        assert!(
+            sql.contains("(tenant_id = ?1 OR tenant_id IS NULL) AND"),
+            "scope predicate must survive the is_own filter: {sql}"
+        );
+        assert!(
+            sql.contains("CASE WHEN tenant_id IS NOT NULL AND tenant_id = ?2 THEN"),
+            "is_own lowered to the own-rank CASE: {sql}"
+        );
     }
 
     fn scoped_select(mode: ScopeMode) -> Select {

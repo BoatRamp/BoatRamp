@@ -171,6 +171,11 @@ interface orm {
     json-extract-dyn(json-pair),   // (exprs[left] ->> exprs[right]); PG+SQLite, MySQL fails closed
     json-concat(json-pair),        // (exprs[left] || exprs[right]); Postgres-only
     related-scalar(related-scalar-node),
+    // A host-resolved "is this row the caller's own tenant?" 0/1 rank — the guest never names the
+    // (host-injected, hidden) tenant column. Lowered against the same resolved scope to
+    // `CASE WHEN (<col> IS NOT NULL AND <col> = <own>) THEN 1 ELSE 0 END`; fails closed with no
+    // own-tenant scope. For base-vs-override reads (`ORDER BY is_own DESC`). Needs host `orm-own-pref`.
+    is-own,
   }
 
   // ---- predicate arena -----------------------------------------------------

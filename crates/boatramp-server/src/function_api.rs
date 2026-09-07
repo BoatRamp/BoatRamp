@@ -238,6 +238,12 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         name: "orm-vector",
         lifecycle: Experimental,
     });
+    // The `is_own()` / `own_first()` own-vs-base ranking (base-vs-override reads). Always compiled
+    // (a pure AST lowering into CASE, no deps); experimental until the shape settles.
+    f.push(CapabilityFeature {
+        name: "orm-own-pref",
+        lifecycle: Experimental,
+    });
     f.push(CapabilityFeature {
         name: "streaming",
         lifecycle: Stable,
@@ -553,6 +559,7 @@ mod tests {
             "always-on surface feature present"
         );
         assert!(host.contains(&"orm-vector"));
+        assert!(host.contains(&"orm-own-pref"));
         // The correlated roll-up is cargo-gated: advertised iff this build enabled it.
         assert_eq!(
             host.contains(&"orm-subquery"),
@@ -576,6 +583,10 @@ mod tests {
         assert_eq!(lifecycle("sql-json"), Some(super::Lifecycle::Stable));
         assert_eq!(
             lifecycle("orm-vector"),
+            Some(super::Lifecycle::Experimental)
+        );
+        assert_eq!(
+            lifecycle("orm-own-pref"),
             Some(super::Lifecycle::Experimental)
         );
         // The admission filter keeps only requirements the host cannot satisfy.

@@ -14,8 +14,8 @@
 #![cfg(any(feature = "sql-postgres", feature = "sql-mysql"))]
 
 use boatramp_core::orm::{
-    Assignment, CmpOp, Delete, Expr, Insert, Join, JoinKind, Predicate, RowValues, Scope,
-    ScopeMode, Select, SelectItem, Update,
+    Assignment, CmpOp, Delete, Direction, Expr, Insert, Join, JoinKind, OrderBy, Predicate,
+    RowValues, Scope, ScopeMode, Select, SelectItem, Update,
 };
 use boatramp_core::sql::{Dialect, SqlBackend, SqlValue};
 use std::sync::Arc;
@@ -303,11 +303,65 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
         tx.commit().await.unwrap();
     }
 
+    // 9) own_first(): on an own+null read, the tenant's override sorts ahead of the shared base
+    //    (and falls back to the base when the tenant has no override) — the base-vs-override read,
+    //    `ORDER BY is_own DESC LIMIT 1`, expressed without naming tenant_id.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(
+            "INSERT INTO notes (id, tenant_id, body) VALUES \
+             ('ovr_b', NULL, 'pref-base'), ('ovr_o', 'acme', 'pref-own'), ('base_only', NULL, 'only-base')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let own_first = |tenant: &str, like: &str| {
+            let mut s = Select {
+                columns: vec![item(Expr::col("body"))],
+                filter: Some(Predicate::Like {
+                    expr: Expr::col("body"),
+                    pattern: like.to_string(),
+                    insensitive: false,
+                    negated: false,
+                }),
+                order: vec![OrderBy {
+                    expr: Expr::IsOwn,
+                    dir: Direction::Desc,
+                }],
+                limit: Some(1),
+                ..Select::from("notes")
+            };
+            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant));
+            s.compile(dialect).unwrap()
+        };
+
+        let mut tx = backend.begin().await.unwrap();
+        // acme HAS an override for the 'pref-%' key → own_first returns the override, not the base.
+        let (sql, params) = own_first("acme", "pref-%");
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["pref-own".to_string()],
+            "[{engine}] own_first returns the tenant's override over the base"
+        );
+        // globex has NO override for the 'only-%' key → falls back to the shared base.
+        let (sql, params) = own_first("globex", "only-%");
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["only-base".to_string()],
+            "[{engine}] own_first falls back to the shared base when there's no override"
+        );
+        tx.commit().await.unwrap();
+    }
+
     println!(
         "ORM IN-SITE TENANT ISOLATION OK [{engine}]: own=acme-only, own+null=acme+baseline, \
          null=baseline, all=every-row; scoped insert stamps own (forgery ignored); scoped \
          update/delete touch own only and can't reassign tenant; a scoped JOIN can't reach \
-         another tenant's table"
+         another tenant's table; own_first prefers the tenant's override over the base"
     );
 }
 

@@ -299,6 +299,9 @@ fn build_expr(
         }
         // The filter is bounded by this node's index `i` (no self/forward reference).
         wit::ExprNode::RelatedScalar(r) => build_related_scalar(exprs, preds, r, i)?,
+        // Host-resolved marker; lowered against the applied scope in `force_scope` (fails closed if
+        // no own-tenant scope is applied). Guests declare `requires = ["orm-own-pref"]`.
+        wit::ExprNode::IsOwn => core::Expr::IsOwn,
     })
 }
 

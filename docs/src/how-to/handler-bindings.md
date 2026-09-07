@@ -338,8 +338,10 @@ portable function set; `RETURNING`; `ON CONFLICT` upserts; `UNION`; `CASE` (and 
 `ORDER BY` via `CASE`); `DISTINCT ON` (Postgres, fails closed elsewhere); JSON — static-key-path
 extract, a bound-key `->>`, and jsonb `||` merge; a narrow correlated roll-up
 (`related-aggregate`), a narrow scalar subquery, and an `IN`-subquery (all single-named-table,
-behind the `orm-subquery` capability); `INSERT … SELECT`; and pgvector distance/`ORDER BY`
-nearest-neighbour (the experimental `orm-vector` capability, Postgres-only). Every value is a bound parameter and every
+behind the `orm-subquery` capability); `INSERT … SELECT`; pgvector distance/`ORDER BY`
+nearest-neighbour (the experimental `orm-vector` capability, Postgres-only); and an **own-vs-base
+preference** for base-vs-override reads — `own_first()` / `is_own()` (the experimental `orm-own-pref`
+capability, see below). Every value is a bound parameter and every
 identifier is validated, so a query **cannot** construct an injection; an unbounded `UPDATE`/`DELETE`
 (no filter, no tenant scope) is refused. Reach for raw `sql` only for what the builder still doesn't
 model — CTEs, window functions, open/free-form nested subqueries.
@@ -372,11 +374,22 @@ let rows = db.query("work_order")
 // ORDER BY created_at DESC LIMIT 20
 ```
 
+**Prefer a tenant's override over the shared base (`own_first()` / `is_own()`).** On an `own+null`
+read of a two-layer table — a shared **base** row (`tenant_id IS NULL`) plus an optional per-tenant
+**override** — you often want *the tenant's own row if present, else the base*. Because the tenant
+column is host-injected and hidden, you can't write `ORDER BY (tenant_id IS NOT NULL)`. Instead
+`own_first()` sorts own rows ahead of base ones without naming the column, so the base-vs-override
+lookup is just `db.query("t").filter(key_pred).own_first().limit(1)`. The host lowers it, using the
+same resolved tenant it injects for the scope, to `ORDER BY (CASE WHEN <own> THEN 1 ELSE 0 END)
+DESC`. `is_own()` is the underlying `0`/`1` expression (usable in `select`, or `is_own().eq(1)` to
+keep only overrides). It **fails closed** without an own-tenant (`own`/`own+null`) read, and needs
+the experimental **`orm-own-pref`** capability — declare `requires = ["orm-own-pref"]`.
+
 The builder is provided by the authoring kit (the
 [boatramp-uchron-shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim) `compat::orm`
 module) behind its off-by-default `orm` cargo feature — turn it on only against a boatramp
 that ships the `orm` interface. See that kit's authoring guide for the full surface
-(inserts, upserts, `RETURNING`, JSON, subqueries, `UNION`, `CASE`, expressions).
+(inserts, upserts, `RETURNING`, JSON, subqueries, `UNION`, `CASE`, expressions, `own_first`).
 
 See the [boatramp.cfg schema](../reference/boatramp-cfg.md#external-sql-databases)
 for the full field list and [Cargo features](../reference/features.md) for the
