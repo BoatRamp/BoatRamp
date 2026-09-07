@@ -32,6 +32,8 @@ pub use bindings::messaging::BUS_TOPIC_SELECTOR;
 pub use bindings::session::{SessionBinding, SessionController, SessionError};
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
+#[cfg(feature = "session")]
+pub use engine::SessionBatch;
 #[cfg(feature = "engine")]
 pub use engine::{
     build_engine, build_engine_pooling, empty_body, HandlerEngine, HandlerError, Lane, Limits,

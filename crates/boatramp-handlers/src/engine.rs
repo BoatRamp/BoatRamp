@@ -36,6 +36,28 @@ mod consumer_world {
     });
 }
 
+// The session-host world: the export caller for `session-handler.handle` (the host re-enters the
+// guest per inbound batch, mechanism B). The `session` import it declares is satisfied on the
+// linker by `bindings::session::add_to_linker` (a separate bindgen), exactly as the consumer world
+// gets `messaging-producer` from `bindings::messaging` — the WIT interface identity matches.
+#[cfg(feature = "session")]
+mod session_world {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "boatramp:handlers/session-host",
+        async: true,
+    });
+}
+
+/// One re-entry's input for [`HandlerEngine::dispatch_session`]: the session id, the checkpoint to
+/// resume from (if any), and the pending inbound frames in order. Frames are opaque bytes.
+#[cfg(feature = "session")]
+pub struct SessionBatch {
+    pub id: String,
+    pub resumed: Option<Vec<u8>>,
+    pub frames: Vec<Vec<u8>>,
+}
+
 /// The shared wasmtime [`Config`] for handler execution: component model, async,
 /// epoch interruption (the per-invocation wall-clock timeout), fuel consumption
 /// (the per-handler **CPU** bound — an instruction-count
@@ -377,6 +399,9 @@ pub struct HandlerEngine {
     /// different world (`handle` export) than the request `ProxyPre`.
     #[cfg(feature = "messaging")]
     consumer_cache: Mutex<LruCache<String, consumer_world::ConsumerPre<HostState>>>,
+    /// Separate compile cache for session (`session-handler` export) components.
+    #[cfg(feature = "session")]
+    session_cache: Mutex<LruCache<String, session_world::SessionHostPre<HostState>>>,
     /// The [`Lane::Sync`] ceiling — connection-bearing requests are clamped to
     /// this (default 10s). Named `limits` for back-compat with existing callers.
     limits: Limits,
@@ -460,6 +485,8 @@ impl HandlerEngine {
             cache,
             #[cfg(feature = "messaging")]
             consumer_cache: Mutex::new(LruCache::new(capacity)),
+            #[cfg(feature = "session")]
+            session_cache: Mutex::new(LruCache::new(capacity)),
             semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             // The async + streaming lanes default to the sync ceiling + an equally-sized,
             // *independent* pool each, so an engine built without opting in behaves
@@ -685,6 +712,82 @@ impl HandlerEngine {
         }
     }
 
+    /// Compile + pre-instantiate a **session** component (`session-handler` export), cached by hash.
+    #[cfg(feature = "session")]
+    fn session_pre(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<session_world::SessionHostPre<HostState>, HandlerError> {
+        if let Some(pre) = self.session_cache.lock().unwrap().get(hash) {
+            return Ok(pre.clone());
+        }
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let instance_pre = self
+            .build_linker()?
+            .instantiate_pre(&component)
+            .map_err(|err| HandlerError::Compile(err.to_string()))?;
+        let pre = session_world::SessionHostPre::new(instance_pre)
+            .map_err(|_| HandlerError::Compile("component is not a session handler".into()))?;
+        self.session_cache
+            .lock()
+            .unwrap()
+            .put(hash.to_string(), pre.clone());
+        Ok(pre)
+    }
+
+    /// Drive one **re-entry** of a session handler (`hash`): instantiate the component and call its
+    /// `session-handler.handle(input)` with the pending inbound batch + resume checkpoint. The
+    /// `bindings` carry the [`SessionController`](crate::SessionController) scoped to this session
+    /// (its `send`/`checkpoint`/`close` reach the store) plus the verified principal's tenancy, so
+    /// frame-triggered `sql`/`orm` is host-scoped identically to a normal handler. Runs on the async
+    /// lane (no connected client on the re-entry itself). `Ok` commits the invocation's sends +
+    /// checkpoint; `Err`/trap fails it (the inbound frames redeliver).
+    #[cfg(feature = "session")]
+    pub async fn dispatch_session(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+        batch: SessionBatch,
+        bindings: Bindings,
+        limits: Limits,
+    ) -> Result<(), HandlerError> {
+        let _permit = self
+            .lane_semaphore(Lane::Async)
+            .try_acquire()
+            .map_err(|_| HandlerError::Overloaded)?;
+        let session_pre = self.session_pre(hash, wasm)?;
+        let mut store = self.new_store(bindings, self.effective_limits(Lane::Async, limits));
+        let session = session_pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| classify(&e))?;
+        let input = session_world::boatramp::handlers::session_types::SessionInput {
+            id: batch.id,
+            resumed: batch.resumed,
+            frames: batch.frames,
+        };
+        let result = session
+            .boatramp_handlers_session_handler()
+            .call_handle(&mut store, &input)
+            .await;
+        // Close any per-invocation SQL transaction: commit only on a clean re-entry.
+        #[cfg(feature = "sql")]
+        store
+            .data_mut()
+            .sql
+            .finalize(matches!(result, Ok(Ok(()))))
+            .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(HandlerError::Trap(format!(
+                "session handler returned error: {err:?}"
+            ))),
+            Err(trap) => Err(classify(&trap)),
+        }
+    }
+
     fn compile(&self, wasm: &[u8]) -> Result<ProxyPre<HostState>, HandlerError> {
         let component = Component::from_binary(&self.engine, wasm)
             .map_err(|err| HandlerError::Compile(err.to_string()))?;
@@ -744,6 +847,10 @@ impl HandlerEngine {
         #[cfg(feature = "admin")]
         bindings::admin::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::admin::AdminHost::new(state.bindings.admin())
+        })?;
+        #[cfg(feature = "session")]
+        bindings::session::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::session::SessionHost::new(state.bindings.session())
         })?;
         Ok(linker)
     }

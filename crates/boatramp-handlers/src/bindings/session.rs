@@ -8,10 +8,6 @@
 //! — cross-session/cross-tenant reach is structurally absent, like the `admin` binding's project
 //! scoping. Frames are opaque bytes; the binding never parses one.
 
-// `SessionHost`/`add_to_linker` are wired into the engine linker by the re-entry dispatch (next
-// step); until then they're exercised only by the unit tests below. The allow is removed then.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 mod generated {
