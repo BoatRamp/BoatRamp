@@ -66,6 +66,9 @@ mod control_api;
 /// guest capability.
 #[cfg(feature = "email")]
 mod email_spool;
+/// The server-side session controller + re-entry driver (PLAN-session-primitive Stage 3).
+#[cfg(feature = "session")]
+mod session_driver;
 /// The KV-backed session store backing the duplex/resumable `session` capability
 /// (PLAN-session-primitive Stage 3).
 #[cfg(feature = "session")]
