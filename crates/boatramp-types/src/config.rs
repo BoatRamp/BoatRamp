@@ -64,6 +64,10 @@ pub struct DeployConfig {
     /// Host-level SSE endpoints fanning out messaging topics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<StreamConfig>,
+    /// Duplex/resumable session routes (`PLAN-session-primitive`): a guest `session-handler` the
+    /// host re-enters per inbound frame, with host-owned ordering/resume/lifetime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionConfig>,
 }
 
 impl Default for DeployConfig {
@@ -85,6 +89,7 @@ impl Default for DeployConfig {
             consumers: Vec::new(),
             crons: Vec::new(),
             streams: Vec::new(),
+            sessions: Vec::new(),
         }
     }
 }
@@ -588,6 +593,35 @@ pub struct StreamConfig {
     /// sends are dropped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_topic: Option<String>,
+}
+
+/// A **duplex, resumable session** route (`PLAN-session-primitive`): a long-lived,
+/// client-addressable, bidirectional channel served by a guest component's `session-handler`
+/// export, which the host re-enters per inbound frame (mechanism B). The host opens the session on
+/// `route` (SSE-out + POST-in), binds the verified principal, buffers/orders outbound frames with
+/// resume-from-cursor, and persists a resumable checkpoint. Frames are opaque bytes. Unlike a
+/// [`StreamConfig`] (host-only pub/sub fan-out), a session runs guest code and carries a backchannel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Route the session is opened at (the client `GET`s it for the SSE stream and `POST`s inbound
+    /// frames to it). Matcher syntax, like a handler route.
+    pub route: String,
+    /// Path to the session component `.wasm` within the deployment (exports `session-handler`).
+    pub component: String,
+    /// Requested capabilities (interface names; see `KNOWN_IMPORTS`). A session handler declares
+    /// `session` plus whatever `sql`/`orm`/`invoke`/… it uses per frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Optional resource limits (capped by site config at activation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<HandlerLimits>,
+    /// Static environment variables (never secrets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Function-to-function invoke allowlist (same contract as a handler's `invoke_targets`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invoke_targets: Vec<String>,
 }
 
 /// Site-scoped, mutable configuration stored in the KV (not in the manifest).
