@@ -1223,6 +1223,51 @@ async fn serve_resolved(
                     return apply_vary(not_found(), &vary);
                 }
             }
+            // Sessions (duplex/resumable guest sessions): a `GET` opens the resumable outbound SSE
+            // stream, a `POST` delivers an inbound frame that re-enters the guest. Matched after
+            // handlers + streams (distinct route set); other methods are 405.
+            #[cfg(feature = "session")]
+            if let Some(session) = manifest
+                .config
+                .sessions
+                .iter()
+                .find(|s| route_matches(&s.route, request_path))
+            {
+                let enabled = site_config
+                    .and_then(|c| c.handlers.as_ref())
+                    .filter(|h| h.enabled);
+                if let (Some(inner), Some(site_handlers)) = (handlers.inner.as_ref(), enabled) {
+                    let project = project.unwrap_or(ProjectRef::DEFAULT.as_str());
+                    return apply_vary(
+                        match *request.method() {
+                            Method::GET => {
+                                crate::session_serve::serve_session_open(
+                                    inner,
+                                    site_handlers,
+                                    project,
+                                    site,
+                                    session,
+                                    request,
+                                    client_ip,
+                                    preview,
+                                )
+                                .await
+                            }
+                            Method::POST => {
+                                crate::session_serve::dispatch_session_post(
+                                    inner, deploy, manifest, project, site, session, request,
+                                    client_ip, preview,
+                                )
+                                .await
+                            }
+                            _ => method_not_allowed(),
+                        },
+                        &vary,
+                    );
+                }
+                // A session route on a site with handlers disabled / no runtime is not served.
+                return apply_vary(not_found(), &vary);
+            }
         }
     }
     // Gateway: an operator-declared route forwards to a private

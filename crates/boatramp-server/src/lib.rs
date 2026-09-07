@@ -225,6 +225,11 @@ pub(crate) use function_runtime::{
     get_invocation_record, invoke_function, list_triggers_handler, new_invocation_id,
     put_trigger_handler, webhook_ingress,
 };
+/// SSE-out + POST-in serving of the duplex/resumable `session` capability
+/// (PLAN-session-primitive Stage 4): a `GET` opens the resumable outbound stream, a `POST` delivers
+/// an inbound frame that re-enters the guest `session-handler`.
+#[cfg(feature = "session")]
+mod session_serve;
 #[cfg(feature = "handlers")]
 mod stream;
 #[cfg(feature = "handlers")]
@@ -395,6 +400,14 @@ struct HandlerRuntimeInner {
     #[cfg(feature = "admin")]
     admin_surfaces:
         std::sync::OnceLock<std::collections::BTreeSet<boatramp_handlers::AdminSurface>>,
+    /// The KV-backed store behind the duplex/resumable `session` capability (PLAN-session-primitive).
+    /// Lazily built over this runtime's own `kv` with the default [`SessionLimits`] on first session
+    /// use ([`session_serve`]); a session needs no external wiring, so unlike `email`/`admin` there
+    /// is no operator gate — the `session` cargo feature + the guest's declared capability + the
+    /// site's import allowlist govern it. (Operator-tunable limits land with the Stage-7 posture
+    /// knobs.)
+    #[cfg(feature = "session")]
+    session_store: std::sync::OnceLock<session_store::SessionStore>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -459,6 +472,8 @@ impl HandlerRuntime {
                 admin_controller: std::sync::OnceLock::new(),
                 #[cfg(feature = "admin")]
                 admin_surfaces: std::sync::OnceLock::new(),
+                #[cfg(feature = "session")]
+                session_store: std::sync::OnceLock::new(),
             })),
         }
     }

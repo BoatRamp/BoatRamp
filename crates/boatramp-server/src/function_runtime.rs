@@ -686,9 +686,10 @@ pub(super) async fn build_function_bindings(
 }
 
 /// Per-invocation limits for a function: its own `limits` (memory/timeout/fuel),
-/// left at the engine default where unset. The engine clamps to its ceiling.
+/// left at the engine default where unset. The engine clamps to its ceiling. Also reused by the
+/// session re-entry path ([`crate::session_serve`]), whose config carries the same `HandlerLimits`.
 #[cfg(feature = "handlers")]
-fn function_limits(
+pub(super) fn function_limits(
     limits: Option<&boatramp_core::config::HandlerLimits>,
 ) -> boatramp_handlers::Limits {
     let mut l = boatramp_handlers::Limits::default();

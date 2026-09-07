@@ -10,11 +10,8 @@
 //! The re-entry loop itself — dedup the inbound frame, load the resume checkpoint, bind this
 //! controller + the verified principal's tenancy (so frame-triggered `sql`/`orm` is host-scoped),
 //! and invoke the guest `session-handler` export via `engine.dispatch_session` — is wired to the
-//! SSE-out + POST-in routes in the serving layer (Stage 4). Frames are opaque bytes throughout.
-
-// The controller is bound into a session invocation by the Stage 4 serving loop; until then it is
-// exercised only by the unit tests below. The allow is removed when the serving layer wires it.
-#![allow(dead_code)]
+//! SSE-out + POST-in routes in the serving layer ([`crate::session_serve`], Stage 4). Frames are
+//! opaque bytes throughout.
 
 use std::sync::Arc;
 
@@ -33,6 +30,10 @@ fn to_handler_err(err: StoreError) -> boatramp_handlers::SessionError {
         StoreError::Session(Core::BufferFull) => H::BufferFull,
         StoreError::Session(Core::Closed) => H::Closed,
         StoreError::NotFound => H::Closed,
+        // A principal mismatch can't be reached through the controller (which is bound to one
+        // verified `(project, id)`); it surfaces at open/re-entry admission in the serving layer. Map
+        // it to `AccessDenied` for completeness.
+        StoreError::PrincipalMismatch => H::AccessDenied,
         StoreError::Kv(m) => H::Other(format!("session store: {m}")),
         StoreError::Corrupt(m) => H::Other(format!("session record: {m}")),
     }

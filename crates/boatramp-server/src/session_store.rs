@@ -15,9 +15,9 @@
 //! address another tenant's session (cross-tenant reach is structurally absent). Frames are opaque
 //! bytes — the store never parses one.
 
-// The store's consumers — the event-driven re-entry driver (Stage 3) and the SSE/POST serving
-// layer (Stage 4) — land next; until then its API is exercised only by the unit tests below. The
-// allow is removed when the driver wires it in.
+// `gc_if_expired` (and `frames_since`, used by the driver tests) await the background reaper /
+// direct callers landing with the measured Stage-6 pass; the rest of the API is wired by the
+// Stage-4 serving layer below. The narrow allow keeps those two from warning until then.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -62,6 +62,24 @@ pub(crate) enum StoreError {
     /// The stored record could not be (de)serialized — a corrupt/incompatible record.
     #[error("session record corrupt: {0}")]
     Corrupt(String),
+    /// A caller tried to (re)open / drive a session id already bound to a **different** verified
+    /// principal — a within-project session-hijack attempt. Fail-closed (the caller is refused, the
+    /// bound session is untouched). Cross-*tenant* reach is already structurally impossible (the key
+    /// is namespaced under the caller's own project), so this guards the within-project case.
+    #[error("session principal mismatch")]
+    PrincipalMismatch,
+}
+
+/// One SSE-producer poll's result (see [`SessionStore::poll`]): the tail frames past the client's
+/// cursor, plus the session's terminal status so the producer can end the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionPoll {
+    /// Buffered outbound frames with `cursor > after`, in order.
+    pub frames: Vec<OutboundFrame>,
+    /// `Some(reason)` once the session is closed (emit a final `close` event, then end).
+    pub closed: Option<String>,
+    /// Whether the session is idle past its TTL / closed (end the stream; it may be reaped).
+    pub expired: bool,
 }
 
 /// Persists + mutates sessions in the control-plane KV. Cheap to clone (holds an `Arc`).
@@ -128,6 +146,46 @@ impl SessionStore {
             state: SessionState::new(now_ms),
         })
         .await
+    }
+
+    /// Open a session binding `principal`, **or** — if the id already exists — verify the caller's
+    /// `principal` matches the bound one, refusing a mismatch ([`StoreError::PrincipalMismatch`]).
+    /// This is the session-open/re-entry admission the serving layer runs before every `GET`
+    /// (SSE-out) and `POST` (inbound frame): the first caller binds the id to its verified principal,
+    /// and any later caller on the same id must present the same principal. A fresh id is opened.
+    ///
+    /// The `(project, id)` key is already namespaced under the caller's own project, so this can only
+    /// ever guard a *within-project* collision — cross-tenant reach is structurally absent. Load →
+    /// (verify | put) is not a single atomic CAS (the KV offers none), but the only racer that could
+    /// interleave carries the *same* principal in the legitimate case; a mismatched principal is
+    /// refused regardless of ordering, and the honest client simply retries its own open.
+    pub(crate) async fn open_or_verify(
+        &self,
+        project: &str,
+        id: &str,
+        route: &str,
+        principal: Option<Vec<u8>>,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        match self.load(project, id).await? {
+            Some(rec) => {
+                if rec.principal == principal {
+                    Ok(())
+                } else {
+                    Err(StoreError::PrincipalMismatch)
+                }
+            }
+            None => {
+                self.put(&SessionRecord {
+                    id: id.to_string(),
+                    project: project.to_string(),
+                    route: route.to_string(),
+                    principal,
+                    state: SessionState::new(now_ms),
+                })
+                .await
+            }
+        }
     }
 
     /// The verified principal bound at open — the driver rebuilds `HostTenancy` from it so
@@ -224,6 +282,25 @@ impl SessionStore {
             .frames_since(after)
             .cloned()
             .collect())
+    }
+
+    /// One SSE-producer poll in a single KV load: the buffered outbound frames with `cursor > after`
+    /// (in order), plus whether the session is `closed` (and why) and whether it has `expired`. The
+    /// serving layer drains the frames, emits a final `close` event on `closed`, and ends the stream
+    /// on `closed`/`expired` (the client reconnects with its `Last-Event-ID` if it still wants it).
+    pub(crate) async fn poll(
+        &self,
+        project: &str,
+        id: &str,
+        after: Cursor,
+        now_ms: u64,
+    ) -> Result<SessionPoll, StoreError> {
+        let rec = self.require(project, id).await?;
+        Ok(SessionPoll {
+            frames: rec.state.frames_since(after).cloned().collect(),
+            closed: rec.state.close_reason().map(str::to_string),
+            expired: rec.state.is_expired(&self.limits, now_ms),
+        })
     }
 
     /// Close the session with a reason (idempotent; a no-op if already reaped).
@@ -338,6 +415,61 @@ mod tests {
             s.send("acme", "s", b"x".to_vec(), 3).await,
             Err(StoreError::Session(SessionError::Closed))
         ));
+    }
+
+    #[tokio::test]
+    async fn open_or_verify_binds_then_refuses_a_different_principal() {
+        let s = store();
+        // First caller binds the id to its principal.
+        s.open_or_verify("acme", "s", "GET /a", Some(b"alice".to_vec()), 0)
+            .await
+            .unwrap();
+        // Same principal re-opening is a no-op success (reconnect / POST after open).
+        s.open_or_verify("acme", "s", "GET /a", Some(b"alice".to_vec()), 1)
+            .await
+            .unwrap();
+        // A different principal on the same id is refused (within-project hijack).
+        assert!(matches!(
+            s.open_or_verify("acme", "s", "GET /a", Some(b"mallory".to_vec()), 2)
+                .await,
+            Err(StoreError::PrincipalMismatch)
+        ));
+        // The bound principal is untouched by the refused attempt.
+        assert_eq!(
+            s.principal("acme", "s").await.unwrap(),
+            Some(b"alice".to_vec())
+        );
+        // An anonymous (None) session is a distinct binding from a principal'd one.
+        s.open_or_verify("acme", "anon", "GET /a", None, 3)
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.open_or_verify("acme", "anon", "GET /a", Some(b"x".to_vec()), 4)
+                .await,
+            Err(StoreError::PrincipalMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_returns_tail_frames_then_reports_closed() {
+        let s = store();
+        s.open("acme", "s", "GET /a", None, 0).await.unwrap();
+        s.send("acme", "s", b"one".to_vec(), 1).await.unwrap();
+        s.send("acme", "s", b"two".to_vec(), 2).await.unwrap();
+        // A client at cursor 1 polls and sees only frame 2, still open.
+        let p = s.poll("acme", "s", 1, 3).await.unwrap();
+        assert_eq!(
+            p.frames.iter().map(|f| f.cursor).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(p.closed, None);
+        assert!(!p.expired);
+        // After close the poll reports the reason (buffer dropped) and expiry.
+        s.close("acme", "s", "bye", 4).await.unwrap();
+        let p = s.poll("acme", "s", 0, 5).await.unwrap();
+        assert!(p.frames.is_empty());
+        assert_eq!(p.closed.as_deref(), Some("bye"));
+        assert!(p.expired);
     }
 
     #[tokio::test]
