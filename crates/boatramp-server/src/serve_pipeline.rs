@@ -1255,8 +1255,16 @@ async fn serve_resolved(
                             }
                             Method::POST => {
                                 crate::session_serve::dispatch_session_post(
-                                    inner, deploy, manifest, project, site, session, request,
-                                    client_ip, preview,
+                                    inner,
+                                    deploy,
+                                    manifest,
+                                    site_handlers,
+                                    project,
+                                    site,
+                                    session,
+                                    request,
+                                    client_ip,
+                                    preview,
                                 )
                                 .await
                             }

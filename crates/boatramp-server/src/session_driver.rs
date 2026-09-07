@@ -30,10 +30,11 @@ fn to_handler_err(err: StoreError) -> boatramp_handlers::SessionError {
         StoreError::Session(Core::BufferFull) => H::BufferFull,
         StoreError::Session(Core::Closed) => H::Closed,
         StoreError::NotFound => H::Closed,
-        // A principal mismatch can't be reached through the controller (which is bound to one
-        // verified `(project, id)`); it surfaces at open/re-entry admission in the serving layer. Map
-        // it to `AccessDenied` for completeness.
+        // Neither a principal mismatch nor the project-full cap can be reached through the controller
+        // (which is bound to one already-open `(project, id)`); both surface at open/re-entry
+        // admission in the serving layer. Map them for completeness.
         StoreError::PrincipalMismatch => H::AccessDenied,
+        StoreError::ProjectSessionsFull => H::Other("project session limit reached".into()),
         StoreError::Kv(m) => H::Other(format!("session store: {m}")),
         StoreError::Corrupt(m) => H::Other(format!("session record: {m}")),
     }

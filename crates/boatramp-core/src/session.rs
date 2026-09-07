@@ -33,6 +33,9 @@ pub struct SessionLimits {
     /// this window is deduped (delivered to the guest once); a duplicate arriving *after* it has
     /// fallen out of the window may be re-delivered — the documented bound of at-least-once.
     pub dedup_window: usize,
+    /// Max bytes in a resumable checkpoint snapshot. A larger `checkpoint()` is refused
+    /// [`SessionError::FrameTooLarge`], so a guest can't grow the persisted record without bound.
+    pub max_checkpoint_bytes: usize,
     /// Idle time (ms) after which the session is reapable — see [`SessionState::is_expired`].
     pub idle_ttl_ms: u64,
 }
@@ -43,7 +46,8 @@ impl Default for SessionLimits {
             max_buffered_outbound: 256,
             max_frame_bytes: 1 << 20, // 1 MiB
             dedup_window: 256,
-            idle_ttl_ms: 5 * 60 * 1000, // 5 minutes
+            max_checkpoint_bytes: 4 << 20, // 4 MiB
+            idle_ttl_ms: 5 * 60 * 1000,    // 5 minutes
         }
     }
 }
@@ -176,6 +180,14 @@ impl SessionState {
     /// Record an inbound frame's idempotency `key` (client → handler). Returns `true` if it is **new**
     /// (accept + deliver to the guest) or `false` if it is a **duplicate** within the dedup window
     /// (drop — a retried POST). A new key is retained, evicting the oldest once the window is full.
+    /// Whether an inbound idempotency `key` is already within the dedup window (a duplicate to
+    /// drop), **without recording it** — the serving layer checks this before a re-entry and commits
+    /// the key via [`record_inbound`](Self::record_inbound) only *after* a successful dispatch, so a
+    /// trapped re-entry redelivers the frame (at-least-once) rather than silently dropping it.
+    pub fn contains_inbound(&self, key: &str) -> bool {
+        self.dedup.iter().any(|k| k == key)
+    }
+
     /// Rejects when closed (fail-closed — an inbound frame on a closed session is dropped).
     pub fn record_inbound(
         &mut self,
@@ -235,6 +247,7 @@ mod tests {
             max_buffered_outbound: 3,
             max_frame_bytes: 8,
             dedup_window: 2,
+            max_checkpoint_bytes: 16,
             idle_ttl_ms: 1_000,
         }
     }

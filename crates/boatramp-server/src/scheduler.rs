@@ -294,6 +294,31 @@ pub(super) async fn run_scheduler_tick(
     let projects = deploy.discover_projects().await?;
     for project_name in &projects {
         let project = ProjectRef::new(project_name);
+        // Session GC: reap this project's idle/closed session records, at most once per minute — the
+        // enforcement side of the idle-TTL (paired with the per-project open cap), so the KV can't
+        // accumulate dead session records. Throttled via `sweep_state` like the retention sweep.
+        #[cfg(feature = "session")]
+        {
+            let reap_key = format!("__session_reap/{project_name}");
+            if sweep_state
+                .get(&reap_key)
+                .is_none_or(|stamp| *stamp != now.minute_stamp)
+            {
+                sweep_state.insert(reap_key, now.minute_stamp);
+                match crate::session_serve::session_store(inner)
+                    .reap_expired(project.as_str(), boatramp_core::time::now_unix_ms())
+                    .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!(project = %project_name, reaped = n, "session reap");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(project = %project_name, %err, "session reap failed");
+                    }
+                }
+            }
+        }
         for site in deploy.list_sites(project).await? {
             let Some(site_config) = deploy.get_site_config(project, &site).await? else {
                 continue;

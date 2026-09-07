@@ -21,6 +21,32 @@
 //! framing), the event `id:` is its monotonic cursor (the client's `Last-Event-ID` resume token),
 //! and a terminal `event: close` carries the close reason. The session id, principal, and tenancy
 //! are all **host-stamped**; the guest never names another session or forges a tenant.
+//!
+//! ## Security model (what the admission does and does NOT isolate)
+//!
+//! - **Cross-tenant isolation is structural.** The store key is `session/<project>/<id>` with
+//!   `project` host-stamped from the resolved site owner (never guest input), so a caller can only
+//!   ever address a session under its own project — cross-tenant reach is absent by construction.
+//! - **Binding is by the resolved TENANT value, not a per-user identity.** The sealed `principal`
+//!   is the tenancy value (the tenant-column value / domain tag), so the reconnect re-verification
+//!   isolates across *tenants*, not across users *within* one tenant. **Within a tenant a session id
+//!   is a bearer capability**: two users of the same tenant seal identically, so anyone who learns
+//!   the id can drive/read that session. Apps MUST therefore treat the id as a secret (the shim
+//!   generates an unguessable UUID) and must not use a session as a per-user auth boundary beyond
+//!   the tenant. Anonymous (`tenancy = none`) sessions have `principal = None` — the id secrecy is
+//!   then the *only* boundary. `valid_session_id` bounds + charset-restricts the id but does not
+//!   mint entropy; that is the app/shim's responsibility.
+//! - **Delivery is at-least-once, so re-entries may replay.** The inbound dedup key is committed only
+//!   after a successful re-entry, so a trapped dispatch redelivers the frame rather than dropping it;
+//!   a guest's `send`s from a partially-run then-trapped re-entry are already persisted, so a guest
+//!   handler must be **idempotent w.r.t. its own effects** across a redelivery (checkpoint-gated).
+//! - **Resource bounds:** per-frame size, outbound buffer, dedup window, checkpoint size, and the
+//!   idle-TTL (enforced by the scheduler-driven reaper) + a per-project open cap bound KV growth;
+//!   the SSE GET and the POST re-entry both hold a per-scope + per-`(scope,IP)` admission slot.
+//! - **Preview caveat:** a session route served under a by-id preview inherits the preview path's
+//!   "unguessable id = the capability" model (site visitor access-control/WAF/rate-limit does not run
+//!   on preview serving) — but its session record is preview-scoped (a distinct key), so live and
+//!   preview never share state.
 
 use super::*;
 
@@ -50,9 +76,47 @@ fn seal_principal(value: Option<&SqlValue>) -> Option<Vec<u8>> {
     value.map(|v| format!("{v:?}").into_bytes())
 }
 
+/// Upper bound on the client-chosen session id — it lands verbatim in a KV key and the record.
+const MAX_SESSION_ID_LEN: usize = 256;
+
+/// Whether a client-supplied session id is acceptable: non-empty, bounded, and made of only RFC 3986
+/// **unreserved** characters. The charset restriction is load-bearing — it forbids `/`, `%`, and
+/// other bytes, so a client can neither inject extra path segments into the `session/<project>/…`
+/// keyspace nor collide with the host's own `_preview/<id>/` scoping prefix. The id is a bearer
+/// capability *within* a tenant (the principal-match only isolates across principals/tenants), so an
+/// app must use an unguessable value — the shim generates a UUID.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SESSION_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+}
+
+/// The store-facing session id: the raw client id for live serving, or a `_preview/<pid>/` prefixed
+/// id under a by-id preview, so a preview's session record is **distinct** from the live one on the
+/// same client id (its guest bindings are already preview-isolated — the record must match). The
+/// `/` here is host-injected and can't come from the client id (see [`valid_session_id`]).
+fn store_id(preview: Option<&str>, id: &str) -> String {
+    match preview {
+        Some(pid) => format!("_preview/{pid}/{id}"),
+        None => id.to_string(),
+    }
+}
+
+/// The per-scope key for the shared topic-stream connection caps: the raw site, or the
+/// preview-namespaced form. **Not** project-qualified (matches `serve_stream`) — this is an operator
+/// resource budget, not a tenant boundary (the tenant boundary is the store's project-keyed record).
+fn stream_scope(site: &str, preview: Option<&str>) -> String {
+    match preview {
+        Some(pid) => format!("{site}/_preview/{pid}"),
+        None => site.to_string(),
+    }
+}
+
 /// The lazily-built, KV-backed session store for this runtime (default [`SessionLimits`]; no operator
 /// gate — the `session` feature + the guest's declared capability + the site allowlist govern it).
-fn session_store(inner: &HandlerRuntimeInner) -> SessionStore {
+pub(super) fn session_store(inner: &HandlerRuntimeInner) -> SessionStore {
     inner
         .session_store
         .get_or_init(|| {
@@ -148,15 +212,16 @@ pub(super) async fn serve_session_open(
 ) -> Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
 
-    // The session id (client-chosen, host-namespaced under `project`). Required.
-    let Some(id) = query_param(request.uri(), "id").filter(|s| !s.is_empty()) else {
+    // The session id (client-chosen, host-namespaced under `project`). Required + bounded/charset.
+    let Some(id) = query_param(request.uri(), "id").filter(|s| valid_session_id(s)) else {
         return (
             StatusCode::BAD_REQUEST,
-            "session open requires an `id` query parameter\n",
+            "session open requires a valid `id` query parameter\n",
         )
             .into_response();
     };
-    let id = id.to_string();
+    // Store-facing id (preview-scoped so a preview session is a distinct record).
+    let id = store_id(preview, id);
     // Resume cursor: the reconnect `Last-Event-ID` header (EventSource sets it), else an explicit
     // `?cursor=` on first connect, else 0 (from the beginning).
     let after: Cursor = request
@@ -199,6 +264,13 @@ pub(super) async fn serve_session_open(
         Err(StoreError::PrincipalMismatch) => {
             return (StatusCode::FORBIDDEN, "session principal mismatch\n").into_response();
         }
+        Err(StoreError::ProjectSessionsFull) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "project session limit reached\n",
+            )
+                .into_response();
+        }
         Err(err) => {
             tracing::warn!(site, %err, "opening session failed");
             return handler_unavailable();
@@ -210,10 +282,7 @@ pub(super) async fn serve_session_open(
 
     // Per-scope + per-IP SSE connection caps, shared with the topic-stream fan-out and held for the
     // connection's lifetime via the guards moved into the producer below.
-    let scope = match preview {
-        Some(pid) => format!("{site}/_preview/{pid}"),
-        None => site.to_string(),
-    };
+    let scope = stream_scope(site, preview);
     let site_permit = match crate::stream::acquire_stream_permit(inner, &scope, site_handlers) {
         Ok(permit) => permit,
         Err(()) => {
@@ -332,6 +401,7 @@ pub(super) async fn dispatch_session_post(
     inner: &Arc<HandlerRuntimeInner>,
     deploy: &DeployStore,
     manifest: &Manifest,
+    site_handlers: &boatramp_core::config::HandlersSiteConfig,
     project: &str,
     site: &str,
     session: &boatramp_core::config::SessionConfig,
@@ -339,20 +409,47 @@ pub(super) async fn dispatch_session_post(
     client_ip: IpAddr,
     preview: Option<&str>,
 ) -> Response {
-    let _ = client_ip; // inbound frames run on the engine's async lane, not a per-IP stream slot.
-
     let (parts, body) = request.into_parts();
-    // The session id (required) + an optional `ack` cursor (the client's confirmed `Last-Event-ID`,
-    // GCing the acked outbound buffer mid-stream) + an optional idempotency key (dedupe a retried
-    // POST). EventSource can't POST, so the client's own fetch supplies these.
-    let Some(id) = query_param(&parts.uri, "id").filter(|s| !s.is_empty()) else {
+    // The session id (required + bounded/charset) + an optional `ack` cursor (the client's confirmed
+    // `Last-Event-ID`, GCing the acked outbound buffer mid-stream) + an optional idempotency key
+    // (dedupe a retried POST). EventSource can't POST, so the client's own fetch supplies these.
+    let Some(id) = query_param(&parts.uri, "id").filter(|s| valid_session_id(s)) else {
         return (
             StatusCode::BAD_REQUEST,
-            "session frame requires an `id` query parameter\n",
+            "session frame requires a valid `id` query parameter\n",
         )
             .into_response();
     };
-    let id = id.to_string();
+    // Store-facing id (preview-scoped so a preview session is a distinct record).
+    let id = store_id(preview, id);
+
+    // Bound inbound amplification: hold a per-scope + per-(scope,IP) admission slot for this POST's
+    // duration BEFORE any KV work, so a client can't drive unbounded open/record/instantiate churn.
+    // (The engine's async lane caps the expensive dispatch itself; this caps the pre-dispatch KV
+    // round-trips too.) Shares the topic-stream connection budget for the scope.
+    let permit_scope = stream_scope(site, preview);
+    let _site_permit =
+        match crate::stream::acquire_stream_permit(inner, &permit_scope, site_handlers) {
+            Ok(permit) => permit,
+            Err(()) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "site stream connection limit reached\n",
+                )
+                    .into_response()
+            }
+        };
+    let _ip_guard = match crate::stream::acquire_stream_ip_slot(inner, &permit_scope, client_ip) {
+        Ok(guard) => guard,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "per-client stream connection limit reached\n",
+            )
+                .into_response()
+        }
+    };
+
     let ack: Option<Cursor> = query_param(&parts.uri, "ack").and_then(|s| s.parse().ok());
     let idem_key = parts
         .headers
@@ -393,6 +490,13 @@ pub(super) async fn dispatch_session_post(
         Err(StoreError::PrincipalMismatch) => {
             return (StatusCode::FORBIDDEN, "session principal mismatch\n").into_response();
         }
+        Err(StoreError::ProjectSessionsFull) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "project session limit reached\n",
+            )
+                .into_response();
+        }
         Err(err) => {
             tracing::warn!(site, %err, "opening session failed");
             return handler_unavailable();
@@ -411,21 +515,24 @@ pub(super) async fn dispatch_session_post(
         }
     };
 
-    // Inbound dedup (record-on-receipt): a retried POST carrying the same idempotency key within the
-    // dedup window is dropped (delivered to the guest once). A frame on a closed/reaped session is
-    // gone.
+    // Inbound dedup — CHECK only (don't record yet): a retried POST with the same idempotency key
+    // within the dedup window returns 200 without re-running. The key is COMMITTED only after a
+    // successful re-entry (below), so a trapped dispatch redelivers the frame (at-least-once) rather
+    // than silently dropping it — honoring the WIT contract. A frame on a closed/reaped session is
+    // gone. (NOTE: at-least-once permits replay, and a guest's `send`s from a partially-run,
+    // then-trapped re-entry are already committed; a guest handler must therefore be idempotent
+    // w.r.t. its own effects across a redelivery — documented in the WIT + how-to.)
     if let Some(key) = &idem_key {
-        match store.record_inbound(project, &id, key, now).await {
-            Ok(true) => {}
-            Ok(false) => {
+        match store.seen(project, &id, key).await {
+            Ok(true) => {
                 return (StatusCode::OK, "duplicate frame ignored\n").into_response();
             }
-            Err(StoreError::Session(boatramp_core::session::SessionError::Closed))
-            | Err(StoreError::NotFound) => {
+            Ok(false) => {}
+            Err(StoreError::NotFound) => {
                 return (StatusCode::GONE, "session is closed\n").into_response();
             }
             Err(err) => {
-                tracing::warn!(site, %err, "recording session inbound frame failed");
+                tracing::warn!(site, %err, "checking session inbound dedup failed");
                 return handler_unavailable();
             }
         }
@@ -502,8 +609,17 @@ pub(super) async fn dispatch_session_post(
         start.elapsed(),
     );
     match result {
-        // The guest's sends/checkpoint committed to the store; the SSE stream delivers them.
-        Ok(()) => (StatusCode::ACCEPTED, "frame accepted\n").into_response(),
+        Ok(()) => {
+            // Commit the dedup key only now the re-entry succeeded — a later retry with the same key
+            // is deduped, while a trapped dispatch (the Err arm) left it unrecorded so the frame
+            // redelivers. Best-effort: if the guest closed the session during the re-entry the record
+            // is gone, which is fine (a retry then gets `GONE`). The guest's sends/checkpoint already
+            // committed to the store; the SSE stream delivers them.
+            if let Some(key) = &idem_key {
+                let _ = store.record_inbound(project, &id, key, now_unix_ms()).await;
+            }
+            (StatusCode::ACCEPTED, "frame accepted\n").into_response()
+        }
         Err(err) => {
             tracing::warn!(site, route = %session.route, %err, "session re-entry failed");
             handler_error_response(&err)
