@@ -20,6 +20,9 @@ name: CI
 #   • test-orm-tenancy — the Stage 0 in-site tenant-isolation proof on a REAL libsql engine
 #                      (`sql`-feature-gated, so the lean `test` lane skips it); asserts a success
 #                      marker so a silent skip or a cross-tenant regression fails the merge.
+#   • test-orm-tenancy-sqlx — the SAME in-site tenant-isolation proof on a REAL Postgres AND MySQL
+#                      (service containers): the ORM renders the scope per-dialect, so isolation is
+#                      proven on every engine it targets, not only SQLite. Marker-gated per engine.
 #   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
 # clippy and test are the two full workspace compiles; running them as separate
 # jobs lets them build concurrently on separate runners instead of one after the
@@ -301,6 +304,64 @@ jobs:
             || { echo "::error::ORM tenant isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
+
+  # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
+  # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder
+  # style ($N on PG, ? on MySQL); a per-dialect rendering bug in the SCOPED predicate could drop
+  # the tenant filter on one engine and not another, so the #1 invariant is proven on every engine
+  # the ORM targets — not just the libsql gate above. Postgres + MySQL come up as service
+  # containers; the env-gated test runs both batteries and prints a per-engine marker that the grep
+  # requires (a silent skip or a cross-tenant regression on either engine fails the merge). Host
+  # toolchain (real TCP + the sqlx drivers), matching test-orm-tenancy.
+  test-orm-tenancy-sqlx:
+    name: test (ORM tenant isolation on Postgres + MySQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: boatramp
+          POSTGRES_PASSWORD: boatramp
+          POSTGRES_DB: boatramp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U boatramp"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_USER: boatramp
+          MYSQL_PASSWORD: boatramp
+          MYSQL_DATABASE: boatramp
+          MYSQL_ROOT_PASSWORD: boatramp
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uboatramp -pboatramp --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-orm-tenancy-sqlx-host
+      - name: Live in-site tenant isolation on Postgres + MySQL
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+          BOATRAMP_TEST_MYSQL_URL: mysql://boatramp:boatramp@localhost:3306/boatramp
+        run: |
+          set -eo pipefail
+          # Both engines' batteries must actually RUN (URLs set above) — a skipped engine still
+          # reports `ok`, so we additionally require both per-engine success markers.
+          cargo test -p boatramp-storage --features sql-postgres,sql-mysql \
+            --test orm_tenant_isolation_sqlx_live -- --nocapture --test-threads=1 2>&1 | tee orm-sqlx.log
+          grep -qE 'test result: ok\. 2 passed' orm-sqlx.log \
+            || { echo "::error::ORM sqlx tenant isolation did not run both engines (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'ORM IN-SITE TENANT ISOLATION OK \[postgres\]' orm-sqlx.log \
+            || { echo "::error::Postgres ORM tenant isolation never reached its marker (cross-tenant breach or skip)" >&2; exit 1; }
+          grep -q 'ORM IN-SITE TENANT ISOLATION OK \[mysql\]' orm-sqlx.log \
+            || { echo "::error::MySQL ORM tenant isolation never reached its marker (cross-tenant breach or skip)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
