@@ -274,7 +274,11 @@ publish-dry:
     for c in {{ crate_order }}; do
       if out="$(cargo publish -p "$c" --dry-run --no-verify 2>&1)"; then
         echo "OK       $c"
-      elif grep -q "no matching package named" <<<"$out"; then
+      elif grep -qE "no matching package named .boatramp-|failed to select a version for the requirement .boatramp-" <<<"$out"; then
+        # An internal dep's new version isn't on crates.io yet — cargo can't resolve it in a
+        # dry run (either "no matching package" if the crate is brand-new, or "failed to select
+        # a version" if only older versions are indexed). Both are the expected DEFERRED case,
+        # validated for real when the crates publish in dependency order.
         echo "DEFERRED $c (internal deps not yet on crates.io)"
       else
         echo "FAIL     $c"; tail -5 <<<"$out"; rc=1
