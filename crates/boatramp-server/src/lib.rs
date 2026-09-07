@@ -66,6 +66,10 @@ mod control_api;
 /// guest capability.
 #[cfg(feature = "email")]
 mod email_spool;
+/// The KV-backed session store backing the duplex/resumable `session` capability
+/// (PLAN-session-primitive Stage 3).
+#[cfg(feature = "session")]
+mod session_store;
 #[cfg(feature = "admin")]
 pub use admin_controller::ServerAdminController;
 #[cfg(feature = "compression")]
