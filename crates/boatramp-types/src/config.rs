@@ -622,6 +622,14 @@ pub struct SessionConfig {
     /// Function-to-function invoke allowlist (same contract as a handler's `invoke_targets`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
+    /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
+    /// **open** from the verified source and carried across every re-entry, so a frame-triggered
+    /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
+    /// JWKS/issuer verifying the app bearer for a `token`-sourced tenant (same as a function's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_claims: Option<HandlerGraphqlTokenClaims>,
 }
 
 /// Site-scoped, mutable configuration stored in the KV (not in the manifest).

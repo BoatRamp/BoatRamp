@@ -482,7 +482,7 @@ pub(super) async fn execute_function(
 /// scope so kv/blob/messaging/sql land in an isolated namespace.
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
-async fn build_function_bindings(
+pub(super) async fn build_function_bindings(
     inner: &HandlerRuntimeInner,
     project: ProjectRef<'_>,
     scope: &str,
