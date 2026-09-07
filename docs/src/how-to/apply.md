@@ -64,6 +64,10 @@ Each `sites[]` entry is a slug plus:
 `runtime`, `webhook_secret_env`, and — parity with a site handler — `imports`
 (requested capabilities like `sql` / `invoke`), `env` (static, non-secret vars),
 `invoke_targets` (the deny-by-default function-to-function allowlist), and `limits`.
+A function that opens a `sql`/`orm` database in a **multi-tenant** project also carries a
+`tenancy` block (its in-site tenant column + host source + per-axis access modes) and, when
+its tenant comes from an app bearer token, a `token_claims` block (the JWKS/issuer that
+verifies it) — see [Isolate tenants within a project](./tenant-isolation.md).
 `compute[]` carry a raw `spec` PUT straight to the compute endpoint, the same body
 `boatramp compute set` builds.
 

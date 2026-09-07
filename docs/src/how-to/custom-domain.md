@@ -171,6 +171,35 @@ tenant by host. For HTTPS across all sub-labels, issue a wildcard certificate wi
 admin `--unverified` override (`boatramp domain add '*.example.com' --site my-portal --unverified`);
 it routes immediately.
 
+### Map each host to a tenant (`domains.contexts`)
+
+When those per-tenant hosts share **one database** and you want each storefront to see only its
+own rows, tag every host with a **tenant context** in site config and let the host — not your
+handler — apply the row scope. `domains.contexts` is a map of host-or-wildcard-pattern → an opaque
+tenant tag:
+
+```json
+{
+  "domains": {
+    "primary": "console.example.com",
+    "wildcards": ["*.example.com"],
+    "contexts": {
+      "acme.example.com":   "acme",
+      "globex.example.com": "globex",
+      "*.example.com":      "shared-pool"
+    }
+  }
+}
+```
+
+An exact host with no own entry inherits the primary's tag (so apex↔www share a tenant); a
+subdomain with no exact tag inherits its matching wildcard's tag. When a function or handler
+declares `TenantSource::Domain`, the host binds the matched tag as the in-site tenant value and
+folds it into every query — the guest never supplies (or can spoof) it, and a host with no
+resolvable tag fails closed rather than leaking across tenants. This is the declarative,
+no-guest-code path to per-domain multi-tenancy; see
+[Isolate tenants within a project](./tenant-isolation.md) for the full model.
+
 ## Remove a domain
 
 Detach a host — attached or still pending — with `domain rm`. It stops routing

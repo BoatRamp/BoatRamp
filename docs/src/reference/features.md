@@ -22,8 +22,8 @@ cargo build --release -p boatramp --no-default-features --features fs,slatedb
 ```
 
 Some features imply others: `http3`/`acme-dns` imply `tls`; `cluster` implies
-`handlers` + `slatedb`; `operator` implies `cluster`; each `sql-*` implies
-`handlers`.
+`handlers` + `slatedb`; `operator` implies `cluster`; each `sql-*` and
+`orm-subquery` imply `handlers`.
 
 | Feature | Default | Enables |
 | --- | --- | --- |
@@ -48,6 +48,7 @@ Some features imply others: `http3`/`acme-dns` imply `tls`; `cluster` implies
 | `cluster` | yes | Self-hosted Raft cluster mode. Implies `handlers` and `slatedb`. |
 | `sql-postgres` | yes | External (bring-your-own) PostgreSQL for the handler `sql` binding, opened by name. Implies `handlers`. |
 | `sql-mysql` | yes | External (bring-your-own) MySQL/MariaDB for the handler `sql` binding, opened by name. Implies `handlers`. |
+| `orm-subquery` | yes | The typed [`orm`](../how-to/handler-bindings.md#typed-queries-with-the-orm-builder) builder's **correlated roll-up** (`related_count`/`related_agg`) and **narrow scalar/`IN` subqueries** — the one scalar-subquery form. Implies `handlers`; drop it to ship a host that refuses correlated subqueries. (pgvector distance and the rest of the `orm` surface are always compiled — not a cargo feature; pgvector is advertised to guests as the experimental `orm-vector` **capability** — a `requires` gate, not a build feature.) |
 | `console` | yes | Bake the web management console (a Wasm SPA) into the binary; serve it at an operator-configured host+path (`[serve.console]`). On in every shipped build (release binaries + Nix/OCI images), which stage the built SPA in; a from-source build embeds a placeholder unless you build the SPA first with `just console`. |
 | `mcp` | yes | The [Model Context Protocol](../how-to/mcp.md) server: the `boatramp mcp` stdio subcommand + the HTTP `/mcp` endpoint on `serve`. Also enables `boatramp-server/mcp`. |
 

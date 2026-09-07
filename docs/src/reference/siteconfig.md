@@ -37,6 +37,7 @@ The hostnames a site answers to (virtualhost routing). See
 | `aliases` | list\<string\> | `[]` | Additional exact hostnames (`www.example.com`). |
 | `wildcards` | list\<string\> | `[]` | Wildcard patterns (`*.example.com`), matched by suffix at any depth. |
 | `canonical_redirect` | bool | `false` | 301 exact-alias hosts to `primary` (apex↔www). Wildcard hosts serve as-is. |
+| `contexts` | map\<string, string\> | `{}` | Per-host **tenant-context tag**: host-or-wildcard → an opaque in-site tenant id, the `domain` [tenant source](../how-to/tenant-isolation.md#dimension-1-the-tenant-source). Lets one deployment serve many customer storefronts, each domain its own tenant. An exact host with no entry inherits `primary`'s tag; a subdomain inherits its wildcard's. Bound as a parameter, never formatted into SQL. |
 
 ## `security`
 
@@ -90,6 +91,7 @@ entirely.
 | `cache` | HandlerCacheConfig? | `None` (off) | [Edge response cache](#handlerscache). |
 | `graphql` | HandlerGraphqlConfig? | `None` (off) | [GraphQL edge features](#handlersgraphql). |
 | `cookie_auth` | CookieAuthConfig? | `None` (off) | [Browser cookie session auth](#handlerscookie_auth). |
+| `tenancy` | Tenancy? | `None` (undeclared) | Site-level in-site [tenancy decision](#handlerstenancy) for `sql`/`orm` access — the ceiling for this site's handlers. |
 
 A handler that requests an import not in `allow_imports`, or exceeds a cap, is
 rejected at activation — not at request time. See
@@ -142,6 +144,42 @@ with a `__Host-` prefix. See
 | --- | --- | --- | --- |
 | `cookie_name` | string | — | The cookie whose value becomes the bearer when no `Authorization` header is present. |
 | `allowed_origins` | list\<string\> | `[]` | **Additional** cross-origin CSRF allowlist. Same-origin (request `Origin`/`Referer` authority == own `Host`) always passes, so `[]` ⇒ *same-origin only* — no config for the usual SPA. List the extra origins a browser app on a **different** origin than this API may use; a cross-origin request that's neither same-origin nor listed is rejected `403`. Each entry is a `scheme://host[:port]` origin. |
+
+### `handlers.tenancy`
+
+The site's **in-site tenancy decision** — how the host scopes `sql`/`orm` row access across
+sub-tenants sharing one database. Absent (`None`) means *undeclared*: refused at activation for a
+`sql`/`orm`-importing site under the `multi-tenant` posture (which requires an explicit decision),
+treated as `disabled` under single-tenant/dev. Two shapes (a tagged `mode`):
+
+```json
+{ "mode": "disabled" }
+```
+Deliberately no in-site tenancy — plain queries (the project = database boundary is the whole
+isolation). The explicit "single-tenant / no tenancy" declaration.
+
+```json
+{ "mode": "scoped",
+  "column": "tenant_id",
+  "source": { "kind": "token", "claim": "tid" },
+  "read":  "own",
+  "write": "own" }
+```
+In-site sub-tenancy on `column`, resolving "own" from `source`, at per-axis access grants.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `column` | string | — | The tenant column the host scopes on (validated as an identifier). |
+| `source` | TenantSource | `{"kind":"none"}` | How the host resolves "own": `{"kind":"token","claim":"tid"}` (a verified JWT claim), `{"kind":"domain"}` (the routed domain's [`contexts`](#domains) tag), `{"kind":"signed_context"}` (reserved), or `{"kind":"none"}` (anonymous). |
+| `read` | AccessMode | `own` | Which tenant-set reads may reach. |
+| `write` | AccessMode | `own` | Which tenant-set writes may reach. |
+
+`AccessMode` is one of `none` (deny), `null` (the `tenant_id IS NULL` shared baseline only), `own`
+(the resolved tenant), `own_or_null` (both), or `all` (cross-tenant — default-deny, gated by the
+[`allow_cross_tenant_db`](./boatramp-cfg.md) posture ceiling; capped to `own` when off). `own_or_null`
+on the **write** axis degrades to `own` (a write never touches the shared baseline). A top-level
+function's own [`tenancy`](../how-to/apply.md) block narrows within this site ceiling. Full model:
+[Isolate tenants in one database](../how-to/tenant-isolation.md).
 
 ## `compression`
 

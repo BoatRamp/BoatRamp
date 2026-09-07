@@ -17,7 +17,12 @@ handlers, and content, but cannot widen the trust boundary.
 
 This is why some capabilities are refused by default even though the code
 supports them: a site cannot declare a private-IP gateway upstream, and
-shared-kernel compute is off, until the operator opts in.
+shared-kernel compute is off, until the operator opts in. It is also why the
+default requires every database-opening handler to make an **explicit in-site
+tenancy decision** and forbids any handler from reaching **across tenants** in a
+shared database — a cross-tenant leak is exactly the hazard a site writer must
+not be able to introduce by omission. See
+[Isolate tenants within a project](../how-to/tenant-isolation.md).
 
 ## Knobs are the truth; profiles are sugar
 

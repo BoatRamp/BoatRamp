@@ -38,6 +38,7 @@
 - [Deploy a handler](./how-to/deploy-handler.md)
 - [Compose components into one handler](./how-to/compose.md)
 - [Use kv / sql / blobstore / messaging](./how-to/handler-bindings.md)
+- [Isolate tenants within a project](./how-to/tenant-isolation.md)
 - [Serve a GraphQL API](./how-to/graphql.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
 - [Deploy & invoke a function](./how-to/functions.md)

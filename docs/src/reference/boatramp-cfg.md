@@ -103,6 +103,8 @@ Override knobs (byte caps: `0` = unlimited):
 | `ratelimit_fail_open` | Serve rather than reject if the rate-limit store is unavailable. |
 | `allow_implicit_routing` | Resolve an unmatched host to a site without a registered domain (first-label `<site>.host` / sole site). Off under `multi-tenant`; a loopback bind enables it regardless. See [addressing](../explanation/addressing.md). |
 | `require_pop` | Require **every** control-plane token to be holder-bound (`cnf`) and present a valid per-request proof-of-possession. Off by default (a `cnf` token always requires a proof regardless; this knob additionally bans plain bearer tokens fleet-wide). Needs `pop_origin` set. See [PoP-bind a token](../how-to/pop-tokens.md). |
+| `require_tenancy_declaration` | Require every function/handler that opens a `sql`/`orm` database to make an **explicit** in-site tenancy decision (`disabled` or `scoped`) — an undeclared importer is refused at activation, so serving a database unscoped is always a reviewed choice, never an accidental omission. **On under `multi-tenant`**, off under `single-tenant`/`dev` (which treat undeclared as `disabled`). See [Isolate tenants within a project](../how-to/tenant-isolation.md). |
+| `allow_cross_tenant_db` | Permit a function/handler to declare a cross-tenant (`all`) read/write access mode — reaching every tenant's rows in a shared database. **Off under `multi-tenant`** (an `all` mode is capped down to `own`, so no guest can read across tenants even if it asks), on under `single-tenant`/`dev`. See [Isolate tenants within a project](../how-to/tenant-isolation.md). |
 
 See [Choose & inspect a security posture](../how-to/security-posture.md) and
 [The security posture model](../explanation/security-posture.md).

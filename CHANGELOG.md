@@ -5,6 +5,52 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.0] - unreleased
+
+### Added
+- **Typed `orm` builder — full verb/clause surface (`boatramp:handlers/orm`).** The typed,
+  injection-safe query builder gained the clauses that previously forced a drop to raw SQL:
+  `DELETE` (with `RETURNING`), narrow scalar / `IN` **subqueries**, `DISTINCT ON`, `UNION`,
+  `CASE` expressions, bound-key **JSON** extraction + `jsonb` concat, `INSERT … SELECT`, and —
+  on Postgres — **pgvector** distance (`cosine_distance`/`l2_distance` + `vec_literal`) for
+  nearest-neighbour search. Each is compiled host-side to the target engine's dialect with the
+  query built as a validated AST (parameters always bound, never string-formatted). The
+  correlated roll-up and narrow-subquery forms sit behind the new `orm-subquery` cargo feature
+  (in the batteries-included default); the rest is always compiled. Import it from a guest with
+  the shim's off-by-default `orm` cargo feature, so a component stays instantiable on an older
+  pinned host.
+- **In-site tenant isolation — host-forced row scoping.** A project already maps 1:1 to its own
+  database (cross-project isolation is structural). New in 0.4.0: when **one** project's database
+  holds many sub-tenants (a SaaS with per-customer storefronts, a multi-org portal), a
+  function/site **declares** an in-site tenancy block and boatramp scopes every query to the
+  caller's tenant — resolved **host-side from a verified source and never supplied by the
+  guest**. Three independent decisions: (0) **opt in or out** — `scoped`, `disabled`, or
+  undeclared, with the new `require_tenancy_declaration` posture (on under `multi-tenant`)
+  refusing an undeclared `sql`/`orm` importer so running unscoped is always a reviewed choice;
+  (1) the **tenant source** — a verified JWT `token` claim, the routed `domain`'s context tag
+  (`domains.contexts`), a reserved `signed_context`, or `none`; (2) the **access mode** per
+  read/write axis — `none`/`null`/`own`/`own_or_null`/`all`, cross-tenant (`all`) default-deny
+  and gated by the new `allow_cross_tenant_db` posture (capped to `own` under `multi-tenant`).
+  Both query surfaces are scoped identically: the `orm` builder folds the predicate in
+  structurally (every `WHERE`/`HAVING`, joined table, `INSERT`/`INSERT … SELECT` source,
+  `RETURNING`, `UNION` branch, and subquery), and raw `sql` uses a host-filled `{scope}` marker
+  (a scoped statement that omits it is refused before the database). Invoke chains carry the
+  caller's resolved tenant value host-side (a sibling applies its own modes, never a
+  guest-injected value); background paths fail closed. Declared as a site ceiling
+  (`SiteConfig.handlers.tenancy`) that a top-level function's own `tenancy` (+ `token_claims`)
+  block narrows within. A live capability gate asserts two-tenant + shared-baseline isolation on
+  a real database. See the new how-to: "Isolate tenants within a project".
+
+### Changed
+- **BREAKING: the guest-supplied query scope (`Database::scoped(column, value)`) is removed.**
+  A handler no longer passes its own tenant value — in-site tenancy is host-forced and declared
+  in config (above). Migrate by dropping `.scoped(col, value)` from `sql::open(...)` /
+  `orm::open(...)` (query entry is now on the plain handle), declaring the tenancy block, and —
+  for raw SQL — placing the `{scope}` marker where your `tenant_id = ?` predicate was. A
+  single-tenant app declares `{ "mode": "disabled" }` (or runs under `single-tenant`/`dev`,
+  where undeclared is treated as disabled). See "Isolate tenants within a project →
+  Migrating from pre-0.4".
+
 ## [0.3.19] - 2026-09-06
 
 ### Added

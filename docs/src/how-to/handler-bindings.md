@@ -222,10 +222,12 @@ handler imports `sql:<name>` (e.g. `sql:analytics`) — or `sql:*` for every nam
 and the site's [`allow_imports`](../reference/siteconfig.md#handlers) must list it too (the site is
 the hard ceiling). A handler that opens only `analytics` imports `sql:analytics`, and
 `sql.open("events")` from it then **fails closed**. This is the seam for **least-privilege tenant
-isolation**: give the tenant-facing path a normal role (say `sql:product`) and any privileged path
-its own binding (`sql:privileged`) — each a distinct connection + credential — so one missed
-`WHERE tenant_id = ?` can't leak across tenants, and Postgres `FORCE ROW LEVEL SECURITY` becomes a
-live backstop instead of resting on app discipline alone.
+isolation** at the *connection* level: give the tenant-facing path a normal role (say `sql:product`)
+and any privileged path its own binding (`sql:privileged`) — each a distinct connection + credential.
+On top of that, **in-site row scoping is host-forced** (see [tenant isolation](./tenant-isolation.md)):
+when the site declares scoped tenancy the host injects the `tenant_id` predicate itself, so a missed
+`WHERE` can't leak across tenants, with Postgres `FORCE ROW LEVEL SECURITY` a live backstop rather
+than resting on app discipline alone.
 
 The guest code is unchanged — the name simply resolves to the external database
 instead of a per-site libsql one, and the **placeholders stay `?N`** on every
@@ -236,6 +238,13 @@ let db = sql::open("analytics")?;               // the configured Postgres
 let rows = db.query("SELECT id, name FROM signups WHERE country = ?1",
                     &[Value::Text(country)])?;
 ```
+
+> **Raw SQL under scoped tenancy uses the `{scope}` marker.** If the site/function declares in-site
+> tenancy, place `{scope}` where the tenant predicate belongs and the host fills it (`tenant_id =
+> ?N`) from the verified source — `... WHERE status = ?1 AND {scope}`. A scoped statement that omits
+> the marker is **refused** (fail-closed), so raw SQL can't silently skip the tenant boundary. A
+> plain (no-tenancy) app writes ordinary SQL and needs no marker. The typed `orm` builder injects
+> the same predicate structurally, no marker needed — see [tenant isolation](./tenant-isolation.md).
 
 > **Placeholders are always `?1`, `?2`, …** — the SQLite-style numbered form —
 > regardless of which engine backs the database. Writing native Postgres `$1` (or
@@ -322,16 +331,31 @@ with `orm.open(name)` that it would with `sql.open(name)`, on the **same transac
 you can mix the two freely, and `orm.open` on an ungranted name fails closed exactly like
 `sql.open`.
 
-It covers the common shapes safely: nested `AND`/`OR`/`NOT`, joins with aliases, aggregates
-with `GROUP BY`/`HAVING`, `BETWEEN`/`IN`/`LIKE`/`IS NULL`, arithmetic + a portable function
-set, `RETURNING`, upserts, and JSON key-path extraction (rendered per engine). Every value
-is a bound parameter and every identifier is validated, so a query **cannot** construct an
-injection; an unbounded `UPDATE` (no filter, no scope) is refused. Reach for raw `sql` only
-for what the builder doesn't model — subqueries, CTEs, window functions, `DISTINCT ON`.
+It covers the shapes an app realistically uses without dropping to raw SQL: `SELECT`, `INSERT`
+(multi-row), `UPDATE`, and `DELETE`; nested `AND`/`OR`/`NOT`, joins with aliases, aggregates with
+`GROUP BY`/`HAVING`, `BETWEEN`/`IN`/`LIKE`/`IS NULL`, `ORDER BY`, `LIMIT`/`OFFSET`; arithmetic + a
+portable function set; `RETURNING`; `ON CONFLICT` upserts; `UNION`; `CASE` (and a boolean/comparison
+`ORDER BY` via `CASE`); `DISTINCT ON` (Postgres, fails closed elsewhere); JSON — static-key-path
+extract, a bound-key `->>`, and jsonb `||` merge; a narrow correlated roll-up
+(`related-aggregate`), a narrow scalar subquery, and an `IN`-subquery (all single-named-table,
+behind the `orm-subquery` capability); `INSERT … SELECT`; and pgvector distance/`ORDER BY`
+nearest-neighbour (the experimental `orm-vector` capability, Postgres-only). Every value is a bound parameter and every
+identifier is validated, so a query **cannot** construct an injection; an unbounded `UPDATE`/`DELETE`
+(no filter, no tenant scope) is refused. Reach for raw `sql` only for what the builder still doesn't
+model — CTEs, window functions, open/free-form nested subqueries.
+
+**Tenant scoping is host-forced — you pass no tenant value.** If the site (or function) declares
+in-site tenancy ([tenant isolation](./tenant-isolation.md)), the host injects the tenant predicate
+into every query the builder produces — a `WHERE tenant_id = ?` on reads, an auto-stamped column on
+inserts, reaching every joined table and subquery — from the request's verified source, not from
+anything the guest supplies. A plain (single-tenant / no-tenancy) app builds queries unchanged and
+nothing is injected. (Pre-0.4 you called `open(..).scoped(col, value)`; that guest-supplied scope is
+gone — see [tenant isolation](./tenant-isolation.md#migrating-from-pre-04).)
 
 ```rust
-// Same database + transaction as `sql.open("")`; the scope is folded into every query.
-let db = orm::open("")?.scoped("tenant_id", tenant);
+// Same database + transaction as `sql.open("")`; the host folds the tenant scope into every
+// query (when the site declares scoped tenancy) — the guest never names it.
+let db = orm::open("")?;
 
 let rows = db.query("work_order")
     .select([col("id"), col("state")])
@@ -342,6 +366,7 @@ let rows = db.query("work_order")
     .order_by_desc("created_at")
     .limit(20)
     .run()?;
+// Under scoped tenancy the host prepends the tenant predicate:
 // SELECT id, state FROM work_order
 // WHERE tenant_id = ?1 AND (project_id = ?2 AND (priority >= ?3 OR escalated = ?4))
 // ORDER BY created_at DESC LIMIT 20
@@ -351,7 +376,7 @@ The builder is provided by the authoring kit (the
 [boatramp-uchron-shim](https://git.bytesoba.net/uchron/boatramp-uchron-shim) `compat::orm`
 module) behind its off-by-default `orm` cargo feature — turn it on only against a boatramp
 that ships the `orm` interface. See that kit's authoring guide for the full surface
-(inserts, upserts, `RETURNING`, JSON, expressions).
+(inserts, upserts, `RETURNING`, JSON, subqueries, `UNION`, `CASE`, expressions).
 
 See the [boatramp.cfg schema](../reference/boatramp-cfg.md#external-sql-databases)
 for the full field list and [Cargo features](../reference/features.md) for the

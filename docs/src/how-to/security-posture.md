@@ -3,8 +3,10 @@
 The **security posture** is the operator's trust model, resolved at startup from
 `boatramp.cfg`. It decides defaults for hazards a site writer must not control:
 whether a public bind may run without auth, upload and component size caps,
-whether a site may reach private-network upstreams, and whether compute may share
-the host kernel. The posture is operator-only — it is never part of site config,
+whether a site may reach private-network upstreams, whether compute may share
+the host kernel, and whether a database-opening handler may skip an in-site
+[tenancy declaration](./tenant-isolation.md) or reach across tenants. The posture
+is operator-only — it is never part of site config,
 so a `site-write` principal cannot relax it. For why the model exists, see
 [The security posture model](../explanation/security-posture.md).
 
