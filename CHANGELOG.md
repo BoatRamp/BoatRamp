@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.2] - 2026-09-07
+
+### Added
+- **Duplex, resumable sessions (`boatramp:handlers/session`, experimental).** A new capability for
+  streaming agent UIs (AG-UI, chat, tool-call streams): a client opens an SSE stream to receive
+  frames and `POST`s frames back on the same route, and the host **re-enters your guest once per
+  inbound frame** rather than holding a long-lived instance. boatramp owns the ordering, buffering,
+  at-least-once redelivery, resume-from-cursor, idle lifetime, and per-tenant isolation; every frame
+  is **opaque bytes** (boatramp never parses your protocol). The guest exports a `session-handler`
+  and drives the channel with `send` / `checkpoint` / `close` — rehydrating its state from the last
+  checkpoint on each re-entry (no in-memory state survives), so a reconnect resumes seamlessly.
+  - **Wire protocol:** `GET <route>?id=<id>` opens the SSE out (each frame a base64 `data:` with a
+    monotonic cursor `id:`; `Last-Event-ID` resumes past a cursor; a terminal `event: close` ends
+    it); `POST <route>?id=<id>` delivers one inbound frame (with `Idempotency-Key` for safe retries
+    and `?ack=<cursor>` to release the outbound buffer).
+  - **Security:** cross-tenant isolation is structural (the session record is keyed under the
+    verified caller's project); the binding re-verifies the caller's tenant on every open/POST; any
+    `sql`/`orm` a frame triggers runs under **host-forced tenancy** resolved once at open — never
+    guest-spoofable, fail-closed. A session id is a *within-tenant* bearer capability, so use an
+    unguessable id (the shim generates one).
+  - **Bounds & lifetime:** per-frame (1 MiB), unacked-buffer (256, backpressured), inbound-dedup
+    window (256), checkpoint (4 MiB), and idle-TTL (5 min) caps, a per-project live-session cap, and
+    a background reaper; per-scope + per-IP connection admission on both the SSE and POST sides.
+  - Off-by-default `session` cargo feature (in the batteries-included default build); a component
+    declares `requires = ["session"]` so deploying it to a host build without the capability is
+    refused cleanly. Ships with a live capability gate (`capability.yml` Tier I) driving the full
+    duplex + checkpoint-resume + cursor-resume + idempotent-redelivery + guest-close contract
+    against a real compiled guest, and a [how-to](https://docs.boatramp.dev/how-to/sessions.html).
+
 ## [0.4.1] - 2026-09-07
 
 ### Added
