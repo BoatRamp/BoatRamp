@@ -48,7 +48,14 @@ async fn run_query(tx: &mut dyn SqlTransaction, sql: &str, params: &[SqlValue]) 
     out
 }
 
+// `#[ignore]` by default so the general workspace test lane skips it (a skip is not evidence
+// there): built for the **static-musl** target and run under musl's default malloc, libsql's
+// bundled SQLite SIGSEGVs — a test-harness quirk, NOT a logic issue and NOT a production one (the
+// shipped musl binary uses jemalloc; managed libsql is proven on musl by the container capability
+// gate + real deployments). The dedicated `test-orm-tenancy` CI job runs it **unignored** on the
+// host glibc toolchain (`-- --ignored`) and asserts the success marker — that job is the evidence.
 #[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
 async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
     let dir = std::env::temp_dir().join(format!("boatramp-orm-tenancy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

@@ -293,8 +293,10 @@ jobs:
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
+          # The test is `#[ignore]`d (the general workspace lane skips it — a static-musl test
+          # binary segfaults in libsql); run it explicitly here, unignored, on the host toolchain.
           cargo test -p boatramp-storage \
-            --features sql --test orm_tenant_isolation -- --nocapture 2>&1 | tee orm-tenancy.log
+            --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
           grep -qE 'test result: ok\. 1 passed' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
