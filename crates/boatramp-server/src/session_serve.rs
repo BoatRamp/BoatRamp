@@ -505,6 +505,18 @@ pub(super) async fn dispatch_session_post(
     if let Some(cursor) = ack {
         let _ = store.ack(project, &id, cursor, now).await;
     }
+    // A frame on a closed session is refused cleanly up front (410) rather than letting the guest's
+    // `send` fail mid-re-entry. NotFound (reaped between admission and here) is likewise terminal.
+    match store.is_closed(project, &id).await {
+        Ok(false) => {}
+        Ok(true) | Err(StoreError::NotFound) => {
+            return (StatusCode::GONE, "session is closed\n").into_response();
+        }
+        Err(err) => {
+            tracing::warn!(site, %err, "checking session state failed");
+            return handler_unavailable();
+        }
+    }
 
     // Buffer the inbound frame, capped at the session frame-size limit (opaque bytes, one frame).
     let max_frame = store.limits().max_frame_bytes;

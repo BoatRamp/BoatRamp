@@ -268,6 +268,12 @@ impl SessionStore {
         Ok(fresh)
     }
 
+    /// Whether the session is closed — the serving layer refuses an inbound `POST` on a closed
+    /// session with `410 Gone` up front, rather than letting the guest's `send` fail mid-re-entry.
+    pub(crate) async fn is_closed(&self, project: &str, id: &str) -> Result<bool, StoreError> {
+        Ok(self.require(project, id).await?.state.is_closed())
+    }
+
     /// Whether an inbound idempotency `key` is already within the dedup window (a duplicate to drop),
     /// **without recording it**. The serving layer checks this before a re-entry and commits the key
     /// (via [`record_inbound`](Self::record_inbound)) only after a *successful* dispatch, so a
@@ -371,6 +377,11 @@ impl SessionStore {
     /// project's key prefix and delete each expired record. Returns how many were reaped. Driven by
     /// the scheduler tick (throttled per project) so the KV can't accumulate dead sessions — the
     /// enforcement side of the idle-TTL, paired with the per-project open cap ([`open_or_verify`]).
+    ///
+    /// Not a CAS (the KV offers none): if a session is reactivated between this load and its delete
+    /// it may be reaped a tick early — benign and self-healing (the client reconnects with its
+    /// `Last-Event-ID`), the same accepted no-CAS tradeoff as [`open_or_verify`]. Idempotent, so a
+    /// multi-node double-reap is harmless.
     pub(crate) async fn reap_expired(
         &self,
         project: &str,
