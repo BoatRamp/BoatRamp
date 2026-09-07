@@ -221,6 +221,18 @@ impl DeployConfig {
                 )));
             }
         }
+        for session in &self.sessions {
+            Pattern::compile(&session.route)?;
+            if session.component.is_empty() {
+                return Err(ConfigError::parse(format!(
+                    "session {} has an empty component path",
+                    session.route
+                )));
+            }
+            for import in &session.imports {
+                check_import(import)?;
+            }
+        }
         Ok(())
     }
 }
@@ -339,14 +351,21 @@ pub fn is_named_admin_import(import: &str) -> bool {
 }
 
 fn check_import(import: &str) -> Result<(), ConfigError> {
+    // `session` is accepted here (client-side cfg vocabulary) but is intentionally NOT in
+    // `KNOWN_IMPORTS`: a session route grants the session binding intrinsically, and the host
+    // advertises `session` as an Experimental capability only when the `session` feature is
+    // compiled — so the ABI gate (a component's `requires = ["session"]` vs the host's advertised
+    // set) enforces host support at activation, while this keeps `imports: ["session"]` from being
+    // rejected offline regardless of which host build the deploy targets.
     if KNOWN_IMPORTS.contains(&import)
+        || import == "session"
         || is_named_sql_import(import)
         || is_named_admin_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -1238,6 +1257,53 @@ mod tests {
         };
         let err = config.compile_check().unwrap_err().to_string();
         assert!(err.contains("looks like a secret"), "got: {err}");
+    }
+
+    #[test]
+    fn check_handlers_validates_sessions() {
+        // A well-formed session (compiling route, non-empty component, recognized imports incl.
+        // the intrinsic `session` token) passes.
+        let ok = DeployConfig {
+            sessions: vec![SessionConfig {
+                route: "/agent".into(),
+                component: "agent.wasm".into(),
+                imports: vec!["session".into(), "sql".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ok.compile_check().expect("valid session config");
+
+        // An empty component path is rejected.
+        let no_component = DeployConfig {
+            sessions: vec![SessionConfig {
+                route: "/agent".into(),
+                component: String::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(no_component
+            .compile_check()
+            .unwrap_err()
+            .to_string()
+            .contains("empty component"));
+
+        // An unknown import is rejected.
+        let bad_import = DeployConfig {
+            sessions: vec![SessionConfig {
+                route: "/agent".into(),
+                component: "agent.wasm".into(),
+                imports: vec!["not-a-capability".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(bad_import
+            .compile_check()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown handler import"));
     }
 
     #[test]

@@ -41,6 +41,7 @@
 - [Isolate tenants within a project](./how-to/tenant-isolation.md)
 - [Serve a GraphQL API](./how-to/graphql.md)
 - [Run consumers, crons, and streams](./how-to/background-work.md)
+- [Build a duplex agent session (SSE + resume)](./how-to/sessions.md)
 - [Deploy & invoke a function](./how-to/functions.md)
 - [Orchestrate functions with workflows](./how-to/workflows.md)
 - [Run a container or microVM](./how-to/compute.md)
