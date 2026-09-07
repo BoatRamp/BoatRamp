@@ -725,8 +725,16 @@ interface session-handler {
 }
 
 /// A session component: it imports the session host half and must export the handler (like a
-/// messaging `consumer`). Gated by the host `session` capability + the manifest `requires`.
+/// messaging `consumer`). Gated by the host `session` capability + the manifest `requires`. The
+/// host `bindgen!`s this for the export caller (invoking `session-handler.handle`).
 world session-host {
   import session;
   export session-handler;
+}
+
+/// Import-only world for the host `session` binding (the `SessionHost`/`SessionController` Host
+/// impl), mirroring `admin-host` — generates just the `session` import Host trait, no export
+/// machinery. (The full `session-host` world above is what the engine `bindgen!`s for dispatch.)
+world session-import-host {
+  import session;
 }

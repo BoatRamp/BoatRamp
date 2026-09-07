@@ -34,6 +34,8 @@ pub mod keyvalue;
 pub mod messaging;
 #[cfg(feature = "sql")]
 pub mod orm;
+#[cfg(feature = "session")]
+pub mod session;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod wasi_logging;

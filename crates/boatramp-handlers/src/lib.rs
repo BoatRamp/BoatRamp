@@ -28,6 +28,8 @@ pub use bindings::invoke::{
 };
 #[cfg(feature = "messaging")]
 pub use bindings::messaging::BUS_TOPIC_SELECTOR;
+#[cfg(feature = "session")]
+pub use bindings::session::{SessionBinding, SessionController, SessionError};
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
 #[cfg(feature = "engine")]
