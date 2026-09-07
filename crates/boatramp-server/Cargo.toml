@@ -45,6 +45,11 @@ email = ["handlers", "boatramp-handlers/email"]
 # `ServerAdminController`. Implies `handlers`. On in batteries-included builds, off in lean.
 admin = ["handlers", "boatramp-handlers/admin"]
 
+# The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
+# a long-lived, client-addressable, bidirectional, resumable channel the host drives via
+# event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.
+session = ["handlers", "boatramp-handlers/session"]
+
 # DNS-TXT domain ownership verification. Pulls a resolver (hickory)
 # for the public-DNS TXT lookup; off by default so the lean build verifies via
 # the HTTP-token method (no extra dependency). The verification logic is always

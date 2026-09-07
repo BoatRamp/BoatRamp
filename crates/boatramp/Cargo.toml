@@ -56,6 +56,7 @@ default = [
   "orm-subquery",
   "email",
   "admin",
+  "session",
   "cluster",
   "operator",
   "mcp",
@@ -178,6 +179,7 @@ email = ["handlers", "boatramp-node/email", "boatramp-server/email"]
 # Implies `handlers`; forwards to the node + server `admin` features. In the batteries-included
 # default; drop it for a build with no guest self-config.
 admin = ["handlers", "boatramp-node/admin", "boatramp-server/admin"]
+session = ["handlers", "boatramp-server/session"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /
 # RaftMessaging serving facades. Pulls boatramp-cluster +

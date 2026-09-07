@@ -68,6 +68,10 @@ email = ["engine", "dep:lettre", "dep:async-trait", "dep:serde"]
 # config / secrets) via the server's `AdminController` (the mutation logic, per-project rate
 # quota, and audit live a layer up). Needs async-trait for the object-safe controller trait.
 admin = ["engine", "dep:async-trait"]
+# The `session` binding: a duplex/resumable session handler (PLAN-session-primitive). The host
+# session store + re-entry driver + serving live a layer up (boatramp-server); this gates the WIT
+# `session` interface + the guest-export/host-import binding. Off by default (experimental).
+session = ["engine", "dep:async-trait"]
 
 [dependencies]
 boatramp-core.workspace = true
