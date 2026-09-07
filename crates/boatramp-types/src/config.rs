@@ -64,6 +64,10 @@ pub struct DeployConfig {
     /// Host-level SSE endpoints fanning out messaging topics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<StreamConfig>,
+    /// Duplex/resumable session routes (`PLAN-session-primitive`): a guest `session-handler` the
+    /// host re-enters per inbound frame, with host-owned ordering/resume/lifetime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionConfig>,
 }
 
 impl Default for DeployConfig {
@@ -85,6 +89,7 @@ impl Default for DeployConfig {
             consumers: Vec::new(),
             crons: Vec::new(),
             streams: Vec::new(),
+            sessions: Vec::new(),
         }
     }
 }
@@ -216,6 +221,18 @@ impl DeployConfig {
                 )));
             }
         }
+        for session in &self.sessions {
+            Pattern::compile(&session.route)?;
+            if session.component.is_empty() {
+                return Err(ConfigError::parse(format!(
+                    "session {} has an empty component path",
+                    session.route
+                )));
+            }
+            for import in &session.imports {
+                check_import(import)?;
+            }
+        }
         Ok(())
     }
 }
@@ -334,14 +351,21 @@ pub fn is_named_admin_import(import: &str) -> bool {
 }
 
 fn check_import(import: &str) -> Result<(), ConfigError> {
+    // `session` is accepted here (client-side cfg vocabulary) but is intentionally NOT in
+    // `KNOWN_IMPORTS`: a session route grants the session binding intrinsically, and the host
+    // advertises `session` as an Experimental capability only when the `session` feature is
+    // compiled — so the ABI gate (a component's `requires = ["session"]` vs the host's advertised
+    // set) enforces host support at activation, while this keeps `imports: ["session"]` from being
+    // rejected offline regardless of which host build the deploy targets.
     if KNOWN_IMPORTS.contains(&import)
+        || import == "session"
         || is_named_sql_import(import)
         || is_named_admin_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -588,6 +612,43 @@ pub struct StreamConfig {
     /// sends are dropped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_topic: Option<String>,
+}
+
+/// A **duplex, resumable session** route (`PLAN-session-primitive`): a long-lived,
+/// client-addressable, bidirectional channel served by a guest component's `session-handler`
+/// export, which the host re-enters per inbound frame (mechanism B). The host opens the session on
+/// `route` (SSE-out + POST-in), binds the verified principal, buffers/orders outbound frames with
+/// resume-from-cursor, and persists a resumable checkpoint. Frames are opaque bytes. Unlike a
+/// [`StreamConfig`] (host-only pub/sub fan-out), a session runs guest code and carries a backchannel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Route the session is opened at (the client `GET`s it for the SSE stream and `POST`s inbound
+    /// frames to it). Matcher syntax, like a handler route.
+    pub route: String,
+    /// Path to the session component `.wasm` within the deployment (exports `session-handler`).
+    pub component: String,
+    /// Requested capabilities (interface names; see `KNOWN_IMPORTS`). A session handler declares
+    /// `session` plus whatever `sql`/`orm`/`invoke`/… it uses per frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Optional resource limits (capped by site config at activation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<HandlerLimits>,
+    /// Static environment variables (never secrets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Function-to-function invoke allowlist (same contract as a handler's `invoke_targets`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invoke_targets: Vec<String>,
+    /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
+    /// **open** from the verified source and carried across every re-entry, so a frame-triggered
+    /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
+    /// JWKS/issuer verifying the app bearer for a `token`-sourced tenant (same as a function's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_claims: Option<HandlerGraphqlTokenClaims>,
 }
 
 /// Site-scoped, mutable configuration stored in the KV (not in the manifest).
@@ -1196,6 +1257,53 @@ mod tests {
         };
         let err = config.compile_check().unwrap_err().to_string();
         assert!(err.contains("looks like a secret"), "got: {err}");
+    }
+
+    #[test]
+    fn check_handlers_validates_sessions() {
+        // A well-formed session (compiling route, non-empty component, recognized imports incl.
+        // the intrinsic `session` token) passes.
+        let ok = DeployConfig {
+            sessions: vec![SessionConfig {
+                route: "/agent".into(),
+                component: "agent.wasm".into(),
+                imports: vec!["session".into(), "sql".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ok.compile_check().expect("valid session config");
+
+        // An empty component path is rejected.
+        let no_component = DeployConfig {
+            sessions: vec![SessionConfig {
+                route: "/agent".into(),
+                component: String::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(no_component
+            .compile_check()
+            .unwrap_err()
+            .to_string()
+            .contains("empty component"));
+
+        // An unknown import is rejected.
+        let bad_import = DeployConfig {
+            sessions: vec![SessionConfig {
+                route: "/agent".into(),
+                component: "agent.wasm".into(),
+                imports: vec!["not-a-capability".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(bad_import
+            .compile_check()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown handler import"));
     }
 
     #[test]

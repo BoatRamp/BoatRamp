@@ -1,0 +1,39 @@
+// The boatramp `session` capability interfaces, vendored for the guest. These MUST
+// match the host's definitions in boatramp-handlers (crates/boatramp-handlers/
+// wit/world.wit) exactly so the component links against the engine's binding.
+package boatramp:handlers;
+
+interface session-types {
+  /// A monotonic per-session outbound cursor (host-assigned). `0` = before the first frame.
+  type cursor = u64;
+
+  /// Why a session operation failed.
+  variant session-error {
+    access-denied,
+    frame-too-large,
+    buffer-full,
+    closed,
+    other(string),
+  }
+
+  /// The batch handed to one re-entry of the handler (mechanism B).
+  record session-input {
+    id: string,
+    resumed: option<list<u8>>,
+    frames: list<list<u8>>,
+  }
+}
+
+interface session {
+  use session-types.{cursor, session-error};
+
+  send: func(payload: list<u8>) -> result<cursor, session-error>;
+  checkpoint: func(snapshot: list<u8>) -> result<_, session-error>;
+  close: func(reason: string) -> result<_, session-error>;
+}
+
+interface session-handler {
+  use session-types.{session-input, session-error};
+
+  handle: func(input: session-input) -> result<_, session-error>;
+}

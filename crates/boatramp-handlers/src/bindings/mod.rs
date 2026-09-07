@@ -34,6 +34,8 @@ pub mod keyvalue;
 pub mod messaging;
 #[cfg(feature = "sql")]
 pub mod orm;
+#[cfg(feature = "session")]
+pub mod session;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod wasi_logging;
@@ -75,6 +77,10 @@ pub struct Bindings {
     /// the granted config surfaces. `None` = admin not granted.
     #[cfg(feature = "admin")]
     admin: Option<admin::AdminBinding>,
+    /// The `session` grant (duplex/resumable session): the controller bound to the current
+    /// session. `None` = session not granted.
+    #[cfg(feature = "session")]
+    session: Option<session::SessionBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -314,5 +320,19 @@ impl Bindings {
     #[cfg(feature = "admin")]
     pub(crate) fn admin(&self) -> Option<&admin::AdminBinding> {
         self.admin.as_ref()
+    }
+
+    /// Bind the `session` grant: the controller for the current session (host-bound, so the guest
+    /// addresses no id). The re-entry driver sets this per invocation.
+    #[cfg(feature = "session")]
+    pub fn with_session(mut self, controller: Arc<dyn session::SessionController>) -> Self {
+        self.session = Some(session::SessionBinding { controller });
+        self
+    }
+
+    /// The granted session binding, if any.
+    #[cfg(feature = "session")]
+    pub(crate) fn session(&self) -> Option<&session::SessionBinding> {
+        self.session.as_ref()
     }
 }

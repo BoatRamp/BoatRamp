@@ -573,3 +573,33 @@ jobs:
             || { echo "::error::admin capability test did not pass" >&2; exit 1; }
           grep -q 'ADMIN CAPABILITY GATE OK' admin.log \
             || { echo "::error::admin capability never reached the success marker (silent skip or tenant breach?)" >&2; exit 1; }
+
+  # Tier I — the duplex/resumable `session` capability (`boatramp:handlers/session`). Drives the
+  # REAL serving pipeline (router → serve_resolved → the session GET/POST routes) re-entering a REAL
+  # compiled guest component (the committed `session-echo.wasm` fixture — no wasm build at gate time)
+  # and asserts the end-to-end contract: duplex send/recv, checkpoint-resume, cursor-resume,
+  # idempotent redelivery, guest-initiated close, and session-id hardening. No privileges, no
+  # secrets, no egress — the thing under test is the serving + delivery + tenancy path itself.
+  session:
+    name: session capability duplex + resume + close
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capability-session
+
+      - name: Duplex + resume + dedup + close hold end to end (hard gate)
+        run: |
+          set -o pipefail
+          # Drives router() → the session routes → the engine re-entering the compiled guest, and
+          # asserts the whole contract against an in-memory control plane.
+          cargo test -p boatramp-server --features session --test session_live \
+            -- --ignored --nocapture 2>&1 | tee session.log
+          # A silent skip still prints `test result: ok`; gate on the success marker that prints
+          # ONLY after every property held against the real guest (the anti-silent-skip rule).
+          grep -qE 'test result: ok' session.log \
+            || { echo "::error::session capability test did not pass" >&2; exit 1; }
+          grep -q 'SESSION CAPABILITY GATE OK' session.log \
+            || { echo "::error::session capability never reached the success marker (silent skip or broken duplex/resume?)" >&2; exit 1; }

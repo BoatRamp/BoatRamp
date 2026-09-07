@@ -662,3 +662,79 @@ world admin-host {
 world wasi-logging-host {
   import wasi:logging/logging;
 }
+
+/// Value types for the duplex, resumable **session** capability (`PLAN-session-primitive`): a
+/// long-lived, client-addressable, bidirectional channel whose lifetime, ordering, backpressure,
+/// and resume the host owns. Every frame is **opaque bytes** — the host never parses one.
+interface session-types {
+  /// A monotonic per-session outbound cursor (host-assigned). `0` = before the first frame.
+  type cursor = u64;
+
+  /// Why a session operation failed.
+  variant session-error {
+    /// The `session` capability was not granted to this component.
+    access-denied,
+    /// The frame exceeded the host's per-frame byte cap.
+    frame-too-large,
+    /// The unacked outbound buffer is full — backpressure; retry after the client acks.
+    buffer-full,
+    /// The session is closed.
+    closed,
+    /// Any other backend error.
+    other(string),
+  }
+
+  /// The batch handed to one re-entry of the handler (mechanism B): the session id, the last
+  /// checkpoint to resume from (if any), and the pending inbound frames in order. The host holds
+  /// the session state between re-entries; the guest rehydrates from `resumed` (it must NOT rely on
+  /// in-memory state surviving across re-entries — only a `checkpoint` survives).
+  record session-input {
+    id: string,
+    resumed: option<list<u8>>,
+    frames: list<list<u8>>,
+  }
+}
+
+/// The host half a session handler imports: enqueue an outbound frame, set a resumable checkpoint,
+/// and close. All operate on the **current** session, bound host-side at open — the guest names no
+/// id and cannot address another session (cross-session/cross-tenant reach is structurally absent).
+interface session {
+  use session-types.{cursor, session-error};
+
+  /// Enqueue an outbound frame (host → client). Ordered; the host assigns + returns its cursor and
+  /// retains it for at-least-once redelivery until the client acks.
+  send: func(payload: list<u8>) -> result<cursor, session-error>;
+
+  /// Set the resumable snapshot (host persists it; replayed as `session-input.resumed` on the next
+  /// re-entry). Opaque app state — the host never parses it.
+  checkpoint: func(snapshot: list<u8>) -> result<_, session-error>;
+
+  /// End the session with a reason; the client is notified and no further frames flow.
+  close: func(reason: string) -> result<_, session-error>;
+}
+
+/// The handler half: the host calls `handle` once per re-entry with the pending inbound batch. `ok`
+/// commits the invocation's `send`s + `checkpoint`; `err`/trap fails the re-entry (the inbound
+/// frames are redelivered per the host's at-least-once semantics).
+interface session-handler {
+  use session-types.{session-input, session-error};
+
+  /// Process one re-entry's inbound batch (rehydrate from `input.resumed`, `send`/`checkpoint` as
+  /// needed). `ok` commits; `err`/trap redelivers.
+  handle: func(input: session-input) -> result<_, session-error>;
+}
+
+/// A session component: it imports the session host half and must export the handler (like a
+/// messaging `consumer`). Gated by the host `session` capability + the manifest `requires`. The
+/// host `bindgen!`s this for the export caller (invoking `session-handler.handle`).
+world session-host {
+  import session;
+  export session-handler;
+}
+
+/// Import-only world for the host `session` binding (the `SessionHost`/`SessionController` Host
+/// impl), mirroring `admin-host` — generates just the `session` import Host trait, no export
+/// machinery. (The full `session-host` world above is what the engine `bindgen!`s for dispatch.)
+world session-import-host {
+  import session;
+}

@@ -45,6 +45,8 @@ pub mod mode;
 pub mod orm;
 pub mod project;
 pub mod secret_store;
+/// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
+pub mod session;
 pub mod sql;
 /// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
 pub mod time;

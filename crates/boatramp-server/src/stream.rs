@@ -39,7 +39,7 @@ pub(super) fn route_matches(route: &str, request_path: &str) -> bool {
 
 /// RAII decrement for the per-`(scope, IP)` live-stream counter.
 #[cfg(feature = "handlers")]
-struct IpStreamGuard {
+pub(super) struct IpStreamGuard {
     counts: Arc<std::sync::Mutex<std::collections::HashMap<(String, IpAddr), u32>>>,
     key: (String, IpAddr),
 }
@@ -73,7 +73,7 @@ struct StreamConn {
 /// only once the scope's streams have drained (same as the per-site concurrency
 /// semaphore). `Err(())` when the scope is at its cap.
 #[cfg(feature = "handlers")]
-fn acquire_stream_permit(
+pub(super) fn acquire_stream_permit(
     inner: &HandlerRuntimeInner,
     scope: &str,
     site_handlers: &boatramp_core::config::HandlersSiteConfig,
@@ -95,7 +95,7 @@ fn acquire_stream_permit(
 /// decrements the counter on drop. `Err(())` when this IP already holds
 /// [`MAX_STREAMS_PER_IP`] streams on the scope.
 #[cfg(feature = "handlers")]
-fn acquire_stream_ip_slot(
+pub(super) fn acquire_stream_ip_slot(
     inner: &HandlerRuntimeInner,
     scope: &str,
     ip: IpAddr,

@@ -30,6 +30,7 @@ exclude = [
   "examples/handlers/sql-counter",
   "examples/handlers/sql-named",
   "examples/handlers/event-consumer",
+  "examples/handlers/session-echo",
   "examples/handlers/invoke-caller",
   "examples/handlers/graphql-run-caller",
   "examples/handlers/graphql-accounts",

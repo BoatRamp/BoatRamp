@@ -248,6 +248,15 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
         name: "streaming",
         lifecycle: Stable,
     });
+    // The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive).
+    // Cargo-gated on `session`; experimental until the shape settles. A guest declares
+    // `requires = ["session"]` and a deploy against a host without it is refused cleanly.
+    if cfg!(feature = "session") {
+        f.push(CapabilityFeature {
+            name: "session",
+            lifecycle: Experimental,
+        });
+    }
     if cfg!(feature = "orm-subquery") {
         // Correlated roll-ups ship off-by-default (the riskiest query surface) — experimental
         // until the shape settles.
@@ -565,6 +574,8 @@ mod tests {
             host.contains(&"orm-subquery"),
             cfg!(feature = "orm-subquery")
         );
+        // The session capability is cargo-gated too: advertised iff this build enabled it.
+        assert_eq!(host.contains(&"session"), cfg!(feature = "session"));
         // The detailed registry pairs each name with a lifecycle, and its names are exactly the
         // flat list (one source of truth — the flat list derives from the detailed one).
         let detailed = host_capability_features_detailed();
