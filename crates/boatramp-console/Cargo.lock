@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-console"
-version = "0.3.17"
+version = "0.4.0"
 dependencies = [
  "base64",
  "boatramp-types",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "boatramp-types"
-version = "0.3.17"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "async-trait",

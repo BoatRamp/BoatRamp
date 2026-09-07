@@ -5,7 +5,7 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-09-07
 
 ### Added
 - **Typed `orm` builder — full verb/clause surface (`boatramp:handlers/orm`).** The typed,
