@@ -216,8 +216,11 @@ impl SessionStore {
         }
     }
 
-    /// The verified principal bound at open — the driver rebuilds `HostTenancy` from it so
-    /// frame-triggered `sql`/`orm` is host-scoped identically to a normal handler.
+    /// The opaque sealed principal bound at open — compared **for equality** to admit a re-open /
+    /// re-entry (a mismatch is a within-project hijack, refused). It is never parsed back into a
+    /// `HostTenancy`: a frame re-entry re-resolves the principal from its own request
+    /// (`resolve_session_principal`) and host-scopes `sql`/`orm` from that, identically to a normal
+    /// handler — the seal is only the identity the re-entry must match.
     pub(crate) async fn principal(
         &self,
         project: &str,
