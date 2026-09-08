@@ -254,13 +254,30 @@ pub(super) async fn dispatch_handler(
     // Edge response cache: on a cacheable request a fresh hit short-circuits the
     // whole handler path — no blob read, no bindings, no instantiation. The write
     // context is captured here because `serve_with_limits` below consumes `request`.
+    // R3 (PLAN-tenancy-principal): resolve — or, on a first anonymous request to an R3 project,
+    // mint — the host-signed session cookie. `session_cookie` feeds the `Session` scope-fact; a
+    // freshly-minted `set_session_cookie` is added to the response (`Set-Cookie`) below. Resolved
+    // **before** the edge cache so a session-scoped response is never shared-cached (see below).
+    let (session_cookie, set_session_cookie) = resolve_or_mint_session(
+        request.headers(),
+        inner,
+        boatramp_core::project::ProjectRef::new(project),
+    )
+    .await;
+    // The edge cache is keyed on the project/site + path, NOT the session id, so it MUST NOT serve
+    // or store a response computed under a per-visitor `Session` fact — that would leak one anon
+    // visitor's `tenant IS NULL` rows to another. When a session fact is in play, bypass the cache
+    // entirely (both read and write); non-R3 traffic caches as before.
     let cache_cfg = handler_cache::config_for(site_handlers);
-    let cache_key = cache_cfg.as_ref().and_then(|cfg| {
-        handler_cache::request_lookupable(cfg, request.method()).then(|| {
-            let path_and_query = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
-            handler_cache::cache_key(&scope, request.method(), path_and_query)
-        })
-    });
+    let cache_key = cache_cfg
+        .as_ref()
+        .filter(|_| session_cookie.is_none())
+        .and_then(|cfg| {
+            handler_cache::request_lookupable(cfg, request.method()).then(|| {
+                let path_and_query = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
+                handler_cache::cache_key(&scope, request.method(), path_and_query)
+            })
+        });
     if let Some(key) = &cache_key {
         if let Some(hit) = handler_cache::lookup_response(
             inner.kv.as_ref(),
@@ -315,15 +332,6 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::DomainContext>()
         .map(|c| c.0.clone());
-    // R3 (PLAN-tenancy-principal): resolve — or, on a first anonymous request to an R3 project,
-    // mint — the host-signed session cookie. `session_cookie` feeds the `Session` scope-fact; a
-    // freshly-minted `set_session_cookie` is added to the response (`Set-Cookie`) below.
-    let (session_cookie, set_session_cookie) = resolve_or_mint_session(
-        request.headers(),
-        inner,
-        boatramp_core::project::ProjectRef::new(project),
-    )
-    .await;
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -837,13 +845,16 @@ const SESSION_COOKIE_NAME: &str = "br_session";
 const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// A random 16-byte session id (hex, OS CSPRNG) — unguessable so the anonymous partition can't be
-/// enumerated (the cookie is a bearer for its own `tenant IS NULL` rows).
-fn new_session_sid() -> String {
+/// enumerated (the cookie is a bearer for its own `tenant IS NULL` rows). **Fail-closed**: an RNG
+/// failure returns `None` (no cookie minted) rather than a predictable/all-zero sid that would
+/// collide two visitors' partitions — mirroring the token layer's `random_cti`.
+fn new_session_sid() -> Option<String> {
     let mut bytes = [0u8; 16];
     if getrandom::getrandom(&mut bytes).is_err() {
-        tracing::error!("getrandom failed generating a session id");
+        tracing::error!("getrandom failed generating a session id — not minting a session cookie");
+        return None;
     }
-    hex::encode(bytes)
+    Some(hex::encode(bytes))
 }
 
 /// Resolve (or mint) the R3 anonymous session cookie for a request: `.0` is the cookie value to feed
@@ -878,14 +889,10 @@ async fn resolve_or_mint_session(
             return (Some(cookie), None);
         }
     }
-    match boatramp_core::cose::mint_session(
-        &new_session_sid(),
-        SESSION_TTL_SECS,
-        now,
-        signer.as_ref(),
-    )
-    .await
-    {
+    let Some(sid) = new_session_sid() else {
+        return (None, None); // fail-closed on an RNG failure — no cookie rather than a weak one
+    };
+    match boatramp_core::cose::mint_session(&sid, SESSION_TTL_SECS, now, signer.as_ref()).await {
         Ok(cookie) => {
             let set = format!(
                 "{SESSION_COOKIE_NAME}={cookie}; Path=/; Max-Age={SESSION_TTL_SECS}; \
