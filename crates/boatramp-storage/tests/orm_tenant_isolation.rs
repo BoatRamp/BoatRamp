@@ -1050,10 +1050,89 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
         );
     }
 
+    // 6) PROMOTE (D7): a returning visitor authenticates as `acme` and claims their sess-1 rows. The
+    //    verb lowers to `UPDATE carts SET tenant_id = ? WHERE (session_id = ? AND tenant_id IS NULL)`
+    //    — the `IS NULL` anti-widening guard means it can ONLY claim not-yet-owned session rows.
+    {
+        let sc = scope(Some("acme"), Some("sess-1"));
+        let (sql, params) =
+            boatramp_core::orm::compile_promote(&sc, "carts", Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("SET tenant_id = ?")
+                && sql.contains("session_id = ?")
+                && sql.contains("tenant_id IS NULL"),
+            "promote must set tenant_id where session matches AND tenant IS NULL: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let affected = tx.execute(&sql, &params).await.unwrap();
+        assert_eq!(
+            affected, 1,
+            "promote claims exactly sess-1's one not-yet-owned cart"
+        );
+        // sess-1's cart is now acme's (session_id preserved); acme (tenant-only) now reads it.
+        let acme_carts = {
+            let (rsql, rparams) = read_items(&scope(Some("acme"), None));
+            run_query(tx.as_mut(), &rsql, &rparams).await
+        };
+        assert_eq!(
+            acme_carts,
+            vec!["acme-cart".to_string(), "anon-cart-1".to_string()],
+            "after promote, acme owns its original cart + the claimed session cart"
+        );
+        // Anti-widening: sess-2's cart was NOT claimed (different session) and stays anon.
+        let sess2 = {
+            let (rsql, rparams) = read_items(&scope(None, Some("sess-2")));
+            run_query(tx.as_mut(), &rsql, &rparams).await
+        };
+        assert_eq!(
+            sess2,
+            vec!["anon-cart-2".to_string()],
+            "a different session's cart is untouched by acme's promotion"
+        );
+        // Idempotent / race-safe: a second promote matches nothing (the rows are no longer NULL).
+        let (sql2, params2) =
+            boatramp_core::orm::compile_promote(&sc, "carts", Dialect::Sqlite).unwrap();
+        assert_eq!(
+            tx.execute(&sql2, &params2).await.unwrap(),
+            0,
+            "re-promoting is a no-op (IS NULL guard)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 7) Promote is deny-by-default: it needs BOTH facts (an anon-only or tenant-only principal is
+    //    refused), and only on a TenantOrSession table.
+    {
+        assert!(
+            matches!(
+                boatramp_core::orm::compile_promote(
+                    &scope(None, Some("sess-1")),
+                    "carts",
+                    Dialect::Sqlite
+                ),
+                Err(boatramp_core::orm::OrmError::TenancyNoPrincipal)
+            ),
+            "promote with no tenant fact must be refused"
+        );
+        assert!(
+            matches!(
+                boatramp_core::orm::compile_promote(
+                    &scope(Some("acme"), None),
+                    "carts",
+                    Dialect::Sqlite
+                ),
+                Err(boatramp_core::orm::OrmError::TenancyNoPrincipal)
+            ),
+            "promote with no session fact must be refused"
+        );
+    }
+
     println!(
         "ORM TENANT-OR-SESSION DISJUNCT OK: anon session reads/writes only its own session rows \
          (keyed on session_id, never tenant_id); an authenticated actor reads only its tenant rows; \
          both-fact reads the Or of the two disjoint columns; an anon write stamps its own session \
-         (forged tenant/session overridden); a read with no principal is refused deny-by-default"
+         (forged tenant/session overridden); a read with no principal is refused deny-by-default; \
+         promote (D7) claims only this session's not-yet-owned rows (IS NULL anti-widening, \
+         idempotent), needs both facts, and can't touch another session's or tenant's rows"
     );
 }

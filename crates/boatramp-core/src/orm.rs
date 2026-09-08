@@ -1911,6 +1911,63 @@ impl Delete {
     }
 }
 
+/// Compile the deny-by-default **`promote`** verb (PLAN-tenancy-principal D7): claim a returning
+/// visitor's anonymous-session rows for their now-authenticated tenant. It is a **distinct
+/// host-mediated verb**, never an [`AccessMode`](crate::tenancy::AccessMode) or a guest-authored
+/// UPDATE — the guest can name neither the session value nor the cross-axis NULL.
+///
+/// Requires `table` to be a [`TableScope::TenantOrSession`](crate::tenancy::TableScope) table AND
+/// the [`Scope`] to carry BOTH a tenant fact `T` (`value`) and a session fact `S` (`session`) — else
+/// refused ([`OrmError::TenancyNoPrincipal`] / [`OrmError::BadExpr`]). Lowers to:
+///
+/// ```sql
+/// UPDATE <table> SET <tenant_col> = T WHERE <session_col> = S AND <tenant_col> IS NULL
+/// ```
+///
+/// The `<tenant_col> IS NULL` match is the **anti-widening guard**: promotion can only claim rows
+/// not yet owned by any tenant, never re-home another tenant's rows into `T`. It is non-escalating,
+/// idempotent, and race-safe — a second promotion (or a concurrent one that lost) matches nothing.
+pub fn compile_promote(scope: &Scope, table: &str, dialect: Dialect) -> Result<Compiled, OrmError> {
+    let (tenant_col, session_col) = match scope.resolve_table(table)? {
+        ResolvedScope::TenantOrSession { tenant, session } => (tenant, session),
+        _ => {
+            return Err(OrmError::BadExpr(
+                "promote requires a TenantOrSession table (an anonymous-first table)",
+            ))
+        }
+    };
+    ident(&tenant_col)?;
+    ident(&session_col)?;
+    // BOTH facts are mandatory — promotion is the authenticated claim of one's own anon session.
+    let tenant = scope.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+    let session = scope.session.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+    let promote = Update {
+        table: table.to_string(),
+        // set the tenant column to the resolved tenant fact.
+        set: vec![Assignment {
+            column: tenant_col.clone(),
+            value: Expr::val(tenant),
+        }],
+        // match this session's not-yet-owned rows only (the anti-widening guard).
+        filter: Predicate::And(vec![
+            Predicate::Cmp {
+                left: Expr::Column(session_col),
+                op: CmpOp::Eq,
+                right: Expr::val(session),
+            },
+            Predicate::Null {
+                expr: Expr::Column(tenant_col),
+                negated: false,
+            },
+        ]),
+        // The promotion IS the scope; no additional host force_scope (and the tenant-column SET is
+        // the sanctioned reassignment-from-NULL, so the usual reassignment SET-drop must NOT fire).
+        scope: None,
+        returning: vec![],
+    };
+    promote.compile(dialect)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
