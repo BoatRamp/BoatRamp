@@ -439,6 +439,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             ),
             ("countries".into(), TableScope::Unscoped),
         ]),
+        ..Default::default()
     };
     let keys = TableKeys::PerTable(schema.table_key_map());
     let scope_for = |tenant: &str| Scope {
@@ -669,6 +670,7 @@ async fn run_session_disjunct_battery(
         default_tenant_key: "tenant_id".into(),
         session_key: Some("session_id".into()),
         tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+        ..Default::default()
     };
     let keys = TableKeys::PerTable(schema.table_key_map());
     let sc = |tenant: Option<&str>, session: Option<&str>| Scope {

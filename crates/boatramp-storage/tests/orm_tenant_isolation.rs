@@ -419,6 +419,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             ),
             ("countries".into(), TableScope::Unscoped),
         ]),
+        ..Default::default()
     };
     // Build the scope exactly as `HostTenancy::with_schema(&schema).orm_scope()` does.
     let keys = TableKeys::PerTable(schema.table_key_map());
@@ -882,6 +883,7 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
         default_tenant_key: "tenant_id".into(),
         session_key: Some("session_id".into()),
         tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+        ..Default::default()
     };
     let keys = TableKeys::PerTable(schema.table_key_map());
     // A read/write scope carrying whichever axis facts the request holds (mode `own`).

@@ -12,7 +12,7 @@
 //! This module carries only the wasm-clean *declaration*. Resolving the tenant **value** from the
 //! source and building the injected row scope happens above (host-side), where `SqlValue` lives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,127 @@ where
         }
     }
     deserializer.deserialize_any(SourcesVisitor)
+}
+
+/// A **closed** set of the host-verified/host-resolved sources for the *target* axis (R4/D8) — a
+/// SECOND tenant `B` (≠ the caller's own tenant `A`), used only to read `B`'s deliberately-published
+/// PUBLIC subset. Deliberately **distinct** from [`TenantSource`] so `Handle` (a public slug) is
+/// *unrepresentable* on the own/session/private axes at the type level — a guest can never name its
+/// OWN tenant, only a public target, and only within the guardrails (G1–G6). `via` is a
+/// priority-ordered list of these, homogeneous in tier by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TargetSource {
+    /// The terminating request domain, host-verified (same-origin, write-capable) — a world-public
+    /// funnel served on the tenant's own host. Tier-2 (published storefront/directory).
+    Domain,
+    /// A public **slug/handle** passed from a third-party origin (embed / aggregator / preview):
+    /// **READ-ONLY (G1)** and admissible **only** on a `world_public` subset (G2). It names public
+    /// data, so it grants nothing an anonymous GET of that data wouldn't. Never on a write field.
+    Handle,
+    /// A host-verified **capability token** carrying the target facts (`tid`, `sub`): the token is
+    /// the *authorization* (tier-3 embed/handoff, NOT world-public), so it is never mixed with
+    /// `Handle` and can back a target write.
+    Capability,
+}
+
+/// The tenancy **class** a root Query/Mutation field (or a plain-wasm route) runs under (R4/D8),
+/// composed from the trusted SDL `@tenant` directive at publish and gated by the operator's
+/// [`TenancySchema::target_eligible_fields`]. Looked up by the host planner and bound **before the
+/// guest runs** — there is no request-time parameter expressing own-vs-target, so a guest can never
+/// select or detect which scope it got (picking the wrong scope is *unrepresentable*). Absent ⇒
+/// `Own` (byte-identical to pre-Stage-5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TenancyClass {
+    /// The caller's OWN resolved tenant/session (today's behavior).
+    #[default]
+    Own,
+    /// A SECOND tenant `B`'s PUBLIC subset. `via` is the prioritized target-source list
+    /// (first-resolves-wins); `public` NAMES the host-held public subset to confine to; `write` is
+    /// the (deny-by-default, empty ⇒ read-only) SET-allowlist of columns a target write may set.
+    Target {
+        via: Vec<TargetSource>,
+        public: String,
+        #[serde(default)]
+        write: Vec<String>,
+    },
+}
+
+impl TenancyClass {
+    /// Whether this class reads/writes another tenant (target axis) vs. the caller's own.
+    pub fn is_target(&self) -> bool {
+        matches!(self, Self::Target { .. })
+    }
+}
+
+/// One host-held visibility term of a [`PublicPredicate`] — `column <op> literal` or a null test.
+/// Never a DSL, never guest-authored or claim-bound: a fixed shape over a literal only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicTerm {
+    /// `column <op> <value>` (e.g. `published = true`).
+    Cmp {
+        column: String,
+        op: PublicCmp,
+        value: PublicLiteral,
+    },
+    /// `column IS [NOT] NULL` (e.g. `deleted_at IS NULL`).
+    Null { column: String, negated: bool },
+}
+
+/// The comparison operators a [`PublicTerm`] may use (a closed set — visibility predicates only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// A literal a [`PublicTerm`] compares against. Types-local (this crate is `SqlValue`-free —
+/// boatramp-core lowers it to a bound `SqlValue` at injection, so the literal is always a parameter,
+/// never interpolated text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicLiteral {
+    Bool(bool),
+    Int(i64),
+    Text(String),
+}
+
+/// A host-held definition of a table's PUBLIC rows (R4/D8): a **closed conjunction** of visibility
+/// terms (`published = true AND deleted_at IS NULL`). A target READ conjoins it (never sees a
+/// non-public row of `B`); a target WRITE filters on it (a non-public row is a fail-closed no-op).
+/// Host-held per table — never a guest-authored DSL — so a guest can never widen its own visibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PublicPredicate {
+    /// The conjoined terms (AND). Empty is legal but meaningless (matches every row) — the schema
+    /// loader should reject an empty public predicate on a `world_public` subset.
+    pub terms: Vec<PublicTerm>,
+}
+
+/// A named PUBLIC subset (R4/D8): a table's [`PublicPredicate`] plus the two **separate**,
+/// deny-by-default, operator-held flags that gate the least-trusted target sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PublicSubset {
+    /// The visibility predicate confining a target read/write to public rows.
+    pub predicate: PublicPredicate,
+    /// **G2** — is this subset readable by an anonymous `Handle` (public slug) at all? A SEPARATE,
+    /// explicit flag, NOT "has a public subset" (every target field has one, incl. tier-3 capability
+    /// data). `false` (default) ⇒ `handle` is refused on this subset at composition, regardless of a
+    /// field's declared `via` list — so a tier-2 handle can never reach tier-3 data.
+    pub world_public: bool,
+    /// Whether this table's tenants are discoverable by a `handle` lookup (`SELECT tenant WHERE slug
+    /// = ? AND listable = true`). Directory-scraping of listable tenants is confidentiality-neutral
+    /// (that is what listable means) but rate-limited (G5). `false` (default) ⇒ no handle resolves.
+    pub listable: bool,
 }
 
 /// Which **axis** a resolved tenant fact belongs to (`PLAN-tenancy-principal` D1). The host-resolved
@@ -262,6 +383,20 @@ pub struct TenancySchema {
     /// Per-table scope facts. Authoritative + exhaustive when a schema is present (an absent table
     /// is refused, not defaulted — see the type doc).
     pub tables: BTreeMap<String, TableScope>,
+    /// **R4 target axis — the operator's host-held allowlist ceiling.** The set of root
+    /// Query/Mutation field names (and plain-wasm route ids) that may carry `@tenant(scope: target)`
+    /// at all. Composition **refuses** a `target` field absent from this set — the app declares
+    /// intent in its SDL, but the operator gates which fields may cross to another tenant. Empty ⇒
+    /// no field may be target (deny-by-default).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub target_eligible_fields: BTreeSet<String>,
+    /// **R4 target axis — per-table PUBLIC subset definitions.** Keyed by table name: the host-held
+    /// visibility predicate + the deny-by-default `world_public`/`listable` flags a target read/write
+    /// confines to. A `target` field over a table with **no** entry here is refused at composition
+    /// (mandatory — deny-by-default); the ORM join composition refuses a joined table with no entry
+    /// under a target read (the strict analog of the missing-tenant-column fail-close).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub public_subsets: BTreeMap<String, PublicSubset>,
 }
 
 impl Default for TenancySchema {
@@ -270,6 +405,8 @@ impl Default for TenancySchema {
             default_tenant_key: "tenant_id".to_string(),
             session_key: None,
             tables: BTreeMap::new(),
+            target_eligible_fields: BTreeSet::new(),
+            public_subsets: BTreeMap::new(),
         }
     }
 }
@@ -284,7 +421,25 @@ impl TenancySchema {
             default_tenant_key: "tenant_id".to_string(),
             session_key: None,
             tables: BTreeMap::new(),
+            // A deny-all posture must also refuse every target field + declare no public subset, so
+            // the target axis fails closed exactly like the own axis when a schema can't be read.
+            target_eligible_fields: BTreeSet::new(),
+            public_subsets: BTreeMap::new(),
         }
+    }
+
+    /// Whether a root field / route `field` is operator-permitted to carry `@tenant(scope: target)`
+    /// (the host-held allowlist ceiling). Composition refuses a `target` field for which this is
+    /// `false`, so the app's SDL intent can never exceed the operator's grant.
+    pub fn target_field_eligible(&self, field: &str) -> bool {
+        self.target_eligible_fields.contains(field)
+    }
+
+    /// The host-held PUBLIC subset for `table` (its visibility predicate + `world_public`/`listable`
+    /// flags), or `None` when the table declares none — a target read/write over which is refused
+    /// (deny-by-default), including a joined ref with no declared subset.
+    pub fn public_subset(&self, table: &str) -> Option<&PublicSubset> {
+        self.public_subsets.get(table)
     }
 
     /// Resolve how to scope `table`. `None` ⇒ **refused** (undeclared under a present schema —
@@ -387,6 +542,7 @@ mod tests {
             default_tenant_key: "tenant_id".into(),
             session_key: Some("session_id".into()),
             tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+            ..Default::default()
         };
         assert_eq!(
             s.resolve("carts"),
@@ -403,6 +559,7 @@ mod tests {
             default_tenant_key: "tenant_id".into(),
             session_key: None,
             tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+            ..Default::default()
         };
         assert_eq!(s.resolve("carts"), None);
         assert!(
@@ -505,5 +662,77 @@ mod tests {
         };
         let s = serde_json::to_string(&t).unwrap();
         assert_eq!(t, serde_json::from_str::<Tenancy>(&s).unwrap());
+    }
+
+    #[test]
+    fn tenancy_class_default_is_own_and_target_flag() {
+        assert_eq!(TenancyClass::default(), TenancyClass::Own);
+        assert!(!TenancyClass::Own.is_target());
+        let tgt = TenancyClass::Target {
+            via: vec![TargetSource::Domain, TargetSource::Handle],
+            public: "storefront".into(),
+            write: vec![],
+        };
+        assert!(tgt.is_target());
+        // Round-trips (the class rides on the composed supergraph).
+        assert_eq!(
+            tgt,
+            serde_json::from_str(&serde_json::to_string(&tgt).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn target_schema_facts_roundtrip_and_gate_deny_by_default() {
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("products".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema
+            .target_eligible_fields
+            .insert("publicProducts".into());
+        schema.public_subsets.insert(
+            "products".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![
+                        PublicTerm::Cmp {
+                            column: "published".into(),
+                            op: PublicCmp::Eq,
+                            value: PublicLiteral::Bool(true),
+                        },
+                        PublicTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+
+        // The operator allowlist gates which fields may be target (deny-by-default).
+        assert!(schema.target_field_eligible("publicProducts"));
+        assert!(!schema.target_field_eligible("secretOrders"));
+        // A declared public subset resolves; an undeclared table is None (⇒ refused downstream).
+        assert!(schema.public_subset("products").unwrap().world_public);
+        assert!(schema.public_subset("orders").is_none());
+
+        // The whole schema round-trips (it is stored/loaded as the project config).
+        let s = serde_json::to_string(&schema).unwrap();
+        assert_eq!(schema, serde_json::from_str::<TenancySchema>(&s).unwrap());
+    }
+
+    #[test]
+    fn a_pre_stage5_schema_deserializes_with_empty_target_facts() {
+        // A schema stored by a pre-Stage-5 binary has no target fields; `#[serde(default)]` must
+        // fill them empty (no target eligibility, no public subsets) — a clean fail-closed default,
+        // never a parse error under `deny_unknown_fields`.
+        let legacy = r#"{"default_tenant_key":"tenant_id","tables":{"notes":{"kind":"tenant"}}}"#;
+        let schema: TenancySchema = serde_json::from_str(legacy).unwrap();
+        assert!(schema.target_eligible_fields.is_empty());
+        assert!(schema.public_subsets.is_empty());
+        assert!(!schema.target_field_eligible("anything"));
     }
 }
