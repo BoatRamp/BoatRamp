@@ -183,6 +183,26 @@ impl TenancySchema {
             TableScope::Unscoped => Some(ResolvedScope::Unscoped),
         }
     }
+
+    /// The `table → Some(column) | None(=Unscoped)` map the host threads into the ORM scope injector
+    /// (wrapped as `boatramp_core::orm::TableKeys::PerTable` one layer up — that type lives in the
+    /// crate that owns the injector, which depends on this one). The [`TableScope`] match is
+    /// exhaustive **here**, in its defining crate, so adding a variant is a compile error to classify
+    /// rather than a silent miss (a `#[non_exhaustive]` match elsewhere would need a wildcard, which
+    /// could quietly scope a new kind wrongly). An empty schema yields an empty map.
+    pub fn table_key_map(&self) -> BTreeMap<String, Option<String>> {
+        self.tables
+            .iter()
+            .map(|(table, scope)| {
+                let column = match scope {
+                    TableScope::Tenant => Some(self.default_tenant_key.clone()),
+                    TableScope::TenantKeyed { key } => Some(key.clone()),
+                    TableScope::Unscoped => None,
+                };
+                (table.clone(), column)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

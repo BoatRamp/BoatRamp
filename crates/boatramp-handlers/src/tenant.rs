@@ -60,11 +60,16 @@ pub struct HostTenancy {
     value: Option<SqlValue>,
     read: AccessMode,
     write: AccessMode,
+    /// Per-table tenant-key resolution from the project [`TenancySchema`](boatramp_core::tenancy::TenancySchema)
+    /// (Stage 1 / R2). `Uniform` (no project schema) ⇒ every table scopes on `column`; `PerTable`
+    /// ⇒ the identity table on its own PK, `Unscoped` tables skipped, undeclared tables refused.
+    keys: boatramp_core::orm::TableKeys,
 }
 
 impl HostTenancy {
-    /// Build a resolved tenancy. `column` is the tenant column; `value` the resolved tenant (if
-    /// any); `read`/`write` the posture-capped access modes.
+    /// Build a resolved tenancy. `column` is the default tenant column; `value` the resolved tenant
+    /// (if any); `read`/`write` the posture-capped access modes. Per-table keys default to
+    /// `Uniform` (legacy single-column); attach a project schema with [`with_schema`](Self::with_schema).
     pub fn new(
         column: impl Into<String>,
         value: Option<SqlValue>,
@@ -76,7 +81,21 @@ impl HostTenancy {
             value,
             read,
             write,
+            keys: boatramp_core::orm::TableKeys::Uniform,
         }
+    }
+
+    /// Attach the project's per-table tenancy map (R2), so each table scopes on its own key (the
+    /// identity table on its PK, `Unscoped` tables skipped, undeclared tables refused). `None` /
+    /// an empty schema leaves the `Uniform` single-column behavior. Chained by the host at bind time.
+    #[must_use]
+    pub fn with_schema(mut self, schema: Option<&boatramp_core::tenancy::TenancySchema>) -> Self {
+        if let Some(s) = schema {
+            if !s.tables.is_empty() {
+                self.keys = boatramp_core::orm::TableKeys::PerTable(s.table_key_map());
+            }
+        }
+        self
     }
 
     /// The resolved tenant value, if any. Used by the host to **propagate** the caller's tenant
@@ -122,9 +141,9 @@ impl HostTenancy {
             column: self.column.clone(),
             value,
             mode,
-            // Stage 1: the per-table key map (from the project TenancySchema) is threaded in by the
-            // binding in a later increment; `Uniform` preserves the pre-schema single-column behavior.
-            keys: boatramp_core::orm::TableKeys::Uniform,
+            // The project schema's per-table key map (R2), resolved at `HostTenancy::new`; `Uniform`
+            // when the project declared no schema (byte-identical to the pre-schema behavior).
+            keys: self.keys.clone(),
         }))
     }
 
@@ -211,6 +230,49 @@ mod tests {
         );
         // `all` on the write axis → no scope (unscoped by design).
         assert_eq!(ht.orm_scope(Axis::Write).unwrap(), None);
+    }
+
+    #[test]
+    fn with_schema_puts_per_table_keys_on_the_scope() {
+        use boatramp_core::orm::TableKeys;
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let mut schema = TenancySchema::default();
+        schema.tables.insert("orders".into(), TableScope::Tenant);
+        schema.tables.insert(
+            "tenant".into(),
+            TableScope::TenantKeyed { key: "id".into() },
+        );
+        schema
+            .tables
+            .insert("countries".into(), TableScope::Unscoped);
+        let ht = HostTenancy::new(
+            "tenant_id",
+            Some(t("acme")),
+            AccessMode::Own,
+            AccessMode::Own,
+        )
+        .with_schema(Some(&schema));
+        let scope = ht.orm_scope(Axis::Read).unwrap().unwrap();
+        match &scope.keys {
+            TableKeys::PerTable(m) => {
+                assert_eq!(m.get("orders"), Some(&Some("tenant_id".to_string())));
+                assert_eq!(m.get("tenant"), Some(&Some("id".to_string()))); // identity table on its PK
+                assert_eq!(m.get("countries"), Some(&None)); // unscoped
+                assert_eq!(m.get("secrets"), None); // undeclared → refused at injection
+            }
+            other => panic!("expected PerTable, got {other:?}"),
+        }
+        // No project schema ⇒ Uniform (legacy single-column).
+        let ht2 = HostTenancy::new(
+            "tenant_id",
+            Some(t("acme")),
+            AccessMode::Own,
+            AccessMode::Own,
+        );
+        assert!(matches!(
+            ht2.orm_scope(Axis::Read).unwrap().unwrap().keys,
+            TableKeys::Uniform
+        ));
     }
 
     #[test]
