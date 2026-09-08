@@ -12,6 +12,8 @@
 //! This module carries only the wasm-clean *declaration*. Resolving the tenant **value** from the
 //! source and building the injected row scope happens above (host-side), where `SqlValue` lives.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// How the host resolves an app's in-site "own" tenant for a request. Every source is
@@ -110,9 +112,127 @@ impl Tenancy {
     }
 }
 
+/// How the host scopes one table under a project's [`TenancySchema`] (`PLAN-tenancy-principal`,
+/// Decision A / D2 / D3). A table's scope is a fact of the **data model**, declared per project (the
+/// guiding principle — the app configures its own concepts — not baked into a component). New
+/// variants (the R3 session disjunct, the R4 target public-subset) land in later stages; the enum is
+/// `#[non_exhaustive]` so adding them is not a breaking change for downstream crates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TableScope {
+    /// Scope on the schema's [`default_tenant_key`](TenancySchema::default_tenant_key) = the resolved
+    /// tenant (the common case).
+    Tenant,
+    /// The identity table (`tenant`/`org`/`account`), keyed by its own PK: scope on `key` = the
+    /// resolved tenant instead of the default column (R2). `key` MUST be unique — a non-unique key
+    /// would match other tenants' rows — validated at schema load.
+    TenantKeyed { key: String },
+    /// Global reference/enum data (`countries`): reads are unscoped (reachable even by a
+    /// principal-less request — fail-closed is per table-scope, not per invocation); writes are
+    /// deny-by-default (a shared-data write is a cross-tenant blast). Host-declared, never
+    /// guest-inferred (a guest can't mark a sensitive table global).
+    Unscoped,
+}
+
+/// The effective, host-resolved scope for one table (from [`TenancySchema::resolve`]) — the input
+/// the ORM scope-injector needs per table reference. `None` from `resolve` means **refused**
+/// (undeclared — deny-by-default); this enum is only the *declared* outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedScope {
+    /// Scope this table on `column` = the resolved tenant (the injector picks the mode/value).
+    Column(String),
+    /// No tenant predicate — a globally-readable `Unscoped` table.
+    Unscoped,
+}
+
+/// A project's tenant-isolation **schema map** — the host-held facts the scope-injector keys off
+/// (`PLAN-tenancy-principal`, D2). Per-project, not per-component: a table's tenant key is a fact of
+/// the data model. **Absent** (no project schema at all) ⇒ the legacy behavior (every table scopes
+/// on the component's `Tenancy::Scoped.column`, byte-identical to pre-schema). **Present** ⇒ the
+/// `tables` map is authoritative and **exhaustive**: a scoped component touching a table with no
+/// entry is *refused* (deny-by-default, D3 — "no key" and "forgot the key" are indistinguishable, so
+/// the safe collapse is deny; `Unscoped` is the explicit, reviewed "this table is global").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TenancySchema {
+    /// The tenant column for a [`TableScope::Tenant`] table (e.g. `tenant_id`).
+    pub default_tenant_key: String,
+    /// Per-table scope facts. Authoritative + exhaustive when a schema is present (an absent table
+    /// is refused, not defaulted — see the type doc).
+    pub tables: BTreeMap<String, TableScope>,
+}
+
+impl Default for TenancySchema {
+    fn default() -> Self {
+        Self {
+            default_tenant_key: "tenant_id".to_string(),
+            tables: BTreeMap::new(),
+        }
+    }
+}
+
+impl TenancySchema {
+    /// Resolve how to scope `table`. `None` ⇒ **refused** (the table is undeclared under a present
+    /// schema — deny-by-default; the injector fails the query closed). `Some(ResolvedScope::Column)`
+    /// ⇒ scope on that column; `Some(ResolvedScope::Unscoped)` ⇒ no tenant predicate (global read).
+    pub fn resolve(&self, table: &str) -> Option<ResolvedScope> {
+        match self.tables.get(table)? {
+            TableScope::Tenant => Some(ResolvedScope::Column(self.default_tenant_key.clone())),
+            TableScope::TenantKeyed { key } => Some(ResolvedScope::Column(key.clone())),
+            TableScope::Unscoped => Some(ResolvedScope::Unscoped),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_resolves_per_table_key_and_denies_undeclared() {
+        // A present schema is authoritative + exhaustive: Tenant → default key, TenantKeyed → its
+        // own key (R2 identity table), Unscoped → global, and an ABSENT table is refused (D3).
+        let schema: TenancySchema = serde_json::from_str(
+            r#"{"default_tenant_key":"tenant_id","tables":{
+                 "orders":{"kind":"tenant"},
+                 "tenant":{"kind":"tenant_keyed","key":"id"},
+                 "countries":{"kind":"unscoped"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            schema.resolve("orders"),
+            Some(ResolvedScope::Column("tenant_id".into()))
+        );
+        assert_eq!(
+            schema.resolve("tenant"),
+            Some(ResolvedScope::Column("id".into())) // scoped on its PK, not tenant_id
+        );
+        assert_eq!(schema.resolve("countries"), Some(ResolvedScope::Unscoped));
+        assert_eq!(schema.resolve("secrets_table"), None); // undeclared → deny-by-default
+    }
+
+    #[test]
+    fn schema_default_is_tenant_id_no_tables() {
+        let s = TenancySchema::default();
+        assert_eq!(s.default_tenant_key, "tenant_id");
+        assert!(s.tables.is_empty());
+        // With no declared tables, even the default column resolves nothing (present-but-empty
+        // schema refuses everything — a project adopting a schema declares its tables exhaustively).
+        assert_eq!(s.resolve("orders"), None);
+    }
+
+    #[test]
+    fn table_scope_roundtrips_through_json() {
+        for ts in [
+            TableScope::Tenant,
+            TableScope::TenantKeyed { key: "id".into() },
+            TableScope::Unscoped,
+        ] {
+            let j = serde_json::to_string(&ts).unwrap();
+            assert_eq!(ts, serde_json::from_str::<TableScope>(&j).unwrap());
+        }
+    }
 
     #[test]
     fn scoped_defaults_are_own_own_none_source() {
