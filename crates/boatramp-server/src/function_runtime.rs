@@ -55,18 +55,30 @@ const LEASE_MARGIN_SECS: u64 = 60;
 #[cfg(feature = "handlers")]
 const MAX_ASYNC_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// TTL for a durable signed-context envelope (R1). A published message may sit queued and retry
-/// for a while before a consumer drains it, so the stamp must outlive realistic residency; expiry
-/// still bounds how long a captured/replayed envelope stays valid. 30 days (matches the session
-/// cookie horizon). Past expiry the consumer resolves no own tenant and fails an "own" op closed.
+/// TTL for a durable signed-context envelope (R1). It must outlive a message's *automatic*
+/// residency — publish, lease, up to `MAX_INVOKE_ATTEMPTS` redeliveries, and a backlog drain — but
+/// no longer, because it also bounds how long a captured envelope can be replayed and how stale a
+/// resolved tenant may be after off-boarding (a de-provisioned tenant's in-flight envelope stops
+/// resolving at expiry). 48 hours comfortably covers automatic residency plus a multi-day backlog
+/// while keeping that replay/staleness window tight (a deliberate ~15× cut from a naive 30-day
+/// horizon). Past expiry the consumer resolves no own tenant and fails an "own" op closed; an
+/// operator redrive after expiry likewise fails closed (never a cross-tenant widening).
 #[cfg(feature = "handlers")]
-const DURABLE_CONTEXT_TTL_SECS: u64 = 30 * 24 * 3600;
+const DURABLE_CONTEXT_TTL_SECS: u64 = 48 * 3600;
 
 /// Mint a durable signed-context envelope (R1) from the producer's resolved **own-tenant**, so a
 /// message it publishes carries that tenant across the durability boundary for a consumer that
 /// declares `sources: [signed_context]`. The guest never names a tenant — the host stamps its
 /// already-resolved principal. `None` (⇒ the message carries no context, and the consumer fails an
 /// "own" op closed) when there is no fleet signer, no own-tenant fact, or a non-stampable value.
+///
+/// TRUST MODEL (same-project bus): the envelope binds the producer's **tenant**, not the topic or
+/// the producing component. A project is one trust domain (its owner deploys all its components),
+/// so on the shared `{project}/bus/` a consumer declaring `signed_context` acts as **whatever
+/// tenant published the message it drains** — correct within a project, and cross-*project* is
+/// structurally impossible (the bus keyspace is `{project}/bus/`, project names are `/`-free). A
+/// consumer author therefore opts into "act as the producer's tenant"; a project that deploys
+/// mutually-distrusting components onto one bus topic should not use `signed_context` there.
 #[cfg(feature = "handlers")]
 pub(super) async fn mint_producer_context(
     inner: &HandlerRuntimeInner,

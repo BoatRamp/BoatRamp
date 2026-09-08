@@ -730,6 +730,12 @@ impl LogMessaging {
     /// (the grouped fan-out path has no per-message record of its own, so it re-reads the shared
     /// index record). Any miss (record gone, decode error) ⇒ `None`, so the consumer's
     /// `signed_context` source simply fails closed rather than erroring the whole claim.
+    ///
+    /// Caveat (fail-closed, not a breach): if the *same* topic is also drained by the default
+    /// work-queue, a work-queue `ack` deletes the shared index record, after which a grouped
+    /// consumer's `read_ctx` misses and that delivery carries no context (its "own" op then fails
+    /// closed). A `signed_context` grouped consumer should therefore not share a topic with a
+    /// work-queue drain — use a dedicated `bus:<topic>` per group.
     async fn read_ctx(&self, topic: &str, id: &str) -> Option<String> {
         let raw = self.kv.get(&meta_key(topic, id)).await.ok()??;
         let record: Record = serde_json::from_slice(&raw).ok()?;
