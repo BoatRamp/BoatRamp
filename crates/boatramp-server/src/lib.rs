@@ -42,10 +42,11 @@ pub(crate) use admin_api::auth_exchange;
 pub(crate) use admin_api::{
     activate_deployment, cert_status, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
     compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
-    create_deployment, current_deployment, delete_compute, delete_compute_volume, delete_site,
-    get_compute, get_daemon_config, get_deployment, get_site_config, invalidate_cache,
-    list_aliases, list_compute, list_compute_volumes, list_deployments, list_sites, prune_delete,
-    prune_report, put_blob, put_compute, put_daemon_config, put_site_config, remove_alias,
+    create_deployment, current_deployment, delete_compute, delete_compute_volume,
+    delete_project_tenancy, delete_site, get_compute, get_daemon_config, get_deployment,
+    get_project_tenancy, get_site_config, invalidate_cache, list_aliases, list_compute,
+    list_compute_volumes, list_deployments, list_sites, prune_delete, prune_report, put_blob,
+    put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
     rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_ping, sql_query,
 };
 #[cfg(feature = "handlers")]

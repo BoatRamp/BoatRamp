@@ -10,7 +10,7 @@
 
 use boatramp_core::orm::{
     Assignment, CmpOp, Delete, Direction, Expr, Insert, OrderBy, Predicate, RowValues, Scope,
-    ScopeMode, Select, SelectItem, Update,
+    ScopeMode, Select, SelectItem, TableKeys, Update,
 };
 use boatramp_core::sql::{Dialect, SqlBackends, SqlTransaction, SqlValue};
 use boatramp_storage::LibsqlSqlBackends;
@@ -23,6 +23,7 @@ fn scope(mode: ScopeMode, value: &str) -> Scope {
         column: "tenant_id".into(),
         value: t(value),
         mode,
+        keys: TableKeys::Uniform,
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -359,5 +360,236 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
          all=every-row; scoped insert stamps own (forgery ignored); scoped update/delete touch \
          own only and can't reassign tenant; a scoped JOIN can't reach another tenant's table; \
          own_first prefers the tenant's override over the base"
+    );
+}
+
+/// **Live** proof of the Stage 1 *per-table-key* tenancy model on a real libsql engine — the
+/// project [`TenancySchema`](boatramp_core::tenancy::TenancySchema) is authoritative and each
+/// table-ref is scoped on the key the schema declares for **that** table, not one global column:
+///
+///   * a `Tenant` table (`orders`) is scoped on the schema's `default_tenant_key` (`tenant_id`);
+///   * a `TenantKeyed` **identity** table (`tenant`) is scoped on its own PK (`id`) — the carve-out
+///     that lets a tenant read its *own* row from a table that has no `tenant_id` column at all;
+///   * an `Unscoped` reference table (`countries`) gets **no** tenant predicate (globally readable);
+///   * an **undeclared** table (`secrets_shadow`) is **refused at compile** (deny-by-default) — no
+///     SQL ever reaches the engine.
+///
+/// The [`Scope`] is built exactly as the host builds it —
+/// `HostTenancy::with_schema(&schema).orm_scope()` yields `column = default_tenant_key`,
+/// `keys = PerTable(schema.table_key_map())` — so this exercises the real injector, not a
+/// hand-rolled predicate. A **control** proves the per-table key is load-bearing: a legacy
+/// `Uniform` `tenant_id` scope on the identity table compiles to `tenant_id = ?` and the engine
+/// **rejects** it (no such column), which the schema-driven per-table key avoids.
+///
+/// Same `#[ignore]` rationale as the sibling above (static-musl libsql segfault); the
+/// `test-orm-tenancy` CI job runs it unignored on the host toolchain and greps the marker.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
+    use boatramp_core::orm::{Join, JoinKind};
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    let dir = std::env::temp_dir().join(format!("boatramp-orm-pertable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let backends = LibsqlSqlBackends::local(&dir);
+    let db = backends.database("default", "shop", "").await.unwrap();
+
+    // The project's declared schema: `orders` keyed on the default `tenant_id`; the identity
+    // table `tenant` keyed on its own PK `id`; `countries` a global reference (Unscoped).
+    // `secrets_shadow` is DELIBERATELY absent → deny-by-default.
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        tables: BTreeMap::from([
+            ("orders".into(), TableScope::Tenant),
+            (
+                "tenant".into(),
+                TableScope::TenantKeyed { key: "id".into() },
+            ),
+            ("countries".into(), TableScope::Unscoped),
+        ]),
+    };
+    // Build the scope exactly as `HostTenancy::with_schema(&schema).orm_scope()` does.
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let scope_for = |tenant: &str| Scope {
+        column: "tenant_id".into(),
+        value: t(tenant),
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+    };
+
+    // Seed: two tenants' orders; a `tenant` identity table whose PK IS the tenant (no tenant_id
+    // column); a global `countries` reference (no tenant_id column).
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE orders (id TEXT PRIMARY KEY, tenant_id TEXT, item TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute("CREATE TABLE tenant (id TEXT PRIMARY KEY, plan TEXT)", &[])
+            .await
+            .unwrap();
+        tx.execute(
+            "CREATE TABLE countries (code TEXT PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO orders (id, tenant_id, item) VALUES ('o_a','acme','acme-widget'),('o_g','globex','globex-gadget')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO tenant (id, plan) VALUES ('acme','pro'),('globex','free')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO countries (code, name) VALUES ('US','United States'),('FR','France')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // 1) `orders` (Tenant) scoped on `tenant_id` → acme sees ONLY its own order.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("orders")
+        };
+        s.force_scope(&scope_for("acme"));
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(got, vec!["acme-widget".to_string()], "orders is acme-only");
+        tx.commit().await.unwrap();
+    }
+
+    // 2) `tenant` (TenantKeyed on `id`) scoped on its OWN PK → acme sees only id='acme'. The
+    //    generated predicate names `id`, not `tenant_id` (which this table lacks).
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("plan"))],
+            ..Select::from("tenant")
+        };
+        s.force_scope(&scope_for("acme"));
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("id = ?") && !sql.contains("tenant_id = ?"),
+            "identity table must scope on its own PK `id`, not tenant_id: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["pro".to_string()],
+            "acme sees only its own identity row"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2b) CONTROL — the per-table key is load-bearing, not cosmetic: a legacy `Uniform`
+    //     `tenant_id` scope on the identity table compiles to `tenant_id = ?` and the REAL engine
+    //     rejects it (no such column). The schema-driven per-table key is what avoids this.
+    {
+        let mut bad = Select {
+            columns: vec![item(Expr::col("plan"))],
+            ..Select::from("tenant")
+        };
+        bad.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("acme"),
+            mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
+        });
+        let (bad_sql, bad_params) = bad.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        assert!(
+            tx.query(&bad_sql, &bad_params).await.is_err(),
+            "a uniform tenant_id scope must FAIL on the identity table (no such column): {bad_sql}"
+        );
+    }
+
+    // 3) `countries` (Unscoped) → NO tenant predicate: acme sees EVERY country (global reference).
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("name"))],
+            ..Select::from("countries")
+        };
+        s.force_scope(&scope_for("acme"));
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["France".to_string(), "United States".to_string()],
+            "an Unscoped reference table is globally readable"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 4) A JOIN scopes EACH ref on ITS OWN key: `o.tenant_id = acme AND t.id = acme`. acme's
+    //    joined row surfaces; globex can't leak in through either side.
+    {
+        let mut sel = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("o.item"))],
+            joins: vec![Join {
+                kind: JoinKind::Inner,
+                table: "tenant".into(),
+                alias: Some("t".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("t.id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("o.tenant_id"),
+                },
+            }],
+            ..Select::from("orders")
+        };
+        sel.force_scope(&scope_for("acme"));
+        let (sql, params) = sel.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("o.tenant_id = ?") && sql.contains("t.id = ?"),
+            "each joined ref scoped on its own key: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "the join surfaces only acme's row"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 5) DENY-BY-DEFAULT: a SELECT on the UNDECLARED table is refused at compile — no SQL emitted.
+    {
+        let mut undeclared = Select {
+            columns: vec![item(Expr::col("v"))],
+            ..Select::from("secrets_shadow")
+        };
+        undeclared.force_scope(&scope_for("acme"));
+        assert!(
+            matches!(
+                undeclared.compile(Dialect::Sqlite),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "an undeclared table must be refused, not silently unscoped"
+        );
+    }
+
+    println!(
+        "ORM PER-TABLE-KEY TENANCY OK: Tenant table scoped on default tenant_id; identity \
+         TenantKeyed table scoped on its own PK (uniform tenant_id scope rejected by the engine — \
+         key is load-bearing); Unscoped reference table globally readable; per-ref join keys each \
+         on its own column; an undeclared table refused deny-by-default"
     );
 }

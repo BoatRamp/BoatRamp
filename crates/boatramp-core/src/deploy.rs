@@ -810,6 +810,16 @@ impl DeployStore {
         Ok(())
     }
 
+    /// Clear the project's [`TenancySchema`](crate::tenancy::TenancySchema), reverting to
+    /// legacy single-column `Uniform` scoping (no per-table key map). Idempotent — clearing
+    /// an absent schema is a no-op that still returns `Ok`.
+    pub async fn clear_project_tenancy(&self, project: ProjectRef<'_>) -> Result<(), DeployError> {
+        self.kv
+            .delete(&keys::project_config(project, "tenancy"))
+            .await?;
+        Ok(())
+    }
+
     /// Like [`get_site_config`](Self::get_site_config) but returns a shared,
     /// **cached** parse for the hot serve path. Reads the mutable `site/<site>`
     /// pointer (small) to learn the current content hash, then serves the parsed

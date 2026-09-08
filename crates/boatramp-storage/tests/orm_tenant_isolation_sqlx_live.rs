@@ -15,7 +15,7 @@
 
 use boatramp_core::orm::{
     Assignment, CmpOp, Delete, Direction, Expr, Insert, Join, JoinKind, OrderBy, Predicate,
-    RowValues, Scope, ScopeMode, Select, SelectItem, Update,
+    RowValues, Scope, ScopeMode, Select, SelectItem, TableKeys, Update,
 };
 use boatramp_core::sql::{Dialect, SqlBackend, SqlValue};
 use std::sync::Arc;
@@ -31,6 +31,7 @@ fn scope(mode: ScopeMode, value: &str) -> Scope {
         column: "tenant_id".into(),
         value: t(value),
         mode,
+        keys: TableKeys::Uniform,
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -365,6 +366,193 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
     );
 }
 
+/// The Stage 1 *per-table-key* battery — the multi-engine companion to the libsql
+/// `orm_per_table_key_scope_isolates_on_a_real_engine` gate. A project schema keys each table
+/// independently, so a per-dialect rendering bug (placeholder renumbering, column quoting) in the
+/// per-ref scope predicate could drop or misplace one table's key on one engine but not another;
+/// proving it on Postgres AND MySQL closes that gap. The [`Scope`] is built exactly as the host
+/// builds it: `column = default_tenant_key`, `keys = PerTable(schema.table_key_map())`.
+async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &str) {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    // Fresh schema, idempotent across a reused service-container DB.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS orders",
+            "DROP TABLE IF EXISTS tenant",
+            "DROP TABLE IF EXISTS countries",
+            "CREATE TABLE orders (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), item VARCHAR(255))",
+            "CREATE TABLE tenant (id VARCHAR(64) PRIMARY KEY, plan VARCHAR(64))",
+            "CREATE TABLE countries (code VARCHAR(8) PRIMARY KEY, name VARCHAR(64))",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        tx.execute(
+            "INSERT INTO orders (id, tenant_id, item) VALUES ('o_a','acme','acme-widget'),('o_g','globex','globex-gadget')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO tenant (id, plan) VALUES ('acme','pro'),('globex','free')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO countries (code, name) VALUES ('US','United States'),('FR','France')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        tables: BTreeMap::from([
+            ("orders".into(), TableScope::Tenant),
+            (
+                "tenant".into(),
+                TableScope::TenantKeyed { key: "id".into() },
+            ),
+            ("countries".into(), TableScope::Unscoped),
+        ]),
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let scope_for = |tenant: &str| Scope {
+        column: "tenant_id".into(),
+        value: t(tenant),
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+    };
+
+    // 1) `orders` (Tenant) scoped on `tenant_id` → acme-only.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("orders")
+        };
+        s.force_scope(&scope_for("acme"));
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "[{engine}] orders acme-only"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2) identity `tenant` (TenantKeyed on `id`) scoped on its own PK → acme's row only.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("plan"))],
+            ..Select::from("tenant")
+        };
+        s.force_scope(&scope_for("acme"));
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["pro".to_string()],
+            "[{engine}] identity row is own-only"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2b) CONTROL — a legacy Uniform `tenant_id` scope on the identity table names a column the
+    //     table lacks; the REAL engine rejects it. The per-table key is load-bearing.
+    {
+        let mut bad = Select {
+            columns: vec![item(Expr::col("plan"))],
+            ..Select::from("tenant")
+        };
+        bad.force_scope(&scope(ScopeMode::Own, "acme")); // Uniform helper → tenant_id
+        let (bad_sql, bad_params) = bad.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        assert!(
+            tx.query(&bad_sql, &bad_params).await.is_err(),
+            "[{engine}] a uniform tenant_id scope must FAIL on the identity table: {bad_sql}"
+        );
+    }
+
+    // 3) `countries` (Unscoped) → globally readable (every country).
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("name"))],
+            ..Select::from("countries")
+        };
+        s.force_scope(&scope_for("acme"));
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["France".to_string(), "United States".to_string()],
+            "[{engine}] Unscoped reference table is global"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 4) A JOIN scopes each ref on its own key → only acme's joined row.
+    {
+        let mut sel = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("o.item"))],
+            joins: vec![Join {
+                kind: JoinKind::Inner,
+                table: "tenant".into(),
+                alias: Some("t".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("t.id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("o.tenant_id"),
+                },
+            }],
+            ..Select::from("orders")
+        };
+        sel.force_scope(&scope_for("acme"));
+        let (sql, params) = sel.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "[{engine}] join is acme-only"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 5) DENY-BY-DEFAULT: an undeclared table is refused at compile — no SQL reaches the engine.
+    {
+        let mut undeclared = Select {
+            columns: vec![item(Expr::col("v"))],
+            ..Select::from("secrets_shadow")
+        };
+        undeclared.force_scope(&scope_for("acme"));
+        assert!(
+            matches!(
+                undeclared.compile(dialect),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "[{engine}] an undeclared table must be refused deny-by-default"
+        );
+    }
+
+    println!(
+        "ORM PER-TABLE-KEY TENANCY OK [{engine}]: Tenant table on default tenant_id; identity \
+         TenantKeyed table on its own PK (uniform tenant_id scope rejected by the engine); \
+         Unscoped reference table global; per-ref join keys each on its own column; an undeclared \
+         table refused deny-by-default"
+    );
+}
+
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_orm_scope_isolates_on_a_real_engine() {
@@ -373,7 +561,8 @@ async fn postgres_orm_scope_isolates_on_a_real_engine() {
         return;
     };
     let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
-    run_battery(backend, Dialect::Postgres, "postgres").await;
+    run_battery(backend.clone(), Dialect::Postgres, "postgres").await;
+    run_pertable_battery(backend, Dialect::Postgres, "postgres").await;
 }
 
 #[cfg(feature = "sql-mysql")]
@@ -384,5 +573,6 @@ async fn mysql_orm_scope_isolates_on_a_real_engine() {
         return;
     };
     let backend = connect(ExternalSqlKind::Mysql, &ExternalSqlOptions::new(url)).unwrap();
-    run_battery(backend, Dialect::Mysql, "mysql").await;
+    run_battery(backend.clone(), Dialect::Mysql, "mysql").await;
+    run_pertable_battery(backend, Dialect::Mysql, "mysql").await;
 }

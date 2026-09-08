@@ -340,6 +340,50 @@ pub(super) async fn put_site_config(
     }
 }
 
+/// `GET /api/projects/{proj}/tenancy` — the project's [`TenancySchema`], the per-table
+/// tenant-key map the scope injector consults (deny-by-default on undeclared tables).
+/// A project that declared none returns the default schema (`tenant_id`, no tables),
+/// i.e. legacy single-column `Uniform` scoping. Read-scoped (`Project·Read`).
+pub(super) async fn get_project_tenancy(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    match deploy.get_project_tenancy(project.as_ref()).await {
+        Ok(schema) => Json(schema.unwrap_or_default()).into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `PUT /api/projects/{proj}/tenancy` — replace the project's [`TenancySchema`].
+///
+/// This redraws the tenant-isolation boundary for **every** guest query in the
+/// project, so it is gated at `Project·Admin` in [`authz::Right::required`] — never the
+/// deploy-grade publisher right. Storage is plain; deny-by-default is enforced
+/// downstream at scope injection, so a malformed/over-broad schema cannot silently
+/// widen access without a subsequent query still resolving each table's key.
+pub(super) async fn put_project_tenancy(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Json(schema): Json<boatramp_core::tenancy::TenancySchema>,
+) -> Response {
+    match deploy.set_project_tenancy(project.as_ref(), &schema).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
+/// `DELETE /api/projects/{proj}/tenancy` — clear the project's schema (revert to legacy
+/// `Uniform` single-column scoping). Idempotent; `Project·Admin` like the PUT.
+pub(super) async fn delete_project_tenancy(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    match deploy.clear_project_tenancy(project.as_ref()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => deploy_error_response(err),
+    }
+}
+
 /// `PUT /api/projects/{proj}/graphql/subgraphs/{name}` — publish a subgraph's SDL (the
 /// request body). Recomposes + validates the whole supergraph; a composition failure is a
 /// `400` and the subgraph is **not** stored. On success, returns the composed supergraph

@@ -48,6 +48,12 @@ pub const PROJECT_SCOPED_FAMILIES: &[&str] = &[
     // tool (it resolved to the bare `pg`/default workload). The `sql_exec`/`sql_query`
     // handlers already honor the injected `ProjectContext`.
     "sql",
+    // The project's tenancy schema (`/api/projects/<proj>/tenancy`) — the per-table
+    // tenant-key map the scope injector consults. Rewrites onto the global
+    // `/api/tenancy` handler, tagged with the tenant, so `boatramp tenancy show/apply`
+    // reaches the right project. (Authz still sees the original project-qualified path
+    // and gates mutation at `Project·Admin` — see `authz::Right::required`.)
+    "tenancy",
 ];
 
 /// The tenant project a request targets, injected as a request extension by
@@ -250,6 +256,12 @@ mod tests {
         let s = scope_of("/api/projects/acme/secrets/db-password");
         assert_eq!(s.project, "acme");
         assert_eq!(s.rewrite.as_deref(), Some("/api/secrets/db-password"));
+
+        // The tenancy schema is a project-owned singleton: the project-scoped path
+        // rewrites onto the global `/api/tenancy` handler, tagged with the tenant.
+        let s = scope_of("/api/projects/acme/tenancy");
+        assert_eq!(s.project, "acme");
+        assert_eq!(s.rewrite.as_deref(), Some("/api/tenancy"));
     }
 
     #[test]
