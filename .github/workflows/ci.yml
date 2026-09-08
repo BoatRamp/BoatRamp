@@ -373,6 +373,11 @@ jobs:
             || { echo "::error::Postgres ORM per-table-key tenancy never reached its marker (per-table scoping breach or skip)" >&2; exit 1; }
           grep -q 'ORM PER-TABLE-KEY TENANCY OK \[mysql\]' orm-sqlx.log \
             || { echo "::error::MySQL ORM per-table-key tenancy never reached its marker (per-table scoping breach or skip)" >&2; exit 1; }
+          # Stage 3 R3 anonymous-first (TenantOrSession) disjunct + promote, per engine.
+          grep -q 'ORM TENANT-OR-SESSION DISJUNCT OK \[postgres\]' orm-sqlx.log \
+            || { echo "::error::Postgres R3 TenantOrSession disjunct never reached its marker (anon/tenant/session breach or skip)" >&2; exit 1; }
+          grep -q 'ORM TENANT-OR-SESSION DISJUNCT OK \[mysql\]' orm-sqlx.log \
+            || { echo "::error::MySQL R3 TenantOrSession disjunct never reached its marker (anon/tenant/session breach or skip)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in

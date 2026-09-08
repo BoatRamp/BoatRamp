@@ -633,6 +633,124 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
     );
 }
 
+/// The Stage 3 R3 **anonymous-first disjunct** (`TenantOrSession`) + `promote`, on real Postgres and
+/// MySQL — the multi-engine companion to the SQLite `orm_tenant_or_session_disjunct_*` gate. The
+/// disjunct's `Or([tenant=T, session=S])` and promote's `tenant_id IS NULL` guard lean on NULL /
+/// three-valued-logic semantics that can differ per engine, so R3 is proven on each engine, not
+/// SQLite alone (the repo's ignore-gated-tests-not-evidence rule).
+async fn run_session_disjunct_battery(
+    backend: Arc<dyn SqlBackend>,
+    dialect: Dialect,
+    engine: &str,
+) {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS carts",
+            "CREATE TABLE carts (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), session_id VARCHAR(64), item VARCHAR(255))",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        tx.execute(
+            "INSERT INTO carts (id, tenant_id, session_id, item) VALUES \
+             ('c_acme','acme',NULL,'acme-cart'),('c_glob','globex',NULL,'globex-cart'), \
+             ('c_s1',NULL,'sess-1','anon-cart-1'),('c_s2',NULL,'sess-2','anon-cart-2')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        session_key: Some("session_id".into()),
+        tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let sc = |tenant: Option<&str>, session: Option<&str>| Scope {
+        column: "tenant_id".into(),
+        value: tenant.map(t),
+        session: session.map(t),
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+    };
+    let read_items = |scope: &Scope| {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("carts")
+        };
+        s.force_scope(scope).unwrap();
+        s.compile(dialect).unwrap()
+    };
+
+    // Anon reads only its own session; authed only its tenant; both = the Or.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        let (q, p) = read_items(&sc(None, Some("sess-1")));
+        assert_eq!(
+            run_query(tx.as_mut(), &q, &p).await,
+            vec!["anon-cart-1".to_string()],
+            "[{engine}] anon reads only its session cart"
+        );
+        let (q, p) = read_items(&sc(Some("acme"), None));
+        assert_eq!(
+            run_query(tx.as_mut(), &q, &p).await,
+            vec!["acme-cart".to_string()],
+            "[{engine}] authed reads only its tenant cart"
+        );
+        let (q, p) = read_items(&sc(Some("acme"), Some("sess-1")));
+        assert_eq!(
+            run_query(tx.as_mut(), &q, &p).await,
+            vec!["acme-cart".to_string(), "anon-cart-1".to_string()],
+            "[{engine}] both-fact reads the Or"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // No principal ⇒ refused; promote (D7) claims only sess-1's not-yet-owned rows, idempotent.
+    {
+        let mut refused = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("carts")
+        };
+        refused.force_scope(&sc(None, None)).unwrap();
+        assert!(
+            matches!(
+                refused.compile(dialect),
+                Err(boatramp_core::orm::OrmError::TenancyNoPrincipal)
+            ),
+            "[{engine}] a TenantOrSession read with no principal must be refused"
+        );
+
+        let promote = sc(Some("acme"), Some("sess-1"));
+        let (psql, pparams) =
+            boatramp_core::orm::compile_promote(&promote, "carts", dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        assert_eq!(
+            tx.execute(&psql, &pparams).await.unwrap(),
+            1,
+            "[{engine}] promote claims exactly sess-1's one not-yet-owned cart"
+        );
+        // sess-2 untouched; a second promote is a no-op.
+        assert_eq!(
+            tx.execute(&psql, &pparams).await.unwrap(),
+            0,
+            "[{engine}] re-promoting is a no-op (IS NULL guard)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    println!(
+        "ORM TENANT-OR-SESSION DISJUNCT OK [{engine}]: anon reads/writes only its session; authed \
+         only its tenant; both-fact reads the Or; no-principal refused; promote claims only this \
+         session's not-yet-owned rows (IS NULL anti-widening, idempotent)"
+    );
+}
+
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_orm_scope_isolates_on_a_real_engine() {
@@ -642,7 +760,8 @@ async fn postgres_orm_scope_isolates_on_a_real_engine() {
     };
     let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
     run_battery(backend.clone(), Dialect::Postgres, "postgres").await;
-    run_pertable_battery(backend, Dialect::Postgres, "postgres").await;
+    run_pertable_battery(backend.clone(), Dialect::Postgres, "postgres").await;
+    run_session_disjunct_battery(backend, Dialect::Postgres, "postgres").await;
 }
 
 #[cfg(feature = "sql-mysql")]
@@ -654,5 +773,6 @@ async fn mysql_orm_scope_isolates_on_a_real_engine() {
     };
     let backend = connect(ExternalSqlKind::Mysql, &ExternalSqlOptions::new(url)).unwrap();
     run_battery(backend.clone(), Dialect::Mysql, "mysql").await;
-    run_pertable_battery(backend, Dialect::Mysql, "mysql").await;
+    run_pertable_battery(backend.clone(), Dialect::Mysql, "mysql").await;
+    run_session_disjunct_battery(backend, Dialect::Mysql, "mysql").await;
 }

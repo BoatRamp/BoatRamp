@@ -212,6 +212,13 @@ pub enum TableScope {
     /// whichever axis facts the request carries; the disjoint columns confine a cheap anon session
     /// to `tenant IS NULL` rows structurally (never tenant-owned rows). Requires the schema to set
     /// `session_key`; a `TenantOrSession` table with no `session_key` is refused (deny-by-default).
+    ///
+    /// The confinement rests on the invariant **a session-owned row has `default_tenant_key IS
+    /// NULL`** — the host write path enforces it (an anon write stamps only `session_key`, leaving
+    /// the tenant key NULL; `promote` is the sole cross-partition move, guarded by `tenant_key IS
+    /// NULL`). An app should add a DB `CHECK (<tenant_key> IS NULL OR <session_key> IS NULL)` as
+    /// belt-and-suspenders: a raw-SQL migration or an `all`-grant write that set BOTH columns on one
+    /// row would let a session reader match a row a tenant also owns.
     TenantOrSession,
 }
 
