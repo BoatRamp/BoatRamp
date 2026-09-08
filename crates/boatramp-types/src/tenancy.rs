@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 /// How the host resolves an app's in-site "own" tenant for a request. Every source is
@@ -44,6 +45,45 @@ pub enum TenantSource {
 
 fn default_tid_claim() -> String {
     "tid".to_string()
+}
+
+/// The default source list when a `Scoped` block omits it: truly anonymous (`[None]`) — an "own"
+/// grant then fails closed until a source is declared.
+fn default_sources() -> Vec<TenantSource> {
+    vec![TenantSource::None]
+}
+
+/// Deserialize the [`Tenancy::Scoped`] `sources` list, accepting BOTH the Stage-2 list form
+/// (`sources: [ (kind: token), (kind: domain) ]` — priority-ordered per-trigger sources) AND — for
+/// backward compatibility with the pre-Stage-2 singular `source:` field (v0.4.0) — a single source
+/// written as one map (`source: (kind: token)`), which becomes a one-element list. Uses
+/// `deserialize_any` (the wire format is self-describing) so a seq → many and a map → the singleton,
+/// **without** an `untagged` enum (which RON — the manifest format — handles poorly). A pre-Stage-2
+/// config therefore keeps resolving exactly as before.
+fn de_sources<'de, D>(deserializer: D) -> Result<Vec<TenantSource>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct SourcesVisitor;
+    impl<'de> Visitor<'de> for SourcesVisitor {
+        type Value = Vec<TenantSource>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a TenantSource map or a list of TenantSource maps")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<TenantSource>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            // A single source written as a struct-map (the legacy `source:` singular).
+            let s = TenantSource::deserialize(de::value::MapAccessDeserializer::new(map))?;
+            Ok(vec![s])
+        }
+    }
+    deserializer.deserialize_any(SourcesVisitor)
 }
 
 /// Which **axis** a resolved tenant fact belongs to (`PLAN-tenancy-principal` D1). The host-resolved
@@ -110,14 +150,24 @@ pub enum Tenancy {
     /// Deliberately no in-site tenancy — plain queries (the project=database boundary is the whole
     /// isolation). The explicit "single-tenant / no tenancy" declaration.
     Disabled,
-    /// In-site sub-tenancy on `column`, resolving "own" from `source`, at the per-axis grants.
+    /// In-site sub-tenancy on `column`, resolving "own" from the first applicable `sources` entry,
+    /// at the per-axis grants.
     Scoped {
         /// The tenant column the host scopes on (e.g. `tenant_id`). Validated as a SQL identifier
         /// when the scope is applied.
         column: String,
-        /// How the host resolves "own".
-        #[serde(default)]
-        source: TenantSource,
+        /// The host-verified sources the "own" tenant may resolve from, in **priority order** — the
+        /// host picks the first whose current-trigger input is present (a `token` on an authenticated
+        /// HTTP request, the routed `domain` on a storefront, a `signed_context` on an async job), so
+        /// one component can serve multiple trigger kinds (`PLAN-tenancy-principal` R1). Accepts the
+        /// pre-Stage-2 singular `source:` map too (back-compat, [`de_sources`]). Default `[None]`
+        /// (anonymous — an "own" grant fails closed).
+        #[serde(
+            default = "default_sources",
+            alias = "source",
+            deserialize_with = "de_sources"
+        )]
+        sources: Vec<TenantSource>,
         /// Which tenant-set reads may reach (default [`AccessMode::Own`]).
         #[serde(default = "default_own")]
         read: AccessMode,
@@ -289,18 +339,50 @@ mod tests {
 
     #[test]
     fn scoped_defaults_are_own_own_none_source() {
-        // Only `column` is required; source defaults to None, both axes to Own.
+        // Only `column` is required; sources default to [None], both axes to Own.
         let t: Tenancy = serde_json::from_str(r#"{"mode":"scoped","column":"tenant_id"}"#).unwrap();
         assert_eq!(
             t,
             Tenancy::Scoped {
                 column: "tenant_id".into(),
-                source: TenantSource::None,
+                sources: vec![TenantSource::None],
                 read: AccessMode::Own,
                 write: AccessMode::Own,
             }
         );
         assert!(t.is_scoped());
+    }
+
+    #[test]
+    fn sources_accept_both_the_legacy_singular_and_the_stage2_list() {
+        // Back-compat: the pre-Stage-2 singular `source:` map still parses (→ a one-element list),
+        // so a v0.4.0 tenancy config resolves exactly as before.
+        let legacy: Tenancy = serde_json::from_str(
+            r#"{"mode":"scoped","column":"tenant_id","source":{"kind":"domain"}}"#,
+        )
+        .unwrap();
+        let Tenancy::Scoped { sources, .. } = &legacy else {
+            panic!("scoped")
+        };
+        assert_eq!(sources, &vec![TenantSource::Domain]);
+
+        // Stage 2: a priority-ordered list of per-trigger sources.
+        let listed: Tenancy = serde_json::from_str(
+            r#"{"mode":"scoped","column":"tenant_id","sources":[{"kind":"token"},{"kind":"domain"}]}"#,
+        )
+        .unwrap();
+        let Tenancy::Scoped { sources, .. } = &listed else {
+            panic!("scoped")
+        };
+        assert_eq!(
+            sources,
+            &vec![
+                TenantSource::Token {
+                    claim: "tid".into()
+                },
+                TenantSource::Domain
+            ]
+        );
     }
 
     #[test]
@@ -316,14 +398,14 @@ mod tests {
             r#"{"mode":"scoped","column":"tenant_id","source":{"kind":"token"},"read":"own_or_null","write":"own"}"#,
         )
         .unwrap();
-        let Tenancy::Scoped { source, read, .. } = t else {
+        let Tenancy::Scoped { sources, read, .. } = t else {
             panic!("scoped")
         };
         assert_eq!(
-            source,
-            TenantSource::Token {
+            sources,
+            vec![TenantSource::Token {
                 claim: "tid".into()
-            }
+            }]
         );
         assert_eq!(read, AccessMode::OwnOrNull);
     }
@@ -343,7 +425,7 @@ mod tests {
     fn roundtrips_through_json() {
         let t = Tenancy::Scoped {
             column: "org_id".into(),
-            source: TenantSource::Domain,
+            sources: vec![TenantSource::Domain],
             read: AccessMode::OwnOrNull,
             write: AccessMode::Own,
         };

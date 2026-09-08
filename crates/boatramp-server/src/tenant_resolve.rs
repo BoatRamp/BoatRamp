@@ -78,11 +78,11 @@ pub(crate) async fn resolve_host_tenancy(
         Some(Tenancy::Disabled) => Ok(None),
         Some(Tenancy::Scoped {
             column,
-            source,
+            sources,
             read,
             write,
         }) => {
-            let value = resolve_value(source, &inputs).await;
+            let value = resolve_from_sources(sources, &inputs).await;
             let read = cap(*read, posture.allow_cross_tenant);
             let write = normalize_write(cap(*write, posture.allow_cross_tenant));
             Ok(Some(HostTenancy::new(column.clone(), value, read, write)))
@@ -149,8 +149,25 @@ fn normalize_write(mode: AccessMode) -> AccessMode {
     }
 }
 
-/// Resolve the tenant value from the verified source. `None` for anonymous / not-yet-wired
-/// sources — the binding then fails an "own" operation closed.
+/// Resolve the "own" tenant value from the **priority-ordered** source list (`PLAN-tenancy-principal`
+/// R1): the first source whose current-trigger input is present wins, so one component can serve a
+/// token-auth'd request, a storefront domain, and an async job by declaring `[token, domain,
+/// signed_context]`. `None` if none apply (anonymous / not-yet-wired source) — the binding then
+/// fails an "own" op closed rather than running unscoped.
+async fn resolve_from_sources(
+    sources: &[TenantSource],
+    inputs: &TenantSourceInputs<'_>,
+) -> Option<boatramp_core::sql::SqlValue> {
+    for source in sources {
+        if let Some(value) = resolve_value(source, inputs).await {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Resolve the tenant value from a single verified source. `None` for anonymous / not-yet-wired
+/// sources — the caller ([`resolve_from_sources`]) then tries the next, else fails closed.
 async fn resolve_value(
     source: &TenantSource,
     inputs: &TenantSourceInputs<'_>,
@@ -225,7 +242,7 @@ mod tests {
         // own+null-write degraded to own).
         let decision = Tenancy::Scoped {
             column: "tenant_id".into(),
-            source: TenantSource::None, // irrelevant on the invoke path — the value is inherited
+            sources: vec![TenantSource::None], // irrelevant on the invoke path — the value is inherited
             read: AccessMode::OwnOrNull,
             write: AccessMode::All,
         };
@@ -308,7 +325,7 @@ mod tests {
     async fn domain_source_binds_the_context_tag() {
         let decision = Tenancy::Scoped {
             column: "tenant_id".into(),
-            source: TenantSource::Domain,
+            sources: vec![TenantSource::Domain],
             read: AccessMode::Own,
             write: AccessMode::Own,
         };
@@ -332,7 +349,7 @@ mod tests {
     async fn all_is_capped_to_own_unless_the_posture_opens_it() {
         let decision = Tenancy::Scoped {
             column: "tenant_id".into(),
-            source: TenantSource::Domain,
+            sources: vec![TenantSource::Domain],
             read: AccessMode::All,
             write: AccessMode::All,
         };
@@ -364,7 +381,7 @@ mod tests {
     async fn own_plus_null_write_degrades_to_own_never_the_shared_baseline() {
         let decision = Tenancy::Scoped {
             column: "tenant_id".into(),
-            source: TenantSource::Domain,
+            sources: vec![TenantSource::Domain],
             read: AccessMode::OwnOrNull,
             write: AccessMode::OwnOrNull,
         };
@@ -393,7 +410,7 @@ mod tests {
     async fn own_source_without_inputs_resolves_to_no_value_then_fails_closed() {
         let decision = Tenancy::Scoped {
             column: "tenant_id".into(),
-            source: TenantSource::Domain,
+            sources: vec![TenantSource::Domain],
             read: AccessMode::Own,
             write: AccessMode::Own,
         };
