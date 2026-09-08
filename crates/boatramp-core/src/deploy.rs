@@ -491,19 +491,23 @@ pub struct ComputeTeardown {
     pub volumes: Vec<String>,
 }
 
-/// Best-effort load of a project's [`TenancySchema`](crate::tenancy::TenancySchema) directly from a
-/// KV handle — for the bind hot path, where the caller holds `&dyn KvStore` (a `HandlerRuntimeInner`)
-/// but not a [`DeployStore`]. A missing or unparsable body reads as `None` (⇒ legacy `Uniform`
-/// scoping); the authoritative, error-surfacing accessor is [`DeployStore::get_project_tenancy`].
+/// Load a project's [`TenancySchema`](crate::tenancy::TenancySchema) directly from a KV handle —
+/// for the bind hot path, where the caller holds `&dyn KvStore` (a `HandlerRuntimeInner`) but not a
+/// [`DeployStore`]. Returns `Ok(None)` when **absent** (⇒ legacy `Uniform` scoping) and — crucially
+/// — `Err` when the body is **present but unreadable/unparsable**, so the bind path can tell "no
+/// schema declared" apart from "a schema exists but I can't read it" and **fail closed** on the
+/// latter (a silent fallback to `Uniform` would re-admit an undeclared table that a corrupt read
+/// should keep denying). Mirrors [`DeployStore::get_project_tenancy`].
 pub async fn load_project_tenancy(
     kv: &dyn KvStore,
     project: ProjectRef<'_>,
-) -> Option<crate::tenancy::TenancySchema> {
-    let bytes = kv
-        .get(&keys::project_config(project, "tenancy"))
-        .await
-        .ok()??;
-    serde_json::from_slice(&bytes).ok()
+) -> Result<Option<crate::tenancy::TenancySchema>, DeployError> {
+    match kv.get(&keys::project_config(project, "tenancy")).await? {
+        Some(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
 }
 
 impl DeployStore {

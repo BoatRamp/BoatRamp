@@ -93,7 +93,7 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
             columns: vec![item(Expr::col("body"))],
             ..Select::from("notes")
         };
-        s.force_scope(&scope(mode, tenant));
+        s.force_scope(&scope(mode, tenant)).unwrap();
         s.compile(Dialect::Sqlite).unwrap()
     };
 
@@ -169,7 +169,8 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
         ins.force_scope(
             Some(&scope(ScopeMode::Own, "acme")),
             Some(&scope(ScopeMode::Own, "acme")),
-        );
+        )
+        .unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -205,7 +206,7 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
             scope: None,
             returning: vec![],
         };
-        upd.force_scope(&scope(ScopeMode::Own, "acme"));
+        upd.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = upd.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -238,7 +239,7 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
             scope: None,
             returning: vec![],
         };
-        del.force_scope(&scope(ScopeMode::Own, "acme"));
+        del.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = del.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -292,7 +293,7 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
             }],
             ..Select::from("notes")
         };
-        sel.force_scope(&scope(ScopeMode::Own, "acme"));
+        sel.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = sel.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -333,7 +334,7 @@ async fn orm_in_site_tenant_scope_isolates_on_a_real_engine() {
                 limit: Some(1),
                 ..Select::from("notes")
             };
-            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant));
+            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant)).unwrap();
             s.compile(Dialect::Sqlite).unwrap()
         };
 
@@ -396,7 +397,9 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
     let db = backends.database("default", "shop", "").await.unwrap();
 
     // The project's declared schema: `orders` keyed on the default `tenant_id`; the identity
-    // table `tenant` keyed on its own PK `id`; `countries` a global reference (Unscoped).
+    // table `tenant` keyed on its own PK `id`; `member` keyed on `account_id` (a real key that is
+    // NOT the default, and the table ALSO carries a shared/denormalized `tenant_id` — the exact
+    // shape a wrong-key subquery would leak through); `countries` a global reference (Unscoped).
     // `secrets_shadow` is DELIBERATELY absent → deny-by-default.
     let schema = TenancySchema {
         default_tenant_key: "tenant_id".into(),
@@ -405,6 +408,12 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             (
                 "tenant".into(),
                 TableScope::TenantKeyed { key: "id".into() },
+            ),
+            (
+                "member".into(),
+                TableScope::TenantKeyed {
+                    key: "account_id".into(),
+                },
             ),
             ("countries".into(), TableScope::Unscoped),
         ]),
@@ -455,6 +464,22 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         )
         .await
         .unwrap();
+        // `member(account_id, tenant_id, secret)`: BOTH rows share `tenant_id='acme'` (a
+        // denormalized/forged shared value) while `account_id` is the real isolation key. So a
+        // subquery wrongly scoped on `tenant_id` would surface globex's secret to acme; a subquery
+        // correctly scoped on the declared `account_id` cannot.
+        tx.execute(
+            "CREATE TABLE member (account_id TEXT PRIMARY KEY, tenant_id TEXT, secret TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO member (account_id, tenant_id, secret) VALUES ('acme','acme','acme-secret'),('globex','acme','globex-secret')",
+            &[],
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -464,7 +489,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             columns: vec![item(Expr::col("item"))],
             ..Select::from("orders")
         };
-        s.force_scope(&scope_for("acme"));
+        s.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -479,7 +504,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             columns: vec![item(Expr::col("plan"))],
             ..Select::from("tenant")
         };
-        s.force_scope(&scope_for("acme"));
+        s.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
         assert!(
             sql.contains("id = ?") && !sql.contains("tenant_id = ?"),
@@ -508,7 +533,8 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             value: t("acme"),
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (bad_sql, bad_params) = bad.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         assert!(
@@ -523,7 +549,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             columns: vec![item(Expr::col("name"))],
             ..Select::from("countries")
         };
-        s.force_scope(&scope_for("acme"));
+        s.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
         let mut tx = db.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -554,7 +580,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             }],
             ..Select::from("orders")
         };
-        sel.force_scope(&scope_for("acme"));
+        sel.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = sel.compile(Dialect::Sqlite).unwrap();
         assert!(
             sql.contains("o.tenant_id = ?") && sql.contains("t.id = ?"),
@@ -576,7 +602,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
             columns: vec![item(Expr::col("v"))],
             ..Select::from("secrets_shadow")
         };
-        undeclared.force_scope(&scope_for("acme"));
+        undeclared.force_scope(&scope_for("acme")).unwrap();
         assert!(
             matches!(
                 undeclared.compile(Dialect::Sqlite),
@@ -586,10 +612,107 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         );
     }
 
+    // 6) SUBQUERY keyed correctly (the CRITICAL regression guard): an `IN (SELECT … FROM member …)`
+    //    scopes the subquery's `member` table on its DECLARED key `account_id`, never the default
+    //    `tenant_id`. Because both member rows share `tenant_id='acme'`, a wrong key on `tenant_id`
+    //    would surface globex's row to the subquery — the exact cross-tenant leak. The SQL-shape
+    //    assertion fails closed if the subquery injector ever regresses to `scope.column`.
+    {
+        let mut s = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("o.item"))],
+            filter: Some(Predicate::InSubquery {
+                expr: Expr::col("o.tenant_id"),
+                column: "account_id".into(),
+                table: "member".into(),
+                filter: Box::new(Predicate::And(Vec::new())),
+                negated: false,
+            }),
+            ..Select::from("orders")
+        };
+        s.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("member.account_id = ?"),
+            "subquery must scope member on its declared key account_id: {sql}"
+        );
+        assert!(
+            !sql.contains("member.tenant_id"),
+            "subquery must NOT scope member on the default tenant_id (the cross-tenant leak): {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "the subquery-filtered read stays acme-only and the SQL is valid on a real engine"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 7) SUBQUERY on an `Unscoped` reference table adds NO tenant predicate to that subquery.
+    {
+        let mut s = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("o.item"))],
+            filter: Some(Predicate::InSubquery {
+                expr: Expr::col("o.item"),
+                column: "code".into(),
+                table: "countries".into(),
+                filter: Box::new(Predicate::And(Vec::new())),
+                negated: true, // NOT IN, so a real reference lookup that doesn't filter everything out
+            }),
+            ..Select::from("orders")
+        };
+        s.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = s.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            !sql.contains("countries."),
+            "an Unscoped subquery table must carry no tenant predicate: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "unscoped subquery is a plain reference"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 8) SUBQUERY deny-by-default (the other half of the CRITICAL fix): an `IN (SELECT … FROM
+    //    <undeclared> …)` is REFUSED at scope injection — `force_scope` returns `TenancyUndeclared`
+    //    and no SQL is ever built. Before the fix the injector silently emitted `<undeclared>.
+    //    tenant_id = ?`, voiding deny-by-default for the entire subquery surface.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            filter: Some(Predicate::InSubquery {
+                expr: Expr::col("id"),
+                column: "v".into(),
+                table: "secrets_shadow".into(),
+                filter: Box::new(Predicate::And(Vec::new())),
+                negated: false,
+            }),
+            ..Select::from("orders")
+        };
+        assert!(
+            matches!(
+                s.force_scope(&scope_for("acme")),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "a subquery on an undeclared table must be refused at injection, not silently scoped"
+        );
+    }
+
     println!(
         "ORM PER-TABLE-KEY TENANCY OK: Tenant table scoped on default tenant_id; identity \
          TenantKeyed table scoped on its own PK (uniform tenant_id scope rejected by the engine — \
          key is load-bearing); Unscoped reference table globally readable; per-ref join keys each \
-         on its own column; an undeclared table refused deny-by-default"
+         on its own column; a subquery scopes its inner table on that table's declared key (never \
+         the default) and is refused deny-by-default on an undeclared table; a top-level undeclared \
+         table refused deny-by-default"
     );
 }

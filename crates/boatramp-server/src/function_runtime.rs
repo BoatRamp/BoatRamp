@@ -577,10 +577,15 @@ pub(super) async fn build_function_bindings(
             .await
             .map_err(|e| e.to_string())?,
         };
-        // Attach the project per-table tenancy schema (R2/D2) from the KV; `None` ⇒ Uniform. Applies
-        // on every trigger (request/inherited/background) so a frame- or job-triggered query scopes
-        // each table on its own key identically to a request.
-        let schema = boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await;
+        // Attach the project per-table tenancy schema (R2/D2) from the KV. Absent ⇒ Uniform;
+        // present-but-unreadable ⇒ **fail closed** with a deny-all schema (never a silent downgrade
+        // to Uniform). Applies on every trigger (request/inherited/background) so a frame- or
+        // job-triggered query scopes each table on its own key identically to a request.
+        let schema =
+            match boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await {
+                Ok(s) => s,
+                Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
+            };
         let resolved = resolved.map(|h| h.with_schema(schema.as_ref()));
         bindings = bindings.with_tenancy(resolved.clone());
         resolved

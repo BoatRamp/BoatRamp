@@ -97,7 +97,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             columns: vec![item(Expr::col("body"))],
             ..Select::from("notes")
         };
-        s.force_scope(&scope(mode, tenant));
+        s.force_scope(&scope(mode, tenant)).unwrap();
         s.compile(dialect).unwrap()
     };
 
@@ -177,7 +177,8 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
         ins.force_scope(
             Some(&scope(ScopeMode::Own, "acme")),
             Some(&scope(ScopeMode::Own, "acme")),
-        );
+        )
+        .unwrap();
         let (sql, params) = ins.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -211,7 +212,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             scope: None,
             returning: vec![],
         };
-        upd.force_scope(&scope(ScopeMode::Own, "acme"));
+        upd.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = upd.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -246,7 +247,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             scope: None,
             returning: vec![],
         };
-        del.force_scope(&scope(ScopeMode::Own, "acme"));
+        del.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = del.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -293,7 +294,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             }],
             ..Select::from("notes")
         };
-        sel.force_scope(&scope(ScopeMode::Own, "acme"));
+        sel.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = sel.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -334,7 +335,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
                 limit: Some(1),
                 ..Select::from("notes")
             };
-            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant));
+            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant)).unwrap();
             s.compile(dialect).unwrap()
         };
 
@@ -435,7 +436,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             columns: vec![item(Expr::col("item"))],
             ..Select::from("orders")
         };
-        s.force_scope(&scope_for("acme"));
+        s.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = s.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -453,7 +454,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             columns: vec![item(Expr::col("plan"))],
             ..Select::from("tenant")
         };
-        s.force_scope(&scope_for("acme"));
+        s.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = s.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -472,7 +473,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             columns: vec![item(Expr::col("plan"))],
             ..Select::from("tenant")
         };
-        bad.force_scope(&scope(ScopeMode::Own, "acme")); // Uniform helper → tenant_id
+        bad.force_scope(&scope(ScopeMode::Own, "acme")).unwrap(); // Uniform helper → tenant_id
         let (bad_sql, bad_params) = bad.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         assert!(
@@ -487,7 +488,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             columns: vec![item(Expr::col("name"))],
             ..Select::from("countries")
         };
-        s.force_scope(&scope_for("acme"));
+        s.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = s.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -517,7 +518,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             }],
             ..Select::from("orders")
         };
-        sel.force_scope(&scope_for("acme"));
+        sel.force_scope(&scope_for("acme")).unwrap();
         let (sql, params) = sel.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -535,7 +536,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             columns: vec![item(Expr::col("v"))],
             ..Select::from("secrets_shadow")
         };
-        undeclared.force_scope(&scope_for("acme"));
+        undeclared.force_scope(&scope_for("acme")).unwrap();
         assert!(
             matches!(
                 undeclared.compile(dialect),

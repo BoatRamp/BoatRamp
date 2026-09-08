@@ -86,14 +86,18 @@ impl HostTenancy {
     }
 
     /// Attach the project's per-table tenancy map (R2), so each table scopes on its own key (the
-    /// identity table on its PK, `Unscoped` tables skipped, undeclared tables refused). `None` /
-    /// an empty schema leaves the `Uniform` single-column behavior. Chained by the host at bind time.
+    /// identity table on its PK, `Unscoped` tables skipped, undeclared tables refused).
+    ///
+    /// A **present** schema (`Some`) is authoritative — it becomes `PerTable` **even when empty**, so
+    /// an empty (or [`deny_all`](boatramp_core::tenancy::TenancySchema::deny_all)) schema refuses
+    /// every table rather than silently reverting to single-column scoping. Only an **absent** schema
+    /// (`None` — the project declared none) keeps the legacy `Uniform` behavior. This is the
+    /// fail-closed contract the bind path relies on: a project that has adopted a schema can never be
+    /// downgraded to `Uniform` by an empty map. Chained by the host at bind time.
     #[must_use]
     pub fn with_schema(mut self, schema: Option<&boatramp_core::tenancy::TenancySchema>) -> Self {
         if let Some(s) = schema {
-            if !s.tables.is_empty() {
-                self.keys = boatramp_core::orm::TableKeys::PerTable(s.table_key_map());
-            }
+            self.keys = boatramp_core::orm::TableKeys::PerTable(s.table_key_map());
         }
         self
     }
@@ -262,7 +266,7 @@ mod tests {
             }
             other => panic!("expected PerTable, got {other:?}"),
         }
-        // No project schema ⇒ Uniform (legacy single-column).
+        // No project schema (absent) ⇒ Uniform (legacy single-column).
         let ht2 = HostTenancy::new(
             "tenant_id",
             Some(t("acme")),
@@ -273,6 +277,20 @@ mod tests {
             ht2.orm_scope(Axis::Read).unwrap().unwrap().keys,
             TableKeys::Uniform
         ));
+        // A PRESENT but empty (deny-all) schema is authoritative ⇒ PerTable(empty), NOT Uniform, so
+        // every table is undeclared and refused. This is the fail-closed posture the bind path binds
+        // when the stored schema can't be read — an empty map must never downgrade to Uniform.
+        let ht3 = HostTenancy::new(
+            "tenant_id",
+            Some(t("acme")),
+            AccessMode::Own,
+            AccessMode::Own,
+        )
+        .with_schema(Some(&TenancySchema::deny_all()));
+        match ht3.orm_scope(Axis::Read).unwrap().unwrap().keys {
+            TableKeys::PerTable(m) => assert!(m.is_empty(), "deny-all is an empty PerTable map"),
+            other => panic!("deny-all must be PerTable(empty), got {other:?}"),
+        }
     }
 
     #[test]

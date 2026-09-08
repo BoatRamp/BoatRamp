@@ -555,12 +555,13 @@ impl Select {
     /// `UNION` branch — so a tenant scope reaches every row source (a union branch left unscoped
     /// would leak across tenants). Overwrites any pre-existing scope. This is the host's tenant
     /// injection point for reads; the guest never sets a scope of its own.
-    pub fn force_scope(&mut self, scope: &Scope) {
+    pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         self.scope = Some(scope.clone());
-        self.inject_subquery_scope(scope);
+        self.inject_subquery_scope(scope)?;
         if let Some(u) = self.union.as_mut() {
-            u.query.force_scope(scope);
+            u.query.force_scope(scope)?;
         }
+        Ok(())
     }
 }
 
@@ -573,28 +574,32 @@ impl Insert {
     /// guest can't project another tenant's id into the write (a cross-tenant write forgery).
     /// `None` for an axis (cross-tenant `all`) clears that scope — the operation runs unscoped on
     /// that axis, by design (an `all` write's `stamp_value()` is `None`, so nothing is forced).
-    pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
+    pub fn force_scope(
+        &mut self,
+        write: Option<&Scope>,
+        read: Option<&Scope>,
+    ) -> Result<(), OrmError> {
         self.scope = write.cloned();
         // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
         // of another table — scope it to that table so it can't read cross-tenant.
         if let Some(r) = read {
             for row in &mut self.rows {
                 for cell in &mut row.cells {
-                    inject_scope_expr(r, &mut cell.value);
+                    inject_scope_expr(r, &mut cell.value)?;
                 }
             }
             if let Some(c) = self.conflict.as_mut() {
                 for a in &mut c.update {
-                    inject_scope_expr(r, &mut a.value);
+                    inject_scope_expr(r, &mut a.value)?;
                 }
             }
             for it in &mut self.returning {
-                inject_scope_expr(r, &mut it.expr);
+                inject_scope_expr(r, &mut it.expr)?;
             }
         }
         if let Some((cols, src)) = self.from_select.as_mut() {
             match read {
-                Some(r) => src.force_scope(r),
+                Some(r) => src.force_scope(r)?,
                 None => src.scope = None,
             }
             // A scoped write owns the tenant column written — never trust the guest's target
@@ -616,6 +621,7 @@ impl Insert {
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -677,49 +683,74 @@ fn own_rank_expr(scope: &Scope) -> Expr {
     }
 }
 
+/// Conjoin the tenant scope for a **subquery's inner `table`** onto its `filter`, resolving that
+/// table's key exactly as the top-level [`Select::scope_where_pred`] does: scope on the declared
+/// per-table column, add **no** predicate for an `Unscoped` reference table, and **refuse** an
+/// undeclared table ([`OrmError::TenancyUndeclared`], deny-by-default). This is what makes a
+/// subquery no weaker than a top-level FROM/JOIN ref — under a `PerTable` schema a subquery can
+/// neither reach an undeclared table nor be scoped on the wrong (default) column. Legacy `Uniform`
+/// keys resolve to `scope.column` for every table, preserving the pre-schema behavior.
+fn conjoin_subquery_scope(
+    scope: &Scope,
+    table: &str,
+    filter: &mut Predicate,
+) -> Result<(), OrmError> {
+    if let Some(col) = scope.column_for(table)? {
+        conjoin_front(filter, scope.predicate_on(col, Some(table)));
+    }
+    Ok(())
+}
+
 /// Walk an expression and inject the tenant scope into every **narrow subquery**'s inner filter,
-/// qualified to that subquery's own table (`<subtable>.col`), so a subquery can't read another
-/// tenant's rows. Recurses into a subquery's filter first (nested subqueries scope their own
-/// tables). The correctness twin of [`Select::scope_where_pred`] for the subquery surface. Also
+/// qualified to that subquery's own table (`<subtable>.col`) and keyed on that table's declared
+/// per-table column, so a subquery can neither read another tenant's rows nor reach an undeclared
+/// table. Recurses into a subquery's filter first (nested subqueries scope their own tables). The
+/// correctness twin of [`Select::scope_where_pred`] for the subquery surface — including its
+/// deny-by-default, so `Err(TenancyUndeclared)` propagates out and the query fails closed. Also
 /// lowers any [`Expr::IsOwn`] marker here (where the resolved `scope` is in hand) — so an
 /// unlowered `IsOwn` reaching the renderer means no scope was applied, and it fails closed.
-fn inject_scope_expr(scope: &Scope, e: &mut Expr) {
+fn inject_scope_expr(scope: &Scope, e: &mut Expr) -> Result<(), OrmError> {
     match e {
         Expr::IsOwn => *e = own_rank_expr(scope),
         Expr::RelatedAggregate { table, filter, .. }
         | Expr::RelatedScalar { table, filter, .. } => {
-            inject_scope_pred(scope, filter);
-            conjoin_front(filter, scope.predicate_on(&scope.column, Some(table)));
+            inject_scope_pred(scope, filter)?;
+            conjoin_subquery_scope(scope, table, filter)?;
         }
-        Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner),
+        Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner)?,
         Expr::Binary(_, l, r) | Expr::JsonExtractDyn(l, r) | Expr::JsonConcat(l, r) => {
-            inject_scope_expr(scope, l);
-            inject_scope_expr(scope, r);
+            inject_scope_expr(scope, l)?;
+            inject_scope_expr(scope, r)?;
         }
         Expr::Distance { left, right, .. } => {
-            inject_scope_expr(scope, left);
-            inject_scope_expr(scope, right);
+            inject_scope_expr(scope, left)?;
+            inject_scope_expr(scope, right)?;
         }
-        Expr::Func(_, args) => args.iter_mut().for_each(|a| inject_scope_expr(scope, a)),
+        Expr::Func(_, args) => {
+            for a in args.iter_mut() {
+                inject_scope_expr(scope, a)?;
+            }
+        }
         Expr::Case {
             branches,
             otherwise,
         } => {
             for (when, then) in branches {
-                inject_scope_pred(scope, when);
-                inject_scope_expr(scope, then);
+                inject_scope_pred(scope, when)?;
+                inject_scope_expr(scope, then)?;
             }
             if let Some(e) = otherwise {
-                inject_scope_expr(scope, e);
+                inject_scope_expr(scope, e)?;
             }
         }
         Expr::Column(_) | Expr::Value(_) | Expr::Star | Expr::VectorLiteral(_) => {}
     }
+    Ok(())
 }
 
 /// Walk a predicate and inject the tenant scope into every narrow subquery (see
-/// [`inject_scope_expr`]).
-fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
+/// [`inject_scope_expr`]). Propagates `Err(TenancyUndeclared)` from an undeclared subquery table.
+fn inject_scope_pred(scope: &Scope, p: &mut Predicate) -> Result<(), OrmError> {
     match p {
         Predicate::InSubquery {
             expr,
@@ -727,33 +758,38 @@ fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
             filter,
             ..
         } => {
-            inject_scope_expr(scope, expr);
-            inject_scope_pred(scope, filter);
-            conjoin_front(filter, scope.predicate_on(&scope.column, Some(table)));
+            inject_scope_expr(scope, expr)?;
+            inject_scope_pred(scope, filter)?;
+            conjoin_subquery_scope(scope, table, filter)?;
         }
         Predicate::And(v) | Predicate::Or(v) => {
-            v.iter_mut().for_each(|c| inject_scope_pred(scope, c));
+            for c in v.iter_mut() {
+                inject_scope_pred(scope, c)?;
+            }
         }
-        Predicate::Not(inner) => inject_scope_pred(scope, inner),
+        Predicate::Not(inner) => inject_scope_pred(scope, inner)?,
         Predicate::Cmp { left, right, .. } => {
-            inject_scope_expr(scope, left);
-            inject_scope_expr(scope, right);
+            inject_scope_expr(scope, left)?;
+            inject_scope_expr(scope, right)?;
         }
         Predicate::Between {
             expr, low, high, ..
         } => {
-            inject_scope_expr(scope, expr);
-            inject_scope_expr(scope, low);
-            inject_scope_expr(scope, high);
+            inject_scope_expr(scope, expr)?;
+            inject_scope_expr(scope, low)?;
+            inject_scope_expr(scope, high)?;
         }
         Predicate::In { expr, values, .. } => {
-            inject_scope_expr(scope, expr);
-            values.iter_mut().for_each(|v| inject_scope_expr(scope, v));
+            inject_scope_expr(scope, expr)?;
+            for v in values.iter_mut() {
+                inject_scope_expr(scope, v)?;
+            }
         }
         Predicate::Like { expr, .. } | Predicate::Null { expr, .. } => {
-            inject_scope_expr(scope, expr);
+            inject_scope_expr(scope, expr)?;
         }
     }
+    Ok(())
 }
 
 impl Select {
@@ -762,55 +798,58 @@ impl Select {
     /// join `ON`s) — so a subquery's own table is scoped, not just the outer FROM. Called by
     /// [`Select::force_scope`] after setting the scope. Must stay exhaustive over the Expr/Predicate
     /// fields: a missed field is a cross-tenant subquery leak.
-    fn inject_subquery_scope(&mut self, scope: &Scope) {
+    fn inject_subquery_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         for it in &mut self.columns {
-            inject_scope_expr(scope, &mut it.expr);
+            inject_scope_expr(scope, &mut it.expr)?;
         }
         for e in &mut self.distinct_on {
-            inject_scope_expr(scope, e);
+            inject_scope_expr(scope, e)?;
         }
         if let Some(f) = self.filter.as_mut() {
-            inject_scope_pred(scope, f);
+            inject_scope_pred(scope, f)?;
         }
         if let Some(h) = self.having.as_mut() {
-            inject_scope_pred(scope, h);
+            inject_scope_pred(scope, h)?;
         }
         for e in &mut self.group_by {
-            inject_scope_expr(scope, e);
+            inject_scope_expr(scope, e)?;
         }
         for o in &mut self.order {
-            inject_scope_expr(scope, &mut o.expr);
+            inject_scope_expr(scope, &mut o.expr)?;
         }
         for j in &mut self.joins {
-            inject_scope_pred(scope, &mut j.on);
+            inject_scope_pred(scope, &mut j.on)?;
         }
+        Ok(())
     }
 }
 
 impl Update {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
     /// the `SET` exprs, filter, and `RETURNING` items. Overwrites any prior scope.
-    pub fn force_scope(&mut self, scope: &Scope) {
+    pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         self.scope = Some(scope.clone());
         for a in &mut self.set {
-            inject_scope_expr(scope, &mut a.value);
+            inject_scope_expr(scope, &mut a.value)?;
         }
-        inject_scope_pred(scope, &mut self.filter);
+        inject_scope_pred(scope, &mut self.filter)?;
         for it in &mut self.returning {
-            inject_scope_expr(scope, &mut it.expr);
+            inject_scope_expr(scope, &mut it.expr)?;
         }
+        Ok(())
     }
 }
 
 impl Delete {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
     /// the filter and `RETURNING` items. Overwrites any prior scope.
-    pub fn force_scope(&mut self, scope: &Scope) {
+    pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         self.scope = Some(scope.clone());
-        inject_scope_pred(scope, &mut self.filter);
+        inject_scope_pred(scope, &mut self.filter)?;
         for it in &mut self.returning {
-            inject_scope_expr(scope, &mut it.expr);
+            inject_scope_expr(scope, &mut it.expr)?;
         }
+        Ok(())
     }
 }
 
@@ -1840,7 +1879,8 @@ mod tests {
                 ),
                 ("countries".to_string(), None),
             ])),
-        });
+        })
+        .unwrap();
         let (sql2, params2) = q2.compile(Dialect::Sqlite).unwrap();
         assert!(sql2.contains("sc.tenant_id = ?"), "sql2: {sql2}");
         // The `Unscoped` join binds NO tenant value — the sole bind is the base's own tenant — which
@@ -1862,7 +1902,8 @@ mod tests {
                 "orders".to_string(),
                 Some("tenant_id".to_string()),
             )])),
-        });
+        })
+        .unwrap();
         assert!(matches!(
             q3.compile(Dialect::Sqlite),
             Err(OrmError::TenancyUndeclared(tbl)) if tbl == "secret_table"
@@ -1888,7 +1929,8 @@ mod tests {
             value: t("acme"),
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -1921,7 +1963,8 @@ mod tests {
             value: t("acme"),
             mode: ScopeMode::All,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -1968,7 +2011,8 @@ mod tests {
             value: t("acme"),
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
         // The host scope predicate is conjoined in FRONT, independent of the is_own label.
         assert!(
@@ -2046,7 +2090,8 @@ mod tests {
             value: t("ten_1"),
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -2080,7 +2125,8 @@ mod tests {
             value: t("ten_1"),
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -2110,7 +2156,7 @@ mod tests {
             scope: None,
             returning: vec![item(sub())],
         };
-        del.force_scope(&scope);
+        del.force_scope(&scope).unwrap();
         let (sql, _) = del.compile(Dialect::Sqlite).unwrap();
         assert!(
             sql.contains("RETURNING (SELECT balance FROM victim WHERE victim.tenant_id = ?"),
@@ -2122,7 +2168,7 @@ mod tests {
             distinct_on: vec![sub()],
             ..Select::from("orders")
         };
-        sel.force_scope(&scope);
+        sel.force_scope(&scope).unwrap();
         // The compiler emits portable `?N` placeholders (the backend rewrites to `$N` on PG).
         let (sql, _) = sel.compile(Dialect::Postgres).unwrap();
         assert!(
@@ -2148,7 +2194,8 @@ mod tests {
             value: t("ten_1"),
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
-        });
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         // The subquery's WHERE is scoped to victim.tenant_id; the outer to orders (single table).
         assert_eq!(
@@ -2185,7 +2232,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         };
-        ins.force_scope(Some(&own), Some(&own));
+        ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
         // The tenant column is re-appended last, bound to OWN; the source is read-scoped to OWN.
         assert_eq!(
@@ -2270,7 +2317,7 @@ mod tests {
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         };
-        ins.force_scope(Some(&own), Some(&own));
+        ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,

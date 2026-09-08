@@ -173,6 +173,17 @@ impl Default for TenancySchema {
 }
 
 impl TenancySchema {
+    /// A **deny-all** schema: present (so it is authoritative, not legacy `Uniform`) with **no**
+    /// declared tables, so every table is undeclared and every guest ORM query is refused
+    /// deny-by-default. The host binds this as the fail-closed posture when a project's stored
+    /// schema is present but cannot be read/parsed — never a silent downgrade to `Uniform`.
+    pub fn deny_all() -> Self {
+        Self {
+            default_tenant_key: "tenant_id".to_string(),
+            tables: BTreeMap::new(),
+        }
+    }
+
     /// Resolve how to scope `table`. `None` ⇒ **refused** (the table is undeclared under a present
     /// schema — deny-by-default; the injector fails the query closed). `Some(ResolvedScope::Column)`
     /// ⇒ scope on that column; `Some(ResolvedScope::Unscoped)` ⇒ no tenant predicate (global read).

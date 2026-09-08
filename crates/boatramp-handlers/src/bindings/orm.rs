@@ -83,7 +83,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let read = self.scope_for(crate::tenant::Axis::Read)?;
         let mut core = to_core_select(&q)?;
         if let Some(s) = &read {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -114,7 +114,8 @@ impl wit::HostDatabase for OrmHost<'_> {
         // Only force when in-site tenancy is active (either axis resolved a scope); otherwise the
         // insert stays plain. `all` on an axis resolves to `None`, correctly clearing that axis.
         if self.session.tenancy().is_some() {
-            core.force_scope(write.as_ref(), read.as_ref());
+            core.force_scope(write.as_ref(), read.as_ref())
+                .map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -131,7 +132,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_update(&q)?;
         if let Some(s) = &write {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -148,7 +149,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_delete(&q)?;
         if let Some(s) = &write {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -168,7 +169,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_delete(&q)?;
         if let Some(s) = &write {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
