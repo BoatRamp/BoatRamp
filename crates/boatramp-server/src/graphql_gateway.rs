@@ -295,6 +295,8 @@ impl BackendRouter {
                 invoker,
                 self.bearer.as_deref(),
                 self.depth,
+                // Own path for now; a Target-class fetch's TargetScope is built + passed in 5a-iv(4).
+                None,
             )
             .await
         } else {
@@ -309,6 +311,7 @@ impl BackendRouter {
                 invoker,
                 self.bearer.as_deref(),
                 self.depth,
+                None,
             )
             .await
         }

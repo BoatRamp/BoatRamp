@@ -602,6 +602,9 @@ async fn data_connector_serve(
             invoker.as_deref(),
             bearer,
             0, // an external data-connector request is the root of the call chain
+            // A direct (non-federated) data-connector endpoint is an OWN read; the target axis is a
+            // federation-`@tenant` concern resolved in the gateway.
+            None,
         )
         .await
     };

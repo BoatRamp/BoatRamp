@@ -8,7 +8,7 @@
 
 use super::compile::{compile, Delegation, OutField, OutSource};
 use super::dialect::Dialect;
-use super::policy::{Claims, DataPolicy};
+use super::policy::{Claims, DataPolicy, TargetScope};
 use super::schema::DbSchema;
 use boatramp_core::sql::{SqlBackend, SqlRows, SqlValue};
 use boatramp_handlers::{InvokeRequest, Invoker};
@@ -31,8 +31,9 @@ pub(crate) async fn execute(
     invoker: Option<&dyn Invoker>,
     bearer: Option<&str>,
     depth: u32,
+    target: Option<&TargetScope>,
 ) -> Value {
-    let planned = match compile(query, variables, schema, policy, claims, dialect) {
+    let planned = match compile(query, variables, schema, policy, claims, dialect, target) {
         Ok(planned) => planned,
         Err(err) => return errors(&err.to_string()),
     };
@@ -127,9 +128,10 @@ pub(crate) async fn execute_entities(
     invoker: Option<&dyn Invoker>,
     bearer: Option<&str>,
     depth: u32,
+    target: Option<&TargetScope>,
 ) -> Value {
     use super::compile::compile_entities;
-    let plan = match compile_entities(query, variables, schema, policy, claims, dialect) {
+    let plan = match compile_entities(query, variables, schema, policy, claims, dialect, target) {
         Ok(plan) => plan,
         Err(err) => return errors(&err.to_string()),
     };
@@ -402,6 +404,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         )
         .await;
         assert_eq!(out["data"]["users"][0]["name"], json!("Alice"));
@@ -436,6 +439,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         )
         .await;
         let entities = out["data"]["_entities"]
@@ -463,6 +467,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         )
         .await;
         assert_eq!(out["data"]["users_by_pk"]["name"], json!("Alice"));
@@ -483,6 +488,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         )
         .await;
         assert!(out["data"].is_null());

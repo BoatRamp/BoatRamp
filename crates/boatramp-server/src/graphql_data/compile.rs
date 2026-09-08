@@ -12,7 +12,7 @@
 //! subquery), so tenant isolation is enforced at compile time, at every depth.
 
 use super::dialect::{sql_string_literal, Dialect};
-use super::policy::{Claims, DataPolicy, PolicyError, RowOp};
+use super::policy::{Claims, DataPolicy, PolicyError, RowOp, TargetScope};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
 use async_graphql_parser::types::{
     DocumentOperations, ExecutableDocument, Field, OperationDefinition, OperationType, Selection,
@@ -168,6 +168,7 @@ pub(crate) fn compile_entities(
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
+    target: Option<&TargetScope>,
 ) -> Result<EntitiesPlan, CompileError> {
     let doc =
         async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
@@ -242,8 +243,9 @@ pub(crate) fn compile_entities(
         alias_seq: 1,
     };
     let qualifier = dialect.quote_ident(&type_name);
-    let (mut exprs, projection, delegations) =
-        compile_selection(inner, table, &qualifier, schema, policy, claims, &mut cx)?;
+    let (mut exprs, projection, delegations) = compile_selection(
+        inner, table, &qualifier, schema, policy, claims, target, &mut cx,
+    )?;
     // Ensure the key columns are selected, so a row can be matched to its representation.
     let mut key_indices = Vec::with_capacity(table.primary_key.len());
     for pk in &table.primary_key {
@@ -286,7 +288,7 @@ pub(crate) fn compile_entities(
             clauses.push(format!("({cols}) IN ({})", tuples.join(", ")));
         }
     }
-    if let Some(filter) = policy.row_filter_with_target(&type_name, claims, None)? {
+    if let Some(filter) = policy.row_filter_with_target(&type_name, claims, target)? {
         for term in filter.terms {
             let col = qualify(&qualifier, &term.column, dialect);
             let ph = cx.bind(term.value);
@@ -349,6 +351,7 @@ pub(crate) fn compile(
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
+    target: Option<&TargetScope>,
 ) -> Result<PlannedSql, CompileError> {
     let doc =
         async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
@@ -373,6 +376,7 @@ pub(crate) fn compile(
             policy,
             claims,
             dialect,
+            target,
         )?);
     }
     Ok(PlannedSql { roots })
@@ -646,6 +650,7 @@ fn compile_root(
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
+    target: Option<&TargetScope>,
 ) -> Result<RootQuery, CompileError> {
     let response_key = field_response_key(field);
     let field_name = field.name.node.as_str();
@@ -679,12 +684,14 @@ fn compile_root(
         schema,
         policy,
         claims,
+        target,
         &mut cx,
     )?;
 
-    // WHERE = the policy row filter, plus the `_by_pk` key equality or the list `where` arg.
+    // WHERE = the policy row filter (own claim-bound, or the target `tenant=B AND public`), plus
+    // the `_by_pk` key equality or the list `where` arg.
     let mut clauses: Vec<String> = Vec::new();
-    if let Some(filter) = policy.row_filter_with_target(table_name, claims, None)? {
+    if let Some(filter) = policy.row_filter_with_target(table_name, claims, target)? {
         for term in filter.terms {
             let op = match term.op {
                 RowOp::Eq => "=",
@@ -757,6 +764,7 @@ fn compile_root(
 /// expression list, the output projection, and any delegated fields. A scalar field is a
 /// qualified column; a relationship field is a correlated JSON subquery; a delegated field
 /// is resolved by a wasm function after the query; `__typename` is a constant.
+#[allow(clippy::too_many_arguments)]
 fn compile_selection(
     items: &[Positioned<Selection>],
     table: &Table,
@@ -764,6 +772,7 @@ fn compile_selection(
     schema: &DbSchema,
     policy: &DataPolicy,
     claims: &Claims,
+    target: Option<&TargetScope>,
     cx: &mut Cx<'_>,
 ) -> Result<CompiledSelection, CompileError> {
     let relationships = schema.relationships(&table.name);
@@ -793,7 +802,8 @@ fn compile_selection(
                     table.name
                 )));
             }
-            let subquery = relationship_subquery(rel, f, qualifier, schema, policy, claims, cx)?;
+            let subquery =
+                relationship_subquery(rel, f, qualifier, schema, policy, claims, target, cx)?;
             let idx = exprs.len();
             exprs.push(subquery);
             projection.push(OutField {
@@ -920,6 +930,7 @@ fn serialize_field(field: &Field) -> String {
 /// Lower a relationship field to a correlated JSON subquery selecting the target's scalar
 /// fields, joined to the outer row and filtered by the target's row policy. The target
 /// selection must be scalar-only — a relationship nested beyond one level is rejected.
+#[allow(clippy::too_many_arguments)]
 fn relationship_subquery(
     rel: &Relationship,
     field: &Field,
@@ -927,12 +938,13 @@ fn relationship_subquery(
     schema: &DbSchema,
     policy: &DataPolicy,
     claims: &Claims,
+    target: Option<&TargetScope>,
     cx: &mut Cx<'_>,
 ) -> Result<String, CompileError> {
     if !policy.is_table_exposed(&rel.target_table) {
         return Err(CompileError::UnknownField(rel.field.clone()));
     }
-    let target = schema
+    let tbl = schema
         .table(&rel.target_table)
         .ok_or_else(|| CompileError::UnknownField(rel.field.clone()))?;
     let alias = cx.next_alias();
@@ -956,8 +968,7 @@ fn relationship_subquery(
                 "a relationship nested beyond one level".into(),
             ));
         }
-        if target.column(sf_name).is_none() || !policy.is_column_exposed(&rel.target_table, sf_name)
-        {
+        if tbl.column(sf_name).is_none() || !policy.is_column_exposed(&rel.target_table, sf_name) {
             return Err(CompileError::UnknownField(format!(
                 "{}.{sf_name}",
                 rel.target_table
@@ -976,7 +987,7 @@ fn relationship_subquery(
             cx.dialect.quote_ident(local)
         ));
     }
-    if let Some(filter) = policy.row_filter_with_target(&rel.target_table, claims, None)? {
+    if let Some(filter) = policy.row_filter_with_target(&rel.target_table, claims, target)? {
         for term in filter.terms {
             let col = format!("{qalias}.{}", cx.dialect.quote_ident(&term.column));
             let ph = cx.bind(term.value);
@@ -1333,6 +1344,7 @@ mod tests {
             policy,
             claims,
             &super::super::dialect::Sqlite,
+            None,
         )?;
         Ok(planned.roots.remove(0))
     }
@@ -1557,6 +1569,7 @@ mod tests {
             &open_policy(),
             &Claims::default(),
             &super::super::dialect::Sqlite,
+            None,
         )
         .unwrap();
         let root = planned.roots.remove(0);
@@ -1573,6 +1586,7 @@ mod tests {
             &open_policy(),
             &Claims::default(),
             &super::super::dialect::Sqlite,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, CompileError::Unsupported(m) if m.contains("mutation")));
@@ -1609,6 +1623,7 @@ mod tests {
             &policy,
             &Claims::default(),
             &super::super::dialect::Sqlite,
+            None,
         )
         .unwrap();
         // Exact full SQL: only `name` was asked, but the key column `id` is selected (for
