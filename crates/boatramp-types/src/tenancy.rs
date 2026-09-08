@@ -297,30 +297,27 @@ impl TenancySchema {
         }
     }
 
-    /// The `table → Some(column) | None(=Unscoped)` map the host threads into the ORM scope injector
-    /// (wrapped as `boatramp_core::orm::TableKeys::PerTable` one layer up — that type lives in the
-    /// crate that owns the injector, which depends on this one). The [`TableScope`] match is
-    /// exhaustive **here**, in its defining crate, so adding a variant is a compile error to classify
-    /// rather than a silent miss.
-    ///
-    /// `TenantOrSession` (R3) is a **two-column** disjunct that this single-column map cannot express,
-    /// so it is **omitted** — an absent entry is refused (deny-by-default) at the injector. The ORM
-    /// disjunct lowering resolves it separately via [`resolve`](Self::resolve); until that lands a
-    /// `TenantOrSession` table is fail-closed (declared, but denied), never a silent single-axis
-    /// scope. An empty schema yields an empty map.
-    pub fn table_key_map(&self) -> BTreeMap<String, Option<String>> {
+    /// The `table → `[`ResolvedScope`] map the host threads into the ORM scope injector (wrapped as
+    /// `boatramp_core::orm::TableKeys::PerTable` one layer up — that type lives in the crate that owns
+    /// the injector, which depends on this one). The [`TableScope`] match is exhaustive **here**, in
+    /// its defining crate, so adding a variant is a compile error to classify rather than a silent
+    /// miss. A `TenantOrSession` table with no `session_key` is **omitted** — an absent entry is
+    /// refused (deny-by-default), never a silent single-axis scope. An empty schema yields an empty
+    /// map.
+    pub fn table_key_map(&self) -> BTreeMap<String, ResolvedScope> {
         self.tables
             .iter()
             .filter_map(|(table, scope)| {
-                let column = match scope {
-                    TableScope::Tenant => Some(self.default_tenant_key.clone()),
-                    TableScope::TenantKeyed { key } => Some(key.clone()),
-                    TableScope::Unscoped => None,
-                    // Unrepresentable here (two columns); omit ⇒ deny-by-default until the ORM
-                    // disjunct lowering resolves it via `resolve`.
-                    TableScope::TenantOrSession => return None,
+                let resolved = match scope {
+                    TableScope::Tenant => ResolvedScope::Column(self.default_tenant_key.clone()),
+                    TableScope::TenantKeyed { key } => ResolvedScope::Column(key.clone()),
+                    TableScope::Unscoped => ResolvedScope::Unscoped,
+                    TableScope::TenantOrSession => ResolvedScope::TenantOrSession {
+                        tenant: self.default_tenant_key.clone(),
+                        session: self.session_key.clone()?, // no session_key ⇒ omit ⇒ deny
+                    },
                 };
-                Some((table.clone(), column))
+                Some((table.clone(), resolved))
             })
             .collect()
     }

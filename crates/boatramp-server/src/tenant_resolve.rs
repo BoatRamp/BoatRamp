@@ -264,7 +264,7 @@ mod tests {
             .orm_scope(boatramp_handlers::TenantAxis::Read)
             .unwrap()
             .unwrap();
-        assert_eq!(read.value, SqlValue::Text("caller-tenant".into()));
+        assert_eq!(read.value, Some(SqlValue::Text("caller-tenant".into())));
         assert_eq!(read.mode, boatramp_core::orm::ScopeMode::OwnOrNull);
         // write: all capped to own (posture closed) → a concrete predicate, bound to the caller's value.
         let write = ht
@@ -348,7 +348,7 @@ mod tests {
             .orm_scope(boatramp_handlers::TenantAxis::Read)
             .unwrap()
             .unwrap();
-        assert_eq!(scope.value, SqlValue::Text("acme-store".into()));
+        assert_eq!(scope.value, Some(SqlValue::Text("acme-store".into())));
     }
 
     #[tokio::test]

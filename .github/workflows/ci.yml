@@ -296,17 +296,20 @@ jobs:
       - name: Live in-site tenant isolation on a real libsql engine
         run: |
           set -eo pipefail
-          # Both tests are `#[ignore]`d (the general workspace lane skips them — a static-musl test
+          # All three are `#[ignore]`d (the general workspace lane skips them — a static-musl test
           # binary segfaults in libsql); run them explicitly here, unignored, on the host toolchain.
-          # Two batteries: the Stage 0 single-column model, and the Stage 1 per-table-key model.
+          # Three batteries: the Stage 0 single-column model, the Stage 1 per-table-key model, and the
+          # Stage 3 anonymous-first (TenantOrSession) disjunct.
           cargo test -p boatramp-storage \
             --features sql --test orm_tenant_isolation -- --ignored --nocapture 2>&1 | tee orm-tenancy.log
-          grep -qE 'test result: ok\. 2 passed' orm-tenancy.log \
-            || { echo "::error::ORM tenant isolation tests did not both pass (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 3 passed' orm-tenancy.log \
+            || { echo "::error::ORM tenant isolation tests did not all pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'ORM IN-SITE TENANT ISOLATION OK' orm-tenancy.log \
             || { echo "::error::ORM tenant isolation never reached its success marker (a cross-tenant breach or a skipped test)" >&2; exit 1; }
           grep -q 'ORM PER-TABLE-KEY TENANCY OK' orm-tenancy.log \
             || { echo "::error::ORM per-table-key tenancy never reached its success marker (a per-table scoping breach or a skipped test)" >&2; exit 1; }
+          grep -q 'ORM TENANT-OR-SESSION DISJUNCT OK' orm-tenancy.log \
+            || { echo "::error::ORM TenantOrSession disjunct never reached its success marker (an R3 anon/tenant isolation breach or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

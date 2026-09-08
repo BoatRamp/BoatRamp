@@ -29,7 +29,8 @@ fn t(s: &str) -> SqlValue {
 fn scope(mode: ScopeMode, value: &str) -> Scope {
     Scope {
         column: "tenant_id".into(),
-        value: t(value),
+        value: Some(t(value)),
+        session: None,
         mode,
         keys: TableKeys::Uniform,
     }
@@ -423,6 +424,7 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
 
     let schema = TenancySchema {
         default_tenant_key: "tenant_id".into(),
+        session_key: None,
         tables: BTreeMap::from([
             ("orders".into(), TableScope::Tenant),
             (
@@ -441,7 +443,8 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
     let keys = TableKeys::PerTable(schema.table_key_map());
     let scope_for = |tenant: &str| Scope {
         column: "tenant_id".into(),
-        value: t(tenant),
+        value: Some(t(tenant)),
+        session: None,
         mode: ScopeMode::Own,
         keys: keys.clone(),
     };

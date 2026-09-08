@@ -130,12 +130,20 @@ impl HostTenancy {
     }
 
     /// The resolved own-[`ScopeAxis::Tenant`] value, if any — the value the `Own`/`OwnOrNull` scope
-    /// modes bind. (`Session`/`TargetTenant` facts are consulted by their own axes in later stages.)
+    /// modes bind.
     fn tenant_value(&self) -> Option<&SqlValue> {
-        self.facts
-            .iter()
-            .find(|f| f.axis == ScopeAxis::Tenant)
-            .map(|f| &f.value)
+        self.fact(ScopeAxis::Tenant)
+    }
+
+    /// The resolved anonymous-[`ScopeAxis::Session`] value, if any (R3) — the `session_key` arm of a
+    /// `TenantOrSession` table's disjunct.
+    fn session_value(&self) -> Option<&SqlValue> {
+        self.fact(ScopeAxis::Session)
+    }
+
+    /// The resolved value on `axis`, if the principal carries a fact for it.
+    fn fact(&self, axis: ScopeAxis) -> Option<&SqlValue> {
+        self.facts.iter().find(|f| f.axis == axis).map(|f| &f.value)
     }
 
     /// Attach the project's per-table tenancy map (R2), so each table scopes on its own key (the
@@ -188,18 +196,27 @@ impl HostTenancy {
             AccessMode::Own => ScopeMode::Own,
             AccessMode::OwnOrNull => ScopeMode::OwnOrNull,
         };
-        // NullOnly never references the value; own/own+null require a resolved one.
-        let value = if matches!(mode, ScopeMode::NullOnly) {
-            SqlValue::Null
-        } else {
-            self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?
-        };
+        let tenant = self.tenant_value().cloned();
+        let session = self.session_value().cloned();
+        // `own`/`own+null` need SOME principal. Fail closed early only when the mode needs a value
+        // AND neither a tenant nor a session fact is present (a fully anonymous request). The finer,
+        // per-table decision is the injector's: a plain tenant table with only a session fact still
+        // denies there ([`OrmError::TenancyNoPrincipal`]), while a `TenantOrSession` table uses the
+        // session arm. `NullOnly` needs no value (it emits `IS NULL`).
+        if matches!(mode, ScopeMode::Own | ScopeMode::OwnOrNull)
+            && tenant.is_none()
+            && session.is_none()
+        {
+            return Err(TenantDenied::NoSource);
+        }
         Ok(Some(Scope {
             column: self.column.clone(),
-            value,
-            mode,
-            // The project schema's per-table key map (R2), resolved at `HostTenancy::new`; `Uniform`
+            // The resolved own-tenant fact (`None` for a purely anonymous actor) + the session fact
+            // (R3). The per-table key map (R2/R3), resolved at bind time via `with_schema`; `Uniform`
             // when the project declared no schema (byte-identical to the pre-schema behavior).
+            value: tenant,
+            session,
+            mode,
             keys: self.keys.clone(),
         }))
     }
@@ -294,7 +311,7 @@ mod tests {
         assert_eq!(carried.value(), Some(&t("globex")));
         assert_eq!(
             carried.orm_scope(Axis::Read).unwrap().unwrap().value,
-            t("globex")
+            Some(t("globex"))
         );
     }
 
@@ -308,7 +325,7 @@ mod tests {
         );
         let s = ht.orm_scope(Axis::Read).unwrap().unwrap();
         assert_eq!(s.column, "tenant_id");
-        assert_eq!(s.value, t("ten_1"));
+        assert_eq!(s.value, Some(t("ten_1")));
         assert_eq!(s.mode, ScopeMode::Own);
 
         let ht = HostTenancy::new(
@@ -348,9 +365,17 @@ mod tests {
         let scope = ht.orm_scope(Axis::Read).unwrap().unwrap();
         match &scope.keys {
             TableKeys::PerTable(m) => {
-                assert_eq!(m.get("orders"), Some(&Some("tenant_id".to_string())));
-                assert_eq!(m.get("tenant"), Some(&Some("id".to_string()))); // identity table on its PK
-                assert_eq!(m.get("countries"), Some(&None)); // unscoped
+                use boatramp_core::tenancy::ResolvedScope;
+                assert_eq!(
+                    m.get("orders"),
+                    Some(&ResolvedScope::Column("tenant_id".to_string()))
+                );
+                // identity table on its own PK:
+                assert_eq!(
+                    m.get("tenant"),
+                    Some(&ResolvedScope::Column("id".to_string()))
+                );
+                assert_eq!(m.get("countries"), Some(&ResolvedScope::Unscoped)); // unscoped
                 assert_eq!(m.get("secrets"), None); // undeclared → refused at injection
             }
             other => panic!("expected PerTable, got {other:?}"),
@@ -395,7 +420,9 @@ mod tests {
         let ht = HostTenancy::new("tenant_id", None, AccessMode::Null, AccessMode::Null);
         let s = ht.orm_scope(Axis::Read).unwrap().unwrap();
         assert_eq!(s.mode, ScopeMode::NullOnly);
-        assert_eq!(s.value, SqlValue::Null);
+        // No tenant fact resolved ⇒ `value` is `None`; the injector emits `IS NULL` for NullOnly
+        // regardless of the value, so null-only genuinely needs no resolved principal.
+        assert_eq!(s.value, None);
     }
 
     #[test]

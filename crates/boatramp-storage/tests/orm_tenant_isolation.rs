@@ -21,7 +21,8 @@ fn t(s: &str) -> SqlValue {
 fn scope(mode: ScopeMode, value: &str) -> Scope {
     Scope {
         column: "tenant_id".into(),
-        value: t(value),
+        value: Some(t(value)),
+        session: None,
         mode,
         keys: TableKeys::Uniform,
     }
@@ -403,6 +404,7 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
     // `secrets_shadow` is DELIBERATELY absent → deny-by-default.
     let schema = TenancySchema {
         default_tenant_key: "tenant_id".into(),
+        session_key: None,
         tables: BTreeMap::from([
             ("orders".into(), TableScope::Tenant),
             (
@@ -422,7 +424,8 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
     let keys = TableKeys::PerTable(schema.table_key_map());
     let scope_for = |tenant: &str| Scope {
         column: "tenant_id".into(),
-        value: t(tenant),
+        value: Some(t(tenant)),
+        session: None,
         mode: ScopeMode::Own,
         keys: keys.clone(),
     };
@@ -530,7 +533,8 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         };
         bad.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         })
@@ -842,5 +846,214 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
          INSERT) is bounded + stamped on the target's declared key, can't reassign the tenant, \
          refuses an undeclared target, AND refuses a write to an Unscoped reference table; a \
          top-level undeclared table refused deny-by-default"
+    );
+}
+
+/// **Live** proof of the Stage 3 R3 **anonymous-first disjunct** (`TableScope::TenantOrSession`) on a
+/// real libsql engine: a table whose rows are owned EITHER by a resolved tenant (`tenant_id = T`) OR
+/// by an anonymous session (`session_id = S`, on `tenant_id IS NULL` rows). Proves, end to end, that
+///   * an anonymous (`Session`-only) actor reads/writes **only its own session** rows — never another
+///     session's, never any tenant's (the disjoint columns confine it structurally);
+///   * an authenticated (`Tenant`-only) actor reads **only its tenant** rows;
+///   * an actor carrying BOTH facts reads the **union** `Or([tenant_id = T, session_id = S])`;
+///   * an anonymous WRITE stamps `session_id = S` (with `tenant_id` NULL), landing in the session
+///     partition, and cannot forge a tenant;
+///   * a `TenantOrSession` read with **no** principal (neither fact) is **refused** (fail closed).
+///
+/// The [`Scope`] is built exactly as `HostTenancy::with_schema(&schema).orm_scope()` yields it:
+/// `keys = PerTable(schema.table_key_map())` with the `TenantOrSession { tenant_id, session_id }`
+/// resolution, `value` = the tenant fact (or `None`), `session` = the session fact. Same `#[ignore]`
+/// rationale + `test-orm-tenancy` CI gate as the siblings above.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    let dir = std::env::temp_dir().join(format!("boatramp-orm-tos-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let backends = LibsqlSqlBackends::local(&dir);
+    let db = backends.database("default", "shop", "").await.unwrap();
+
+    // `carts` is anonymous-first: a resolved tenant owns `tenant_id = T` rows; an anon session owns
+    // `session_id = S` rows (with `tenant_id` NULL). The schema declares it `TenantOrSession` and
+    // sets `session_key`.
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        session_key: Some("session_id".into()),
+        tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    // A read/write scope carrying whichever axis facts the request holds (mode `own`).
+    let scope = |tenant: Option<&str>, session: Option<&str>| Scope {
+        column: "tenant_id".into(),
+        value: tenant.map(t),
+        session: session.map(t),
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+    };
+
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE carts (id TEXT PRIMARY KEY, tenant_id TEXT, session_id TEXT, item TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO carts (id, tenant_id, session_id, item) VALUES \
+             ('c_acme','acme',NULL,'acme-cart'), \
+             ('c_glob','globex',NULL,'globex-cart'), \
+             ('c_s1',NULL,'sess-1','anon-cart-1'), \
+             ('c_s2',NULL,'sess-2','anon-cart-2')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Helper: SELECT item FROM carts under `scope`, sorted.
+    let read_items = |sc: &Scope| {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("carts")
+        };
+        s.force_scope(sc).unwrap();
+        s.compile(Dialect::Sqlite).unwrap()
+    };
+
+    // 1) Anonymous (session-only) actor reads ONLY its own session's rows — never another session's,
+    //    never any tenant's. The predicate keys on `session_id`, not `tenant_id`.
+    {
+        let (sql, params) = read_items(&scope(None, Some("sess-1")));
+        assert!(
+            sql.contains("session_id = ?") && !sql.contains("tenant_id = ?"),
+            "anon read must key on session_id only: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["anon-cart-1".to_string()],
+            "anon session reads only its own cart"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2) Authenticated (tenant-only) actor reads ONLY its tenant's rows.
+    {
+        let (sql, params) = read_items(&scope(Some("acme"), None));
+        assert!(
+            sql.contains("tenant_id = ?") && !sql.contains("session_id = ?"),
+            "authed read must key on tenant_id only: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-cart".to_string()],
+            "tenant reads only its cart"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 3) An actor carrying BOTH facts reads the disjunction `Or([tenant_id = T, session_id = S])` —
+    //    its tenant rows PLUS its anon-session rows, and nothing else.
+    {
+        let (sql, params) = read_items(&scope(Some("acme"), Some("sess-1")));
+        assert!(
+            sql.contains("tenant_id = ?") && sql.contains("session_id = ?"),
+            "combined read must Or both axes: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-cart".to_string(), "anon-cart-1".to_string()],
+            "both-fact read = own tenant + own session, nothing else"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 4) An anonymous WRITE stamps `session_id = S` (tenant_id NULL) — lands in the session partition,
+    //    can't forge a tenant. Insert a guest-forged tenant_id + session_id; the host overrides both.
+    {
+        let mut ins = Insert {
+            table: "carts".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "id".into(),
+                        value: Expr::val(t("c_new")),
+                    },
+                    Assignment {
+                        column: "tenant_id".into(),
+                        value: Expr::val(t("globex")), // forgery — must be dropped (anon has no tenant)
+                    },
+                    Assignment {
+                        column: "session_id".into(),
+                        value: Expr::val(t("sess-EVIL")), // forgery — must be host-overridden to sess-1
+                    },
+                    Assignment {
+                        column: "item".into(),
+                        value: Expr::val(t("new-anon")),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        let sc = scope(None, Some("sess-1"));
+        ins.force_scope(Some(&sc), Some(&sc)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        // The new row is session sess-1's, not the forged session/tenant.
+        let row = tx
+            .query(
+                "SELECT tenant_id, session_id FROM carts WHERE id = 'c_new'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.rows[0][1],
+            t("sess-1"),
+            "anon write stamped its own session"
+        );
+        assert_ne!(
+            row.rows[0][1],
+            t("sess-EVIL"),
+            "the guest-forged session must be overridden"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 5) A `TenantOrSession` read with NO principal (neither a tenant nor a session fact) is refused
+    //    at compile — fail closed, never an unscoped read of every cart.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("carts")
+        };
+        s.force_scope(&scope(None, None)).unwrap();
+        assert!(
+            matches!(
+                s.compile(Dialect::Sqlite),
+                Err(boatramp_core::orm::OrmError::TenancyNoPrincipal)
+            ),
+            "a TenantOrSession read with no principal must be refused"
+        );
+    }
+
+    println!(
+        "ORM TENANT-OR-SESSION DISJUNCT OK: anon session reads/writes only its own session rows \
+         (keyed on session_id, never tenant_id); an authenticated actor reads only its tenant rows; \
+         both-fact reads the Or of the two disjoint columns; an anon write stamps its own session \
+         (forged tenant/session overridden); a read with no principal is refused deny-by-default"
     );
 }

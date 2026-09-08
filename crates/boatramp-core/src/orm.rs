@@ -33,6 +33,7 @@
 //! later enhancement (see plans/PLAN-orm-wit.md §4).
 
 use crate::sql::{Dialect, SqlValue};
+use crate::tenancy::ResolvedScope;
 
 // ---- expressions -----------------------------------------------------------
 
@@ -373,27 +374,36 @@ pub enum ScopeMode {
     All,
 }
 
-/// Per-table tenant-key resolution for a [`Scope`] (Stage 1, PLAN-tenancy-principal D2/D3). Legacy /
-/// no project schema ⇒ [`Uniform`](TableKeys::Uniform): every table scopes on [`Scope::column`].
-/// A present project schema ⇒ [`PerTable`](TableKeys::PerTable): the authoritative map, `table →
-/// Some(column)` to scope that table on `column` (`TenantKeyed` identity tables use their own PK),
-/// `table → None` for an `Unscoped` global table (no predicate); a table **absent** from the map is
+/// Per-table tenant-key resolution for a [`Scope`] (PLAN-tenancy-principal D2/D3). Legacy / no
+/// project schema ⇒ [`Uniform`](TableKeys::Uniform): every table scopes on [`Scope::column`].
+/// A present project schema ⇒ [`PerTable`](TableKeys::PerTable): the authoritative `table →
+/// `[`ResolvedScope`] map — `Column(col)` scopes that table on `col` (`TenantKeyed` identity tables
+/// on their own PK), `Unscoped` a global table (no predicate), `TenantOrSession { tenant, session }`
+/// the R3 anonymous-first disjunct on two disjoint columns; a table **absent** from the map is
 /// refused ([`OrmError::TenancyUndeclared`], deny-by-default).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TableKeys {
     #[default]
     Uniform,
-    PerTable(std::collections::BTreeMap<String, Option<String>>),
+    PerTable(std::collections::BTreeMap<String, ResolvedScope>),
 }
 
-/// A host-resolved in-site row-tenancy scope. The `value` is the resolved tenant (from the
-/// verified source); `mode` decides how it restricts the operation; `keys` resolves the tenant
-/// **column per table** (the project schema — R2/D2). Injected by the host on **every** query node
-/// (top-level, `UNION` branch, `INSERT … SELECT` source), never guest-set.
+/// A host-resolved in-site row-tenancy scope — the applied side of the resolved principal. `value`
+/// is the resolved **own-tenant** fact (`None` ⇒ the actor has no tenant, e.g. a purely anonymous
+/// `Session`-only request); `session` is the resolved anonymous-**session** fact (R3); `mode`
+/// decides how the tenant axis restricts the operation; `keys` resolves the tenant **column(s) per
+/// table** (the project schema — R2/R3/D2). Injected by the host on **every** query node (top-level,
+/// `UNION` branch, `INSERT … SELECT` source), never guest-set. The fail-closed "no fact for a scope
+/// that needs one" decision is made **per table** in the injector (a `Column` table with no tenant
+/// value denies; a `TenantOrSession` table falls back to whichever axis fact is present).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scope {
     pub column: String,
-    pub value: SqlValue,
+    /// The resolved own-tenant value, or `None` for an anonymous (`Session`-only) actor.
+    pub value: Option<SqlValue>,
+    /// The resolved anonymous-session value (R3), or `None` when the request carries no session
+    /// fact. Only consulted for a [`TableScope::TenantOrSession`](crate::tenancy::TableScope) table.
+    pub session: Option<SqlValue>,
     pub mode: ScopeMode,
     /// Per-table key resolution; [`TableKeys::Uniform`] (the default) preserves the pre-schema
     /// single-column behavior (every table scopes on `column`).
@@ -401,72 +411,155 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// The tenant column to scope `table` on: `Ok(Some(col))` ⇒ scope on `col`; `Ok(None)` ⇒ the
-    /// table is `Unscoped` (no predicate); `Err(TenancyUndeclared)` ⇒ undeclared under a present
-    /// schema (deny-by-default). Legacy `Uniform` keys always yield `Some(self.column)`.
-    fn column_for<'a>(&'a self, table: &str) -> Result<Option<&'a str>, OrmError> {
+    /// Resolve how `table` is scoped under the project schema (R2/R3/D2/D3): `Column(col)` ⇒ scope
+    /// on `col`; `Unscoped` ⇒ no predicate; `TenantOrSession{tenant,session}` ⇒ the R3 disjunct;
+    /// `Err(TenancyUndeclared)` ⇒ undeclared (deny-by-default). Legacy `Uniform` keys resolve every
+    /// table to `Column(self.column)`, byte-identical to the pre-schema single-column behavior.
+    fn resolve_table(&self, table: &str) -> Result<ResolvedScope, OrmError> {
         match &self.keys {
-            TableKeys::Uniform => Ok(Some(self.column.as_str())),
-            TableKeys::PerTable(m) => match m.get(table) {
-                Some(Some(col)) => Ok(Some(col.as_str())),
-                Some(None) => Ok(None),
-                None => Err(OrmError::TenancyUndeclared(table.to_string())),
-            },
+            TableKeys::Uniform => Ok(ResolvedScope::Column(self.column.clone())),
+            TableKeys::PerTable(m) => m
+                .get(table)
+                .cloned()
+                .ok_or_else(|| OrmError::TenancyUndeclared(table.to_string())),
         }
     }
 
-    /// The tenant column to scope a **WRITE** target (`table`) on. Like [`column_for`](Self::column_for)
-    /// but an `Unscoped` table is **refused** (`Err(UnscopedWrite)`) rather than returning `Ok(None)`:
-    /// reads of a global reference table are allowed, but a guest write to one is a cross-tenant blast
-    /// (the [`TableScope::Unscoped`](crate::tenancy::TableScope) contract makes writes deny-by-default).
-    /// Legacy `Uniform` keys always yield `self.column`.
-    fn write_column_for<'a>(&'a self, table: &str) -> Result<&'a str, OrmError> {
-        match &self.keys {
-            TableKeys::Uniform => Ok(self.column.as_str()),
-            TableKeys::PerTable(m) => match m.get(table) {
-                Some(Some(col)) => Ok(col.as_str()),
-                Some(None) => Err(OrmError::UnscopedWrite(table.to_string())),
-                None => Err(OrmError::TenancyUndeclared(table.to_string())),
-            },
-        }
+    /// A (possibly-qualified) column expression `<qualifier>.column`.
+    fn col_expr(column: &str, qualifier: Option<&str>) -> Expr {
+        Expr::Column(match qualifier {
+            Some(q) => format!("{q}.{column}"),
+            None => column.to_string(),
+        })
     }
 
-    /// The per-mode predicate on `column`, optionally qualified `<qualifier>.column` — so it binds to
-    /// a specific table in a multi-table (join) or subquery context, never accidentally to an
-    /// outer/other table with the same column name (a scoping leak). `column` is the per-table
-    /// resolved key (see [`Scope::column_for`]).
-    fn predicate_on(&self, column: &str, qualifier: Option<&str>) -> Option<Predicate> {
-        let col = || {
-            Expr::Column(match qualifier {
-                Some(q) => format!("{q}.{column}"),
-                None => column.to_string(),
-            })
-        };
-        let eq = || Predicate::Cmp {
-            left: col(),
-            op: CmpOp::Eq,
-            right: Expr::Value(self.value.clone()),
-        };
-        let is_null = || Predicate::Null {
-            expr: col(),
+    /// The **tenant-axis** predicate on `column` (optionally `<qual>.column`) for the resolved mode:
+    /// `Ok(None)` for `All` (no predicate — cross-tenant); `NullOnly` needs no value; `Own`/`OwnOrNull`
+    /// require a resolved own-tenant value and **fail closed** ([`OrmError::TenancyNoPrincipal`]) when
+    /// there is none (a purely anonymous actor reading a plain tenant table). Never binds to another
+    /// table's same-named column — it is qualified by `qual`.
+    fn tenant_pred(
+        &self,
+        column: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        let is_null = Predicate::Null {
+            expr: Self::col_expr(column, qualifier),
             negated: false,
         };
-        match self.mode {
-            ScopeMode::Own => Some(eq()),
-            ScopeMode::OwnOrNull => Some(Predicate::Or(vec![eq(), is_null()])),
-            ScopeMode::NullOnly => Some(is_null()),
+        let eq = |v: SqlValue| Predicate::Cmp {
+            left: Self::col_expr(column, qualifier),
+            op: CmpOp::Eq,
+            right: Expr::Value(v),
+        };
+        Ok(match self.mode {
             ScopeMode::All => None,
+            ScopeMode::NullOnly => Some(is_null),
+            ScopeMode::Own => {
+                let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+                Some(eq(v))
+            }
+            ScopeMode::OwnOrNull => {
+                let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+                Some(Predicate::Or(vec![eq(v), is_null]))
+            }
+        })
+    }
+
+    /// The R3 **disjunct** read predicate for a `TenantOrSession` table: `Or` of the arms for
+    /// whichever axis facts the request carries — `tenant = <own>` (if a tenant fact is present) and
+    /// `session = <sid>` (if a session fact is present) — over the two **disjoint** columns. `All`
+    /// mode ⇒ no predicate (cross-tenant). No fact at all ⇒ **deny** ([`TenancyNoPrincipal`]): a
+    /// `TenantOrSession` read with neither an own nor a session identity fails closed rather than
+    /// running unscoped. Each arm is a plain `col = value` (the session partition IS the
+    /// tenant-`NULL` rows, so no extra NULL arm is added).
+    fn disjunct_pred(
+        &self,
+        tenant_col: &str,
+        session_col: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        if matches!(self.mode, ScopeMode::All) {
+            return Ok(None);
+        }
+        let eq = |column: &str, v: SqlValue| Predicate::Cmp {
+            left: Self::col_expr(column, qualifier),
+            op: CmpOp::Eq,
+            right: Expr::Value(v),
+        };
+        let mut arms = Vec::new();
+        if let Some(v) = self.value.clone() {
+            arms.push(eq(tenant_col, v));
+        }
+        if let Some(s) = self.session.clone() {
+            arms.push(eq(session_col, s));
+        }
+        match arms.len() {
+            0 => Err(OrmError::TenancyNoPrincipal),
+            1 => Ok(arms.pop()),
+            _ => Ok(Some(Predicate::Or(arms))),
         }
     }
 
-    /// The value the scope stamps into a scoped `INSERT`'s tenant column for this mode, or `None`
-    /// when the mode forces no column (`all` — the guest supplies the value; a cross-tenant write).
-    /// `own`/`own+null` stamp the resolved tenant; `null` stamps `NULL` (the shared baseline).
-    fn stamp_value(&self) -> Option<SqlValue> {
-        match self.mode {
-            ScopeMode::Own | ScopeMode::OwnOrNull => Some(self.value.clone()),
-            ScopeMode::NullOnly => Some(SqlValue::Null),
-            ScopeMode::All => None,
+    /// The READ predicate to conjoin for `table` (qualified by `qualifier` in a join/subquery):
+    /// dispatches on the per-table [`ResolvedScope`] — a plain tenant column, an `Unscoped` global
+    /// (no predicate), or the R3 `TenantOrSession` disjunct. `Ok(None)` ⇒ no predicate (the table is
+    /// global, or the mode is cross-tenant `All`). Undeclared / no-principal ⇒ fail closed.
+    fn read_pred(
+        &self,
+        table: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        match self.resolve_table(table)? {
+            ResolvedScope::Column(col) => {
+                ident(&col)?;
+                self.tenant_pred(&col, qualifier)
+            }
+            ResolvedScope::Unscoped => Ok(None),
+            ResolvedScope::TenantOrSession { tenant, session } => {
+                ident(&tenant)?;
+                ident(&session)?;
+                self.disjunct_pred(&tenant, &session, qualifier)
+            }
+        }
+    }
+
+    /// The `(column, value)` a scoped **WRITE** stamps/bounds for `table` — the actor's OWN axis:
+    /// a plain tenant table (or `Uniform`) stamps `default_tenant_key = <own tenant>`; a
+    /// `TenantOrSession` table stamps whichever single axis the actor holds (tenant if authenticated,
+    /// else session) so an anonymous write lands in the session partition and an authenticated write
+    /// in the tenant partition — never both, never cross. `Ok(None)` ⇒ `All` mode (no stamp — a
+    /// posture-vetted cross-tenant write). Fail closed: an `Unscoped` (global) target
+    /// ([`UnscopedWrite`]), an undeclared target ([`TenancyUndeclared`]), or a scoped write with no
+    /// principal ([`TenancyNoPrincipal`]) are refused before any SQL.
+    fn write_target(&self, table: &str) -> Result<Option<(String, SqlValue)>, OrmError> {
+        // The tenant-axis stamp value for this mode (own/own+null → the resolved tenant; null → the
+        // shared baseline; all → no stamp).
+        let tenant_stamp = || -> Result<Option<SqlValue>, OrmError> {
+            Ok(match self.mode {
+                ScopeMode::All => None,
+                ScopeMode::NullOnly => Some(SqlValue::Null),
+                ScopeMode::Own | ScopeMode::OwnOrNull => {
+                    Some(self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?)
+                }
+            })
+        };
+        match self.resolve_table(table)? {
+            ResolvedScope::Column(col) => Ok(tenant_stamp()?.map(|v| (col, v))),
+            ResolvedScope::Unscoped => Err(OrmError::UnscopedWrite(table.to_string())),
+            ResolvedScope::TenantOrSession { tenant, session } => {
+                if matches!(self.mode, ScopeMode::All) {
+                    return Ok(None);
+                }
+                // Prefer the tenant axis when authenticated; else the session axis for an anon write.
+                if let Some(v) = self.value.clone() {
+                    Ok(Some((tenant, v)))
+                } else if let Some(s) = self.session.clone() {
+                    Ok(Some((session, s)))
+                } else {
+                    Err(OrmError::TenancyNoPrincipal)
+                }
+            }
         }
     }
 }
@@ -588,12 +681,12 @@ impl Insert {
         read: Option<&Scope>,
     ) -> Result<(), OrmError> {
         self.scope = write.cloned();
-        // The write target's per-table tenant column (Stage 1), resolved once for the INSERT…SELECT
-        // tenant-projection stamp below. Deny-by-default: an undeclared target is refused here (so a
-        // guest INSERT…SELECT can't write an undeclared table), and an `Unscoped` (global) target is
-        // refused for writes (`write_column_for`).
-        let target_col: Option<String> = match write {
-            Some(w) => Some(w.write_column_for(&self.table)?.to_string()),
+        // The write target's per-table stamp `(column, value)` — the actor's OWN axis (Stage 1/R3),
+        // resolved once for the INSERT…SELECT tenant-projection re-append below. Resolving it enforces
+        // deny-by-default at bind time (an undeclared target, an `Unscoped` target, or a scoped write
+        // with no principal are refused). `None` ⇒ `all` mode (no stamp).
+        let target: Option<(String, SqlValue)> = match write {
+            Some(w) => w.write_target(&self.table)?,
             None => None,
         };
         // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
@@ -618,16 +711,18 @@ impl Insert {
                 Some(r) => src.force_scope(r)?,
                 None => src.scope = None,
             }
-            // A scoped write owns the tenant column written — never trust the guest's target
-            // projection. Drop any guest-supplied tenant column (+ its aligned projection, in the
-            // source and every union branch) and re-append it bound to the host value. The column
-            // is the target's **per-table** key (Stage 1): an undeclared target was already refused
-            // above; an `Unscoped` target has no tenant column, so nothing is forced.
-            if let (Some(v), Some(column)) = (write.and_then(Scope::stamp_value), target_col) {
+            // A scoped write owns the axis column written — never trust the guest's target
+            // projection. Drop any guest-supplied owning-axis column (+ its aligned projection, in
+            // the source and every union branch) and re-append it bound to the host value. The
+            // column is the actor's per-table axis key (Stage 1/R3); `all` mode ⇒ `target` is `None`
+            // ⇒ nothing is forced (a posture-vetted cross-tenant write).
+            if let Some((column, v)) = &target {
+                let column = column.clone();
                 if let Some(i) = cols.iter().position(|c| same_col(c, &column)) {
                     cols.remove(i);
                     drop_projection_at(src, i);
                 }
+                let v = v.clone();
                 cols.push(column);
                 push_projection(
                     src,
@@ -682,6 +777,10 @@ fn conjoin_front(filter: &mut Predicate, add: Option<Predicate>) {
 /// it a proper boolean (never `NULL`) so `ORDER BY … DESC` is portable (own sorts first) across
 /// every dialect. The column is unqualified — the base-vs-override read this serves is single-table.
 fn own_rank_expr(scope: &Scope) -> Expr {
+    // No resolved own-tenant value (a purely anonymous actor) ⇒ nothing ranks as "own" ⇒ constant 0.
+    let Some(value) = scope.value.clone() else {
+        return Expr::Value(SqlValue::Integer(0));
+    };
     let col = || Expr::Column(scope.column.clone());
     let own = Predicate::And(vec![
         Predicate::Null {
@@ -691,7 +790,7 @@ fn own_rank_expr(scope: &Scope) -> Expr {
         Predicate::Cmp {
             left: col(),
             op: CmpOp::Eq,
-            right: Expr::Value(scope.value.clone()),
+            right: Expr::Value(value),
         },
     ]);
     Expr::Case {
@@ -701,20 +800,18 @@ fn own_rank_expr(scope: &Scope) -> Expr {
 }
 
 /// Conjoin the tenant scope for a **subquery's inner `table`** onto its `filter`, resolving that
-/// table's key exactly as the top-level [`Select::scope_where_pred`] does: scope on the declared
-/// per-table column, add **no** predicate for an `Unscoped` reference table, and **refuse** an
-/// undeclared table ([`OrmError::TenancyUndeclared`], deny-by-default). This is what makes a
-/// subquery no weaker than a top-level FROM/JOIN ref — under a `PerTable` schema a subquery can
-/// neither reach an undeclared table nor be scoped on the wrong (default) column. Legacy `Uniform`
-/// keys resolve to `scope.column` for every table, preserving the pre-schema behavior.
+/// table exactly as the top-level [`Select::scope_where_pred`] does (via [`Scope::read_pred`]): the
+/// declared per-table column, the R3 `TenantOrSession` disjunct, **no** predicate for an `Unscoped`
+/// reference table, and **refuse** an undeclared table or a scoped ref with no principal
+/// (deny-by-default). This is what makes a subquery no weaker than a top-level FROM/JOIN ref — under
+/// a `PerTable` schema a subquery can neither reach an undeclared table nor be scoped on the wrong
+/// column. Legacy `Uniform` keys resolve to `scope.column` for every table (pre-schema behavior).
 fn conjoin_subquery_scope(
     scope: &Scope,
     table: &str,
     filter: &mut Predicate,
 ) -> Result<(), OrmError> {
-    if let Some(col) = scope.column_for(table)? {
-        conjoin_front(filter, scope.predicate_on(col, Some(table)));
-    }
+    conjoin_front(filter, scope.read_pred(table, Some(table))?);
     Ok(())
 }
 
@@ -896,6 +993,12 @@ pub enum OrmError {
     /// contract), so the host refuses them rather than running the write unbounded-by-tenant.
     #[error("tenancy: table {0:?} is Unscoped (global reference); guest writes are refused (deny-by-default)")]
     UnscopedWrite(String),
+    /// A scoped read/write needed a resolved principal (an own-tenant value, or — for a
+    /// `TenantOrSession` table — at least one of the tenant/session facts) but the request carried
+    /// none. Fail closed: the query is refused rather than run unscoped. (The single-column raw-SQL
+    /// path reports the equivalent `TenantDenied::NoSource` at the binding.)
+    #[error("tenancy: no resolved principal for a scoped operation (deny-by-default)")]
+    TenancyNoPrincipal,
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -1280,19 +1383,36 @@ fn render_where(
     Ok(Some(render_pred(&combined, params, false, dialect)?))
 }
 
-/// The single-table scope predicate for an UPDATE/DELETE `WHERE`, keyed on `table`'s **per-table**
-/// tenant column (Stage 1): `Ok(Some(pred))` scopes on the declared key; `Ok(None)` ⇒ no scope was
-/// forced (the guest binding only forces a scope when tenancy is active). An `Unscoped` target is
-/// **refused** (`Err(UnscopedWrite)`) and an undeclared one too (`Err(TenancyUndeclared)`) — a guest
-/// write to a global/undeclared table is deny-by-default.
+/// The single-table scope predicate for an UPDATE/DELETE `WHERE`, bounding the write to the actor's
+/// OWN partition via [`Scope::write_target`]: a plain tenant table bounds `tenant_col = <own>` (or
+/// `tenant_col IS NULL` for the explicit null-baseline grant); a `TenantOrSession` table bounds the
+/// single axis the actor holds (`tenant_col = T` authenticated, else `session_col = S`). `Ok(None)`
+/// ⇒ `All` (no bound) or no forced scope. An `Unscoped` target is refused (`UnscopedWrite`), an
+/// undeclared one too (`TenancyUndeclared`), and a scoped write with no principal
+/// (`TenancyNoPrincipal`) — deny-by-default.
 fn single_scope_pred(scope: Option<&Scope>, table: &str) -> Result<Option<Predicate>, OrmError> {
-    match scope {
-        Some(s) => {
-            let col = s.write_column_for(table)?; // Unscoped ⇒ refused; undeclared ⇒ refused
-            ident(col)?;
-            Ok(s.predicate_on(col, None))
+    let Some(s) = scope else { return Ok(None) };
+    match s.write_target(table)? {
+        None => Ok(None), // All — no bound
+        Some((col, value)) => {
+            ident(&col)?;
+            let col_expr = Expr::Column(col);
+            // A NULL stamp value is the explicit null-baseline grant ⇒ `IS NULL`; any real tenant /
+            // session value ⇒ `= value`. (Own/session values are never NULL, so this is unambiguous.)
+            let pred = if matches!(value, SqlValue::Null) {
+                Predicate::Null {
+                    expr: col_expr,
+                    negated: false,
+                }
+            } else {
+                Predicate::Cmp {
+                    left: col_expr,
+                    op: CmpOp::Eq,
+                    right: Expr::Value(value),
+                }
+            };
+            Ok(Some(pred))
         }
-        None => Ok(None),
     }
 }
 
@@ -1374,13 +1494,9 @@ impl Select {
             return Ok(None);
         };
         if self.joins.is_empty() {
-            // Single table: resolve its per-table key (deny-by-default if undeclared; skip if
-            // Unscoped), and emit the unqualified predicate on it.
-            let Some(col) = scope.column_for(&self.table)? else {
-                return Ok(None); // Unscoped table — no tenant predicate
-            };
-            ident(col)?;
-            return Ok(scope.predicate_on(col, None));
+            // Single table: its per-table read predicate (the tenant column, the R3 disjunct, or
+            // `None` for an `Unscoped` global; deny-by-default / no-principal fail closed).
+            return scope.read_pred(&self.table, None);
         }
         // Joined: each table reference is scoped on its OWN resolved key, qualified by alias-or-name,
         // so a guest can't read a joined table's cross-tenant rows through the projection. A ref
@@ -1399,11 +1515,7 @@ impl Select {
         let mut parts: Vec<Predicate> = Vec::with_capacity(refs.len());
         for (table, qual) in refs {
             ident(qual)?;
-            let Some(col) = scope.column_for(table)? else {
-                continue; // Unscoped ref
-            };
-            ident(col)?;
-            if let Some(p) = scope.predicate_on(col, Some(qual)) {
+            if let Some(p) = scope.read_pred(table, Some(qual))? {
                 parts.push(p);
             }
         }
@@ -1523,12 +1635,14 @@ impl Insert {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
-        // The write target's per-table tenant key (Stage 1): scope-stamp + upsert-guard on THIS
-        // column, not the schema default. Deny-by-default — an undeclared target is refused, and an
-        // `Unscoped` (global reference) target is refused for writes (`write_column_for`), for both
-        // the VALUES and INSERT…SELECT forms.
-        let target_col: Option<String> = match self.scope.as_ref() {
-            Some(s) => Some(s.write_column_for(&self.table)?.to_string()),
+        // The write target's per-table stamp `(column, value)` — the actor's OWN axis (tenant when
+        // authenticated, the anon session for a `TenantOrSession` table otherwise; PLAN R2/R3).
+        // Resolving it enforces deny-by-default for BOTH the VALUES and INSERT…SELECT forms — an
+        // undeclared target, an `Unscoped` (global) target, or a scoped write with no principal are
+        // refused here. `None` ⇒ `all` mode (no stamp — a posture-vetted cross-tenant write) or no
+        // forced scope.
+        let stamp: Option<(String, SqlValue)> = match self.scope.as_ref() {
+            Some(s) => s.write_target(&self.table)?,
             None => None,
         };
 
@@ -1545,8 +1659,7 @@ impl Insert {
             let mut sql = format!("INSERT INTO {table} ({}) {select_sql}", col_sql.join(", "));
             sql.push_str(&render_conflict(
                 self.conflict.as_ref(),
-                self.scope.as_ref(),
-                target_col.as_deref(),
+                stamp.as_ref().map(|(c, v)| (c.as_str(), v)),
                 &mut params,
                 dialect,
             )?);
@@ -1567,16 +1680,10 @@ impl Insert {
                 columns.push(c);
             }
         }
-        // A scope with a stampable value (own/own+null → the tenant, null → NULL) forces its
-        // per-table tenant column into every row. `all` mode stamps nothing (the guest supplies
-        // the value — a cross-tenant write), and an `Unscoped` target (`target_col == None`) has no
-        // tenant column to force. The column match is case/qualifier-insensitive (`same_col`) so a
-        // guest can't smuggle its own value into the tenant column by re-spelling it (`TENANT_ID`,
-        // `t.tenant_id`).
-        let stamp = match (self.scope.as_ref(), target_col.as_deref()) {
-            (Some(s), Some(col)) => s.stamp_value().map(|v| (col, v)),
-            _ => None,
-        };
+        // The resolved stamp (own tenant, the null baseline, or the anon session value) forces its
+        // per-table column into every row. `all` mode / no forced scope stamps nothing (`stamp` is
+        // `None`). The column match is case/qualifier-insensitive (`same_col`) so a guest can't
+        // smuggle its own value into the stamped column by re-spelling it (`TENANT_ID`, `t.tenant_id`).
         if let Some((column, _)) = &stamp {
             let c = ident(column)?.to_string();
             if !columns.iter().any(|existing| same_col(existing, &c)) {
@@ -1615,8 +1722,7 @@ impl Insert {
 
         sql.push_str(&render_conflict(
             self.conflict.as_ref(),
-            self.scope.as_ref(),
-            target_col.as_deref(),
+            stamp.as_ref().map(|(c, v)| (c.as_str(), v)),
             &mut params,
             dialect,
         )?);
@@ -1635,8 +1741,7 @@ impl Insert {
 /// UPDATE` can't carry that bound, so a scoped upsert on MySQL is refused (fail-closed).
 fn render_conflict(
     conflict: Option<&OnConflict>,
-    scope: Option<&Scope>,
-    target_col: Option<&str>,
+    stamp: Option<(&str, &SqlValue)>,
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<String, OrmError> {
@@ -1648,10 +1753,9 @@ fn render_conflict(
         .iter()
         .map(|c| ident(c).map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
-    // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing) —
-    // AND a per-table tenant column to bound *on* (an `Unscoped` target has `target_col == None`, so
-    // there is no tenant column to guard, exactly as for a plain scoped write to that table).
-    let guard = scope.filter(|s| s.stamp_value().is_some()).zip(target_col);
+    // The resolved write stamp `(column, value)` that must bound the upsert (own/session/null →
+    // a predicate; `all` / no-scope → `None`, nothing to guard).
+    let guard = stamp;
     let do_nothing = || format!(" ON CONFLICT ({}) DO NOTHING", conflict_cols.join(", "));
     if oc.update.is_empty() {
         return Ok(do_nothing());
@@ -1662,12 +1766,12 @@ fn render_conflict(
              (ON DUPLICATE KEY UPDATE cannot be bounded to the tenant's rows)",
         ));
     }
-    // Drop any assignment to the tenant column: a guest upsert never reassigns an existing row's
-    // tenant. If that leaves nothing to update, degrade to DO NOTHING.
+    // Drop any assignment to the stamped (tenant/session) column: a guest upsert never reassigns an
+    // existing row's owning axis. If that leaves nothing to update, degrade to DO NOTHING.
     let sets = oc
         .update
         .iter()
-        .filter(|a| guard.is_none_or(|(_, col)| !same_col(&a.column, col)))
+        .filter(|a| guard.is_none_or(|(col, _)| !same_col(&a.column, col)))
         .map(|a| {
             let c = ident(&a.column)?;
             Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
@@ -1681,12 +1785,23 @@ fn render_conflict(
         conflict_cols.join(", "),
         sets.join(", ")
     );
-    if let Some((s, col)) = guard {
-        // Bound the DO UPDATE to the tenant's own rows (Postgres/SQLite support a trailing WHERE),
-        // keyed on the target's per-table tenant column.
-        let pred = s
-            .predicate_on(col, None)
-            .expect("a stampable scope always has a predicate");
+    if let Some((col, value)) = guard {
+        ident(col)?;
+        // Bound the DO UPDATE to the actor's own partition (Postgres/SQLite support a trailing
+        // WHERE), keyed on the stamped column — `= value`, or `IS NULL` for the null baseline.
+        let col_expr = Expr::Column(col.to_string());
+        let pred = if matches!(value, SqlValue::Null) {
+            Predicate::Null {
+                expr: col_expr,
+                negated: false,
+            }
+        } else {
+            Predicate::Cmp {
+                left: col_expr,
+                op: CmpOp::Eq,
+                right: Expr::Value(value.clone()),
+            }
+        };
         clause.push_str(&format!(
             " WHERE {}",
             render_pred(&pred, params, false, dialect)?
@@ -1715,17 +1830,17 @@ impl Update {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
-        // A scoped write never reassigns the tenant column: drop any `SET <tenant column> = …`
-        // (case/qualifier-insensitively) so a guest can't donate its own rows into another
-        // tenant's partition (mirrors the ON CONFLICT DO UPDATE guard). The column is the target's
-        // **per-table** key (Stage 1); an `Unscoped` target has none to protect, and an undeclared
-        // target is refused. The WHERE still bounds the update to own rows; this bounds what it may
-        // *change*.
-        let scope_col: Option<String> =
-            match self.scope.as_ref().filter(|s| s.stamp_value().is_some()) {
-                Some(s) => Some(s.write_column_for(&self.table)?.to_string()),
-                None => None,
-            };
+        // A scoped write never reassigns the owning-axis column: drop any `SET <axis column> = …`
+        // (case/qualifier-insensitively) so a guest can't donate its own rows into another tenant's
+        // (or session's) partition (mirrors the ON CONFLICT DO UPDATE guard). The column is the
+        // actor's per-table axis key (Stage 1/R3): `tenant_id` (or the identity PK) authenticated,
+        // the `session_id` for an anon `TenantOrSession` write. `all` mode ⇒ no drop; an `Unscoped`
+        // or undeclared or no-principal write is refused (via `write_target`). The WHERE still bounds
+        // the update to own rows; this bounds what it may *change*.
+        let scope_col: Option<String> = match self.scope.as_ref() {
+            Some(s) => s.write_target(&self.table)?.map(|(col, _)| col),
+            None => None,
+        };
         // SET binds before WHERE so placeholder order matches the parameter order.
         let sets: Result<Vec<String>, _> = self
             .set
@@ -1843,7 +1958,8 @@ mod tests {
             filter: Some(cmp("kind", CmpOp::Eq, t("supplier"))),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
@@ -1876,14 +1992,18 @@ mod tests {
             }],
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("acme"),
+                value: Some(t("acme")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::PerTable(BTreeMap::from([
                     (
                         "storefront_config".to_string(),
-                        Some("tenant_id".to_string()),
+                        ResolvedScope::Column("tenant_id".to_string()),
                     ),
-                    ("tenant".to_string(), Some("id".to_string())),
+                    (
+                        "tenant".to_string(),
+                        ResolvedScope::Column("id".to_string()),
+                    ),
                 ])),
             }),
             ..Select::from("storefront_config")
@@ -1916,14 +2036,15 @@ mod tests {
         };
         q2.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::PerTable(BTreeMap::from([
                 (
                     "storefront_config".to_string(),
-                    Some("tenant_id".to_string()),
+                    ResolvedScope::Column("tenant_id".to_string()),
                 ),
-                ("countries".to_string(), None),
+                ("countries".to_string(), ResolvedScope::Unscoped),
             ])),
         })
         .unwrap();
@@ -1942,11 +2063,12 @@ mod tests {
         let mut q3 = Select::from("secret_table");
         q3.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::PerTable(BTreeMap::from([(
                 "orders".to_string(),
-                Some("tenant_id".to_string()),
+                ResolvedScope::Column("tenant_id".to_string()),
             )])),
         })
         .unwrap();
@@ -1972,7 +2094,8 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
         })
@@ -2006,7 +2129,8 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::All,
             keys: TableKeys::Uniform,
         })
@@ -2054,7 +2178,8 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::OwnOrNull,
             keys: TableKeys::Uniform,
         })
@@ -2076,7 +2201,8 @@ mod tests {
             filter: Some(cmp("kind", CmpOp::Eq, t("supplier"))),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode,
                 keys: TableKeys::Uniform,
             }),
@@ -2133,7 +2259,8 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         })
@@ -2168,7 +2295,8 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         })
@@ -2191,7 +2319,8 @@ mod tests {
         };
         let scope = Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         };
@@ -2237,7 +2366,8 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         })
@@ -2274,7 +2404,8 @@ mod tests {
         };
         let own = Scope {
             column: "tenant_id".into(),
-            value: t("OWN"),
+            value: Some(t("OWN")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         };
@@ -2311,7 +2442,8 @@ mod tests {
             filter: cmp("id", CmpOp::Eq, t("o_1")),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("OWN"),
+                value: Some(t("OWN")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
@@ -2359,7 +2491,8 @@ mod tests {
         };
         let own = Scope {
             column: "tenant_id".into(),
-            value: t("OWN"),
+            value: Some(t("OWN")),
+            session: None,
             mode: ScopeMode::Own,
             keys: TableKeys::Uniform,
         };
@@ -2396,7 +2529,8 @@ mod tests {
             conflict: None,
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode,
                 keys: TableKeys::Uniform,
             }),
@@ -2438,7 +2572,8 @@ mod tests {
             ])),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
@@ -2631,7 +2766,8 @@ mod tests {
             conflict: None,
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
@@ -2702,7 +2838,8 @@ mod tests {
             filter: cmp("id", CmpOp::Eq, t("c_1")),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
@@ -2780,7 +2917,8 @@ mod tests {
             filter: Predicate::And(vec![]),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
@@ -2844,7 +2982,8 @@ mod tests {
             filter: Predicate::And(vec![]),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
                 keys: TableKeys::Uniform,
             }),
