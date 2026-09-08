@@ -34,6 +34,8 @@ const CLAIM_KIND: &str = "br_kind";
 const CLAIM_NODE: &str = "br_node";
 /// Text claim key for a mesh join token's bound mesh public key (SPKI hex).
 const CLAIM_PUBKEY: &str = "br_pubkey";
+/// Text claim key for an anonymous session cookie's session id (R3, PLAN-tenancy-principal).
+const CLAIM_SID: &str = "br_sid";
 
 /// Token kind: an RBAC role-bearing control-plane token (the `/api/*` bearer).
 pub const KIND_ROLE: &str = "role";
@@ -56,6 +58,12 @@ pub const KIND_POP: &str = "pop";
 /// this against the root anchor, so a malicious seed cannot inject a fabricated
 /// member (dynamic-join trust bootstrap; see PLAN-cluster-join F3).
 pub const KIND_MESH_MEMBER: &str = "mesh-member";
+/// Token kind: a host-issued **anonymous session cookie** (R3, PLAN-tenancy-principal). Binds a
+/// CSPRNG session id (`br_sid`) with `iat`/`exp`, signed by the fleet's `Signer` trust root — no app
+/// JWKS, no JS. Verified (signature + expiry) at each resolution; a client-forged/unsigned `sid`
+/// fails verification. Isolation is structural (the `Session` scope-fact binds a disjoint column),
+/// so the cookie only ever names the actor's own anonymous rows.
+pub const KIND_SESSION: &str = "session";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -800,6 +808,61 @@ pub fn verify_join(
     Ok(jti)
 }
 
+/// Mint a host-issued **anonymous session cookie** (R3): a `COSE_Sign1` CWT with
+/// `br_kind = "session"`, the CSPRNG `sid` bound in the signed payload (`br_sid`), `iat = now`, and
+/// `exp = now + ttl_secs`. Signed by the fleet `Signer` trust root — no app JWKS. The returned
+/// base64url string is the cookie value (`HttpOnly; Secure; SameSite=Lax` set by the serving path).
+/// Verified with [`verify_session`]; a client-forged/unsigned `sid` never verifies.
+pub async fn mint_session(
+    sid: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_SESSION.to_string()),
+        )
+        .text_claim(CLAIM_SID.to_string(), CborValue::Text(sid.to_string()))
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify a host-issued session cookie against the fleet public key at `now_unix`: checks the COSE
+/// signature, the expiry, and `br_kind == "session"`, then returns the bound `sid`. Any tampering
+/// (a client-chosen `sid`, an altered/expired payload) fails closed — the caller then mints a fresh
+/// cookie. Stateless: no server-side session table for the identity itself (isolation is structural
+/// via the disjoint `Session` column, not a stored label).
+pub fn verify_session(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+) -> Result<String, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    check_exp(&claims, now_unix)?;
+    let mut kind = None;
+    let mut sid = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_SID => sid = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_SESSION) {
+        return Err(TokenError::Claims("not a session cookie".into()));
+    }
+    sid.ok_or_else(|| TokenError::Claims("session cookie has no sid".into()))
+}
+
 /// The canonical bytes a joiner signs with its mesh private key to **prove
 /// possession** of the key it presents when redeeming join token `jti`. Bound to
 /// the token (`jti`), the presented key (`mesh_pubkey_hex`), and a fresh timestamp
@@ -1283,6 +1346,25 @@ mod tests {
     #[tokio::test]
     async fn ed25519_round_trips() {
         round_trip(TokenAlg::Ed25519).await;
+    }
+
+    #[tokio::test]
+    async fn session_cookie_round_trips_and_rejects_tamper_expiry_and_kind() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        // Mint at t=1000, ttl 3600 ⇒ exp 4600. Round-trip returns the bound sid within the window.
+        let cookie = mint_session("sid-abc", 3600, 1000, &signer).await.unwrap();
+        assert_eq!(verify_session(&cookie, &pubkey, 1000).unwrap(), "sid-abc");
+        assert_eq!(verify_session(&cookie, &pubkey, 4000).unwrap(), "sid-abc");
+        // Expired past the window ⇒ refused.
+        assert!(verify_session(&cookie, &pubkey, 5000).is_err());
+        // A stranger's key can't verify (the cookie is signed by the fleet root) — fixation via an
+        // unsigned/forged sid fails here.
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_session(&cookie, &stranger.public_key(), 1000).is_err());
+        // Domain separation: a join token (same signer, wrong `br_kind`) is NOT a session cookie.
+        let join = mint_join(3600, 1000, &signer).await.unwrap();
+        assert!(verify_session(&join, &pubkey, 1000).is_err());
     }
 
     #[tokio::test]
