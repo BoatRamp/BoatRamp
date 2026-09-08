@@ -491,6 +491,21 @@ pub struct ComputeTeardown {
     pub volumes: Vec<String>,
 }
 
+/// Best-effort load of a project's [`TenancySchema`](crate::tenancy::TenancySchema) directly from a
+/// KV handle — for the bind hot path, where the caller holds `&dyn KvStore` (a `HandlerRuntimeInner`)
+/// but not a [`DeployStore`]. A missing or unparsable body reads as `None` (⇒ legacy `Uniform`
+/// scoping); the authoritative, error-surfacing accessor is [`DeployStore::get_project_tenancy`].
+pub async fn load_project_tenancy(
+    kv: &dyn KvStore,
+    project: ProjectRef<'_>,
+) -> Option<crate::tenancy::TenancySchema> {
+    let bytes = kv
+        .get(&keys::project_config(project, "tenancy"))
+        .await
+        .ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
 impl DeployStore {
     /// Build a deploy store over a blob `storage` and a metadata `kv`.
     pub fn new(storage: Arc<dyn Storage>, kv: Arc<dyn KvStore>) -> Self {
