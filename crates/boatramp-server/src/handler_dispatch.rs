@@ -315,6 +315,15 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::DomainContext>()
         .map(|c| c.0.clone());
+    // R3 (PLAN-tenancy-principal): resolve — or, on a first anonymous request to an R3 project,
+    // mint — the host-signed session cookie. `session_cookie` feeds the `Session` scope-fact; a
+    // freshly-minted `set_session_cookie` is added to the response (`Set-Cookie`) below.
+    let (session_cookie, set_session_cookie) = resolve_or_mint_session(
+        request.headers(),
+        inner,
+        boatramp_core::project::ProjectRef::new(project),
+    )
+    .await;
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -331,6 +340,7 @@ pub(super) async fn dispatch_handler(
         request_id.as_deref(),
         bearer.as_deref(),
         domain_context.as_deref(),
+        session_cookie.as_deref(),
     )
     .await
     {
@@ -393,7 +403,7 @@ pub(super) async fn dispatch_handler(
         metrics::Outcome::from_result(&result),
         start.elapsed(),
     );
-    match result {
+    let mut response = match result {
         Ok(response) => {
             let (parts, body) = response.into_parts();
             let response = axum::http::Response::from_parts(parts, axum::body::Body::new(body));
@@ -420,7 +430,17 @@ pub(super) async fn dispatch_handler(
             tracing::warn!(site, route = %handler.route, %err, "handler invocation failed");
             handler_error_response(&err)
         }
+    };
+    // Issue a freshly-minted R3 session cookie (added last so it lands on the guest's own response;
+    // never cached — it is a per-visitor identity). Only present on a first anonymous request.
+    if let Some(set_cookie) = set_session_cookie {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&set_cookie) {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
     }
+    response
 }
 
 /// The federation gateway: load the project's composed supergraph, plan `query` against
@@ -809,6 +829,77 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+/// The host-issued anonymous session cookie name (R3, PLAN-tenancy-principal).
+const SESSION_COOKIE_NAME: &str = "br_session";
+/// The anon-session cookie lifetime (a **long** returning-visitor identity — a privacy/consent
+/// ceiling, not a security one, since the disjoint `session_id` column confines it to `tenant IS
+/// NULL` rows). 30 days.
+const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// A random 16-byte session id (hex, OS CSPRNG) — unguessable so the anonymous partition can't be
+/// enumerated (the cookie is a bearer for its own `tenant IS NULL` rows).
+fn new_session_sid() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        tracing::error!("getrandom failed generating a session id");
+    }
+    hex::encode(bytes)
+}
+
+/// Resolve (or mint) the R3 anonymous session cookie for a request: `.0` is the cookie value to feed
+/// the tenancy resolver (the `Session` fact), `.1` is a `Set-Cookie` header value to add to the
+/// response when a fresh cookie was minted. Returns `(None, None)` — issuing NO cookie — unless the
+/// project declares an R3 `session_key` AND the node wired a session signer (fail-safe: no signer /
+/// no R3 ⇒ no anon session axis). A valid incoming cookie is reused (no re-issue); an
+/// absent/invalid/expired one is replaced with a fresh CSPRNG cookie. `HttpOnly; Secure;
+/// SameSite=Lax`.
+#[cfg(feature = "handlers")]
+async fn resolve_or_mint_session(
+    headers: &HeaderMap,
+    inner: &HandlerRuntimeInner,
+    project: boatramp_core::project::ProjectRef<'_>,
+) -> (Option<String>, Option<String>) {
+    let Some(signer) = inner.session_signer.get() else {
+        return (None, None); // the node issues no session cookies
+    };
+    // Only for projects that adopted R3 (declared a session_key) — a small KV read.
+    let uses_r3 = matches!(
+        boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await,
+        Ok(Some(schema)) if schema.session_key.is_some()
+    );
+    if !uses_r3 {
+        return (None, None);
+    }
+    let anchor = signer.public_key();
+    let now = boatramp_core::time::now_unix();
+    // Reuse a still-valid incoming cookie (its own per-fact lifetime); else mint fresh.
+    if let Some(cookie) = cookie_value(headers, SESSION_COOKIE_NAME) {
+        if boatramp_core::cose::verify_session(&cookie, &anchor, now).is_ok() {
+            return (Some(cookie), None);
+        }
+    }
+    match boatramp_core::cose::mint_session(
+        &new_session_sid(),
+        SESSION_TTL_SECS,
+        now,
+        signer.as_ref(),
+    )
+    .await
+    {
+        Ok(cookie) => {
+            let set = format!(
+                "{SESSION_COOKIE_NAME}={cookie}; Path=/; Max-Age={SESSION_TTL_SECS}; \
+                 HttpOnly; Secure; SameSite=Lax"
+            );
+            (Some(cookie), Some(set))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "minting an anonymous session cookie failed");
+            (None, None)
+        }
+    }
+}
+
 /// The origin (`scheme://host[:port]`) of a `Referer` URL, if parseable (the CSRF fallback when
 /// no `Origin` header is present).
 fn referer_origin(referer: &str) -> Option<String> {
@@ -927,6 +1018,9 @@ pub(super) async fn build_bindings(
     // context tag for a domain source). Background triggers pass `None` for both.
     bearer: Option<&str>,
     domain_context: Option<&str>,
+    // R3 session-cookie value from the request (already verified/minted by the caller); the verify
+    // anchor is the runtime's own session signer. `None` ⇒ no session fact on this invocation.
+    session_cookie: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -983,14 +1077,15 @@ pub(super) async fn build_bindings(
             .as_ref()
             .and_then(|g| g.data.as_ref())
             .and_then(|d| d.claims_from_token.as_ref());
+        // The R3 session-cookie verify anchor is the runtime's own session signer's public half
+        // (set at startup from the node issuer). Absent ⇒ no session fact.
+        let session_anchor = inner.session_signer.get().map(|s| s.public_key());
         let inputs = crate::tenant_resolve::TenantSourceInputs {
             bearer,
             domain_context,
             token_cfg,
-            // Session-cookie wiring (R3) lands with the serving-path cookie mint/extract; until then
-            // no session fact is resolved on this path.
-            session_cookie: None,
-            session_anchor: None,
+            session_cookie,
+            session_anchor: session_anchor.as_ref(),
         };
         let tenancy = crate::tenant_resolve::resolve_host_tenancy(
             site_handlers.tenancy.as_ref(),

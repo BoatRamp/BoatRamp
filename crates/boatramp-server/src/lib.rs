@@ -409,6 +409,11 @@ struct HandlerRuntimeInner {
     /// knobs.)
     #[cfg(feature = "session")]
     session_store: std::sync::OnceLock<session_store::SessionStore>,
+    /// The fleet [`Signer`] used to **mint + verify** anonymous session cookies (R3,
+    /// PLAN-tenancy-principal — the `ScopeAxis::Session` fact). Set once at startup from the node's
+    /// `issuer` (its public half is the verify anchor). **Unset ⇒ no session cookies are issued or
+    /// verified** (the R3 disjunct then has only the tenant arm — fail-safe: no anon session axis).
+    session_signer: std::sync::OnceLock<Arc<dyn Signer>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -475,6 +480,7 @@ impl HandlerRuntime {
                 admin_surfaces: std::sync::OnceLock::new(),
                 #[cfg(feature = "session")]
                 session_store: std::sync::OnceLock::new(),
+                session_signer: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -613,6 +619,18 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.require_tenancy_declaration.set(require_declaration);
             let _ = inner.allow_cross_tenant_db.set(allow_cross_tenant);
+        }
+    }
+
+    /// Wire the fleet [`Signer`] used to mint + verify anonymous session cookies (R3). Pass the
+    /// node's issuing signer (typically the same `issuer` that mints control-plane tokens); its
+    /// public half becomes the session-cookie verify anchor. Set once at startup; **unset ⇒ the
+    /// host issues/verifies no session cookies** (the `Session` scope axis stays dormant — a
+    /// project's `TenantOrSession` reads then carry only the tenant arm). No-op on a plain runtime.
+    #[cfg(feature = "handlers")]
+    pub fn set_session_signer(&self, signer: Arc<dyn Signer>) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.session_signer.set(signer);
         }
     }
 
@@ -4030,6 +4048,7 @@ mod tests {
                     env,
                     &[],
                     0,
+                    None,
                     None,
                     None,
                     None,

@@ -219,6 +219,13 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         secrets_envelope.clone(),
     )
     .await?;
+    // Wire the fleet session-cookie signer (R3, PLAN-tenancy-principal): the same issuer that mints
+    // control-plane tokens signs + verifies the host-issued anonymous session cookie. Absent
+    // issuer (a verify-only node) ⇒ no session cookies are issued (the `Session` scope axis stays
+    // dormant), which is fail-safe.
+    if let Some(issuer) = options.issuer.clone() {
+        handlers.set_session_signer(issuer);
+    }
     // Wire the guest project self-config capability (`boatramp:handlers/admin`) when the
     // operator posture enables at least one surface. The controller reuses the same in-process
     // domain-verify / email-profile / secret / site-config subsystems + the real domain probe;

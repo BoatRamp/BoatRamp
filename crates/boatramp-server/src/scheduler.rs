@@ -381,6 +381,8 @@ pub(super) async fn run_scheduler_tick(
                             // wired).
                             None,
                             None,
+                            // No request cookie ⇒ no R3 session fact on a background trigger.
+                            None,
                         )
                         .await
                         {
@@ -587,6 +589,8 @@ async fn fire_cron(
         None,
         // No HTTP request ⇒ no token/domain tenant source (an `own` scope fails closed).
         None,
+        None,
+        // No request cookie ⇒ no R3 session fact on a cron trigger.
         None,
     )
     .await
