@@ -290,6 +290,13 @@ pub(crate) mod keys {
         format!("project/{project}/email/")
     }
 
+    /// A project-scoped config object: `project/<proj>/config/<key>` → JSON body. Project-scoped
+    /// (not per-site) host-held config; the first `key` is `tenancy` (the [`TenancySchema`] — the
+    /// per-table tenant-key map the scope injector consults, PLAN-tenancy-principal D2).
+    pub fn project_config(project: ProjectRef<'_>, key: &str) -> String {
+        format!("project/{project}/config/{key}")
+    }
+
     /// The prefix under which a project's GraphQL **safelist** (persisted trusted
     /// operations, `hapq/<proj>/<hash>`) lives. Note it is **not** under the
     /// `project/<proj>/…` resource prefix — the residual sweep in
@@ -751,6 +758,41 @@ impl DeployStore {
             // A dangling pointer (body GC'd out from under it) reads as unset.
             None => Ok(None),
         }
+    }
+
+    /// The project's [`TenancySchema`](crate::tenancy::TenancySchema) — the host-held per-table
+    /// tenant-key map the scope injector consults (R2 / D2). `None` ⇒ the project declared no schema
+    /// (legacy single-column `Uniform` scoping). Stored as a small JSON singleton at
+    /// `project/<proj>/config/tenancy` (direct, like a function config — no dedup/pointer indirection
+    /// needed for a per-project singleton; a cached read is a later hot-path optimization).
+    pub async fn get_project_tenancy(
+        &self,
+        project: ProjectRef<'_>,
+    ) -> Result<Option<crate::tenancy::TenancySchema>, DeployError> {
+        match self
+            .kv
+            .get(&keys::project_config(project, "tenancy"))
+            .await?
+        {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| DeployError::Serde(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Store the project's [`TenancySchema`](crate::tenancy::TenancySchema) (replaces any prior one).
+    /// Deny-by-default is enforced downstream at scope injection, not here — this is plain storage.
+    pub async fn set_project_tenancy(
+        &self,
+        project: ProjectRef<'_>,
+        schema: &crate::tenancy::TenancySchema,
+    ) -> Result<(), DeployError> {
+        let bytes = serde_json::to_vec(schema).map_err(|e| DeployError::Serde(e.to_string()))?;
+        self.kv
+            .put(&keys::project_config(project, "tenancy"), bytes)
+            .await?;
+        Ok(())
     }
 
     /// Like [`get_site_config`](Self::get_site_config) but returns a shared,
