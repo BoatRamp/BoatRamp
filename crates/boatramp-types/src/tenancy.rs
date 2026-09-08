@@ -205,6 +205,14 @@ pub enum TableScope {
     /// deny-by-default (a shared-data write is a cross-tenant blast). Host-declared, never
     /// guest-inferred (a guest can't mark a sensitive table global).
     Unscoped,
+    /// An **anonymous-first** table (R3): rows are owned EITHER by a resolved tenant
+    /// (`default_tenant_key = <Tenant fact>`) OR by an anonymous session
+    /// ([`session_key`](TenancySchema::session_key)` = <Session fact>`, on `default_tenant_key IS
+    /// NULL` rows). A read lowers to the disjunction `Or([tenant_key = T, session_key = S])` over
+    /// whichever axis facts the request carries; the disjoint columns confine a cheap anon session
+    /// to `tenant IS NULL` rows structurally (never tenant-owned rows). Requires the schema to set
+    /// `session_key`; a `TenantOrSession` table with no `session_key` is refused (deny-by-default).
+    TenantOrSession,
 }
 
 /// The effective, host-resolved scope for one table (from [`TenancySchema::resolve`]) — the input
@@ -216,6 +224,15 @@ pub enum ResolvedScope {
     Column(String),
     /// No tenant predicate — a globally-readable `Unscoped` table.
     Unscoped,
+    /// The R3 anonymous-first disjunction: a read is `Or([tenant = <Tenant fact>, session =
+    /// <Session fact>])` over whichever axis facts are present; a write stamps the actor's own axis
+    /// (`tenant` if authenticated, else `session`, with the other column left `NULL`).
+    TenantOrSession {
+        /// The tenant column (`default_tenant_key`).
+        tenant: String,
+        /// The anonymous-session column (`session_key`).
+        session: String,
+    },
 }
 
 /// A project's tenant-isolation **schema map** — the host-held facts the scope-injector keys off
@@ -230,6 +247,11 @@ pub enum ResolvedScope {
 pub struct TenancySchema {
     /// The tenant column for a [`TableScope::Tenant`] table (e.g. `tenant_id`).
     pub default_tenant_key: String,
+    /// The anonymous-session column for [`TableScope::TenantOrSession`] tables (e.g. `session_id`),
+    /// present iff the project uses the R3 session axis. A `TenantOrSession` table with no
+    /// `session_key` is refused (the disjunct is unrepresentable — deny-by-default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     /// Per-table scope facts. Authoritative + exhaustive when a schema is present (an absent table
     /// is refused, not defaulted — see the type doc).
     pub tables: BTreeMap<String, TableScope>,
@@ -239,6 +261,7 @@ impl Default for TenancySchema {
     fn default() -> Self {
         Self {
             default_tenant_key: "tenant_id".to_string(),
+            session_key: None,
             tables: BTreeMap::new(),
         }
     }
@@ -252,18 +275,25 @@ impl TenancySchema {
     pub fn deny_all() -> Self {
         Self {
             default_tenant_key: "tenant_id".to_string(),
+            session_key: None,
             tables: BTreeMap::new(),
         }
     }
 
-    /// Resolve how to scope `table`. `None` ⇒ **refused** (the table is undeclared under a present
-    /// schema — deny-by-default; the injector fails the query closed). `Some(ResolvedScope::Column)`
-    /// ⇒ scope on that column; `Some(ResolvedScope::Unscoped)` ⇒ no tenant predicate (global read).
+    /// Resolve how to scope `table`. `None` ⇒ **refused** (undeclared under a present schema —
+    /// deny-by-default; the injector fails the query closed; ALSO returned for a `TenantOrSession`
+    /// table when the schema declares no `session_key`, so the unrepresentable disjunct fails
+    /// closed). `Some(Column)` ⇒ scope on that column; `Some(Unscoped)` ⇒ global read; `Some(
+    /// TenantOrSession)` ⇒ the R3 disjunction.
     pub fn resolve(&self, table: &str) -> Option<ResolvedScope> {
         match self.tables.get(table)? {
             TableScope::Tenant => Some(ResolvedScope::Column(self.default_tenant_key.clone())),
             TableScope::TenantKeyed { key } => Some(ResolvedScope::Column(key.clone())),
             TableScope::Unscoped => Some(ResolvedScope::Unscoped),
+            TableScope::TenantOrSession => Some(ResolvedScope::TenantOrSession {
+                tenant: self.default_tenant_key.clone(),
+                session: self.session_key.clone()?,
+            }),
         }
     }
 
@@ -271,18 +301,26 @@ impl TenancySchema {
     /// (wrapped as `boatramp_core::orm::TableKeys::PerTable` one layer up — that type lives in the
     /// crate that owns the injector, which depends on this one). The [`TableScope`] match is
     /// exhaustive **here**, in its defining crate, so adding a variant is a compile error to classify
-    /// rather than a silent miss (a `#[non_exhaustive]` match elsewhere would need a wildcard, which
-    /// could quietly scope a new kind wrongly). An empty schema yields an empty map.
+    /// rather than a silent miss.
+    ///
+    /// `TenantOrSession` (R3) is a **two-column** disjunct that this single-column map cannot express,
+    /// so it is **omitted** — an absent entry is refused (deny-by-default) at the injector. The ORM
+    /// disjunct lowering resolves it separately via [`resolve`](Self::resolve); until that lands a
+    /// `TenantOrSession` table is fail-closed (declared, but denied), never a silent single-axis
+    /// scope. An empty schema yields an empty map.
     pub fn table_key_map(&self) -> BTreeMap<String, Option<String>> {
         self.tables
             .iter()
-            .map(|(table, scope)| {
+            .filter_map(|(table, scope)| {
                 let column = match scope {
                     TableScope::Tenant => Some(self.default_tenant_key.clone()),
                     TableScope::TenantKeyed { key } => Some(key.clone()),
                     TableScope::Unscoped => None,
+                    // Unrepresentable here (two columns); omit ⇒ deny-by-default until the ORM
+                    // disjunct lowering resolves it via `resolve`.
+                    TableScope::TenantOrSession => return None,
                 };
-                (table.clone(), column)
+                Some((table.clone(), column))
             })
             .collect()
     }
@@ -331,10 +369,42 @@ mod tests {
             TableScope::Tenant,
             TableScope::TenantKeyed { key: "id".into() },
             TableScope::Unscoped,
+            TableScope::TenantOrSession,
         ] {
             let j = serde_json::to_string(&ts).unwrap();
             assert_eq!(ts, serde_json::from_str::<TableScope>(&j).unwrap());
         }
+    }
+
+    #[test]
+    fn tenant_or_session_needs_a_session_key_else_denies() {
+        // With a session_key, a TenantOrSession table resolves to the R3 disjunct on both columns.
+        let s = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            session_key: Some("session_id".into()),
+            tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+        };
+        assert_eq!(
+            s.resolve("carts"),
+            Some(ResolvedScope::TenantOrSession {
+                tenant: "tenant_id".into(),
+                session: "session_id".into(),
+            })
+        );
+
+        // WITHOUT a session_key the disjunct is unrepresentable ⇒ fail closed: `resolve` refuses,
+        // and `table_key_map` OMITS it (an absent entry is deny-by-default at the injector), never a
+        // silent single-axis scope.
+        let s = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            session_key: None,
+            tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+        };
+        assert_eq!(s.resolve("carts"), None);
+        assert!(
+            !s.table_key_map().contains_key("carts"),
+            "a TenantOrSession table without a session_key must be omitted (denied), not scoped"
+        );
     }
 
     #[test]
