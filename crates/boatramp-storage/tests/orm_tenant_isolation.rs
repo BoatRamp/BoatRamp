@@ -1136,3 +1136,193 @@ async fn orm_tenant_or_session_disjunct_isolates_on_a_real_engine() {
          idempotent), needs both facts, and can't touch another session's or tenant's rows"
     );
 }
+
+/// **Live** proof of the Stage 4 *durable signed-context* lane (R1) end-to-end on real
+/// infrastructure: a producer publishes to a **real** messaging store (`LogMessaging` over a
+/// temp-dir blob store + in-memory KV) with a host-minted COSE signed-context envelope
+/// (`mint_context`, signed by a real `LocalSigner`); the envelope survives the durable
+/// publish→claim round-trip on **both** the default work-queue and a consumer group (the grouped
+/// path re-reads the index record via `read_ctx`); the consumer verifies it against the fleet
+/// anchor (`verify_context`) and the recovered tenant scopes a query on a **real** libsql engine to
+/// that tenant's rows only. Two fail-closed cases: a **stranger-signed** envelope fails
+/// verification, and an **unstamped** publish carries no context — in both the consumer recovers
+/// **no** tenant, so an "own" op fails closed (the `boatramp-server` resolver's `SignedContext`
+/// arm, unit-tested there, returns `None` for exactly these inputs).
+///
+/// Boundary: this battery lives in `boatramp-storage` (no dep on `boatramp-server`), so it drives
+/// the real durable store + real crypto + real engine and replicates the consumer's one-line
+/// resolution (`verify_context` → tenant → [`Scope`]); the server glue that turns a verified tenant
+/// into `FnTenant::Durable`→`resolve_host_tenancy` is covered by the server unit test. Same
+/// `#[ignore]` rationale as the siblings (static-musl libsql segfault); the `test-orm-tenancy` CI
+/// job runs it unignored on the host toolchain and greps the marker.
+#[tokio::test]
+#[ignore = "run via the test-orm-tenancy CI job on the host toolchain (static-musl test binary segfaults in libsql's bundled SQLite)"]
+async fn orm_durable_signed_context_isolates_on_a_real_engine() {
+    use boatramp_core::cose::{mint_context, verify_context, LocalSigner, Signer, TokenAlg};
+    use boatramp_core::kv::{KvStore, MemoryKv};
+    use boatramp_core::messaging::{LogMessaging, Messaging, StartPosition};
+    use boatramp_core::Storage;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let now = boatramp_core::time::now_unix();
+
+    // A real durable messaging store: a temp-dir blob store for payloads + an in-memory KV for the
+    // index records the signed context rides on (exactly the shape `LogMessaging` uses in prod).
+    let mqdir =
+        std::env::temp_dir().join(format!("boatramp-durable-ctx-mq-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mqdir);
+    let storage: Arc<dyn Storage> = Arc::new(boatramp_storage::FsStorage::new(&mqdir));
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+    let mq = LogMessaging::new(storage, kv);
+
+    // The fleet signer mints + verifies the durable context envelope; a *stranger* signer models a
+    // forger who does not hold the fleet key.
+    let fleet = LocalSigner::generate(TokenAlg::Es256);
+    let anchor = fleet.public_key();
+    let stranger = LocalSigner::generate(TokenAlg::Es256);
+
+    // A shared multi-tenant table on a real libsql engine: acme + globex rows.
+    let dbdir =
+        std::env::temp_dir().join(format!("boatramp-durable-ctx-db-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dbdir);
+    let backends = LibsqlSqlBackends::local(&dbdir);
+    let db = backends.database("default", "shop", "").await.unwrap();
+    {
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO notes VALUES ('1','acme','acme-note'), ('2','globex','globex-note')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // The consumer's own-scoped SELECT, built exactly as the host builds it from the recovered
+    // tenant (`force_scope` + `compile`) — the same injector the other batteries exercise.
+    let scoped_bodies = |tenant: &str| {
+        let mut s = Select {
+            columns: vec![item(Expr::col("body"))],
+            ..Select::from("notes")
+        };
+        s.force_scope(&scope(ScopeMode::Own, tenant)).unwrap();
+        s.compile(Dialect::Sqlite).unwrap()
+    };
+
+    // The host-minted envelope carrying acme's own-tenant (the guest never names it).
+    let envelope = mint_context("acme", 3600, now, &fleet).await.unwrap();
+
+    // 1) DEFAULT WORK-QUEUE: publish stamps the context; claim carries it back verbatim.
+    mq.publish_ctx("jobs-ok", b"job", Some(&envelope))
+        .await
+        .unwrap();
+    let claimed = mq
+        .claim("jobs-ok", Duration::from_secs(30), 10, 5)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1, "the published message is claimable");
+    assert_eq!(
+        claimed[0].signed_context.as_deref(),
+        Some(envelope.as_str()),
+        "the signed context survives the durable publish->claim round-trip (work-queue)"
+    );
+    // The consumer verifies against the fleet anchor and recovers acme, then scopes the real engine.
+    let tenant =
+        verify_context(claimed[0].signed_context.as_deref().unwrap(), &anchor, now).unwrap();
+    assert_eq!(tenant, "acme");
+    {
+        let mut tx = db.begin().await.unwrap();
+        let (sql, params) = scoped_bodies(&tenant);
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-note".to_string()],
+            "the recovered tenant scopes the real engine to acme's rows only (never globex)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2) CONSUMER GROUP (fan-out): the group must be registered before the publish so the message is
+    // retained for it; the grouped claim recovers the context by re-reading the index record.
+    let _ = mq
+        .claim_grouped(
+            "events",
+            "g1",
+            StartPosition::Earliest,
+            Duration::from_secs(30),
+            10,
+            5,
+        )
+        .await
+        .unwrap();
+    mq.publish_ctx("events", b"evt", Some(&envelope))
+        .await
+        .unwrap();
+    let grouped = mq
+        .claim_grouped(
+            "events",
+            "g1",
+            StartPosition::Earliest,
+            Duration::from_secs(30),
+            10,
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(grouped.len(), 1, "the group receives the published message");
+    assert_eq!(
+        grouped[0].signed_context.as_deref(),
+        Some(envelope.as_str()),
+        "the signed context survives the durable round-trip on the consumer-group path too"
+    );
+    assert_eq!(
+        verify_context(grouped[0].signed_context.as_deref().unwrap(), &anchor, now).unwrap(),
+        "acme"
+    );
+
+    // 3) FORGED: a stranger-signed envelope fails verification ⇒ the consumer recovers NO tenant.
+    let forged = mint_context("globex", 3600, now, &stranger).await.unwrap();
+    mq.publish_ctx("jobs-forged", b"job", Some(&forged))
+        .await
+        .unwrap();
+    let claimed = mq
+        .claim("jobs-forged", Duration::from_secs(30), 10, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed[0].signed_context.as_deref(),
+        Some(forged.as_str()),
+        "the forged envelope is carried opaquely (the store never trusts it)"
+    );
+    assert!(
+        verify_context(claimed[0].signed_context.as_deref().unwrap(), &anchor, now).is_err(),
+        "a stranger-signed envelope fails verification ⇒ no tenant ⇒ an own op fails closed \
+         (it can never masquerade as globex)"
+    );
+
+    // 4) UNSTAMPED: a plain publish carries no context ⇒ the consumer recovers NO tenant.
+    mq.publish("jobs-plain", b"job").await.unwrap();
+    let claimed = mq
+        .claim("jobs-plain", Duration::from_secs(30), 10, 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed[0].signed_context, None,
+        "an unstamped publish carries no context ⇒ the consumer's own op fails closed"
+    );
+
+    println!(
+        "ORM DURABLE SIGNED-CONTEXT ISOLATION OK: a host-minted envelope survives the real \
+         publish->claim round-trip on both the work-queue and a consumer group; the fleet anchor \
+         verifies it and the recovered tenant scopes a real libsql engine to its own rows only; a \
+         stranger-signed envelope fails verification and an unstamped message carries no context, \
+         so both fail an own op closed (never cross-tenant)"
+    );
+}
