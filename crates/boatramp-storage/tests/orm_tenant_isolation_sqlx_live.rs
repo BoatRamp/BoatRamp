@@ -601,14 +601,32 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             ),
             "[{engine}] an undeclared write target must be refused deny-by-default"
         );
+
+        // A write to an `Unscoped` (global reference) table is refused — reads are global, writes are
+        // a cross-tenant blast (deny-by-default).
+        let mut unscoped_write = Delete {
+            table: "countries".into(),
+            filter: eq("code", "US"),
+            scope: None,
+            returning: vec![],
+        };
+        unscoped_write.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                unscoped_write.compile(dialect),
+                Err(boatramp_core::orm::OrmError::UnscopedWrite(tbl)) if tbl == "countries"
+            ),
+            "[{engine}] a guest write to an Unscoped reference table must be refused"
+        );
     }
 
     println!(
         "ORM PER-TABLE-KEY TENANCY OK [{engine}]: Tenant table on default tenant_id; identity \
          TenantKeyed table on its own PK (uniform tenant_id scope rejected by the engine); \
-         Unscoped reference table global; per-ref join keys each on its own column; a WRITE is \
-         bounded on the target's declared key (a cross-tenant DELETE affects 0 rows) and refuses an \
-         undeclared target; an undeclared table refused deny-by-default"
+         Unscoped reference table global for reads; per-ref join keys each on its own column; a \
+         WRITE is bounded on the target's declared key (a cross-tenant DELETE affects 0 rows), \
+         refuses an undeclared target, and refuses a write to an Unscoped table; an undeclared table \
+         refused deny-by-default"
     );
 }
 

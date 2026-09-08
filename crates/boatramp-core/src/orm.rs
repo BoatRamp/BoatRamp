@@ -415,12 +415,20 @@ impl Scope {
         }
     }
 
-    /// The scope as a `WHERE`/`HAVING` predicate on `column` for the resolved mode (unqualified), or
-    /// `None` for [`ScopeMode::All`] (cross-tenant — no tenant predicate). The single-table SELECT +
-    /// the write paths use this with the scope's own `column` (per-table resolution matters only
-    /// across joins, handled in `scope_where_pred`).
-    fn as_predicate(&self) -> Option<Predicate> {
-        self.predicate_on(&self.column, None)
+    /// The tenant column to scope a **WRITE** target (`table`) on. Like [`column_for`](Self::column_for)
+    /// but an `Unscoped` table is **refused** (`Err(UnscopedWrite)`) rather than returning `Ok(None)`:
+    /// reads of a global reference table are allowed, but a guest write to one is a cross-tenant blast
+    /// (the [`TableScope::Unscoped`](crate::tenancy::TableScope) contract makes writes deny-by-default).
+    /// Legacy `Uniform` keys always yield `self.column`.
+    fn write_column_for<'a>(&'a self, table: &str) -> Result<&'a str, OrmError> {
+        match &self.keys {
+            TableKeys::Uniform => Ok(self.column.as_str()),
+            TableKeys::PerTable(m) => match m.get(table) {
+                Some(Some(col)) => Ok(col.as_str()),
+                Some(None) => Err(OrmError::UnscopedWrite(table.to_string())),
+                None => Err(OrmError::TenancyUndeclared(table.to_string())),
+            },
+        }
     }
 
     /// The per-mode predicate on `column`, optionally qualified `<qualifier>.column` — so it binds to
@@ -582,9 +590,10 @@ impl Insert {
         self.scope = write.cloned();
         // The write target's per-table tenant column (Stage 1), resolved once for the INSERT…SELECT
         // tenant-projection stamp below. Deny-by-default: an undeclared target is refused here (so a
-        // guest INSERT…SELECT can't write an undeclared table); an `Unscoped` target ⇒ `None`.
+        // guest INSERT…SELECT can't write an undeclared table), and an `Unscoped` (global) target is
+        // refused for writes (`write_column_for`).
         let target_col: Option<String> = match write {
-            Some(w) => w.column_for(&self.table)?.map(str::to_string),
+            Some(w) => Some(w.write_column_for(&self.table)?.to_string()),
             None => None,
         };
         // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
@@ -881,6 +890,12 @@ pub enum OrmError {
     /// misconfiguration the host surfaces (the binding names the component + marker site).
     #[error("tenancy: table {0:?} has no declared scope (deny-by-default)")]
     TenancyUndeclared(String),
+    /// A guest WRITE (INSERT/UPDATE/DELETE) targeted a table declared `Unscoped` (global reference
+    /// data). Reads of an `Unscoped` table are global by design, but writes are **deny-by-default**
+    /// (a shared-data write is a cross-tenant blast — the [`TableScope::Unscoped`](crate::tenancy::TableScope::Unscoped)
+    /// contract), so the host refuses them rather than running the write unbounded-by-tenant.
+    #[error("tenancy: table {0:?} is Unscoped (global reference); guest writes are refused (deny-by-default)")]
+    UnscopedWrite(String),
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -1266,18 +1281,17 @@ fn render_where(
 }
 
 /// The single-table scope predicate for an UPDATE/DELETE `WHERE`, keyed on `table`'s **per-table**
-/// tenant column (Stage 1): `Ok(Some(pred))` scopes on the declared key; `Ok(None)` ⇒ the target is
-/// `Unscoped` (no tenant predicate — the write is bounded only by the guest filter + the
-/// unbounded-write guard); `Err(TenancyUndeclared)` ⇒ the target is undeclared (deny-by-default).
+/// tenant column (Stage 1): `Ok(Some(pred))` scopes on the declared key; `Ok(None)` ⇒ no scope was
+/// forced (the guest binding only forces a scope when tenancy is active). An `Unscoped` target is
+/// **refused** (`Err(UnscopedWrite)`) and an undeclared one too (`Err(TenancyUndeclared)`) — a guest
+/// write to a global/undeclared table is deny-by-default.
 fn single_scope_pred(scope: Option<&Scope>, table: &str) -> Result<Option<Predicate>, OrmError> {
     match scope {
-        Some(s) => match s.column_for(table)? {
-            Some(col) => {
-                ident(col)?;
-                Ok(s.predicate_on(col, None))
-            }
-            None => Ok(None),
-        },
+        Some(s) => {
+            let col = s.write_column_for(table)?; // Unscoped ⇒ refused; undeclared ⇒ refused
+            ident(col)?;
+            Ok(s.predicate_on(col, None))
+        }
         None => Ok(None),
     }
 }
@@ -1510,11 +1524,11 @@ impl Insert {
         let mut params = Params::default();
 
         // The write target's per-table tenant key (Stage 1): scope-stamp + upsert-guard on THIS
-        // column, not the schema default. Deny-by-default — an undeclared target is refused here
-        // (both the VALUES and INSERT…SELECT forms); an `Unscoped` target resolves to `None` (no
-        // tenant column to stamp/guard — the write is not tenant-partitioned on that table).
+        // column, not the schema default. Deny-by-default — an undeclared target is refused, and an
+        // `Unscoped` (global reference) target is refused for writes (`write_column_for`), for both
+        // the VALUES and INSERT…SELECT forms.
         let target_col: Option<String> = match self.scope.as_ref() {
-            Some(s) => s.column_for(&self.table)?.map(str::to_string),
+            Some(s) => Some(s.write_column_for(&self.table)?.to_string()),
             None => None,
         };
 
@@ -1711,7 +1725,7 @@ impl Update {
         // *change*.
         let scope_col: Option<String> =
             match self.scope.as_ref().filter(|s| s.stamp_value().is_some()) {
-                Some(s) => s.column_for(&self.table)?.map(str::to_string),
+                Some(s) => Some(s.write_column_for(&self.table)?.to_string()),
                 None => None,
             };
         // SET binds before WHERE so placeholder order matches the parameter order.

@@ -792,13 +792,55 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         );
     }
 
+    // 12) WRITE to an `Unscoped` (global reference) table is REFUSED — reads of `countries` are
+    //     global (case 3), but a guest write to it is a cross-tenant blast, so it is deny-by-default
+    //     (the TableScope::Unscoped contract). Every write verb refuses it.
+    {
+        let mut del = Delete {
+            table: "countries".into(),
+            filter: eq("code", "US"),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                del.compile(Dialect::Sqlite),
+                Err(boatramp_core::orm::OrmError::UnscopedWrite(tbl)) if tbl == "countries"
+            ),
+            "a guest write to an Unscoped reference table must be refused"
+        );
+        // INSERT into an Unscoped table is refused at force_scope (target-column resolution).
+        let mut ins = Insert {
+            table: "countries".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "code".into(),
+                    value: Expr::val(t("XX")),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        assert!(
+            matches!(
+                ins.force_scope(Some(&scope_for("acme")), Some(&scope_for("acme"))),
+                Err(boatramp_core::orm::OrmError::UnscopedWrite(tbl)) if tbl == "countries"
+            ),
+            "a guest INSERT into an Unscoped reference table must be refused"
+        );
+    }
+
     println!(
         "ORM PER-TABLE-KEY TENANCY OK: Tenant table scoped on default tenant_id; identity \
          TenantKeyed table scoped on its own PK (uniform tenant_id scope rejected by the engine — \
          key is load-bearing); Unscoped reference table globally readable; per-ref join keys each \
          on its own column; a subquery scopes its inner table on that table's declared key (never \
          the default) and is refused deny-by-default on an undeclared table; a WRITE (UPDATE/DELETE/\
-         INSERT) is bounded + stamped on the target's declared key, can't reassign the tenant, and \
-         refuses an undeclared target; a top-level undeclared table refused deny-by-default"
+         INSERT) is bounded + stamped on the target's declared key, can't reassign the tenant, \
+         refuses an undeclared target, AND refuses a write to an Unscoped reference table; a \
+         top-level undeclared table refused deny-by-default"
     );
 }
