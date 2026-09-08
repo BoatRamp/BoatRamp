@@ -381,11 +381,75 @@ pub enum ScopeMode {
 /// on their own PK), `Unscoped` a global table (no predicate), `TenantOrSession { tenant, session }`
 /// the R3 anonymous-first disjunct on two disjoint columns; a table **absent** from the map is
 /// refused ([`OrmError::TenancyUndeclared`], deny-by-default).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+// Not `Eq`: `PerTableTarget` carries bound `SqlValue` literals (public-subset terms), and
+// `SqlValue` is only `PartialEq` (a float variant) — same as `Scope`, which holds `TableKeys`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum TableKeys {
     #[default]
     Uniform,
     PerTable(std::collections::BTreeMap<String, ResolvedScope>),
+    /// A **target read** (R4/D8): the same per-table tenant keys as `PerTable`, PLUS a per-table
+    /// PUBLIC-subset confinement conjoined onto every accessed table. Deny-by-default — a table
+    /// accessed under this variant with **no** entry in `public` is refused
+    /// ([`OrmError::PublicSubsetUndeclared`]), the strict analog of an undeclared tenant key: a
+    /// target read can only ever see rows that satisfy the host-held public predicate of *each*
+    /// table it touches (root + every joined/subquery ref). Built only by the host for a
+    /// `TenancyClass::Target` fetch; never by a guest.
+    PerTableTarget {
+        keys: std::collections::BTreeMap<String, ResolvedScope>,
+        public: std::collections::BTreeMap<String, Vec<PublicTermSql>>,
+    },
+}
+
+/// A lowered public-subset visibility term: a [`crate::tenancy::PublicTerm`] whose literal is
+/// already a bound [`SqlValue`] (so it is always a parameter, never interpolated text). Conjoined
+/// onto a target read to confine it to a table's public rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PublicTermSql {
+    /// `<column> <op> <bound value>`.
+    Cmp {
+        column: String,
+        op: CmpOp,
+        value: SqlValue,
+    },
+    /// `<column> IS [NOT] NULL`.
+    Null { column: String, negated: bool },
+}
+
+/// Lower a host-held [`crate::tenancy::PublicPredicate`] (types-local literals) into the ORM's
+/// bound-value [`PublicTermSql`] terms. Called by the host when building a target scope; a
+/// `PublicLiteral` becomes a bound `SqlValue` (never interpolated).
+pub fn lower_public_terms(pred: &crate::tenancy::PublicPredicate) -> Vec<PublicTermSql> {
+    use crate::tenancy::{PublicCmp, PublicLiteral, PublicTerm};
+    pred.terms
+        .iter()
+        .map(|t| match t {
+            PublicTerm::Cmp { column, op, value } => {
+                let op = match op {
+                    PublicCmp::Eq => CmpOp::Eq,
+                    PublicCmp::Ne => CmpOp::Ne,
+                    PublicCmp::Lt => CmpOp::Lt,
+                    PublicCmp::Le => CmpOp::Le,
+                    PublicCmp::Gt => CmpOp::Gt,
+                    PublicCmp::Ge => CmpOp::Ge,
+                };
+                let value = match value {
+                    PublicLiteral::Bool(b) => SqlValue::Boolean(*b),
+                    PublicLiteral::Int(n) => SqlValue::Integer(*n),
+                    PublicLiteral::Text(s) => SqlValue::Text(s.clone()),
+                };
+                PublicTermSql::Cmp {
+                    column: column.clone(),
+                    op,
+                    value,
+                }
+            }
+            PublicTerm::Null { column, negated } => PublicTermSql::Null {
+                column: column.clone(),
+                negated: *negated,
+            },
+        })
+        .collect()
 }
 
 /// A host-resolved in-site row-tenancy scope — the applied side of the resolved principal. `value`
@@ -418,11 +482,56 @@ impl Scope {
     fn resolve_table(&self, table: &str) -> Result<ResolvedScope, OrmError> {
         match &self.keys {
             TableKeys::Uniform => Ok(ResolvedScope::Column(self.column.clone())),
-            TableKeys::PerTable(m) => m
+            TableKeys::PerTable(m) | TableKeys::PerTableTarget { keys: m, .. } => m
                 .get(table)
                 .cloned()
                 .ok_or_else(|| OrmError::TenancyUndeclared(table.to_string())),
         }
+    }
+
+    /// The PUBLIC-subset confinement to conjoin for `table` under a **target read** (R4/D8):
+    /// `Ok(None)` when the scope is not a target read (own/session — no public confinement, today's
+    /// behavior). Under a target read, a table with **no** declared public subset is refused
+    /// ([`OrmError::PublicSubsetUndeclared`], deny-by-default); otherwise the host-held terms are
+    /// built as a qualified `AND` (each column qualified by `qualifier` for a join/subquery ref, so
+    /// the confinement composes across every reachable table). An empty term list ⇒ no predicate
+    /// (a match-all public subset — the schema loader is responsible for rejecting an empty one).
+    fn public_pred(
+        &self,
+        table: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        let TableKeys::PerTableTarget { public, .. } = &self.keys else {
+            return Ok(None);
+        };
+        let terms = public
+            .get(table)
+            .ok_or_else(|| OrmError::PublicSubsetUndeclared(table.to_string()))?;
+        let mut preds = Vec::with_capacity(terms.len());
+        for term in terms {
+            match term {
+                PublicTermSql::Cmp { column, op, value } => {
+                    ident(column)?;
+                    preds.push(Predicate::Cmp {
+                        left: Self::col_expr(column, qualifier),
+                        op: *op,
+                        right: Expr::Value(value.clone()),
+                    });
+                }
+                PublicTermSql::Null { column, negated } => {
+                    ident(column)?;
+                    preds.push(Predicate::Null {
+                        expr: Self::col_expr(column, qualifier),
+                        negated: *negated,
+                    });
+                }
+            }
+        }
+        Ok(match preds.len() {
+            0 => None,
+            1 => Some(preds.pop().unwrap()),
+            _ => Some(Predicate::And(preds)),
+        })
     }
 
     /// A (possibly-qualified) column expression `<qualifier>.column`.
@@ -510,18 +619,29 @@ impl Scope {
         table: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Predicate>, OrmError> {
-        match self.resolve_table(table)? {
+        let tenant = match self.resolve_table(table)? {
             ResolvedScope::Column(col) => {
                 ident(&col)?;
-                self.tenant_pred(&col, qualifier)
+                self.tenant_pred(&col, qualifier)?
             }
-            ResolvedScope::Unscoped => Ok(None),
+            ResolvedScope::Unscoped => None,
             ResolvedScope::TenantOrSession { tenant, session } => {
                 ident(&tenant)?;
                 ident(&session)?;
-                self.disjunct_pred(&tenant, &session, qualifier)
+                self.disjunct_pred(&tenant, &session, qualifier)?
             }
-        }
+        };
+        // R4/D8: under a TARGET read, additionally confine to the table's host-held PUBLIC subset
+        // (deny-by-default if the table declares none). No-op under an own/session read. So a target
+        // read of table `t` becomes `t.tenant = B AND <t's public predicate>`, composed per ref.
+        let public = self.public_pred(table, qualifier)?;
+        let mut out = Predicate::And(Vec::new());
+        conjoin_front(&mut out, tenant);
+        conjoin_front(&mut out, public);
+        Ok(match out {
+            Predicate::And(v) if v.is_empty() => None,
+            p => Some(p),
+        })
     }
 
     /// The `(column, value)` a scoped **WRITE** stamps/bounds for `table` — the actor's OWN axis:
@@ -999,6 +1119,15 @@ pub enum OrmError {
     /// path reports the equivalent `TenantDenied::NoSource` at the binding.)
     #[error("tenancy: no resolved principal for a scoped operation (deny-by-default)")]
     TenancyNoPrincipal,
+    /// A **target read** (R4/D8) touched a table with **no** declared public subset in the project
+    /// schema. A target scope may only read rows that satisfy each accessed table's host-held public
+    /// predicate, so a table (root or any joined/subquery ref) that declares none is refused —
+    /// deny-by-default, the strict analog of [`TenancyUndeclared`]. This is what keeps a target read
+    /// from ever reaching another tenant's PRIVATE rows through an un-confined table.
+    #[error(
+        "tenancy: table {0:?} has no declared public subset for a target read (deny-by-default)"
+    )]
+    PublicSubsetUndeclared(String),
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -3608,5 +3737,143 @@ mod tests {
             q.compile(Dialect::Postgres),
             Err(OrmError::InvalidIdentifier(_))
         ));
+    }
+
+    #[test]
+    fn target_read_conjoins_the_public_subset_and_composes_across_joins() {
+        use std::collections::BTreeMap;
+        // A target read of tenant `B`: products (Tenant→tenant_id) LEFT JOIN reviews
+        // (Tenant→tenant_id). Each ref is confined to `tenant_id = B` AND its OWN public predicate,
+        // qualified per ref — so a target read can never reach B's private rows through any table.
+        let keys = BTreeMap::from([
+            (
+                "products".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+            (
+                "reviews".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+        ]);
+        let public = BTreeMap::from([
+            (
+                "products".to_string(),
+                vec![
+                    PublicTermSql::Cmp {
+                        column: "published".into(),
+                        op: CmpOp::Eq,
+                        value: SqlValue::Boolean(true),
+                    },
+                    PublicTermSql::Null {
+                        column: "deleted_at".into(),
+                        negated: false,
+                    },
+                ],
+            ),
+            (
+                "reviews".to_string(),
+                vec![PublicTermSql::Cmp {
+                    column: "visible".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Boolean(true),
+                }],
+            ),
+        ]);
+        let mut q = Select {
+            table_alias: Some("p".into()),
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "reviews".into(),
+                alias: Some("r".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("p.id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("r.product_id"),
+                },
+            }],
+            ..Select::from("products")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: Some(t("B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: keys.clone(),
+                public: public.clone(),
+            },
+        })
+        .unwrap();
+        let (sql, _params) = q.compile(Dialect::Sqlite).unwrap();
+        // Base ref `p`: tenant + its public terms, all qualified `p.`.
+        assert!(sql.contains("p.tenant_id = ?"), "base tenant scope: {sql}");
+        assert!(sql.contains("p.published = ?"), "base public term: {sql}");
+        assert!(
+            sql.contains("p.deleted_at IS NULL"),
+            "base public null term: {sql}"
+        );
+        // Joined ref `r`: tenant + ITS OWN public term, qualified `r.` (composition across the join).
+        assert!(
+            sql.contains("r.tenant_id = ?"),
+            "joined tenant scope: {sql}"
+        );
+        assert!(sql.contains("r.visible = ?"), "joined public term: {sql}");
+    }
+
+    #[test]
+    fn target_read_of_a_table_with_no_public_subset_is_refused() {
+        use std::collections::BTreeMap;
+        // Deny-by-default: a target read touching a table that declares NO public subset is refused
+        // (PublicSubsetUndeclared) — the strict analog of an undeclared tenant key, and what keeps a
+        // target read from reaching a private table.
+        let keys = BTreeMap::from([(
+            "secret_table".to_string(),
+            ResolvedScope::Column("tenant_id".to_string()),
+        )]);
+        let deny = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys,
+                public: BTreeMap::new(), // no public subset for secret_table
+            },
+        };
+        let mut q = Select::from("secret_table");
+        // The refusal surfaces at force_scope (join/subquery refs) or compile (base ref).
+        let err = q
+            .force_scope(&deny)
+            .err()
+            .or_else(|| q.compile(Dialect::Sqlite).err());
+        assert!(
+            matches!(&err, Some(OrmError::PublicSubsetUndeclared(t)) if t == "secret_table"),
+            "expected PublicSubsetUndeclared, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn own_read_is_unaffected_by_the_public_injection() {
+        // An own read (PerTable, not PerTableTarget) conjoins NO public predicate — byte-identical
+        // to pre-Stage-5. (Regression fence: the target path must not leak into the own path.)
+        use std::collections::BTreeMap;
+        let mut q = Select::from("products");
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([(
+                "products".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            )])),
+        })
+        .unwrap();
+        let (sql, _p) = q.compile(Dialect::Sqlite).unwrap();
+        assert!(sql.contains("tenant_id = ?"));
+        assert!(
+            !sql.contains("published") && !sql.contains("IS NULL"),
+            "own read must carry no public confinement: {sql}"
+        );
     }
 }
