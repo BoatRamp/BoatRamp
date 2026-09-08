@@ -478,7 +478,7 @@ async fn federation_gateway(
     let runner = crate::graphql_gateway::BackendRouter::new(
         // A federated sub-fetch to a sibling doesn't propagate an in-site tenant (the GDC's own
         // row policy governs data access); a scoped sibling fail-closes for an `own` op.
-        invoker.scoped(boatramp_core::project::ProjectRef::new(project), None),
+        invoker.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()),
         project.to_string(),
         inner.sql.clone(),
         sql_subgraphs,
@@ -562,7 +562,7 @@ async fn data_connector_serve(
         let invoker = inner
             .invoker
             .get()
-            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project), None));
+            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()));
         crate::graphql_data::runner::execute(
             backend.as_ref(),
             &dialect,
@@ -1007,8 +1007,9 @@ pub(super) async fn build_bindings(
             };
         let tenancy = tenancy.map(|h| h.with_schema(schema.as_ref()));
         bindings = bindings.with_tenancy(tenancy.clone());
-        // Carry the resolved tenant value so a sibling this handler invokes inherits it.
-        tenancy.and_then(|h| h.value().cloned())
+        // Carry the resolved principal (axis-tagged facts) so a sibling this handler invokes
+        // inherits it (each fact keeps its axis).
+        tenancy.map(|h| h.facts().to_vec()).unwrap_or_default()
     };
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the

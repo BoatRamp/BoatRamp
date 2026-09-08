@@ -53,6 +53,7 @@ use super::*;
 use std::sync::Arc;
 
 use boatramp_core::session::Cursor;
+#[cfg(test)]
 use boatramp_core::sql::SqlValue;
 use boatramp_core::time::now_unix_ms;
 
@@ -68,12 +69,18 @@ const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// fails, tearing the stream down and dropping the connection's permits) between outbound frames.
 const SESSION_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Seal a resolved tenant value to the opaque bytes stored as a session's `principal`. Compared for
-/// **equality** at re-open/re-entry admission (never parsed back or shown to the guest), so the
-/// [`Debug`] rendering — total over every [`SqlValue`] variant and stable within a process — is a
-/// sufficient, maintenance-free encoding. `None` (anonymous) seals to `None`.
-fn seal_principal(value: Option<&SqlValue>) -> Option<Vec<u8>> {
-    value.map(|v| format!("{v:?}").into_bytes())
+/// Seal the resolved **principal** (the axis-tagged fact set) to the opaque bytes stored as a
+/// session's `principal`. Compared for **equality** at re-open/re-entry admission (never parsed back
+/// or shown to the guest), so the [`Debug`] rendering — total over every [`ScopeFact`]/[`SqlValue`]
+/// variant and stable within a process — is a sufficient, maintenance-free encoding. An empty fact
+/// set (anonymous) seals to `None`. Sealing the whole set (not just the tenant value) binds the
+/// session to the full principal, so a later `Session`/`TargetTenant` fact is part of the identity.
+fn seal_principal(facts: &[boatramp_handlers::ScopeFact]) -> Option<Vec<u8>> {
+    if facts.is_empty() {
+        None
+    } else {
+        Some(format!("{facts:?}").into_bytes())
+    }
 }
 
 /// Upper bound on the client-chosen session id — it lands verbatim in a KV key and the record.
@@ -161,7 +168,7 @@ async fn resolve_session_principal(
     session: &boatramp_core::config::SessionConfig,
     bearer: Option<&str>,
     domain_context: Option<&str>,
-) -> Result<Option<SqlValue>, String> {
+) -> Result<Vec<boatramp_handlers::ScopeFact>, String> {
     let imports_db = session.imports.iter().any(|i| i == "sql")
         || session.imports.iter().any(|i| i.starts_with("sql:"));
     let posture = crate::tenant_resolve::TenantPosture {
@@ -184,7 +191,7 @@ async fn resolve_session_principal(
     )
     .await
     .map_err(|e| e.to_string())?;
-    Ok(resolved.and_then(|h| h.value().cloned()))
+    Ok(resolved.map(|h| h.facts().to_vec()).unwrap_or_default())
 }
 
 /// The binding identity for a session: the preview-namespaced site, project-qualified (BR-TEN-1) —
@@ -248,7 +255,7 @@ pub(super) async fn serve_session_open(
     )
     .await
     {
-        Ok(value) => seal_principal(value.as_ref()),
+        Ok(facts) => seal_principal(&facts),
         Err(err) => {
             tracing::warn!(site, route = %session.route, %err, "session tenancy refused");
             return (StatusCode::FORBIDDEN, "session tenancy refused\n").into_response();
@@ -479,7 +486,7 @@ pub(super) async fn dispatch_session_post(
             return (StatusCode::FORBIDDEN, "session tenancy refused\n").into_response();
         }
     };
-    let principal = seal_principal(caller_tenant.as_ref());
+    let principal = seal_principal(&caller_tenant);
     let store = session_store(inner);
     let now = now_unix_ms();
     match store
@@ -645,8 +652,16 @@ mod tests {
 
     #[test]
     fn seal_is_deterministic_total_and_distinguishes_values() {
-        // Anonymous seals to None; every value variant seals to some stable bytes.
-        assert_eq!(seal_principal(None), None);
+        use boatramp_core::tenancy::ScopeAxis;
+        // A single-Tenant-fact principal for a value (the Stage-2 shape).
+        let fact = |v: SqlValue| {
+            vec![boatramp_handlers::ScopeFact {
+                axis: ScopeAxis::Tenant,
+                value: v,
+            }]
+        };
+        // Anonymous (empty fact set) seals to None; every value variant seals to some stable bytes.
+        assert_eq!(seal_principal(&[]), None);
         for v in [
             SqlValue::Null,
             SqlValue::Boolean(true),
@@ -655,22 +670,22 @@ mod tests {
             SqlValue::Text("acme".into()),
             SqlValue::Blob(vec![0, 255, 7]),
         ] {
-            let a = seal_principal(Some(&v));
-            let b = seal_principal(Some(&v));
+            let a = seal_principal(&fact(v.clone()));
+            let b = seal_principal(&fact(v.clone()));
             assert_eq!(a, b, "seal must be deterministic for {v:?}");
             assert!(a.is_some());
         }
-        // Different values (and a None vs a value) must not collide — the admission check is an
+        // Different values (and an empty vs a value) must not collide — the admission check is an
         // equality compare of these bytes.
         assert_ne!(
-            seal_principal(Some(&SqlValue::Integer(1))),
-            seal_principal(Some(&SqlValue::Integer(2)))
+            seal_principal(&fact(SqlValue::Integer(1))),
+            seal_principal(&fact(SqlValue::Integer(2)))
         );
         assert_ne!(
-            seal_principal(Some(&SqlValue::Integer(1))),
-            seal_principal(Some(&SqlValue::Text("1".into())))
+            seal_principal(&fact(SqlValue::Integer(1))),
+            seal_principal(&fact(SqlValue::Text("1".into())))
         );
-        assert_ne!(seal_principal(Some(&SqlValue::Null)), seal_principal(None));
+        assert_ne!(seal_principal(&fact(SqlValue::Null)), seal_principal(&[]));
     }
 
     #[test]

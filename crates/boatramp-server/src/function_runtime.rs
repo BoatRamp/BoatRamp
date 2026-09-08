@@ -16,8 +16,10 @@ use boatramp_core::project::ProjectRef;
 pub(super) enum FnTenant {
     /// A trusted inbound HTTP request — resolve from its verified bearer + routed domain tag.
     Request,
-    /// Inherit the caller's host-resolved tenant value down an in-project invoke chain.
-    Inherited(Option<boatramp_core::sql::SqlValue>),
+    /// Inherit the caller's host-resolved **principal** (the axis-tagged fact set) down an
+    /// in-project invoke chain — so an inherited `Session`/`TargetTenant` fact keeps its axis, not
+    /// just the `Tenant` value. Empty ⇒ no inherited principal. In-process only; never serialized.
+    Inherited(Vec<boatramp_handlers::ScopeFact>),
     /// No trusted source (cron / consumer / webhook / durable drain).
     Background,
 }
@@ -590,8 +592,12 @@ pub(super) async fn build_function_bindings(
         bindings = bindings.with_tenancy(resolved.clone());
         resolved
     };
-    // The tenant value to propagate down an in-project invoke chain (host-carried).
-    let caller_tenant = host_tenancy.as_ref().and_then(|h| h.value().cloned());
+    // The resolved principal (axis-tagged fact set) to propagate down an in-project invoke chain
+    // (host-carried, never guest-supplied). Empty when there's no in-site tenancy.
+    let caller_tenant = host_tenancy
+        .as_ref()
+        .map(|h| h.facts().to_vec())
+        .unwrap_or_default();
     if granted("wasi:messaging") {
         if let Some(messaging) = &inner.messaging {
             // Private topics namespace under the function's own scope; `bus:<topic>`
@@ -757,11 +763,12 @@ pub(crate) struct FunctionInvoker {
     /// project, never across the tenant boundary. The startup template carries
     /// `default`; [`scoped`](Self::scoped) rebinds it per caller.
     project: String,
-    /// The caller's host-resolved **in-site tenant value** (Stage 0), carried so an invoked sibling
-    /// inherits the caller's tenant identity — host-propagated, never read from the guest's invoke
-    /// request. `None` when the caller has no resolved tenant (plain / anonymous). Set per binding
-    /// by [`scoped`](Self::scoped).
-    caller_tenant: Option<boatramp_core::sql::SqlValue>,
+    /// The caller's host-resolved **principal** — the axis-tagged fact set (`PLAN-tenancy-principal`
+    /// D1) — carried so an invoked sibling inherits the caller's tenant identity (and, later, its
+    /// `Session`/`TargetTenant` facts with their axes intact) — host-propagated, never read from the
+    /// guest's invoke request. Empty when the caller has no resolved tenancy (plain / anonymous).
+    /// Set per binding by [`scoped`](Self::scoped).
+    caller_tenant: Vec<boatramp_handlers::ScopeFact>,
 }
 
 #[cfg(feature = "handlers")]
@@ -771,7 +778,7 @@ impl FunctionInvoker {
             deploy,
             runtime,
             project: ProjectRef::DEFAULT.as_str().to_string(),
-            caller_tenant: None,
+            caller_tenant: Vec::new(),
         }
     }
 
@@ -782,7 +789,7 @@ impl FunctionInvoker {
     pub(crate) fn scoped(
         &self,
         project: ProjectRef<'_>,
-        caller_tenant: Option<boatramp_core::sql::SqlValue>,
+        caller_tenant: Vec<boatramp_handlers::ScopeFact>,
     ) -> Arc<dyn boatramp_handlers::Invoker> {
         Arc::new(Self {
             deploy: self.deploy.clone(),

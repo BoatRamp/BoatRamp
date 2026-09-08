@@ -98,7 +98,7 @@ pub(crate) fn resolve_inherited_tenancy(
     decision: Option<&Tenancy>,
     imports_db: bool,
     posture: TenantPosture,
-    inherited: Option<boatramp_core::sql::SqlValue>,
+    inherited: Vec<boatramp_handlers::ScopeFact>,
 ) -> Result<Option<HostTenancy>, TenancyUndeclared> {
     match decision {
         None => {
@@ -117,7 +117,10 @@ pub(crate) fn resolve_inherited_tenancy(
         }) => {
             let read = cap(*read, posture.allow_cross_tenant);
             let write = normalize_write(cap(*write, posture.allow_cross_tenant));
-            Ok(Some(HostTenancy::new(
+            // The callee applies its OWN column + posture-capped modes to the caller's inherited
+            // **principal** (axis-tagged facts), so an inherited `TargetTenant`/`Session` fact keeps
+            // its axis rather than collapsing into an `own` `Tenant` value.
+            Ok(Some(HostTenancy::from_facts(
                 column.clone(),
                 inherited,
                 read,
@@ -250,7 +253,10 @@ mod tests {
             Some(&decision),
             true,
             posture(true, false),
-            Some(SqlValue::Text("caller-tenant".into())),
+            vec![boatramp_handlers::ScopeFact {
+                axis: boatramp_core::tenancy::ScopeAxis::Tenant,
+                value: SqlValue::Text("caller-tenant".into()),
+            }],
         )
         .unwrap()
         .unwrap();
@@ -266,8 +272,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(write.mode, boatramp_core::orm::ScopeMode::Own);
-        // A sibling with no inherited value + an own grant fails closed.
-        let ht = resolve_inherited_tenancy(Some(&decision), true, posture(true, false), None)
+        // A sibling with no inherited principal (empty fact set) + an own grant fails closed.
+        let ht = resolve_inherited_tenancy(Some(&decision), true, posture(true, false), Vec::new())
             .unwrap()
             .unwrap();
         assert!(ht.orm_scope(boatramp_handlers::TenantAxis::Read).is_err());

@@ -446,7 +446,7 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
         let router = BackendRouter::new(
             // A federated sub-fetch doesn't propagate an in-site tenant (the GDC row policy governs
             // data); a scoped sibling fail-closes for an `own` op.
-            invoker.scoped(boatramp_core::project::ProjectRef::new(project), None),
+            invoker.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()),
             project.to_string(),
             inner.sql.clone(),
             sql_subgraphs,
