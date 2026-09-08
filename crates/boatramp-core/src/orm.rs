@@ -1651,9 +1651,7 @@ fn render_conflict(
     // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing) —
     // AND a per-table tenant column to bound *on* (an `Unscoped` target has `target_col == None`, so
     // there is no tenant column to guard, exactly as for a plain scoped write to that table).
-    let guard = scope
-        .filter(|s| s.stamp_value().is_some())
-        .and_then(|s| target_col.map(|col| (s, col)));
+    let guard = scope.filter(|s| s.stamp_value().is_some()).zip(target_col);
     let do_nothing = || format!(" ON CONFLICT ({}) DO NOTHING", conflict_cols.join(", "));
     if oc.update.is_empty() {
         return Ok(do_nothing());
