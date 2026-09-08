@@ -122,6 +122,9 @@ impl HostTenancy {
             column: self.column.clone(),
             value,
             mode,
+            // Stage 1: the per-table key map (from the project TenancySchema) is threaded in by the
+            // binding in a later increment; `Uniform` preserves the pre-schema single-column behavior.
+            keys: boatramp_core::orm::TableKeys::Uniform,
         }))
     }
 

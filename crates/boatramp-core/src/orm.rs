@@ -373,31 +373,65 @@ pub enum ScopeMode {
     All,
 }
 
+/// Per-table tenant-key resolution for a [`Scope`] (Stage 1, PLAN-tenancy-principal D2/D3). Legacy /
+/// no project schema ⇒ [`Uniform`](TableKeys::Uniform): every table scopes on [`Scope::column`].
+/// A present project schema ⇒ [`PerTable`](TableKeys::PerTable): the authoritative map, `table →
+/// Some(column)` to scope that table on `column` (`TenantKeyed` identity tables use their own PK),
+/// `table → None` for an `Unscoped` global table (no predicate); a table **absent** from the map is
+/// refused ([`OrmError::TenancyUndeclared`], deny-by-default).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TableKeys {
+    #[default]
+    Uniform,
+    PerTable(std::collections::BTreeMap<String, Option<String>>),
+}
+
 /// A host-resolved in-site row-tenancy scope. The `value` is the resolved tenant (from the
-/// verified source); `mode` decides how it restricts the operation. Injected by the host on
-/// **every** query node (top-level, `UNION` branch, `INSERT … SELECT` source), never guest-set.
+/// verified source); `mode` decides how it restricts the operation; `keys` resolves the tenant
+/// **column per table** (the project schema — R2/D2). Injected by the host on **every** query node
+/// (top-level, `UNION` branch, `INSERT … SELECT` source), never guest-set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scope {
     pub column: String,
     pub value: SqlValue,
     pub mode: ScopeMode,
+    /// Per-table key resolution; [`TableKeys::Uniform`] (the default) preserves the pre-schema
+    /// single-column behavior (every table scopes on `column`).
+    pub keys: TableKeys,
 }
 
 impl Scope {
-    /// The scope as a `WHERE`/`HAVING` predicate for the resolved mode, or `None` for
-    /// [`ScopeMode::All`] (cross-tenant — no tenant predicate at all). Unqualified column.
-    fn as_predicate(&self) -> Option<Predicate> {
-        self.as_predicate_for(None)
+    /// The tenant column to scope `table` on: `Ok(Some(col))` ⇒ scope on `col`; `Ok(None)` ⇒ the
+    /// table is `Unscoped` (no predicate); `Err(TenancyUndeclared)` ⇒ undeclared under a present
+    /// schema (deny-by-default). Legacy `Uniform` keys always yield `Some(self.column)`.
+    fn column_for<'a>(&'a self, table: &str) -> Result<Option<&'a str>, OrmError> {
+        match &self.keys {
+            TableKeys::Uniform => Ok(Some(self.column.as_str())),
+            TableKeys::PerTable(m) => match m.get(table) {
+                Some(Some(col)) => Ok(Some(col.as_str())),
+                Some(None) => Ok(None),
+                None => Err(OrmError::TenancyUndeclared(table.to_string())),
+            },
+        }
     }
 
-    /// Like [`Scope::as_predicate`] but the tenant column is optionally qualified `<qualifier>.col`
-    /// — so the predicate binds to a specific table in a multi-table (join) or subquery context,
-    /// never accidentally to an outer/other table with the same column name (a scoping leak).
-    fn as_predicate_for(&self, qualifier: Option<&str>) -> Option<Predicate> {
+    /// The scope as a `WHERE`/`HAVING` predicate on `column` for the resolved mode (unqualified), or
+    /// `None` for [`ScopeMode::All`] (cross-tenant — no tenant predicate). The single-table SELECT +
+    /// the write paths use this with the scope's own `column` (per-table resolution matters only
+    /// across joins, handled in `scope_where_pred`).
+    fn as_predicate(&self) -> Option<Predicate> {
+        self.predicate_on(&self.column, None)
+    }
+
+    /// The per-mode predicate on `column`, optionally qualified `<qualifier>.column` — so it binds to
+    /// a specific table in a multi-table (join) or subquery context, never accidentally to an
+    /// outer/other table with the same column name (a scoping leak). `column` is the per-table
+    /// resolved key (see [`Scope::column_for`]).
+    fn predicate_on(&self, column: &str, qualifier: Option<&str>) -> Option<Predicate> {
         let col = || {
             Expr::Column(match qualifier {
-                Some(q) => format!("{q}.{}", self.column),
-                None => self.column.clone(),
+                Some(q) => format!("{q}.{column}"),
+                None => column.to_string(),
             })
         };
         let eq = || Predicate::Cmp {
@@ -655,7 +689,7 @@ fn inject_scope_expr(scope: &Scope, e: &mut Expr) {
         Expr::RelatedAggregate { table, filter, .. }
         | Expr::RelatedScalar { table, filter, .. } => {
             inject_scope_pred(scope, filter);
-            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+            conjoin_front(filter, scope.predicate_on(&scope.column, Some(table)));
         }
         Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner),
         Expr::Binary(_, l, r) | Expr::JsonExtractDyn(l, r) | Expr::JsonConcat(l, r) => {
@@ -695,7 +729,7 @@ fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
         } => {
             inject_scope_expr(scope, expr);
             inject_scope_pred(scope, filter);
-            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+            conjoin_front(filter, scope.predicate_on(&scope.column, Some(table)));
         }
         Predicate::And(v) | Predicate::Or(v) => {
             v.iter_mut().for_each(|c| inject_scope_pred(scope, c));
@@ -793,6 +827,13 @@ pub enum OrmError {
     /// `count(*)`.
     #[error("bad expression: {0}")]
     BadExpr(&'static str),
+    /// A scoped query touched a table with **no** entry in the project's [`TenancySchema`]
+    /// (deny-by-default, PLAN-tenancy-principal D3): "no key" and "forgot the key" are
+    /// indistinguishable, so the safe collapse is to refuse rather than run it unscoped or wrongly
+    /// scoped. `Unscoped` is the explicit, reviewed "this table is global"; an absent table is a
+    /// misconfiguration the host surfaces (the binding names the component + marker site).
+    #[error("tenancy: table {0:?} has no declared scope (deny-by-default)")]
+    TenancyUndeclared(String),
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -1265,19 +1306,37 @@ impl Select {
         let Some(scope) = &self.scope else {
             return Ok(None);
         };
-        ident(&scope.column)?;
         if self.joins.is_empty() {
-            return Ok(scope.as_predicate());
+            // Single table: resolve its per-table key (deny-by-default if undeclared; skip if
+            // Unscoped), and emit the unqualified predicate on it.
+            let Some(col) = scope.column_for(&self.table)? else {
+                return Ok(None); // Unscoped table — no tenant predicate
+            };
+            ident(col)?;
+            return Ok(scope.predicate_on(col, None));
         }
-        let mut refs: Vec<&str> = Vec::with_capacity(self.joins.len() + 1);
-        refs.push(self.table_alias.as_deref().unwrap_or(&self.table));
-        for j in &self.joins {
-            refs.push(j.alias.as_deref().unwrap_or(&j.table));
-        }
+        // Joined: each table reference is scoped on its OWN resolved key, qualified by alias-or-name,
+        // so a guest can't read a joined table's cross-tenant rows through the projection. A ref
+        // whose table is undeclared fails closed (deny-by-default); an `Unscoped` ref adds no
+        // predicate (it is global by declaration).
+        let refs: Vec<(&str, &str)> = std::iter::once((
+            self.table.as_str(),
+            self.table_alias.as_deref().unwrap_or(&self.table),
+        ))
+        .chain(
+            self.joins
+                .iter()
+                .map(|j| (j.table.as_str(), j.alias.as_deref().unwrap_or(&j.table))),
+        )
+        .collect();
         let mut parts: Vec<Predicate> = Vec::with_capacity(refs.len());
-        for r in refs {
-            ident(r)?;
-            if let Some(p) = scope.as_predicate_for(Some(r)) {
+        for (table, qual) in refs {
+            ident(qual)?;
+            let Some(col) = scope.column_for(table)? else {
+                continue; // Unscoped ref
+            };
+            ident(col)?;
+            if let Some(p) = scope.predicate_on(col, Some(qual)) {
                 parts.push(p);
             }
         }
@@ -1701,6 +1760,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             ..Select::from("party")
         };
@@ -1710,6 +1770,103 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    #[test]
+    fn per_table_keys_scope_each_ref_on_its_own_column() {
+        use std::collections::BTreeMap;
+        // A settings-page read: storefront_config (Tenant -> tenant_id) LEFT JOIN the identity table
+        // `tenant` (TenantKeyed -> its own PK `id`). The host injects the RIGHT column per ref (R2).
+        let q = Select {
+            table_alias: Some("sc".into()),
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "tenant".into(),
+                alias: Some("t".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("sc.tenant_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("t.id"),
+                },
+            }],
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: t("acme"),
+                mode: ScopeMode::Own,
+                keys: TableKeys::PerTable(BTreeMap::from([
+                    (
+                        "storefront_config".to_string(),
+                        Some("tenant_id".to_string()),
+                    ),
+                    ("tenant".to_string(), Some("id".to_string())),
+                ])),
+            }),
+            ..Select::from("storefront_config")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("sc.tenant_id = ?"),
+            "base scoped on tenant_id: {sql}"
+        );
+        assert!(
+            sql.contains("t.id = ?"),
+            "identity table scoped on its own PK: {sql}"
+        );
+        assert_eq!(params, vec![t("acme"), t("acme")]);
+
+        // An `Unscoped` join (reference data) adds NO tenant predicate; the base still scopes.
+        let mut q2 = Select {
+            table_alias: Some("sc".into()),
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "countries".into(),
+                alias: Some("c".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("sc.country"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("c.code"),
+                },
+            }],
+            ..Select::from("storefront_config")
+        };
+        q2.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("acme"),
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "storefront_config".to_string(),
+                    Some("tenant_id".to_string()),
+                ),
+                ("countries".to_string(), None),
+            ])),
+        });
+        let (sql2, params2) = q2.compile(Dialect::Sqlite).unwrap();
+        assert!(sql2.contains("sc.tenant_id = ?"), "sql2: {sql2}");
+        // The `Unscoped` join binds NO tenant value — the sole bind is the base's own tenant — which
+        // proves `countries` contributed no scope predicate (a substring check on the alias would
+        // false-match `sc.tenant_id`).
+        assert_eq!(
+            params2,
+            vec![t("acme")],
+            "unscoped join adds no tenant predicate: {sql2}"
+        );
+
+        // An UNDECLARED table under a present schema is refused (deny-by-default, D3).
+        let mut q3 = Select::from("secret_table");
+        q3.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: t("acme"),
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([(
+                "orders".to_string(),
+                Some("tenant_id".to_string()),
+            )])),
+        });
+        assert!(matches!(
+            q3.compile(Dialect::Sqlite),
+            Err(OrmError::TenancyUndeclared(tbl)) if tbl == "secret_table"
+        ));
     }
 
     #[test]
@@ -1730,6 +1887,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("acme"),
             mode: ScopeMode::OwnOrNull,
+            keys: TableKeys::Uniform,
         });
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
@@ -1762,6 +1920,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("acme"),
             mode: ScopeMode::All,
+            keys: TableKeys::Uniform,
         });
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
@@ -1808,6 +1967,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("acme"),
             mode: ScopeMode::OwnOrNull,
+            keys: TableKeys::Uniform,
         });
         let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
         // The host scope predicate is conjoined in FRONT, independent of the is_own label.
@@ -1828,6 +1988,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode,
+                keys: TableKeys::Uniform,
             }),
             ..Select::from("party")
         }
@@ -1884,6 +2045,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("ten_1"),
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         });
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
@@ -1917,6 +2079,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("ten_1"),
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         });
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
@@ -1938,6 +2101,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("ten_1"),
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         };
         // DELETE … RETURNING (subquery) — the RETURNING read must be scoped to victim.
         let mut del = Delete {
@@ -1983,6 +2147,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("ten_1"),
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         });
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         // The subquery's WHERE is scoped to victim.tenant_id; the outer to orders (single table).
@@ -2018,6 +2183,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("OWN"),
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         };
         ins.force_scope(Some(&own), Some(&own));
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
@@ -2054,6 +2220,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("OWN"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -2101,6 +2268,7 @@ mod tests {
             column: "tenant_id".into(),
             value: t("OWN"),
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         };
         ins.force_scope(Some(&own), Some(&own));
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
@@ -2137,6 +2305,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
             from_select: None,
@@ -2178,6 +2347,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             ..Select::from("order_to_network")
         };
@@ -2370,6 +2540,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![item(Expr::col("id"))],
             from_select: None,
@@ -2440,6 +2611,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -2517,6 +2689,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -2580,6 +2753,7 @@ mod tests {
                 column: "tenant_id".into(),
                 value: t("ten_1"),
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
