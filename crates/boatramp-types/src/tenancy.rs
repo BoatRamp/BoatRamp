@@ -92,7 +92,7 @@ where
 /// *unrepresentable* on the own/session/private axes at the type level — a guest can never name its
 /// OWN tenant, only a public target, and only within the guardrails (G1–G6). `via` is a
 /// priority-ordered list of these, homogeneous in tier by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TargetSource {
@@ -115,7 +115,7 @@ pub enum TargetSource {
 /// guest runs** — there is no request-time parameter expressing own-vs-target, so a guest can never
 /// select or detect which scope it got (picking the wrong scope is *unrepresentable*). Absent ⇒
 /// `Own` (byte-identical to pre-Stage-5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TenancyClass {
