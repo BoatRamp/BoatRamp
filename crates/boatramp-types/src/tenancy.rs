@@ -46,6 +46,28 @@ fn default_tid_claim() -> String {
     "tid".to_string()
 }
 
+/// Which **axis** a resolved tenant fact belongs to (`PLAN-tenancy-principal` D1). The host-resolved
+/// principal is a small *set* of facts, each tagged with its axis, so an inherited/carried principal
+/// preserves which axis a value belongs to (e.g. an inherited `TargetTenant` fact keeps its
+/// public-subset confinement, never collapsing into an `own` `Tenant` fact).
+///
+/// **CLOSED enum — the line.** Only these three axes exist, ever: `Tenant` (the caller's own tenant,
+/// Stage 2), `Session` (an anonymous-identity disjunct, Stage 3), `TargetTenant` (one *other*
+/// tenant's public subset, Stage 5). A fourth axis is a design smell — extend a table's scope class
+/// or a fact's lifetime instead. `#[non_exhaustive]` only so the later stages can land their variants
+/// without a breaking change for downstream crates; it is not an invitation to add a fourth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ScopeAxis {
+    /// The caller's own tenant — resolved per trigger from a [`TenantSource`] (Stage 2).
+    Tenant,
+    /// An anonymous returning-visitor identity, a disjunct of `Tenant` (Stage 3).
+    Session,
+    /// One *other* tenant, read-only, confined to a host-declared public subset (Stage 5).
+    TargetTenant,
+}
+
 /// Which tenant-set one axis (read or write) of a function may reach. **Default-deny** on
 /// cross-tenant: only [`AccessMode::All`] crosses tenants, and it needs the operator posture
 /// ceiling to permit it. Distinguishes every case: own, own+null, null-only, all, and no access.

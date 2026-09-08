@@ -12,7 +12,20 @@
 
 use boatramp_core::orm::{Scope, ScopeMode};
 use boatramp_core::sql::SqlValue;
-use boatramp_core::tenancy::AccessMode;
+use boatramp_core::tenancy::{AccessMode, ScopeAxis};
+
+/// One host-resolved, host-verified tenant fact, tagged with the [`ScopeAxis`] it belongs to
+/// (`PLAN-tenancy-principal` D1). The principal is a small *set* of these, borne statelessly. In
+/// Stage 2 only the [`ScopeAxis::Tenant`] fact is ever populated (the caller's own tenant); the
+/// `Session` and `TargetTenant` facts land in later stages. Keeping the set axis-tagged now is the
+/// keystone: an inherited/carried principal preserves which axis a value belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeFact {
+    /// Which axis this fact scopes.
+    pub axis: ScopeAxis,
+    /// The host-resolved value (never guest-supplied).
+    pub value: SqlValue,
+}
 
 /// The reserved token a scoped-tenancy guest places in a raw-SQL statement to mark **where** the
 /// host injects the tenant predicate (the host, not the guest, decides *what* it is). A scoped
@@ -57,7 +70,10 @@ impl TenantDenied {
 #[derive(Debug, Clone)]
 pub struct HostTenancy {
     column: String,
-    value: Option<SqlValue>,
+    /// The resolved **principal**: an axis-tagged fact set (`PLAN-tenancy-principal` D1). Stage 2
+    /// only ever holds a single [`ScopeAxis::Tenant`] fact (or none, for anonymous / null-only); the
+    /// `Session` (Stage 3) and `TargetTenant` (Stage 5) facts join it later. Carried statelessly.
+    facts: Vec<ScopeFact>,
     read: AccessMode,
     write: AccessMode,
     /// Per-table tenant-key resolution from the project [`TenancySchema`](boatramp_core::tenancy::TenancySchema)
@@ -76,13 +92,50 @@ impl HostTenancy {
         read: AccessMode,
         write: AccessMode,
     ) -> Self {
+        // A resolved own-tenant value becomes the single `Tenant` fact; anonymous / null-only
+        // resolves to an empty fact set. The fact-set shape is the Stage-2 keystone.
+        let facts = value
+            .map(|value| ScopeFact {
+                axis: ScopeAxis::Tenant,
+                value,
+            })
+            .into_iter()
+            .collect();
+        Self::from_facts(column, facts, read, write)
+    }
+
+    /// Build a resolved tenancy directly from an axis-tagged fact set — the constructor the edge
+    /// **carry** uses (invoke / session re-entry), so an inherited principal preserves each fact's
+    /// axis. Per-table keys default to `Uniform`; attach a project schema with
+    /// [`with_schema`](Self::with_schema).
+    pub fn from_facts(
+        column: impl Into<String>,
+        facts: Vec<ScopeFact>,
+        read: AccessMode,
+        write: AccessMode,
+    ) -> Self {
         Self {
             column: column.into(),
-            value,
+            facts,
             read,
             write,
             keys: boatramp_core::orm::TableKeys::Uniform,
         }
+    }
+
+    /// The resolved principal's fact set (axis-tagged). The host **carries** this down an in-project
+    /// invoke / session re-entry so an inherited principal keeps each fact's axis.
+    pub fn facts(&self) -> &[ScopeFact] {
+        &self.facts
+    }
+
+    /// The resolved own-[`ScopeAxis::Tenant`] value, if any — the value the `Own`/`OwnOrNull` scope
+    /// modes bind. (`Session`/`TargetTenant` facts are consulted by their own axes in later stages.)
+    fn tenant_value(&self) -> Option<&SqlValue> {
+        self.facts
+            .iter()
+            .find(|f| f.axis == ScopeAxis::Tenant)
+            .map(|f| &f.value)
     }
 
     /// Attach the project's per-table tenancy map (R2), so each table scopes on its own key (the
@@ -102,12 +155,12 @@ impl HostTenancy {
         self
     }
 
-    /// The resolved tenant value, if any. Used by the host to **propagate** the caller's tenant
-    /// down an in-project invoke chain (host-carried — never read from a guest-supplied invoke
-    /// request), so an invoked sibling inherits the caller's tenant identity while applying its
-    /// own grant.
+    /// The resolved own-tenant value, if any (the [`ScopeAxis::Tenant`] fact). Used by the host to
+    /// **propagate** the caller's tenant down an in-project invoke chain (host-carried — never read
+    /// from a guest-supplied invoke request), so an invoked sibling inherits the caller's tenant
+    /// identity while applying its own grant. (Prefer [`facts`](Self::facts) for the full principal.)
     pub fn value(&self) -> Option<&SqlValue> {
-        self.value.as_ref()
+        self.tenant_value()
     }
 
     fn mode(&self, axis: Axis) -> AccessMode {
@@ -139,7 +192,7 @@ impl HostTenancy {
         let value = if matches!(mode, ScopeMode::NullOnly) {
             SqlValue::Null
         } else {
-            self.value.clone().ok_or(TenantDenied::NoSource)?
+            self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?
         };
         Ok(Some(Scope {
             column: self.column.clone(),
@@ -176,11 +229,11 @@ impl HostTenancy {
             AccessMode::All => Ok(("1 = 1".to_string(), None)),
             AccessMode::Null => Ok((format!("{col} IS NULL"), None)),
             AccessMode::Own => {
-                let v = self.value.clone().ok_or(TenantDenied::NoSource)?;
+                let v = self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?;
                 Ok((format!("{col} = ?{}", param_count + 1), Some(v)))
             }
             AccessMode::OwnOrNull => {
-                let v = self.value.clone().ok_or(TenantDenied::NoSource)?;
+                let v = self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?;
                 Ok((
                     format!("({col} = ?{} OR {col} IS NULL)", param_count + 1),
                     Some(v),
@@ -207,6 +260,42 @@ mod tests {
 
     fn t(s: &str) -> SqlValue {
         SqlValue::Text(s.to_string())
+    }
+
+    #[test]
+    fn a_resolved_value_becomes_a_single_tenant_fact() {
+        // The keystone: `new(Some(v))` yields a one-fact `Tenant` principal; `value()`/the scope
+        // read it back. Anonymous (`None`) is an empty fact set.
+        let ht = HostTenancy::new(
+            "tenant_id",
+            Some(t("acme")),
+            AccessMode::Own,
+            AccessMode::Own,
+        );
+        assert_eq!(ht.facts().len(), 1);
+        assert_eq!(ht.facts()[0].axis, ScopeAxis::Tenant);
+        assert_eq!(ht.facts()[0].value, t("acme"));
+        assert_eq!(ht.value(), Some(&t("acme")));
+
+        let anon = HostTenancy::new("tenant_id", None, AccessMode::Null, AccessMode::Null);
+        assert!(anon.facts().is_empty());
+        assert_eq!(anon.value(), None);
+
+        // `from_facts` is the carry constructor — it round-trips the axis-tagged set.
+        let carried = HostTenancy::from_facts(
+            "tenant_id",
+            vec![ScopeFact {
+                axis: ScopeAxis::Tenant,
+                value: t("globex"),
+            }],
+            AccessMode::Own,
+            AccessMode::Own,
+        );
+        assert_eq!(carried.value(), Some(&t("globex")));
+        assert_eq!(
+            carried.orm_scope(Axis::Read).unwrap().unwrap().value,
+            t("globex")
+        );
     }
 
     #[test]
