@@ -110,6 +110,36 @@ pub(crate) enum PolicyError {
     /// A row predicate references a claim the request doesn't carry — deny (never widen).
     #[error("access requires the `{0}` claim, which the request does not carry")]
     MissingClaim(String),
+    /// A **target read** (R4/D8) touched a table with no declared public subset — deny-by-default
+    /// (the strict analog of an undeclared tenant key). A target scope may only read rows that
+    /// satisfy each accessed table's host-held public predicate, so a table (root or any
+    /// joined/subquery ref) that declares none is refused before any SQL is emitted.
+    #[error("table `{0}` has no declared public subset for a target read (deny-by-default)")]
+    TargetSubsetUndeclared(String),
+}
+
+/// One table's confinement under a **target read**: the tenant column to bind to the target tenant
+/// `B`, plus the host-held public-subset terms (literals) to conjoin. Sourced from the project
+/// `TenancySchema` by the host (never from the GDC's own claim-bound config, which is the OWN path).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TargetTable {
+    /// The table's tenant key column (from the project schema's per-table keys).
+    pub tenant_column: String,
+    /// The table's host-held public-subset terms (all literal values — never claim-bound).
+    pub public: Vec<ResolvedTerm>,
+}
+
+/// A host-resolved **target-tenant read scope** (R4/D8): read another tenant `B`'s PUBLIC subset.
+/// `B` is host-derived at the edge (terminating domain / verified capability / handle lookup), NEVER
+/// guest input. `tables` maps each table permitted under this scope to its confinement; a table
+/// **absent** from the map is refused (deny-by-default), so a target read can never reach `B`'s
+/// PRIVATE rows through an un-confined table (root, join, or subquery).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TargetScope {
+    /// The resolved target tenant `B` — bound as a literal on every table's tenant column.
+    pub tenant_value: SqlValue,
+    /// Per-table confinement; deny-by-default for a table not present.
+    pub tables: BTreeMap<String, TargetTable>,
 }
 
 /// One resolved row-predicate term: a column compared to a concrete bound value.
@@ -241,6 +271,43 @@ impl DataPolicy {
         }
         Ok(Some(ResolvedFilter { terms }))
     }
+
+    /// Resolve `table`'s row filter under an optional **target scope** (R4/D8).
+    ///
+    /// - `target = None` ⇒ identical to [`row_filter`](Self::row_filter) (the OWN path: the table's
+    ///   claim-bound predicate).
+    /// - `target = Some(ts)` ⇒ the OWN claim-bound predicate is **replaced** by `tenant_column = B`
+    ///   (the host-resolved target tenant, a literal — never the caller's own claim) conjoined with
+    ///   the table's host-held public-subset terms. A table **not** present in `ts.tables` is refused
+    ///   ([`PolicyError::TargetSubsetUndeclared`], deny-by-default) — the confinement that stops a
+    ///   target read from reaching `B`'s private rows through any table (root/join/subquery).
+    ///
+    /// Applied at every per-table injection seam, so the confinement composes at every depth.
+    pub(crate) fn row_filter_with_target(
+        &self,
+        table: &str,
+        claims: &Claims,
+        target: Option<&TargetScope>,
+    ) -> Result<Option<ResolvedFilter>, PolicyError> {
+        let Some(ts) = target else {
+            return self.row_filter(table, claims);
+        };
+        let confine = ts
+            .tables
+            .get(table)
+            .ok_or_else(|| PolicyError::TargetSubsetUndeclared(table.to_string()))?;
+        // `tenant_column = B` (literal), then every public-subset term (also literals). The own
+        // claim-bound predicate is deliberately NOT consulted here — a target read is confined by
+        // the host-resolved B + the public subset, not by the caller's own claim.
+        let mut terms = Vec::with_capacity(1 + confine.public.len());
+        terms.push(ResolvedTerm {
+            column: confine.tenant_column.clone(),
+            op: RowOp::Eq,
+            value: ts.tenant_value.clone(),
+        });
+        terms.extend(confine.public.iter().cloned());
+        Ok(Some(ResolvedFilter { terms }))
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +428,63 @@ mod tests {
     fn a_table_with_no_predicate_resolves_to_no_filter() {
         let p = DataPolicy::new().with_table("users", TablePolicy::columns(["id"]));
         assert_eq!(p.row_filter("users", &Claims::default()).unwrap(), None);
+    }
+
+    #[test]
+    fn target_scope_binds_b_and_public_and_denies_undeclared() {
+        // A target read of tenant `B`: the OWN claim-bound filter is REPLACED by `tenant_id = B`
+        // (a host literal) conjoined with the host-held public subset — no `tenant` claim consulted.
+        let target = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::from([(
+                "users".to_string(),
+                TargetTable {
+                    tenant_column: "tenant_id".into(),
+                    public: vec![ResolvedTerm {
+                        column: "published".into(),
+                        op: RowOp::Eq,
+                        value: SqlValue::Boolean(true),
+                    }],
+                },
+            )]),
+        };
+        // No `tenant` claim at all — a target read does not need one (B is host-resolved).
+        let filter = policy()
+            .row_filter_with_target("users", &Claims::default(), Some(&target))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filter.terms,
+            vec![
+                ResolvedTerm {
+                    column: "tenant_id".into(),
+                    op: RowOp::Eq,
+                    value: SqlValue::Text("tenant_B".into()),
+                },
+                ResolvedTerm {
+                    column: "published".into(),
+                    op: RowOp::Eq,
+                    value: SqlValue::Boolean(true),
+                },
+            ]
+        );
+
+        // Deny-by-default: a table with no target confinement is refused (never an un-confined read).
+        let err = policy()
+            .row_filter_with_target("audit", &Claims::default(), Some(&target))
+            .unwrap_err();
+        assert_eq!(err, PolicyError::TargetSubsetUndeclared("audit".into()));
+
+        // target = None ⇒ the own path is unchanged (claim-bound), byte-identical to before.
+        let claims = Claims::new(BTreeMap::from([(
+            "tenant".to_string(),
+            SqlValue::Text("acme".into()),
+        )]));
+        assert_eq!(
+            policy()
+                .row_filter_with_target("users", &claims, None)
+                .unwrap(),
+            policy().row_filter("users", &claims).unwrap(),
+        );
     }
 }

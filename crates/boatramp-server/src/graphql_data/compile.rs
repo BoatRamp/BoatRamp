@@ -286,7 +286,7 @@ pub(crate) fn compile_entities(
             clauses.push(format!("({cols}) IN ({})", tuples.join(", ")));
         }
     }
-    if let Some(filter) = policy.row_filter(&type_name, claims)? {
+    if let Some(filter) = policy.row_filter_with_target(&type_name, claims, None)? {
         for term in filter.terms {
             let col = qualify(&qualifier, &term.column, dialect);
             let ph = cx.bind(term.value);
@@ -494,7 +494,7 @@ fn compile_insert(
         values.push(resolve_value(val, cx.variables)?);
     }
     // A new row must belong to the tenant: force the row-filter columns to the claim values.
-    if let Some(filter) = policy.row_filter(&table.name, claims)? {
+    if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
         for term in filter.terms {
             match columns.iter().position(|c| *c == term.column) {
                 Some(pos) => values[pos] = term.value,
@@ -601,7 +601,7 @@ fn compile_write_where(
             clauses.push(expr);
         }
     }
-    if let Some(filter) = policy.row_filter(&table.name, claims)? {
+    if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
         for term in filter.terms {
             let col = cx.dialect.quote_ident(&term.column);
             let ph = cx.bind(term.value);
@@ -684,7 +684,7 @@ fn compile_root(
 
     // WHERE = the policy row filter, plus the `_by_pk` key equality or the list `where` arg.
     let mut clauses: Vec<String> = Vec::new();
-    if let Some(filter) = policy.row_filter(table_name, claims)? {
+    if let Some(filter) = policy.row_filter_with_target(table_name, claims, None)? {
         for term in filter.terms {
             let op = match term.op {
                 RowOp::Eq => "=",
@@ -976,7 +976,7 @@ fn relationship_subquery(
             cx.dialect.quote_ident(local)
         ));
     }
-    if let Some(filter) = policy.row_filter(&rel.target_table, claims)? {
+    if let Some(filter) = policy.row_filter_with_target(&rel.target_table, claims, None)? {
         for term in filter.terms {
             let col = format!("{qalias}.{}", cx.dialect.quote_ident(&term.column));
             let ph = cx.bind(term.value);
