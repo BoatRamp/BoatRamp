@@ -30,6 +30,14 @@ pub(crate) struct TenantSourceInputs<'a> {
     /// The JWKS/issuer config used to verify the bearer (reused from the GDC's `claims_from_token`).
     /// Absent ⇒ the token source can't verify, so it resolves to no value (fail-closed).
     pub token_cfg: Option<&'a HandlerGraphqlTokenClaims>,
+    /// The host-issued anonymous **session cookie** value (R3), if the request carried one. Verified
+    /// (signature + expiry) against [`session_anchor`](Self::session_anchor) to populate the
+    /// [`ScopeAxis::Session`](boatramp_core::tenancy::ScopeAxis) fact — independent of the tenant
+    /// source. Absent / unverifiable ⇒ no session fact (the disjunct then has only the tenant arm).
+    pub session_cookie: Option<&'a str>,
+    /// The fleet public key that verifies a session cookie (the issuing [`Signer`]'s public half).
+    /// `None` ⇒ session cookies can't be verified here, so no session fact is resolved.
+    pub session_anchor: Option<&'a boatramp_core::cose::TokenPublicKey>,
 }
 
 /// The posture knobs that bound tenancy (read from the runtime's resolved [`SecurityPosture`]).
@@ -82,10 +90,31 @@ pub(crate) async fn resolve_host_tenancy(
             read,
             write,
         }) => {
-            let value = resolve_from_sources(sources, &inputs).await;
+            // The own-tenant fact (from the trigger's first applicable source) + the anonymous
+            // session fact (R3, from a verified cookie) — each axis resolved independently, tagged,
+            // and carried as the principal's fact set. Either may be absent (a purely anonymous
+            // request has only a session fact; a plain token request has only a tenant fact).
+            let mut facts = Vec::new();
+            if let Some(value) = resolve_from_sources(sources, &inputs).await {
+                facts.push(boatramp_handlers::ScopeFact {
+                    axis: boatramp_core::tenancy::ScopeAxis::Tenant,
+                    value,
+                });
+            }
+            if let Some(value) = resolve_session_fact(&inputs) {
+                facts.push(boatramp_handlers::ScopeFact {
+                    axis: boatramp_core::tenancy::ScopeAxis::Session,
+                    value,
+                });
+            }
             let read = cap(*read, posture.allow_cross_tenant);
             let write = normalize_write(cap(*write, posture.allow_cross_tenant));
-            Ok(Some(HostTenancy::new(column.clone(), value, read, write)))
+            Ok(Some(HostTenancy::from_facts(
+                column.clone(),
+                facts,
+                read,
+                write,
+            )))
         }
     }
 }
@@ -169,6 +198,20 @@ async fn resolve_from_sources(
     None
 }
 
+/// Resolve the anonymous-**session** fact (R3) from a host-issued session cookie: verify its COSE
+/// signature + expiry against the fleet anchor and return the bound `sid` as the session value.
+/// `None` when no cookie / no anchor / an invalid or expired cookie — the request then simply
+/// carries no session fact (a client-forged `sid` never verifies, so it can't manufacture one).
+/// Per-fact lifetime is enforced here: an expired cookie drops out, and (with a still-live tenant
+/// fact) the request falls back to the tenant arm.
+fn resolve_session_fact(inputs: &TenantSourceInputs<'_>) -> Option<boatramp_core::sql::SqlValue> {
+    let cookie = inputs.session_cookie?;
+    let anchor = inputs.session_anchor?;
+    let sid = boatramp_core::cose::verify_session(cookie, anchor, boatramp_core::time::now_unix())
+        .ok()?;
+    Some(boatramp_core::sql::SqlValue::Text(sid))
+}
+
 /// Resolve the tenant value from a single verified source. `None` for anonymous / not-yet-wired
 /// sources — the caller ([`resolve_from_sources`]) then tries the next, else fails closed.
 async fn resolve_value(
@@ -236,6 +279,76 @@ mod tests {
             require_declaration: require,
             allow_cross_tenant: cross,
         }
+    }
+
+    /// A valid host-issued session cookie resolves the `Session` axis fact (R3), carried alongside a
+    /// tenant fact in the principal; a forged/absent cookie resolves none.
+    #[tokio::test]
+    async fn a_valid_session_cookie_resolves_the_session_fact() {
+        use boatramp_core::cose::{mint_session, LocalSigner, Signer, TokenAlg};
+        use boatramp_handlers::ScopeFact;
+
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        let cookie = mint_session("sid-xyz", 3600, boatramp_core::time::now_unix(), &signer)
+            .await
+            .unwrap();
+
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::Domain],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        // A request carrying BOTH a routed domain (⇒ a tenant fact) and a valid session cookie
+        // (⇒ a session fact): the resolved principal holds both, axis-tagged.
+        let inputs = TenantSourceInputs {
+            domain_context: Some("acme"),
+            session_cookie: Some(&cookie),
+            session_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        let facts: Vec<&ScopeFact> = ht.facts().iter().collect();
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Tenant
+                    && f.value == SqlValue::Text("acme".into())),
+            "the domain source resolved the tenant fact"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Session
+                    && f.value == SqlValue::Text("sid-xyz".into())),
+            "the valid cookie resolved the session fact"
+        );
+
+        // A forged cookie (signed by a stranger, not the fleet anchor) resolves NO session fact.
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        let forged = mint_session("sid-EVIL", 3600, boatramp_core::time::now_unix(), &stranger)
+            .await
+            .unwrap();
+        let inputs = TenantSourceInputs {
+            domain_context: Some("acme"),
+            session_cookie: Some(&forged),
+            session_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !ht.facts()
+                .iter()
+                .any(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Session),
+            "a cookie not signed by the fleet anchor resolves no session fact"
+        );
     }
 
     #[test]

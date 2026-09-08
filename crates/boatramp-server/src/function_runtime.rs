@@ -559,6 +559,8 @@ pub(super) async fn build_function_bindings(
                     bearer,
                     domain_context,
                     token_cfg: config.token_claims.as_ref(),
+                    session_cookie: None,
+                    session_anchor: None,
                 },
             )
             .await

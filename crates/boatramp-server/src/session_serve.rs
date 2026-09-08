@@ -187,6 +187,8 @@ async fn resolve_session_principal(
             bearer,
             domain_context,
             token_cfg: session.token_claims.as_ref(),
+            session_cookie: None,
+            session_anchor: None,
         },
     )
     .await

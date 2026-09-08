@@ -987,6 +987,10 @@ pub(super) async fn build_bindings(
             bearer,
             domain_context,
             token_cfg,
+            // Session-cookie wiring (R3) lands with the serving-path cookie mint/extract; until then
+            // no session fact is resolved on this path.
+            session_cookie: None,
+            session_anchor: None,
         };
         let tenancy = crate::tenant_resolve::resolve_host_tenancy(
             site_handlers.tenancy.as_ref(),
