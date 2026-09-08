@@ -12,7 +12,9 @@
 use async_graphql_parser::types::{
     ConstDirective, FieldDefinition, TypeKind, TypeSystemDefinition,
 };
+use async_graphql_parser::Positioned;
 use async_graphql_value::ConstValue;
+use boatramp_core::tenancy::{TargetSource, TenancyClass};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One federated entity type: its key field names and the subgraphs that can fetch it by
@@ -39,6 +41,12 @@ pub(crate) struct Supergraph {
     /// recorded for every field including roots and `@external` ones, so the query
     /// planner can walk a selection and know each field's child type.
     pub field_types: BTreeMap<(String, String), String>,
+    /// Root Query/Mutation field name → its [`TenancyClass`] (R4/D8), parsed from the field's
+    /// `@tenant` directive at composition. A field with no `@tenant` is absent here ⇒ the planner
+    /// treats it as [`TenancyClass::Own`] (byte-identical to pre-Stage-5). A `Target` class here is
+    /// still gated at publish by the operator's `TenancySchema.target_eligible_fields` (a separate
+    /// check that needs the project schema — see the registry) before it may bind.
+    pub root_tenancy: BTreeMap<String, TenancyClass>,
 }
 
 /// A composition failure.
@@ -51,6 +59,14 @@ pub(crate) enum CompositionError {
         type_name: String,
         field: String,
         subgraphs: Vec<String>,
+    },
+    /// A root field's `@tenant` directive is malformed or violates a deny-by-default guardrail
+    /// (e.g. `scope: target` without a `public:`/`via:`, or a `handle` source on a write field —
+    /// G1). Refused at publish (R4/D8).
+    InvalidTenantDirective {
+        type_name: String,
+        field: String,
+        reason: String,
     },
 }
 
@@ -69,6 +85,14 @@ impl std::fmt::Display for CompositionError {
                 "field `{type_name}.{field}` is resolved by multiple subgraphs \
                  ({}) without @shareable",
                 subgraphs.join(", ")
+            ),
+            Self::InvalidTenantDirective {
+                type_name,
+                field,
+                reason,
+            } => write!(
+                f,
+                "field `{type_name}.{field}` has an invalid @tenant directive: {reason}"
             ),
         }
     }
@@ -101,7 +125,7 @@ pub(crate) fn compose(subgraphs: &[(String, String)]) -> Result<Supergraph, Comp
                         ty.node.name.node.as_str(),
                         &ty.node.directives,
                         &obj.fields,
-                    );
+                    )?;
                 }
             }
         }
@@ -140,7 +164,7 @@ fn ingest_object(
     type_name: &str,
     directives: &[async_graphql_parser::Positioned<ConstDirective>],
     fields: &[async_graphql_parser::Positioned<FieldDefinition>],
-) {
+) -> Result<(), CompositionError> {
     // An `@key` makes this type an entity resolvable by that key from this subgraph.
     if let Some(key) = key_fields(directives) {
         let entity = sg.entities.entry(type_name.to_string()).or_insert(Entity {
@@ -168,13 +192,28 @@ fn ingest_object(
             shareable.insert((type_name.to_string(), field_name.to_string()));
         }
         match type_name {
-            "Query" => {
-                sg.root_query
-                    .insert(field_name.to_string(), subgraph.to_string());
-            }
-            "Mutation" => {
-                sg.root_mutation
-                    .insert(field_name.to_string(), subgraph.to_string());
+            "Query" | "Mutation" => {
+                if type_name == "Query" {
+                    sg.root_query
+                        .insert(field_name.to_string(), subgraph.to_string());
+                } else {
+                    sg.root_mutation
+                        .insert(field_name.to_string(), subgraph.to_string());
+                }
+                // R4/D8: a root field's `@tenant` directive declares its tenancy class. Parsed here
+                // (SDL-derivable) and recorded; the operator's `target_eligible_fields` gate + the
+                // cross-scope-join rejection are applied against the project schema in the registry.
+                if let Some(class) =
+                    parse_tenant_directive(&field.directives).map_err(|reason| {
+                        CompositionError::InvalidTenantDirective {
+                            type_name: type_name.to_string(),
+                            field: field_name.to_string(),
+                            reason,
+                        }
+                    })?
+                {
+                    sg.root_tenancy.insert(field_name.to_string(), class);
+                }
             }
             _ => {
                 let owners = sg
@@ -186,6 +225,95 @@ fn ingest_object(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Parse a root field's `@tenant(scope: own|target, via: [...], public: "<subset>", write: [...])`
+/// directive into a [`TenancyClass`] (R4/D8). `None` ⇒ no directive ⇒ the planner defaults to
+/// `Own`. Errors (a `String` reason the caller wraps in [`CompositionError::InvalidTenantDirective`])
+/// on a malformed directive or a deny-by-default guardrail violation. Purely SDL-derivable — the
+/// operator's allowlist gate needs the project schema and is applied in the registry.
+fn parse_tenant_directive(
+    dirs: &[Positioned<ConstDirective>],
+) -> Result<Option<TenancyClass>, String> {
+    let Some(d) = dirs.iter().find(|d| d.node.name.node == "tenant") else {
+        return Ok(None);
+    };
+    let arg = |name: &str| {
+        d.node
+            .arguments
+            .iter()
+            .find(|(n, _)| n.node == name)
+            .map(|(_, v)| &v.node)
+    };
+    let scope = arg("scope").map(const_ident).transpose()?;
+    match scope.as_deref() {
+        None | Some("own") => Ok(Some(TenancyClass::Own)),
+        Some("target") => {
+            let public = match arg("public") {
+                Some(ConstValue::String(s)) => s.clone(),
+                _ => {
+                    return Err(
+                        "scope: target requires a `public: \"<subset>\"` argument".to_string()
+                    )
+                }
+            };
+            let via = match arg("via") {
+                Some(ConstValue::List(items)) => items
+                    .iter()
+                    .map(parse_target_source)
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err("scope: target requires a `via: [...]` source list".to_string()),
+            };
+            if via.is_empty() {
+                return Err("scope: target `via` list must be non-empty".to_string());
+            }
+            let write = match arg("write") {
+                None => Vec::new(),
+                Some(ConstValue::List(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        ConstValue::String(s) => Ok(s.clone()),
+                        _ => Err("`write` must be a list of column-name strings".to_string()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(_) => return Err("`write` must be a list of column-name strings".to_string()),
+            };
+            // G1 (deny-by-default from the first commit): `handle` is READ-ONLY — a public slug
+            // carries no write authorization, so it can never appear on a write field.
+            if !write.is_empty() && via.contains(&TargetSource::Handle) {
+                return Err(
+                    "a write field (non-empty `write`) may not list `handle` in `via` \
+                     (handle is read-only — G1); use `domain` or `capability`"
+                        .to_string(),
+                );
+            }
+            Ok(Some(TenancyClass::Target { via, public, write }))
+        }
+        Some(other) => Err(format!("unknown scope `{other}` (expected own|target)")),
+    }
+}
+
+/// A directive argument that may be written as an enum value (`scope: target`) or a string
+/// (`scope: "target"`) — return the identifier either way.
+fn const_ident(v: &ConstValue) -> Result<String, String> {
+    match v {
+        ConstValue::Enum(name) => Ok(name.to_string()),
+        ConstValue::String(s) => Ok(s.clone()),
+        _ => Err("expected an enum value or string".to_string()),
+    }
+}
+
+/// Parse one `via` list element into a [`TargetSource`] (enum value or string).
+fn parse_target_source(v: &ConstValue) -> Result<TargetSource, String> {
+    match const_ident(v)?.as_str() {
+        "domain" => Ok(TargetSource::Domain),
+        "handle" => Ok(TargetSource::Handle),
+        "capability" => Ok(TargetSource::Capability),
+        other => Err(format!(
+            "unknown target source `{other}` (expected domain|handle|capability)"
+        )),
     }
 }
 
@@ -459,5 +587,82 @@ extend schema @link(
             // Every `@key` entity survives every ordering.
             assert!(sg.entities.contains_key("User") && sg.entities.contains_key("Item"));
         }
+    }
+
+    #[test]
+    fn tenant_directive_records_own_and_target_classes() {
+        // A field with no `@tenant` is absent from root_tenancy (⇒ planner defaults to Own); an
+        // explicit `scope: own` records Own; a `scope: target` records the parsed class.
+        let sdl = r#"
+            type Query {
+              me: User
+              settings: Settings @tenant(scope: own)
+              publicProducts: [Product] @tenant(scope: target, via: [domain, handle], public: "storefront")
+            }
+            type User { id: ID! }
+            type Settings { id: ID! }
+            type Product { id: ID! }
+        "#;
+        let sg = compose(&[sub("shop", sdl)]).unwrap();
+        assert!(
+            !sg.root_tenancy.contains_key("me"),
+            "no @tenant ⇒ absent (defaults to Own downstream)"
+        );
+        assert_eq!(sg.root_tenancy.get("settings"), Some(&TenancyClass::Own));
+        assert_eq!(
+            sg.root_tenancy.get("publicProducts"),
+            Some(&TenancyClass::Target {
+                via: vec![TargetSource::Domain, TargetSource::Handle],
+                public: "storefront".into(),
+                write: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn target_without_public_or_via_is_refused() {
+        let no_public =
+            r#"type Query { p: [P] @tenant(scope: target, via: [domain]) } type P { id: ID! }"#;
+        assert!(matches!(
+            compose(&[sub("s", no_public)]).unwrap_err(),
+            CompositionError::InvalidTenantDirective { field, .. } if field == "p"
+        ));
+        let no_via =
+            r#"type Query { p: [P] @tenant(scope: target, public: "pub") } type P { id: ID! }"#;
+        assert!(matches!(
+            compose(&[sub("s", no_via)]).unwrap_err(),
+            CompositionError::InvalidTenantDirective { .. }
+        ));
+    }
+
+    #[test]
+    fn g1_handle_on_a_write_field_is_refused_at_composition() {
+        // G1 (deny-by-default): a public slug carries no write authorization, so `handle` can never
+        // appear in the `via` of a field that declares a `write` allowlist.
+        let sdl = r#"
+            type Mutation {
+              submit: Result @tenant(scope: target, via: [handle], public: "storefront", write: ["status"])
+            }
+            type Result { ok: Boolean }
+        "#;
+        let err = compose(&[sub("s", sdl)]).unwrap_err();
+        assert!(
+            matches!(&err, CompositionError::InvalidTenantDirective { reason, .. } if reason.contains("handle is read-only")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_scope_or_source_is_refused() {
+        let bad_scope = r#"type Query { p: P @tenant(scope: sideways) } type P { id: ID! }"#;
+        assert!(matches!(
+            compose(&[sub("s", bad_scope)]).unwrap_err(),
+            CompositionError::InvalidTenantDirective { .. }
+        ));
+        let bad_src = r#"type Query { p: [P] @tenant(scope: target, via: [guessable], public: "x") } type P { id: ID! }"#;
+        assert!(matches!(
+            compose(&[sub("s", bad_src)]).unwrap_err(),
+            CompositionError::InvalidTenantDirective { .. }
+        ));
     }
 }
