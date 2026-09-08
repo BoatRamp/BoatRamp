@@ -123,6 +123,11 @@ pub enum WriteOp {
         id: String,
         #[serde(default)]
         retain: bool,
+        /// The host-minted durable signed-context envelope (R1) to stamp onto this message's index
+        /// record, from the producer's own-tenant. `#[serde(default)]` so an older node's replicated
+        /// `MqPublish` (no field) applies as an unscoped publish.
+        #[serde(default)]
+        signed_context: Option<String>,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -298,13 +303,18 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             WriteResponse::Kv
         }
-        WriteOp::MqPublish { topic, id, retain } => {
+        WriteOp::MqPublish {
+            topic,
+            id,
+            retain,
+            signed_context,
+        } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
             let key = messaging::meta_key(&topic, &id);
             if !target.data.contains_key(&key) {
-                let fresh =
-                    serde_json::to_vec(&messaging::Record::fresh()).expect("record serializes");
+                let fresh = serde_json::to_vec(&messaging::Record::fresh(signed_context))
+                    .expect("record serializes");
                 target.put(key, fresh);
             }
             if retain {
@@ -474,6 +484,7 @@ fn apply_mq_claim(
                 claimed.push(ClaimedRecord {
                     id,
                     attempts: record.attempts,
+                    signed_context: record.signed_context,
                 });
             }
             messaging::ClaimAction::DeadLetter { id, record } => {
@@ -587,6 +598,9 @@ fn apply_mq_claim_grouped(
             version: boatramp_core::SCHEMA_VERSION,
             attempts: *attempts,
             lease_until_ms: 0,
+            // The group offset log doesn't carry per-message context; a redriven grouped
+            // dead-letter re-resolves via the shared index record if still present.
+            signed_context: None,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);
@@ -597,9 +611,23 @@ fn apply_mq_claim_grouped(
         put_group_state(target, topic, group, &state);
     }
 
+    // The grouped fan-out log carries only ids; re-read the shared index record (deterministic
+    // applied state) to recover each message's durable signed-context, so a grouped consumer
+    // resolves the producer's tenant identically to the work-queue path. Absent ⇒ None (fail closed).
     plan.leased
         .into_iter()
-        .map(|(id, attempts)| ClaimedRecord { id, attempts })
+        .map(|(id, attempts)| {
+            let signed_context = target
+                .data
+                .get(&messaging::meta_key(topic, &id))
+                .and_then(|raw| serde_json::from_slice::<messaging::Record>(raw).ok())
+                .and_then(|r| r.signed_context);
+            ClaimedRecord {
+                id,
+                attempts,
+                signed_context,
+            }
+        })
         .collect()
 }
 
@@ -655,6 +683,11 @@ pub struct ClaimedRecord {
     pub id: String,
     /// Delivery attempts so far, including this one (starts at 1).
     pub attempts: u32,
+    /// The message's host-minted durable signed-context envelope (R1), if any — carried back to
+    /// the claiming node so it resolves the producer's own-tenant. `#[serde(default)]` for a
+    /// rolling upgrade (an older leader's claim response omits it ⇒ no context ⇒ fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_context: Option<String>,
 }
 
 /// The result of applying a [`WriteOp`]: empty for KV/ack/nack/publish, or the

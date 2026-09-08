@@ -42,6 +42,12 @@ pub struct MessagingBinding {
     /// The shared project-bus prefix (`{project}/bus/`). A `bus:<topic>` publish
     /// routes here; a plain topic uses the private [`prefix`](Self::prefix).
     pub(crate) bus_prefix: String,
+    /// The host-minted **durable signed-context** envelope (R1) stamped onto every message this
+    /// producer publishes — the producer's own-tenant, sealed for the async lane so a consumer
+    /// declaring `sources: [signed_context]` resolves it. Fixed at bind time from the invocation's
+    /// resolved principal (the guest never names a tenant); `None` when the producer had no resolved
+    /// own-tenant, so the published message carries no context (the consumer then fails closed).
+    pub(crate) signed_context: Option<String>,
 }
 
 /// Per-invocation view over the (optional) messaging grant.
@@ -71,9 +77,12 @@ impl messaging_producer::Host for MessagingHost<'_> {
             Some(bus_topic) => format!("{}{bus_topic}", binding.bus_prefix),
             None => format!("{}{topic}", binding.prefix),
         };
+        // The guest names no tenant; the host stamps the producer's own-tenant signed context
+        // (fixed at bind time) onto the message so a declaring consumer resolves it on the async
+        // lane. `None` ⇒ an unscoped producer, identical to a plain publish.
         binding
             .messaging
-            .publish(&namespaced, &data)
+            .publish_ctx(&namespaced, &data, binding.signed_context.as_deref())
             .await
             .map_err(|err| messaging_types::Error::Other(err.to_string()))
     }
@@ -96,19 +105,34 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    /// Records what topics it was asked to publish (with the namespaced topic).
+    /// One recorded publish: the namespaced topic, the payload, and the durable signed-context
+    /// envelope the host stamped (`None` for an unscoped producer).
+    type PublishRecord = (String, Vec<u8>, Option<String>);
+
+    /// Records what topics it was asked to publish (with the namespaced topic) and the durable
+    /// signed-context envelope the host stamped, so a test can assert both the namespacing and the
+    /// producer-context stamp.
     #[derive(Default)]
     struct FakeMessaging {
-        published: Mutex<Vec<(String, Vec<u8>)>>,
+        published: Mutex<Vec<PublishRecord>>,
     }
 
     #[async_trait::async_trait]
     impl Messaging for FakeMessaging {
         async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MessagingError> {
-            self.published
-                .lock()
-                .unwrap()
-                .push((topic.to_string(), payload.to_vec()));
+            self.publish_ctx(topic, payload, None).await
+        }
+        async fn publish_ctx(
+            &self,
+            topic: &str,
+            payload: &[u8],
+            signed_context: Option<&str>,
+        ) -> Result<(), MessagingError> {
+            self.published.lock().unwrap().push((
+                topic.to_string(),
+                payload.to_vec(),
+                signed_context.map(str::to_owned),
+            ));
             Ok(())
         }
         async fn claim(
@@ -129,10 +153,18 @@ mod tests {
     }
 
     fn binding(backend: Arc<FakeMessaging>) -> MessagingBinding {
+        binding_with_context(backend, None)
+    }
+
+    fn binding_with_context(
+        backend: Arc<FakeMessaging>,
+        signed_context: Option<String>,
+    ) -> MessagingBinding {
         MessagingBinding {
             messaging: backend,
             prefix: "blog/production/".to_string(),
             bus_prefix: "acme/bus/".to_string(),
+            signed_context,
         }
     }
 
@@ -164,6 +196,37 @@ mod tests {
             .unwrap();
         let published = backend.published.lock().unwrap();
         assert_eq!(published[0].0, "acme/bus/concept.generate");
+    }
+
+    #[tokio::test]
+    async fn publish_stamps_the_host_minted_producer_context() {
+        // A producer bound with a resolved own-tenant stamps the host-minted signed-context
+        // envelope onto every message (guest-blind) — a declaring consumer resolves it later.
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding_with_context(backend.clone(), Some("ctx-envelope-abc".to_string()));
+        let mut host = MessagingHost::new(Some(&binding));
+        host.publish("orders/created".into(), b"hi".to_vec())
+            .await
+            .unwrap();
+        let published = backend.published.lock().unwrap();
+        assert_eq!(
+            published[0].2.as_deref(),
+            Some("ctx-envelope-abc"),
+            "the host stamped the producer's signed context onto the published message"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_without_a_resolved_tenant_stamps_no_context() {
+        // An unscoped producer (no resolved own-tenant) stamps no context — the consumer then
+        // fails an "own" op closed rather than acting as an unknown tenant.
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding(backend.clone());
+        let mut host = MessagingHost::new(Some(&binding));
+        host.publish("orders/created".into(), b"hi".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(backend.published.lock().unwrap()[0].2, None);
     }
 
     #[tokio::test]

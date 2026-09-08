@@ -1093,6 +1093,10 @@ pub(super) async fn build_bindings(
             token_cfg,
             session_cookie,
             session_anchor: session_anchor.as_ref(),
+            // The serving path is the synchronous request lane, not the durable async lane, so it
+            // never carries a signed-context envelope (that source resolves only on a queue drain).
+            signed_context: None,
+            context_anchor: None,
         };
         let tenancy = crate::tenant_resolve::resolve_host_tenancy(
             site_handlers.tenancy.as_ref(),
@@ -1123,10 +1127,16 @@ pub(super) async fn build_bindings(
         // previews can't touch live topics; `bus:<topic>` publishes route to the
         // shared, project-scoped bus.
         if let Some(messaging) = &inner.messaging {
+            // Stamp this handler's resolved own-tenant onto every message it publishes (R1,
+            // guest-blind), so a consumer declaring `sources: [signed_context]` resolves it on the
+            // async lane. `None` for an unscoped handler ⇒ the message carries no context.
+            let signed_context =
+                super::function_runtime::mint_producer_context(inner, &handler_caller_tenant).await;
             bindings = bindings.with_messaging(
                 format!("{scope}/"),
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
+                signed_context,
             );
         }
     }

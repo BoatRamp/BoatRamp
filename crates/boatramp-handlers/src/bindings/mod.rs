@@ -209,17 +209,23 @@ impl Bindings {
     /// guest can't publish outside its own namespace); a `bus:<topic>` is
     /// namespaced under `bus_prefix` (the shared `{project}/bus/` space, so a
     /// producer and a consumer in different components can meet on one topic).
+    ///
+    /// `signed_context` is the host-minted durable signed-context envelope (R1) stamped onto every
+    /// message this producer publishes — the producer's own-tenant, sealed for the async lane so a
+    /// declaring consumer resolves it. `None` ⇒ an unscoped producer (messages carry no context).
     #[cfg(feature = "messaging")]
     pub fn with_messaging(
         mut self,
         prefix: impl Into<String>,
         bus_prefix: impl Into<String>,
         messaging: Arc<dyn Messaging>,
+        signed_context: Option<String>,
     ) -> Self {
         self.messaging = Some(messaging::MessagingBinding {
             messaging,
             prefix: prefix.into(),
             bus_prefix: bus_prefix.into(),
+            signed_context,
         });
         self
     }

@@ -38,6 +38,16 @@ pub(crate) struct TenantSourceInputs<'a> {
     /// The fleet public key that verifies a session cookie (the issuing [`Signer`]'s public half).
     /// `None` ⇒ session cookies can't be verified here, so no session fact is resolved.
     pub session_anchor: Option<&'a boatramp_core::cose::TokenPublicKey>,
+    /// The host-minted **durable signed-context** envelope (R1) carried on a durable message the
+    /// async lane is draining (for [`TenantSource::SignedContext`]). Verified (signature + expiry +
+    /// `br_kind == "context"`) against [`context_anchor`](Self::context_anchor); a forged/absent
+    /// envelope resolves no value, so an "own" op on the async lane fails closed. The producer's
+    /// tenant is stamped host-side at publish — the guest never names it.
+    pub signed_context: Option<&'a str>,
+    /// The fleet public key that verifies a signed-context envelope (the issuing [`Signer`]'s
+    /// public half — the same key that mints/verifies session cookies). `None` ⇒ signed contexts
+    /// can't be verified here, so the `SignedContext` source resolves no value (fail-closed).
+    pub context_anchor: Option<&'a boatramp_core::cose::TokenPublicKey>,
 }
 
 /// The posture knobs that bound tenancy (read from the runtime's resolved [`SecurityPosture`]).
@@ -246,9 +256,18 @@ async fn resolve_value(
             .domain_context
             .filter(|c| !c.is_empty())
             .map(|c| boatramp_core::sql::SqlValue::Text(c.to_string())),
-        // Reserved: async worker signed-context isn't wired yet, so it resolves to no value —
-        // an "own" op then fails closed rather than running unscoped.
-        TenantSource::SignedContext => None,
+        // The async lane's durable signed-context (R1): verify the host-minted envelope carried on
+        // the drained message against the fleet anchor and return the producer's stamped tenant. A
+        // forged/altered/expired envelope (or no envelope / no anchor) resolves no value — the
+        // consumer's "own" op then fails closed rather than running unscoped. The guest never names
+        // the tenant; only a host signature over the producer's principal verifies here.
+        TenantSource::SignedContext => {
+            let (env, anchor) = (inputs.signed_context?, inputs.context_anchor?);
+            let tenant =
+                boatramp_core::cose::verify_context(env, anchor, boatramp_core::time::now_unix())
+                    .ok()?;
+            Some(boatramp_core::sql::SqlValue::Text(tenant))
+        }
         // Truly anonymous — no "own" tenant.
         TenantSource::None => None,
     }
@@ -348,6 +367,79 @@ mod tests {
                 .iter()
                 .any(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Session),
             "a cookie not signed by the fleet anchor resolves no session fact"
+        );
+    }
+
+    /// A consumer declaring `sources: [signed_context]` resolves its own-tenant from a host-minted
+    /// durable envelope (R1) — the async-lane keystone. A forged (stranger-signed) or absent
+    /// envelope resolves NO tenant fact, so the consumer's "own" op fails closed rather than
+    /// running unscoped. The guest never names the tenant; only a fleet signature verifies here.
+    #[tokio::test]
+    async fn a_valid_signed_context_resolves_the_own_tenant_on_the_async_lane() {
+        use boatramp_core::cose::{mint_context, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::tenancy::ScopeAxis;
+
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        let envelope = mint_context("acme", 3600, boatramp_core::time::now_unix(), &signer)
+            .await
+            .unwrap();
+
+        let decision = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::SignedContext],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        // The drained message carried a valid envelope + the fleet anchor ⇒ the producer's stamped
+        // tenant resolves as the consumer's own `Tenant` fact.
+        let inputs = TenantSourceInputs {
+            signed_context: Some(&envelope),
+            context_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ht.facts()
+                .iter()
+                .any(|f| f.axis == ScopeAxis::Tenant && f.value == SqlValue::Text("acme".into())),
+            "a valid signed context resolves the producer's tenant as the consumer's own fact"
+        );
+
+        // A forged envelope (signed by a stranger) resolves NO tenant fact — fail closed.
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        let forged = mint_context("evil", 3600, boatramp_core::time::now_unix(), &stranger)
+            .await
+            .unwrap();
+        let inputs = TenantSourceInputs {
+            signed_context: Some(&forged),
+            context_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !ht.facts().iter().any(|f| f.axis == ScopeAxis::Tenant),
+            "an envelope not signed by the fleet anchor resolves no own tenant"
+        );
+
+        // No envelope at all (a plain background drain) resolves no tenant fact either.
+        let inputs = TenantSourceInputs {
+            context_anchor: Some(&anchor),
+            ..Default::default()
+        };
+        let ht = resolve_host_tenancy(Some(&decision), true, posture(true, false), inputs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !ht.facts().iter().any(|f| f.axis == ScopeAxis::Tenant),
+            "no envelope ⇒ no own tenant (the async lane fails an own op closed)"
         );
     }
 
