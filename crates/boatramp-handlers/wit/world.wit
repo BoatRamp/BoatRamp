@@ -295,6 +295,15 @@ interface orm {
     delete: func(q: delete-query) -> result<u64, error>;
     /// Run a DELETE and return its RETURNING rows (the `returning` list must be non-empty).
     delete-returning: func(q: delete-query) -> result<query-result, error>;
+    /// promote (R3, PLAN-tenancy-principal D7): a returning visitor, now authenticated, CLAIMS
+    /// their anonymous-session rows in `table` for their tenant. Host-mediated + deny-by-default:
+    /// the host builds `UPDATE <table> SET <tenant-key> = <own> WHERE <session-key> = <session>
+    /// AND <tenant-key> IS NULL` from the request's OWN resolved tenant + session facts (the guest
+    /// names neither and cannot widen past its own not-yet-owned session rows). Requires `table` be
+    /// a TenantOrSession table and BOTH facts present, else refused. Returns the rows claimed
+    /// (idempotent: a second call claims 0). Append-only ABI addition — a pinned older guest that
+    /// does not import it is unaffected.
+    promote: func(table: string) -> result<u64, error>;
   }
 
   open: func(name: string) -> result<database, error>;

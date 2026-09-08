@@ -27,6 +27,7 @@ mod generated {
                 "[method]database.update",
                 "[method]database.delete",
                 "[method]database.delete-returning",
+                "[method]database.promote",
             ],
         },
         with: {
@@ -184,6 +185,25 @@ impl wit::HostDatabase for OrmHost<'_> {
                 })
                 .collect(),
         })
+    }
+
+    async fn promote(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        table: String,
+    ) -> Result<u64, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        // Promotion (D7) needs the resolved principal carrying BOTH a tenant fact and a session
+        // fact — the write axis carries both. No in-site tenancy (or an `all`/no-scope axis) ⇒
+        // nothing to promote, so refuse; `compile_promote` further requires both facts present AND
+        // a `TenantOrSession` target, and emits the `tenant IS NULL` anti-widening guard.
+        let scope = self
+            .scope_for(crate::tenant::Axis::Write)?
+            .ok_or_else(|| compile_err(core::OrmError::TenancyNoPrincipal))?;
+        let (sql, params) = core::compile_promote(&scope, &table, dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        txn.execute(&sql, &params).await.map_err(backend_err)
     }
 
     fn drop(&mut self, db: Resource<OrmDatabase>) -> wasmtime::Result<()> {
