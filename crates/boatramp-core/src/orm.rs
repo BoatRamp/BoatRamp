@@ -580,6 +580,13 @@ impl Insert {
         read: Option<&Scope>,
     ) -> Result<(), OrmError> {
         self.scope = write.cloned();
+        // The write target's per-table tenant column (Stage 1), resolved once for the INSERT…SELECT
+        // tenant-projection stamp below. Deny-by-default: an undeclared target is refused here (so a
+        // guest INSERT…SELECT can't write an undeclared table); an `Unscoped` target ⇒ `None`.
+        let target_col: Option<String> = match write {
+            Some(w) => w.column_for(&self.table)?.map(str::to_string),
+            None => None,
+        };
         // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
         // of another table — scope it to that table so it can't read cross-tenant.
         if let Some(r) = read {
@@ -604,9 +611,10 @@ impl Insert {
             }
             // A scoped write owns the tenant column written — never trust the guest's target
             // projection. Drop any guest-supplied tenant column (+ its aligned projection, in the
-            // source and every union branch) and re-append it bound to the host value.
-            if let Some(v) = write.and_then(Scope::stamp_value) {
-                let column = write.expect("stamp implies write").column.clone();
+            // source and every union branch) and re-append it bound to the host value. The column
+            // is the target's **per-table** key (Stage 1): an undeclared target was already refused
+            // above; an `Unscoped` target has no tenant column, so nothing is forced.
+            if let (Some(v), Some(column)) = (write.and_then(Scope::stamp_value), target_col) {
                 if let Some(i) = cols.iter().position(|c| same_col(c, &column)) {
                     cols.remove(i);
                     drop_projection_at(src, i);
@@ -1257,13 +1265,19 @@ fn render_where(
     Ok(Some(render_pred(&combined, params, false, dialect)?))
 }
 
-/// The single-table scope predicate for an UPDATE/DELETE (validates the column, unqualified).
-fn single_scope_pred(scope: Option<&Scope>) -> Result<Option<Predicate>, OrmError> {
+/// The single-table scope predicate for an UPDATE/DELETE `WHERE`, keyed on `table`'s **per-table**
+/// tenant column (Stage 1): `Ok(Some(pred))` scopes on the declared key; `Ok(None)` ⇒ the target is
+/// `Unscoped` (no tenant predicate — the write is bounded only by the guest filter + the
+/// unbounded-write guard); `Err(TenancyUndeclared)` ⇒ the target is undeclared (deny-by-default).
+fn single_scope_pred(scope: Option<&Scope>, table: &str) -> Result<Option<Predicate>, OrmError> {
     match scope {
-        Some(s) => {
-            ident(&s.column)?;
-            Ok(s.as_predicate())
-        }
+        Some(s) => match s.column_for(table)? {
+            Some(col) => {
+                ident(col)?;
+                Ok(s.predicate_on(col, None))
+            }
+            None => Ok(None),
+        },
         None => Ok(None),
     }
 }
@@ -1495,6 +1509,15 @@ impl Insert {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
+        // The write target's per-table tenant key (Stage 1): scope-stamp + upsert-guard on THIS
+        // column, not the schema default. Deny-by-default — an undeclared target is refused here
+        // (both the VALUES and INSERT…SELECT forms); an `Unscoped` target resolves to `None` (no
+        // tenant column to stamp/guard — the write is not tenant-partitioned on that table).
+        let target_col: Option<String> = match self.scope.as_ref() {
+            Some(s) => s.column_for(&self.table)?.map(str::to_string),
+            None => None,
+        };
+
         // INSERT … SELECT: rows come from a source query sharing the placeholder sequence.
         if let Some((cols, select)) = &self.from_select {
             let col_sql = cols
@@ -1509,6 +1532,7 @@ impl Insert {
             sql.push_str(&render_conflict(
                 self.conflict.as_ref(),
                 self.scope.as_ref(),
+                target_col.as_deref(),
                 &mut params,
                 dialect,
             )?);
@@ -1530,14 +1554,15 @@ impl Insert {
             }
         }
         // A scope with a stampable value (own/own+null → the tenant, null → NULL) forces its
-        // column into every row. `all` mode stamps nothing (the guest supplies the value —
-        // a cross-tenant write), so it behaves like no scope here. The column match is
-        // case/qualifier-insensitive (`same_col`) so a guest can't smuggle its own value into the
-        // tenant column by re-spelling it (`TENANT_ID`, `t.tenant_id`).
-        let stamp = self
-            .scope
-            .as_ref()
-            .and_then(|s| s.stamp_value().map(|v| (s.column.as_str(), v)));
+        // per-table tenant column into every row. `all` mode stamps nothing (the guest supplies
+        // the value — a cross-tenant write), and an `Unscoped` target (`target_col == None`) has no
+        // tenant column to force. The column match is case/qualifier-insensitive (`same_col`) so a
+        // guest can't smuggle its own value into the tenant column by re-spelling it (`TENANT_ID`,
+        // `t.tenant_id`).
+        let stamp = match (self.scope.as_ref(), target_col.as_deref()) {
+            (Some(s), Some(col)) => s.stamp_value().map(|v| (col, v)),
+            _ => None,
+        };
         if let Some((column, _)) = &stamp {
             let c = ident(column)?.to_string();
             if !columns.iter().any(|existing| same_col(existing, &c)) {
@@ -1577,6 +1602,7 @@ impl Insert {
         sql.push_str(&render_conflict(
             self.conflict.as_ref(),
             self.scope.as_ref(),
+            target_col.as_deref(),
             &mut params,
             dialect,
         )?);
@@ -1596,6 +1622,7 @@ impl Insert {
 fn render_conflict(
     conflict: Option<&OnConflict>,
     scope: Option<&Scope>,
+    target_col: Option<&str>,
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<String, OrmError> {
@@ -1607,8 +1634,12 @@ fn render_conflict(
         .iter()
         .map(|c| ident(c).map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
-    // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing).
-    let guard = scope.filter(|s| s.stamp_value().is_some());
+    // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing) —
+    // AND a per-table tenant column to bound *on* (an `Unscoped` target has `target_col == None`, so
+    // there is no tenant column to guard, exactly as for a plain scoped write to that table).
+    let guard = scope
+        .filter(|s| s.stamp_value().is_some())
+        .and_then(|s| target_col.map(|col| (s, col)));
     let do_nothing = || format!(" ON CONFLICT ({}) DO NOTHING", conflict_cols.join(", "));
     if oc.update.is_empty() {
         return Ok(do_nothing());
@@ -1619,12 +1650,12 @@ fn render_conflict(
              (ON DUPLICATE KEY UPDATE cannot be bounded to the tenant's rows)",
         ));
     }
-    // Drop any assignment to the scope column: a guest upsert never reassigns an existing row's
+    // Drop any assignment to the tenant column: a guest upsert never reassigns an existing row's
     // tenant. If that leaves nothing to update, degrade to DO NOTHING.
     let sets = oc
         .update
         .iter()
-        .filter(|a| guard.is_none_or(|s| !same_col(&a.column, &s.column)))
+        .filter(|a| guard.is_none_or(|(_, col)| !same_col(&a.column, col)))
         .map(|a| {
             let c = ident(&a.column)?;
             Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
@@ -1638,10 +1669,11 @@ fn render_conflict(
         conflict_cols.join(", "),
         sets.join(", ")
     );
-    if let Some(s) = guard {
-        // Bound the DO UPDATE to the tenant's own rows (Postgres/SQLite support a trailing WHERE).
+    if let Some((s, col)) = guard {
+        // Bound the DO UPDATE to the tenant's own rows (Postgres/SQLite support a trailing WHERE),
+        // keyed on the target's per-table tenant column.
         let pred = s
-            .as_predicate()
+            .predicate_on(col, None)
             .expect("a stampable scope always has a predicate");
         clause.push_str(&format!(
             " WHERE {}",
@@ -1671,15 +1703,17 @@ impl Update {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
-        // A scoped write never reassigns the tenant column: drop any `SET <scope column> = …`
+        // A scoped write never reassigns the tenant column: drop any `SET <tenant column> = …`
         // (case/qualifier-insensitively) so a guest can't donate its own rows into another
-        // tenant's partition (mirrors the ON CONFLICT DO UPDATE guard). The WHERE still bounds the
-        // update to own rows; this bounds what it may *change*.
-        let scope_col = self
-            .scope
-            .as_ref()
-            .filter(|s| s.stamp_value().is_some())
-            .map(|s| s.column.clone());
+        // tenant's partition (mirrors the ON CONFLICT DO UPDATE guard). The column is the target's
+        // **per-table** key (Stage 1); an `Unscoped` target has none to protect, and an undeclared
+        // target is refused. The WHERE still bounds the update to own rows; this bounds what it may
+        // *change*.
+        let scope_col: Option<String> =
+            match self.scope.as_ref().filter(|s| s.stamp_value().is_some()) {
+                Some(s) => s.column_for(&self.table)?.map(str::to_string),
+                None => None,
+            };
         // SET binds before WHERE so placeholder order matches the parameter order.
         let sets: Result<Vec<String>, _> = self
             .set
@@ -1706,7 +1740,7 @@ impl Update {
         let set_sql = sets.join(", ");
 
         let where_sql = render_where(
-            single_scope_pred(self.scope.as_ref())?,
+            single_scope_pred(self.scope.as_ref(), &self.table)?,
             Some(&self.filter),
             &mut params,
             dialect,
@@ -1736,7 +1770,7 @@ impl Delete {
         let table = ident(&self.table)?;
         let mut params = Params::default();
         let where_sql = render_where(
-            single_scope_pred(self.scope.as_ref())?,
+            single_scope_pred(self.scope.as_ref(), &self.table)?,
             Some(&self.filter),
             &mut params,
             dialect,

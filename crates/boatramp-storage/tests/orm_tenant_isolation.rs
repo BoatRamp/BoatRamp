@@ -707,12 +707,98 @@ async fn orm_per_table_key_scope_isolates_on_a_real_engine() {
         );
     }
 
+    // Helper: `WHERE <col> = <text>`.
+    let eq = |col: &str, v: &str| Predicate::Cmp {
+        left: Expr::col(col),
+        op: CmpOp::Eq,
+        right: Expr::Value(t(v)),
+    };
+
+    // 9) WRITE target keyed on its DECLARED column (the write-axis counterpart of case 6): a guest
+    //    DELETE that targets globex's row by a non-tenant predicate is scoped on `member.account_id`
+    //    — NOT the shared `tenant_id` (='acme' on both rows) — so as acme it matches ZERO rows and
+    //    cannot delete globex's row cross-tenant. A `tenant_id`-keyed DELETE (the pre-fix bug) would
+    //    delete it. The affected-row count is the proof; the SQL-shape assertion guards a revert.
+    {
+        let mut del = Delete {
+            table: "member".into(),
+            filter: eq("secret", "globex-secret"),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = del.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("account_id = ?") && !sql.contains("tenant_id = ?"),
+            "DELETE must bound member on its declared key account_id: {sql}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let affected = tx.execute(&sql, &params).await.unwrap();
+        assert_eq!(
+            affected, 0,
+            "acme's DELETE keyed on account_id must not reach globex's row"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 10) WRITE deny-by-default: a DELETE (or UPDATE/INSERT) targeting an UNDECLARED table is
+    //     refused at compile — the write axis is no weaker than the read axis.
+    {
+        let mut del = Delete {
+            table: "secrets_shadow".into(),
+            filter: eq("x", "y"),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                del.compile(Dialect::Sqlite),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "an undeclared write target must be refused deny-by-default"
+        );
+    }
+
+    // 11) UPDATE is bounded on the declared key AND the tenant column can't be reassigned: a guest
+    //     `SET account_id = 'globex'` is dropped (never donate a row to another tenant), and the
+    //     WHERE is keyed on `account_id`, not the default `tenant_id`.
+    {
+        let mut upd = Update {
+            table: "member".into(),
+            set: vec![
+                Assignment {
+                    column: "account_id".into(), // reassignment attempt — must be dropped
+                    value: Expr::val(t("globex")),
+                },
+                Assignment {
+                    column: "secret".into(),
+                    value: Expr::val(t("edited")),
+                },
+            ],
+            filter: eq("secret", "acme-secret"),
+            scope: None,
+            returning: vec![],
+        };
+        upd.force_scope(&scope_for("acme")).unwrap();
+        let (sql, _params) = upd.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("account_id = ?"),
+            "UPDATE must bound member on its declared key account_id: {sql}"
+        );
+        assert!(
+            !sql.contains("SET account_id") && sql.contains("SET secret ="),
+            "the tenant-key assignment must be dropped (no tenant reassignment): {sql}"
+        );
+    }
+
     println!(
         "ORM PER-TABLE-KEY TENANCY OK: Tenant table scoped on default tenant_id; identity \
          TenantKeyed table scoped on its own PK (uniform tenant_id scope rejected by the engine — \
          key is load-bearing); Unscoped reference table globally readable; per-ref join keys each \
          on its own column; a subquery scopes its inner table on that table's declared key (never \
-         the default) and is refused deny-by-default on an undeclared table; a top-level undeclared \
-         table refused deny-by-default"
+         the default) and is refused deny-by-default on an undeclared table; a WRITE (UPDATE/DELETE/\
+         INSERT) is bounded + stamped on the target's declared key, can't reassign the tenant, and \
+         refuses an undeclared target; a top-level undeclared table refused deny-by-default"
     );
 }

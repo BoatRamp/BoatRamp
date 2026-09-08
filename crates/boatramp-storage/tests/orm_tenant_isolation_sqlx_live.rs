@@ -384,9 +384,13 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             "DROP TABLE IF EXISTS orders",
             "DROP TABLE IF EXISTS tenant",
             "DROP TABLE IF EXISTS countries",
+            "DROP TABLE IF EXISTS member",
             "CREATE TABLE orders (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), item VARCHAR(255))",
             "CREATE TABLE tenant (id VARCHAR(64) PRIMARY KEY, plan VARCHAR(64))",
             "CREATE TABLE countries (code VARCHAR(8) PRIMARY KEY, name VARCHAR(64))",
+            // `member` keyed on `account_id` (NOT the default) with a shared `tenant_id='acme'` on
+            // BOTH rows — the write-axis leak fixture (a tenant_id-keyed write would reach globex).
+            "CREATE TABLE member (account_id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), secret VARCHAR(255))",
         ] {
             tx.execute(ddl, &[]).await.unwrap();
         }
@@ -408,6 +412,12 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
         )
         .await
         .unwrap();
+        tx.execute(
+            "INSERT INTO member (account_id, tenant_id, secret) VALUES ('acme','acme','acme-secret'),('globex','acme','globex-secret')",
+            &[],
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -418,6 +428,12 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             (
                 "tenant".into(),
                 TableScope::TenantKeyed { key: "id".into() },
+            ),
+            (
+                "member".into(),
+                TableScope::TenantKeyed {
+                    key: "account_id".into(),
+                },
             ),
             ("countries".into(), TableScope::Unscoped),
         ]),
@@ -546,11 +562,53 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
         );
     }
 
+    // 6) WRITE target keyed on its DECLARED column: a guest DELETE of globex's row by a non-tenant
+    //    predicate is scoped on `member.account_id` (not the shared tenant_id='acme'), so as acme it
+    //    affects ZERO rows on the real engine — no cross-tenant write. Undeclared write refused.
+    {
+        let eq = |col: &str, v: &str| Predicate::Cmp {
+            left: Expr::col(col),
+            op: CmpOp::Eq,
+            right: Expr::Value(t(v)),
+        };
+        let mut del = Delete {
+            table: "member".into(),
+            filter: eq("secret", "globex-secret"),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = del.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let affected = tx.execute(&sql, &params).await.unwrap();
+        assert_eq!(
+            affected, 0,
+            "[{engine}] a DELETE keyed on account_id must not reach globex's row"
+        );
+        tx.commit().await.unwrap();
+
+        let mut undeclared_write = Delete {
+            table: "secrets_shadow".into(),
+            filter: eq("x", "y"),
+            scope: None,
+            returning: vec![],
+        };
+        undeclared_write.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                undeclared_write.compile(dialect),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "[{engine}] an undeclared write target must be refused deny-by-default"
+        );
+    }
+
     println!(
         "ORM PER-TABLE-KEY TENANCY OK [{engine}]: Tenant table on default tenant_id; identity \
          TenantKeyed table on its own PK (uniform tenant_id scope rejected by the engine); \
-         Unscoped reference table global; per-ref join keys each on its own column; an undeclared \
-         table refused deny-by-default"
+         Unscoped reference table global; per-ref join keys each on its own column; a WRITE is \
+         bounded on the target's declared key (a cross-tenant DELETE affects 0 rows) and refuses an \
+         undeclared target; an undeclared table refused deny-by-default"
     );
 }
 
