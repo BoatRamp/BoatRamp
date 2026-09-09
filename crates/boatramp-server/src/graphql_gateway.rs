@@ -209,6 +209,77 @@ async fn invoke_subgraph(
     }
 }
 
+/// Build the request's target-tenant read scope (R4/D8) from the project [`TenancySchema`] and a
+/// host-resolved target tenant `B`: for every table that declares a public subset **and** resolves
+/// to a tenant column, bind `tenant_column = B` + that table's public predicate (lowered to GDC
+/// terms). A table with a public subset but no resolvable tenant column is omitted — so a target
+/// read of it is refused (deny-by-default). `B` is host-derived at the edge (terminating domain /
+/// verified capability / handle lookup), NEVER guest input.
+#[allow(dead_code)] // called by the edge target resolver (next increment) + the test below
+pub(crate) fn build_target_scope(
+    schema: &boatramp_core::tenancy::TenancySchema,
+    tenant_value: boatramp_core::sql::SqlValue,
+) -> crate::graphql_data::policy::TargetScope {
+    use crate::graphql_data::policy::{TargetScope, TargetTable};
+    use boatramp_core::tenancy::ResolvedScope;
+    let mut tables = std::collections::BTreeMap::new();
+    for (table, subset) in &schema.public_subsets {
+        // Only a table with a resolvable tenant column is target-readable; anything else is left
+        // out of the map, so the GDC refuses a target read of it (deny-by-default).
+        let Some(ResolvedScope::Column(tenant_column)) = schema.resolve(table) else {
+            continue;
+        };
+        tables.insert(
+            table.clone(),
+            TargetTable {
+                tenant_column,
+                public: lower_public_terms_gdc(&subset.predicate),
+            },
+        );
+    }
+    TargetScope {
+        tenant_value,
+        tables,
+    }
+}
+
+/// Lower a host-held [`PublicPredicate`](boatramp_core::tenancy::PublicPredicate) into GDC
+/// [`ResolvedTerm`](crate::graphql_data::policy::ResolvedTerm)s (literals become bound values, never
+/// interpolated). The GDC analogue of `boatramp_core::orm::lower_public_terms`.
+#[allow(dead_code)] // reached via build_target_scope (edge resolver next increment)
+fn lower_public_terms_gdc(
+    pred: &boatramp_core::tenancy::PublicPredicate,
+) -> Vec<crate::graphql_data::policy::ResolvedTerm> {
+    use crate::graphql_data::policy::{ResolvedTerm, RowOp};
+    use boatramp_core::sql::SqlValue;
+    use boatramp_core::tenancy::{PublicCmp, PublicLiteral, PublicTerm};
+    pred.terms
+        .iter()
+        .map(|t| match t {
+            PublicTerm::Cmp { column, op, value } => ResolvedTerm::Cmp {
+                column: column.clone(),
+                op: match op {
+                    PublicCmp::Eq => RowOp::Eq,
+                    PublicCmp::Ne => RowOp::Ne,
+                    PublicCmp::Lt => RowOp::Lt,
+                    PublicCmp::Le => RowOp::Le,
+                    PublicCmp::Gt => RowOp::Gt,
+                    PublicCmp::Ge => RowOp::Ge,
+                },
+                value: match value {
+                    PublicLiteral::Bool(b) => SqlValue::Boolean(*b),
+                    PublicLiteral::Int(n) => SqlValue::Integer(*n),
+                    PublicLiteral::Text(s) => SqlValue::Text(s.clone()),
+                },
+            },
+            PublicTerm::Null { column, negated } => ResolvedTerm::Null {
+                column: column.clone(),
+                negated: *negated,
+            },
+        })
+        .collect()
+}
+
 /// A [`SubgraphFetcher`] that dispatches each fetch to the **right backend**: a SQL-backed
 /// subgraph (compiled to SQL against a managed database) or, by default, a wasm function.
 /// This is where a GraphQL→SQL subgraph and a GraphQL→Wasi subgraph compose in one
@@ -996,6 +1067,71 @@ mod tests {
         assert!(
             msg.contains("no function named `accounts` is deployed"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_target_scope_lowers_schema_public_subsets() {
+        use crate::graphql_data::policy::{ResolvedTerm, RowOp};
+        use boatramp_core::sql::SqlValue;
+        use boatramp_core::tenancy::{
+            PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm, TableScope,
+            TenancySchema,
+        };
+        use std::collections::BTreeMap;
+
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([
+                ("products".into(), TableScope::Tenant),
+                // A table with a public subset but NO tenant scope: omitted from the target map
+                // (a target read of it is refused, deny-by-default).
+                ("countries".into(), TableScope::Unscoped),
+            ]),
+            ..Default::default()
+        };
+        let subset = PublicSubset {
+            predicate: PublicPredicate {
+                terms: vec![
+                    PublicTerm::Cmp {
+                        column: "published".into(),
+                        op: PublicCmp::Eq,
+                        value: PublicLiteral::Bool(true),
+                    },
+                    PublicTerm::Null {
+                        column: "deleted_at".into(),
+                        negated: false,
+                    },
+                ],
+            },
+            world_public: true,
+            listable: true,
+        };
+        schema
+            .public_subsets
+            .insert("products".into(), subset.clone());
+        schema.public_subsets.insert("countries".into(), subset);
+
+        let scope = build_target_scope(&schema, SqlValue::Text("tenant_B".into()));
+        assert_eq!(scope.tenant_value, SqlValue::Text("tenant_B".into()));
+        // `products` (Tenant) is target-readable, confined on its tenant column + the lowered public
+        // predicate; `countries` (Unscoped, no tenant column) is omitted (deny-by-default).
+        assert!(!scope.tables.contains_key("countries"));
+        let products = scope.tables.get("products").expect("products confined");
+        assert_eq!(products.tenant_column, "tenant_id");
+        assert_eq!(
+            products.public,
+            vec![
+                ResolvedTerm::Cmp {
+                    column: "published".into(),
+                    op: RowOp::Eq,
+                    value: SqlValue::Boolean(true),
+                },
+                ResolvedTerm::Null {
+                    column: "deleted_at".into(),
+                    negated: false,
+                },
+            ]
         );
     }
 
