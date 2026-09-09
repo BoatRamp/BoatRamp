@@ -1133,35 +1133,74 @@ pub(super) async fn build_bindings(
         // The R3 session-cookie verify anchor is the runtime's own session signer's public half
         // (set at startup from the node issuer). Absent ⇒ no session fact.
         let session_anchor = inner.session_signer.get().map(|s| s.public_key());
-        let inputs = crate::tenant_resolve::TenantSourceInputs {
-            bearer,
-            domain_context,
-            token_cfg,
-            session_cookie,
-            session_anchor: session_anchor.as_ref(),
-            // The serving path is the synchronous request lane, not the durable async lane, so it
-            // never carries a signed-context envelope (that source resolves only on a queue drain).
-            signed_context: None,
-            context_anchor: None,
-        };
-        let tenancy = crate::tenant_resolve::resolve_host_tenancy(
-            site_handlers.tenancy.as_ref(),
-            imports_db,
-            posture,
-            inputs,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        // Attach the project per-table tenancy schema (R2/D2), loaded from the KV. Absent ⇒ the
-        // legacy single-column `Uniform` scoping; present-but-unreadable ⇒ **fail closed** with a
-        // deny-all schema (every table refused) rather than a silent downgrade to `Uniform` that
-        // would re-admit an undeclared table. Chained onto the resolved tenancy before binding.
+        // The project per-table tenancy schema (R2/D2), loaded from the KV — needed by BOTH the own
+        // path (`with_schema`) and a target route (per-table keys + public subsets + eligibility).
+        // Absent ⇒ the legacy single-column `Uniform` scoping; present-but-unreadable ⇒ **fail
+        // closed** with a deny-all schema (every table refused), never a silent downgrade.
         let schema =
             match boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await {
                 Ok(s) => s,
                 Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
             };
-        let tenancy = tenancy.map(|h| h.with_schema(schema.as_ref()));
+        let tenancy: Option<boatramp_handlers::HostTenancy> = match site_handlers.tenancy.as_ref() {
+            // R4/D8 plain-wasm TARGET route: bind a target scope for a SECOND tenant `B`'s public
+            // subset (the non-federated analog of a `@tenant(scope: target)` field). `B` is
+            // host-derived from the routed domain (5a's carried-domain source); the guest never
+            // names it. Confinement rides on BOTH the `orm` binding (PerTableTarget) and the raw-SQL
+            // `{scope}` marker. Fail-closed on every gap (not eligible / no domain / no schema).
+            Some(boatramp_core::tenancy::Tenancy::Target { via, public }) => {
+                // Operator ceiling: the site must be listed in target_eligible_fields.
+                if !schema
+                    .as_ref()
+                    .is_some_and(|s| s.target_field_eligible(site))
+                {
+                    return Err(format!(
+                        "tenancy: site `{site}` is not an operator-permitted target-tenant route \
+                         (add it to the project's target_eligible_fields)"
+                    ));
+                }
+                // 5a resolves `B` from the routed domain only (the full `via` model is 5c).
+                let b = via
+                    .contains(&boatramp_core::tenancy::TargetSource::Domain)
+                    .then(|| domain_context.filter(|c| !c.is_empty()))
+                    .flatten();
+                match (b, schema.as_ref()) {
+                    (Some(b), Some(sc)) => Some(boatramp_handlers::HostTenancy::target(
+                        boatramp_core::sql::SqlValue::Text(b.to_string()),
+                        boatramp_core::tenancy::AccessMode::Own,
+                        sc,
+                        public,
+                    )),
+                    // No resolvable target tenant / schema ⇒ refuse (a target route must never fall
+                    // back to an own/plain — that would read the caller's own or every tenant's rows).
+                    _ => {
+                        return Err(
+                            "tenancy: this target route could not resolve a target tenant \
+                                    (no routed domain, or no project schema)"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            // Own / session / disabled: today's path.
+            other => {
+                let inputs = crate::tenant_resolve::TenantSourceInputs {
+                    bearer,
+                    domain_context,
+                    token_cfg,
+                    session_cookie,
+                    session_anchor: session_anchor.as_ref(),
+                    // The serving path is the synchronous request lane, not the durable async lane,
+                    // so it never carries a signed-context envelope (that source resolves on a drain).
+                    signed_context: None,
+                    context_anchor: None,
+                };
+                crate::tenant_resolve::resolve_host_tenancy(other, imports_db, posture, inputs)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map(|h| h.with_schema(schema.as_ref()))
+            }
+        };
         bindings = bindings.with_tenancy(tenancy.clone());
         // Carry the resolved principal (axis-tagged facts) so a sibling this handler invokes
         // inherits it (each fact keeps its axis).
