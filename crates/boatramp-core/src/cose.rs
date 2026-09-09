@@ -38,6 +38,9 @@ const CLAIM_PUBKEY: &str = "br_pubkey";
 const CLAIM_SID: &str = "br_sid";
 /// Text claim key for a durable signed-context envelope's carried own-tenant value (R1).
 const CLAIM_CTX: &str = "br_ctx";
+/// The public-subset name a target-capability envelope grants (5c) — binds the capability to a
+/// specific declared `PublicSubset`, so a capability minted for one subset can't reach another.
+const CLAIM_PUB: &str = "br_pub";
 
 /// Token kind: an RBAC role-bearing control-plane token (the `/api/*` bearer).
 pub const KIND_ROLE: &str = "role";
@@ -73,6 +76,16 @@ pub const KIND_SESSION: &str = "session";
 /// the consumer/drain resolves it. Guest-blind: the guest never names the tenant — the host stamps
 /// it from the producer's principal, and a forged/absent envelope fails closed.
 pub const KIND_CONTEXT: &str = "context";
+/// Token kind: a host-signed **target capability** envelope (R4/D8 5c, PLAN-tenancy-principal) — the
+/// AUTHENTICATED target source. Names a SECOND tenant `B` (`br_ctx`) and the public subset it grants
+/// (`br_pub`), scoped to an `aud`ience (the project permitted to redeem it) with `iat`/`exp`/`cti`,
+/// signed by the fleet `Signer`. A caller presenting it (as a bearer) resolves a target scope for
+/// `B`, exactly like the routed-domain source, but proven by signature rather than by the terminating
+/// domain — so an off-domain / API caller can be granted read (or, with the route's write grant,
+/// write) access to `B`'s public subset. Verified (signature + expiry + kind + audience) at bind; a
+/// forged/expired/wrong-audience envelope fails closed. Distinct from `handle` (which is read-only,
+/// unauthenticated, and world-public only).
+pub const KIND_CAPABILITY: &str = "capability";
 
 /// PoP claim: the bound HTTP method (upper-case).
 const CLAIM_HTM: &str = "htm";
@@ -926,6 +939,97 @@ pub fn verify_context(
     ctx.ok_or_else(|| TokenError::Claims("signed context has no tenant".into()))
 }
 
+/// The grant a verified [`KIND_CAPABILITY`] envelope carries: the target tenant `B` and the public
+/// subset name it is scoped to (R4/D8 5c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityGrant {
+    /// The target tenant `B` (`br_ctx`) the bearer may reach.
+    pub tenant: String,
+    /// The public-subset name (`br_pub`) the capability is scoped to — must match the route's
+    /// declared `public` at bind (a capability for one subset can't be redeemed for another).
+    pub public: String,
+}
+
+/// Mint a host-signed **target capability** envelope (5c): `br_kind = "capability"`, the target tenant
+/// bound as `br_ctx`, the granted public-subset name as `br_pub`, the redeeming project as `aud`,
+/// `iat = now`, `exp = now + ttl_secs`, a random `cti`, signed by the fleet `Signer`. Presented as a
+/// bearer, it authenticates target access to `B`'s public subset for the named audience only.
+/// Verified with [`verify_capability`]; a forged/expired/wrong-audience envelope never verifies.
+pub async fn mint_capability(
+    target_tenant: &str,
+    audience: &str,
+    public_subset: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    signer: &dyn Signer,
+) -> Result<String, TokenError> {
+    let claims = ClaimsSetBuilder::new()
+        .issued_at(Timestamp::WholeSeconds(now_unix as i64))
+        .cwt_id(random_cti()?)
+        .audience(audience.to_string())
+        .expiration_time(Timestamp::WholeSeconds(
+            now_unix.saturating_add(ttl_secs) as i64
+        ))
+        .text_claim(
+            CLAIM_KIND.to_string(),
+            CborValue::Text(KIND_CAPABILITY.to_string()),
+        )
+        .text_claim(
+            CLAIM_CTX.to_string(),
+            CborValue::Text(target_tenant.to_string()),
+        )
+        .text_claim(
+            CLAIM_PUB.to_string(),
+            CborValue::Text(public_subset.to_string()),
+        )
+        .build();
+    sign_claims(claims, signer).await
+}
+
+/// Verify a target-capability envelope against the fleet public key at `now_unix`, requiring the
+/// carried audience to equal `expected_audience` (the redeeming project). Checks the COSE signature,
+/// the expiry, `br_kind == "capability"`, and the audience, then returns the [`CapabilityGrant`]
+/// (`B` + the granted public-subset name). Any tampering — a forged tenant, an altered/expired
+/// envelope, a wrong kind, or a **different audience** (a capability minted for project X presented at
+/// project Y) — fails closed; the bind then resolves no target fact and the route fails closed.
+pub fn verify_capability(
+    token: &str,
+    public: &TokenPublicKey,
+    now_unix: u64,
+    expected_audience: &str,
+) -> Result<CapabilityGrant, TokenError> {
+    let claims = verify_envelope(token, public)?;
+    check_exp(&claims, now_unix)?;
+    // Audience binding: a capability is redeemable ONLY at the project it names — never replayed
+    // across projects. Absent or mismatched audience fails closed.
+    if claims.audience.as_deref() != Some(expected_audience) {
+        return Err(TokenError::Claims(
+            "capability audience does not match this project".into(),
+        ));
+    }
+    let mut kind = None;
+    let mut ctx = None;
+    let mut pubname = None;
+    for (name, value) in &claims.rest {
+        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
+            match t.as_str() {
+                CLAIM_KIND => kind = Some(v.clone()),
+                CLAIM_CTX => ctx = Some(v.clone()),
+                CLAIM_PUB => pubname = Some(v.clone()),
+                _ => {}
+            }
+        }
+    }
+    if kind.as_deref() != Some(KIND_CAPABILITY) {
+        return Err(TokenError::Claims("not a capability envelope".into()));
+    }
+    Ok(CapabilityGrant {
+        tenant: ctx.ok_or_else(|| TokenError::Claims("capability has no target tenant".into()))?,
+        public: pubname
+            .ok_or_else(|| TokenError::Claims("capability has no public subset".into()))?,
+    })
+}
+
 /// The canonical bytes a joiner signs with its mesh private key to **prove
 /// possession** of the key it presents when redeeming join token `jti`. Bound to
 /// the token (`jti`), the presented key (`mesh_pubkey_hex`), and a fresh timestamp
@@ -1447,6 +1551,33 @@ mod tests {
         let cookie = mint_session("sid-1", 300, 1000, &signer).await.unwrap();
         assert!(verify_context(&cookie, &pubkey, 1000).is_err());
         assert!(verify_session(&ctx, &pubkey, 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn capability_round_trips_and_is_audience_and_kind_bound() {
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        // Mint a capability granting target tenant B's `storefront` subset, redeemable at project
+        // `shop`, ttl 300 ⇒ exp 1300.
+        let cap = mint_capability("tenant_B", "shop", "storefront", 300, 1000, &signer)
+            .await
+            .unwrap();
+        // Round-trip at the right audience returns B + the granted subset name.
+        let grant = verify_capability(&cap, &pubkey, 1000, "shop").unwrap();
+        assert_eq!(grant.tenant, "tenant_B");
+        assert_eq!(grant.public, "storefront");
+        // Audience binding: presented at a DIFFERENT project ⇒ refused (no cross-project replay).
+        assert!(verify_capability(&cap, &pubkey, 1000, "other-project").is_err());
+        // Expired ⇒ refused.
+        assert!(verify_capability(&cap, &pubkey, 2000, "shop").is_err());
+        // A stranger's key can't verify (a forged target tenant fails the signature).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_capability(&cap, &stranger.public_key(), 1000, "shop").is_err());
+        // Cross-kind confusion: a signed context is NOT a capability, and a capability is NOT a
+        // context (so a capability can never be redeemed as an own-tenant fact and vice-versa).
+        let ctx = mint_context("tenant_B", 300, 1000, &signer).await.unwrap();
+        assert!(verify_capability(&ctx, &pubkey, 1000, "shop").is_err());
+        assert!(verify_context(&cap, &pubkey, 1000).is_err());
     }
 
     #[tokio::test]
