@@ -22,16 +22,19 @@
 //!
 //! 1. The traversal is sqlparser's derived [`VisitMut`](sqlparser::ast::VisitMut) walk, which is
 //!    maintained by sqlparser to cover the WHOLE grammar. Every `Query` node in the tree — including
-//!    those buried in `IN (SELECT …)`, `EXISTS (…)`, scalar subqueries, derived tables, CTE bodies,
-//!    and `UNION`/`INTERSECT`/`EXCEPT` arms — receives a [`pre_visit_query`](Rewriter::pre_visit_query),
+//!    those buried in `IN (SELECT …)`, `EXISTS (…)`, scalar subqueries, derived tables, and
+//!    `UNION`/`INTERSECT`/`EXCEPT` arms — receives a [`pre_visit_query`](Rewriter::pre_visit_query),
 //!    where its own `SELECT`s are confined.
 //! 2. Every table reference lives in a `SELECT`'s `FROM` (directly or under a `NESTED JOIN`), and
 //!    every `SELECT` is confined by exactly one enclosing query's visit — so every base table is
-//!    reached exactly once.
+//!    reached exactly once. With `WITH`/CTEs refused up front, a bare `FROM foo` is ALWAYS a base
+//!    table (derived tables are a distinct AST node, subqueries are their own `Query`), so there is
+//!    no name-shadowing case in which a reference could be mistaken for a non-table and skipped.
 //! 3. Anything the confinement cannot reason about — a table-valued function, `UNNEST`, `PIVOT`, a
-//!    schema-qualified name, a write smuggled into a CTE, an exotic table source — is **refused**
-//!    (fail-closed), never silently passed. A second [`pre_visit_table_factor`](Rewriter::pre_visit_table_factor)
-//!    guard rejects any un-confinable table source anywhere in the tree as belt-and-suspenders.
+//!    schema-qualified name, a CTE, a write smuggled into a read position, an exotic table source —
+//!    is **refused** (fail-closed), never silently passed. A second
+//!    [`pre_visit_table_factor`](Rewriter::pre_visit_table_factor) guard rejects any un-confinable
+//!    table source anywhere in the tree as belt-and-suspenders.
 //!
 //! The injected `B` and public-subset literals are host-held (from the routing context + the
 //! operator's schema), never guest input, and are rendered through sqlparser's own escaping
@@ -39,7 +42,7 @@
 //! literals and, unlike bound parameters, do not disturb the guest's own positional placeholders
 //! (which matters for the positional-parameter dialects).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -91,6 +94,13 @@ pub enum TargetRewriteError {
     /// `TargetTenant` fact). Unreachable by construction — a target principal always resolves `B` —
     /// but refused fail-closed rather than run unconfined.
     MissingTarget,
+    /// The statement used a `WITH` (CTE). CTEs are refused in a raw-SQL target read (deny-by-default,
+    /// matching the ORM target path, which does not support CTEs): a non-recursive CTE's body may
+    /// reference the base table under the CTE's own name, and a recursive CTE references itself, so a
+    /// name-based "is this a CTE reference?" test cannot soundly distinguish a base-table read from a
+    /// CTE reference — the safe collapse is to refuse. The same read is expressible with a derived
+    /// table / subquery, which IS confined.
+    CteNotAllowed,
 }
 
 impl TargetRewriteError {
@@ -127,6 +137,11 @@ impl TargetRewriteError {
             }
             Self::MissingTarget => {
                 "tenancy(target): no resolved target tenant for this request".into()
+            }
+            Self::CteNotAllowed => {
+                "tenancy(target): a WITH/CTE is not allowed in a target read (use a subquery or \
+                 derived table)"
+                    .into()
             }
         }
     }
@@ -169,7 +184,6 @@ pub fn rewrite_target_select(
         keys,
         public,
         bound,
-        scope: Vec::new(),
     };
     if let ControlFlow::Break(err) = statements[0].visit(&mut rewriter) {
         return Err(err);
@@ -177,44 +191,34 @@ pub fn rewrite_target_select(
     Ok(statements[0].to_string())
 }
 
-/// The mutating visitor that injects the per-table confinement. `scope` is a stack of CTE-name
-/// frames (one per enclosing query that has a `WITH`); a `FROM` reference to a name visible on the
-/// stack is a CTE reference (its body is confined at its own level), not a base table.
+/// The mutating visitor that injects the per-table confinement. `WITH`/CTEs are refused up front
+/// (see [`TargetRewriteError::CteNotAllowed`]), so — because derived tables are `TableFactor::Derived`
+/// and subqueries are their own `Query` nodes — a `TableFactor::Table` bare name is ALWAYS a base
+/// table (never a CTE reference). That removes the need to track a CTE-name scope, and with it the
+/// scope foot-gun class entirely: every base table is unconditionally confined.
 struct Rewriter<'a> {
     keys: &'a BTreeMap<String, ResolvedScope>,
     public: &'a BTreeMap<String, Vec<PublicTermSql>>,
     /// The host-resolved target tenant `B`, pre-rendered as a literal expression.
     bound: Expr,
-    scope: Vec<BTreeSet<String>>,
 }
 
 impl VisitorMut for Rewriter<'_> {
     type Break = TargetRewriteError;
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        // Bring this query's CTE names into scope *before* confining its body (a body SELECT may
-        // reference a sibling CTE; over-approximating the scope matches SQL's own name shadowing —
-        // a bare name that matches a visible CTE resolves to the CTE, whose body is confined).
-        if let Some(with) = &query.with {
-            let frame = with
-                .cte_tables
-                .iter()
-                .map(|c| c.alias.name.value.clone())
-                .collect();
-            self.scope.push(frame);
+        // Refuse any CTE (deny-by-default): a non-recursive CTE body may reference the base table
+        // under the CTE's own name, and a recursive CTE references itself, so a name-based test
+        // cannot soundly tell a base-table read from a CTE reference. The same read is expressible
+        // with a derived table / subquery, which is confined.
+        if query.with.is_some() {
+            return ControlFlow::Break(TargetRewriteError::CteNotAllowed);
         }
         // Confine every SELECT directly in this query's body (through set-operation arms). Nested
-        // queries (derived tables, expression subqueries, CTE bodies, `SetExpr::Query`) are separate
-        // `Query` nodes and receive their own `pre_visit_query`.
+        // queries (derived tables, expression subqueries, `SetExpr::Query`) are separate `Query`
+        // nodes and receive their own `pre_visit_query`.
         if let Err(e) = self.confine_body(&mut query.body) {
             return ControlFlow::Break(e);
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        if query.with.is_some() {
-            self.scope.pop();
         }
         ControlFlow::Continue(())
     }
@@ -245,12 +249,6 @@ impl VisitorMut for Rewriter<'_> {
 }
 
 impl Rewriter<'_> {
-    /// Whether `name` is a CTE name visible in the current scope (so a `FROM` reference to it is a
-    /// CTE reference, not a base table).
-    fn cte_in_scope(&self, name: &str) -> bool {
-        self.scope.iter().any(|frame| frame.contains(name))
-    }
-
     /// Confine every `SELECT` reachable in this `SetExpr` at THIS query level (through set-operation
     /// arms), refusing writes smuggled into a read position. Nested `Query` nodes are left to their
     /// own `pre_visit_query`.
@@ -335,12 +333,8 @@ impl Rewriter<'_> {
                         name,
                     )));
                 }
+                // With CTEs refused, a bare `TableFactor::Table` is unconditionally a base table.
                 let base = name.0[0].value.clone();
-                if self.cte_in_scope(&base) {
-                    // A reference to a CTE defined in an enclosing scope — its body is confined at
-                    // its own level; do not treat it as a base table.
-                    return Ok(());
-                }
                 // The qualifier columns will be referenced by: the alias if present, else the
                 // table's own identifier (cloned to preserve any quoting).
                 let qualifier = alias
@@ -620,16 +614,34 @@ mod tests {
     }
 
     #[test]
-    fn cte_body_is_confined_and_cte_reference_is_not_a_base_table() {
-        let out = rewrite("WITH live AS (SELECT id FROM products) SELECT * FROM live WHERE id > 0")
-            .unwrap();
-        // The CTE body confines `products`...
-        assert!(
-            out.contains("FROM products WHERE products.tenant_id = 'tenant_B'"),
-            "{out}"
+    fn any_cte_is_refused() {
+        // CTEs are refused deny-by-default (a self-named CTE is a scope-shadowing leak vector; the
+        // same read is expressible with a subquery/derived table, which is confined).
+        assert_eq!(
+            rewrite("WITH live AS (SELECT id FROM products) SELECT * FROM live WHERE id > 0")
+                .unwrap_err(),
+            TargetRewriteError::CteNotAllowed
         );
-        // ...and `FROM live` (the CTE name) is NOT treated as a base table (no `live.tenant_id`).
-        assert!(!out.contains("live.tenant_id"), "{out}");
+    }
+
+    /// Regression for the Critical review finding: a self-named CTE must NOT pass through unconfined.
+    /// These exact statements previously leaked another tenant's private rows (the outer ref and the
+    /// CTE body's own base ref were both skipped by the over-approximating scope). They must now be
+    /// refused, never rewritten to a pass-through.
+    #[test]
+    fn self_named_cte_bypass_is_refused() {
+        for hostile in [
+            "WITH products AS (SELECT * FROM products WHERE tenant_id = 'tenant_A' AND published = false) SELECT * FROM products",
+            "WITH reviews AS (SELECT * FROM reviews) SELECT id FROM products",
+            "WITH secrets AS (SELECT * FROM secrets) SELECT * FROM secrets",
+            "WITH RECURSIVE products AS (SELECT * FROM products) SELECT * FROM products",
+        ] {
+            assert_eq!(
+                rewrite(hostile).unwrap_err(),
+                TargetRewriteError::CteNotAllowed,
+                "must refuse (never pass through unconfined): {hostile}"
+            );
+        }
     }
 
     #[test]

@@ -805,6 +805,17 @@ mod tests {
                 .is_err(),
             "a target read of an undeclared table must be refused"
         );
+        // The Critical review finding: a self-named CTE must be refused (never a pass-through) — it
+        // would otherwise read tenant A's private rows raw.
+        assert!(
+            ht.rewrite_target_read(
+                "WITH products AS (SELECT * FROM products WHERE tenant_id = 'tenant_A') \
+                 SELECT name FROM products",
+                Dialect::Sqlite,
+            )
+            .is_err(),
+            "a self-named CTE must be refused, not passed through unconfined"
+        );
 
         println!(
             "PLAIN-WASM TARGET ISOLATION OK: a target route's orm AND raw-sql reads each return only \
