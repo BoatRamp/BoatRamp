@@ -1347,6 +1347,165 @@ mod tests {
         );
     }
 
+    /// **Live** proof (R4/D8, Stage 5d) that `attach_reference` derives the child's tenant from a
+    /// parent reachable under the caller's confined scope on a REAL libsql engine: a reference to B's
+    /// PUBLIC parent row inserts a child row stamped tenant=B (+ the child's visibility forced); a
+    /// reference to B's DRAFT (non-public) parent or to tenant A's parent is a fail-closed NO-OP (0
+    /// rows), so the derived tenant can never be one the caller couldn't already reach. `#[ignore]`d
+    /// (static-musl libsql segfault); the `test-target-plain-wasm` CI job runs it + greps the marker.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn plain_wasm_target_attach_reference_derives_tenant_from_a_reachable_parent_on_a_real_engine(
+    ) {
+        use boatramp_core::orm::{compile_attach_reference, Assignment, AttachReference, Expr};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm,
+            TableScope, TenancySchema,
+        };
+        use boatramp_handlers::{HostTenancy, TenantAxis};
+        use std::collections::BTreeMap;
+
+        let dir =
+            std::env::temp_dir().join(format!("boatramp-target-attachref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "shop", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE products (id TEXT PRIMARY KEY, tenant_id TEXT, published INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            tx.execute(
+                "CREATE TABLE favorites (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT, \
+                 product_id TEXT, note TEXT, visible INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, published) in [
+                ("b_pub", "tenant_B", 1i64),
+                ("b_draft", "tenant_B", 0),
+                ("a_pub", "tenant_A", 1),
+            ] {
+                tx.execute(
+                    "INSERT INTO products (id, tenant_id, published) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Integer(published),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Schema: products public = published=1; favorites public = visible=1. Write-granted target
+        // scope for B, `note` settable on favorites.
+        let world = |col: &str, v: i64| PublicSubset {
+            predicate: PublicPredicate {
+                terms: vec![PublicTerm::Cmp {
+                    column: col.into(),
+                    op: PublicCmp::Eq,
+                    value: PublicLiteral::Int(v),
+                }],
+            },
+            world_public: true,
+            listable: true,
+        };
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([
+                ("products".into(), TableScope::Tenant),
+                ("favorites".into(), TableScope::Tenant),
+            ]),
+            ..Default::default()
+        };
+        schema
+            .public_subsets
+            .insert("products".into(), world("published", 1));
+        schema
+            .public_subsets
+            .insert("favorites".into(), world("visible", 1));
+        let ht = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema,
+            "products",
+            &["note".to_string(), "product_id".to_string()],
+        );
+        let write = ht.orm_scope(TenantAxis::Write).unwrap().unwrap();
+
+        let attach = |product: &str| AttachReference {
+            child: "favorites".into(),
+            parent: "products".into(),
+            ref_column: "id".into(),
+            ref_value: SqlValue::Text(product.into()),
+            set: vec![
+                Assignment {
+                    column: "product_id".into(),
+                    value: Expr::val(SqlValue::Text(product.into())),
+                },
+                Assignment {
+                    column: "note".into(),
+                    value: Expr::val(SqlValue::Text("fav".into())),
+                },
+            ],
+        };
+        // Reference each product; only B's PUBLIC product is reachable → 1 insert; the draft + tenant
+        // A are no-ops (0 rows).
+        for (product, expected) in [("b_pub", 1u64), ("b_draft", 0), ("a_pub", 0)] {
+            let (sql, params) =
+                compile_attach_reference(&write, &attach(product), Dialect::Sqlite).unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let n = tx.execute(&sql, &params).await.unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(
+                n, expected,
+                "attach_reference to {product}: expected {expected} inserts (reachable-parent gate)"
+            );
+        }
+        // The one inserted favorite is stamped tenant=B and visible=1 (forced public), referencing the
+        // public product — never tenant A, never the draft.
+        let mut tx = db.begin().await.unwrap();
+        let rows = tx
+            .query("SELECT tenant_id, product_id, visible FROM favorites", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            rows.rows.len(),
+            1,
+            "exactly one favorite inserted (only b_pub reachable)"
+        );
+        let row = &rows.rows[0];
+        assert_eq!(
+            row[0],
+            SqlValue::Text("tenant_B".into()),
+            "derived tenant = B (the parent's)"
+        );
+        assert_eq!(
+            row[1],
+            SqlValue::Text("b_pub".into()),
+            "references B's public product"
+        );
+        assert!(
+            matches!(row[2], SqlValue::Integer(1)),
+            "child visibility forced public"
+        );
+
+        println!(
+            "PLAIN-WASM TARGET ATTACH-REFERENCE ISOLATION OK: attach_reference stamped the child's \
+             tenant from B's reachable public parent (never tenant A, never B's draft) and was a \
+             fail-closed no-op for every unreachable parent, on a real libsql engine"
+        );
+    }
+
     /// Run a compiled `(sql, params)` returning the single text column, sorted.
     async fn run_text_rows(
         tx: &mut dyn boatramp_core::sql::SqlTransaction,

@@ -2322,6 +2322,130 @@ pub fn compile_promote(scope: &Scope, table: &str, dialect: Dialect) -> Result<C
     promote.compile(dialect)
 }
 
+/// A parent-referencing derived-tenant write ([`compile_attach_reference`], PLAN-tenancy-principal
+/// 5d): insert a row into `child` whose tenant is DERIVED from a `parent` row reachable under the
+/// caller's current confined scope, gated by `parent.<ref_column> = ref_value`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachReference {
+    /// The table the new row is inserted into.
+    pub child: String,
+    /// The referenced parent table (read under the caller's scope).
+    pub parent: String,
+    /// The parent selector column: `parent.<ref_column> = <ref_value>` picks the referenced row.
+    pub ref_column: String,
+    /// The parent selector value (guest-supplied — a row selector INSIDE the caller's confined scope,
+    /// never a tenant value).
+    pub ref_value: SqlValue,
+    /// The child's non-tenant column assignments (guest values). Under a target scope each column
+    /// must be in the route's SET-allowlist (never the tenant or a visibility column).
+    pub set: Vec<Assignment>,
+}
+
+/// Compile `attach_reference` (5d): the host-mediated **derived-tenant** write. Lowers to
+///
+/// ```sql
+/// INSERT INTO <child> (<set cols…>, <child tenant col> [, <child public cols…>])
+/// SELECT <set vals…>, <parent tenant col> [, <public literals…>]
+/// FROM <parent> WHERE <parent>.<ref> = ? AND <caller's scope on the parent>
+/// ```
+///
+/// The child's tenant is **projected from the scope-confined parent**, never the guest — so it is
+/// bounded by the caller's own reach (`own` → {A, NULL}; `target` → {B}, since the parent is confined
+/// to `tenant = B AND <public>`). An unreachable parent selects zero rows ⇒ zero inserts (a
+/// fail-closed no-op, never an oracle). Under a **target** scope the child's own public-visibility
+/// columns are force-stamped and the guest `set` columns are gated by the target write-allowlist
+/// ([`Scope::assert_target_settable`]), so the inserted row lands in the child's public subset. The
+/// caller's WRITE grant is enforced above this (the binding's `scope_for(Write)` fails closed for a
+/// read-only route — so a `handle`-resolved target, whose write axis is denied, can never reach here,
+/// satisfying G1). `child`/`parent` must be plain `Column`-scoped tenant tables.
+pub fn compile_attach_reference(
+    scope: &Scope,
+    spec: &AttachReference,
+    dialect: Dialect,
+) -> Result<Compiled, OrmError> {
+    ident(&spec.ref_column)?;
+    // Resolve the child + parent tenant columns — both must be plain tenant `Column` tables (a
+    // derived-tenant write onto an identity/`Unscoped`/`TenantOrSession` table is out of scope).
+    let child_tenant = match scope.resolve_table(&spec.child)? {
+        ResolvedScope::Column(c) => c,
+        _ => {
+            return Err(OrmError::BadExpr(
+                "attach_reference child must be a plain tenant table",
+            ))
+        }
+    };
+    let parent_tenant = match scope.resolve_table(&spec.parent)? {
+        ResolvedScope::Column(c) => c,
+        _ => {
+            return Err(OrmError::BadExpr(
+                "attach_reference parent must be a plain tenant table",
+            ))
+        }
+    };
+    ident(&child_tenant)?;
+    ident(&parent_tenant)?;
+
+    let is_target = scope.is_target();
+    let mut columns: Vec<String> = Vec::with_capacity(spec.set.len() + 2);
+    let mut projection: Vec<SelectItem> = Vec::with_capacity(spec.set.len() + 2);
+    // The guest's non-tenant columns — gated by the target write-allowlist (never tenant/visibility).
+    for a in &spec.set {
+        if is_target {
+            scope.assert_target_settable(&spec.child, &a.column)?;
+        } else {
+            ident(&a.column)?;
+        }
+        columns.push(a.column.clone());
+        projection.push(SelectItem {
+            expr: a.value.clone(),
+            alias: None,
+        });
+    }
+    // The derived tenant: the child's tenant column is projected from the (scope-confined) parent's
+    // tenant column — never a guest value.
+    columns.push(child_tenant);
+    projection.push(SelectItem {
+        expr: Expr::Column(parent_tenant),
+        alias: None,
+    });
+    // Under a target scope, force the child's public-visibility columns so the inserted row is itself
+    // public (deny-by-default: a child table with no declared public subset is refused).
+    if is_target {
+        for (col, val) in scope.public_force_cells(&spec.child)? {
+            columns.push(col);
+            projection.push(SelectItem {
+                expr: Expr::Value(val),
+                alias: None,
+            });
+        }
+    }
+    // The source: SELECT <projection> FROM parent WHERE parent.<ref> = ?. Read-scoping it confines the
+    // parent to the caller's reachable set (own: tenant = A [OR NULL]; target: tenant = B AND public),
+    // so the projected parent tenant is bounded and an unreachable parent yields zero rows.
+    let mut source = Select {
+        columns: projection,
+        filter: Some(Predicate::Cmp {
+            left: Expr::Column(spec.ref_column.clone()),
+            op: CmpOp::Eq,
+            right: Expr::Value(spec.ref_value.clone()),
+        }),
+        ..Select::from(spec.parent.clone())
+    };
+    source.force_scope(scope)?;
+    // The INSERT itself carries NO scope (`scope: None`) — the tenant is the projected parent's, not a
+    // re-stamped scalar. (This is the sanctioned target INSERT…SELECT; a generic one is refused by
+    // `Insert::force_scope` under a target scope.)
+    let insert = Insert {
+        table: spec.child.clone(),
+        rows: vec![],
+        conflict: None,
+        scope: None,
+        returning: vec![],
+        from_select: Some((columns, Box::new(source))),
+    };
+    insert.compile(dialect)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4356,5 +4480,202 @@ mod tests {
             compile_promote(&scope, "products", Dialect::Sqlite).unwrap_err(),
             OrmError::TargetWriteUnsupported("promote")
         ));
+    }
+
+    // ---- 5d: attach_reference (derived-tenant write) ------------------------------------------
+
+    fn attach_spec() -> AttachReference {
+        AttachReference {
+            child: "favorites".into(),
+            parent: "products".into(),
+            ref_column: "id".into(),
+            ref_value: t("prod_1"),
+            set: vec![Assignment {
+                column: "note".into(),
+                value: Expr::val(t("nice")),
+            }],
+        }
+    }
+
+    #[test]
+    fn attach_reference_own_derives_tenant_from_the_scoped_parent() {
+        use std::collections::BTreeMap;
+        // An OWN scope over `favorites` (child) + `products` (parent), both keyed on tenant_id.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "favorites".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+                (
+                    "products".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+            ])),
+        };
+        let (sql, params) =
+            compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
+        // The child tenant is projected from the parent; the source is confined to the caller's own
+        // tenant (so the derived tenant is bounded; an unreachable product selects nothing).
+        assert_eq!(
+            sql,
+            "INSERT INTO favorites (note, tenant_id) SELECT ?1, tenant_id FROM products \
+             WHERE tenant_id = ?2 AND id = ?3"
+        );
+        assert_eq!(params, vec![t("nice"), t("A"), t("prod_1")]);
+    }
+
+    #[test]
+    fn attach_reference_target_confines_parent_to_b_public_and_forces_child_public() {
+        // A TARGET write scope: parent `products` confined to B + public; child `favorites` gets its
+        // tenant from the parent (=B) + its own public columns force-stamped; `note` is allowlisted.
+        use std::collections::{BTreeMap, BTreeSet};
+        let public_terms = vec![PublicTermSql::Cmp {
+            column: "visible".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Boolean(true),
+        }];
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([
+                    (
+                        "favorites".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                    (
+                        "products".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                ]),
+                public: BTreeMap::from([
+                    ("favorites".to_string(), public_terms.clone()),
+                    (
+                        "products".to_string(),
+                        vec![PublicTermSql::Cmp {
+                            column: "published".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        }],
+                    ),
+                ]),
+                write: BTreeSet::from(["note".to_string()]),
+            },
+        };
+        let (sql, params) =
+            compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
+        // Child gets note + tenant(from parent) + forced visible=true; the source (products) is
+        // confined to tenant=B AND published=true (the base-table predicate is unqualified).
+        assert!(
+            sql.contains("INSERT INTO favorites (note, tenant_id, visible)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("SELECT ?1, tenant_id, ?2 FROM products"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("published = ?") && sql.contains("tenant_id = ?"),
+            "parent confined: {sql}"
+        );
+        assert!(sql.contains("AND id = ?"), "ref selector present: {sql}");
+        assert!(
+            params.contains(&t("tenant_B")),
+            "parent confined to B: {params:?}"
+        );
+        assert!(
+            params.contains(&SqlValue::Boolean(true)),
+            "child visible forced + parent published: {params:?}"
+        );
+    }
+
+    #[test]
+    fn attach_reference_target_refuses_a_non_allowlisted_or_visibility_set() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([
+                    (
+                        "favorites".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                    (
+                        "products".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                ]),
+                public: BTreeMap::from([
+                    (
+                        "favorites".to_string(),
+                        vec![PublicTermSql::Cmp {
+                            column: "visible".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        }],
+                    ),
+                    (
+                        "products".to_string(),
+                        vec![PublicTermSql::Cmp {
+                            column: "published".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        }],
+                    ),
+                ]),
+                write: BTreeSet::from(["note".to_string()]),
+            },
+        };
+        // `price` isn't allowlisted; `visible` is a visibility column — both refused.
+        for bad in ["price", "visible", "tenant_id"] {
+            let spec = AttachReference {
+                set: vec![Assignment {
+                    column: bad.into(),
+                    value: Expr::val(t("x")),
+                }],
+                ..attach_spec()
+            };
+            assert!(
+                matches!(
+                    compile_attach_reference(&scope, &spec, Dialect::Sqlite).unwrap_err(),
+                    OrmError::TargetWriteColumnDenied(ref c) if c == bad
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_reference_refuses_a_non_column_table() {
+        use std::collections::BTreeMap;
+        // `countries` is Unscoped ⇒ not a plain tenant table ⇒ refused as a child/parent.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "favorites".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+                ("countries".to_string(), ResolvedScope::Unscoped),
+            ])),
+        };
+        let spec = AttachReference {
+            parent: "countries".into(),
+            ..attach_spec()
+        };
+        assert!(compile_attach_reference(&scope, &spec, Dialect::Sqlite).is_err());
     }
 }

@@ -28,6 +28,7 @@ mod generated {
                 "[method]database.delete",
                 "[method]database.delete-returning",
                 "[method]database.promote",
+                "[method]database.attach-reference",
             ],
         },
         with: {
@@ -202,6 +203,47 @@ impl wit::HostDatabase for OrmHost<'_> {
             .scope_for(crate::tenant::Axis::Write)?
             .ok_or_else(|| compile_err(core::OrmError::TenancyNoPrincipal))?;
         let (sql, params) = core::compile_promote(&scope, &table, dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        txn.execute(&sql, &params).await.map_err(backend_err)
+    }
+
+    async fn attach_reference(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        q: wit::AttachReferenceQuery,
+    ) -> Result<u64, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        // attach_reference is a host-mediated WRITE (5d): the caller's write axis must grant a write.
+        // A read-only route (no in-site tenancy, an `all`/no-scope axis, or a `handle`-resolved target
+        // whose write axis is `None` — G1) resolves no write scope here and is refused.
+        let scope = self
+            .scope_for(crate::tenant::Axis::Write)?
+            .ok_or_else(|| compile_err(core::OrmError::TenancyNoPrincipal))?;
+        // The `ref-value` selector must be a bound literal (a row selector inside the caller's scope,
+        // never an arbitrary expression / subquery).
+        let ref_value = match build_expr(&q.exprs, &[], q.ref_value, q.exprs.len())? {
+            core::Expr::Value(v) => v,
+            _ => {
+                return Err(wit::Error::Syntax(
+                    "attach_reference ref-value must be a literal".into(),
+                ))
+            }
+        };
+        let set = q
+            .set
+            .iter()
+            .map(|a| to_core_assignment(&q.exprs, &[], a))
+            .collect::<Result<Vec<_>, _>>()?;
+        let spec = core::AttachReference {
+            child: q.child,
+            parent: q.parent,
+            ref_column: q.ref_column,
+            ref_value,
+            set,
+        };
+        let (sql, params) =
+            core::compile_attach_reference(&scope, &spec, dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
@@ -1767,6 +1809,40 @@ mod tests {
         assert!(
             host.insert(db, ins).await.is_err(),
             "a read-only target denies writes"
+        );
+    }
+
+    /// attach_reference via the binding is refused on a READ-ONLY target route (no write axis) — the
+    /// binding's `scope_for(Write)` gate (which a `handle`-resolved target also hits, G1). Never
+    /// reaches the backend.
+    #[tokio::test]
+    async fn target_attach_reference_via_the_binding_refuses_a_read_only_route() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &[]); // read-only target
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let q = wit::AttachReferenceQuery {
+            exprs: vec![lit(text("prod_1")), lit(text("nice"))],
+            child: "favorites".into(),
+            parent: "products".into(),
+            ref_column: "id".into(),
+            ref_value: 0,
+            set: vec![wit::Assignment {
+                column: "note".into(),
+                value: 1,
+            }],
+        };
+        assert!(
+            host.attach_reference(db, q).await.is_err(),
+            "attach_reference on a read-only target route is refused"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("execute|")),
+            "nothing reached the backend"
         );
     }
 
