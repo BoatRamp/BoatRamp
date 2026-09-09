@@ -337,7 +337,7 @@ fn apply_scope_marker(
         // Unscoped: neutralise any stray marker so the statement still parses.
         return Ok(statement.replace(SCOPE_MARKER, "1 = 1"));
     };
-    let (pred, value) = ht
+    let (pred, values) = ht
         .sql_marker(axis, params.len())
         .map_err(|d| SqlError::Other(d.reason().to_string()))?;
     if ht.requires_marker(axis) && !statement.contains(SCOPE_MARKER) {
@@ -346,9 +346,10 @@ fn apply_scope_marker(
              (the host injects the tenant predicate there); none found"
         )));
     }
-    if let Some(v) = value {
-        params.push(v);
-    }
+    // Append the marker's bound values in placeholder order (the tenant `B`, then a target read's
+    // public-subset literals). The marker references them as `?<len+1..>`, so they are correct
+    // wherever the marker sits; appended once even if the marker repeats (the predicate is stable).
+    params.extend(values);
     Ok(statement.replace(SCOPE_MARKER, &pred))
 }
 
