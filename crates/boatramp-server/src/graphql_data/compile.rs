@@ -12,7 +12,7 @@
 //! subquery), so tenant isolation is enforced at compile time, at every depth.
 
 use super::dialect::{sql_string_literal, Dialect};
-use super::policy::{Claims, DataPolicy, PolicyError, RowOp, TargetScope};
+use super::policy::{Claims, DataPolicy, PolicyError, TargetScope};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
 use async_graphql_parser::types::{
     DocumentOperations, ExecutableDocument, Field, OperationDefinition, OperationType, Selection,
@@ -158,6 +158,31 @@ pub(crate) fn is_entities_query(query: &str) -> bool {
             .any(|s| matches!(&s.node, Selection::Field(f) if f.node.name.node == "_entities"))
 }
 
+/// Lower a resolved row-predicate term to a `WHERE` fragment against `qualified_col` (already
+/// qualified + quoted by the caller): `<col> <op> <?param>` for a comparison (the value bound as a
+/// parameter — never interpolated), or `<col> IS [NOT] NULL` for a null test. Shared by every
+/// per-table injection seam so an own filter (`tenant = X`) and a target public subset
+/// (`published = ? AND deleted_at IS NULL`) lower identically at every depth.
+fn resolved_term_where(
+    term: &super::policy::ResolvedTerm,
+    qualified_col: &str,
+    cx: &mut Cx,
+) -> String {
+    use super::policy::ResolvedTerm;
+    match term {
+        ResolvedTerm::Cmp { op, value, .. } => {
+            let ph = cx.bind(value.clone());
+            format!("{qualified_col} {} {ph}", op.symbol())
+        }
+        ResolvedTerm::Null { negated, .. } => {
+            format!(
+                "{qualified_col} IS {}NULL",
+                if *negated { "NOT " } else { "" }
+            )
+        }
+    }
+}
+
 /// Compile a federation `_entities` fetch into one keyed `SELECT`. The `... on <Type>`
 /// selection names the entity table; each representation supplies the key. The row filter
 /// still applies, so a subgraph only resolves entities it's allowed to see.
@@ -289,10 +314,9 @@ pub(crate) fn compile_entities(
         }
     }
     if let Some(filter) = policy.row_filter_with_target(&type_name, claims, target)? {
-        for term in filter.terms {
-            let col = qualify(&qualifier, &term.column, dialect);
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} = {ph}"));
+        for term in &filter.terms {
+            let col = qualify(&qualifier, term.column(), dialect);
+            clauses.push(resolved_term_where(term, &col, &mut cx));
         }
     }
 
@@ -497,14 +521,27 @@ fn compile_insert(
         columns.push(col.to_string());
         values.push(resolve_value(val, cx.variables)?);
     }
-    // A new row must belong to the tenant: force the row-filter columns to the claim values.
+    // A new row must belong to the tenant: force the row-filter columns to the claim values. An
+    // insert can only force an equality term (`column = value`); a non-equality / null row-filter
+    // term is refused (fail-closed) — the own path is always equality, and a richer target-write
+    // filter lands with target writes (a later stage).
     if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
         for term in filter.terms {
-            match columns.iter().position(|c| *c == term.column) {
-                Some(pos) => values[pos] = term.value,
+            let super::policy::ResolvedTerm::Cmp {
+                column,
+                op: super::policy::RowOp::Eq,
+                value,
+            } = term
+            else {
+                return Err(CompileError::Unsupported(
+                    "a non-equality row filter cannot be forced onto an insert".into(),
+                ));
+            };
+            match columns.iter().position(|c| *c == column) {
+                Some(pos) => values[pos] = value,
                 None => {
-                    columns.push(term.column);
-                    values.push(term.value);
+                    columns.push(column);
+                    values.push(value);
                 }
             }
         }
@@ -606,10 +643,9 @@ fn compile_write_where(
         }
     }
     if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
-        for term in filter.terms {
-            let col = cx.dialect.quote_ident(&term.column);
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} = {ph}"));
+        for term in &filter.terms {
+            let col = cx.dialect.quote_ident(term.column());
+            clauses.push(resolved_term_where(term, &col, cx));
         }
     }
     Ok(if clauses.is_empty() {
@@ -692,13 +728,9 @@ fn compile_root(
     // the `_by_pk` key equality or the list `where` arg.
     let mut clauses: Vec<String> = Vec::new();
     if let Some(filter) = policy.row_filter_with_target(table_name, claims, target)? {
-        for term in filter.terms {
-            let op = match term.op {
-                RowOp::Eq => "=",
-            };
-            let col = format!("{qualifier}.{}", dialect.quote_ident(&term.column));
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} {op} {ph}"));
+        for term in &filter.terms {
+            let col = format!("{qualifier}.{}", dialect.quote_ident(term.column()));
+            clauses.push(resolved_term_where(term, &col, &mut cx));
         }
     }
     if single {
@@ -988,10 +1020,9 @@ fn relationship_subquery(
         ));
     }
     if let Some(filter) = policy.row_filter_with_target(&rel.target_table, claims, target)? {
-        for term in filter.terms {
-            let col = format!("{qalias}.{}", cx.dialect.quote_ident(&term.column));
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} = {ph}"));
+        for term in &filter.terms {
+            let col = format!("{qalias}.{}", cx.dialect.quote_ident(term.column()));
+            clauses.push(resolved_term_where(term, &col, cx));
         }
     }
     let where_sql = clauses.join(" AND ");
@@ -1265,7 +1296,7 @@ fn json_to_sql(value: &serde_json::Value) -> Result<SqlValue, CompileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::policy::{DataPolicy, RowPredicate, RowTerm, RowValue, TablePolicy};
+    use super::super::policy::{DataPolicy, RowOp, RowPredicate, RowTerm, RowValue, TablePolicy};
     use super::super::schema::{Column, DbSchema, ForeignKey, ScalarType, Table};
     use super::*;
     use std::collections::BTreeMap;
@@ -1762,5 +1793,63 @@ mod tests {
         .unwrap();
         assert_eq!(stmt.sql, r#"DELETE FROM "users" WHERE "id" = ?1"#);
         assert_eq!(stmt.params, vec![SqlValue::Text("9".into())]);
+    }
+
+    #[test]
+    fn a_target_read_emits_tenant_b_and_the_public_subset_incl_a_null_test() {
+        use super::super::policy::{ResolvedTerm, TargetScope, TargetTable};
+        use std::collections::BTreeMap;
+        // A target read of tenant `B` confines `users` to `tenant_id = B AND published = ? AND
+        // deleted_at IS NULL` — proving the richer public predicate (equality + null test) lowers
+        // correctly at the root, with the tenant + literal bound as parameters (never interpolated)
+        // and the null test binding nothing.
+        let target = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::from([(
+                "users".to_string(),
+                TargetTable {
+                    tenant_column: "tenant_id".into(),
+                    public: vec![
+                        ResolvedTerm::Cmp {
+                            column: "published".into(),
+                            op: RowOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        },
+                        ResolvedTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+            )]),
+        };
+        let mut planned = compile(
+            "{ users { id } }",
+            &serde_json::json!({}),
+            &schema(),
+            &open_policy(),
+            &Claims::default(),
+            &super::super::dialect::Sqlite,
+            Some(&target),
+        )
+        .unwrap();
+        let root = planned.roots.remove(0);
+        assert!(
+            root.sql.contains(r#""users"."tenant_id" = ?"#),
+            "tenant scoped to B: {}",
+            root.sql
+        );
+        assert!(
+            root.sql.contains(r#""users"."published" = ?"#),
+            "public equality term: {}",
+            root.sql
+        );
+        assert!(
+            root.sql.contains(r#""users"."deleted_at" IS NULL"#),
+            "public null test (no placeholder): {}",
+            root.sql
+        );
+        assert!(root.params.contains(&SqlValue::Text("tenant_B".into())));
+        assert!(root.params.contains(&SqlValue::Boolean(true)));
     }
 }

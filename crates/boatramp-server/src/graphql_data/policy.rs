@@ -40,11 +40,31 @@ pub(crate) enum RowValue {
     Literal(SqlValue),
 }
 
-/// A row-predicate comparison. Kept minimal (equality) — the tenant-isolation case — and
-/// extensible.
+/// A row-predicate comparison. Equality is the tenant-isolation case (an own filter is always
+/// `tenant = X`); the ordering/inequality operators are used by a **target** read's public-subset
+/// terms (R4/D8), never by the own claim-bound path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowOp {
     Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl RowOp {
+    /// The SQL operator symbol.
+    pub(crate) fn symbol(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "<>",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
 }
 
 /// One term of a row predicate: `<column> <op> <value>`.
@@ -142,12 +162,29 @@ pub(crate) struct TargetScope {
     pub tables: BTreeMap<String, TargetTable>,
 }
 
-/// One resolved row-predicate term: a column compared to a concrete bound value.
+/// One resolved row-predicate term, ready to lower to a `WHERE` fragment: a column compared to a
+/// concrete bound value, or a null test. A tenant filter is always [`Cmp`](Self::Cmp) with
+/// [`RowOp::Eq`]; a target read's public-subset terms may be any comparison or a
+/// [`Null`](Self::Null) test (`deleted_at IS NULL`).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ResolvedTerm {
-    pub column: String,
-    pub op: RowOp,
-    pub value: SqlValue,
+pub(crate) enum ResolvedTerm {
+    /// `<column> <op> <bound value>`.
+    Cmp {
+        column: String,
+        op: RowOp,
+        value: SqlValue,
+    },
+    /// `<column> IS [NOT] NULL`.
+    Null { column: String, negated: bool },
+}
+
+impl ResolvedTerm {
+    /// The column this term constrains (for the write-insert force path, which keys on column).
+    pub(crate) fn column(&self) -> &str {
+        match self {
+            Self::Cmp { column, .. } | Self::Null { column, .. } => column,
+        }
+    }
 }
 
 /// A table's row predicate resolved against the request claims — ready to lower to a
@@ -263,7 +300,7 @@ impl DataPolicy {
                     .cloned()
                     .ok_or_else(|| PolicyError::MissingClaim(name.clone()))?,
             };
-            terms.push(ResolvedTerm {
+            terms.push(ResolvedTerm::Cmp {
                 column: term.column.clone(),
                 op: term.op,
                 value,
@@ -300,7 +337,7 @@ impl DataPolicy {
         // claim-bound predicate is deliberately NOT consulted here — a target read is confined by
         // the host-resolved B + the public subset, not by the caller's own claim.
         let mut terms = Vec::with_capacity(1 + confine.public.len());
-        terms.push(ResolvedTerm {
+        terms.push(ResolvedTerm::Cmp {
             column: confine.tenant_column.clone(),
             op: RowOp::Eq,
             value: ts.tenant_value.clone(),
@@ -407,7 +444,7 @@ mod tests {
         let filter = policy().row_filter("users", &claims).unwrap().unwrap();
         assert_eq!(
             filter.terms,
-            vec![ResolvedTerm {
+            vec![ResolvedTerm::Cmp {
                 column: "tenant_id".into(),
                 op: RowOp::Eq,
                 value: SqlValue::Text("acme".into()),
@@ -440,11 +477,18 @@ mod tests {
                 "users".to_string(),
                 TargetTable {
                     tenant_column: "tenant_id".into(),
-                    public: vec![ResolvedTerm {
-                        column: "published".into(),
-                        op: RowOp::Eq,
-                        value: SqlValue::Boolean(true),
-                    }],
+                    public: vec![
+                        ResolvedTerm::Cmp {
+                            column: "published".into(),
+                            op: RowOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        },
+                        // A null test (`deleted_at IS NULL`) — exercises the richer public predicate.
+                        ResolvedTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
                 },
             )]),
         };
@@ -456,15 +500,19 @@ mod tests {
         assert_eq!(
             filter.terms,
             vec![
-                ResolvedTerm {
+                ResolvedTerm::Cmp {
                     column: "tenant_id".into(),
                     op: RowOp::Eq,
                     value: SqlValue::Text("tenant_B".into()),
                 },
-                ResolvedTerm {
+                ResolvedTerm::Cmp {
                     column: "published".into(),
                     op: RowOp::Eq,
                     value: SqlValue::Boolean(true),
+                },
+                ResolvedTerm::Null {
+                    column: "deleted_at".into(),
+                    negated: false,
                 },
             ]
         );
