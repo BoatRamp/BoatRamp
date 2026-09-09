@@ -26,6 +26,9 @@ name: CI
 #   • test-gdc-target — the Stage 5a GraphQL target-tenant READ isolation proof on a REAL libsql
 #                      engine (`@tenant(scope: target)` confines to another tenant's PUBLIC subset;
 #                      deny-by-default on an undeclared subset). Ignore-gated → host lane, marker-gated.
+#   • test-target-plain-wasm — the SAME target-read isolation for a non-federated `Tenancy::Target`
+#                      route, over BOTH the `orm` binding and raw `sql` ({scope} marker), on a REAL
+#                      libsql engine. Ignore-gated → host lane, marker-gated.
 #   • deny           — cargo-deny bans/licenses/sources (+ non-blocking advisories).
 # clippy and test are the two full workspace compiles; running them as separate
 # jobs lets them build concurrently on separate runners instead of one after the
@@ -344,6 +347,32 @@ jobs:
             || { echo "::error::GDC target-tenant read isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GDC TARGET-TENANT ISOLATION OK' gdc-target.log \
             || { echo "::error::GDC target-tenant read never reached its success marker (a target-read isolation breach or a skipped test)" >&2; exit 1; }
+
+  # Stage 5a PLAIN-WASM target-tenant read isolation HARD GATE. The non-federated analog of
+  # test-gdc-target: a `Tenancy::Target` route's `orm` AND raw-`sql` reads must both confine to
+  # another tenant `B`'s declared PUBLIC subset on a REAL libsql engine (HostTenancy::target →
+  # orm_scope compile+run AND sql_marker splice+run). `#[ignore]`d (static-musl libsql segfault),
+  # run here unignored on the host toolchain + marker-asserted, so a silent skip OR a target-read
+  # isolation breach on either binding fails the merge.
+  test-target-plain-wasm:
+    name: test (plain-wasm target-tenant read isolation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-target-plain-wasm-host
+      - name: Live plain-wasm target-tenant read isolation on a real libsql engine
+        run: |
+          set -eo pipefail
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            plain_wasm_target_confines_orm_and_raw_sql_to_b_public_on_a_real_engine \
+            -- --ignored --nocapture 2>&1 | tee target-plainwasm.log
+          grep -qE 'test result: ok\. 1 passed' target-plainwasm.log \
+            || { echo "::error::plain-wasm target-tenant read isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'PLAIN-WASM TARGET ISOLATION OK' target-plainwasm.log \
+            || { echo "::error::plain-wasm target-tenant read never reached its success marker (an orm/raw-sql target-read isolation breach or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

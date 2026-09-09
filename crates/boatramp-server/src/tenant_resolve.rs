@@ -647,4 +647,154 @@ mod tests {
         .unwrap();
         assert!(ht.orm_scope(boatramp_handlers::TenantAxis::Read).is_err());
     }
+
+    /// **Live** proof (R4/D8) that a **plain-wasm** target route confines BOTH its `orm` and its
+    /// raw-`sql` reads to tenant `B`'s PUBLIC subset on a REAL libsql engine — the non-federated
+    /// analog of the GDC target live gate. Drives `HostTenancy::target` through `orm_scope`
+    /// (force_scope → compile → run) AND `sql_marker` (splice → run) against a shared `products`
+    /// table holding tenant A's row + tenant B's public / draft / soft-deleted rows, asserting each
+    /// path returns ONLY B's published, non-deleted row. `#[ignore]`d for the same libsql
+    /// static-musl segfault reason as the ORM batteries; the `test-target-plain-wasm` CI job runs it
+    /// unignored on the host toolchain and greps the marker.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn plain_wasm_target_confines_orm_and_raw_sql_to_b_public_on_a_real_engine() {
+        use boatramp_core::orm::{Expr, Select, SelectItem};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm,
+            TableScope, TenancySchema,
+        };
+        use boatramp_handlers::{HostTenancy, TenantAxis};
+        use std::collections::BTreeMap;
+
+        let dir =
+            std::env::temp_dir().join(format!("boatramp-target-plainwasm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "shop", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE products (id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, \
+                 published INTEGER, deleted_at TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, name, published, deleted) in [
+                ("b1", "tenant_B", "B public", 1i64, None),
+                ("b2", "tenant_B", "B draft", 0, None),
+                ("b3", "tenant_B", "B removed", 1, Some("2020-01-01")),
+                ("a1", "tenant_A", "A public", 1, None),
+            ] {
+                tx.execute(
+                    "INSERT INTO products (id, tenant_id, name, published, deleted_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(name.into()),
+                        SqlValue::Integer(published),
+                        deleted.map_or(SqlValue::Null, |d| SqlValue::Text(d.into())),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Project schema: `products` is a Tenant table with a public subset (published=1 AND
+        // deleted_at IS NULL). Build the plain-wasm target principal for tenant B.
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("products".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "products".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![
+                        PublicTerm::Cmp {
+                            column: "published".into(),
+                            op: PublicCmp::Eq,
+                            value: PublicLiteral::Int(1),
+                        },
+                        PublicTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        let ht = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema,
+            "products",
+        );
+
+        // (1) The `orm` path: force the target scope onto a Select, compile, run.
+        let mut q = Select {
+            columns: vec![SelectItem {
+                expr: Expr::col("name"),
+                alias: None,
+            }],
+            ..Select::from("products")
+        };
+        q.force_scope(&ht.orm_scope(TenantAxis::Read).unwrap().unwrap())
+            .unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let orm_rows = run_text_rows(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            orm_rows,
+            vec!["B public".to_string()],
+            "orm target read returns ONLY B's published, non-deleted row: {sql}"
+        );
+        tx.commit().await.unwrap();
+
+        // (2) The raw-SQL path: splice the `{scope}` marker into a raw statement, run.
+        let (pred, values) = ht.sql_marker(TenantAxis::Read, 0).unwrap();
+        let raw = format!("SELECT name FROM products WHERE {pred}");
+        let mut tx = db.begin().await.unwrap();
+        let raw_rows = run_text_rows(tx.as_mut(), &raw, &values).await;
+        assert_eq!(
+            raw_rows,
+            vec!["B public".to_string()],
+            "raw-SQL target read returns ONLY B's published, non-deleted row: {raw}"
+        );
+        tx.commit().await.unwrap();
+
+        println!(
+            "PLAIN-WASM TARGET ISOLATION OK: a target route's orm AND raw-sql reads each return only \
+             tenant B's published+non-deleted rows (never tenant A's, never B's draft/removed) on a \
+             real libsql engine"
+        );
+    }
+
+    /// Run a compiled `(sql, params)` returning the single text column, sorted.
+    async fn run_text_rows(
+        tx: &mut dyn boatramp_core::sql::SqlTransaction,
+        sql: &str,
+        params: &[boatramp_core::sql::SqlValue],
+    ) -> Vec<String> {
+        let rows = tx.query(sql, params).await.expect("query runs");
+        let mut out: Vec<String> = rows
+            .rows
+            .into_iter()
+            .flatten()
+            .filter_map(|v| match v {
+                boatramp_core::sql::SqlValue::Text(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
 }
