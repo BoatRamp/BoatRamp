@@ -5,6 +5,50 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.3] - 2026-09-09
+
+### Added
+- **Host-forced tenancy becomes a resolved *principal* — an axis-tagged fact set
+  (`PLAN-tenancy-principal`).** v0.4.0 gave every guest `sql`/`orm` query one host-forced tenant
+  scope (one column, one value, one request-time source). This release generalizes that scalar into
+  a small, closed set of host-verified **scope facts** — `Tenant`, `Session`, `TargetTenant` —
+  resolved per axis and applied against a **project-declared tenancy schema**, so several real
+  app shapes stop having to fall back to `all`/`disabled` + hand-written predicates. The guest still
+  names no own/session/private value, column, scope, or predicate; the host owns every fact, key, and
+  predicate, and injects them fail-closed. Guest-blind, host-verified, deny-by-default throughout;
+  each piece shipped behind a security-review-to-convergence loop **and** a CI-hard-gated live
+  tenant-isolation test on a real engine.
+  - **Project tenancy schema.** A per-project `TenancySchema` holds the tenant key(s) as a data-model
+    fact instead of baking one column into each component: per-table `TableScope` (`Tenant`,
+    `TenantKeyed { key }` for an identity table on its own PK, `TenantOrSession`, `Unscoped` global
+    reference data), with an **absent table refused deny-by-default** (never silently global). An
+    absent schema stays byte-identical to v0.4.0 (`tenant_id`, every table `Tenant`).
+  - **Anonymous `Session` axis.** A host-issued, host-verified COSE-signed session cookie (reusing
+    the fleet `Signer`; no app JWKS, no JS) gives anonymous-first flows (carts, onboarding drafts) a
+    stable identity. A `TenantOrSession` table lowers to `Or([tenant = <own>, session = <sid>])` over
+    two disjoint columns, so a cheap anon session is structurally confined to `tenant IS NULL` rows.
+    A new deny-by-default **`promote`** verb claims a session's rows for a tenant on sign-up
+    (idempotent, non-widening).
+  - **Durable signed context (the async lane).** A host-signed context envelope stamps the
+    producer's resolved tenant onto durable messages / cron materializations / async invokes, so a
+    background consumer declaring `sources: [signed_context]` resolves a verified "own" tenant with no
+    inbound request. Guest-blind (the host stamps it); forged/absent fails closed.
+  - **Target-tenant axis — read (and, with a grant, write) *one other* tenant's PUBLIC subset.** A
+    route/field can serve the caller's own data AND a second tenant `B`'s published subset (a public
+    storefront / embed / share link), confined to `tenant = B AND <public subset>` and never `all`.
+    The public-subset confinement composes across every join/subquery reference (ORM), across the
+    federated GraphQL data connector, and — new — across **arbitrary raw SQL**, which the host now
+    parses and rewrites at the AST level so every table reference is confined (a guest can't reposition
+    or `OR`-escape it; CTEs and un-confinable constructs are refused). Target **writes** (INSERT +
+    UPDATE with a SET-allowlist; DELETE refused) land only in `B`'s public subset and can't flip
+    visibility or change ownership. The target tenant is resolved from a prioritized **`via`** source
+    list — `domain` (the routed host), `capability` (a host-signed, audience- and subset-bound
+    envelope), or a read-only public **`handle`** (an operator-published slug, admissible only on a
+    `world_public` subset, no existence oracle). A host-mediated **`attach_reference`** verb creates a
+    row whose tenant is derived from a parent reachable under the caller's scope (adds no authority; a
+    no-op when unreachable). The target axis is opt-in per route via an operator-held
+    `target_eligible_fields` allowlist; selecting the wrong scope is unrepresentable.
+
 ## [0.4.2] - 2026-09-07
 
 ### Added
