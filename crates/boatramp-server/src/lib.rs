@@ -1745,6 +1745,8 @@ fn deploy_error_response(err: DeployError) -> Response {
         DeployError::Conflict(_) => StatusCode::CONFLICT,
         // An ambiguous preview-id prefix is not a usable capability → not found.
         DeployError::Ambiguous(_) => StatusCode::NOT_FOUND,
+        // A submitted config failed content validation (e.g. an empty target public predicate).
+        DeployError::Invalid(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     tracing::warn!(error = %err, "request failed");

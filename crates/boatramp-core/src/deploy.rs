@@ -801,12 +801,16 @@ impl DeployStore {
     }
 
     /// Store the project's [`TenancySchema`](crate::tenancy::TenancySchema) (replaces any prior one).
-    /// Deny-by-default is enforced downstream at scope injection, not here — this is plain storage.
+    /// Deny-by-default is enforced downstream at scope injection; the one thing enforced **here** is
+    /// [`TenancySchema::validate`] — refusing a schema whose public subset would defeat the
+    /// target-read confinement (an empty predicate) rather than storing a match-all subset. The
+    /// write path is the single choke point where this is caught.
     pub async fn set_project_tenancy(
         &self,
         project: ProjectRef<'_>,
         schema: &crate::tenancy::TenancySchema,
     ) -> Result<(), DeployError> {
+        schema.validate().map_err(DeployError::Invalid)?;
         let bytes = serde_json::to_vec(schema).map_err(|e| DeployError::Serde(e.to_string()))?;
         self.kv
             .put(&keys::project_config(project, "tenancy"), bytes)

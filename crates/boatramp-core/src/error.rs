@@ -100,6 +100,12 @@ pub enum DeployError {
     /// `409 Conflict`.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// A submitted config failed a content-validation check before storage (e.g. a project
+    /// tenancy schema with an empty public predicate that would defeat the target-read
+    /// confinement). Surfaced as a `400 Bad Request` — the write is refused, not stored.
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl From<serde_json::Error> for DeployError {

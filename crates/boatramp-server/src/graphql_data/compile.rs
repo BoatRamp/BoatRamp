@@ -846,6 +846,16 @@ fn compile_selection(
         }
         // A field resolved by a wasm function (the config allowlist), not a column.
         if let Some(function) = policy.delegated(&table.name, f_name) {
+            // R4/D8 fail-closed: a delegated (wasm-resolved) field is NOT confined by the target
+            // public subset (it invokes a function with the row keys, outside the per-table
+            // `tenant = B AND <public>` injection), so it is refused under a target read rather than
+            // resolved un-confined. Own reads delegate as before.
+            if target.is_some() {
+                return Err(CompileError::Unsupported(format!(
+                    "delegated field `{}.{f_name}` is not permitted under a target-tenant read",
+                    table.name
+                )));
+            }
             delegations.push(compile_delegation(
                 f,
                 function,
@@ -1851,5 +1861,60 @@ mod tests {
         );
         assert!(root.params.contains(&SqlValue::Text("tenant_B".into())));
         assert!(root.params.contains(&SqlValue::Boolean(true)));
+    }
+
+    #[test]
+    fn a_delegated_field_is_refused_under_a_target_read() {
+        use super::super::policy::{ResolvedTerm, RowOp, TargetScope, TargetTable};
+        use std::collections::BTreeMap;
+        // `users.reviews` delegates to a wasm resolver. A delegated field runs OUTSIDE the per-table
+        // `tenant = B AND <public>` injection, so a target read must refuse it (fail-closed), while
+        // an own read still delegates.
+        let policy = DataPolicy::new().with_table(
+            "users",
+            TablePolicy::columns(["id", "name"]).with_resolver("reviews", "reviews"),
+        );
+        let target = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::from([(
+                "users".to_string(),
+                TargetTable {
+                    tenant_column: "tenant_id".into(),
+                    public: vec![ResolvedTerm::Cmp {
+                        column: "published".into(),
+                        op: RowOp::Eq,
+                        value: SqlValue::Boolean(true),
+                    }],
+                },
+            )]),
+        };
+        let err = compile(
+            "{ users { name reviews { body } } }",
+            &serde_json::json!({}),
+            &schema(),
+            &policy,
+            &Claims::default(),
+            &super::super::dialect::Sqlite,
+            Some(&target),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("delegated") && m.contains("target-tenant")),
+            "a delegated field must be refused under a target read, got {err:?}"
+        );
+        // The SAME query on the OWN path (target = None) still delegates.
+        assert!(
+            compile(
+                "{ users { name reviews { body } } }",
+                &serde_json::json!({}),
+                &schema(),
+                &policy,
+                &Claims::default(),
+                &super::super::dialect::Sqlite,
+                None,
+            )
+            .is_ok(),
+            "an own read still delegates"
+        );
     }
 }

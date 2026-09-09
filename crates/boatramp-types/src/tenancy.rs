@@ -442,6 +442,27 @@ impl TenancySchema {
         self.public_subsets.get(table)
     }
 
+    /// Validate the schema before it is stored — the safety checks the target-read confinement
+    /// assumes. Returns a human-readable reason on the first violation.
+    ///
+    /// **An empty public predicate is refused (R4/D8).** A [`PublicSubset`] with no terms would
+    /// match **every** row (`tenant = B` with no visibility restriction), silently defeating the
+    /// target-read confinement and exposing a tenant's PRIVATE rows — so a subset that declares a
+    /// public surface must actually restrict it. Callers reject a schema that fails this rather than
+    /// store a match-all subset (the write path is the single choke point where this can be caught).
+    pub fn validate(&self) -> Result<(), String> {
+        for (table, subset) in &self.public_subsets {
+            if subset.predicate.terms.is_empty() {
+                return Err(format!(
+                    "public subset for table `{table}` has an empty predicate (would match every \
+                     row, defeating the target-read confinement) — declare at least one visibility \
+                     term (e.g. `published = true`)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve how to scope `table`. `None` ⇒ **refused** (undeclared under a present schema —
     /// deny-by-default; the injector fails the query closed; ALSO returned for a `TenantOrSession`
     /// table when the schema declares no `session_key`, so the unrepresentable disjunct fails
@@ -722,6 +743,42 @@ mod tests {
         // The whole schema round-trips (it is stored/loaded as the project config).
         let s = serde_json::to_string(&schema).unwrap();
         assert_eq!(schema, serde_json::from_str::<TenancySchema>(&s).unwrap());
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_public_predicate() {
+        let mut schema = TenancySchema::default();
+        // A public subset with at least one visibility term is valid.
+        schema.public_subsets.insert(
+            "products".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![PublicTerm::Cmp {
+                        column: "published".into(),
+                        op: PublicCmp::Eq,
+                        value: PublicLiteral::Bool(true),
+                    }],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        assert!(schema.validate().is_ok());
+        // An EMPTY predicate would match every row (`tenant = B` with no visibility restriction),
+        // defeating the target-read confinement — refused at the write path.
+        schema.public_subsets.insert(
+            "orders".into(),
+            PublicSubset {
+                predicate: PublicPredicate { terms: vec![] },
+                world_public: true,
+                listable: false,
+            },
+        );
+        let err = schema.validate().unwrap_err();
+        assert!(
+            err.contains("orders") && err.contains("empty predicate"),
+            "got: {err}"
+        );
     }
 
     #[test]
