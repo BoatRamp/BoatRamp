@@ -2388,8 +2388,15 @@ pub fn compile_attach_reference(
     let is_target = scope.is_target();
     let mut columns: Vec<String> = Vec::with_capacity(spec.set.len() + 2);
     let mut projection: Vec<SelectItem> = Vec::with_capacity(spec.set.len() + 2);
-    // The guest's non-tenant columns — gated by the target write-allowlist (never tenant/visibility).
+    // The guest's non-tenant columns. The host DERIVES the child's tenant column from the parent, so
+    // the guest may never name it (own OR target) — that would collide with (or try to forge) the
+    // derived value. Under target, columns are additionally gated by the write-allowlist (never a
+    // visibility column). Under own, they are only validated as identifiers (the caller writes its
+    // own rows, exactly as a normal own INSERT).
     for a in &spec.set {
+        if same_col(&a.column, &child_tenant) {
+            return Err(OrmError::TargetWriteColumnDenied(a.column.clone()));
+        }
         if is_target {
             scope.assert_target_settable(&spec.child, &a.column)?;
         } else {
@@ -4653,6 +4660,40 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn attach_reference_own_refuses_the_guest_naming_the_tenant_column() {
+        use std::collections::BTreeMap;
+        // Even under OWN (no write-allowlist gating), the guest may not name the child's tenant
+        // column in `set` — the host derives it from the parent; a guest value would collide/forge.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "favorites".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+                (
+                    "products".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+            ])),
+        };
+        let spec = AttachReference {
+            set: vec![Assignment {
+                column: "tenant_id".into(),
+                value: Expr::val(t("VICTIM")),
+            }],
+            ..attach_spec()
+        };
+        assert!(matches!(
+            compile_attach_reference(&scope, &spec, Dialect::Sqlite).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(ref c) if c == "tenant_id"
+        ));
     }
 
     #[test]
