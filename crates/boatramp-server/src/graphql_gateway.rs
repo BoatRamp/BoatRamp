@@ -215,7 +215,6 @@ async fn invoke_subgraph(
 /// terms). A table with a public subset but no resolvable tenant column is omitted — so a target
 /// read of it is refused (deny-by-default). `B` is host-derived at the edge (terminating domain /
 /// verified capability / handle lookup), NEVER guest input.
-#[allow(dead_code)] // called by the edge target resolver (next increment) + the test below
 pub(crate) fn build_target_scope(
     schema: &boatramp_core::tenancy::TenancySchema,
     tenant_value: boatramp_core::sql::SqlValue,
@@ -246,7 +245,6 @@ pub(crate) fn build_target_scope(
 /// Lower a host-held [`PublicPredicate`](boatramp_core::tenancy::PublicPredicate) into GDC
 /// [`ResolvedTerm`](crate::graphql_data::policy::ResolvedTerm)s (literals become bound values, never
 /// interpolated). The GDC analogue of `boatramp_core::orm::lower_public_terms`.
-#[allow(dead_code)] // reached via build_target_scope (edge resolver next increment)
 fn lower_public_terms_gdc(
     pred: &boatramp_core::tenancy::PublicPredicate,
 ) -> Vec<crate::graphql_data::policy::ResolvedTerm> {
@@ -343,7 +341,6 @@ impl BackendRouter {
     /// `Target`-class fetch (read another tenant `B`'s public subset). Absent ⇒ a `Target` fetch
     /// fails closed. Set by the edge once it has resolved the target identity + built the confinement
     /// from the project schema.
-    #[allow(dead_code)] // wired by the edge's target resolver (5c / live gate)
     pub(crate) fn with_target(
         mut self,
         target: Option<crate::graphql_data::policy::TargetScope>,

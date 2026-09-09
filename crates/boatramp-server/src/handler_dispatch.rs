@@ -196,6 +196,13 @@ pub(super) async fn dispatch_handler(
                                 .or_else(|| s.strip_prefix("bearer "))
                         })
                         .map(str::to_string);
+                    // The routed domain's context tag (R4/D8): the target-tenant `B` for a
+                    // carried-domain target read (a same-origin funnel served on B's host). Stashed
+                    // in the request extensions at host routing — never guest input.
+                    let domain_context = parts
+                        .extensions
+                        .get::<crate::DomainContext>()
+                        .map(|c| c.0.clone());
                     // GraphQL subscription: serve it as a graphql-sse event stream,
                     // deriving the messaging topic from the subscription's root field. A
                     // producer (a mutation, a function) publishes each execution result to
@@ -227,6 +234,7 @@ pub(super) async fn dispatch_handler(
                             query,
                             &variables,
                             bearer.as_deref(),
+                            domain_context.as_deref(),
                         )
                         .await;
                     }
@@ -461,6 +469,7 @@ async fn federation_gateway(
     query: &str,
     variables: &serde_json::Value,
     bearer: Option<&str>,
+    domain_context: Option<&str>,
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
@@ -503,7 +512,7 @@ async fn federation_gateway(
     // data connector, a function subgraph via the invoke path. This is where a GraphQL→SQL
     // subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
     let sql_subgraphs = (*cached.sql_subgraphs).clone();
-    let runner = crate::graphql_gateway::BackendRouter::new(
+    let mut runner = crate::graphql_gateway::BackendRouter::new(
         // A federated sub-fetch to a sibling doesn't propagate an in-site tenant (the GDC's own
         // row policy governs data access); a scoped sibling fail-closes for an `own` op.
         invoker.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()),
@@ -512,7 +521,41 @@ async fn federation_gateway(
         sql_subgraphs,
         bearer.map(str::to_string),
     );
+    // R4/D8: when the plan has any `target`-class fetch, resolve the target tenant `B` and bind the
+    // request's confinement so those fetches read only B's public subset. For 5a, `B` is the
+    // terminating domain's context tag (a same-origin funnel on B's host) — never guest input; the
+    // full `via` source model (handle/capability) lands in 5c. No domain, or no project schema, ⇒
+    // no target scope ⇒ every target fetch fails closed (build_target_scope + the fetch branch).
+    if plan.fetches.iter().any(|f| f.class.is_target()) {
+        if let Some(target) = resolve_carried_domain_target(inner, project, domain_context).await {
+            runner = runner.with_target(Some(target));
+        }
+    }
     axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
+}
+
+/// Resolve a **carried-domain** target scope (R4/D8, the 5a source): the target tenant `B` is the
+/// terminating domain's context tag, confined by the project's [`TenancySchema`] public subsets.
+/// `None` — so every target fetch fails closed — when there is no domain tag, no stored project
+/// schema, or the schema can't be read. `B` is host-derived (the routed domain), never guest input.
+#[cfg(feature = "handlers")]
+async fn resolve_carried_domain_target(
+    inner: &HandlerRuntimeInner,
+    project: &str,
+    domain_context: Option<&str>,
+) -> Option<crate::graphql_data::policy::TargetScope> {
+    let b = domain_context.filter(|c| !c.is_empty())?;
+    let schema = boatramp_core::deploy::load_project_tenancy(
+        inner.kv.as_ref(),
+        boatramp_core::project::ProjectRef::new(project),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    Some(crate::graphql_gateway::build_target_scope(
+        &schema,
+        boatramp_core::sql::SqlValue::Text(b.to_string()),
+    ))
 }
 
 /// The declarative data connector: serve a GraphQL query from the site's managed database.
