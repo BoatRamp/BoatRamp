@@ -1159,6 +1159,20 @@ pub(super) async fn build_bindings(
                          (add it to the project's target_eligible_fields)"
                     ));
                 }
+                // The named `public` subset MUST be declared (deny-by-default). Without this the
+                // raw-SQL marker would degrade OPEN — `tenant = B` with no visibility restriction,
+                // exposing B's private rows — so a missing/typo'd subset name is refused at bind,
+                // never bound. (The orm path is already deny-by-default per table.)
+                if schema
+                    .as_ref()
+                    .and_then(|s| s.public_subset(public))
+                    .is_none()
+                {
+                    return Err(format!(
+                        "tenancy: target route `{site}` names public subset `{public}` which the \
+                         project schema does not declare (deny-by-default)"
+                    ));
+                }
                 // 5a resolves `B` from the routed domain only (the full `via` model is 5c).
                 let b = via
                     .contains(&boatramp_core::tenancy::TargetSource::Domain)

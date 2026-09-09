@@ -342,6 +342,13 @@ impl HostTenancy {
                 }
                 .cloned()
                 .ok_or(TenantDenied::NoSource)?;
+                // Fail closed: a target read with NO public terms would degrade to a bare
+                // `tenant = B` (every one of B's rows, incl. private) — refuse rather than emit an
+                // unconfined marker. (build_bindings also refuses an undeclared `public` at bind;
+                // this is the marker-level backstop for any other caller / a subset-less name.)
+                if is_target && self.target_public.is_empty() {
+                    return Err(TenantDenied::NoSource);
+                }
                 let mut next = param_count + 1;
                 let mut sql = format!("{col} = ?{next}");
                 let mut values = vec![v];
