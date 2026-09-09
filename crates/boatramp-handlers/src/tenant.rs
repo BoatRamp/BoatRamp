@@ -140,11 +140,17 @@ impl HostTenancy {
     /// guest-placed marker). `public` remains part of the bind API — the caller uses it to prove the
     /// route's declared subset exists at bind time — but does not narrow the confinement: every
     /// accessed table is confined on its OWN declared subset.
+    /// `write` is the SET-allowlist of the target route's write grant (5b) — the columns a target
+    /// INSERT/UPDATE may set. **Empty ⇒ read-only** (the write axis is denied); non-empty ⇒ the write
+    /// axis is `Own`-mode and the orm write path confines the write to `B`'s public subset (force-stamp
+    /// `tenant = B` + the visibility columns on INSERT, confine the WHERE + allowlist on UPDATE, refuse
+    /// DELETE). Raw-SQL target writes stay refused regardless (the AST rewriter is read-only).
     pub fn target(
         target_value: SqlValue,
         read: AccessMode,
         schema: &TenancySchema,
         public: &str,
+        write: &[String],
     ) -> Self {
         let _ = public;
         // Confine every accessed table on its own declared public subset (both the orm compiler and
@@ -168,12 +174,19 @@ impl HostTenancy {
                 value: target_value,
             }],
             read,
-            // Target writes need their own grant + confinement (a later stage); a target-read
-            // principal is read-only, so the write axis is denied outright here.
-            write: AccessMode::None,
+            // A target write grant (5b) opens the write axis (`Own`-mode, bound to `B`); an empty
+            // allowlist leaves it denied (`None`) — read-only, today's behavior. The orm write path
+            // reads the allowlist out of `PerTableTarget.write` and confines the write to B's public
+            // subset; a raw-SQL write is refused by the AST rewriter regardless.
+            write: if write.is_empty() {
+                AccessMode::None
+            } else {
+                AccessMode::Own
+            },
             keys: TableKeys::PerTableTarget {
                 keys: schema.table_key_map(),
                 public: per_table,
+                write: write.iter().cloned().collect(),
             },
         }
     }
@@ -313,7 +326,7 @@ impl HostTenancy {
         dialect: boatramp_core::sql::Dialect,
     ) -> Result<String, boatramp_core::target_sql::TargetRewriteError> {
         use boatramp_core::target_sql::{rewrite_target_select, TargetRewriteError};
-        let TableKeys::PerTableTarget { keys, public } = &self.keys else {
+        let TableKeys::PerTableTarget { keys, public, .. } = &self.keys else {
             // Only ever called for a target principal; refuse fail-closed if not.
             return Err(TargetRewriteError::MissingTarget);
         };
@@ -615,14 +628,14 @@ mod tests {
             },
         );
 
-        let ht = HostTenancy::target(t("tenant_B"), AccessMode::Own, &schema, "products");
+        let ht = HostTenancy::target(t("tenant_B"), AccessMode::Own, &schema, "products", &[]);
         let scope = ht.orm_scope(Axis::Read).unwrap().unwrap();
         // Bound to B (the TargetTenant fact), own-mode, and carrying the PerTableTarget keys+public.
         assert_eq!(scope.value, Some(t("tenant_B")));
         assert_eq!(scope.session, None);
         assert_eq!(scope.mode, ScopeMode::Own);
         match &scope.keys {
-            TableKeys::PerTableTarget { keys, public } => {
+            TableKeys::PerTableTarget { keys, public, .. } => {
                 assert!(keys.contains_key("products"));
                 assert!(
                     public.contains_key("products"),

@@ -698,7 +698,7 @@ mod tests {
                         SqlValue::Text(tenant.into()),
                         SqlValue::Text(name.into()),
                         SqlValue::Integer(published),
-                        deleted.map_or(SqlValue::Null, |d| SqlValue::Text(d.into())),
+                        deleted.map_or(SqlValue::Null, |d: &str| SqlValue::Text(d.into())),
                     ],
                 )
                 .await
@@ -739,6 +739,7 @@ mod tests {
             AccessMode::Own,
             &schema,
             "products",
+            &[],
         );
 
         // (1) The `orm` path: force the target scope onto a Select, compile, run.
@@ -822,6 +823,270 @@ mod tests {
              tenant B's published+non-deleted rows (never tenant A's, never B's draft/removed) on a \
              real libsql engine — the raw-SQL path is AST-rewritten so multi-table joins, subqueries, \
              and OR-escapes are all confined, and an undeclared table is refused"
+        );
+    }
+
+    /// **Live** proof (R4/D8, Stage 5b) that a **plain-wasm** target route's WRITES land ONLY in
+    /// tenant `B`'s PUBLIC subset on a REAL libsql engine: an INSERT force-stamps `tenant = B` + the
+    /// visibility columns (so the row is B's and public) and takes only the SET-allowlisted column
+    /// from the guest; an UPDATE is confined to `tenant = B AND <public>` and may set only the
+    /// allowlisted column; a DELETE, a set of the tenant/visibility column, and a read-only-route
+    /// write are all refused. `#[ignore]`d (static-musl libsql segfault); the `test-target-plain-wasm`
+    /// CI job runs it unignored and greps the marker.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn plain_wasm_target_writes_confine_to_b_public_subset_on_a_real_engine() {
+        use boatramp_core::orm::{Assignment, CmpOp, Delete, Expr, Insert, Predicate, RowValues};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm,
+            TableScope, TenancySchema,
+        };
+        use boatramp_handlers::{HostTenancy, TenantAxis};
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!(
+            "boatramp-target-plainwasm-write-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "shop", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE products (id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, \
+                 published INTEGER, deleted_at TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, name, published, deleted) in [
+                ("b1", "tenant_B", "B public", 1i64, None),
+                ("b2", "tenant_B", "B draft", 0, None),
+                ("a1", "tenant_A", "A public", 1, None),
+            ] {
+                tx.execute(
+                    "INSERT INTO products (id, tenant_id, name, published, deleted_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(name.into()),
+                        SqlValue::Integer(published),
+                        deleted.map_or(SqlValue::Null, |d: &str| SqlValue::Text(d.into())),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("products".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "products".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![
+                        PublicTerm::Cmp {
+                            column: "published".into(),
+                            op: PublicCmp::Eq,
+                            value: PublicLiteral::Int(1),
+                        },
+                        PublicTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        // A write-granted target principal: the guest may set ONLY `name`.
+        let ht = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema,
+            "products",
+            &["name".to_string()],
+        );
+        let write = ht.orm_scope(TenantAxis::Write).unwrap().unwrap();
+        let read = ht.orm_scope(TenantAxis::Read).unwrap().unwrap();
+
+        // (1) INSERT: the guest sets only `name`; the host force-stamps tenant=B + published=1 +
+        // deleted_at=NULL, so the row lands in B's public subset.
+        let mut ins = Insert {
+            table: "products".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "id".into(),
+                        value: Expr::val(SqlValue::Text("new1".into())),
+                    },
+                    Assignment {
+                        column: "name".into(),
+                        value: Expr::val(SqlValue::Text("guest wrote".into())),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        // `id` is not in the allowlist → the INSERT must be refused (the guest may set only `name`).
+        assert!(
+            ins.force_scope(Some(&write), Some(&read)).is_err(),
+            "a target INSERT setting a non-allowlisted column (id) must be refused"
+        );
+        // With only `name`, it is accepted and confined.
+        let mut ins = Insert {
+            table: "products".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "name".into(),
+                    value: Expr::val(SqlValue::Text("guest wrote".into())),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&write), Some(&read)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        tx.commit().await.unwrap();
+        // Read the inserted row back (as the operator, unscoped) — it must be B's + public.
+        let mut tx = db.begin().await.unwrap();
+        let rows = tx
+            .query(
+                "SELECT tenant_id, published, deleted_at FROM products WHERE name = 'guest wrote'",
+                &[],
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(rows.rows.len(), 1, "exactly one inserted row");
+        let row = &rows.rows[0];
+        assert_eq!(
+            row[0],
+            SqlValue::Text("tenant_B".into()),
+            "tenant forced to B"
+        );
+        assert!(
+            matches!(row[1], SqlValue::Integer(1)),
+            "published forced to 1 (public)"
+        );
+        assert_eq!(row[2], SqlValue::Null, "deleted_at forced NULL (public)");
+
+        // (2) UPDATE confined to B's public rows. Targeting b2 (B's DRAFT, non-public) changes
+        // nothing; targeting a1 (tenant A) changes nothing; targeting b1 (B public) renames it.
+        for (id, expected) in [("b2", 0u64), ("a1", 0), ("b1", 1)] {
+            let mut upd = boatramp_core::orm::Update {
+                table: "products".into(),
+                set: vec![Assignment {
+                    column: "name".into(),
+                    value: Expr::val(SqlValue::Text("RENAMED".into())),
+                }],
+                filter: Predicate::Cmp {
+                    left: Expr::col("id"),
+                    op: CmpOp::Eq,
+                    right: Expr::val(SqlValue::Text(id.into())),
+                },
+                scope: None,
+                returning: vec![],
+            };
+            upd.force_scope(&write).unwrap();
+            let (sql, params) = upd.compile(Dialect::Sqlite).unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let n = tx.execute(&sql, &params).await.unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(
+                n, expected,
+                "UPDATE of {id}: expected {expected} rows affected (confined to B's public subset)"
+            );
+        }
+        // Confirm only b1 was renamed; b2/a1 kept their names.
+        let mut tx = db.begin().await.unwrap();
+        let names = run_text_rows(
+            tx.as_mut(),
+            "SELECT name FROM products WHERE id IN ('b1','b2','a1') ORDER BY id",
+            &[],
+        )
+        .await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "A public".to_string(),
+                "B draft".to_string(),
+                "RENAMED".to_string()
+            ],
+            "only B's public row (b1) was renamed; B's draft + tenant A untouched"
+        );
+
+        // (3) A target UPDATE that tries to flip visibility (set published) is refused.
+        let mut flip = boatramp_core::orm::Update {
+            table: "products".into(),
+            set: vec![Assignment {
+                column: "published".into(),
+                value: Expr::val(SqlValue::Integer(0)),
+            }],
+            filter: Predicate::Cmp {
+                left: Expr::col("id"),
+                op: CmpOp::Eq,
+                right: Expr::val(SqlValue::Text("b1".into())),
+            },
+            scope: None,
+            returning: vec![],
+        };
+        assert!(
+            flip.force_scope(&write).is_err(),
+            "a target UPDATE may not set a visibility column (published)"
+        );
+
+        // (4) A target DELETE is always refused.
+        let mut del = Delete {
+            table: "products".into(),
+            filter: Predicate::Cmp {
+                left: Expr::col("id"),
+                op: CmpOp::Eq,
+                right: Expr::val(SqlValue::Text("b1".into())),
+            },
+            scope: None,
+            returning: vec![],
+        };
+        assert!(
+            del.force_scope(&write).is_err(),
+            "a target DELETE is refused"
+        );
+
+        // (5) A read-only target route (no write grant) cannot write at all.
+        let ro = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema,
+            "products",
+            &[],
+        );
+        assert!(
+            ro.orm_scope(TenantAxis::Write).is_err(),
+            "a read-only target route denies the write axis outright"
+        );
+
+        println!(
+            "PLAIN-WASM TARGET WRITE ISOLATION OK: a target route's orm writes land only in tenant \
+             B's public subset (INSERT force-stamps tenant=B + visibility; UPDATE confined to B's \
+             public rows, only the allowlisted column settable), and a DELETE / visibility-flip / \
+             read-only write are all refused, on a real libsql engine"
         );
     }
 

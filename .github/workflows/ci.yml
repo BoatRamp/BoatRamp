@@ -363,16 +363,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-target-plain-wasm-host
-      - name: Live plain-wasm target-tenant read isolation on a real libsql engine
+      - name: Live plain-wasm target-tenant read + write isolation on a real libsql engine
         run: |
           set -eo pipefail
+          # Both plain-wasm target gates: the READ isolation (5a) and the WRITE isolation (5b).
           cargo test -p boatramp-server --features handlers,oidc --lib \
-            plain_wasm_target_confines_orm_and_raw_sql_to_b_public_on_a_real_engine \
+            plain_wasm_target \
             -- --ignored --nocapture 2>&1 | tee target-plainwasm.log
-          grep -qE 'test result: ok\. 1 passed' target-plainwasm.log \
-            || { echo "::error::plain-wasm target-tenant read isolation test did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -qE 'test result: ok\. 2 passed' target-plainwasm.log \
+            || { echo "::error::plain-wasm target-tenant isolation tests did not both pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET ISOLATION OK' target-plainwasm.log \
-            || { echo "::error::plain-wasm target-tenant read never reached its success marker (an orm/raw-sql target-read isolation breach or a skipped test)" >&2; exit 1; }
+            || { echo "::error::plain-wasm target-tenant READ never reached its success marker (an orm/raw-sql target-read isolation breach or a skipped test)" >&2; exit 1; }
+          grep -q 'PLAIN-WASM TARGET WRITE ISOLATION OK' target-plainwasm.log \
+            || { echo "::error::plain-wasm target-tenant WRITE never reached its success marker (a target-write isolation breach or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

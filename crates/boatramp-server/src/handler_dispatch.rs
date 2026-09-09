@@ -1148,7 +1148,7 @@ pub(super) async fn build_bindings(
             // host-derived from the routed domain (5a's carried-domain source); the guest never
             // names it. Confinement rides on BOTH the `orm` binding (PerTableTarget) and the raw-SQL
             // `{scope}` marker. Fail-closed on every gap (not eligible / no domain / no schema).
-            Some(boatramp_core::tenancy::Tenancy::Target { via, public }) => {
+            Some(boatramp_core::tenancy::Tenancy::Target { via, public, write }) => {
                 // Operator ceiling: the site must be listed in target_eligible_fields.
                 if !schema
                     .as_ref()
@@ -1184,6 +1184,9 @@ pub(super) async fn build_bindings(
                         boatramp_core::tenancy::AccessMode::Own,
                         sc,
                         public,
+                        // 5b: the target route's SET-allowlist (empty ⇒ read-only). The orm write
+                        // path confines a target write to B's public subset; raw-SQL writes refused.
+                        write,
                     )),
                     // No resolvable target tenant / schema ⇒ refuse (a target route must never fall
                     // back to an own/plain — that would read the caller's own or every tenant's rows).

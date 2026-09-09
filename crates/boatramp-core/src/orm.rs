@@ -389,7 +389,7 @@ pub enum TableKeys {
     #[default]
     Uniform,
     PerTable(std::collections::BTreeMap<String, ResolvedScope>),
-    /// A **target read** (R4/D8): the same per-table tenant keys as `PerTable`, PLUS a per-table
+    /// A **target read/write** (R4/D8): the same per-table tenant keys as `PerTable`, PLUS a per-table
     /// PUBLIC-subset confinement conjoined onto every accessed table. Deny-by-default — a table
     /// accessed under this variant with **no** entry in `public` is refused
     /// ([`OrmError::PublicSubsetUndeclared`]), the strict analog of an undeclared tenant key: a
@@ -399,6 +399,14 @@ pub enum TableKeys {
     PerTableTarget {
         keys: std::collections::BTreeMap<String, ResolvedScope>,
         public: std::collections::BTreeMap<String, Vec<PublicTermSql>>,
+        /// **Target WRITE SET-allowlist (5b), deny-by-default.** The columns a target INSERT/UPDATE
+        /// may set. **Empty ⇒ read-only** — any write force-scoped under this variant is refused
+        /// ([`OrmError::TargetWriteNotGranted`]). Non-empty ⇒ an INSERT force-stamps `tenant = B` and
+        /// the public-visibility columns and accepts ONLY these columns from the guest; an UPDATE
+        /// confines its `WHERE` to `tenant = B AND <public>` and may set ONLY these columns; a DELETE
+        /// is always refused. The tenant/visibility columns are never in this set, so a target write
+        /// can neither change ownership nor flip a row's visibility.
+        write: std::collections::BTreeSet<String>,
     },
 }
 
@@ -683,6 +691,108 @@ impl Scope {
             }
         }
     }
+
+    /// Whether this scope is a **target** scope (`PerTableTarget` — reading/writing another tenant
+    /// `B`'s public subset, R4/D8), vs. the caller's own.
+    pub fn is_target(&self) -> bool {
+        matches!(self.keys, TableKeys::PerTableTarget { .. })
+    }
+
+    /// The target-write SET-allowlist (5b), or `None` when this is not a target scope. An **empty**
+    /// set means the target route is read-only (no `write` grant) — a write force-scoped under it is
+    /// refused. Returned as `Some(&set)` for a target scope so a write path can tell "not a target"
+    /// (own path) from "target, read-only" (refuse) from "target, may set these columns".
+    fn target_write_allowlist(&self) -> Option<&std::collections::BTreeSet<String>> {
+        match &self.keys {
+            TableKeys::PerTableTarget { write, .. } => Some(write),
+            _ => None,
+        }
+    }
+
+    /// The `(column, value)` pairs a target **INSERT** must force so the inserted row lands in
+    /// `table`'s PUBLIC subset (5b): each `column = <literal>` public term contributes `(column,
+    /// literal)`, each `column IS NULL` term contributes `(column, NULL)`. A public term the host
+    /// cannot pin to a single value (a range comparison, or `IS NOT NULL`) is not forceable — the
+    /// host cannot guarantee publicness — so the INSERT is refused ([`PublicSubsetNotForceable`]).
+    /// Deny-by-default: a table with no declared public subset is refused ([`PublicSubsetUndeclared`]).
+    fn public_force_cells(&self, table: &str) -> Result<Vec<(String, SqlValue)>, OrmError> {
+        let TableKeys::PerTableTarget { public, .. } = &self.keys else {
+            return Ok(Vec::new());
+        };
+        let terms = public
+            .get(table)
+            .ok_or_else(|| OrmError::PublicSubsetUndeclared(table.to_string()))?;
+        let mut out = Vec::with_capacity(terms.len());
+        for term in terms {
+            match term {
+                PublicTermSql::Cmp {
+                    column,
+                    op: CmpOp::Eq,
+                    value,
+                } => {
+                    ident(column)?;
+                    out.push((column.clone(), value.clone()));
+                }
+                PublicTermSql::Null {
+                    column,
+                    negated: false,
+                } => {
+                    ident(column)?;
+                    out.push((column.clone(), SqlValue::Null));
+                }
+                // A range comparison or `IS NOT NULL` has no single value to stamp.
+                PublicTermSql::Cmp { .. } | PublicTermSql::Null { .. } => {
+                    return Err(OrmError::PublicSubsetNotForceable(table.to_string()))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Assert a guest-supplied `column` is settable by a target write on `table` (5b). Two gates,
+    /// both must pass: it is in the route's SET-allowlist, AND it is neither the tenant column nor a
+    /// public-visibility column (the latter a defense-in-depth check so even an operator who wrongly
+    /// listed the tenant/visibility column can't let a target write change ownership or flip
+    /// visibility). A no-op (`Ok`) when this is not a target scope. Fail-closed
+    /// ([`TargetWriteColumnDenied`]).
+    fn assert_target_settable(&self, table: &str, column: &str) -> Result<(), OrmError> {
+        let TableKeys::PerTableTarget {
+            keys,
+            public,
+            write,
+        } = &self.keys
+        else {
+            return Ok(());
+        };
+        let denied = || OrmError::TargetWriteColumnDenied(column.to_string());
+        // Gate 1: must be granted in the SET-allowlist.
+        if !write.iter().any(|c| same_col(c, column)) {
+            return Err(denied());
+        }
+        // Gate 2: never the tenant column (would change ownership).
+        if let Some(rs) = keys.get(table) {
+            let tenant_cols: &[&str] = match rs {
+                ResolvedScope::Column(c) => &[c],
+                ResolvedScope::TenantOrSession { tenant, session } => &[tenant, session],
+                ResolvedScope::Unscoped => &[],
+            };
+            if tenant_cols.iter().any(|t| same_col(t, column)) {
+                return Err(denied());
+            }
+        }
+        // Gate 2 (cont.): never a public-visibility column (would flip the row in/out of the subset).
+        if let Some(terms) = public.get(table) {
+            let is_public_col = terms.iter().any(|t| match t {
+                PublicTermSql::Cmp { column: c, .. } | PublicTermSql::Null { column: c, .. } => {
+                    same_col(c, column)
+                }
+            });
+            if is_public_col {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A `SELECT`.
@@ -801,6 +911,15 @@ impl Insert {
         write: Option<&Scope>,
         read: Option<&Scope>,
     ) -> Result<(), OrmError> {
+        // R4/D8 target write (5b): confine BEFORE the own-write logic. A target INSERT accepts only
+        // the SET-allowlisted columns from the guest and force-stamps the public-visibility columns,
+        // so the inserted row lands in `B`'s public subset (the `tenant = B` stamp is applied by the
+        // shared own-write path below, since `write_target` yields `B` for a target scope).
+        if let Some(w) = write {
+            if let Some(allow) = w.target_write_allowlist() {
+                self.confine_target_insert(w, allow.is_empty())?;
+            }
+        }
         self.scope = write.cloned();
         // The write target's per-table stamp `(column, value)` — the actor's OWN axis (Stage 1/R3),
         // resolved once for the INSERT…SELECT tenant-projection re-append below. Resolving it enforces
@@ -852,6 +971,47 @@ impl Insert {
                         alias: None,
                     },
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Confine a **target INSERT** (5b): the guest may set ONLY the route's SET-allowlisted columns,
+    /// and the host force-stamps the table's public-visibility columns so the inserted row lands in
+    /// `B`'s public subset. Refused fail-closed on: a read-only target (`empty_allowlist`), an
+    /// `INSERT … SELECT` / `ON CONFLICT` (shapes that could reach beyond the public subset), a guest
+    /// cell outside the allowlist (or the tenant/visibility columns), or a public subset that cannot
+    /// be forced to a concrete row. (`tenant = B` itself is stamped by the shared own-write path.)
+    fn confine_target_insert(
+        &mut self,
+        scope: &Scope,
+        empty_allowlist: bool,
+    ) -> Result<(), OrmError> {
+        if empty_allowlist {
+            return Err(OrmError::TargetWriteNotGranted(self.table.clone()));
+        }
+        if self.from_select.is_some() {
+            return Err(OrmError::TargetWriteUnsupported("INSERT … SELECT"));
+        }
+        if self.conflict.is_some() {
+            return Err(OrmError::TargetWriteUnsupported("ON CONFLICT upsert"));
+        }
+        // Every guest-supplied cell must be a granted, non-tenant, non-visibility column.
+        for row in &self.rows {
+            for cell in &row.cells {
+                scope.assert_target_settable(&self.table, &cell.column)?;
+            }
+        }
+        // Force the public-visibility columns onto every row (deny-by-default / not-forceable checks
+        // live in `public_force_cells`). Appended as host literals — the guest cannot have set them
+        // (they're excluded by `assert_target_settable`), so there is no dup to reconcile.
+        let forced = scope.public_force_cells(&self.table)?;
+        for row in &mut self.rows {
+            for (column, value) in &forced {
+                row.cells.push(Assignment {
+                    column: column.clone(),
+                    value: Expr::Value(value.clone()),
+                });
             }
         }
         Ok(())
@@ -1062,7 +1222,27 @@ impl Select {
 impl Update {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
     /// the `SET` exprs, filter, and `RETURNING` items. Overwrites any prior scope.
+    ///
+    /// **R4/D8 target write (5b):** under a target scope the guest may set ONLY the route's
+    /// SET-allowlisted columns (never the tenant or a visibility column), and the `WHERE` is confined
+    /// to `tenant = B AND <public>` — the tenant half via [`single_scope_pred`] at compile, the
+    /// public half conjoined here — so an UPDATE can touch ONLY `B`'s already-public rows and cannot
+    /// flip a row in or out of the public subset. A read-only target (empty allowlist) is refused.
     pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
+        if let Some(allow) = scope.target_write_allowlist() {
+            if allow.is_empty() {
+                return Err(OrmError::TargetWriteNotGranted(self.table.clone()));
+            }
+            for a in &self.set {
+                scope.assert_target_settable(&self.table, &a.column)?;
+            }
+            // Confine to the public subset (the `tenant = B` half is added by the compiler). A target
+            // table with no declared public predicate is refused (deny-by-default).
+            match scope.public_pred(&self.table, None)? {
+                Some(pred) => conjoin_front(&mut self.filter, Some(pred)),
+                None => return Err(OrmError::PublicSubsetUndeclared(self.table.clone())),
+            }
+        }
         self.scope = Some(scope.clone());
         for a in &mut self.set {
             inject_scope_expr(scope, &mut a.value)?;
@@ -1077,8 +1257,13 @@ impl Update {
 
 impl Delete {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
-    /// the filter and `RETURNING` items. Overwrites any prior scope.
+    /// the filter and `RETURNING` items. Overwrites any prior scope. **A DELETE under a target scope
+    /// is always refused (5b):** target writes are INSERT/UPDATE only — a cross-tenant delete is
+    /// never granted.
     pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
+        if scope.is_target() {
+            return Err(OrmError::TargetDeleteRefused(self.table.clone()));
+        }
         self.scope = Some(scope.clone());
         inject_scope_pred(scope, &mut self.filter)?;
         for it in &mut self.returning {
@@ -1129,6 +1314,32 @@ pub enum OrmError {
         "tenancy: table {0:?} has no declared public subset for a target read (deny-by-default)"
     )]
     PublicSubsetUndeclared(String),
+    /// A WRITE (INSERT/UPDATE) was force-scoped under a **target** scope whose SET-allowlist is empty
+    /// — i.e. a target route with no `write` grant is read-only (5b, deny-by-default). Refused before
+    /// any SQL.
+    #[error("tenancy: target route {0:?} has no write grant (read-only; deny-by-default)")]
+    TargetWriteNotGranted(String),
+    /// A target write tried to set a column that is not in the route's SET-allowlist — the tenant
+    /// column, a public-visibility column, or any other un-granted column. Refused fail-closed so a
+    /// target write can never change ownership, flip visibility, or touch a non-granted column.
+    #[error("tenancy: target write may not set column {0:?} (not in the write allowlist)")]
+    TargetWriteColumnDenied(String),
+    /// A `DELETE` was attempted under a target scope. Target writes are INSERT/UPDATE only; a target
+    /// DELETE is always refused (a cross-tenant delete is never granted).
+    #[error("tenancy: a target-tenant DELETE is refused (target writes are INSERT/UPDATE only)")]
+    TargetDeleteRefused(String),
+    /// A target INSERT could not force a table's public subset to a concrete row: a public term that
+    /// is not `column = <literal>` or `column IS NULL` (e.g. a range or `IS NOT NULL`) has no single
+    /// value to stamp, so the host cannot guarantee the inserted row lands in the public subset —
+    /// refused (deny-by-default). Such a subset is read-/update-only, never target-insertable.
+    #[error("tenancy: target INSERT cannot force table {0:?} into its public subset (a non-equality/non-null public term); refused")]
+    PublicSubsetNotForceable(String),
+    /// A target write used a shape the confinement does not support: an `INSERT … SELECT`, an
+    /// `ON CONFLICT` upsert, or a `promote`. These could reach rows outside the public subset (a
+    /// selected source, or an existing private row on conflict), so a target write is restricted to a
+    /// plain `VALUES` INSERT / a confined UPDATE — the rest are refused (deny-by-default).
+    #[error("tenancy: unsupported target write shape ({0}); target writes are a plain INSERT or a confined UPDATE only")]
+    TargetWriteUnsupported(&'static str),
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -2058,6 +2269,11 @@ impl Delete {
 /// not yet owned by any tenant, never re-home another tenant's rows into `T`. It is non-escalating,
 /// idempotent, and race-safe — a second promotion (or a concurrent one that lost) matches nothing.
 pub fn compile_promote(scope: &Scope, table: &str, dialect: Dialect) -> Result<Compiled, OrmError> {
+    // `promote` is an OWN-axis session→tenant claim; it is meaningless (and unsafe) under a target
+    // scope. Refuse it fail-closed so a target route can never move another tenant's rows.
+    if scope.is_target() {
+        return Err(OrmError::TargetWriteUnsupported("promote"));
+    }
     let (tenant_col, session_col) = match scope.resolve_table(table)? {
         ResolvedScope::TenantOrSession { tenant, session } => (tenant, session),
         _ => {
@@ -3802,6 +4018,7 @@ mod tests {
             keys: TableKeys::PerTableTarget {
                 keys: keys.clone(),
                 public: public.clone(),
+                write: std::collections::BTreeSet::new(),
             },
         })
         .unwrap();
@@ -3839,6 +4056,7 @@ mod tests {
             keys: TableKeys::PerTableTarget {
                 keys,
                 public: BTreeMap::new(), // no public subset for secret_table
+                write: std::collections::BTreeSet::new(),
             },
         };
         let mut q = Select::from("secret_table");
@@ -3876,5 +4094,230 @@ mod tests {
             !sql.contains("published") && !sql.contains("IS NULL"),
             "own read must carry no public confinement: {sql}"
         );
+    }
+
+    // ---- 5b: target WRITES (INSERT + UPDATE with a SET-allowlist; DELETE refused) --------------
+
+    /// A target-WRITE scope for `products`: tenant key `tenant_id`, public subset `published = true
+    /// AND deleted_at IS NULL`, SET-allowlist = the given columns.
+    fn target_write_scope(write: &[&str]) -> Scope {
+        use std::collections::{BTreeMap, BTreeSet};
+        Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([(
+                    "products".to_string(),
+                    ResolvedScope::Column("tenant_id".to_string()),
+                )]),
+                public: BTreeMap::from([(
+                    "products".to_string(),
+                    vec![
+                        PublicTermSql::Cmp {
+                            column: "published".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        },
+                        PublicTermSql::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                )]),
+                write: write.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            },
+        }
+    }
+
+    fn target_insert(cells: Vec<Assignment>) -> Insert {
+        Insert {
+            table: "products".into(),
+            rows: vec![RowValues { cells }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        }
+    }
+
+    #[test]
+    fn target_insert_forces_tenant_and_public_and_accepts_only_allowlisted_columns() {
+        // The guest sets only the allowlisted `title`; the host force-stamps tenant=B, published=true,
+        // deleted_at=NULL — so the inserted row lands squarely in B's public subset.
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("Hello")),
+        }]);
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert!(sql.contains("tenant_id"), "{sql}");
+        assert!(sql.contains("published"), "{sql}");
+        assert!(sql.contains("deleted_at"), "{sql}");
+        assert!(
+            params.contains(&t("tenant_B")),
+            "tenant forced to B: {params:?}"
+        );
+        assert!(
+            params.contains(&SqlValue::Boolean(true)),
+            "published forced true: {params:?}"
+        );
+        assert!(
+            params.contains(&SqlValue::Null),
+            "deleted_at forced NULL: {params:?}"
+        );
+        assert!(params.contains(&t("Hello")), "guest title kept: {params:?}");
+    }
+
+    #[test]
+    fn target_insert_refuses_a_non_allowlisted_column() {
+        // `price` is not in the SET-allowlist ⇒ refused (a target write may set only granted columns).
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![
+            Assignment {
+                column: "title".into(),
+                value: Expr::val(t("x")),
+            },
+            Assignment {
+                column: "price".into(),
+                value: Expr::val(SqlValue::Integer(9)),
+            },
+        ]);
+        let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+        assert!(
+            matches!(err, OrmError::TargetWriteColumnDenied(ref c) if c == "price"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn target_insert_refuses_setting_the_tenant_or_visibility_column() {
+        // Even if the guest tries to set tenant_id or published directly, it's denied (they're never
+        // in the allowlist; and `assert_target_settable` refuses them structurally regardless).
+        for bad in ["tenant_id", "published", "deleted_at"] {
+            let scope = target_write_scope(&["title", bad]); // even if wrongly granted...
+            let mut ins = target_insert(vec![Assignment {
+                column: bad.into(),
+                value: Expr::val(t("x")),
+            }]);
+            let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+            assert!(
+                matches!(err, OrmError::TargetWriteColumnDenied(ref c) if c == bad),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_insert_with_no_write_grant_is_refused() {
+        let scope = target_write_scope(&[]); // read-only
+        let mut ins = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("x")),
+        }]);
+        let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+        assert!(
+            matches!(err, OrmError::TargetWriteNotGranted(ref t) if t == "products"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn target_insert_select_and_upsert_are_refused() {
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("x")),
+        }]);
+        ins.from_select = Some((vec!["title".into()], Box::new(Select::from("products"))));
+        assert!(matches!(
+            ins.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteUnsupported("INSERT … SELECT")
+        ));
+        let mut ins2 = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("x")),
+        }]);
+        ins2.conflict = Some(OnConflict {
+            conflict_columns: vec![],
+            update: vec![],
+        });
+        assert!(matches!(
+            ins2.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteUnsupported("ON CONFLICT upsert")
+        ));
+    }
+
+    #[test]
+    fn target_update_confines_to_the_public_subset_and_enforces_the_allowlist() {
+        let scope = target_write_scope(&["title"]);
+        let mut upd = Update {
+            table: "products".into(),
+            set: vec![Assignment {
+                column: "title".into(),
+                value: Expr::val(t("new")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("p1")),
+            scope: None,
+            returning: vec![],
+        };
+        upd.force_scope(&scope).unwrap();
+        let (sql, params) = upd.compile(Dialect::Sqlite).unwrap();
+        // WHERE = tenant = B AND (public terms) AND (guest filter).
+        assert!(sql.contains("tenant_id = ?"), "tenant confinement: {sql}");
+        assert!(sql.contains("published = ?"), "public confinement: {sql}");
+        assert!(
+            sql.contains("deleted_at IS NULL"),
+            "public null confinement: {sql}"
+        );
+        assert!(sql.contains("SET title = ?"), "{sql}");
+        assert!(params.contains(&t("tenant_B")), "{params:?}");
+    }
+
+    #[test]
+    fn target_update_refuses_a_non_allowlisted_or_visibility_set() {
+        for bad in ["price", "published", "tenant_id"] {
+            let scope = target_write_scope(&["title"]);
+            let mut upd = Update {
+                table: "products".into(),
+                set: vec![Assignment {
+                    column: bad.into(),
+                    value: Expr::val(t("x")),
+                }],
+                filter: cmp("id", CmpOp::Eq, t("p1")),
+                scope: None,
+                returning: vec![],
+            };
+            assert!(
+                matches!(upd.force_scope(&scope).unwrap_err(), OrmError::TargetWriteColumnDenied(ref c) if c == bad),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_delete_is_always_refused() {
+        let scope = target_write_scope(&["title"]);
+        let mut del = Delete {
+            table: "products".into(),
+            filter: cmp("id", CmpOp::Eq, t("p1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            del.force_scope(&scope).unwrap_err(),
+            OrmError::TargetDeleteRefused(t) if t == "products"
+        ));
+    }
+
+    #[test]
+    fn target_promote_is_refused() {
+        let scope = target_write_scope(&["title"]);
+        assert!(matches!(
+            compile_promote(&scope, "products", Dialect::Sqlite).unwrap_err(),
+            OrmError::TargetWriteUnsupported("promote")
+        ));
     }
 }

@@ -954,6 +954,7 @@ mod tests {
             boatramp_core::tenancy::AccessMode::Own,
             &schema,
             "products",
+            &[],
         )))
     }
 

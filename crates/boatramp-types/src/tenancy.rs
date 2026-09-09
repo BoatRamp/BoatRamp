@@ -296,21 +296,31 @@ pub enum Tenancy {
         #[serde(default = "default_own")]
         write: AccessMode,
     },
-    /// **Target** (R4/D8): this route/handler reads a SECOND tenant `B`'s PUBLIC subset (never the
-    /// caller's own). The non-federated (plain-wasm) analog of a GraphQL `@tenant(scope: target)`
-    /// field: the host resolves `B` from the first applicable [`via`](Self::Target::via) source
-    /// (5a: the routed domain) and binds a target scope BEFORE the guest runs — confining every
-    /// `orm`/raw-`sql` access to `tenant = B AND <public subset>` (deny-by-default on an undeclared
-    /// subset). A distinct variant from [`Scoped`](Self::Scoped) so a route can't be both own and
-    /// target (a misdeclaration is unrepresentable); it is READ-ONLY here (target writes are a later
-    /// grant). Gated by the operator's [`TenancySchema::target_eligible_fields`].
+    /// **Target** (R4/D8): this route/handler reads (and, with a `write` grant, writes) a SECOND
+    /// tenant `B`'s PUBLIC subset (never the caller's own). The non-federated (plain-wasm) analog of
+    /// a GraphQL `@tenant(scope: target)` field: the host resolves `B` from the first applicable
+    /// [`via`](Self::Target::via) source (5a: the routed domain) and binds a target scope BEFORE the
+    /// guest runs — confining every `orm` access to `tenant = B AND <public subset>` (deny-by-default
+    /// on an undeclared subset), and AST-rewriting every raw-`sql` READ the same way. A distinct
+    /// variant from [`Scoped`](Self::Scoped) so a route can't be both own and target (a misdeclaration
+    /// is unrepresentable). Gated by the operator's [`TenancySchema::target_eligible_fields`].
     Target {
         /// The prioritized target-source list (first-resolves-wins). 5a resolves only `domain`.
         via: Vec<TargetSource>,
         /// Names the host-held public subset (a table in [`TenancySchema::public_subsets`]) this
-        /// route confines its raw-`sql` `{scope}` marker to; the `orm` path confines every accessed
-        /// table on its own declared subset.
+        /// route's raw-`sql`/`orm` accesses confine to; the `orm` path confines every accessed table
+        /// on its own declared subset.
         public: String,
+        /// **Target WRITE grant (5b), deny-by-default.** The SET-allowlist of columns a target write
+        /// (INSERT / UPDATE, via the typed `orm` only) may set. **Empty ⇒ read-only** (today's
+        /// behavior). Non-empty ⇒ the guest may INSERT/UPDATE rows in `B`'s public subset, setting
+        /// ONLY these columns — the host force-stamps `tenant = B` and the public-visibility columns,
+        /// confines an UPDATE's `WHERE` to `tenant = B AND <public>`, and refuses a DELETE, a raw-SQL
+        /// write, or any attempt to set the tenant/visibility columns (so a target write can never
+        /// change ownership or flip a row's visibility). The tenant/public columns MUST NOT appear in
+        /// this list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        write: Vec<String>,
     },
 }
 
