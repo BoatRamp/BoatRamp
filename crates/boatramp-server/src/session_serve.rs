@@ -189,6 +189,10 @@ async fn resolve_session_principal(
             token_cfg: session.token_claims.as_ref(),
             session_cookie: None,
             session_anchor: None,
+            // The session-primitive serving path is the sync request lane, not the durable async
+            // lane, so it carries no signed-context envelope.
+            signed_context: None,
+            context_anchor: None,
         },
     )
     .await

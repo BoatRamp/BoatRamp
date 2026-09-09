@@ -296,12 +296,35 @@ pub enum Tenancy {
         #[serde(default = "default_own")]
         write: AccessMode,
     },
+    /// **Target** (R4/D8): this route/handler reads a SECOND tenant `B`'s PUBLIC subset (never the
+    /// caller's own). The non-federated (plain-wasm) analog of a GraphQL `@tenant(scope: target)`
+    /// field: the host resolves `B` from the first applicable [`via`](Self::Target::via) source
+    /// (5a: the routed domain) and binds a target scope BEFORE the guest runs — confining every
+    /// `orm`/raw-`sql` access to `tenant = B AND <public subset>` (deny-by-default on an undeclared
+    /// subset). A distinct variant from [`Scoped`](Self::Scoped) so a route can't be both own and
+    /// target (a misdeclaration is unrepresentable); it is READ-ONLY here (target writes are a later
+    /// grant). Gated by the operator's [`TenancySchema::target_eligible_fields`].
+    Target {
+        /// The prioritized target-source list (first-resolves-wins). 5a resolves only `domain`.
+        via: Vec<TargetSource>,
+        /// Names the host-held public subset (a table in [`TenancySchema::public_subsets`]) this
+        /// route confines its raw-`sql` `{scope}` marker to; the `orm` path confines every accessed
+        /// table on its own declared subset.
+        public: String,
+    },
 }
 
 impl Tenancy {
-    /// Whether this decision enables in-site row scoping (`Scoped`), vs. plain queries.
+    /// Whether this decision enables in-site row scoping (own [`Scoped`](Self::Scoped) or
+    /// [`Target`](Self::Target)), vs. plain queries ([`Disabled`](Self::Disabled)).
     pub fn is_scoped(&self) -> bool {
-        matches!(self, Self::Scoped { .. })
+        matches!(self, Self::Scoped { .. } | Self::Target { .. })
+    }
+
+    /// Whether this decision reads/writes a SECOND tenant (the target axis) rather than the caller's
+    /// own — the plain-wasm analog of a `@tenant(scope: target)` field.
+    pub fn is_target(&self) -> bool {
+        matches!(self, Self::Target { .. })
     }
 }
 

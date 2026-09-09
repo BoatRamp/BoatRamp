@@ -126,6 +126,12 @@ pub(crate) async fn resolve_host_tenancy(
                 write,
             )))
         }
+        // R4/D8: a `target` route is bound by the serving path ([`build_bindings`] in
+        // handler_dispatch), which has the routed domain + the project schema to resolve `B` and
+        // build the confined target scope (`HostTenancy::target`). This OWN-axis resolver never
+        // produces a target scope, so reaching here for a `Target` decision means the serving path
+        // did not bind it for this trigger — fail closed (refuse) rather than run own/unscoped.
+        Some(Tenancy::Target { .. }) => Err(TenancyUndeclared),
     }
 }
 
@@ -166,6 +172,10 @@ pub(crate) fn resolve_inherited_tenancy(
                 write,
             )))
         }
+        // A `target` route resolves `B` from its own trigger (the routed domain), not from an
+        // inherited invoke principal — so a target decision reached over the invoke path is refused
+        // (fail closed) rather than wrongly binding the caller's inherited facts as a target scope.
+        Some(Tenancy::Target { .. }) => Err(TenancyUndeclared),
     }
 }
 
