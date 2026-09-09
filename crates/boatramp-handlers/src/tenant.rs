@@ -78,14 +78,10 @@ pub struct HostTenancy {
     write: AccessMode,
     /// Per-table tenant-key resolution from the project [`TenancySchema`](boatramp_core::tenancy::TenancySchema)
     /// (Stage 1 / R2). `Uniform` (no project schema) ⇒ every table scopes on `column`; `PerTable`
-    /// ⇒ the identity table on its own PK, `Unscoped` tables skipped, undeclared tables refused.
+    /// ⇒ the identity table on its own PK, `Unscoped` tables skipped, undeclared tables refused;
+    /// `PerTableTarget` ⇒ a target read (the `orm` path confines every table per its public subset,
+    /// and raw SQL is AST-rewritten by [`rewrite_target_read`](Self::rewrite_target_read)).
     keys: boatramp_core::orm::TableKeys,
-    /// The public-subset terms the **raw-SQL `{scope}` marker** conjoins under a TARGET read (R4/D8)
-    /// — the single-table (`Tenancy::Target.public`-named) analog of the `orm` path's per-table
-    /// `PerTableTarget` confinement. Empty for an own scope (the marker then injects only the tenant
-    /// predicate). Populated by [`target`](Self::target) from the named subset; unqualified columns
-    /// (raw SQL is single-table at the marker).
-    target_public: Vec<boatramp_core::orm::PublicTermSql>,
 }
 
 impl HostTenancy {
@@ -126,8 +122,6 @@ impl HostTenancy {
             read,
             write,
             keys: boatramp_core::orm::TableKeys::Uniform,
-            // Own/session principals carry no target marker terms; only `target()` populates them.
-            target_public: Vec::new(),
         }
     }
 
@@ -139,17 +133,22 @@ impl HostTenancy {
     /// that confines every accessed table to `tenant = B AND <that table's public subset>` and
     /// refuses any table with no declared public subset (deny-by-default). `B` is host-derived at the
     /// edge (terminating domain / verified capability claim / handle lookup), NEVER guest input.
-    /// `public` NAMES the subset (a table in [`TenancySchema::public_subsets`]) the raw-SQL `{scope}`
-    /// marker confines to (single-table); the `orm` path independently confines EVERY accessed table
-    /// on its own declared subset via [`TableKeys::PerTableTarget`]. The marker's tenant column is
-    /// that named table's key (from the schema); `B` is host-derived, never guest input.
+    ///
+    /// Both surfaces get the SAME per-table, deny-by-default confinement: the `orm` path via
+    /// [`TableKeys::PerTableTarget`], and raw SQL via [`rewrite_target_read`](Self::rewrite_target_read),
+    /// which AST-rewrites the guest statement to confine EVERY table reference (not a single
+    /// guest-placed marker). `public` remains part of the bind API — the caller uses it to prove the
+    /// route's declared subset exists at bind time — but does not narrow the confinement: every
+    /// accessed table is confined on its OWN declared subset.
     pub fn target(
         target_value: SqlValue,
         read: AccessMode,
         schema: &TenancySchema,
         public: &str,
     ) -> Self {
-        // The orm path: confine every accessed table on its own declared public subset.
+        let _ = public;
+        // Confine every accessed table on its own declared public subset (both the orm compiler and
+        // the raw-SQL AST rewriter read these two maps out of the `PerTableTarget` keys).
         let per_table = schema
             .public_subsets
             .iter()
@@ -160,21 +159,10 @@ impl HostTenancy {
                 )
             })
             .collect();
-        // The raw-SQL marker path (single-table): the named subset's tenant column + public terms.
-        // A `public` that names no tenant-scoped table with a subset leaves the marker terms empty
-        // and the column at the default key — the marker then still binds `tenant = B`, and any
-        // unconfined raw-SQL read is the operator's misdeclaration (documented), never a silent
-        // widening on the orm path (which is per-table deny-by-default regardless).
-        let column = match schema.resolve(public) {
-            Some(boatramp_core::tenancy::ResolvedScope::Column(c)) => c,
-            _ => schema.default_tenant_key.clone(),
-        };
-        let target_public = schema
-            .public_subset(public)
-            .map(|s| boatramp_core::orm::lower_public_terms(&s.predicate))
-            .unwrap_or_default();
         Self {
-            column,
+            // For a target principal the per-table `PerTableTarget` keys drive the actual predicate;
+            // `column` is only validated as an identifier, so the default tenant key suffices.
+            column: schema.default_tenant_key.clone(),
             facts: vec![ScopeFact {
                 axis: ScopeAxis::TargetTenant,
                 value: target_value,
@@ -187,7 +175,6 @@ impl HostTenancy {
                 keys: schema.table_key_map(),
                 public: per_table,
             },
-            target_public,
         }
     }
 
@@ -302,6 +289,40 @@ impl HostTenancy {
         }))
     }
 
+    /// Whether this principal is a **target read** (R4/D8) — its per-table keys carry the target
+    /// public-subset confinement ([`TableKeys::PerTableTarget`]). Under a target read the host
+    /// confines raw SQL by an AST rewrite ([`rewrite_target_read`](Self::rewrite_target_read))
+    /// instead of the guest-cooperative [`SCOPE_MARKER`]: the guest writes plain SQL and the host
+    /// injects the confinement onto EVERY table reference, so it cannot be repositioned or
+    /// `OR`-escaped.
+    pub fn is_target(&self) -> bool {
+        matches!(self.keys, TableKeys::PerTableTarget { .. })
+    }
+
+    /// Confine a guest's raw-SQL **target read** by rewriting its AST so every table reference is
+    /// scoped to `tenant = B AND <that table's public subset>` (R4/D8) — the airtight analog of the
+    /// `orm` path's [`TableKeys::PerTableTarget`] confinement, closing the guest-cooperative
+    /// marker's multi-table / `OR`-escape gaps. `B` is this principal's resolved
+    /// [`ScopeAxis::TargetTenant`] fact (host-derived, never guest input); `dialect` selects the
+    /// parser for the backend engine. Fail-closed: a statement that cannot be provably confined (a
+    /// write, an exotic table source, a table with no declared public subset, …) is refused and the
+    /// read does not run.
+    pub fn rewrite_target_read(
+        &self,
+        statement: &str,
+        dialect: boatramp_core::sql::Dialect,
+    ) -> Result<String, boatramp_core::target_sql::TargetRewriteError> {
+        use boatramp_core::target_sql::{rewrite_target_select, TargetRewriteError};
+        let TableKeys::PerTableTarget { keys, public } = &self.keys else {
+            // Only ever called for a target principal; refuse fail-closed if not.
+            return Err(TargetRewriteError::MissingTarget);
+        };
+        let b = self
+            .fact(ScopeAxis::TargetTenant)
+            .ok_or(TargetRewriteError::MissingTarget)?;
+        rewrite_target_select(statement, b, keys, public, dialect)
+    }
+
     /// Whether raw SQL on `axis` must carry the [`SCOPE_MARKER`]. True whenever the axis actually
     /// restricts rows (null/own/own+null); false for cross-tenant `all` (nothing to inject) — a
     /// `None`-grant axis "requires" it moot-ly since it's denied outright.
@@ -314,65 +335,34 @@ impl HostTenancy {
     /// to the params, in placeholder order (the predicate references them as `?<param_count+1>`,
     /// `?<param_count+2>`, …). `all` yields a tautology (`1 = 1`) and no values.
     ///
-    /// Under a **target** read (R4/D8) the predicate is `<col> = ?N AND <public subset>` — the
-    /// tenant `B` bound at `?N`, then the named public subset's terms (comparison literals bound in
-    /// order; a null test binds nothing) — the single-table analog of the `orm` path's per-table
-    /// confinement, so a target raw-SQL read reaches only B's public rows.
+    /// This is the **own/session** marker path. A **target read** does NOT use the marker — its raw
+    /// SQL is confined by an AST rewrite ([`rewrite_target_read`](Self::rewrite_target_read)) that
+    /// confines every table reference, not a single guest-placed marker. Calling this under a target
+    /// principal fails closed ([`TenantDenied::NoSource`]) so a weaker single-table marker can never
+    /// be substituted for the airtight rewrite.
     pub fn sql_marker(
         &self,
         axis: Axis,
         param_count: usize,
     ) -> Result<(String, Vec<SqlValue>), TenantDenied> {
-        use boatramp_core::orm::{PublicTermSql, TableKeys};
         if !self.valid_column() {
             return Err(TenantDenied::BadColumn);
         }
+        if self.is_target() {
+            // The marker is not the target path; the caller must use `rewrite_target_read`.
+            return Err(TenantDenied::NoSource);
+        }
         let col = &self.column;
-        let is_target = matches!(self.keys, TableKeys::PerTableTarget { .. });
         match self.mode(axis) {
             AccessMode::None => Err(TenantDenied::NoAccess),
             AccessMode::All => Ok(("1 = 1".to_string(), Vec::new())),
             AccessMode::Null => Ok((format!("{col} IS NULL"), Vec::new())),
             AccessMode::Own => {
-                // The bound value is the target `B` under a target read, else the own tenant.
-                let v = if is_target {
-                    self.fact(ScopeAxis::TargetTenant)
-                } else {
-                    self.tenant_value()
-                }
-                .cloned()
-                .ok_or(TenantDenied::NoSource)?;
-                // Fail closed: a target read with NO public terms would degrade to a bare
-                // `tenant = B` (every one of B's rows, incl. private) — refuse rather than emit an
-                // unconfined marker. (build_bindings also refuses an undeclared `public` at bind;
-                // this is the marker-level backstop for any other caller / a subset-less name.)
-                if is_target && self.target_public.is_empty() {
-                    return Err(TenantDenied::NoSource);
-                }
-                let mut next = param_count + 1;
-                let mut sql = format!("{col} = ?{next}");
-                let mut values = vec![v];
-                if is_target {
-                    // Conjoin the named public subset (single-table, unqualified columns) so a target
-                    // raw-SQL read is confined to `tenant = B AND <public>`, never all of B's rows.
-                    for term in &self.target_public {
-                        match term {
-                            PublicTermSql::Cmp { column, op, value } => {
-                                next += 1;
-                                sql.push_str(&format!(" AND {column} {} ?{next}", op.symbol()));
-                                values.push(value.clone());
-                            }
-                            PublicTermSql::Null { column, negated } => {
-                                let not = if *negated { "NOT " } else { "" };
-                                sql.push_str(&format!(" AND {column} IS {not}NULL"));
-                            }
-                        }
-                    }
-                }
-                Ok((sql, values))
+                let v = self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?;
+                Ok((format!("{col} = ?{}", param_count + 1), vec![v]))
             }
             AccessMode::OwnOrNull => {
-                // `own+null` is an OWN-axis mode (a target read is exact `= B`, never `OR NULL`).
+                // `own+null` is an OWN-axis mode.
                 let v = self.tenant_value().cloned().ok_or(TenantDenied::NoSource)?;
                 Ok((
                     format!("({col} = ?{} OR {col} IS NULL)", param_count + 1),
@@ -645,11 +635,42 @@ mod tests {
         // a separate, later grant).
         assert_eq!(ht.orm_scope(Axis::Write), Err(TenantDenied::NoAccess));
 
-        // The raw-SQL `{scope}` marker also confines to `tenant = B AND <public subset>` (single
-        // table), so a target raw-SQL read reaches only B's public rows — B + the public literal
-        // bound as params (never interpolated).
-        let (pred, values) = ht.sql_marker(Axis::Read, 0).unwrap();
-        assert_eq!(pred, "tenant_id = ?1 AND published = ?2");
-        assert_eq!(values, vec![t("tenant_B"), SqlValue::Boolean(true)]);
+        // The guest-cooperative `{scope}` marker is NOT the target path — it fails closed, so a
+        // weaker single-table marker can never stand in for the AST rewrite.
+        assert_eq!(ht.sql_marker(Axis::Read, 0), Err(TenantDenied::NoSource));
+
+        // Raw SQL is confined by the AST rewrite instead: every table reference is scoped to
+        // `tenant = B AND <that table's public subset>` (B + the public literal injected as escaped
+        // literals, so the guest's own params are undisturbed).
+        let out = ht
+            .rewrite_target_read(
+                "SELECT id FROM products",
+                boatramp_core::sql::Dialect::Sqlite,
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM products WHERE products.tenant_id = 'tenant_B' AND products.published = true"
+        );
+        // And it is genuinely airtight where the marker was not: a joined table is confined too...
+        let joined = ht
+            .rewrite_target_read(
+                "SELECT * FROM products p JOIN products q ON q.id = p.parent",
+                boatramp_core::sql::Dialect::Sqlite,
+            )
+            .unwrap();
+        assert!(joined.contains("p.tenant_id = 'tenant_B'"), "{joined}");
+        assert!(joined.contains("q.tenant_id = 'tenant_B'"), "{joined}");
+        // ...and a top-level OR in the guest predicate cannot escape the gate.
+        let ored = ht
+            .rewrite_target_read(
+                "SELECT id FROM products WHERE 1 = 1 OR published = false",
+                boatramp_core::sql::Dialect::Sqlite,
+            )
+            .unwrap();
+        assert!(
+            ored.contains("(1 = 1 OR published = false) AND products.tenant_id = 'tenant_B'"),
+            "{ored}"
+        );
     }
 }

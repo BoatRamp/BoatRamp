@@ -651,11 +651,13 @@ mod tests {
     /// **Live** proof (R4/D8) that a **plain-wasm** target route confines BOTH its `orm` and its
     /// raw-`sql` reads to tenant `B`'s PUBLIC subset on a REAL libsql engine — the non-federated
     /// analog of the GDC target live gate. Drives `HostTenancy::target` through `orm_scope`
-    /// (force_scope → compile → run) AND `sql_marker` (splice → run) against a shared `products`
-    /// table holding tenant A's row + tenant B's public / draft / soft-deleted rows, asserting each
-    /// path returns ONLY B's published, non-deleted row. `#[ignore]`d for the same libsql
-    /// static-musl segfault reason as the ORM batteries; the `test-target-plain-wasm` CI job runs it
-    /// unignored on the host toolchain and greps the marker.
+    /// (force_scope → compile → run) AND `rewrite_target_read` (AST rewrite → run) against a shared
+    /// `products` table holding tenant A's row + tenant B's public / draft / soft-deleted rows,
+    /// asserting each path returns ONLY B's published, non-deleted row — the raw-SQL path proven over
+    /// a join, a subquery, and an OR-escape (the multi-table / escape cases the old single-table
+    /// `{scope}` marker could not confine). `#[ignore]`d for the same libsql static-musl segfault
+    /// reason as the ORM batteries; the `test-target-plain-wasm` CI job runs it unignored on the host
+    /// toolchain and greps the marker.
     #[tokio::test]
     #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
     async fn plain_wasm_target_confines_orm_and_raw_sql_to_b_public_on_a_real_engine() {
@@ -759,22 +761,56 @@ mod tests {
         );
         tx.commit().await.unwrap();
 
-        // (2) The raw-SQL path: splice the `{scope}` marker into a raw statement, run.
-        let (pred, values) = ht.sql_marker(TenantAxis::Read, 0).unwrap();
-        let raw = format!("SELECT name FROM products WHERE {pred}");
-        let mut tx = db.begin().await.unwrap();
-        let raw_rows = run_text_rows(tx.as_mut(), &raw, &values).await;
-        assert_eq!(
-            raw_rows,
-            vec!["B public".to_string()],
-            "raw-SQL target read returns ONLY B's published, non-deleted row: {raw}"
+        // (2) The raw-SQL path: the guest writes PLAIN SQL and the host AST-rewrites it, confining
+        // every table reference to `tenant = B AND <public>`. Run each rewritten statement on the
+        // real engine and assert it returns ONLY B's published, non-deleted row — INCLUDING the two
+        // cases the old single-table `{scope}` marker could NOT confine (M1 multi-table, M2
+        // OR-escape). B + the public literals are injected as literals, so no params are bound.
+        for (label, guest_sql) in [
+            // Plain single-table read.
+            ("plain", "SELECT name FROM products"),
+            // M2: a top-level OR that tried to widen to every row — parenthesised, cannot escape.
+            (
+                "or-escape",
+                "SELECT name FROM products WHERE 1 = 1 OR published = 0",
+            ),
+            // M1: a self-join — BOTH references must be confined, not just one marker position.
+            (
+                "self-join",
+                "SELECT p.name FROM products p JOIN products q ON q.id = p.id",
+            ),
+            // A subquery source — the inner ref must be confined too.
+            (
+                "subquery",
+                "SELECT name FROM products WHERE id IN (SELECT id FROM products)",
+            ),
+        ] {
+            let rewritten = ht
+                .rewrite_target_read(guest_sql, Dialect::Sqlite)
+                .unwrap_or_else(|e| panic!("{label}: rewrite refused: {}", e.reason()));
+            let mut tx = db.begin().await.unwrap();
+            let raw_rows = run_text_rows(tx.as_mut(), &rewritten, &[]).await;
+            assert_eq!(
+                raw_rows,
+                vec!["B public".to_string()],
+                "raw-SQL target read [{label}] returns ONLY B's published, non-deleted row: {rewritten}"
+            );
+            tx.commit().await.unwrap();
+        }
+
+        // A target read that touches an UNDECLARED table (no public subset) is refused before the
+        // engine — deny-by-default, proven live.
+        assert!(
+            ht.rewrite_target_read("SELECT name FROM orders", Dialect::Sqlite)
+                .is_err(),
+            "a target read of an undeclared table must be refused"
         );
-        tx.commit().await.unwrap();
 
         println!(
             "PLAIN-WASM TARGET ISOLATION OK: a target route's orm AND raw-sql reads each return only \
              tenant B's published+non-deleted rows (never tenant A's, never B's draft/removed) on a \
-             real libsql engine"
+             real libsql engine — the raw-SQL path is AST-rewritten so multi-table joins, subqueries, \
+             and OR-escapes are all confined, and an undeclared table is refused"
         );
     }
 

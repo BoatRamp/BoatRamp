@@ -48,6 +48,11 @@ pub mod secret_store;
 /// The duplex/resumable session delivery-semantics model (Stage 1 of `PLAN-session-primitive`).
 pub mod session;
 pub mod sql;
+/// Host-side parse-and-rewrite confinement of a guest's **raw-SQL target read** (R4/D8): the
+/// AST-level analog of the `orm` path's `PerTableTarget` per-table confinement, injecting
+/// `tenant = B AND <public subset>` onto EVERY table reference so a target read of another tenant
+/// `B` can reach only B's declared public rows — the guest cannot reposition or `OR`-escape it.
+pub mod target_sql;
 /// The one canonical wall-clock read for native crates (`now_unix`/`now_unix_ms`).
 pub mod time;
 

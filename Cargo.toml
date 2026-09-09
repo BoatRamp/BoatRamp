@@ -110,7 +110,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 bytes = "1"
 async-trait = "0.1"
-sqlparser = "0.53"
+# `visitor` enables the derived `Visit`/`VisitMut` whole-AST traversal — the exhaustive,
+# sqlparser-maintained walk the target-read raw-SQL rewriter (`boatramp_core::target_sql`) rests on
+# to reach every table reference (a missed node = a cross-tenant leak, so completeness must not be
+# our hand-rolled belief).
+sqlparser = { version = "0.53", features = ["visitor"] }
 # Native filesystem change notification (inotify / FSEvents / kqueue) for the
 # FsStorage blob-change watch (FA-5). Syscall-crate-correct vs. shelling out.
 notify = "6"

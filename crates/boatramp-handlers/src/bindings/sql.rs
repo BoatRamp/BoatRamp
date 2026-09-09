@@ -215,12 +215,14 @@ impl sql_query::HostDatabase for SqlHost<'_> {
         let mut params = to_values(params);
         // Stage 0: fill the `{scope}` marker with the host predicate for the axis the STATEMENT
         // exercises (a `DELETE` via `query()` is a write, not a read). Fail-closed: an unmarked
-        // scoped statement, or one the axis grant denies, is refused before the backend.
+        // scoped statement, or one the axis grant denies, is refused before the backend. Under a
+        // target read the whole statement is AST-rewritten instead (dialect selects the parser).
         let statement = apply_scope_marker(
             self.session.tenancy(),
             stmt_axis(&statement),
             statement,
             &mut params,
+            self.session.dialect(&name),
         )
         .map_err(to_wit_error)?;
         let txn = self
@@ -259,12 +261,13 @@ impl sql_query::HostDatabase for SqlHost<'_> {
         let mut params = to_values(params);
         // Stage 0: fill the `{scope}` marker with the host predicate for the axis the STATEMENT
         // exercises (a bare `SELECT` via `execute()` is still a read). Fail-closed on a missing
-        // marker or a denied axis.
+        // marker or a denied axis. Under a target read the whole statement is AST-rewritten instead.
         let statement = apply_scope_marker(
             self.session.tenancy(),
             stmt_axis(&statement),
             statement,
             &mut params,
+            self.session.dialect(&name),
         )
         .map_err(to_wit_error)?;
         let txn = self
@@ -321,22 +324,40 @@ fn stmt_axis(statement: &str) -> crate::tenant::Axis {
 ///
 /// - **No tenancy** (plain): a stray marker is neutralised to `1 = 1` (a scoped app never lands
 ///   here; this only guards against an accidental marker on an unscoped function).
-/// - **Scoped**: the axis grant is consulted first (a `none` grant is refused outright), then the
-///   marker is **required** — an unmarked scoped statement is refused (fail-closed) rather than
-///   run across tenants — and substituted with the host predicate. The predicate references the
-///   appended value as `?<N+1>`, so it is correct wherever the marker sits; the value is appended
-///   once even if the marker repeats.
+/// - **Target read** (R4/D8): the guest-cooperative marker cannot confine another tenant's data
+///   across joins/subqueries, so the WHOLE statement is instead rewritten AST-side — every table
+///   reference is confined to `tenant = B AND <public subset>` and the statement is required to be
+///   read-only (fail-closed). The guest writes plain SQL; a stray marker is neutralised first so a
+///   copy-pasted `{scope}` still parses. `dialect` selects the parser for the backend engine.
+/// - **Scoped (own/session)**: the axis grant is consulted first (a `none` grant is refused
+///   outright), then the marker is **required** — an unmarked scoped statement is refused
+///   (fail-closed) rather than run across tenants — and substituted with the host predicate. The
+///   predicate references the appended value as `?<N+1>`, so it is correct wherever the marker sits;
+///   the value is appended once even if the marker repeats.
 fn apply_scope_marker(
     tenancy: Option<&crate::tenant::HostTenancy>,
     axis: crate::tenant::Axis,
     statement: String,
     params: &mut Vec<SqlValue>,
+    dialect: boatramp_core::sql::Dialect,
 ) -> Result<String, SqlError> {
     use crate::tenant::SCOPE_MARKER;
     let Some(ht) = tenancy else {
         // Unscoped: neutralise any stray marker so the statement still parses.
         return Ok(statement.replace(SCOPE_MARKER, "1 = 1"));
     };
+    if ht.is_target() {
+        // Target read: the marker is not used — the host AST-rewrites the whole statement, confining
+        // EVERY table reference (root/join/subquery/CTE/set-op) to `tenant = B AND <public>`. The
+        // rewriter itself enforces read-only, so a target write is refused there (belt-and-suspenders
+        // with the write-axis grant, which is `None` under a target principal). Neutralise a stray
+        // marker first so a copy-pasted `{scope}` does not break the parse. B + public literals are
+        // injected by the rewriter, so `params` is left untouched.
+        let neutralised = statement.replace(SCOPE_MARKER, "1 = 1");
+        return ht
+            .rewrite_target_read(&neutralised, dialect)
+            .map_err(|e| SqlError::Other(e.reason()));
+    }
     let (pred, values) = ht
         .sql_marker(axis, params.len())
         .map_err(|d| SqlError::Other(d.reason().to_string()))?;
@@ -891,5 +912,151 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.contains("SELECT 1 WHERE 1 = 1")));
+    }
+
+    // ---- R4/D8: a raw-SQL target read is AST-rewritten (not marker-substituted) ---------------
+
+    /// A two-table schema (`products`, `reviews`) with per-table public subsets, for building a
+    /// target-read `HostTenancy`.
+    fn target_session(log: Log, b: &str) -> SqlSession {
+        use boatramp_core::tenancy::{
+            PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm, TableScope,
+            TenancySchema,
+        };
+        use std::collections::BTreeMap;
+        let public = |col: &str| PublicSubset {
+            predicate: PublicPredicate {
+                terms: vec![PublicTerm::Cmp {
+                    column: col.into(),
+                    op: PublicCmp::Eq,
+                    value: PublicLiteral::Bool(true),
+                }],
+            },
+            world_public: true,
+            listable: true,
+        };
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([
+                ("products".into(), TableScope::Tenant),
+                ("reviews".into(), TableScope::Tenant),
+            ]),
+            ..Default::default()
+        };
+        schema
+            .public_subsets
+            .insert("products".into(), public("published"));
+        schema
+            .public_subsets
+            .insert("reviews".into(), public("visible"));
+        session(&[("", "db", log)]).with_tenancy(Some(crate::tenant::HostTenancy::target(
+            SqlValue::Text(b.into()),
+            boatramp_core::tenancy::AccessMode::Own,
+            &schema,
+            "products",
+        )))
+    }
+
+    /// A target read that JOINs two tenant tables is confined on BOTH tables — the airtight fix the
+    /// single-table `{scope}` marker could not deliver. The guest writes plain SQL (no marker).
+    #[tokio::test]
+    async fn target_raw_sql_read_confines_every_joined_table_to_b_public() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = target_session(log.clone(), "tenant_B");
+        let mut table = ResourceTable::new();
+        {
+            let mut host = SqlHost::new(&mut table, &mut session);
+            let db = host.open(String::new()).unwrap();
+            host.query(
+                db,
+                "SELECT p.id FROM products p JOIN reviews r ON r.product_id = p.id".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+        let log = log.lock().unwrap();
+        let ran = log
+            .iter()
+            .find(|l| l.contains("query"))
+            .expect("a query ran");
+        assert!(
+            ran.contains("p.tenant_id = 'tenant_B' AND p.published = true"),
+            "{ran}"
+        );
+        assert!(
+            ran.contains("r.tenant_id = 'tenant_B' AND r.visible = true"),
+            "{ran}"
+        );
+    }
+
+    /// A target read cannot `OR`-escape the confinement: the guest's `WHERE` is parenthesised and
+    /// the tenant/public gate `AND`-ed on (closes M2). Also proves the guest need not (and here does)
+    /// place a stray `{scope}` — it is neutralised before the rewrite.
+    #[tokio::test]
+    async fn target_raw_sql_read_cannot_or_escape_the_gate() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = target_session(log.clone(), "tenant_B");
+        let mut table = ResourceTable::new();
+        {
+            let mut host = SqlHost::new(&mut table, &mut session);
+            let db = host.open(String::new()).unwrap();
+            host.query(
+                db,
+                "SELECT id FROM products WHERE published = false OR 1 = 1".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+        let log = log.lock().unwrap();
+        let ran = log
+            .iter()
+            .find(|l| l.contains("query"))
+            .expect("a query ran");
+        assert!(
+            ran.contains("(published = false OR 1 = 1) AND products.tenant_id = 'tenant_B'"),
+            "{ran}"
+        );
+    }
+
+    /// A target read that touches a table with no declared public subset is refused (deny-by-default)
+    /// and never reaches the backend.
+    #[tokio::test]
+    async fn target_raw_sql_read_refuses_an_undeclared_table() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = target_session(log.clone(), "tenant_B");
+        let mut table = ResourceTable::new();
+        let mut host = SqlHost::new(&mut table, &mut session);
+        let db = host.open(String::new()).unwrap();
+        let err = host
+            .query(db, "SELECT * FROM secrets".into(), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sql_types::Error::Other(m) if m.contains("public subset")));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing reached the backend"
+        );
+    }
+
+    /// A write under a target principal is refused (the rewriter enforces read-only) and never
+    /// reaches the backend — belt-and-suspenders with the `None` write-axis grant.
+    #[tokio::test]
+    async fn target_raw_sql_write_is_refused() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut session = target_session(log.clone(), "tenant_B");
+        let mut table = ResourceTable::new();
+        let mut host = SqlHost::new(&mut table, &mut session);
+        let db = host.open(String::new()).unwrap();
+        let err = host
+            .execute(db, "DELETE FROM products WHERE id = 1".into(), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sql_types::Error::Other(_)));
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the write never reached the backend"
+        );
     }
 }

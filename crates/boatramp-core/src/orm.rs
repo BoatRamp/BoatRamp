@@ -250,8 +250,8 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
-    /// The SQL operator symbol (used by the compiler and by the raw-SQL target `{scope}` marker).
-    pub fn symbol(self) -> &'static str {
+    /// The SQL operator symbol (used by the compiler).
+    fn symbol(self) -> &'static str {
         match self {
             Self::Eq => "=",
             Self::Ne => "<>",
