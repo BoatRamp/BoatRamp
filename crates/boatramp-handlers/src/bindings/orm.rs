@@ -1623,4 +1623,179 @@ mod tests {
         }
         assert_frozen(wit::Value::Null);
     }
+
+    // ---- 5b: target WRITE binding-level wiring (the WIT insert/update/delete entry points) -----
+
+    /// An orm session whose tenancy is a **target write** principal for tenant `B` on `products`
+    /// (public subset `published = true AND deleted_at IS NULL`), with the given SET-allowlist.
+    fn target_write_session(log: &Log, write: &[&str]) -> SqlSession {
+        use boatramp_core::tenancy::{
+            PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm, TableScope,
+            TenancySchema,
+        };
+        use std::collections::BTreeMap;
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("products".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "products".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![
+                        PublicTerm::Cmp {
+                            column: "published".into(),
+                            op: PublicCmp::Eq,
+                            value: PublicLiteral::Bool(true),
+                        },
+                        PublicTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        session(log).with_tenancy(Some(crate::tenant::HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            boatramp_core::tenancy::AccessMode::Own,
+            &schema,
+            "products",
+            &write.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )))
+    }
+
+    /// The WIT `insert` entry point, under a target write grant on `title`, force-stamps tenant=B +
+    /// the public-visibility columns and reaches the backend confined — the guest set only `title`.
+    #[tokio::test]
+    async fn target_insert_via_the_binding_confines_to_b_public() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &["title"]);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            let ins = wit::InsertQuery {
+                exprs: vec![lit(text("Hello"))],
+                table: "products".into(),
+                rows: vec![wit::RowValues {
+                    cells: vec![wit::Assignment {
+                        column: "title".into(),
+                        value: 0,
+                    }],
+                }],
+                conflict: None,
+                scope: None,
+                returning: vec![],
+                select_source: None,
+            };
+            host.insert(db, ins).await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        let ran = log
+            .iter()
+            .find(|l| l.starts_with("execute|INSERT"))
+            .expect("an insert ran");
+        // Every forced column reaches the backend; the guest title too.
+        assert!(ran.contains("tenant_id"), "{ran}");
+        assert!(ran.contains("published"), "{ran}");
+        assert!(ran.contains("deleted_at"), "{ran}");
+        assert!(ran.contains("tenant_B") && ran.contains("Hello"), "{ran}");
+    }
+
+    /// The binding refuses a target INSERT that sets a non-allowlisted column, and never reaches the
+    /// backend.
+    #[tokio::test]
+    async fn target_insert_via_the_binding_refuses_a_non_allowlisted_column() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &["title"]);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let ins = wit::InsertQuery {
+            exprs: vec![lit(wit::Value::Integer(9))],
+            table: "products".into(),
+            rows: vec![wit::RowValues {
+                cells: vec![wit::Assignment {
+                    column: "price".into(),
+                    value: 0,
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            select_source: None,
+        };
+        assert!(
+            host.insert(db, ins).await.is_err(),
+            "non-allowlisted column must be refused"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("execute|")),
+            "nothing reached the backend"
+        );
+    }
+
+    /// A read-only target route (empty allowlist) denies the write axis at `scope_for(Write)`.
+    #[tokio::test]
+    async fn target_insert_via_the_binding_refuses_a_read_only_route() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &[]);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let ins = wit::InsertQuery {
+            exprs: vec![lit(text("x"))],
+            table: "products".into(),
+            rows: vec![wit::RowValues {
+                cells: vec![wit::Assignment {
+                    column: "title".into(),
+                    value: 0,
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            select_source: None,
+        };
+        assert!(
+            host.insert(db, ins).await.is_err(),
+            "a read-only target denies writes"
+        );
+    }
+
+    /// A target DELETE via the binding is refused (target writes are INSERT/UPDATE only).
+    #[tokio::test]
+    async fn target_delete_via_the_binding_is_refused() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &["title"]);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let del = wit::DeleteQuery {
+            exprs: vec![col("id"), lit(text("p1"))],
+            preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+            table: "products".into(),
+            filter: 0,
+            scope: None,
+            returning: vec![],
+        };
+        assert!(
+            host.delete(db, del).await.is_err(),
+            "a target DELETE is refused"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("execute|")),
+            "nothing reached the backend"
+        );
+    }
 }

@@ -765,6 +765,14 @@ impl Scope {
             return Ok(());
         };
         let denied = || OrmError::TargetWriteColumnDenied(column.to_string());
+        // Gate 0: a write-target column (an INSERT column / an UPDATE SET LHS) must be a BARE column
+        // name — never `table.col`. A qualified name would (a) let `same_col` compare only the last
+        // segment, so `published.x` could slip past the tenant/visibility check on base `x`, and (b)
+        // render invalid SQL. Refuse it fail-closed at compile rather than emit a statement the DB
+        // would reject.
+        if column.contains('.') {
+            return Err(denied());
+        }
         // Gate 1: must be granted in the SET-allowlist.
         if !write.iter().any(|c| same_col(c, column)) {
             return Err(denied());
@@ -4295,6 +4303,35 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn target_write_refuses_a_qualified_column() {
+        // A dotted write-target column (`published.x`) must be refused at compile — never rendered
+        // (it would sneak past the last-segment `same_col` visibility check and emit invalid SQL).
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![Assignment {
+            column: "published.x".into(),
+            value: Expr::val(t("x")),
+        }]);
+        assert!(matches!(
+            ins.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(ref c) if c == "published.x"
+        ));
+        let mut upd = Update {
+            table: "products".into(),
+            set: vec![Assignment {
+                column: "title.y".into(),
+                value: Expr::val(t("x")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("p1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            upd.force_scope(&scope).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(ref c) if c == "title.y"
+        ));
     }
 
     #[test]
