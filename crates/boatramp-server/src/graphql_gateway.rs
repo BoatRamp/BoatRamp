@@ -228,11 +228,20 @@ pub(crate) fn build_target_scope(
         let Some(ResolvedScope::Column(tenant_column)) = schema.resolve(table) else {
             continue;
         };
+        let public = lower_public_terms_gdc(&subset.predicate);
+        // Load-time fail-closed (defense-in-depth, matching the deny-all-on-unreadable-schema
+        // contract): an EMPTY public predicate would confine only to `tenant = B` — a match-all over
+        // B's rows including its private ones. `set_project_tenancy::validate` already rejects this
+        // at the write path; here we ALSO omit such a table (⇒ a target read of it is refused
+        // deny-by-default) so a schema authored on an older binary can never leak at read time.
+        if public.is_empty() {
+            continue;
+        }
         tables.insert(
             table.clone(),
             TargetTable {
                 tenant_column,
-                public: lower_public_terms_gdc(&subset.predicate),
+                public,
             },
         );
     }
@@ -1144,6 +1153,9 @@ mod tests {
                 // A table with a public subset but NO tenant scope: omitted from the target map
                 // (a target read of it is refused, deny-by-default).
                 ("countries".into(), TableScope::Unscoped),
+                // A Tenant table whose public subset is EMPTY: omitted (load-time fail-closed — an
+                // empty predicate would confine only to `tenant = B`, a match-all over B's rows).
+                ("legacy".into(), TableScope::Tenant),
             ]),
             ..Default::default()
         };
@@ -1168,12 +1180,25 @@ mod tests {
             .public_subsets
             .insert("products".into(), subset.clone());
         schema.public_subsets.insert("countries".into(), subset);
+        schema.public_subsets.insert(
+            "legacy".into(),
+            PublicSubset {
+                predicate: PublicPredicate { terms: vec![] },
+                world_public: true,
+                listable: false,
+            },
+        );
 
         let scope = build_target_scope(&schema, SqlValue::Text("tenant_B".into()));
         assert_eq!(scope.tenant_value, SqlValue::Text("tenant_B".into()));
         // `products` (Tenant) is target-readable, confined on its tenant column + the lowered public
-        // predicate; `countries` (Unscoped, no tenant column) is omitted (deny-by-default).
+        // predicate; `countries` (Unscoped, no tenant column) and `legacy` (empty predicate) are
+        // both omitted (deny-by-default).
         assert!(!scope.tables.contains_key("countries"));
+        assert!(
+            !scope.tables.contains_key("legacy"),
+            "an empty public predicate is omitted (load-time fail-closed), never a match-all"
+        );
         let products = scope.tables.get("products").expect("products confined");
         assert_eq!(products.tenant_column, "tenant_id");
         assert_eq!(
