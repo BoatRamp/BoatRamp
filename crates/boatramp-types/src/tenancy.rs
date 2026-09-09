@@ -430,6 +430,16 @@ pub struct TenancySchema {
     /// under a target read (the strict analog of the missing-tenant-column fail-close).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub public_subsets: BTreeMap<String, PublicSubset>,
+    /// **R4 target axis — the operator-curated `handle` registry (5c).** Maps a PUBLIC handle/slug →
+    /// the target tenant's context tag `B` (the same opaque value a routed domain resolves to). A
+    /// [`TargetSource::Handle`] resolves `B` ONLY for a slug listed here (deny-by-default: an unlisted
+    /// slug is indistinguishable from an absent one — no existence oracle, G4), and ONLY when the
+    /// route's `public` subset is [`world_public`](PublicSubset::world_public) (G2/G3). The handle
+    /// source is always READ-ONLY (G1). Empty ⇒ no slug is handle-addressable. This is the opt-in
+    /// allowlist that keeps handle addressing from reaching an arbitrary tenant — only tenants the
+    /// operator deliberately publishes a handle for are reachable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub handles: BTreeMap<String, String>,
 }
 
 impl Default for TenancySchema {
@@ -440,6 +450,7 @@ impl Default for TenancySchema {
             tables: BTreeMap::new(),
             target_eligible_fields: BTreeSet::new(),
             public_subsets: BTreeMap::new(),
+            handles: BTreeMap::new(),
         }
     }
 }
@@ -458,6 +469,8 @@ impl TenancySchema {
             // the target axis fails closed exactly like the own axis when a schema can't be read.
             target_eligible_fields: BTreeSet::new(),
             public_subsets: BTreeMap::new(),
+            // No handle resolves under deny-all (an unreadable schema exposes no public handle).
+            handles: BTreeMap::new(),
         }
     }
 
@@ -466,6 +479,23 @@ impl TenancySchema {
     /// `false`, so the app's SDL intent can never exceed the operator's grant.
     pub fn target_field_eligible(&self, field: &str) -> bool {
         self.target_eligible_fields.contains(field)
+    }
+
+    /// Whether the named public `subset` is flagged [`world_public`](PublicSubset::world_public) —
+    /// the deny-by-default host flag that admits the anonymous `handle` source (G2/G3). A subset that
+    /// declares a public predicate but is NOT `world_public` is target-readable via
+    /// domain/capability, but NEVER via a handle.
+    pub fn subset_is_world_public(&self, subset: &str) -> bool {
+        self.public_subsets
+            .get(subset)
+            .is_some_and(|s| s.world_public)
+    }
+
+    /// Resolve a PUBLIC `handle`/slug to its target tenant's context tag `B` (5c), or `None` for an
+    /// unlisted slug (deny-by-default — an unlisted slug is indistinguishable from an absent one, G4).
+    /// Only slugs the operator deliberately published in [`handles`](Self::handles) resolve.
+    pub fn resolve_handle(&self, slug: &str) -> Option<&str> {
+        self.handles.get(slug).map(String::as_str)
     }
 
     /// The host-held PUBLIC subset for `table` (its visibility predicate + `world_public`/`listable`

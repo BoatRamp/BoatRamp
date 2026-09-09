@@ -145,10 +145,8 @@ pub(crate) struct ResolvedTarget {
 }
 
 /// Resolve the target tenant `B` from the first applicable [`TargetSource`] in `via`
-/// (first-resolves-wins, R4/D8 5c) — the AUTHENTICATED sources (`domain`, `capability`), which are
-/// synchronous. The `handle` source (async registry lookup) is resolved separately by the serving
-/// path and is skipped here. Returns `None` when no listed synchronous source resolves (the caller
-/// then tries `handle`, else fails closed).
+/// (first-resolves-wins, R4/D8 5c). Returns `None` when no listed source resolves (the route then
+/// fails closed — never own/plain).
 ///
 /// - **Domain**: the routed domain's host-stamped context tag (unforgeable — set at routing, never a
 ///   client header). Honors the route's `write` grant.
@@ -156,13 +154,22 @@ pub(crate) struct ResolvedTarget {
 ///   envelope against the fleet key, bound to this project as audience and to this route's `public`
 ///   subset. A wrong-audience / wrong-subset / forged / expired capability does not resolve (fail
 ///   closed → next source). Honors the route's `write` grant.
-pub(crate) fn resolve_target_authenticated(
+/// - **Handle** (G1–G4): a PUBLIC slug (`handle_slug`, guest-named), resolved against the operator's
+///   [`handles`](boatramp_core::tenancy::TenancySchema::handles) registry (deny-by-default: an
+///   unlisted slug does not resolve, G4), and ONLY when the route's `public` subset is
+///   [`world_public`](boatramp_core::tenancy::PublicSubset::world_public) (G2/G3). Always
+///   **read-only** — the effective write-allowlist is forced empty (G1) regardless of the route's
+///   `write` grant. So a public handle can only ever read `B`'s world-public rows.
+#[allow(clippy::too_many_arguments)] // a source resolver: each arg is a distinct verified input.
+pub(crate) fn resolve_target_via(
     via: &[boatramp_core::tenancy::TargetSource],
     route_public: &str,
     route_write: &[String],
+    schema: &boatramp_core::tenancy::TenancySchema,
     domain_context: Option<&str>,
     capability: Option<&str>,
     capability_anchor: Option<&boatramp_core::cose::TokenPublicKey>,
+    handle_slug: Option<&str>,
     audience: &str,
     now_unix: u64,
 ) -> Option<ResolvedTarget> {
@@ -193,8 +200,23 @@ pub(crate) fn resolve_target_authenticated(
                     }
                 }
             }
-            // The `handle` source is resolved by the serving path (async registry lookup, read-only).
-            TargetSource::Handle => {}
+            TargetSource::Handle => {
+                // G2/G3: a handle resolves ONLY when the route's subset is world_public (the
+                // deny-by-default host flag), folded into the chain via `.filter`. G4: only a slug
+                // the operator listed resolves; an unlisted slug does not (no existence oracle — the
+                // route refuses identically whether the slug is absent or the subset isn't
+                // world-public). G1: read-only (the write-allowlist is forced empty).
+                if let Some(ctx) = handle_slug
+                    .filter(|s| !s.is_empty())
+                    .filter(|_| schema.subset_is_world_public(route_public))
+                    .and_then(|slug| schema.resolve_handle(slug))
+                {
+                    return Some(ResolvedTarget {
+                        value: ctx.to_string(),
+                        write: Vec::new(), // G1: a handle is always read-only.
+                    });
+                }
+            }
             // A future source this build doesn't understand does not resolve here (fail-closed).
             _ => {}
         }
@@ -634,100 +656,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn via_resolves_domain_then_capability_first_wins() {
+    async fn via_resolves_first_applicable_source() {
         use boatramp_core::cose::{mint_capability, LocalSigner, Signer, TokenAlg};
-        use boatramp_core::tenancy::TargetSource;
+        use boatramp_core::tenancy::{
+            PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm, TargetSource,
+            TenancySchema,
+        };
         let now = 1000;
         let signer = LocalSigner::generate(TokenAlg::Es256);
         let anchor = signer.public_key();
         let write = vec!["title".to_string()];
+
+        // A schema with a WORLD-PUBLIC `products` subset and a NON-world-public `reviews` subset,
+        // plus a handle registry mapping slug `acme` -> tenant_B.
+        let mk = |world_public: bool| PublicSubset {
+            predicate: PublicPredicate {
+                terms: vec![PublicTerm::Cmp {
+                    column: "published".into(),
+                    op: PublicCmp::Eq,
+                    value: PublicLiteral::Bool(true),
+                }],
+            },
+            world_public,
+            listable: world_public,
+        };
+        let mut schema = TenancySchema::default();
+        schema.public_subsets.insert("products".into(), mk(true));
+        schema.public_subsets.insert("reviews".into(), mk(false));
+        schema.handles.insert("acme".into(), "tenant_B".into());
 
         // A capability granting tenant_B's `products` subset, redeemable at project `shop`.
         let cap = mint_capability("tenant_B", "shop", "products", 300, now, &signer)
             .await
             .unwrap();
 
-        // via = [domain, capability]: the domain wins when present (first-resolves-wins), honoring
-        // the write grant.
-        let r = resolve_target_authenticated(
+        let call = |via: &[TargetSource],
+                    public: &str,
+                    dom: Option<&str>,
+                    capa: Option<&str>,
+                    hnd: Option<&str>,
+                    aud: &str| {
+            resolve_target_via(
+                via,
+                public,
+                &write,
+                &schema,
+                dom,
+                capa,
+                Some(&anchor),
+                hnd,
+                aud,
+                now,
+            )
+        };
+
+        // via = [domain, capability]: domain wins first (honors the write grant).
+        let r = call(
             &[TargetSource::Domain, TargetSource::Capability],
             "products",
-            &write,
             Some("acme-store"),
-            Some(&cap),
-            Some(&anchor),
+            Some(cap.as_str()),
+            None,
             "shop",
-            now,
         )
         .unwrap();
         assert_eq!(r.value, "acme-store");
         assert_eq!(r.write, write);
 
-        // via = [capability] with no domain: the capability resolves B + honors the write grant.
-        let r = resolve_target_authenticated(
+        // Capability (no domain present): resolves B + honors the write grant.
+        let r = call(
             &[TargetSource::Capability],
             "products",
-            &write,
             None,
-            Some(&cap),
-            Some(&anchor),
+            Some(cap.as_str()),
+            None,
             "shop",
-            now,
         )
         .unwrap();
         assert_eq!(r.value, "tenant_B");
         assert_eq!(r.write, write);
 
-        // Wrong audience (presented at another project) ⇒ no resolution (fail closed).
-        assert!(resolve_target_authenticated(
+        // Capability wrong audience / wrong subset / an app bearer ⇒ no resolution.
+        assert!(call(
             &[TargetSource::Capability],
             "products",
-            &write,
             None,
-            Some(&cap),
-            Some(&anchor),
-            "other-project",
-            now,
+            Some(cap.as_str()),
+            None,
+            "other"
         )
         .is_none());
-
-        // Wrong subset (the capability grants `products`, the route names `reviews`) ⇒ no resolution.
-        assert!(resolve_target_authenticated(
+        assert!(call(
             &[TargetSource::Capability],
             "reviews",
-            &write,
             None,
-            Some(&cap),
-            Some(&anchor),
-            "shop",
-            now,
+            Some(cap.as_str()),
+            None,
+            "shop"
         )
         .is_none());
-
-        // An app bearer (not a capability envelope) ⇒ no resolution (fails the kind check).
-        assert!(resolve_target_authenticated(
+        assert!(call(
             &[TargetSource::Capability],
             "products",
-            &write,
             None,
             Some("not-a-capability"),
-            Some(&anchor),
-            "shop",
-            now,
+            None,
+            "shop"
         )
         .is_none());
 
-        // The `handle` source is not resolved here (async, read-only) ⇒ a handle-only via yields
-        // None from this synchronous resolver (the serving path resolves it separately).
-        assert!(resolve_target_authenticated(
+        // Handle (G1-G4): a listed slug on a WORLD-PUBLIC subset resolves B, READ-ONLY (write empty).
+        let r = call(
             &[TargetSource::Handle],
             "products",
-            &write,
+            None,
+            None,
             Some("acme"),
-            Some(&cap),
-            Some(&anchor),
             "shop",
-            now,
+        )
+        .unwrap();
+        assert_eq!(r.value, "tenant_B");
+        assert!(
+            r.write.is_empty(),
+            "G1: a handle source is always read-only"
+        );
+
+        // G4: an UNLISTED slug does not resolve (indistinguishable from absent).
+        assert!(call(
+            &[TargetSource::Handle],
+            "products",
+            None,
+            None,
+            Some("ghost"),
+            "shop"
+        )
+        .is_none());
+        // G2/G3: a listed slug on a NON-world-public subset does not resolve.
+        assert!(call(
+            &[TargetSource::Handle],
+            "reviews",
+            None,
+            None,
+            Some("acme"),
+            "shop"
+        )
+        .is_none());
+        // No slug named ⇒ no handle resolution.
+        assert!(call(
+            &[TargetSource::Handle],
+            "products",
+            None,
+            None,
+            None,
+            "shop"
+        )
+        .is_none());
+        // No via source at all ⇒ None (the route then fails closed).
+        assert!(call(
+            &[],
+            "products",
+            Some("acme-store"),
+            Some(cap.as_str()),
+            Some("acme"),
+            "shop"
         )
         .is_none());
     }

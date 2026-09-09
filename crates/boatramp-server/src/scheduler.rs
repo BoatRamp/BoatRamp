@@ -383,6 +383,9 @@ pub(super) async fn run_scheduler_tick(
                             None,
                             // No request cookie ⇒ no R3 session fact on a background trigger.
                             None,
+                            // No HTTP request ⇒ no `?handle=` slug (a background trigger is never a
+                            // handle-sourced target route).
+                            None,
                         )
                         .await
                         {
@@ -591,6 +594,8 @@ async fn fire_cron(
         None,
         None,
         // No request cookie ⇒ no R3 session fact on a cron trigger.
+        None,
+        // No HTTP request ⇒ no `?handle=` slug on a cron trigger.
         None,
     )
     .await

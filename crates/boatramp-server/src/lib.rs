@@ -4054,6 +4054,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("no secrets → resolves")

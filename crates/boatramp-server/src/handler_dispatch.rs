@@ -340,6 +340,14 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::DomainContext>()
         .map(|c| c.0.clone());
+    // R4/D8 5c: a `Tenancy::Target` route with a `handle` source resolves the target tenant from a
+    // guest-named PUBLIC slug carried in the `?handle=` query parameter (owned, so we hold no borrow
+    // of `request` across the bind). Non-target routes ignore it.
+    let target_handle = request
+        .uri()
+        .query()
+        .and_then(|q| query_value(q, "handle"))
+        .map(str::to_string);
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -357,6 +365,7 @@ pub(super) async fn dispatch_handler(
         bearer.as_deref(),
         domain_context.as_deref(),
         session_cookie.as_deref(),
+        target_handle.as_deref(),
     )
     .await
     {
@@ -685,6 +694,15 @@ pub(super) fn set_forwarded_headers(request: &mut Request, client_ip: IpAddr) {
 /// path}{?query}` so the handler sees its own path (not the `/_sites/<site>/…`
 /// or host-routed form) and `wasi:http` gets a well-formed request.
 #[cfg(feature = "handlers")]
+/// Extract a raw query-parameter value from a `key=value&…` query string (no URL-decoding — a slug
+/// is simple; a value carrying escapes simply won't match the registry and fails closed).
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
 fn rewrite_request_uri(request: &mut Request, request_path: &str) {
     let authority = request
         .headers()
@@ -1074,6 +1092,10 @@ pub(super) async fn build_bindings(
     // R3 session-cookie value from the request (already verified/minted by the caller); the verify
     // anchor is the runtime's own session signer. `None` ⇒ no session fact on this invocation.
     session_cookie: Option<&str>,
+    // R4/D8 5c: the PUBLIC handle/slug the request named (from the `?handle=` query param on a
+    // `Tenancy::Target` route with a `handle` source), used to resolve `B` against the operator's
+    // handle registry — read-only, world-public only. `None` ⇒ no handle named.
+    target_handle: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -1173,24 +1195,42 @@ pub(super) async fn build_bindings(
                          project schema does not declare (deny-by-default)"
                     ));
                 }
+                // G3 (schema-admission fact): the `handle` source is admissible ONLY on a
+                // `world_public` subset — regardless of the via list. A route that lists `handle` on
+                // a non-world-public subset is a misconfiguration that could expose non-public data,
+                // so refuse it at bind rather than silently letting handle be inert.
+                if via.contains(&boatramp_core::tenancy::TargetSource::Handle)
+                    && !schema
+                        .as_ref()
+                        .is_some_and(|s| s.subset_is_world_public(public))
+                {
+                    return Err(format!(
+                        "tenancy: target route `{site}` lists the `handle` source but its public \
+                         subset `{public}` is not `world_public` (deny-by-default; a public handle \
+                         may only reach world-public data)"
+                    ));
+                }
                 // R4/D8 5c: resolve `B` from the first applicable `via` source (first-resolves-wins).
-                // The AUTHENTICATED sources resolve synchronously here — `domain` (the host-stamped
-                // context tag) and `capability` (the request bearer, verified as a signed capability
-                // envelope bound to THIS project as audience + this route's `public` subset). Both
-                // honor the route's `write` grant. The `handle` source (an anonymous public slug) is
-                // resolved separately below — read-only, world-public only.
-                let resolved = crate::tenant_resolve::resolve_target_authenticated(
-                    via,
-                    public,
-                    write,
-                    domain_context,
-                    // Under a target route the bearer is a capability candidate (an app bearer simply
-                    // fails the capability `kind`/audience check and this returns no capability fact).
-                    bearer,
-                    session_anchor.as_ref(),
-                    project.as_str(),
-                    boatramp_core::time::now_unix(),
-                );
+                // `domain` = the host-stamped routed-domain context tag; `capability` = the request
+                // bearer verified as a signed capability envelope bound to THIS project + this route's
+                // `public` subset (both honor the route's `write` grant); `handle` = a guest-named
+                // public slug resolved against the operator's registry, read-only + world-public only.
+                let resolved = schema.as_ref().and_then(|sc| {
+                    crate::tenant_resolve::resolve_target_via(
+                        via,
+                        public,
+                        write,
+                        sc,
+                        domain_context,
+                        // Under a target route the bearer is a capability candidate (an app bearer
+                        // simply fails the capability kind/audience check → no capability fact).
+                        bearer,
+                        session_anchor.as_ref(),
+                        target_handle,
+                        project.as_str(),
+                        boatramp_core::time::now_unix(),
+                    )
+                });
                 match (resolved, schema.as_ref()) {
                     (Some(rt), Some(sc)) => Some(boatramp_handlers::HostTenancy::target(
                         boatramp_core::sql::SqlValue::Text(rt.value),
