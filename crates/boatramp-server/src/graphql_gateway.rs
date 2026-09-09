@@ -17,10 +17,18 @@ use crate::graphql_plan::QueryPlan;
 use serde_json::{json, Map, Value};
 
 /// Dispatches one planned fetch to a subgraph and returns its GraphQL response JSON
-/// (an object with a `data` field, or a bare data object).
+/// (an object with a `data` field, or a bare data object). `class` is the fetch's tenancy class
+/// (R4/D8) — `Own` (today's behavior) or `Target{..}` (read another tenant's public subset); the
+/// router binds the corresponding host scope before the subgraph runs.
 #[async_trait::async_trait]
 pub(crate) trait SubgraphFetcher: Sync {
-    async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value;
+    async fn fetch(
+        &self,
+        subgraph: &str,
+        query: &str,
+        variables: Value,
+        class: &boatramp_core::tenancy::TenancyClass,
+    ) -> Value;
 }
 
 /// Execute `plan` with `fetcher`, returning the merged `{ "data": … }` response. `variables`
@@ -38,7 +46,12 @@ pub(crate) async fn execute(
         match &fetch.requires {
             None => {
                 let resp = fetcher
-                    .fetch(&fetch.subgraph, &fetch.query, variables.clone())
+                    .fetch(
+                        &fetch.subgraph,
+                        &fetch.query,
+                        variables.clone(),
+                        &fetch.class,
+                    )
                     .await;
                 // A root fetch's errors carry their own path relative to the root.
                 collect_errors(&mut errors, &resp, &[]);
@@ -56,6 +69,7 @@ pub(crate) async fn execute(
                         &fetch.subgraph,
                         &fetch.query,
                         with_representations(variables, reprs),
+                        &fetch.class,
                     )
                     .await;
                 // An `_entities` fetch's errors are relative to `_entities[i]`; prefix them
@@ -217,6 +231,11 @@ pub(crate) struct BackendRouter {
     /// request (the root); a guest-initiated run sets its own depth so the shared cap counts
     /// its sub-fetches. See [`BackendRouter::at_depth`].
     depth: u32,
+    /// The request's host-resolved **target-tenant scope** (R4/D8), if any: read another tenant
+    /// `B`'s public subset, confined by the project schema. `Some` only when the edge resolved a
+    /// target identity for this request (5a: from the carried domain). A `Target`-class fetch with
+    /// no resolved target scope here **fails closed** — a target read never runs un-confined.
+    target: Option<crate::graphql_data::policy::TargetScope>,
 }
 
 impl BackendRouter {
@@ -237,6 +256,7 @@ impl BackendRouter {
             sql_subgraphs,
             bearer,
             depth: 0,
+            target: None,
         }
     }
 
@@ -245,6 +265,19 @@ impl BackendRouter {
     /// counts a guest op → subgraph fetch → guest op chain and stops it looping.
     pub(crate) fn at_depth(mut self, depth: u32) -> Self {
         self.depth = depth;
+        self
+    }
+
+    /// Bind the request's host-resolved target-tenant scope (R4/D8) — used to serve a
+    /// `Target`-class fetch (read another tenant `B`'s public subset). Absent ⇒ a `Target` fetch
+    /// fails closed. Set by the edge once it has resolved the target identity + built the confinement
+    /// from the project schema.
+    #[allow(dead_code)] // wired by the edge's target resolver (5c / live gate)
+    pub(crate) fn with_target(
+        mut self,
+        target: Option<crate::graphql_data::policy::TargetScope>,
+    ) -> Self {
+        self.target = target;
         self
     }
 
@@ -257,6 +290,7 @@ impl BackendRouter {
         config: &boatramp_core::config::HandlerGraphqlDataConfig,
         query: &str,
         variables: Value,
+        target: Option<&crate::graphql_data::policy::TargetScope>,
     ) -> Value {
         let Some(provider) = &self.sql_provider else {
             return json!({ "errors": [{ "message": "the federation gateway has no SQL backend configured" }] });
@@ -295,8 +329,7 @@ impl BackendRouter {
                 invoker,
                 self.bearer.as_deref(),
                 self.depth,
-                // Own path for now; a Target-class fetch's TargetScope is built + passed in 5a-iv(4).
-                None,
+                target,
             )
             .await
         } else {
@@ -311,7 +344,7 @@ impl BackendRouter {
                 invoker,
                 self.bearer.as_deref(),
                 self.depth,
-                None,
+                target,
             )
             .await
         }
@@ -320,9 +353,42 @@ impl BackendRouter {
 
 #[async_trait::async_trait]
 impl SubgraphFetcher for BackendRouter {
-    async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+    async fn fetch(
+        &self,
+        subgraph: &str,
+        query: &str,
+        variables: Value,
+        class: &boatramp_core::tenancy::TenancyClass,
+    ) -> Value {
+        // Resolve the host scope to bind for this fetch (R4/D8). `Own` ⇒ today's path. `Target` ⇒
+        // this request's host-resolved target scope, or **fail closed** if none was resolved — a
+        // target read never runs un-confined.
+        let target = match class {
+            boatramp_core::tenancy::TenancyClass::Own => None,
+            boatramp_core::tenancy::TenancyClass::Target { .. } => match &self.target {
+                Some(ts) => Some(ts),
+                None => {
+                    return json!({ "errors": [{ "message":
+                        "target-tenant scope was not resolved for this request (fail-closed)" }] })
+                }
+            },
+            // `TenancyClass` is `#[non_exhaustive]`: any future class the host doesn't yet bind a
+            // scope for fails closed rather than running under the own (or no) scope.
+            _ => {
+                return json!({ "errors": [{ "message":
+                    "unsupported tenancy class for this fetch (fail-closed)" }] })
+            }
+        };
         if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
-            return self.run_sql(subgraph, site, config, query, variables).await;
+            return self
+                .run_sql(subgraph, site, config, query, variables, target)
+                .await;
+        }
+        // A wasm subgraph carries no target confinement in this stage, so a `Target` fetch to one is
+        // refused (target reads are served by SQL/GDC subgraphs). An `Own` wasm fetch is unchanged.
+        if class.is_target() {
+            return json!({ "errors": [{ "message":
+                "target-tenant reads are supported on SQL subgraphs only" }] });
         }
         invoke_subgraph(
             self.invoker.as_ref(),
@@ -550,6 +616,9 @@ fn stitch(data: &mut Value, path: &[String], entities: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Own` tenancy class — the class every fetch in these (pre-Stage-5) tests runs under.
+    const OWN: &boatramp_core::tenancy::TenancyClass = &boatramp_core::tenancy::TenancyClass::Own;
     use crate::graphql_federation::compose;
     use crate::graphql_plan::plan;
     use std::collections::HashMap;
@@ -577,7 +646,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SubgraphFetcher for Mock {
-        async fn fetch(&self, subgraph: &str, query: &str, _variables: Value) -> Value {
+        async fn fetch(
+            &self,
+            subgraph: &str,
+            query: &str,
+            _variables: Value,
+            _class: &boatramp_core::tenancy::TenancyClass,
+        ) -> Value {
             assert!(
                 async_graphql_parser::parse_query(query).is_ok(),
                 "gateway sent subgraph `{subgraph}` an unparsable query: {query}"
@@ -596,7 +671,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SubgraphFetcher for ContractRunner {
-        async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+        async fn fetch(
+            &self,
+            subgraph: &str,
+            query: &str,
+            variables: Value,
+            _class: &boatramp_core::tenancy::TenancyClass,
+        ) -> Value {
             match subgraph {
                 "accounts" => json!({ "data": { "users": [
                     { "__typename": "User", "id": "1", "name": "Alice" },
@@ -842,7 +923,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SubgraphFetcher for MutationRunner {
-        async fn fetch(&self, subgraph: &str, query: &str, variables: Value) -> Value {
+        async fn fetch(
+            &self,
+            subgraph: &str,
+            query: &str,
+            variables: Value,
+            _class: &boatramp_core::tenancy::TenancyClass,
+        ) -> Value {
             assert_eq!(subgraph, "agent");
             let doc = async_graphql_parser::parse_query(query)
                 .unwrap_or_else(|e| panic!("mutation fetch didn't parse: {e}\nquery: {query}"));
@@ -902,11 +989,39 @@ mod tests {
             std::collections::BTreeMap::new(),
             None,
         );
-        let resp = router.fetch("accounts", "{ me { id } }", json!({})).await;
+        let resp = router
+            .fetch("accounts", "{ me { id } }", json!({}), OWN)
+            .await;
         let msg = resp["errors"][0]["message"].as_str().unwrap_or_default();
         assert!(
             msg.contains("no function named `accounts` is deployed"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_fetch_with_no_resolved_scope_fails_closed() {
+        // A Target-class fetch when the request resolved NO target scope (router.target == None) is
+        // refused BEFORE any invoke/SQL — a target read never runs un-confined (deny-by-default).
+        let router = BackendRouter::new(
+            std::sync::Arc::new(MissingInvoker),
+            "default".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        );
+        let target_class = boatramp_core::tenancy::TenancyClass::Target {
+            via: vec![boatramp_core::tenancy::TargetSource::Domain],
+            public: "storefront".into(),
+            write: vec![],
+        };
+        let resp = router
+            .fetch("accounts", "{ me { id } }", json!({}), &target_class)
+            .await;
+        let msg = resp["errors"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("target-tenant scope was not resolved"),
+            "a target fetch with no resolved scope must fail closed, got: {msg}"
         );
     }
 
@@ -920,7 +1035,9 @@ mod tests {
             Some("t-acme".to_string()),
         );
         // A root fetch carries the caller's identity as `Bearer <token>`...
-        let root = router.fetch("orders", "{ me { id } }", json!({})).await;
+        let root = router
+            .fetch("orders", "{ me { id } }", json!({}), OWN)
+            .await;
         assert_eq!(root["data"]["identity"], json!("Bearer t-acme"));
         // ...and so does a dependent `_entities` hydration fetch (same dispatch path).
         let entity = router
@@ -928,6 +1045,7 @@ mod tests {
                 "orders",
                 "query($r: [_Any!]!) { _entities(representations: $r) { id } }",
                 json!({ "representations": [{ "__typename": "Order", "id": "1" }] }),
+                OWN,
             )
             .await;
         assert_eq!(
@@ -946,7 +1064,9 @@ mod tests {
             std::collections::BTreeMap::new(),
             None,
         );
-        let resp = router.fetch("orders", "{ me { id } }", json!({})).await;
+        let resp = router
+            .fetch("orders", "{ me { id } }", json!({}), OWN)
+            .await;
         assert_eq!(
             resp["errors"][0]["extensions"]["code"],
             json!("UNAUTHENTICATED"),
@@ -993,7 +1113,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            root.fetch("s", "{ x }", json!({})).await["data"]["depth"],
+            root.fetch("s", "{ x }", json!({}), OWN).await["data"]["depth"],
             json!(0)
         );
         // ...a guest-initiated run dispatches its sub-fetches at its own depth, so the shared
@@ -1007,7 +1127,7 @@ mod tests {
         )
         .at_depth(4);
         assert_eq!(
-            scoped.fetch("s", "{ x }", json!({})).await["data"]["depth"],
+            scoped.fetch("s", "{ x }", json!({}), OWN).await["data"]["depth"],
             json!(4)
         );
     }
