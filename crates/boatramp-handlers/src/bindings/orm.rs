@@ -1706,7 +1706,7 @@ mod tests {
             boatramp_core::tenancy::AccessMode::Own,
             &schema,
             "products",
-            &write.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &write.iter().map(ToString::to_string).collect::<Vec<_>>(),
         )))
     }
 

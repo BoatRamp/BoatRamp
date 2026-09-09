@@ -500,6 +500,11 @@ async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, en
             tx.query(&bad_sql, &bad_params).await.is_err(),
             "[{engine}] a uniform tenant_id scope must FAIL on the identity table: {bad_sql}"
         );
+        // Roll the aborted transaction back before dropping it: on Postgres a failed statement puts
+        // the transaction in the "aborted, commands ignored until end of transaction block" state, and
+        // returning the pooled connection without an explicit ROLLBACK poisons the NEXT `begin()` on
+        // it. (MySQL has no such sticky-abort, which is why only Postgres surfaced this.)
+        tx.rollback().await.unwrap();
     }
 
     // 3) `countries` (Unscoped) → globally readable (every country).

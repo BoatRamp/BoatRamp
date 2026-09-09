@@ -4265,7 +4265,10 @@ mod tests {
                         },
                     ],
                 )]),
-                write: write.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+                write: write
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
             },
         }
     }
