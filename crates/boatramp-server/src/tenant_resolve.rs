@@ -135,6 +135,73 @@ pub(crate) async fn resolve_host_tenancy(
     }
 }
 
+/// A resolved target source (R4/D8 5c): the target tenant `B` + the effective write-allowlist for
+/// this invocation. `write` is the route's grant for the `domain`/`capability` (authenticated)
+/// sources, but is forced **empty (read-only, G1)** for the `handle` source — a public handle may
+/// only ever read.
+pub(crate) struct ResolvedTarget {
+    pub value: String,
+    pub write: Vec<String>,
+}
+
+/// Resolve the target tenant `B` from the first applicable [`TargetSource`] in `via`
+/// (first-resolves-wins, R4/D8 5c) — the AUTHENTICATED sources (`domain`, `capability`), which are
+/// synchronous. The `handle` source (async registry lookup) is resolved separately by the serving
+/// path and is skipped here. Returns `None` when no listed synchronous source resolves (the caller
+/// then tries `handle`, else fails closed).
+///
+/// - **Domain**: the routed domain's host-stamped context tag (unforgeable — set at routing, never a
+///   client header). Honors the route's `write` grant.
+/// - **Capability**: the request bearer, verified as a [`KIND_CAPABILITY`](boatramp_core::cose::KIND_CAPABILITY)
+///   envelope against the fleet key, bound to this project as audience and to this route's `public`
+///   subset. A wrong-audience / wrong-subset / forged / expired capability does not resolve (fail
+///   closed → next source). Honors the route's `write` grant.
+pub(crate) fn resolve_target_authenticated(
+    via: &[boatramp_core::tenancy::TargetSource],
+    route_public: &str,
+    route_write: &[String],
+    domain_context: Option<&str>,
+    capability: Option<&str>,
+    capability_anchor: Option<&boatramp_core::cose::TokenPublicKey>,
+    audience: &str,
+    now_unix: u64,
+) -> Option<ResolvedTarget> {
+    use boatramp_core::tenancy::TargetSource;
+    for source in via {
+        match source {
+            TargetSource::Domain => {
+                if let Some(ctx) = domain_context.filter(|c| !c.is_empty()) {
+                    return Some(ResolvedTarget {
+                        value: ctx.to_string(),
+                        write: route_write.to_vec(),
+                    });
+                }
+            }
+            TargetSource::Capability => {
+                if let (Some(token), Some(anchor)) = (capability, capability_anchor) {
+                    if let Ok(grant) =
+                        boatramp_core::cose::verify_capability(token, anchor, now_unix, audience)
+                    {
+                        // The capability must grant EXACTLY this route's public subset (a capability
+                        // for another subset can't be redeemed here).
+                        if grant.public == route_public {
+                            return Some(ResolvedTarget {
+                                value: grant.tenant,
+                                write: route_write.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
+            // The `handle` source is resolved by the serving path (async registry lookup, read-only).
+            TargetSource::Handle => {}
+            // A future source this build doesn't understand does not resolve here (fail-closed).
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Resolve tenancy for an **in-project invoke** (a function/handler calling a sibling): the tenant
 /// **value** is inherited from the caller (host-carried, not from the guest's invoke request), and
 /// the callee applies its OWN declared column + modes. Same Dimension-0 refusal + posture cap as
@@ -564,6 +631,105 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(scope.value, Some(SqlValue::Text("acme-store".into())));
+    }
+
+    #[tokio::test]
+    async fn via_resolves_domain_then_capability_first_wins() {
+        use boatramp_core::cose::{mint_capability, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::tenancy::TargetSource;
+        let now = 1000;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        let write = vec!["title".to_string()];
+
+        // A capability granting tenant_B's `products` subset, redeemable at project `shop`.
+        let cap = mint_capability("tenant_B", "shop", "products", 300, now, &signer)
+            .await
+            .unwrap();
+
+        // via = [domain, capability]: the domain wins when present (first-resolves-wins), honoring
+        // the write grant.
+        let r = resolve_target_authenticated(
+            &[TargetSource::Domain, TargetSource::Capability],
+            "products",
+            &write,
+            Some("acme-store"),
+            Some(&cap),
+            Some(&anchor),
+            "shop",
+            now,
+        )
+        .unwrap();
+        assert_eq!(r.value, "acme-store");
+        assert_eq!(r.write, write);
+
+        // via = [capability] with no domain: the capability resolves B + honors the write grant.
+        let r = resolve_target_authenticated(
+            &[TargetSource::Capability],
+            "products",
+            &write,
+            None,
+            Some(&cap),
+            Some(&anchor),
+            "shop",
+            now,
+        )
+        .unwrap();
+        assert_eq!(r.value, "tenant_B");
+        assert_eq!(r.write, write);
+
+        // Wrong audience (presented at another project) ⇒ no resolution (fail closed).
+        assert!(resolve_target_authenticated(
+            &[TargetSource::Capability],
+            "products",
+            &write,
+            None,
+            Some(&cap),
+            Some(&anchor),
+            "other-project",
+            now,
+        )
+        .is_none());
+
+        // Wrong subset (the capability grants `products`, the route names `reviews`) ⇒ no resolution.
+        assert!(resolve_target_authenticated(
+            &[TargetSource::Capability],
+            "reviews",
+            &write,
+            None,
+            Some(&cap),
+            Some(&anchor),
+            "shop",
+            now,
+        )
+        .is_none());
+
+        // An app bearer (not a capability envelope) ⇒ no resolution (fails the kind check).
+        assert!(resolve_target_authenticated(
+            &[TargetSource::Capability],
+            "products",
+            &write,
+            None,
+            Some("not-a-capability"),
+            Some(&anchor),
+            "shop",
+            now,
+        )
+        .is_none());
+
+        // The `handle` source is not resolved here (async, read-only) ⇒ a handle-only via yields
+        // None from this synchronous resolver (the serving path resolves it separately).
+        assert!(resolve_target_authenticated(
+            &[TargetSource::Handle],
+            "products",
+            &write,
+            Some("acme"),
+            Some(&cap),
+            Some(&anchor),
+            "shop",
+            now,
+        )
+        .is_none());
     }
 
     #[tokio::test]

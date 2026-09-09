@@ -1173,27 +1173,40 @@ pub(super) async fn build_bindings(
                          project schema does not declare (deny-by-default)"
                     ));
                 }
-                // 5a resolves `B` from the routed domain only (the full `via` model is 5c).
-                let b = via
-                    .contains(&boatramp_core::tenancy::TargetSource::Domain)
-                    .then(|| domain_context.filter(|c| !c.is_empty()))
-                    .flatten();
-                match (b, schema.as_ref()) {
-                    (Some(b), Some(sc)) => Some(boatramp_handlers::HostTenancy::target(
-                        boatramp_core::sql::SqlValue::Text(b.to_string()),
+                // R4/D8 5c: resolve `B` from the first applicable `via` source (first-resolves-wins).
+                // The AUTHENTICATED sources resolve synchronously here — `domain` (the host-stamped
+                // context tag) and `capability` (the request bearer, verified as a signed capability
+                // envelope bound to THIS project as audience + this route's `public` subset). Both
+                // honor the route's `write` grant. The `handle` source (an anonymous public slug) is
+                // resolved separately below — read-only, world-public only.
+                let resolved = crate::tenant_resolve::resolve_target_authenticated(
+                    via,
+                    public,
+                    write,
+                    domain_context,
+                    // Under a target route the bearer is a capability candidate (an app bearer simply
+                    // fails the capability `kind`/audience check and this returns no capability fact).
+                    bearer,
+                    session_anchor.as_ref(),
+                    project.as_str(),
+                    boatramp_core::time::now_unix(),
+                );
+                match (resolved, schema.as_ref()) {
+                    (Some(rt), Some(sc)) => Some(boatramp_handlers::HostTenancy::target(
+                        boatramp_core::sql::SqlValue::Text(rt.value),
                         boatramp_core::tenancy::AccessMode::Own,
                         sc,
                         public,
-                        // 5b: the target route's SET-allowlist (empty ⇒ read-only). The orm write
-                        // path confines a target write to B's public subset; raw-SQL writes refused.
-                        write,
+                        // The effective write-allowlist: the route's grant for domain/capability,
+                        // forced empty (read-only, G1) for a handle source. Raw-SQL writes refused.
+                        &rt.write,
                     )),
-                    // No resolvable target tenant / schema ⇒ refuse (a target route must never fall
-                    // back to an own/plain — that would read the caller's own or every tenant's rows).
+                    // No `via` source resolved ⇒ refuse (a target route must never fall back to an
+                    // own/plain — that would read the caller's own or every tenant's rows).
                     _ => {
                         return Err(
                             "tenancy: this target route could not resolve a target tenant \
-                                    (no routed domain, or no project schema)"
+                                    (no routed domain, no valid capability, and no resolvable handle)"
                                 .to_string(),
                         )
                     }
