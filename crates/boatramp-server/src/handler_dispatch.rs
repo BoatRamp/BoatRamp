@@ -521,41 +521,41 @@ async fn federation_gateway(
         sql_subgraphs,
         bearer.map(str::to_string),
     );
-    // R4/D8: when the plan has any `target`-class fetch, resolve the target tenant `B` and bind the
-    // request's confinement so those fetches read only B's public subset. For 5a, `B` is the
-    // terminating domain's context tag (a same-origin funnel on B's host) — never guest input; the
-    // full `via` source model (handle/capability) lands in 5c. No domain, or no project schema, ⇒
-    // no target scope ⇒ every target fetch fails closed (build_target_scope + the fetch branch).
+    // R4/D8: when the plan has any `target`-class fetch, (1) enforce the operator ceiling — every
+    // target root field this query uses must be listed in the project's `target_eligible_fields`,
+    // else refuse (the app's SDL alone can never make a field cross to another tenant) — and (2)
+    // bind the request's confinement so those fetches read only B's public subset. For 5a, `B` is
+    // the terminating domain's context tag (a same-origin funnel on B's host) — never guest input;
+    // the full `via` source model (handle/capability) lands in 5c. The schema is loaded FRESH here
+    // (not the cached supergraph), so removing a field's eligibility takes effect immediately. No
+    // domain, or no project schema, ⇒ no target scope ⇒ every target fetch fails closed.
     if plan.fetches.iter().any(|f| f.class.is_target()) {
-        if let Some(target) = resolve_carried_domain_target(inner, project, domain_context).await {
-            runner = runner.with_target(Some(target));
+        let schema = boatramp_core::deploy::load_project_tenancy(
+            inner.kv.as_ref(),
+            boatramp_core::project::ProjectRef::new(project),
+        )
+        .await
+        .ok()
+        .flatten();
+        for field in crate::graphql_gateway::target_root_fields(query, &cached.supergraph) {
+            let eligible = schema
+                .as_ref()
+                .is_some_and(|s| s.target_field_eligible(&field));
+            if !eligible {
+                return graphql_guard::error_response(&format!(
+                    "field `{field}` is not an operator-permitted target-tenant field \
+                     (add it to the project's target_eligible_fields)"
+                ));
+            }
+        }
+        if let (Some(schema), Some(b)) = (schema, domain_context.filter(|c| !c.is_empty())) {
+            runner = runner.with_target(Some(crate::graphql_gateway::build_target_scope(
+                &schema,
+                boatramp_core::sql::SqlValue::Text(b.to_string()),
+            )));
         }
     }
     axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
-}
-
-/// Resolve a **carried-domain** target scope (R4/D8, the 5a source): the target tenant `B` is the
-/// terminating domain's context tag, confined by the project's [`TenancySchema`] public subsets.
-/// `None` — so every target fetch fails closed — when there is no domain tag, no stored project
-/// schema, or the schema can't be read. `B` is host-derived (the routed domain), never guest input.
-#[cfg(feature = "handlers")]
-async fn resolve_carried_domain_target(
-    inner: &HandlerRuntimeInner,
-    project: &str,
-    domain_context: Option<&str>,
-) -> Option<crate::graphql_data::policy::TargetScope> {
-    let b = domain_context.filter(|c| !c.is_empty())?;
-    let schema = boatramp_core::deploy::load_project_tenancy(
-        inner.kv.as_ref(),
-        boatramp_core::project::ProjectRef::new(project),
-    )
-    .await
-    .ok()
-    .flatten()?;
-    Some(crate::graphql_gateway::build_target_scope(
-        &schema,
-        boatramp_core::sql::SqlValue::Text(b.to_string()),
-    ))
 }
 
 /// The declarative data connector: serve a GraphQL query from the site's managed database.

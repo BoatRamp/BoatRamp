@@ -242,6 +242,42 @@ pub(crate) fn build_target_scope(
     }
 }
 
+/// The names of `query`'s root fields that resolve to a **target** tenancy class (R4/D8) — the
+/// fields whose eligibility the operator's `target_eligible_fields` allowlist gates. Empty when the
+/// query has no target root field (or doesn't parse — the planner already validated it). Used at
+/// the gateway to refuse, fresh per request, a target field the project hasn't opted in.
+pub(crate) fn target_root_fields(
+    query: &str,
+    sg: &crate::graphql_federation::Supergraph,
+) -> Vec<String> {
+    use async_graphql_parser::types::{DocumentOperations, Selection};
+    let Ok(doc) = async_graphql_parser::parse_query(query) else {
+        return Vec::new();
+    };
+    let op = match &doc.operations {
+        DocumentOperations::Single(op) => &op.node,
+        DocumentOperations::Multiple(m) => match m.values().next() {
+            Some(o) => &o.node,
+            None => return Vec::new(),
+        },
+    };
+    op.selection_set
+        .node
+        .items
+        .iter()
+        .filter_map(|s| match &s.node {
+            Selection::Field(f) => {
+                let name = f.node.name.node.as_str();
+                sg.root_tenancy
+                    .get(name)
+                    .filter(|c| c.is_target())
+                    .map(|_| name.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Lower a host-held [`PublicPredicate`](boatramp_core::tenancy::PublicPredicate) into GDC
 /// [`ResolvedTerm`](crate::graphql_data::policy::ResolvedTerm)s (literals become bound values, never
 /// interpolated). The GDC analogue of `boatramp_core::orm::lower_public_terms`.
@@ -1064,6 +1100,30 @@ mod tests {
         assert!(
             msg.contains("no function named `accounts` is deployed"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn target_root_fields_lists_only_the_target_fields_a_query_uses() {
+        let sdl = r#"
+            type Query {
+              me: User
+              publicProducts: [Product] @tenant(scope: target, via: [domain], public: "storefront")
+            }
+            type User { id: ID! }
+            type Product { id: ID! }
+        "#;
+        let sg = crate::graphql_federation::compose(&[("shop".into(), sdl.into())]).unwrap();
+        // An own-only query has no target fields; a query using the target field lists it; a mixed
+        // query lists only the target one — so the operator gate refuses exactly the offending field.
+        assert!(target_root_fields("{ me { id } }", &sg).is_empty());
+        assert_eq!(
+            target_root_fields("{ publicProducts { id } }", &sg),
+            vec!["publicProducts".to_string()]
+        );
+        assert_eq!(
+            target_root_fields("{ me { id } publicProducts { id } }", &sg),
+            vec!["publicProducts".to_string()]
         );
     }
 
