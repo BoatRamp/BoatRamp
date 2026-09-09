@@ -573,4 +573,144 @@ mod tests {
         .unwrap();
         assert_eq!(objects[0]["reviews"], json!("anonymous"));
     }
+
+    /// **Live** proof (R4/D8) that a GraphQL Data Connector **target read** is confined to tenant
+    /// `B`'s PUBLIC subset on a **real** libsql engine — compile → SQL → execute → shape end to end,
+    /// not just the compiler's string output. Seeds one shared `products` table with tenant A's rows
+    /// and tenant B's rows (public, draft, and soft-deleted), then runs the GDC with a `TargetScope`
+    /// for B and asserts the read returns ONLY B's published, non-deleted row — never A's, never B's
+    /// draft/removed. Also proves the deny-by-default: a target read of a table with no declared
+    /// public subset is refused. `#[ignore]`d for the same reason as the ORM batteries (a static-musl
+    /// test binary segfaults in libsql's bundled SQLite); the `test-gdc-target` CI job runs it
+    /// unignored on the host toolchain and greps the success marker.
+    #[tokio::test]
+    #[ignore = "run via the test-gdc-target CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn gdc_target_read_isolates_to_b_public_subset_on_a_real_engine() {
+        use super::super::introspect::introspect_sqlite;
+        use super::super::policy::{ResolvedTerm, RowOp, TargetScope, TargetTable};
+        use boatramp_core::sql::SqlBackends;
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join(format!("boatramp-gdc-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let backend = backends.database("default", "shop", "").await.unwrap();
+
+        // A shared products table across tenants A and B, with visibility columns.
+        {
+            let mut tx = backend.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE products (id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, \
+                 published INTEGER, deleted_at TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, name, published, deleted) in [
+                ("b1", "tenant_B", "B public", 1i64, None),
+                ("b2", "tenant_B", "B draft", 0, None),
+                ("b3", "tenant_B", "B removed", 1, Some("2020-01-01")),
+                ("a1", "tenant_A", "A public", 1, None),
+            ] {
+                tx.execute(
+                    "INSERT INTO products (id, tenant_id, name, published, deleted_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(name.into()),
+                        SqlValue::Integer(published),
+                        deleted.map_or(SqlValue::Null, |d| SqlValue::Text(d.into())),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let schema = introspect_sqlite(backend.as_ref()).await.unwrap();
+        let policy = DataPolicy::new().with_table("products", TablePolicy::columns(["id", "name"]));
+        let dialect = super::super::dialect::Sqlite;
+
+        // The host-resolved target scope for B: tenant_id = "tenant_B" AND published = 1 AND
+        // deleted_at IS NULL (the public subset).
+        let target = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::from([(
+                "products".to_string(),
+                TargetTable {
+                    tenant_column: "tenant_id".into(),
+                    public: vec![
+                        ResolvedTerm::Cmp {
+                            column: "published".into(),
+                            op: RowOp::Eq,
+                            value: SqlValue::Integer(1),
+                        },
+                        ResolvedTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+            )]),
+        };
+
+        let out = execute(
+            backend.as_ref(),
+            &dialect,
+            &schema,
+            &policy,
+            &Claims::default(),
+            "{ products { id name } }",
+            &json!({}),
+            None,
+            None,
+            0,
+            Some(&target),
+        )
+        .await;
+        let names: Vec<&str> = out["data"]["products"]
+            .as_array()
+            .expect("data.products is an array")
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["B public"],
+            "a target read returns ONLY B's published, non-deleted row (never A's, never B's \
+             draft/removed): {out}"
+        );
+
+        // Deny-by-default: a target read of a table with NO declared public subset is refused.
+        let empty = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::new(),
+        };
+        let refused = execute(
+            backend.as_ref(),
+            &dialect,
+            &schema,
+            &policy,
+            &Claims::default(),
+            "{ products { id } }",
+            &json!({}),
+            None,
+            None,
+            0,
+            Some(&empty),
+        )
+        .await;
+        assert!(
+            refused.get("errors").is_some() && refused.get("data").is_none(),
+            "a target read of a table with no declared public subset must be refused: {refused}"
+        );
+
+        println!(
+            "GDC TARGET-TENANT ISOLATION OK: a target read returns only B's published+non-deleted \
+             rows (never tenant A's, never B's draft/removed) on a real libsql engine; a table with \
+             no declared public subset is refused deny-by-default"
+        );
+    }
 }
