@@ -52,6 +52,11 @@ pub struct ClaimedMessage {
     /// work-queue (competing consumers, delete-on-ack); a non-empty group is a
     /// durable fan-out subscriber with its own cursor. `ack`/`nack` branch on it.
     pub group: String,
+    /// The host-minted **durable signed-context** envelope stamped at publish from the producer's
+    /// own-tenant principal (R1), or `None` when the producer had no resolved tenant. Opaque here —
+    /// the consumer's tenant resolver verifies it (signature + expiry) against the fleet anchor and
+    /// resolves the `signed_context` source; a forged/absent envelope fails an "own" op closed.
+    pub signed_context: Option<String>,
 }
 
 // A new consumer group's start position — defined in `boatramp-types` (so the
@@ -84,6 +89,21 @@ pub trait Messaging: Send + Sync {
     /// Append a message to `topic`. Coordination-free (a distinct key per
     /// message), so concurrent publishers never contend.
     async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MessagingError>;
+
+    /// Append a message to `topic`, stamping the host-minted **durable signed-context** envelope
+    /// (R1) onto its index record so a consumer declaring `sources: [signed_context]` resolves the
+    /// producer's own-tenant (Stage 4). The envelope is host-issued from the producer's principal —
+    /// the guest never names a tenant. The default drops the context and delegates to
+    /// [`publish`](Self::publish) (backends that don't persist a per-message record); the durable
+    /// backends override it. `None` ⇒ identical to `publish` (an unscoped producer).
+    async fn publish_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish(topic, payload).await
+    }
 
     /// Atomically claim up to `max_batch` deliverable messages from `topic`,
     /// leasing each for `lease` (after which an un-acked message is redelivered).
@@ -214,15 +234,24 @@ pub struct Record {
     pub attempts: u32,
     /// Unix-millis until which the message is leased; `0` = claimable now.
     pub lease_until_ms: u64,
+    /// The host-minted durable signed-context envelope (R1) — the producer's stamped own-tenant,
+    /// carried across the durability boundary so a consumer declaring `sources: [signed_context]`
+    /// resolves it. `None` when the producer had no resolved tenant. Absent on records written by
+    /// an older binary (`#[serde(default)]`); elided when `None` so those records stay byte-identical
+    /// (`skip_serializing_if`). Verified — never trusted — at consume time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_context: Option<String>,
 }
 
 impl Record {
-    /// A freshly-published record: never delivered, claimable immediately.
-    pub fn fresh() -> Self {
+    /// A freshly-published record: never delivered, claimable immediately, carrying the optional
+    /// host-minted signed-context envelope stamped from the producer's own-tenant.
+    pub fn fresh(signed_context: Option<String>) -> Self {
         Self {
             version: crate::SCHEMA_VERSION,
             attempts: 0,
             lease_until_ms: 0,
+            signed_context,
         }
     }
 }
@@ -697,6 +726,22 @@ impl LogMessaging {
         self.read_storage(&gpayload_key(topic, id)).await
     }
 
+    /// Best-effort read of a message's durable signed-context envelope from its index record
+    /// (the grouped fan-out path has no per-message record of its own, so it re-reads the shared
+    /// index record). Any miss (record gone, decode error) ⇒ `None`, so the consumer's
+    /// `signed_context` source simply fails closed rather than erroring the whole claim.
+    ///
+    /// Caveat (fail-closed, not a breach): if the *same* topic is also drained by the default
+    /// work-queue, a work-queue `ack` deletes the shared index record, after which a grouped
+    /// consumer's `read_ctx` misses and that delivery carries no context (its "own" op then fails
+    /// closed). A `signed_context` grouped consumer should therefore not share a topic with a
+    /// work-queue drain — use a dedicated `bus:<topic>` per group.
+    async fn read_ctx(&self, topic: &str, id: &str) -> Option<String> {
+        let raw = self.kv.get(&meta_key(topic, id)).await.ok()??;
+        let record: Record = serde_json::from_slice(&raw).ok()?;
+        record.signed_context
+    }
+
     async fn read_storage(&self, key: &str) -> Result<Vec<u8>, MessagingError> {
         let object = self
             .storage
@@ -873,6 +918,15 @@ impl LogMessaging {
 #[async_trait]
 impl Messaging for LogMessaging {
     async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, None).await
+    }
+
+    async fn publish_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
         let id = format!(
             "{:013}-{:016x}",
             now_unix_ms(),
@@ -886,7 +940,10 @@ impl Messaging for LogMessaging {
             .put(&payload_key(topic, &id), body, PutMeta::default())
             .await
             .map_err(MessagingError::backend)?;
-        let json = serde_json::to_vec(&Record::fresh()).map_err(MessagingError::backend)?;
+        // The durable signed-context (R1) rides on the index record, so it is deleted with the
+        // record on ack/dead-letter (no separate keyspace to clean up).
+        let json = serde_json::to_vec(&Record::fresh(signed_context.map(str::to_owned)))
+            .map_err(MessagingError::backend)?;
         self.kv
             .put(&meta_key(topic, &id), json)
             .await
@@ -987,6 +1044,7 @@ impl Messaging for LogMessaging {
                         payload,
                         attempts: record.attempts,
                         group: String::new(),
+                        signed_context: record.signed_context,
                     });
                 }
                 ClaimAction::DeadLetter { id, record } => {
@@ -1057,6 +1115,9 @@ impl Messaging for LogMessaging {
                 version: crate::SCHEMA_VERSION,
                 attempts: *attempts,
                 lease_until_ms: 0,
+                // The group's offset log doesn't carry the per-message context; a redriven grouped
+                // dead-letter re-resolves via the message's index record if still present.
+                signed_context: None,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -1075,13 +1136,17 @@ impl Messaging for LogMessaging {
         let mut claimed = Vec::new();
         for (id, attempts) in plan.leased {
             match self.read_gpayload(topic, &id).await {
-                Ok(payload) => claimed.push(ClaimedMessage {
-                    id,
-                    topic: topic.to_string(),
-                    payload,
-                    attempts,
-                    group: group.to_string(),
-                }),
+                Ok(payload) => {
+                    let signed_context = self.read_ctx(topic, &id).await;
+                    claimed.push(ClaimedMessage {
+                        id,
+                        topic: topic.to_string(),
+                        payload,
+                        attempts,
+                        group: group.to_string(),
+                        signed_context,
+                    });
+                }
                 Err(_) => continue,
             }
         }
@@ -1208,7 +1273,17 @@ impl Messaging for LogMessaging {
             // Re-arm a fresh, immediately-claimable record (the payload is still
             // present), *then* drop the dead record — so a crash in between leaves
             // the message recoverable (live) rather than orphaning its payload.
-            let json = serde_json::to_vec(&Record::fresh()).map_err(MessagingError::backend)?;
+            // Carry the preserved signed-context forward so a redriven message still resolves the
+            // producer's tenant on retry (the dead record kept it verbatim).
+            let signed_context = self
+                .kv
+                .get(&key)
+                .await
+                .map_err(MessagingError::backend)?
+                .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+                .and_then(|r| r.signed_context);
+            let json = serde_json::to_vec(&Record::fresh(signed_context))
+                .map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, id), json)
                 .await

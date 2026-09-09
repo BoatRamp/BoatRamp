@@ -15,7 +15,7 @@
 
 use boatramp_core::orm::{
     Assignment, CmpOp, Delete, Direction, Expr, Insert, Join, JoinKind, OrderBy, Predicate,
-    RowValues, Scope, ScopeMode, Select, SelectItem, Update,
+    RowValues, Scope, ScopeMode, Select, SelectItem, TableKeys, Update,
 };
 use boatramp_core::sql::{Dialect, SqlBackend, SqlValue};
 use std::sync::Arc;
@@ -29,8 +29,10 @@ fn t(s: &str) -> SqlValue {
 fn scope(mode: ScopeMode, value: &str) -> Scope {
     Scope {
         column: "tenant_id".into(),
-        value: t(value),
+        value: Some(t(value)),
+        session: None,
         mode,
+        keys: TableKeys::Uniform,
     }
 }
 fn item(e: Expr) -> SelectItem {
@@ -96,7 +98,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             columns: vec![item(Expr::col("body"))],
             ..Select::from("notes")
         };
-        s.force_scope(&scope(mode, tenant));
+        s.force_scope(&scope(mode, tenant)).unwrap();
         s.compile(dialect).unwrap()
     };
 
@@ -176,7 +178,8 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
         ins.force_scope(
             Some(&scope(ScopeMode::Own, "acme")),
             Some(&scope(ScopeMode::Own, "acme")),
-        );
+        )
+        .unwrap();
         let (sql, params) = ins.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -210,7 +213,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             scope: None,
             returning: vec![],
         };
-        upd.force_scope(&scope(ScopeMode::Own, "acme"));
+        upd.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = upd.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -245,7 +248,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             scope: None,
             returning: vec![],
         };
-        del.force_scope(&scope(ScopeMode::Own, "acme"));
+        del.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = del.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         tx.execute(&sql, &params).await.unwrap();
@@ -292,7 +295,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
             }],
             ..Select::from("notes")
         };
-        sel.force_scope(&scope(ScopeMode::Own, "acme"));
+        sel.force_scope(&scope(ScopeMode::Own, "acme")).unwrap();
         let (sql, params) = sel.compile(dialect).unwrap();
         let mut tx = backend.begin().await.unwrap();
         let got = run_query(tx.as_mut(), &sql, &params).await;
@@ -333,7 +336,7 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
                 limit: Some(1),
                 ..Select::from("notes")
             };
-            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant));
+            s.force_scope(&scope(ScopeMode::OwnOrNull, tenant)).unwrap();
             s.compile(dialect).unwrap()
         };
 
@@ -365,6 +368,391 @@ async fn run_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &st
     );
 }
 
+/// The Stage 1 *per-table-key* battery — the multi-engine companion to the libsql
+/// `orm_per_table_key_scope_isolates_on_a_real_engine` gate. A project schema keys each table
+/// independently, so a per-dialect rendering bug (placeholder renumbering, column quoting) in the
+/// per-ref scope predicate could drop or misplace one table's key on one engine but not another;
+/// proving it on Postgres AND MySQL closes that gap. The [`Scope`] is built exactly as the host
+/// builds it: `column = default_tenant_key`, `keys = PerTable(schema.table_key_map())`.
+async fn run_pertable_battery(backend: Arc<dyn SqlBackend>, dialect: Dialect, engine: &str) {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    // Fresh schema, idempotent across a reused service-container DB.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS orders",
+            "DROP TABLE IF EXISTS tenant",
+            "DROP TABLE IF EXISTS countries",
+            "DROP TABLE IF EXISTS member",
+            "CREATE TABLE orders (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), item VARCHAR(255))",
+            "CREATE TABLE tenant (id VARCHAR(64) PRIMARY KEY, plan VARCHAR(64))",
+            "CREATE TABLE countries (code VARCHAR(8) PRIMARY KEY, name VARCHAR(64))",
+            // `member` keyed on `account_id` (NOT the default) with a shared `tenant_id='acme'` on
+            // BOTH rows — the write-axis leak fixture (a tenant_id-keyed write would reach globex).
+            "CREATE TABLE member (account_id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), secret VARCHAR(255))",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        tx.execute(
+            "INSERT INTO orders (id, tenant_id, item) VALUES ('o_a','acme','acme-widget'),('o_g','globex','globex-gadget')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO tenant (id, plan) VALUES ('acme','pro'),('globex','free')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO countries (code, name) VALUES ('US','United States'),('FR','France')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO member (account_id, tenant_id, secret) VALUES ('acme','acme','acme-secret'),('globex','acme','globex-secret')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        session_key: None,
+        tables: BTreeMap::from([
+            ("orders".into(), TableScope::Tenant),
+            (
+                "tenant".into(),
+                TableScope::TenantKeyed { key: "id".into() },
+            ),
+            (
+                "member".into(),
+                TableScope::TenantKeyed {
+                    key: "account_id".into(),
+                },
+            ),
+            ("countries".into(), TableScope::Unscoped),
+        ]),
+        ..Default::default()
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let scope_for = |tenant: &str| Scope {
+        column: "tenant_id".into(),
+        value: Some(t(tenant)),
+        session: None,
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+    };
+
+    // 1) `orders` (Tenant) scoped on `tenant_id` → acme-only.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("orders")
+        };
+        s.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "[{engine}] orders acme-only"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2) identity `tenant` (TenantKeyed on `id`) scoped on its own PK → acme's row only.
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("plan"))],
+            ..Select::from("tenant")
+        };
+        s.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["pro".to_string()],
+            "[{engine}] identity row is own-only"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2b) CONTROL — a legacy Uniform `tenant_id` scope on the identity table names a column the
+    //     table lacks; the REAL engine rejects it. The per-table key is load-bearing.
+    {
+        let mut bad = Select {
+            columns: vec![item(Expr::col("plan"))],
+            ..Select::from("tenant")
+        };
+        bad.force_scope(&scope(ScopeMode::Own, "acme")).unwrap(); // Uniform helper → tenant_id
+        let (bad_sql, bad_params) = bad.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        assert!(
+            tx.query(&bad_sql, &bad_params).await.is_err(),
+            "[{engine}] a uniform tenant_id scope must FAIL on the identity table: {bad_sql}"
+        );
+    }
+
+    // 3) `countries` (Unscoped) → globally readable (every country).
+    {
+        let mut s = Select {
+            columns: vec![item(Expr::col("name"))],
+            ..Select::from("countries")
+        };
+        s.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = s.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["France".to_string(), "United States".to_string()],
+            "[{engine}] Unscoped reference table is global"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 4) A JOIN scopes each ref on its own key → only acme's joined row.
+    {
+        let mut sel = Select {
+            table: "orders".into(),
+            table_alias: Some("o".into()),
+            columns: vec![item(Expr::col("o.item"))],
+            joins: vec![Join {
+                kind: JoinKind::Inner,
+                table: "tenant".into(),
+                alias: Some("t".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("t.id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("o.tenant_id"),
+                },
+            }],
+            ..Select::from("orders")
+        };
+        sel.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = sel.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let got = run_query(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            got,
+            vec!["acme-widget".to_string()],
+            "[{engine}] join is acme-only"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 5) DENY-BY-DEFAULT: an undeclared table is refused at compile — no SQL reaches the engine.
+    {
+        let mut undeclared = Select {
+            columns: vec![item(Expr::col("v"))],
+            ..Select::from("secrets_shadow")
+        };
+        undeclared.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                undeclared.compile(dialect),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "[{engine}] an undeclared table must be refused deny-by-default"
+        );
+    }
+
+    // 6) WRITE target keyed on its DECLARED column: a guest DELETE of globex's row by a non-tenant
+    //    predicate is scoped on `member.account_id` (not the shared tenant_id='acme'), so as acme it
+    //    affects ZERO rows on the real engine — no cross-tenant write. Undeclared write refused.
+    {
+        let eq = |col: &str, v: &str| Predicate::Cmp {
+            left: Expr::col(col),
+            op: CmpOp::Eq,
+            right: Expr::Value(t(v)),
+        };
+        let mut del = Delete {
+            table: "member".into(),
+            filter: eq("secret", "globex-secret"),
+            scope: None,
+            returning: vec![],
+        };
+        del.force_scope(&scope_for("acme")).unwrap();
+        let (sql, params) = del.compile(dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        let affected = tx.execute(&sql, &params).await.unwrap();
+        assert_eq!(
+            affected, 0,
+            "[{engine}] a DELETE keyed on account_id must not reach globex's row"
+        );
+        tx.commit().await.unwrap();
+
+        let mut undeclared_write = Delete {
+            table: "secrets_shadow".into(),
+            filter: eq("x", "y"),
+            scope: None,
+            returning: vec![],
+        };
+        undeclared_write.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                undeclared_write.compile(dialect),
+                Err(boatramp_core::orm::OrmError::TenancyUndeclared(tbl)) if tbl == "secrets_shadow"
+            ),
+            "[{engine}] an undeclared write target must be refused deny-by-default"
+        );
+
+        // A write to an `Unscoped` (global reference) table is refused — reads are global, writes are
+        // a cross-tenant blast (deny-by-default).
+        let mut unscoped_write = Delete {
+            table: "countries".into(),
+            filter: eq("code", "US"),
+            scope: None,
+            returning: vec![],
+        };
+        unscoped_write.force_scope(&scope_for("acme")).unwrap();
+        assert!(
+            matches!(
+                unscoped_write.compile(dialect),
+                Err(boatramp_core::orm::OrmError::UnscopedWrite(tbl)) if tbl == "countries"
+            ),
+            "[{engine}] a guest write to an Unscoped reference table must be refused"
+        );
+    }
+
+    println!(
+        "ORM PER-TABLE-KEY TENANCY OK [{engine}]: Tenant table on default tenant_id; identity \
+         TenantKeyed table on its own PK (uniform tenant_id scope rejected by the engine); \
+         Unscoped reference table global for reads; per-ref join keys each on its own column; a \
+         WRITE is bounded on the target's declared key (a cross-tenant DELETE affects 0 rows), \
+         refuses an undeclared target, and refuses a write to an Unscoped table; an undeclared table \
+         refused deny-by-default"
+    );
+}
+
+/// The Stage 3 R3 **anonymous-first disjunct** (`TenantOrSession`) + `promote`, on real Postgres and
+/// MySQL — the multi-engine companion to the SQLite `orm_tenant_or_session_disjunct_*` gate. The
+/// disjunct's `Or([tenant=T, session=S])` and promote's `tenant_id IS NULL` guard lean on NULL /
+/// three-valued-logic semantics that can differ per engine, so R3 is proven on each engine, not
+/// SQLite alone (the repo's ignore-gated-tests-not-evidence rule).
+async fn run_session_disjunct_battery(
+    backend: Arc<dyn SqlBackend>,
+    dialect: Dialect,
+    engine: &str,
+) {
+    use boatramp_core::tenancy::{TableScope, TenancySchema};
+    use std::collections::BTreeMap;
+
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS carts",
+            "CREATE TABLE carts (id VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), session_id VARCHAR(64), item VARCHAR(255))",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        tx.execute(
+            "INSERT INTO carts (id, tenant_id, session_id, item) VALUES \
+             ('c_acme','acme',NULL,'acme-cart'),('c_glob','globex',NULL,'globex-cart'), \
+             ('c_s1',NULL,'sess-1','anon-cart-1'),('c_s2',NULL,'sess-2','anon-cart-2')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let schema = TenancySchema {
+        default_tenant_key: "tenant_id".into(),
+        session_key: Some("session_id".into()),
+        tables: BTreeMap::from([("carts".into(), TableScope::TenantOrSession)]),
+        ..Default::default()
+    };
+    let keys = TableKeys::PerTable(schema.table_key_map());
+    let sc = |tenant: Option<&str>, session: Option<&str>| Scope {
+        column: "tenant_id".into(),
+        value: tenant.map(t),
+        session: session.map(t),
+        mode: ScopeMode::Own,
+        keys: keys.clone(),
+    };
+    let read_items = |scope: &Scope| {
+        let mut s = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("carts")
+        };
+        s.force_scope(scope).unwrap();
+        s.compile(dialect).unwrap()
+    };
+
+    // Anon reads only its own session; authed only its tenant; both = the Or.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        let (q, p) = read_items(&sc(None, Some("sess-1")));
+        assert_eq!(
+            run_query(tx.as_mut(), &q, &p).await,
+            vec!["anon-cart-1".to_string()],
+            "[{engine}] anon reads only its session cart"
+        );
+        let (q, p) = read_items(&sc(Some("acme"), None));
+        assert_eq!(
+            run_query(tx.as_mut(), &q, &p).await,
+            vec!["acme-cart".to_string()],
+            "[{engine}] authed reads only its tenant cart"
+        );
+        let (q, p) = read_items(&sc(Some("acme"), Some("sess-1")));
+        assert_eq!(
+            run_query(tx.as_mut(), &q, &p).await,
+            vec!["acme-cart".to_string(), "anon-cart-1".to_string()],
+            "[{engine}] both-fact reads the Or"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // No principal ⇒ refused; promote (D7) claims only sess-1's not-yet-owned rows, idempotent.
+    {
+        let mut refused = Select {
+            columns: vec![item(Expr::col("item"))],
+            ..Select::from("carts")
+        };
+        refused.force_scope(&sc(None, None)).unwrap();
+        assert!(
+            matches!(
+                refused.compile(dialect),
+                Err(boatramp_core::orm::OrmError::TenancyNoPrincipal)
+            ),
+            "[{engine}] a TenantOrSession read with no principal must be refused"
+        );
+
+        let promote = sc(Some("acme"), Some("sess-1"));
+        let (psql, pparams) =
+            boatramp_core::orm::compile_promote(&promote, "carts", dialect).unwrap();
+        let mut tx = backend.begin().await.unwrap();
+        assert_eq!(
+            tx.execute(&psql, &pparams).await.unwrap(),
+            1,
+            "[{engine}] promote claims exactly sess-1's one not-yet-owned cart"
+        );
+        // sess-2 untouched; a second promote is a no-op.
+        assert_eq!(
+            tx.execute(&psql, &pparams).await.unwrap(),
+            0,
+            "[{engine}] re-promoting is a no-op (IS NULL guard)"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    println!(
+        "ORM TENANT-OR-SESSION DISJUNCT OK [{engine}]: anon reads/writes only its session; authed \
+         only its tenant; both-fact reads the Or; no-principal refused; promote claims only this \
+         session's not-yet-owned rows (IS NULL anti-widening, idempotent)"
+    );
+}
+
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_orm_scope_isolates_on_a_real_engine() {
@@ -373,7 +761,9 @@ async fn postgres_orm_scope_isolates_on_a_real_engine() {
         return;
     };
     let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
-    run_battery(backend, Dialect::Postgres, "postgres").await;
+    run_battery(backend.clone(), Dialect::Postgres, "postgres").await;
+    run_pertable_battery(backend.clone(), Dialect::Postgres, "postgres").await;
+    run_session_disjunct_battery(backend, Dialect::Postgres, "postgres").await;
 }
 
 #[cfg(feature = "sql-mysql")]
@@ -384,5 +774,7 @@ async fn mysql_orm_scope_isolates_on_a_real_engine() {
         return;
     };
     let backend = connect(ExternalSqlKind::Mysql, &ExternalSqlOptions::new(url)).unwrap();
-    run_battery(backend, Dialect::Mysql, "mysql").await;
+    run_battery(backend.clone(), Dialect::Mysql, "mysql").await;
+    run_pertable_battery(backend.clone(), Dialect::Mysql, "mysql").await;
+    run_session_disjunct_battery(backend, Dialect::Mysql, "mysql").await;
 }

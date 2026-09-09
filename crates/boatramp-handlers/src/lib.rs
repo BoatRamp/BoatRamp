@@ -41,7 +41,7 @@ pub use engine::{
 #[cfg(feature = "engine")]
 pub use logging::{LogSink, LogStream};
 #[cfg(feature = "sql")]
-pub use tenant::{Axis as TenantAxis, HostTenancy, TenantDenied};
+pub use tenant::{Axis as TenantAxis, HostTenancy, ScopeFact, TenantDenied};
 
 /// Contract-evolution invariants checked against the host WIT text itself, so a
 /// mistake in `wit/world.wit` fails a fast unit test rather than a deployed guest.

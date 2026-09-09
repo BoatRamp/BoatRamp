@@ -16,9 +16,18 @@ use boatramp_core::project::ProjectRef;
 pub(super) enum FnTenant {
     /// A trusted inbound HTTP request — resolve from its verified bearer + routed domain tag.
     Request,
-    /// Inherit the caller's host-resolved tenant value down an in-project invoke chain.
-    Inherited(Option<boatramp_core::sql::SqlValue>),
-    /// No trusted source (cron / consumer / webhook / durable drain).
+    /// Inherit the caller's host-resolved **principal** (the axis-tagged fact set) down an
+    /// in-project invoke chain — so an inherited `Session`/`TargetTenant` fact keeps its axis, not
+    /// just the `Tenant` value. Empty ⇒ no inherited principal. In-process only; never serialized.
+    Inherited(Vec<boatramp_handlers::ScopeFact>),
+    /// The **durable async lane** (Stage 4): a queue/bus drain carrying an optional host-minted
+    /// [signed-context envelope](boatramp_core::cose::mint_context) stamped at publish from the
+    /// producer's own-tenant. A consumer declaring `sources: [signed_context]` resolves that tenant
+    /// (verified against the fleet anchor); `None` (or a forged/expired envelope) ⇒ no own tenant,
+    /// so an "own" op fails closed. The value crosses the durability boundary **only** as this
+    /// signed, host-issued envelope — never a guest-named tenant.
+    Durable(Option<String>),
+    /// No trusted source (cron / webhook / SDL introspection) and no durable context.
     Background,
 }
 
@@ -45,6 +54,64 @@ const LEASE_MARGIN_SECS: u64 = 60;
 /// so it is bounded here (mirrors the engine's default body cap).
 #[cfg(feature = "handlers")]
 const MAX_ASYNC_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// TTL for a durable signed-context envelope (R1). It must outlive a message's *automatic*
+/// residency — publish, lease, up to `MAX_INVOKE_ATTEMPTS` redeliveries, and a backlog drain — but
+/// no longer, because it also bounds how long a captured envelope can be replayed and how stale a
+/// resolved tenant may be after off-boarding (a de-provisioned tenant's in-flight envelope stops
+/// resolving at expiry). 48 hours comfortably covers automatic residency plus a multi-day backlog
+/// while keeping that replay/staleness window tight (a deliberate ~15× cut from a naive 30-day
+/// horizon). Past expiry the consumer resolves no own tenant and fails an "own" op closed; an
+/// operator redrive after expiry likewise fails closed (never a cross-tenant widening).
+#[cfg(feature = "handlers")]
+const DURABLE_CONTEXT_TTL_SECS: u64 = 48 * 3600;
+
+/// Mint a durable signed-context envelope (R1) from the producer's resolved **own-tenant**, so a
+/// message it publishes carries that tenant across the durability boundary for a consumer that
+/// declares `sources: [signed_context]`. The guest never names a tenant — the host stamps its
+/// already-resolved principal. `None` (⇒ the message carries no context, and the consumer fails an
+/// "own" op closed) when there is no fleet signer, no own-tenant fact, or a non-stampable value.
+///
+/// TRUST MODEL (same-project bus): the envelope binds the producer's **tenant**, not the topic or
+/// the producing component. A project is one trust domain (its owner deploys all its components),
+/// so on the shared `{project}/bus/` a consumer declaring `signed_context` acts as **whatever
+/// tenant published the message it drains** — correct within a project, and cross-*project* is
+/// structurally impossible (the bus keyspace is `{project}/bus/`, project names are `/`-free). A
+/// consumer author therefore opts into "act as the producer's tenant"; a project that deploys
+/// mutually-distrusting components onto one bus topic should not use `signed_context` there.
+#[cfg(feature = "handlers")]
+pub(super) async fn mint_producer_context(
+    inner: &HandlerRuntimeInner,
+    principal: &[boatramp_handlers::ScopeFact],
+) -> Option<String> {
+    let signer = inner.session_signer.get()?;
+    let tenant = principal
+        .iter()
+        .find(|f| f.axis == boatramp_core::tenancy::ScopeAxis::Tenant)
+        .and_then(|f| ctx_stamp(&f.value))?;
+    boatramp_core::cose::mint_context(
+        &tenant,
+        DURABLE_CONTEXT_TTL_SECS,
+        now_unix(),
+        signer.as_ref(),
+    )
+    .await
+    .ok()
+}
+
+/// Render an own-tenant [`SqlValue`](boatramp_core::sql::SqlValue) to the string a durable context
+/// envelope carries. A tenant id is always a scalar; only a scalar is stampable (the consumer
+/// resolves it back as text). A non-scalar tenant value is not stamped ⇒ the async lane fails
+/// closed rather than carrying an ambiguous key.
+#[cfg(feature = "handlers")]
+fn ctx_stamp(value: &boatramp_core::sql::SqlValue) -> Option<String> {
+    use boatramp_core::sql::SqlValue;
+    match value {
+        SqlValue::Text(s) => Some(s.clone()),
+        SqlValue::Integer(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
 
 /// Query of `POST /api/functions/:name/invoke`.
 #[cfg(feature = "handlers")]
@@ -548,6 +615,13 @@ pub(super) async fn build_function_bindings(
                 .unwrap_or(true),
             allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
         };
+        // The fleet anchor that verifies a durable signed-context envelope (the session signer's
+        // public half — the same key that mints/verifies session cookies). Bound outside the match
+        // so it outlives the borrow in the `Durable` arm's inputs.
+        let context_anchor = inner
+            .session_signer
+            .get()
+            .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()));
         let resolved = match tenant {
             FnTenant::Request => crate::tenant_resolve::resolve_host_tenancy(
                 config.tenancy.as_ref(),
@@ -557,6 +631,10 @@ pub(super) async fn build_function_bindings(
                     bearer,
                     domain_context,
                     token_cfg: config.token_claims.as_ref(),
+                    session_cookie: None,
+                    session_anchor: None,
+                    signed_context: None,
+                    context_anchor: None,
                 },
             )
             .await
@@ -568,6 +646,21 @@ pub(super) async fn build_function_bindings(
                 value.clone(),
             )
             .map_err(|e| e.to_string())?,
+            // The durable async lane: a `signed_context` source resolves the producer's stamped
+            // tenant from the envelope carried on the drained message, verified against the fleet
+            // anchor. No envelope / no anchor ⇒ no own tenant (fail closed).
+            FnTenant::Durable(signed_context) => crate::tenant_resolve::resolve_host_tenancy(
+                config.tenancy.as_ref(),
+                imports_db,
+                posture,
+                crate::tenant_resolve::TenantSourceInputs {
+                    signed_context: signed_context.as_deref(),
+                    context_anchor: context_anchor.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?,
             FnTenant::Background => crate::tenant_resolve::resolve_host_tenancy(
                 config.tenancy.as_ref(),
                 imports_db,
@@ -577,19 +670,38 @@ pub(super) async fn build_function_bindings(
             .await
             .map_err(|e| e.to_string())?,
         };
+        // Attach the project per-table tenancy schema (R2/D2) from the KV. Absent ⇒ Uniform;
+        // present-but-unreadable ⇒ **fail closed** with a deny-all schema (never a silent downgrade
+        // to Uniform). Applies on every trigger (request/inherited/background) so a frame- or
+        // job-triggered query scopes each table on its own key identically to a request.
+        let schema =
+            match boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await {
+                Ok(s) => s,
+                Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
+            };
+        let resolved = resolved.map(|h| h.with_schema(schema.as_ref()));
         bindings = bindings.with_tenancy(resolved.clone());
         resolved
     };
-    // The tenant value to propagate down an in-project invoke chain (host-carried).
-    let caller_tenant = host_tenancy.as_ref().and_then(|h| h.value().cloned());
+    // The resolved principal (axis-tagged fact set) to propagate down an in-project invoke chain
+    // (host-carried, never guest-supplied). Empty when there's no in-site tenancy.
+    let caller_tenant = host_tenancy
+        .as_ref()
+        .map(|h| h.facts().to_vec())
+        .unwrap_or_default();
     if granted("wasi:messaging") {
         if let Some(messaging) = &inner.messaging {
+            // Stamp the producer's own-tenant onto every message it publishes (R1, guest-blind), so
+            // a consumer declaring `sources: [signed_context]` resolves it on the async lane. Fixed
+            // here from this invocation's resolved principal; `None` for an unscoped producer.
+            let signed_context = mint_producer_context(inner, &caller_tenant).await;
             // Private topics namespace under the function's own scope; `bus:<topic>`
             // publishes route to the shared, project-scoped bus.
             bindings = bindings.with_messaging(
                 format!("{scope}/"),
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
+                signed_context,
             );
         }
     }
@@ -747,11 +859,12 @@ pub(crate) struct FunctionInvoker {
     /// project, never across the tenant boundary. The startup template carries
     /// `default`; [`scoped`](Self::scoped) rebinds it per caller.
     project: String,
-    /// The caller's host-resolved **in-site tenant value** (Stage 0), carried so an invoked sibling
-    /// inherits the caller's tenant identity — host-propagated, never read from the guest's invoke
-    /// request. `None` when the caller has no resolved tenant (plain / anonymous). Set per binding
-    /// by [`scoped`](Self::scoped).
-    caller_tenant: Option<boatramp_core::sql::SqlValue>,
+    /// The caller's host-resolved **principal** — the axis-tagged fact set (`PLAN-tenancy-principal`
+    /// D1) — carried so an invoked sibling inherits the caller's tenant identity (and, later, its
+    /// `Session`/`TargetTenant` facts with their axes intact) — host-propagated, never read from the
+    /// guest's invoke request. Empty when the caller has no resolved tenancy (plain / anonymous).
+    /// Set per binding by [`scoped`](Self::scoped).
+    caller_tenant: Vec<boatramp_handlers::ScopeFact>,
 }
 
 #[cfg(feature = "handlers")]
@@ -761,7 +874,7 @@ impl FunctionInvoker {
             deploy,
             runtime,
             project: ProjectRef::DEFAULT.as_str().to_string(),
-            caller_tenant: None,
+            caller_tenant: Vec::new(),
         }
     }
 
@@ -772,7 +885,7 @@ impl FunctionInvoker {
     pub(crate) fn scoped(
         &self,
         project: ProjectRef<'_>,
-        caller_tenant: Option<boatramp_core::sql::SqlValue>,
+        caller_tenant: Vec<boatramp_handlers::ScopeFact>,
     ) -> Arc<dyn boatramp_handlers::Invoker> {
         Arc::new(Self {
             deploy: self.deploy.clone(),
@@ -1722,7 +1835,9 @@ async fn dispatch_function_queue(
     for msg in batch {
         let bytes_in = msg.payload.len() as u64;
         let request = build_webhook_request(None, msg.payload.clone());
-        // Queue-drained messages are durable background work → async lane.
+        // Queue-drained messages are durable background work → async lane. The producer's own-tenant
+        // rides on the message as a host-minted signed-context envelope (R1); the consumer resolves
+        // it iff it declares `sources: [signed_context]`, else an "own" op fails closed.
         let (response, duration_ms) = execute_function(
             inner,
             deploy,
@@ -1732,8 +1847,7 @@ async fn dispatch_function_queue(
             request,
             0,
             boatramp_handlers::Lane::Async,
-            // Queue-drained webhook (background): no tenant source.
-            FnTenant::Background,
+            FnTenant::Durable(msg.signed_context.clone()),
         )
         .await;
         let (status, _content_type, body) = capture_response(response).await;

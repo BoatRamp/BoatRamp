@@ -102,6 +102,10 @@ lru = { workspace = true, optional = true }
 memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
+# The Stage-4 durable signed-context battery (`tests/orm_tenant_isolation.rs`) uses the COSE
+# signer/envelope helpers in `boatramp_core::cose`, which are `authz`-gated — enable that feature
+# for the test build only (the storage crate itself needs no COSE).
+boatramp-core = { workspace = true, features = ["authz"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 bytes.workspace = true
 # The `kv_slatedb` tests open a SlateDB instance and close/reopen it. `close()`

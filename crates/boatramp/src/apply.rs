@@ -115,6 +115,11 @@ trait ControlPlane {
         name: &str,
         body: &serde_json::Value,
     ) -> CpResult<serde_json::Value>;
+    /// Replace the project's tenancy schema (the per-table tenant-key map).
+    async fn put_project_tenancy(
+        &self,
+        schema: &boatramp_core::tenancy::TenancySchema,
+    ) -> CpResult<()>;
 }
 
 /// A control-plane call outcome classified for the reconcile core: `NotFound`
@@ -206,6 +211,14 @@ impl ControlPlane for client::ControlPlane {
     ) -> CpResult<serde_json::Value> {
         self.put_compute(name, body).await.map_err(CpError::Client)
     }
+    async fn put_project_tenancy(
+        &self,
+        schema: &boatramp_core::tenancy::TenancySchema,
+    ) -> CpResult<()> {
+        self.put_project_tenancy(schema)
+            .await
+            .map_err(CpError::Client)
+    }
 }
 
 /// A whole-project desired state: the sites, functions, and compute workloads to
@@ -222,6 +235,13 @@ pub struct ApplyManifest {
     pub functions: Vec<ApplyFunction>,
     /// Compute workloads to create-or-replace.
     pub compute: Vec<ApplyCompute>,
+    /// The project's tenancy schema — the per-table tenant-key map the scope injector
+    /// consults (deny-by-default on undeclared tables). Reconciled **before** the sites
+    /// and functions, so a handler deployed in the same apply already runs under the
+    /// declared isolation boundary. `None` ⇒ leave the stored schema untouched (an
+    /// omitted key never clears an existing schema — use `boatramp tenancy clear`).
+    #[serde(default)]
+    pub tenancy: Option<boatramp_core::tenancy::TenancySchema>,
 }
 
 /// One site in the manifest: a slug plus its content dir and folded-in config.
@@ -374,6 +394,12 @@ pub async fn run(args: ApplyArgs, config: &ProjectConfig) -> Result<()> {
     // Ensure the project exists (best-effort; `default` always does).
     ensure_project(&cp, &project, args.dry_run).await?;
 
+    // Reconcile the tenancy schema *before* any site/function, so a handler shipped in
+    // this same apply already runs under the declared isolation boundary.
+    if let Some(schema) = &manifest.tenancy {
+        reconcile_tenancy(&cp, schema, args.dry_run).await?;
+    }
+
     for site in &manifest.sites {
         apply_site(&cp, site, config, args.build, args.dry_run).await?;
     }
@@ -412,6 +438,26 @@ async fn ensure_project<C: ControlPlane>(cp: &C, project: &str, dry_run: bool) -
         },
         Err(err) => Err(err.into()),
     }
+}
+
+/// Reconcile the project's tenancy schema: unconditionally PUT the declared schema
+/// (idempotent replace). Runs before the sites/functions so the isolation boundary is
+/// in place before any handler can serve a request.
+async fn reconcile_tenancy<C: ControlPlane>(
+    cp: &C,
+    schema: &boatramp_core::tenancy::TenancySchema,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        println!(
+            "  tenancy: would set schema ({} table(s))",
+            schema.tables.len()
+        );
+        return Ok(());
+    }
+    cp.put_project_tenancy(schema).await?;
+    println!("  tenancy: set schema ({} table(s))", schema.tables.len());
+    Ok(())
 }
 
 /// Reconcile one site: (optionally build), hash the content dir, negotiate the
@@ -684,6 +730,13 @@ mod tests {
             self.rec(format!("put_compute {name}"));
             Ok(json!({}))
         }
+        async fn put_project_tenancy(
+            &self,
+            schema: &boatramp_core::tenancy::TenancySchema,
+        ) -> CpResult<()> {
+            self.rec(format!("put_project_tenancy {}", schema.tables.len()));
+            Ok(())
+        }
     }
 
     fn a_function() -> ApplyFunction {
@@ -771,6 +824,59 @@ mod tests {
         };
         apply_compute(&mock, &compute, true).await.unwrap();
         assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_tenancy_puts_the_schema() {
+        use boatramp_core::tenancy::{TableScope, TenancySchema};
+        let mock = MockCp::default();
+        let mut schema = TenancySchema::default();
+        schema.tables.insert("orders".into(), TableScope::Tenant);
+        schema.tables.insert(
+            "tenant".into(),
+            TableScope::TenantKeyed { key: "id".into() },
+        );
+        reconcile_tenancy(&mock, &schema, false).await.unwrap();
+        assert_eq!(mock.calls(), ["put_project_tenancy 2"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_tenancy_dry_run_mutates_nothing() {
+        let mock = MockCp::default();
+        reconcile_tenancy(&mock, &Default::default(), true)
+            .await
+            .unwrap();
+        assert!(mock.calls().is_empty());
+    }
+
+    /// The tenancy schema round-trips through the RON manifest surface — proving the
+    /// internally-tagged `TableScope` enum (`kind: "tenant" | "tenant_keyed" | "unscoped"`)
+    /// deserializes from RON, not only JSON, so `boatramp apply` can declare it inline.
+    #[test]
+    fn manifest_parses_a_tenancy_schema() {
+        use boatramp_core::tenancy::TableScope;
+        let manifest = ApplyManifest::parse(
+            r#"(
+                project: "acme",
+                tenancy: (
+                    default_tenant_key: "tenant_id",
+                    tables: {
+                        "orders": (kind: tenant),
+                        "tenant": (kind: tenant_keyed, key: "id"),
+                        "countries": (kind: unscoped),
+                    },
+                ),
+            )"#,
+        )
+        .expect("manifest with tenancy parses");
+        let schema = manifest.tenancy.expect("tenancy present");
+        assert_eq!(schema.default_tenant_key, "tenant_id");
+        assert_eq!(schema.tables.get("orders"), Some(&TableScope::Tenant));
+        assert_eq!(
+            schema.tables.get("tenant"),
+            Some(&TableScope::TenantKeyed { key: "id".into() })
+        );
+        assert_eq!(schema.tables.get("countries"), Some(&TableScope::Unscoped));
     }
 
     #[tokio::test]

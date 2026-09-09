@@ -209,6 +209,15 @@ impl RaftMessaging {
 #[async_trait]
 impl Messaging for RaftMessaging {
     async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, None).await
+    }
+
+    async fn publish_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
         let id = self.next_id();
         // Payload to shared storage first, then the index proposal — so the
         // replicated record never references a missing payload.
@@ -243,6 +252,7 @@ impl Messaging for RaftMessaging {
             topic: topic.to_string(),
             id: id.clone(),
             retain,
+            signed_context: signed_context.map(str::to_owned),
         })
         .await?;
         // Live SSE fan-out across the cluster (best-effort, separate from the
@@ -287,6 +297,7 @@ impl Messaging for RaftMessaging {
                 // The default work-queue group; a non-empty group goes through
                 // `claim_grouped` below.
                 group: String::new(),
+                signed_context: record.signed_context,
             });
         }
         Ok(claimed)
@@ -336,6 +347,7 @@ impl Messaging for RaftMessaging {
                     payload,
                     attempts: record.attempts,
                     group: group.to_string(),
+                    signed_context: record.signed_context,
                 }),
                 Err(_) => continue,
             }
@@ -437,6 +449,10 @@ impl Messaging for RaftMessaging {
                         topic: topic.to_string(),
                         id: id.clone(),
                         retain: false,
+                        // Cluster redrive re-arms from the dead id alone; the producer context is
+                        // not carried here (fail-closed on the retry) — a documented parity gap with
+                        // the single-node redrive, acceptable because it never widens access.
+                        signed_context: None,
                     },
                     WriteOp::Delete {
                         key: messaging::dead_key(topic, id),

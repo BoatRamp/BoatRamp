@@ -72,6 +72,9 @@ pub enum CliError {
     /// The `secrets` command.
     #[error(transparent)]
     Secrets(#[from] crate::secrets::Error),
+    /// The `tenancy` command.
+    #[error(transparent)]
+    Tenancy(#[from] crate::tenancy::Error),
     /// The `email` command.
     #[cfg(feature = "email")]
     #[error(transparent)]

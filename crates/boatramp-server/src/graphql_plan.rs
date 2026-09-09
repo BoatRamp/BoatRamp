@@ -16,6 +16,7 @@ use async_graphql_parser::types::{
 };
 use async_graphql_parser::Positioned;
 use async_graphql_value::{Name, Value};
+use boatramp_core::tenancy::TenancyClass;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// One fetch in a query plan.
@@ -29,6 +30,12 @@ pub(crate) struct Fetch {
     /// the fetch that supplies the representations, and the response path (root-field
     /// names) at which those entities live in that provider. `None` for a root fetch.
     pub requires: Option<Requires>,
+    /// The tenancy class this fetch runs under (R4/D8). Own and target root fields of the same
+    /// subgraph are split into **separate** fetches (separate wasm invocations), each bound to one
+    /// host-resolved scope before the guest runs — so no invocation ever carries both an own and a
+    /// target fact. A dependent entity fetch **inherits** its provider's class. Defaults to
+    /// [`TenancyClass::Own`] for a field with no `@tenant` directive.
+    pub class: TenancyClass,
 }
 
 /// The join a dependent entity fetch performs.
@@ -93,8 +100,12 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
     };
     let var_types = var_type_map(&op.variable_definitions);
 
-    // Group the root fields by the subgraph that owns them → one root fetch per subgraph.
-    let mut by_subgraph: BTreeMap<String, Vec<&Field>> = BTreeMap::new();
+    // Group the root fields by `(owning subgraph, tenancy class)` → one root fetch per
+    // (subgraph, class). Splitting on the class (R4/D8) means an own field and a target field of the
+    // SAME subgraph land in separate fetches → separate wasm invocations, each under one host-bound
+    // scope — so a guest can never correlate its own private rows with a named tenant's rows in one
+    // query. A field with no `@tenant` directive defaults to `Own`.
+    let mut by_group: BTreeMap<(String, TenancyClass), Vec<&Field>> = BTreeMap::new();
     for sel in &op.selection_set.node.items {
         if let Selection::Field(field) = &sel.node {
             let fname = field.node.name.node.as_str();
@@ -102,13 +113,17 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
                 .get(fname)
                 .cloned()
                 .ok_or_else(|| PlanError::UnknownRootField(fname.to_string()))?;
-            by_subgraph.entry(owner).or_default().push(&field.node);
+            let class = sg.root_tenancy.get(fname).cloned().unwrap_or_default();
+            by_group
+                .entry((owner, class))
+                .or_default()
+                .push(&field.node);
         }
     }
 
     let mut fetches = Vec::new();
     let mut queue: VecDeque<(DepFetch, usize)> = VecDeque::new();
-    for (subgraph, fields) in by_subgraph {
+    for ((subgraph, class), fields) in by_group {
         let idx = fetches.len();
         let mut used = BTreeSet::new();
         let mut body = String::new();
@@ -124,6 +139,7 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
             subgraph,
             query: build_root_operation(root_type, &used, &var_types, &body),
             requires: None,
+            class,
         });
     }
 
@@ -131,6 +147,10 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
     // order, so each fetch's provider index already exists.
     while let Some((dep, provider)) = queue.pop_front() {
         let idx = fetches.len();
+        // A dependent entity fetch inherits its provider's tenancy class — the whole reachable
+        // subtree of a target root field resolves under the same target scope (and a cross-scope
+        // join is rejected at composition), so this never mixes classes within a chain.
+        let class = fetches[provider].class.clone();
         fetches.push(Fetch {
             subgraph: dep.subgraph,
             query: entity_fetch_query(&dep.type_name, &dep.selection, &dep.used_vars, &var_types),
@@ -140,6 +160,7 @@ pub(crate) fn plan(query: &str, sg: &Supergraph) -> Result<QueryPlan, PlanError>
                 provider,
                 path: dep.path,
             }),
+            class,
         });
         for d in dep.deps {
             queue.push_back((d, idx));
@@ -623,5 +644,47 @@ mod tests {
             plan.fetches[0].requires.is_none(),
             "no dependent fetch expected"
         );
+    }
+
+    #[test]
+    fn own_and_target_roots_of_one_subgraph_split_into_separate_fetches() {
+        // R4/D8: an own field and a target field owned by the SAME subgraph must NOT coalesce into
+        // one fetch — each binds a different host scope, so they become separate wasm invocations.
+        let shop = r#"
+            type Query {
+              me: User @tenant(scope: own)
+              publicProducts: [Product] @tenant(scope: target, via: [domain], public: "storefront")
+            }
+            type User { id: ID! }
+            type Product { id: ID! }
+        "#;
+        let sg = compose(&[("shop".into(), shop.into())]).unwrap();
+        let plan = plan("{ me { id } publicProducts { id } }", &sg).unwrap();
+        assert_eq!(
+            plan.fetches.len(),
+            2,
+            "own + target of the same subgraph must split, got: {:?}",
+            plan.fetches
+        );
+        // Both fetches target the one subgraph, but carry distinct classes.
+        assert!(plan.fetches.iter().all(|f| f.subgraph == "shop"));
+        let classes: BTreeSet<bool> = plan.fetches.iter().map(|f| f.class.is_target()).collect();
+        assert_eq!(
+            classes,
+            BTreeSet::from([false, true]),
+            "one fetch Own, one fetch Target"
+        );
+    }
+
+    #[test]
+    fn a_plain_query_yields_all_own_fetches() {
+        // No `@tenant` anywhere ⇒ every fetch is Own (byte-identical planning to pre-Stage-5).
+        let plan = plan("{ me { name reviews { body } } }", &supergraph()).unwrap();
+        assert!(
+            plan.fetches.iter().all(|f| !f.class.is_target()),
+            "no directive ⇒ all Own"
+        );
+        // And the dependent entity fetch inherited its provider's (Own) class.
+        assert!(plan.fetches.iter().any(|f| f.requires.is_some()));
     }
 }

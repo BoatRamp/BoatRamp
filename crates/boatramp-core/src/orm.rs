@@ -33,6 +33,7 @@
 //! later enhancement (see plans/PLAN-orm-wit.md §4).
 
 use crate::sql::{Dialect, SqlValue};
+use crate::tenancy::ResolvedScope;
 
 // ---- expressions -----------------------------------------------------------
 
@@ -249,6 +250,7 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
+    /// The SQL operator symbol (used by the compiler).
     fn symbol(self) -> &'static str {
         match self {
             Self::Eq => "=",
@@ -373,59 +375,431 @@ pub enum ScopeMode {
     All,
 }
 
-/// A host-resolved in-site row-tenancy scope. The `value` is the resolved tenant (from the
-/// verified source); `mode` decides how it restricts the operation. Injected by the host on
-/// **every** query node (top-level, `UNION` branch, `INSERT … SELECT` source), never guest-set.
+/// Per-table tenant-key resolution for a [`Scope`] (PLAN-tenancy-principal D2/D3). Legacy / no
+/// project schema ⇒ [`Uniform`](TableKeys::Uniform): every table scopes on [`Scope::column`].
+/// A present project schema ⇒ [`PerTable`](TableKeys::PerTable): the authoritative `table →
+/// `[`ResolvedScope`] map — `Column(col)` scopes that table on `col` (`TenantKeyed` identity tables
+/// on their own PK), `Unscoped` a global table (no predicate), `TenantOrSession { tenant, session }`
+/// the R3 anonymous-first disjunct on two disjoint columns; a table **absent** from the map is
+/// refused ([`OrmError::TenancyUndeclared`], deny-by-default).
+// Not `Eq`: `PerTableTarget` carries bound `SqlValue` literals (public-subset terms), and
+// `SqlValue` is only `PartialEq` (a float variant) — same as `Scope`, which holds `TableKeys`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum TableKeys {
+    #[default]
+    Uniform,
+    PerTable(std::collections::BTreeMap<String, ResolvedScope>),
+    /// A **target read/write** (R4/D8): the same per-table tenant keys as `PerTable`, PLUS a per-table
+    /// PUBLIC-subset confinement conjoined onto every accessed table. Deny-by-default — a table
+    /// accessed under this variant with **no** entry in `public` is refused
+    /// ([`OrmError::PublicSubsetUndeclared`]), the strict analog of an undeclared tenant key: a
+    /// target read can only ever see rows that satisfy the host-held public predicate of *each*
+    /// table it touches (root + every joined/subquery ref). Built only by the host for a
+    /// `TenancyClass::Target` fetch; never by a guest.
+    PerTableTarget {
+        keys: std::collections::BTreeMap<String, ResolvedScope>,
+        public: std::collections::BTreeMap<String, Vec<PublicTermSql>>,
+        /// **Target WRITE SET-allowlist (5b), deny-by-default.** The columns a target INSERT/UPDATE
+        /// may set. **Empty ⇒ read-only** — any write force-scoped under this variant is refused
+        /// ([`OrmError::TargetWriteNotGranted`]). Non-empty ⇒ an INSERT force-stamps `tenant = B` and
+        /// the public-visibility columns and accepts ONLY these columns from the guest; an UPDATE
+        /// confines its `WHERE` to `tenant = B AND <public>` and may set ONLY these columns; a DELETE
+        /// is always refused. The tenant/visibility columns are never in this set, so a target write
+        /// can neither change ownership nor flip a row's visibility.
+        write: std::collections::BTreeSet<String>,
+    },
+}
+
+/// A lowered public-subset visibility term: a [`crate::tenancy::PublicTerm`] whose literal is
+/// already a bound [`SqlValue`] (so it is always a parameter, never interpolated text). Conjoined
+/// onto a target read to confine it to a table's public rows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PublicTermSql {
+    /// `<column> <op> <bound value>`.
+    Cmp {
+        column: String,
+        op: CmpOp,
+        value: SqlValue,
+    },
+    /// `<column> IS [NOT] NULL`.
+    Null { column: String, negated: bool },
+}
+
+/// Lower a host-held [`crate::tenancy::PublicPredicate`] (types-local literals) into the ORM's
+/// bound-value [`PublicTermSql`] terms. Called by the host when building a target scope; a
+/// `PublicLiteral` becomes a bound `SqlValue` (never interpolated).
+pub fn lower_public_terms(pred: &crate::tenancy::PublicPredicate) -> Vec<PublicTermSql> {
+    use crate::tenancy::{PublicCmp, PublicLiteral, PublicTerm};
+    pred.terms
+        .iter()
+        .map(|t| match t {
+            PublicTerm::Cmp { column, op, value } => {
+                let op = match op {
+                    PublicCmp::Eq => CmpOp::Eq,
+                    PublicCmp::Ne => CmpOp::Ne,
+                    PublicCmp::Lt => CmpOp::Lt,
+                    PublicCmp::Le => CmpOp::Le,
+                    PublicCmp::Gt => CmpOp::Gt,
+                    PublicCmp::Ge => CmpOp::Ge,
+                };
+                let value = match value {
+                    PublicLiteral::Bool(b) => SqlValue::Boolean(*b),
+                    PublicLiteral::Int(n) => SqlValue::Integer(*n),
+                    PublicLiteral::Text(s) => SqlValue::Text(s.clone()),
+                };
+                PublicTermSql::Cmp {
+                    column: column.clone(),
+                    op,
+                    value,
+                }
+            }
+            PublicTerm::Null { column, negated } => PublicTermSql::Null {
+                column: column.clone(),
+                negated: *negated,
+            },
+        })
+        .collect()
+}
+
+/// A host-resolved in-site row-tenancy scope — the applied side of the resolved principal. `value`
+/// is the resolved **own-tenant** fact (`None` ⇒ the actor has no tenant, e.g. a purely anonymous
+/// `Session`-only request); `session` is the resolved anonymous-**session** fact (R3); `mode`
+/// decides how the tenant axis restricts the operation; `keys` resolves the tenant **column(s) per
+/// table** (the project schema — R2/R3/D2). Injected by the host on **every** query node (top-level,
+/// `UNION` branch, `INSERT … SELECT` source), never guest-set. The fail-closed "no fact for a scope
+/// that needs one" decision is made **per table** in the injector (a `Column` table with no tenant
+/// value denies; a `TenantOrSession` table falls back to whichever axis fact is present).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scope {
     pub column: String,
-    pub value: SqlValue,
+    /// The resolved own-tenant value, or `None` for an anonymous (`Session`-only) actor.
+    pub value: Option<SqlValue>,
+    /// The resolved anonymous-session value (R3), or `None` when the request carries no session
+    /// fact. Only consulted for a [`TableScope::TenantOrSession`](crate::tenancy::TableScope) table.
+    pub session: Option<SqlValue>,
     pub mode: ScopeMode,
+    /// Per-table key resolution; [`TableKeys::Uniform`] (the default) preserves the pre-schema
+    /// single-column behavior (every table scopes on `column`).
+    pub keys: TableKeys,
 }
 
 impl Scope {
-    /// The scope as a `WHERE`/`HAVING` predicate for the resolved mode, or `None` for
-    /// [`ScopeMode::All`] (cross-tenant — no tenant predicate at all). Unqualified column.
-    fn as_predicate(&self) -> Option<Predicate> {
-        self.as_predicate_for(None)
+    /// Resolve how `table` is scoped under the project schema (R2/R3/D2/D3): `Column(col)` ⇒ scope
+    /// on `col`; `Unscoped` ⇒ no predicate; `TenantOrSession{tenant,session}` ⇒ the R3 disjunct;
+    /// `Err(TenancyUndeclared)` ⇒ undeclared (deny-by-default). Legacy `Uniform` keys resolve every
+    /// table to `Column(self.column)`, byte-identical to the pre-schema single-column behavior.
+    fn resolve_table(&self, table: &str) -> Result<ResolvedScope, OrmError> {
+        match &self.keys {
+            TableKeys::Uniform => Ok(ResolvedScope::Column(self.column.clone())),
+            TableKeys::PerTable(m) | TableKeys::PerTableTarget { keys: m, .. } => m
+                .get(table)
+                .cloned()
+                .ok_or_else(|| OrmError::TenancyUndeclared(table.to_string())),
+        }
     }
 
-    /// Like [`Scope::as_predicate`] but the tenant column is optionally qualified `<qualifier>.col`
-    /// — so the predicate binds to a specific table in a multi-table (join) or subquery context,
-    /// never accidentally to an outer/other table with the same column name (a scoping leak).
-    fn as_predicate_for(&self, qualifier: Option<&str>) -> Option<Predicate> {
-        let col = || {
-            Expr::Column(match qualifier {
-                Some(q) => format!("{q}.{}", self.column),
-                None => self.column.clone(),
-            })
+    /// The PUBLIC-subset confinement to conjoin for `table` under a **target read** (R4/D8):
+    /// `Ok(None)` when the scope is not a target read (own/session — no public confinement, today's
+    /// behavior). Under a target read, a table with **no** declared public subset is refused
+    /// ([`OrmError::PublicSubsetUndeclared`], deny-by-default); otherwise the host-held terms are
+    /// built as a qualified `AND` (each column qualified by `qualifier` for a join/subquery ref, so
+    /// the confinement composes across every reachable table). An empty term list ⇒ no predicate
+    /// (a match-all public subset — the schema loader is responsible for rejecting an empty one).
+    fn public_pred(
+        &self,
+        table: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        let TableKeys::PerTableTarget { public, .. } = &self.keys else {
+            return Ok(None);
         };
-        let eq = || Predicate::Cmp {
-            left: col(),
-            op: CmpOp::Eq,
-            right: Expr::Value(self.value.clone()),
-        };
-        let is_null = || Predicate::Null {
-            expr: col(),
+        let terms = public
+            .get(table)
+            .ok_or_else(|| OrmError::PublicSubsetUndeclared(table.to_string()))?;
+        let mut preds = Vec::with_capacity(terms.len());
+        for term in terms {
+            match term {
+                PublicTermSql::Cmp { column, op, value } => {
+                    ident(column)?;
+                    preds.push(Predicate::Cmp {
+                        left: Self::col_expr(column, qualifier),
+                        op: *op,
+                        right: Expr::Value(value.clone()),
+                    });
+                }
+                PublicTermSql::Null { column, negated } => {
+                    ident(column)?;
+                    preds.push(Predicate::Null {
+                        expr: Self::col_expr(column, qualifier),
+                        negated: *negated,
+                    });
+                }
+            }
+        }
+        Ok(match preds.len() {
+            0 => None,
+            1 => Some(preds.pop().unwrap()),
+            _ => Some(Predicate::And(preds)),
+        })
+    }
+
+    /// A (possibly-qualified) column expression `<qualifier>.column`.
+    fn col_expr(column: &str, qualifier: Option<&str>) -> Expr {
+        Expr::Column(match qualifier {
+            Some(q) => format!("{q}.{column}"),
+            None => column.to_string(),
+        })
+    }
+
+    /// The **tenant-axis** predicate on `column` (optionally `<qual>.column`) for the resolved mode:
+    /// `Ok(None)` for `All` (no predicate — cross-tenant); `NullOnly` needs no value; `Own`/`OwnOrNull`
+    /// require a resolved own-tenant value and **fail closed** ([`OrmError::TenancyNoPrincipal`]) when
+    /// there is none (a purely anonymous actor reading a plain tenant table). Never binds to another
+    /// table's same-named column — it is qualified by `qual`.
+    fn tenant_pred(
+        &self,
+        column: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        let is_null = Predicate::Null {
+            expr: Self::col_expr(column, qualifier),
             negated: false,
         };
-        match self.mode {
-            ScopeMode::Own => Some(eq()),
-            ScopeMode::OwnOrNull => Some(Predicate::Or(vec![eq(), is_null()])),
-            ScopeMode::NullOnly => Some(is_null()),
+        let eq = |v: SqlValue| Predicate::Cmp {
+            left: Self::col_expr(column, qualifier),
+            op: CmpOp::Eq,
+            right: Expr::Value(v),
+        };
+        Ok(match self.mode {
             ScopeMode::All => None,
+            ScopeMode::NullOnly => Some(is_null),
+            ScopeMode::Own => {
+                let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+                Some(eq(v))
+            }
+            ScopeMode::OwnOrNull => {
+                let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+                Some(Predicate::Or(vec![eq(v), is_null]))
+            }
+        })
+    }
+
+    /// The R3 **disjunct** read predicate for a `TenantOrSession` table: `Or` of the arms for
+    /// whichever axis facts the request carries — `tenant = <own>` (if a tenant fact is present) and
+    /// `session = <sid>` (if a session fact is present) — over the two **disjoint** columns. `All`
+    /// mode ⇒ no predicate (cross-tenant). No fact at all ⇒ **deny** ([`TenancyNoPrincipal`]): a
+    /// `TenantOrSession` read with neither an own nor a session identity fails closed rather than
+    /// running unscoped. Each arm is a plain `col = value` (the session partition IS the
+    /// tenant-`NULL` rows, so no extra NULL arm is added).
+    fn disjunct_pred(
+        &self,
+        tenant_col: &str,
+        session_col: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        if matches!(self.mode, ScopeMode::All) {
+            return Ok(None);
+        }
+        let eq = |column: &str, v: SqlValue| Predicate::Cmp {
+            left: Self::col_expr(column, qualifier),
+            op: CmpOp::Eq,
+            right: Expr::Value(v),
+        };
+        let mut arms = Vec::new();
+        if let Some(v) = self.value.clone() {
+            arms.push(eq(tenant_col, v));
+        }
+        if let Some(s) = self.session.clone() {
+            arms.push(eq(session_col, s));
+        }
+        match arms.len() {
+            0 => Err(OrmError::TenancyNoPrincipal),
+            1 => Ok(arms.pop()),
+            _ => Ok(Some(Predicate::Or(arms))),
         }
     }
 
-    /// The value the scope stamps into a scoped `INSERT`'s tenant column for this mode, or `None`
-    /// when the mode forces no column (`all` — the guest supplies the value; a cross-tenant write).
-    /// `own`/`own+null` stamp the resolved tenant; `null` stamps `NULL` (the shared baseline).
-    fn stamp_value(&self) -> Option<SqlValue> {
-        match self.mode {
-            ScopeMode::Own | ScopeMode::OwnOrNull => Some(self.value.clone()),
-            ScopeMode::NullOnly => Some(SqlValue::Null),
-            ScopeMode::All => None,
+    /// The READ predicate to conjoin for `table` (qualified by `qualifier` in a join/subquery):
+    /// dispatches on the per-table [`ResolvedScope`] — a plain tenant column, an `Unscoped` global
+    /// (no predicate), or the R3 `TenantOrSession` disjunct. `Ok(None)` ⇒ no predicate (the table is
+    /// global, or the mode is cross-tenant `All`). Undeclared / no-principal ⇒ fail closed.
+    fn read_pred(
+        &self,
+        table: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Predicate>, OrmError> {
+        let tenant = match self.resolve_table(table)? {
+            ResolvedScope::Column(col) => {
+                ident(&col)?;
+                self.tenant_pred(&col, qualifier)?
+            }
+            ResolvedScope::Unscoped => None,
+            ResolvedScope::TenantOrSession { tenant, session } => {
+                ident(&tenant)?;
+                ident(&session)?;
+                self.disjunct_pred(&tenant, &session, qualifier)?
+            }
+        };
+        // R4/D8: under a TARGET read, additionally confine to the table's host-held PUBLIC subset
+        // (deny-by-default if the table declares none). No-op under an own/session read. So a target
+        // read of table `t` becomes `t.tenant = B AND <t's public predicate>`, composed per ref.
+        let public = self.public_pred(table, qualifier)?;
+        let mut out = Predicate::And(Vec::new());
+        conjoin_front(&mut out, tenant);
+        conjoin_front(&mut out, public);
+        Ok(match out {
+            Predicate::And(v) if v.is_empty() => None,
+            p => Some(p),
+        })
+    }
+
+    /// The `(column, value)` a scoped **WRITE** stamps/bounds for `table` — the actor's OWN axis:
+    /// a plain tenant table (or `Uniform`) stamps `default_tenant_key = <own tenant>`; a
+    /// `TenantOrSession` table stamps whichever single axis the actor holds (tenant if authenticated,
+    /// else session) so an anonymous write lands in the session partition and an authenticated write
+    /// in the tenant partition — never both, never cross. `Ok(None)` ⇒ `All` mode (no stamp — a
+    /// posture-vetted cross-tenant write). Fail closed: an `Unscoped` (global) target
+    /// ([`UnscopedWrite`]), an undeclared target ([`TenancyUndeclared`]), or a scoped write with no
+    /// principal ([`TenancyNoPrincipal`]) are refused before any SQL.
+    fn write_target(&self, table: &str) -> Result<Option<(String, SqlValue)>, OrmError> {
+        // The tenant-axis stamp value for this mode (own/own+null → the resolved tenant; null → the
+        // shared baseline; all → no stamp).
+        let tenant_stamp = || -> Result<Option<SqlValue>, OrmError> {
+            Ok(match self.mode {
+                ScopeMode::All => None,
+                ScopeMode::NullOnly => Some(SqlValue::Null),
+                ScopeMode::Own | ScopeMode::OwnOrNull => {
+                    Some(self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?)
+                }
+            })
+        };
+        match self.resolve_table(table)? {
+            ResolvedScope::Column(col) => Ok(tenant_stamp()?.map(|v| (col, v))),
+            ResolvedScope::Unscoped => Err(OrmError::UnscopedWrite(table.to_string())),
+            ResolvedScope::TenantOrSession { tenant, session } => {
+                if matches!(self.mode, ScopeMode::All) {
+                    return Ok(None);
+                }
+                // Prefer the tenant axis when authenticated; else the session axis for an anon write.
+                if let Some(v) = self.value.clone() {
+                    Ok(Some((tenant, v)))
+                } else if let Some(s) = self.session.clone() {
+                    Ok(Some((session, s)))
+                } else {
+                    Err(OrmError::TenancyNoPrincipal)
+                }
+            }
         }
+    }
+
+    /// Whether this scope is a **target** scope (`PerTableTarget` — reading/writing another tenant
+    /// `B`'s public subset, R4/D8), vs. the caller's own.
+    pub fn is_target(&self) -> bool {
+        matches!(self.keys, TableKeys::PerTableTarget { .. })
+    }
+
+    /// The target-write SET-allowlist (5b), or `None` when this is not a target scope. An **empty**
+    /// set means the target route is read-only (no `write` grant) — a write force-scoped under it is
+    /// refused. Returned as `Some(&set)` for a target scope so a write path can tell "not a target"
+    /// (own path) from "target, read-only" (refuse) from "target, may set these columns".
+    fn target_write_allowlist(&self) -> Option<&std::collections::BTreeSet<String>> {
+        match &self.keys {
+            TableKeys::PerTableTarget { write, .. } => Some(write),
+            _ => None,
+        }
+    }
+
+    /// The `(column, value)` pairs a target **INSERT** must force so the inserted row lands in
+    /// `table`'s PUBLIC subset (5b): each `column = <literal>` public term contributes `(column,
+    /// literal)`, each `column IS NULL` term contributes `(column, NULL)`. A public term the host
+    /// cannot pin to a single value (a range comparison, or `IS NOT NULL`) is not forceable — the
+    /// host cannot guarantee publicness — so the INSERT is refused ([`PublicSubsetNotForceable`]).
+    /// Deny-by-default: a table with no declared public subset is refused ([`PublicSubsetUndeclared`]).
+    fn public_force_cells(&self, table: &str) -> Result<Vec<(String, SqlValue)>, OrmError> {
+        let TableKeys::PerTableTarget { public, .. } = &self.keys else {
+            return Ok(Vec::new());
+        };
+        let terms = public
+            .get(table)
+            .ok_or_else(|| OrmError::PublicSubsetUndeclared(table.to_string()))?;
+        let mut out = Vec::with_capacity(terms.len());
+        for term in terms {
+            match term {
+                PublicTermSql::Cmp {
+                    column,
+                    op: CmpOp::Eq,
+                    value,
+                } => {
+                    ident(column)?;
+                    out.push((column.clone(), value.clone()));
+                }
+                PublicTermSql::Null {
+                    column,
+                    negated: false,
+                } => {
+                    ident(column)?;
+                    out.push((column.clone(), SqlValue::Null));
+                }
+                // A range comparison or `IS NOT NULL` has no single value to stamp.
+                PublicTermSql::Cmp { .. } | PublicTermSql::Null { .. } => {
+                    return Err(OrmError::PublicSubsetNotForceable(table.to_string()))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Assert a guest-supplied `column` is settable by a target write on `table` (5b). Two gates,
+    /// both must pass: it is in the route's SET-allowlist, AND it is neither the tenant column nor a
+    /// public-visibility column (the latter a defense-in-depth check so even an operator who wrongly
+    /// listed the tenant/visibility column can't let a target write change ownership or flip
+    /// visibility). A no-op (`Ok`) when this is not a target scope. Fail-closed
+    /// ([`TargetWriteColumnDenied`]).
+    fn assert_target_settable(&self, table: &str, column: &str) -> Result<(), OrmError> {
+        let TableKeys::PerTableTarget {
+            keys,
+            public,
+            write,
+        } = &self.keys
+        else {
+            return Ok(());
+        };
+        let denied = || OrmError::TargetWriteColumnDenied(column.to_string());
+        // Gate 0: a write-target column (an INSERT column / an UPDATE SET LHS) must be a BARE column
+        // name — never `table.col`. A qualified name would (a) let `same_col` compare only the last
+        // segment, so `published.x` could slip past the tenant/visibility check on base `x`, and (b)
+        // render invalid SQL. Refuse it fail-closed at compile rather than emit a statement the DB
+        // would reject.
+        if column.contains('.') {
+            return Err(denied());
+        }
+        // Gate 1: must be granted in the SET-allowlist.
+        if !write.iter().any(|c| same_col(c, column)) {
+            return Err(denied());
+        }
+        // Gate 2: never the tenant column (would change ownership).
+        if let Some(rs) = keys.get(table) {
+            let tenant_cols: &[&str] = match rs {
+                ResolvedScope::Column(c) => &[c],
+                ResolvedScope::TenantOrSession { tenant, session } => &[tenant, session],
+                ResolvedScope::Unscoped => &[],
+            };
+            if tenant_cols.iter().any(|t| same_col(t, column)) {
+                return Err(denied());
+            }
+        }
+        // Gate 2 (cont.): never a public-visibility column (would flip the row in/out of the subset).
+        if let Some(terms) = public.get(table) {
+            let is_public_col = terms.iter().any(|t| match t {
+                PublicTermSql::Cmp { column: c, .. } | PublicTermSql::Null { column: c, .. } => {
+                    same_col(c, column)
+                }
+            });
+            if is_public_col {
+                return Err(denied());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -521,12 +895,13 @@ impl Select {
     /// `UNION` branch — so a tenant scope reaches every row source (a union branch left unscoped
     /// would leak across tenants). Overwrites any pre-existing scope. This is the host's tenant
     /// injection point for reads; the guest never sets a scope of its own.
-    pub fn force_scope(&mut self, scope: &Scope) {
+    pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         self.scope = Some(scope.clone());
-        self.inject_subquery_scope(scope);
+        self.inject_subquery_scope(scope)?;
         if let Some(u) = self.union.as_mut() {
-            u.query.force_scope(scope);
+            u.query.force_scope(scope)?;
         }
+        Ok(())
     }
 }
 
@@ -539,39 +914,63 @@ impl Insert {
     /// guest can't project another tenant's id into the write (a cross-tenant write forgery).
     /// `None` for an axis (cross-tenant `all`) clears that scope — the operation runs unscoped on
     /// that axis, by design (an `all` write's `stamp_value()` is `None`, so nothing is forced).
-    pub fn force_scope(&mut self, write: Option<&Scope>, read: Option<&Scope>) {
+    pub fn force_scope(
+        &mut self,
+        write: Option<&Scope>,
+        read: Option<&Scope>,
+    ) -> Result<(), OrmError> {
+        // R4/D8 target write (5b): confine BEFORE the own-write logic. A target INSERT accepts only
+        // the SET-allowlisted columns from the guest and force-stamps the public-visibility columns,
+        // so the inserted row lands in `B`'s public subset (the `tenant = B` stamp is applied by the
+        // shared own-write path below, since `write_target` yields `B` for a target scope).
+        if let Some(w) = write {
+            if let Some(allow) = w.target_write_allowlist() {
+                self.confine_target_insert(w, allow.is_empty())?;
+            }
+        }
         self.scope = write.cloned();
+        // The write target's per-table stamp `(column, value)` — the actor's OWN axis (Stage 1/R3),
+        // resolved once for the INSERT…SELECT tenant-projection re-append below. Resolving it enforces
+        // deny-by-default at bind time (an undeclared target, an `Unscoped` target, or a scoped write
+        // with no principal are refused). `None` ⇒ `all` mode (no stamp).
+        let target: Option<(String, SqlValue)> = match write {
+            Some(w) => w.write_target(&self.table)?,
+            None => None,
+        };
         // A subquery embedded in a row cell, an upsert `SET` expr, or a `RETURNING` item is a READ
         // of another table — scope it to that table so it can't read cross-tenant.
         if let Some(r) = read {
             for row in &mut self.rows {
                 for cell in &mut row.cells {
-                    inject_scope_expr(r, &mut cell.value);
+                    inject_scope_expr(r, &mut cell.value)?;
                 }
             }
             if let Some(c) = self.conflict.as_mut() {
                 for a in &mut c.update {
-                    inject_scope_expr(r, &mut a.value);
+                    inject_scope_expr(r, &mut a.value)?;
                 }
             }
             for it in &mut self.returning {
-                inject_scope_expr(r, &mut it.expr);
+                inject_scope_expr(r, &mut it.expr)?;
             }
         }
         if let Some((cols, src)) = self.from_select.as_mut() {
             match read {
-                Some(r) => src.force_scope(r),
+                Some(r) => src.force_scope(r)?,
                 None => src.scope = None,
             }
-            // A scoped write owns the tenant column written — never trust the guest's target
-            // projection. Drop any guest-supplied tenant column (+ its aligned projection, in the
-            // source and every union branch) and re-append it bound to the host value.
-            if let Some(v) = write.and_then(Scope::stamp_value) {
-                let column = write.expect("stamp implies write").column.clone();
+            // A scoped write owns the axis column written — never trust the guest's target
+            // projection. Drop any guest-supplied owning-axis column (+ its aligned projection, in
+            // the source and every union branch) and re-append it bound to the host value. The
+            // column is the actor's per-table axis key (Stage 1/R3); `all` mode ⇒ `target` is `None`
+            // ⇒ nothing is forced (a posture-vetted cross-tenant write).
+            if let Some((column, v)) = &target {
+                let column = column.clone();
                 if let Some(i) = cols.iter().position(|c| same_col(c, &column)) {
                     cols.remove(i);
                     drop_projection_at(src, i);
                 }
+                let v = v.clone();
                 cols.push(column);
                 push_projection(
                     src,
@@ -582,6 +981,48 @@ impl Insert {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Confine a **target INSERT** (5b): the guest may set ONLY the route's SET-allowlisted columns,
+    /// and the host force-stamps the table's public-visibility columns so the inserted row lands in
+    /// `B`'s public subset. Refused fail-closed on: a read-only target (`empty_allowlist`), an
+    /// `INSERT … SELECT` / `ON CONFLICT` (shapes that could reach beyond the public subset), a guest
+    /// cell outside the allowlist (or the tenant/visibility columns), or a public subset that cannot
+    /// be forced to a concrete row. (`tenant = B` itself is stamped by the shared own-write path.)
+    fn confine_target_insert(
+        &mut self,
+        scope: &Scope,
+        empty_allowlist: bool,
+    ) -> Result<(), OrmError> {
+        if empty_allowlist {
+            return Err(OrmError::TargetWriteNotGranted(self.table.clone()));
+        }
+        if self.from_select.is_some() {
+            return Err(OrmError::TargetWriteUnsupported("INSERT … SELECT"));
+        }
+        if self.conflict.is_some() {
+            return Err(OrmError::TargetWriteUnsupported("ON CONFLICT upsert"));
+        }
+        // Every guest-supplied cell must be a granted, non-tenant, non-visibility column.
+        for row in &self.rows {
+            for cell in &row.cells {
+                scope.assert_target_settable(&self.table, &cell.column)?;
+            }
+        }
+        // Force the public-visibility columns onto every row (deny-by-default / not-forceable checks
+        // live in `public_force_cells`). Appended as host literals — the guest cannot have set them
+        // (they're excluded by `assert_target_settable`), so there is no dup to reconcile.
+        let forced = scope.public_force_cells(&self.table)?;
+        for row in &mut self.rows {
+            for (column, value) in &forced {
+                row.cells.push(Assignment {
+                    column: column.clone(),
+                    value: Expr::Value(value.clone()),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -625,6 +1066,10 @@ fn conjoin_front(filter: &mut Predicate, add: Option<Predicate>) {
 /// it a proper boolean (never `NULL`) so `ORDER BY … DESC` is portable (own sorts first) across
 /// every dialect. The column is unqualified — the base-vs-override read this serves is single-table.
 fn own_rank_expr(scope: &Scope) -> Expr {
+    // No resolved own-tenant value (a purely anonymous actor) ⇒ nothing ranks as "own" ⇒ constant 0.
+    let Some(value) = scope.value.clone() else {
+        return Expr::Value(SqlValue::Integer(0));
+    };
     let col = || Expr::Column(scope.column.clone());
     let own = Predicate::And(vec![
         Predicate::Null {
@@ -634,7 +1079,7 @@ fn own_rank_expr(scope: &Scope) -> Expr {
         Predicate::Cmp {
             left: col(),
             op: CmpOp::Eq,
-            right: Expr::Value(scope.value.clone()),
+            right: Expr::Value(value),
         },
     ]);
     Expr::Case {
@@ -643,49 +1088,72 @@ fn own_rank_expr(scope: &Scope) -> Expr {
     }
 }
 
+/// Conjoin the tenant scope for a **subquery's inner `table`** onto its `filter`, resolving that
+/// table exactly as the top-level [`Select::scope_where_pred`] does (via [`Scope::read_pred`]): the
+/// declared per-table column, the R3 `TenantOrSession` disjunct, **no** predicate for an `Unscoped`
+/// reference table, and **refuse** an undeclared table or a scoped ref with no principal
+/// (deny-by-default). This is what makes a subquery no weaker than a top-level FROM/JOIN ref — under
+/// a `PerTable` schema a subquery can neither reach an undeclared table nor be scoped on the wrong
+/// column. Legacy `Uniform` keys resolve to `scope.column` for every table (pre-schema behavior).
+fn conjoin_subquery_scope(
+    scope: &Scope,
+    table: &str,
+    filter: &mut Predicate,
+) -> Result<(), OrmError> {
+    conjoin_front(filter, scope.read_pred(table, Some(table))?);
+    Ok(())
+}
+
 /// Walk an expression and inject the tenant scope into every **narrow subquery**'s inner filter,
-/// qualified to that subquery's own table (`<subtable>.col`), so a subquery can't read another
-/// tenant's rows. Recurses into a subquery's filter first (nested subqueries scope their own
-/// tables). The correctness twin of [`Select::scope_where_pred`] for the subquery surface. Also
+/// qualified to that subquery's own table (`<subtable>.col`) and keyed on that table's declared
+/// per-table column, so a subquery can neither read another tenant's rows nor reach an undeclared
+/// table. Recurses into a subquery's filter first (nested subqueries scope their own tables). The
+/// correctness twin of [`Select::scope_where_pred`] for the subquery surface — including its
+/// deny-by-default, so `Err(TenancyUndeclared)` propagates out and the query fails closed. Also
 /// lowers any [`Expr::IsOwn`] marker here (where the resolved `scope` is in hand) — so an
 /// unlowered `IsOwn` reaching the renderer means no scope was applied, and it fails closed.
-fn inject_scope_expr(scope: &Scope, e: &mut Expr) {
+fn inject_scope_expr(scope: &Scope, e: &mut Expr) -> Result<(), OrmError> {
     match e {
         Expr::IsOwn => *e = own_rank_expr(scope),
         Expr::RelatedAggregate { table, filter, .. }
         | Expr::RelatedScalar { table, filter, .. } => {
-            inject_scope_pred(scope, filter);
-            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+            inject_scope_pred(scope, filter)?;
+            conjoin_subquery_scope(scope, table, filter)?;
         }
-        Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner),
+        Expr::Aggregate(_, inner) | Expr::JsonExtract(inner, _) => inject_scope_expr(scope, inner)?,
         Expr::Binary(_, l, r) | Expr::JsonExtractDyn(l, r) | Expr::JsonConcat(l, r) => {
-            inject_scope_expr(scope, l);
-            inject_scope_expr(scope, r);
+            inject_scope_expr(scope, l)?;
+            inject_scope_expr(scope, r)?;
         }
         Expr::Distance { left, right, .. } => {
-            inject_scope_expr(scope, left);
-            inject_scope_expr(scope, right);
+            inject_scope_expr(scope, left)?;
+            inject_scope_expr(scope, right)?;
         }
-        Expr::Func(_, args) => args.iter_mut().for_each(|a| inject_scope_expr(scope, a)),
+        Expr::Func(_, args) => {
+            for a in args.iter_mut() {
+                inject_scope_expr(scope, a)?;
+            }
+        }
         Expr::Case {
             branches,
             otherwise,
         } => {
             for (when, then) in branches {
-                inject_scope_pred(scope, when);
-                inject_scope_expr(scope, then);
+                inject_scope_pred(scope, when)?;
+                inject_scope_expr(scope, then)?;
             }
             if let Some(e) = otherwise {
-                inject_scope_expr(scope, e);
+                inject_scope_expr(scope, e)?;
             }
         }
         Expr::Column(_) | Expr::Value(_) | Expr::Star | Expr::VectorLiteral(_) => {}
     }
+    Ok(())
 }
 
 /// Walk a predicate and inject the tenant scope into every narrow subquery (see
-/// [`inject_scope_expr`]).
-fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
+/// [`inject_scope_expr`]). Propagates `Err(TenancyUndeclared)` from an undeclared subquery table.
+fn inject_scope_pred(scope: &Scope, p: &mut Predicate) -> Result<(), OrmError> {
     match p {
         Predicate::InSubquery {
             expr,
@@ -693,33 +1161,38 @@ fn inject_scope_pred(scope: &Scope, p: &mut Predicate) {
             filter,
             ..
         } => {
-            inject_scope_expr(scope, expr);
-            inject_scope_pred(scope, filter);
-            conjoin_front(filter, scope.as_predicate_for(Some(table)));
+            inject_scope_expr(scope, expr)?;
+            inject_scope_pred(scope, filter)?;
+            conjoin_subquery_scope(scope, table, filter)?;
         }
         Predicate::And(v) | Predicate::Or(v) => {
-            v.iter_mut().for_each(|c| inject_scope_pred(scope, c));
+            for c in v.iter_mut() {
+                inject_scope_pred(scope, c)?;
+            }
         }
-        Predicate::Not(inner) => inject_scope_pred(scope, inner),
+        Predicate::Not(inner) => inject_scope_pred(scope, inner)?,
         Predicate::Cmp { left, right, .. } => {
-            inject_scope_expr(scope, left);
-            inject_scope_expr(scope, right);
+            inject_scope_expr(scope, left)?;
+            inject_scope_expr(scope, right)?;
         }
         Predicate::Between {
             expr, low, high, ..
         } => {
-            inject_scope_expr(scope, expr);
-            inject_scope_expr(scope, low);
-            inject_scope_expr(scope, high);
+            inject_scope_expr(scope, expr)?;
+            inject_scope_expr(scope, low)?;
+            inject_scope_expr(scope, high)?;
         }
         Predicate::In { expr, values, .. } => {
-            inject_scope_expr(scope, expr);
-            values.iter_mut().for_each(|v| inject_scope_expr(scope, v));
+            inject_scope_expr(scope, expr)?;
+            for v in values.iter_mut() {
+                inject_scope_expr(scope, v)?;
+            }
         }
         Predicate::Like { expr, .. } | Predicate::Null { expr, .. } => {
-            inject_scope_expr(scope, expr);
+            inject_scope_expr(scope, expr)?;
         }
     }
+    Ok(())
 }
 
 impl Select {
@@ -728,55 +1201,83 @@ impl Select {
     /// join `ON`s) — so a subquery's own table is scoped, not just the outer FROM. Called by
     /// [`Select::force_scope`] after setting the scope. Must stay exhaustive over the Expr/Predicate
     /// fields: a missed field is a cross-tenant subquery leak.
-    fn inject_subquery_scope(&mut self, scope: &Scope) {
+    fn inject_subquery_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         for it in &mut self.columns {
-            inject_scope_expr(scope, &mut it.expr);
+            inject_scope_expr(scope, &mut it.expr)?;
         }
         for e in &mut self.distinct_on {
-            inject_scope_expr(scope, e);
+            inject_scope_expr(scope, e)?;
         }
         if let Some(f) = self.filter.as_mut() {
-            inject_scope_pred(scope, f);
+            inject_scope_pred(scope, f)?;
         }
         if let Some(h) = self.having.as_mut() {
-            inject_scope_pred(scope, h);
+            inject_scope_pred(scope, h)?;
         }
         for e in &mut self.group_by {
-            inject_scope_expr(scope, e);
+            inject_scope_expr(scope, e)?;
         }
         for o in &mut self.order {
-            inject_scope_expr(scope, &mut o.expr);
+            inject_scope_expr(scope, &mut o.expr)?;
         }
         for j in &mut self.joins {
-            inject_scope_pred(scope, &mut j.on);
+            inject_scope_pred(scope, &mut j.on)?;
         }
+        Ok(())
     }
 }
 
 impl Update {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
     /// the `SET` exprs, filter, and `RETURNING` items. Overwrites any prior scope.
-    pub fn force_scope(&mut self, scope: &Scope) {
+    ///
+    /// **R4/D8 target write (5b):** under a target scope the guest may set ONLY the route's
+    /// SET-allowlisted columns (never the tenant or a visibility column), and the `WHERE` is confined
+    /// to `tenant = B AND <public>` — the tenant half via [`single_scope_pred`] at compile, the
+    /// public half conjoined here — so an UPDATE can touch ONLY `B`'s already-public rows and cannot
+    /// flip a row in or out of the public subset. A read-only target (empty allowlist) is refused.
+    pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
+        if let Some(allow) = scope.target_write_allowlist() {
+            if allow.is_empty() {
+                return Err(OrmError::TargetWriteNotGranted(self.table.clone()));
+            }
+            for a in &self.set {
+                scope.assert_target_settable(&self.table, &a.column)?;
+            }
+            // Confine to the public subset (the `tenant = B` half is added by the compiler). A target
+            // table with no declared public predicate is refused (deny-by-default).
+            match scope.public_pred(&self.table, None)? {
+                Some(pred) => conjoin_front(&mut self.filter, Some(pred)),
+                None => return Err(OrmError::PublicSubsetUndeclared(self.table.clone())),
+            }
+        }
         self.scope = Some(scope.clone());
         for a in &mut self.set {
-            inject_scope_expr(scope, &mut a.value);
+            inject_scope_expr(scope, &mut a.value)?;
         }
-        inject_scope_pred(scope, &mut self.filter);
+        inject_scope_pred(scope, &mut self.filter)?;
         for it in &mut self.returning {
-            inject_scope_expr(scope, &mut it.expr);
+            inject_scope_expr(scope, &mut it.expr)?;
         }
+        Ok(())
     }
 }
 
 impl Delete {
     /// Force a host-resolved write `scope` (conjoined into `WHERE`), also scoping any subquery in
-    /// the filter and `RETURNING` items. Overwrites any prior scope.
-    pub fn force_scope(&mut self, scope: &Scope) {
-        self.scope = Some(scope.clone());
-        inject_scope_pred(scope, &mut self.filter);
-        for it in &mut self.returning {
-            inject_scope_expr(scope, &mut it.expr);
+    /// the filter and `RETURNING` items. Overwrites any prior scope. **A DELETE under a target scope
+    /// is always refused (5b):** target writes are INSERT/UPDATE only — a cross-tenant delete is
+    /// never granted.
+    pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
+        if scope.is_target() {
+            return Err(OrmError::TargetDeleteRefused(self.table.clone()));
         }
+        self.scope = Some(scope.clone());
+        inject_scope_pred(scope, &mut self.filter)?;
+        for it in &mut self.returning {
+            inject_scope_expr(scope, &mut it.expr)?;
+        }
+        Ok(())
     }
 }
 
@@ -793,6 +1294,60 @@ pub enum OrmError {
     /// `count(*)`.
     #[error("bad expression: {0}")]
     BadExpr(&'static str),
+    /// A scoped query touched a table with **no** entry in the project's [`TenancySchema`]
+    /// (deny-by-default, PLAN-tenancy-principal D3): "no key" and "forgot the key" are
+    /// indistinguishable, so the safe collapse is to refuse rather than run it unscoped or wrongly
+    /// scoped. `Unscoped` is the explicit, reviewed "this table is global"; an absent table is a
+    /// misconfiguration the host surfaces (the binding names the component + marker site).
+    #[error("tenancy: table {0:?} has no declared scope (deny-by-default)")]
+    TenancyUndeclared(String),
+    /// A guest WRITE (INSERT/UPDATE/DELETE) targeted a table declared `Unscoped` (global reference
+    /// data). Reads of an `Unscoped` table are global by design, but writes are **deny-by-default**
+    /// (a shared-data write is a cross-tenant blast — the [`TableScope::Unscoped`](crate::tenancy::TableScope::Unscoped)
+    /// contract), so the host refuses them rather than running the write unbounded-by-tenant.
+    #[error("tenancy: table {0:?} is Unscoped (global reference); guest writes are refused (deny-by-default)")]
+    UnscopedWrite(String),
+    /// A scoped read/write needed a resolved principal (an own-tenant value, or — for a
+    /// `TenantOrSession` table — at least one of the tenant/session facts) but the request carried
+    /// none. Fail closed: the query is refused rather than run unscoped. (The single-column raw-SQL
+    /// path reports the equivalent `TenantDenied::NoSource` at the binding.)
+    #[error("tenancy: no resolved principal for a scoped operation (deny-by-default)")]
+    TenancyNoPrincipal,
+    /// A **target read** (R4/D8) touched a table with **no** declared public subset in the project
+    /// schema. A target scope may only read rows that satisfy each accessed table's host-held public
+    /// predicate, so a table (root or any joined/subquery ref) that declares none is refused —
+    /// deny-by-default, the strict analog of [`TenancyUndeclared`]. This is what keeps a target read
+    /// from ever reaching another tenant's PRIVATE rows through an un-confined table.
+    #[error(
+        "tenancy: table {0:?} has no declared public subset for a target read (deny-by-default)"
+    )]
+    PublicSubsetUndeclared(String),
+    /// A WRITE (INSERT/UPDATE) was force-scoped under a **target** scope whose SET-allowlist is empty
+    /// — i.e. a target route with no `write` grant is read-only (5b, deny-by-default). Refused before
+    /// any SQL.
+    #[error("tenancy: target route {0:?} has no write grant (read-only; deny-by-default)")]
+    TargetWriteNotGranted(String),
+    /// A target write tried to set a column that is not in the route's SET-allowlist — the tenant
+    /// column, a public-visibility column, or any other un-granted column. Refused fail-closed so a
+    /// target write can never change ownership, flip visibility, or touch a non-granted column.
+    #[error("tenancy: target write may not set column {0:?} (not in the write allowlist)")]
+    TargetWriteColumnDenied(String),
+    /// A `DELETE` was attempted under a target scope. Target writes are INSERT/UPDATE only; a target
+    /// DELETE is always refused (a cross-tenant delete is never granted).
+    #[error("tenancy: a target-tenant DELETE is refused (target writes are INSERT/UPDATE only)")]
+    TargetDeleteRefused(String),
+    /// A target INSERT could not force a table's public subset to a concrete row: a public term that
+    /// is not `column = <literal>` or `column IS NULL` (e.g. a range or `IS NOT NULL`) has no single
+    /// value to stamp, so the host cannot guarantee the inserted row lands in the public subset —
+    /// refused (deny-by-default). Such a subset is read-/update-only, never target-insertable.
+    #[error("tenancy: target INSERT cannot force table {0:?} into its public subset (a non-equality/non-null public term); refused")]
+    PublicSubsetNotForceable(String),
+    /// A target write used a shape the confinement does not support: an `INSERT … SELECT`, an
+    /// `ON CONFLICT` upsert, or a `promote`. These could reach rows outside the public subset (a
+    /// selected source, or an existing private row on conflict), so a target write is restricted to a
+    /// plain `VALUES` INSERT / a confined UPDATE — the rest are refused (deny-by-default).
+    #[error("tenancy: unsupported target write shape ({0}); target writes are a plain INSERT or a confined UPDATE only")]
+    TargetWriteUnsupported(&'static str),
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -1177,14 +1732,36 @@ fn render_where(
     Ok(Some(render_pred(&combined, params, false, dialect)?))
 }
 
-/// The single-table scope predicate for an UPDATE/DELETE (validates the column, unqualified).
-fn single_scope_pred(scope: Option<&Scope>) -> Result<Option<Predicate>, OrmError> {
-    match scope {
-        Some(s) => {
-            ident(&s.column)?;
-            Ok(s.as_predicate())
+/// The single-table scope predicate for an UPDATE/DELETE `WHERE`, bounding the write to the actor's
+/// OWN partition via [`Scope::write_target`]: a plain tenant table bounds `tenant_col = <own>` (or
+/// `tenant_col IS NULL` for the explicit null-baseline grant); a `TenantOrSession` table bounds the
+/// single axis the actor holds (`tenant_col = T` authenticated, else `session_col = S`). `Ok(None)`
+/// ⇒ `All` (no bound) or no forced scope. An `Unscoped` target is refused (`UnscopedWrite`), an
+/// undeclared one too (`TenancyUndeclared`), and a scoped write with no principal
+/// (`TenancyNoPrincipal`) — deny-by-default.
+fn single_scope_pred(scope: Option<&Scope>, table: &str) -> Result<Option<Predicate>, OrmError> {
+    let Some(s) = scope else { return Ok(None) };
+    match s.write_target(table)? {
+        None => Ok(None), // All — no bound
+        Some((col, value)) => {
+            ident(&col)?;
+            let col_expr = Expr::Column(col);
+            // A NULL stamp value is the explicit null-baseline grant ⇒ `IS NULL`; any real tenant /
+            // session value ⇒ `= value`. (Own/session values are never NULL, so this is unambiguous.)
+            let pred = if matches!(value, SqlValue::Null) {
+                Predicate::Null {
+                    expr: col_expr,
+                    negated: false,
+                }
+            } else {
+                Predicate::Cmp {
+                    left: col_expr,
+                    op: CmpOp::Eq,
+                    right: Expr::Value(value),
+                }
+            };
+            Ok(Some(pred))
         }
-        None => Ok(None),
     }
 }
 
@@ -1265,19 +1842,29 @@ impl Select {
         let Some(scope) = &self.scope else {
             return Ok(None);
         };
-        ident(&scope.column)?;
         if self.joins.is_empty() {
-            return Ok(scope.as_predicate());
+            // Single table: its per-table read predicate (the tenant column, the R3 disjunct, or
+            // `None` for an `Unscoped` global; deny-by-default / no-principal fail closed).
+            return scope.read_pred(&self.table, None);
         }
-        let mut refs: Vec<&str> = Vec::with_capacity(self.joins.len() + 1);
-        refs.push(self.table_alias.as_deref().unwrap_or(&self.table));
-        for j in &self.joins {
-            refs.push(j.alias.as_deref().unwrap_or(&j.table));
-        }
+        // Joined: each table reference is scoped on its OWN resolved key, qualified by alias-or-name,
+        // so a guest can't read a joined table's cross-tenant rows through the projection. A ref
+        // whose table is undeclared fails closed (deny-by-default); an `Unscoped` ref adds no
+        // predicate (it is global by declaration).
+        let refs: Vec<(&str, &str)> = std::iter::once((
+            self.table.as_str(),
+            self.table_alias.as_deref().unwrap_or(&self.table),
+        ))
+        .chain(
+            self.joins
+                .iter()
+                .map(|j| (j.table.as_str(), j.alias.as_deref().unwrap_or(&j.table))),
+        )
+        .collect();
         let mut parts: Vec<Predicate> = Vec::with_capacity(refs.len());
-        for r in refs {
-            ident(r)?;
-            if let Some(p) = scope.as_predicate_for(Some(r)) {
+        for (table, qual) in refs {
+            ident(qual)?;
+            if let Some(p) = scope.read_pred(table, Some(qual))? {
                 parts.push(p);
             }
         }
@@ -1397,6 +1984,17 @@ impl Insert {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
+        // The write target's per-table stamp `(column, value)` — the actor's OWN axis (tenant when
+        // authenticated, the anon session for a `TenantOrSession` table otherwise; PLAN R2/R3).
+        // Resolving it enforces deny-by-default for BOTH the VALUES and INSERT…SELECT forms — an
+        // undeclared target, an `Unscoped` (global) target, or a scoped write with no principal are
+        // refused here. `None` ⇒ `all` mode (no stamp — a posture-vetted cross-tenant write) or no
+        // forced scope.
+        let stamp: Option<(String, SqlValue)> = match self.scope.as_ref() {
+            Some(s) => s.write_target(&self.table)?,
+            None => None,
+        };
+
         // INSERT … SELECT: rows come from a source query sharing the placeholder sequence.
         if let Some((cols, select)) = &self.from_select {
             let col_sql = cols
@@ -1410,7 +2008,7 @@ impl Insert {
             let mut sql = format!("INSERT INTO {table} ({}) {select_sql}", col_sql.join(", "));
             sql.push_str(&render_conflict(
                 self.conflict.as_ref(),
-                self.scope.as_ref(),
+                stamp.as_ref().map(|(c, v)| (c.as_str(), v)),
                 &mut params,
                 dialect,
             )?);
@@ -1431,15 +2029,10 @@ impl Insert {
                 columns.push(c);
             }
         }
-        // A scope with a stampable value (own/own+null → the tenant, null → NULL) forces its
-        // column into every row. `all` mode stamps nothing (the guest supplies the value —
-        // a cross-tenant write), so it behaves like no scope here. The column match is
-        // case/qualifier-insensitive (`same_col`) so a guest can't smuggle its own value into the
-        // tenant column by re-spelling it (`TENANT_ID`, `t.tenant_id`).
-        let stamp = self
-            .scope
-            .as_ref()
-            .and_then(|s| s.stamp_value().map(|v| (s.column.as_str(), v)));
+        // The resolved stamp (own tenant, the null baseline, or the anon session value) forces its
+        // per-table column into every row. `all` mode / no forced scope stamps nothing (`stamp` is
+        // `None`). The column match is case/qualifier-insensitive (`same_col`) so a guest can't
+        // smuggle its own value into the stamped column by re-spelling it (`TENANT_ID`, `t.tenant_id`).
         if let Some((column, _)) = &stamp {
             let c = ident(column)?.to_string();
             if !columns.iter().any(|existing| same_col(existing, &c)) {
@@ -1478,7 +2071,7 @@ impl Insert {
 
         sql.push_str(&render_conflict(
             self.conflict.as_ref(),
-            self.scope.as_ref(),
+            stamp.as_ref().map(|(c, v)| (c.as_str(), v)),
             &mut params,
             dialect,
         )?);
@@ -1497,7 +2090,7 @@ impl Insert {
 /// UPDATE` can't carry that bound, so a scoped upsert on MySQL is refused (fail-closed).
 fn render_conflict(
     conflict: Option<&OnConflict>,
-    scope: Option<&Scope>,
+    stamp: Option<(&str, &SqlValue)>,
     params: &mut Params,
     dialect: Dialect,
 ) -> Result<String, OrmError> {
@@ -1509,8 +2102,9 @@ fn render_conflict(
         .iter()
         .map(|c| ident(c).map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
-    // The scope that must bound the upsert (own/null → a predicate; all/none contributes nothing).
-    let guard = scope.filter(|s| s.stamp_value().is_some());
+    // The resolved write stamp `(column, value)` that must bound the upsert (own/session/null →
+    // a predicate; `all` / no-scope → `None`, nothing to guard).
+    let guard = stamp;
     let do_nothing = || format!(" ON CONFLICT ({}) DO NOTHING", conflict_cols.join(", "));
     if oc.update.is_empty() {
         return Ok(do_nothing());
@@ -1521,12 +2115,12 @@ fn render_conflict(
              (ON DUPLICATE KEY UPDATE cannot be bounded to the tenant's rows)",
         ));
     }
-    // Drop any assignment to the scope column: a guest upsert never reassigns an existing row's
-    // tenant. If that leaves nothing to update, degrade to DO NOTHING.
+    // Drop any assignment to the stamped (tenant/session) column: a guest upsert never reassigns an
+    // existing row's owning axis. If that leaves nothing to update, degrade to DO NOTHING.
     let sets = oc
         .update
         .iter()
-        .filter(|a| guard.is_none_or(|s| !same_col(&a.column, &s.column)))
+        .filter(|a| guard.is_none_or(|(col, _)| !same_col(&a.column, col)))
         .map(|a| {
             let c = ident(&a.column)?;
             Ok::<String, OrmError>(format!("{c} = {}", render_expr(&a.value, params, dialect)?))
@@ -1540,11 +2134,23 @@ fn render_conflict(
         conflict_cols.join(", "),
         sets.join(", ")
     );
-    if let Some(s) = guard {
-        // Bound the DO UPDATE to the tenant's own rows (Postgres/SQLite support a trailing WHERE).
-        let pred = s
-            .as_predicate()
-            .expect("a stampable scope always has a predicate");
+    if let Some((col, value)) = guard {
+        ident(col)?;
+        // Bound the DO UPDATE to the actor's own partition (Postgres/SQLite support a trailing
+        // WHERE), keyed on the stamped column — `= value`, or `IS NULL` for the null baseline.
+        let col_expr = Expr::Column(col.to_string());
+        let pred = if matches!(value, SqlValue::Null) {
+            Predicate::Null {
+                expr: col_expr,
+                negated: false,
+            }
+        } else {
+            Predicate::Cmp {
+                left: col_expr,
+                op: CmpOp::Eq,
+                right: Expr::Value(value.clone()),
+            }
+        };
         clause.push_str(&format!(
             " WHERE {}",
             render_pred(&pred, params, false, dialect)?
@@ -1573,15 +2179,17 @@ impl Update {
         let table = ident(&self.table)?;
         let mut params = Params::default();
 
-        // A scoped write never reassigns the tenant column: drop any `SET <scope column> = …`
-        // (case/qualifier-insensitively) so a guest can't donate its own rows into another
-        // tenant's partition (mirrors the ON CONFLICT DO UPDATE guard). The WHERE still bounds the
-        // update to own rows; this bounds what it may *change*.
-        let scope_col = self
-            .scope
-            .as_ref()
-            .filter(|s| s.stamp_value().is_some())
-            .map(|s| s.column.clone());
+        // A scoped write never reassigns the owning-axis column: drop any `SET <axis column> = …`
+        // (case/qualifier-insensitively) so a guest can't donate its own rows into another tenant's
+        // (or session's) partition (mirrors the ON CONFLICT DO UPDATE guard). The column is the
+        // actor's per-table axis key (Stage 1/R3): `tenant_id` (or the identity PK) authenticated,
+        // the `session_id` for an anon `TenantOrSession` write. `all` mode ⇒ no drop; an `Unscoped`
+        // or undeclared or no-principal write is refused (via `write_target`). The WHERE still bounds
+        // the update to own rows; this bounds what it may *change*.
+        let scope_col: Option<String> = match self.scope.as_ref() {
+            Some(s) => s.write_target(&self.table)?.map(|(col, _)| col),
+            None => None,
+        };
         // SET binds before WHERE so placeholder order matches the parameter order.
         let sets: Result<Vec<String>, _> = self
             .set
@@ -1608,7 +2216,7 @@ impl Update {
         let set_sql = sets.join(", ");
 
         let where_sql = render_where(
-            single_scope_pred(self.scope.as_ref())?,
+            single_scope_pred(self.scope.as_ref(), &self.table)?,
             Some(&self.filter),
             &mut params,
             dialect,
@@ -1638,7 +2246,7 @@ impl Delete {
         let table = ident(&self.table)?;
         let mut params = Params::default();
         let where_sql = render_where(
-            single_scope_pred(self.scope.as_ref())?,
+            single_scope_pred(self.scope.as_ref(), &self.table)?,
             Some(&self.filter),
             &mut params,
             dialect,
@@ -1650,6 +2258,199 @@ impl Delete {
         sql.push_str(&render_returning(&self.returning, &mut params, dialect)?);
         Ok((sql, params.0))
     }
+}
+
+/// Compile the deny-by-default **`promote`** verb (PLAN-tenancy-principal D7): claim a returning
+/// visitor's anonymous-session rows for their now-authenticated tenant. It is a **distinct
+/// host-mediated verb**, never an [`AccessMode`](crate::tenancy::AccessMode) or a guest-authored
+/// UPDATE — the guest can name neither the session value nor the cross-axis NULL.
+///
+/// Requires `table` to be a [`TableScope::TenantOrSession`](crate::tenancy::TableScope) table AND
+/// the [`Scope`] to carry BOTH a tenant fact `T` (`value`) and a session fact `S` (`session`) — else
+/// refused ([`OrmError::TenancyNoPrincipal`] / [`OrmError::BadExpr`]). Lowers to:
+///
+/// ```sql
+/// UPDATE <table> SET <tenant_col> = T WHERE <session_col> = S AND <tenant_col> IS NULL
+/// ```
+///
+/// The `<tenant_col> IS NULL` match is the **anti-widening guard**: promotion can only claim rows
+/// not yet owned by any tenant, never re-home another tenant's rows into `T`. It is non-escalating,
+/// idempotent, and race-safe — a second promotion (or a concurrent one that lost) matches nothing.
+pub fn compile_promote(scope: &Scope, table: &str, dialect: Dialect) -> Result<Compiled, OrmError> {
+    // `promote` is an OWN-axis session→tenant claim; it is meaningless (and unsafe) under a target
+    // scope. Refuse it fail-closed so a target route can never move another tenant's rows.
+    if scope.is_target() {
+        return Err(OrmError::TargetWriteUnsupported("promote"));
+    }
+    let (tenant_col, session_col) = match scope.resolve_table(table)? {
+        ResolvedScope::TenantOrSession { tenant, session } => (tenant, session),
+        _ => {
+            return Err(OrmError::BadExpr(
+                "promote requires a TenantOrSession table (an anonymous-first table)",
+            ))
+        }
+    };
+    ident(&tenant_col)?;
+    ident(&session_col)?;
+    // BOTH facts are mandatory — promotion is the authenticated claim of one's own anon session.
+    let tenant = scope.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+    let session = scope.session.clone().ok_or(OrmError::TenancyNoPrincipal)?;
+    let promote = Update {
+        table: table.to_string(),
+        // set the tenant column to the resolved tenant fact.
+        set: vec![Assignment {
+            column: tenant_col.clone(),
+            value: Expr::val(tenant),
+        }],
+        // match this session's not-yet-owned rows only (the anti-widening guard).
+        filter: Predicate::And(vec![
+            Predicate::Cmp {
+                left: Expr::Column(session_col),
+                op: CmpOp::Eq,
+                right: Expr::val(session),
+            },
+            Predicate::Null {
+                expr: Expr::Column(tenant_col),
+                negated: false,
+            },
+        ]),
+        // The promotion IS the scope; no additional host force_scope (and the tenant-column SET is
+        // the sanctioned reassignment-from-NULL, so the usual reassignment SET-drop must NOT fire).
+        scope: None,
+        returning: vec![],
+    };
+    promote.compile(dialect)
+}
+
+/// A parent-referencing derived-tenant write ([`compile_attach_reference`], PLAN-tenancy-principal
+/// 5d): insert a row into `child` whose tenant is DERIVED from a `parent` row reachable under the
+/// caller's current confined scope, gated by `parent.<ref_column> = ref_value`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachReference {
+    /// The table the new row is inserted into.
+    pub child: String,
+    /// The referenced parent table (read under the caller's scope).
+    pub parent: String,
+    /// The parent selector column: `parent.<ref_column> = <ref_value>` picks the referenced row.
+    pub ref_column: String,
+    /// The parent selector value (guest-supplied — a row selector INSIDE the caller's confined scope,
+    /// never a tenant value).
+    pub ref_value: SqlValue,
+    /// The child's non-tenant column assignments (guest values). Under a target scope each column
+    /// must be in the route's SET-allowlist (never the tenant or a visibility column).
+    pub set: Vec<Assignment>,
+}
+
+/// Compile `attach_reference` (5d): the host-mediated **derived-tenant** write. Lowers to
+///
+/// ```sql
+/// INSERT INTO <child> (<set cols…>, <child tenant col> [, <child public cols…>])
+/// SELECT <set vals…>, <parent tenant col> [, <public literals…>]
+/// FROM <parent> WHERE <parent>.<ref> = ? AND <caller's scope on the parent>
+/// ```
+///
+/// The child's tenant is **projected from the scope-confined parent**, never the guest — so it is
+/// bounded by the caller's own reach (`own` → {A, NULL}; `target` → {B}, since the parent is confined
+/// to `tenant = B AND <public>`). An unreachable parent selects zero rows ⇒ zero inserts (a
+/// fail-closed no-op, never an oracle). Under a **target** scope the child's own public-visibility
+/// columns are force-stamped and the guest `set` columns are gated by the target write-allowlist
+/// ([`Scope::assert_target_settable`]), so the inserted row lands in the child's public subset. The
+/// caller's WRITE grant is enforced above this (the binding's `scope_for(Write)` fails closed for a
+/// read-only route — so a `handle`-resolved target, whose write axis is denied, can never reach here,
+/// satisfying G1). `child`/`parent` must be plain `Column`-scoped tenant tables.
+pub fn compile_attach_reference(
+    scope: &Scope,
+    spec: &AttachReference,
+    dialect: Dialect,
+) -> Result<Compiled, OrmError> {
+    ident(&spec.ref_column)?;
+    // Resolve the child + parent tenant columns — both must be plain tenant `Column` tables (a
+    // derived-tenant write onto an identity/`Unscoped`/`TenantOrSession` table is out of scope).
+    let child_tenant = match scope.resolve_table(&spec.child)? {
+        ResolvedScope::Column(c) => c,
+        _ => {
+            return Err(OrmError::BadExpr(
+                "attach_reference child must be a plain tenant table",
+            ))
+        }
+    };
+    let parent_tenant = match scope.resolve_table(&spec.parent)? {
+        ResolvedScope::Column(c) => c,
+        _ => {
+            return Err(OrmError::BadExpr(
+                "attach_reference parent must be a plain tenant table",
+            ))
+        }
+    };
+    ident(&child_tenant)?;
+    ident(&parent_tenant)?;
+
+    let is_target = scope.is_target();
+    let mut columns: Vec<String> = Vec::with_capacity(spec.set.len() + 2);
+    let mut projection: Vec<SelectItem> = Vec::with_capacity(spec.set.len() + 2);
+    // The guest's non-tenant columns. The host DERIVES the child's tenant column from the parent, so
+    // the guest may never name it (own OR target) — that would collide with (or try to forge) the
+    // derived value. Under target, columns are additionally gated by the write-allowlist (never a
+    // visibility column). Under own, they are only validated as identifiers (the caller writes its
+    // own rows, exactly as a normal own INSERT).
+    for a in &spec.set {
+        if same_col(&a.column, &child_tenant) {
+            return Err(OrmError::TargetWriteColumnDenied(a.column.clone()));
+        }
+        if is_target {
+            scope.assert_target_settable(&spec.child, &a.column)?;
+        } else {
+            ident(&a.column)?;
+        }
+        columns.push(a.column.clone());
+        projection.push(SelectItem {
+            expr: a.value.clone(),
+            alias: None,
+        });
+    }
+    // The derived tenant: the child's tenant column is projected from the (scope-confined) parent's
+    // tenant column — never a guest value.
+    columns.push(child_tenant);
+    projection.push(SelectItem {
+        expr: Expr::Column(parent_tenant),
+        alias: None,
+    });
+    // Under a target scope, force the child's public-visibility columns so the inserted row is itself
+    // public (deny-by-default: a child table with no declared public subset is refused).
+    if is_target {
+        for (col, val) in scope.public_force_cells(&spec.child)? {
+            columns.push(col);
+            projection.push(SelectItem {
+                expr: Expr::Value(val),
+                alias: None,
+            });
+        }
+    }
+    // The source: SELECT <projection> FROM parent WHERE parent.<ref> = ?. Read-scoping it confines the
+    // parent to the caller's reachable set (own: tenant = A [OR NULL]; target: tenant = B AND public),
+    // so the projected parent tenant is bounded and an unreachable parent yields zero rows.
+    let mut source = Select {
+        columns: projection,
+        filter: Some(Predicate::Cmp {
+            left: Expr::Column(spec.ref_column.clone()),
+            op: CmpOp::Eq,
+            right: Expr::Value(spec.ref_value.clone()),
+        }),
+        ..Select::from(spec.parent.clone())
+    };
+    source.force_scope(scope)?;
+    // The INSERT itself carries NO scope (`scope: None`) — the tenant is the projected parent's, not a
+    // re-stamped scalar. (This is the sanctioned target INSERT…SELECT; a generic one is refused by
+    // `Insert::force_scope` under a target scope.)
+    let insert = Insert {
+        table: spec.child.clone(),
+        rows: vec![],
+        conflict: None,
+        scope: None,
+        returning: vec![],
+        from_select: Some((columns, Box::new(source))),
+    };
+    insert.compile(dialect)
 }
 
 #[cfg(test)]
@@ -1699,8 +2500,10 @@ mod tests {
             filter: Some(cmp("kind", CmpOp::Eq, t("supplier"))),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             ..Select::from("party")
         };
@@ -1710,6 +2513,111 @@ mod tests {
             "SELECT * FROM party WHERE tenant_id = ?1 AND kind = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("supplier")]);
+    }
+
+    #[test]
+    fn per_table_keys_scope_each_ref_on_its_own_column() {
+        use std::collections::BTreeMap;
+        // A settings-page read: storefront_config (Tenant -> tenant_id) LEFT JOIN the identity table
+        // `tenant` (TenantKeyed -> its own PK `id`). The host injects the RIGHT column per ref (R2).
+        let q = Select {
+            table_alias: Some("sc".into()),
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "tenant".into(),
+                alias: Some("t".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("sc.tenant_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("t.id"),
+                },
+            }],
+            scope: Some(Scope {
+                column: "tenant_id".into(),
+                value: Some(t("acme")),
+                session: None,
+                mode: ScopeMode::Own,
+                keys: TableKeys::PerTable(BTreeMap::from([
+                    (
+                        "storefront_config".to_string(),
+                        ResolvedScope::Column("tenant_id".to_string()),
+                    ),
+                    (
+                        "tenant".to_string(),
+                        ResolvedScope::Column("id".to_string()),
+                    ),
+                ])),
+            }),
+            ..Select::from("storefront_config")
+        };
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("sc.tenant_id = ?"),
+            "base scoped on tenant_id: {sql}"
+        );
+        assert!(
+            sql.contains("t.id = ?"),
+            "identity table scoped on its own PK: {sql}"
+        );
+        assert_eq!(params, vec![t("acme"), t("acme")]);
+
+        // An `Unscoped` join (reference data) adds NO tenant predicate; the base still scopes.
+        let mut q2 = Select {
+            table_alias: Some("sc".into()),
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "countries".into(),
+                alias: Some("c".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("sc.country"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("c.code"),
+                },
+            }],
+            ..Select::from("storefront_config")
+        };
+        q2.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: Some(t("acme")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "storefront_config".to_string(),
+                    ResolvedScope::Column("tenant_id".to_string()),
+                ),
+                ("countries".to_string(), ResolvedScope::Unscoped),
+            ])),
+        })
+        .unwrap();
+        let (sql2, params2) = q2.compile(Dialect::Sqlite).unwrap();
+        assert!(sql2.contains("sc.tenant_id = ?"), "sql2: {sql2}");
+        // The `Unscoped` join binds NO tenant value — the sole bind is the base's own tenant — which
+        // proves `countries` contributed no scope predicate (a substring check on the alias would
+        // false-match `sc.tenant_id`).
+        assert_eq!(
+            params2,
+            vec![t("acme")],
+            "unscoped join adds no tenant predicate: {sql2}"
+        );
+
+        // An UNDECLARED table under a present schema is refused (deny-by-default, D3).
+        let mut q3 = Select::from("secret_table");
+        q3.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: Some(t("acme")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([(
+                "orders".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            )])),
+        })
+        .unwrap();
+        assert!(matches!(
+            q3.compile(Dialect::Sqlite),
+            Err(OrmError::TenancyUndeclared(tbl)) if tbl == "secret_table"
+        ));
     }
 
     #[test]
@@ -1728,9 +2636,12 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::OwnOrNull,
-        });
+            keys: TableKeys::Uniform,
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -1760,9 +2671,12 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::All,
-        });
+            keys: TableKeys::Uniform,
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -1806,9 +2720,12 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("acme"),
+            value: Some(t("acme")),
+            session: None,
             mode: ScopeMode::OwnOrNull,
-        });
+            keys: TableKeys::Uniform,
+        })
+        .unwrap();
         let (sql, _) = q.compile(Dialect::Sqlite).unwrap();
         // The host scope predicate is conjoined in FRONT, independent of the is_own label.
         assert!(
@@ -1826,8 +2743,10 @@ mod tests {
             filter: Some(cmp("kind", CmpOp::Eq, t("supplier"))),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode,
+                keys: TableKeys::Uniform,
             }),
             ..Select::from("party")
         }
@@ -1882,9 +2801,12 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
-        });
+            keys: TableKeys::Uniform,
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -1915,9 +2837,12 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
-        });
+            keys: TableKeys::Uniform,
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -1936,8 +2861,10 @@ mod tests {
         };
         let scope = Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         };
         // DELETE … RETURNING (subquery) — the RETURNING read must be scoped to victim.
         let mut del = Delete {
@@ -1946,7 +2873,7 @@ mod tests {
             scope: None,
             returning: vec![item(sub())],
         };
-        del.force_scope(&scope);
+        del.force_scope(&scope).unwrap();
         let (sql, _) = del.compile(Dialect::Sqlite).unwrap();
         assert!(
             sql.contains("RETURNING (SELECT balance FROM victim WHERE victim.tenant_id = ?"),
@@ -1958,7 +2885,7 @@ mod tests {
             distinct_on: vec![sub()],
             ..Select::from("orders")
         };
-        sel.force_scope(&scope);
+        sel.force_scope(&scope).unwrap();
         // The compiler emits portable `?N` placeholders (the backend rewrites to `$N` on PG).
         let (sql, _) = sel.compile(Dialect::Postgres).unwrap();
         assert!(
@@ -1981,9 +2908,12 @@ mod tests {
         };
         q.force_scope(&Scope {
             column: "tenant_id".into(),
-            value: t("ten_1"),
+            value: Some(t("ten_1")),
+            session: None,
             mode: ScopeMode::Own,
-        });
+            keys: TableKeys::Uniform,
+        })
+        .unwrap();
         let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
         // The subquery's WHERE is scoped to victim.tenant_id; the outer to orders (single table).
         assert_eq!(
@@ -2016,10 +2946,12 @@ mod tests {
         };
         let own = Scope {
             column: "tenant_id".into(),
-            value: t("OWN"),
+            value: Some(t("OWN")),
+            session: None,
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         };
-        ins.force_scope(Some(&own), Some(&own));
+        ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
         // The tenant column is re-appended last, bound to OWN; the source is read-scoped to OWN.
         assert_eq!(
@@ -2052,8 +2984,10 @@ mod tests {
             filter: cmp("id", CmpOp::Eq, t("o_1")),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("OWN"),
+                value: Some(t("OWN")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -2099,10 +3033,12 @@ mod tests {
         };
         let own = Scope {
             column: "tenant_id".into(),
-            value: t("OWN"),
+            value: Some(t("OWN")),
+            session: None,
             mode: ScopeMode::Own,
+            keys: TableKeys::Uniform,
         };
-        ins.force_scope(Some(&own), Some(&own));
+        ins.force_scope(Some(&own), Some(&own)).unwrap();
         let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
         assert_eq!(
             sql,
@@ -2135,8 +3071,10 @@ mod tests {
             conflict: None,
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
             from_select: None,
@@ -2176,8 +3114,10 @@ mod tests {
             ])),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             ..Select::from("order_to_network")
         };
@@ -2368,8 +3308,10 @@ mod tests {
             conflict: None,
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![item(Expr::col("id"))],
             from_select: None,
@@ -2438,8 +3380,10 @@ mod tests {
             filter: cmp("id", CmpOp::Eq, t("c_1")),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -2515,8 +3459,10 @@ mod tests {
             filter: Predicate::And(vec![]),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -2578,8 +3524,10 @@ mod tests {
             filter: Predicate::And(vec![]),
             scope: Some(Scope {
                 column: "tenant_id".into(),
-                value: t("ten_1"),
+                value: Some(t("ten_1")),
+                session: None,
                 mode: ScopeMode::Own,
+                keys: TableKeys::Uniform,
             }),
             returning: vec![],
         };
@@ -3145,5 +4093,630 @@ mod tests {
             q.compile(Dialect::Postgres),
             Err(OrmError::InvalidIdentifier(_))
         ));
+    }
+
+    #[test]
+    fn target_read_conjoins_the_public_subset_and_composes_across_joins() {
+        use std::collections::BTreeMap;
+        // A target read of tenant `B`: products (Tenant→tenant_id) LEFT JOIN reviews
+        // (Tenant→tenant_id). Each ref is confined to `tenant_id = B` AND its OWN public predicate,
+        // qualified per ref — so a target read can never reach B's private rows through any table.
+        let keys = BTreeMap::from([
+            (
+                "products".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+            (
+                "reviews".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+        ]);
+        let public = BTreeMap::from([
+            (
+                "products".to_string(),
+                vec![
+                    PublicTermSql::Cmp {
+                        column: "published".into(),
+                        op: CmpOp::Eq,
+                        value: SqlValue::Boolean(true),
+                    },
+                    PublicTermSql::Null {
+                        column: "deleted_at".into(),
+                        negated: false,
+                    },
+                ],
+            ),
+            (
+                "reviews".to_string(),
+                vec![PublicTermSql::Cmp {
+                    column: "visible".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Boolean(true),
+                }],
+            ),
+        ]);
+        let mut q = Select {
+            table_alias: Some("p".into()),
+            joins: vec![Join {
+                kind: JoinKind::Left,
+                table: "reviews".into(),
+                alias: Some("r".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("p.id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("r.product_id"),
+                },
+            }],
+            ..Select::from("products")
+        };
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: Some(t("B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: keys.clone(),
+                public: public.clone(),
+                write: std::collections::BTreeSet::new(),
+            },
+        })
+        .unwrap();
+        let (sql, _params) = q.compile(Dialect::Sqlite).unwrap();
+        // Base ref `p`: tenant + its public terms, all qualified `p.`.
+        assert!(sql.contains("p.tenant_id = ?"), "base tenant scope: {sql}");
+        assert!(sql.contains("p.published = ?"), "base public term: {sql}");
+        assert!(
+            sql.contains("p.deleted_at IS NULL"),
+            "base public null term: {sql}"
+        );
+        // Joined ref `r`: tenant + ITS OWN public term, qualified `r.` (composition across the join).
+        assert!(
+            sql.contains("r.tenant_id = ?"),
+            "joined tenant scope: {sql}"
+        );
+        assert!(sql.contains("r.visible = ?"), "joined public term: {sql}");
+    }
+
+    #[test]
+    fn target_read_of_a_table_with_no_public_subset_is_refused() {
+        use std::collections::BTreeMap;
+        // Deny-by-default: a target read touching a table that declares NO public subset is refused
+        // (PublicSubsetUndeclared) — the strict analog of an undeclared tenant key, and what keeps a
+        // target read from reaching a private table.
+        let keys = BTreeMap::from([(
+            "secret_table".to_string(),
+            ResolvedScope::Column("tenant_id".to_string()),
+        )]);
+        let deny = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys,
+                public: BTreeMap::new(), // no public subset for secret_table
+                write: std::collections::BTreeSet::new(),
+            },
+        };
+        let mut q = Select::from("secret_table");
+        // The refusal surfaces at force_scope (join/subquery refs) or compile (base ref).
+        let err = q
+            .force_scope(&deny)
+            .err()
+            .or_else(|| q.compile(Dialect::Sqlite).err());
+        assert!(
+            matches!(&err, Some(OrmError::PublicSubsetUndeclared(t)) if t == "secret_table"),
+            "expected PublicSubsetUndeclared, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn own_read_is_unaffected_by_the_public_injection() {
+        // An own read (PerTable, not PerTableTarget) conjoins NO public predicate — byte-identical
+        // to pre-Stage-5. (Regression fence: the target path must not leak into the own path.)
+        use std::collections::BTreeMap;
+        let mut q = Select::from("products");
+        q.force_scope(&Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([(
+                "products".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            )])),
+        })
+        .unwrap();
+        let (sql, _p) = q.compile(Dialect::Sqlite).unwrap();
+        assert!(sql.contains("tenant_id = ?"));
+        assert!(
+            !sql.contains("published") && !sql.contains("IS NULL"),
+            "own read must carry no public confinement: {sql}"
+        );
+    }
+
+    // ---- 5b: target WRITES (INSERT + UPDATE with a SET-allowlist; DELETE refused) --------------
+
+    /// A target-WRITE scope for `products`: tenant key `tenant_id`, public subset `published = true
+    /// AND deleted_at IS NULL`, SET-allowlist = the given columns.
+    fn target_write_scope(write: &[&str]) -> Scope {
+        use std::collections::{BTreeMap, BTreeSet};
+        Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([(
+                    "products".to_string(),
+                    ResolvedScope::Column("tenant_id".to_string()),
+                )]),
+                public: BTreeMap::from([(
+                    "products".to_string(),
+                    vec![
+                        PublicTermSql::Cmp {
+                            column: "published".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        },
+                        PublicTermSql::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                )]),
+                write: write.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            },
+        }
+    }
+
+    fn target_insert(cells: Vec<Assignment>) -> Insert {
+        Insert {
+            table: "products".into(),
+            rows: vec![RowValues { cells }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        }
+    }
+
+    #[test]
+    fn target_insert_forces_tenant_and_public_and_accepts_only_allowlisted_columns() {
+        // The guest sets only the allowlisted `title`; the host force-stamps tenant=B, published=true,
+        // deleted_at=NULL — so the inserted row lands squarely in B's public subset.
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("Hello")),
+        }]);
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert!(sql.contains("tenant_id"), "{sql}");
+        assert!(sql.contains("published"), "{sql}");
+        assert!(sql.contains("deleted_at"), "{sql}");
+        assert!(
+            params.contains(&t("tenant_B")),
+            "tenant forced to B: {params:?}"
+        );
+        assert!(
+            params.contains(&SqlValue::Boolean(true)),
+            "published forced true: {params:?}"
+        );
+        assert!(
+            params.contains(&SqlValue::Null),
+            "deleted_at forced NULL: {params:?}"
+        );
+        assert!(params.contains(&t("Hello")), "guest title kept: {params:?}");
+    }
+
+    #[test]
+    fn target_insert_refuses_a_non_allowlisted_column() {
+        // `price` is not in the SET-allowlist ⇒ refused (a target write may set only granted columns).
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![
+            Assignment {
+                column: "title".into(),
+                value: Expr::val(t("x")),
+            },
+            Assignment {
+                column: "price".into(),
+                value: Expr::val(SqlValue::Integer(9)),
+            },
+        ]);
+        let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+        assert!(
+            matches!(err, OrmError::TargetWriteColumnDenied(ref c) if c == "price"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn target_insert_refuses_setting_the_tenant_or_visibility_column() {
+        // Even if the guest tries to set tenant_id or published directly, it's denied (they're never
+        // in the allowlist; and `assert_target_settable` refuses them structurally regardless).
+        for bad in ["tenant_id", "published", "deleted_at"] {
+            let scope = target_write_scope(&["title", bad]); // even if wrongly granted...
+            let mut ins = target_insert(vec![Assignment {
+                column: bad.into(),
+                value: Expr::val(t("x")),
+            }]);
+            let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+            assert!(
+                matches!(err, OrmError::TargetWriteColumnDenied(ref c) if c == bad),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_insert_with_no_write_grant_is_refused() {
+        let scope = target_write_scope(&[]); // read-only
+        let mut ins = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("x")),
+        }]);
+        let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+        assert!(
+            matches!(err, OrmError::TargetWriteNotGranted(ref t) if t == "products"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn target_insert_select_and_upsert_are_refused() {
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("x")),
+        }]);
+        ins.from_select = Some((vec!["title".into()], Box::new(Select::from("products"))));
+        assert!(matches!(
+            ins.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteUnsupported("INSERT … SELECT")
+        ));
+        let mut ins2 = target_insert(vec![Assignment {
+            column: "title".into(),
+            value: Expr::val(t("x")),
+        }]);
+        ins2.conflict = Some(OnConflict {
+            conflict_columns: vec![],
+            update: vec![],
+        });
+        assert!(matches!(
+            ins2.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteUnsupported("ON CONFLICT upsert")
+        ));
+    }
+
+    #[test]
+    fn target_update_confines_to_the_public_subset_and_enforces_the_allowlist() {
+        let scope = target_write_scope(&["title"]);
+        let mut upd = Update {
+            table: "products".into(),
+            set: vec![Assignment {
+                column: "title".into(),
+                value: Expr::val(t("new")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("p1")),
+            scope: None,
+            returning: vec![],
+        };
+        upd.force_scope(&scope).unwrap();
+        let (sql, params) = upd.compile(Dialect::Sqlite).unwrap();
+        // WHERE = tenant = B AND (public terms) AND (guest filter).
+        assert!(sql.contains("tenant_id = ?"), "tenant confinement: {sql}");
+        assert!(sql.contains("published = ?"), "public confinement: {sql}");
+        assert!(
+            sql.contains("deleted_at IS NULL"),
+            "public null confinement: {sql}"
+        );
+        assert!(sql.contains("SET title = ?"), "{sql}");
+        assert!(params.contains(&t("tenant_B")), "{params:?}");
+    }
+
+    #[test]
+    fn target_update_refuses_a_non_allowlisted_or_visibility_set() {
+        for bad in ["price", "published", "tenant_id"] {
+            let scope = target_write_scope(&["title"]);
+            let mut upd = Update {
+                table: "products".into(),
+                set: vec![Assignment {
+                    column: bad.into(),
+                    value: Expr::val(t("x")),
+                }],
+                filter: cmp("id", CmpOp::Eq, t("p1")),
+                scope: None,
+                returning: vec![],
+            };
+            assert!(
+                matches!(upd.force_scope(&scope).unwrap_err(), OrmError::TargetWriteColumnDenied(ref c) if c == bad),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_write_refuses_a_qualified_column() {
+        // A dotted write-target column (`published.x`) must be refused at compile — never rendered
+        // (it would sneak past the last-segment `same_col` visibility check and emit invalid SQL).
+        let scope = target_write_scope(&["title"]);
+        let mut ins = target_insert(vec![Assignment {
+            column: "published.x".into(),
+            value: Expr::val(t("x")),
+        }]);
+        assert!(matches!(
+            ins.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(ref c) if c == "published.x"
+        ));
+        let mut upd = Update {
+            table: "products".into(),
+            set: vec![Assignment {
+                column: "title.y".into(),
+                value: Expr::val(t("x")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("p1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            upd.force_scope(&scope).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(ref c) if c == "title.y"
+        ));
+    }
+
+    #[test]
+    fn target_delete_is_always_refused() {
+        let scope = target_write_scope(&["title"]);
+        let mut del = Delete {
+            table: "products".into(),
+            filter: cmp("id", CmpOp::Eq, t("p1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(matches!(
+            del.force_scope(&scope).unwrap_err(),
+            OrmError::TargetDeleteRefused(t) if t == "products"
+        ));
+    }
+
+    #[test]
+    fn target_promote_is_refused() {
+        let scope = target_write_scope(&["title"]);
+        assert!(matches!(
+            compile_promote(&scope, "products", Dialect::Sqlite).unwrap_err(),
+            OrmError::TargetWriteUnsupported("promote")
+        ));
+    }
+
+    // ---- 5d: attach_reference (derived-tenant write) ------------------------------------------
+
+    fn attach_spec() -> AttachReference {
+        AttachReference {
+            child: "favorites".into(),
+            parent: "products".into(),
+            ref_column: "id".into(),
+            ref_value: t("prod_1"),
+            set: vec![Assignment {
+                column: "note".into(),
+                value: Expr::val(t("nice")),
+            }],
+        }
+    }
+
+    #[test]
+    fn attach_reference_own_derives_tenant_from_the_scoped_parent() {
+        use std::collections::BTreeMap;
+        // An OWN scope over `favorites` (child) + `products` (parent), both keyed on tenant_id.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "favorites".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+                (
+                    "products".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+            ])),
+        };
+        let (sql, params) =
+            compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
+        // The child tenant is projected from the parent; the source is confined to the caller's own
+        // tenant (so the derived tenant is bounded; an unreachable product selects nothing).
+        assert_eq!(
+            sql,
+            "INSERT INTO favorites (note, tenant_id) SELECT ?1, tenant_id FROM products \
+             WHERE tenant_id = ?2 AND id = ?3"
+        );
+        assert_eq!(params, vec![t("nice"), t("A"), t("prod_1")]);
+    }
+
+    #[test]
+    fn attach_reference_target_confines_parent_to_b_public_and_forces_child_public() {
+        // A TARGET write scope: parent `products` confined to B + public; child `favorites` gets its
+        // tenant from the parent (=B) + its own public columns force-stamped; `note` is allowlisted.
+        use std::collections::{BTreeMap, BTreeSet};
+        let public_terms = vec![PublicTermSql::Cmp {
+            column: "visible".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Boolean(true),
+        }];
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([
+                    (
+                        "favorites".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                    (
+                        "products".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                ]),
+                public: BTreeMap::from([
+                    ("favorites".to_string(), public_terms.clone()),
+                    (
+                        "products".to_string(),
+                        vec![PublicTermSql::Cmp {
+                            column: "published".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        }],
+                    ),
+                ]),
+                write: BTreeSet::from(["note".to_string()]),
+            },
+        };
+        let (sql, params) =
+            compile_attach_reference(&scope, &attach_spec(), Dialect::Sqlite).unwrap();
+        // Child gets note + tenant(from parent) + forced visible=true; the source (products) is
+        // confined to tenant=B AND published=true (the base-table predicate is unqualified).
+        assert!(
+            sql.contains("INSERT INTO favorites (note, tenant_id, visible)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("SELECT ?1, tenant_id, ?2 FROM products"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("published = ?") && sql.contains("tenant_id = ?"),
+            "parent confined: {sql}"
+        );
+        assert!(sql.contains("AND id = ?"), "ref selector present: {sql}");
+        assert!(
+            params.contains(&t("tenant_B")),
+            "parent confined to B: {params:?}"
+        );
+        assert!(
+            params.contains(&SqlValue::Boolean(true)),
+            "child visible forced + parent published: {params:?}"
+        );
+    }
+
+    #[test]
+    fn attach_reference_target_refuses_a_non_allowlisted_or_visibility_set() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([
+                    (
+                        "favorites".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                    (
+                        "products".to_string(),
+                        ResolvedScope::Column("tenant_id".into()),
+                    ),
+                ]),
+                public: BTreeMap::from([
+                    (
+                        "favorites".to_string(),
+                        vec![PublicTermSql::Cmp {
+                            column: "visible".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        }],
+                    ),
+                    (
+                        "products".to_string(),
+                        vec![PublicTermSql::Cmp {
+                            column: "published".into(),
+                            op: CmpOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        }],
+                    ),
+                ]),
+                write: BTreeSet::from(["note".to_string()]),
+            },
+        };
+        // `price` isn't allowlisted; `visible` is a visibility column — both refused.
+        for bad in ["price", "visible", "tenant_id"] {
+            let spec = AttachReference {
+                set: vec![Assignment {
+                    column: bad.into(),
+                    value: Expr::val(t("x")),
+                }],
+                ..attach_spec()
+            };
+            assert!(
+                matches!(
+                    compile_attach_reference(&scope, &spec, Dialect::Sqlite).unwrap_err(),
+                    OrmError::TargetWriteColumnDenied(ref c) if c == bad
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_reference_own_refuses_the_guest_naming_the_tenant_column() {
+        use std::collections::BTreeMap;
+        // Even under OWN (no write-allowlist gating), the guest may not name the child's tenant
+        // column in `set` — the host derives it from the parent; a guest value would collide/forge.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "favorites".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+                (
+                    "products".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+            ])),
+        };
+        let spec = AttachReference {
+            set: vec![Assignment {
+                column: "tenant_id".into(),
+                value: Expr::val(t("VICTIM")),
+            }],
+            ..attach_spec()
+        };
+        assert!(matches!(
+            compile_attach_reference(&scope, &spec, Dialect::Sqlite).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(ref c) if c == "tenant_id"
+        ));
+    }
+
+    #[test]
+    fn attach_reference_refuses_a_non_column_table() {
+        use std::collections::BTreeMap;
+        // `countries` is Unscoped ⇒ not a plain tenant table ⇒ refused as a child/parent.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "favorites".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+                ("countries".to_string(), ResolvedScope::Unscoped),
+            ])),
+        };
+        let spec = AttachReference {
+            parent: "countries".into(),
+            ..attach_spec()
+        };
+        assert!(compile_attach_reference(&scope, &spec, Dialect::Sqlite).is_err());
     }
 }

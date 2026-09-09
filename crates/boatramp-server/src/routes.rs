@@ -183,6 +183,18 @@ pub fn router_with_fast(
                 .layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
         )
         .route("/api/secrets/{name}", axum::routing::delete(delete_secret))
+        // The project's tenancy schema (rewritten from `/api/projects/<proj>/tenancy`).
+        // The per-table tenant-key map the scope injector consults; read with
+        // `Project·Read`, replace/clear with `Project·Admin` (see `authz::Right::required`
+        // — mutation is gated above the general project mapping so a publisher can't
+        // redraw the isolation boundary). A small JSON singleton, so the ambient body
+        // limit is fine.
+        .route(
+            "/api/tenancy",
+            get(get_project_tenancy)
+                .put(put_project_tenancy)
+                .delete(delete_project_tenancy),
+        )
         // Project-scoped SMTP email profiles (rewritten from
         // `/api/projects/<proj>/email/profiles{,/{name}}`). The `PUT` body is a small
         // profile config; bound it like the secrets route. Same `Resource::Secrets`

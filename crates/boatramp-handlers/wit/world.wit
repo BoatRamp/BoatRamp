@@ -284,6 +284,18 @@ interface orm {
     scope: option<scope>,
     returning: list<select-item>,
   }
+  /// attach-reference (5d): insert a row into `child` whose tenant is DERIVED from a `parent` row
+  /// reachable under the caller's confined scope. `set` are the child's non-tenant columns; the
+  /// tenant is projected from the scoped parent (the guest never names it). `ref-value` is a
+  /// row-selector INSIDE the caller's scope (`parent.<ref-column> = ref-value`), an expr index.
+  record attach-reference-query {
+    exprs: list<expr-node>,       // the `set` values + the `ref-value`
+    child: string,
+    parent: string,
+    ref-column: string,
+    ref-value: u32,               // expr index of the ref selector value
+    set: list<assignment>,
+  }
 
   /// A handle to one of the site's named databases (same model as `sql-query`).
   resource database {
@@ -295,6 +307,24 @@ interface orm {
     delete: func(q: delete-query) -> result<u64, error>;
     /// Run a DELETE and return its RETURNING rows (the `returning` list must be non-empty).
     delete-returning: func(q: delete-query) -> result<query-result, error>;
+    /// promote (R3, PLAN-tenancy-principal D7): a returning visitor, now authenticated, CLAIMS
+    /// their anonymous-session rows in `table` for their tenant. Host-mediated + deny-by-default:
+    /// the host builds `UPDATE <table> SET <tenant-key> = <own> WHERE <session-key> = <session>
+    /// AND <tenant-key> IS NULL` from the request's OWN resolved tenant + session facts (the guest
+    /// names neither and cannot widen past its own not-yet-owned session rows). Requires `table` be
+    /// a TenantOrSession table and BOTH facts present, else refused. Returns the rows claimed
+    /// (idempotent: a second call claims 0). Append-only ABI addition — a pinned older guest that
+    /// does not import it is unaffected.
+    promote: func(table: string) -> result<u64, error>;
+    /// attach-reference (R4/D8 5d): a host-mediated DERIVED-tenant write. Inserts a row into `child`
+    /// stamping its tenant from a `parent` row reachable under the caller's current confined scope
+    /// (`INSERT … SELECT parent.<tenant> … WHERE parent.<ref> = ? AND <caller scope>`), so the
+    /// stamped tenant is bounded by the caller's own reach (adds no authority) and an unreachable
+    /// parent is a fail-closed no-op (0 rows). Under a target scope the child's public-visibility
+    /// columns are force-stamped and the `set` columns are gated by the write-allowlist; a read-only
+    /// route (e.g. a `handle` source) has no write axis and is refused (G1). Append-only ABI
+    /// addition — a pinned older guest that does not import it is unaffected.
+    attach-reference: func(q: attach-reference-query) -> result<u64, error>;
   }
 
   open: func(name: string) -> result<database, error>;

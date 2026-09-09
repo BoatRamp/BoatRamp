@@ -196,6 +196,13 @@ pub(super) async fn dispatch_handler(
                                 .or_else(|| s.strip_prefix("bearer "))
                         })
                         .map(str::to_string);
+                    // The routed domain's context tag (R4/D8): the target-tenant `B` for a
+                    // carried-domain target read (a same-origin funnel served on B's host). Stashed
+                    // in the request extensions at host routing — never guest input.
+                    let domain_context = parts
+                        .extensions
+                        .get::<crate::DomainContext>()
+                        .map(|c| c.0.clone());
                     // GraphQL subscription: serve it as a graphql-sse event stream,
                     // deriving the messaging topic from the subscription's root field. A
                     // producer (a mutation, a function) publishes each execution result to
@@ -227,6 +234,7 @@ pub(super) async fn dispatch_handler(
                             query,
                             &variables,
                             bearer.as_deref(),
+                            domain_context.as_deref(),
                         )
                         .await;
                     }
@@ -254,13 +262,30 @@ pub(super) async fn dispatch_handler(
     // Edge response cache: on a cacheable request a fresh hit short-circuits the
     // whole handler path — no blob read, no bindings, no instantiation. The write
     // context is captured here because `serve_with_limits` below consumes `request`.
+    // R3 (PLAN-tenancy-principal): resolve — or, on a first anonymous request to an R3 project,
+    // mint — the host-signed session cookie. `session_cookie` feeds the `Session` scope-fact; a
+    // freshly-minted `set_session_cookie` is added to the response (`Set-Cookie`) below. Resolved
+    // **before** the edge cache so a session-scoped response is never shared-cached (see below).
+    let (session_cookie, set_session_cookie) = resolve_or_mint_session(
+        request.headers(),
+        inner,
+        boatramp_core::project::ProjectRef::new(project),
+    )
+    .await;
+    // The edge cache is keyed on the project/site + path, NOT the session id, so it MUST NOT serve
+    // or store a response computed under a per-visitor `Session` fact — that would leak one anon
+    // visitor's `tenant IS NULL` rows to another. When a session fact is in play, bypass the cache
+    // entirely (both read and write); non-R3 traffic caches as before.
     let cache_cfg = handler_cache::config_for(site_handlers);
-    let cache_key = cache_cfg.as_ref().and_then(|cfg| {
-        handler_cache::request_lookupable(cfg, request.method()).then(|| {
-            let path_and_query = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
-            handler_cache::cache_key(&scope, request.method(), path_and_query)
-        })
-    });
+    let cache_key = cache_cfg
+        .as_ref()
+        .filter(|_| session_cookie.is_none())
+        .and_then(|cfg| {
+            handler_cache::request_lookupable(cfg, request.method()).then(|| {
+                let path_and_query = request.uri().path_and_query().map_or("/", |pq| pq.as_str());
+                handler_cache::cache_key(&scope, request.method(), path_and_query)
+            })
+        });
     if let Some(key) = &cache_key {
         if let Some(hit) = handler_cache::lookup_response(
             inner.kv.as_ref(),
@@ -315,6 +340,14 @@ pub(super) async fn dispatch_handler(
         .extensions()
         .get::<crate::DomainContext>()
         .map(|c| c.0.clone());
+    // R4/D8 5c: a `Tenancy::Target` route with a `handle` source resolves the target tenant from a
+    // guest-named PUBLIC slug carried in the `?handle=` query parameter (owned, so we hold no borrow
+    // of `request` across the bind). Non-target routes ignore it.
+    let target_handle = request
+        .uri()
+        .query()
+        .and_then(|q| query_value(q, "handle"))
+        .map(str::to_string);
     let bindings = match build_bindings(
         inner,
         boatramp_core::project::ProjectRef::new(project),
@@ -331,6 +364,8 @@ pub(super) async fn dispatch_handler(
         request_id.as_deref(),
         bearer.as_deref(),
         domain_context.as_deref(),
+        session_cookie.as_deref(),
+        target_handle.as_deref(),
     )
     .await
     {
@@ -393,7 +428,7 @@ pub(super) async fn dispatch_handler(
         metrics::Outcome::from_result(&result),
         start.elapsed(),
     );
-    match result {
+    let mut response = match result {
         Ok(response) => {
             let (parts, body) = response.into_parts();
             let response = axum::http::Response::from_parts(parts, axum::body::Body::new(body));
@@ -420,7 +455,17 @@ pub(super) async fn dispatch_handler(
             tracing::warn!(site, route = %handler.route, %err, "handler invocation failed");
             handler_error_response(&err)
         }
+    };
+    // Issue a freshly-minted R3 session cookie (added last so it lands on the guest's own response;
+    // never cached — it is a per-visitor identity). Only present on a first anonymous request.
+    if let Some(set_cookie) = set_session_cookie {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&set_cookie) {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
     }
+    response
 }
 
 /// The federation gateway: load the project's composed supergraph, plan `query` against
@@ -433,6 +478,7 @@ async fn federation_gateway(
     query: &str,
     variables: &serde_json::Value,
     bearer: Option<&str>,
+    domain_context: Option<&str>,
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
@@ -475,15 +521,49 @@ async fn federation_gateway(
     // data connector, a function subgraph via the invoke path. This is where a GraphQL→SQL
     // subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
     let sql_subgraphs = (*cached.sql_subgraphs).clone();
-    let runner = crate::graphql_gateway::BackendRouter::new(
+    let mut runner = crate::graphql_gateway::BackendRouter::new(
         // A federated sub-fetch to a sibling doesn't propagate an in-site tenant (the GDC's own
         // row policy governs data access); a scoped sibling fail-closes for an `own` op.
-        invoker.scoped(boatramp_core::project::ProjectRef::new(project), None),
+        invoker.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()),
         project.to_string(),
         inner.sql.clone(),
         sql_subgraphs,
         bearer.map(str::to_string),
     );
+    // R4/D8: when the plan has any `target`-class fetch, (1) enforce the operator ceiling — every
+    // target root field this query uses must be listed in the project's `target_eligible_fields`,
+    // else refuse (the app's SDL alone can never make a field cross to another tenant) — and (2)
+    // bind the request's confinement so those fetches read only B's public subset. For 5a, `B` is
+    // the terminating domain's context tag (a same-origin funnel on B's host) — never guest input;
+    // the full `via` source model (handle/capability) lands in 5c. The schema is loaded FRESH here
+    // (not the cached supergraph), so removing a field's eligibility takes effect immediately. No
+    // domain, or no project schema, ⇒ no target scope ⇒ every target fetch fails closed.
+    if plan.fetches.iter().any(|f| f.class.is_target()) {
+        let schema = boatramp_core::deploy::load_project_tenancy(
+            inner.kv.as_ref(),
+            boatramp_core::project::ProjectRef::new(project),
+        )
+        .await
+        .ok()
+        .flatten();
+        for field in crate::graphql_gateway::target_root_fields(query, &cached.supergraph) {
+            let eligible = schema
+                .as_ref()
+                .is_some_and(|s| s.target_field_eligible(&field));
+            if !eligible {
+                return graphql_guard::error_response(&format!(
+                    "field `{field}` is not an operator-permitted target-tenant field \
+                     (add it to the project's target_eligible_fields)"
+                ));
+            }
+        }
+        if let (Some(schema), Some(b)) = (schema, domain_context.filter(|c| !c.is_empty())) {
+            runner = runner.with_target(Some(crate::graphql_gateway::build_target_scope(
+                &schema,
+                boatramp_core::sql::SqlValue::Text(b.to_string()),
+            )));
+        }
+    }
     axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
 }
 
@@ -562,7 +642,7 @@ async fn data_connector_serve(
         let invoker = inner
             .invoker
             .get()
-            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project), None));
+            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()));
         crate::graphql_data::runner::execute(
             backend.as_ref(),
             &dialect,
@@ -574,6 +654,9 @@ async fn data_connector_serve(
             invoker.as_deref(),
             bearer,
             0, // an external data-connector request is the root of the call chain
+            // A direct (non-federated) data-connector endpoint is an OWN read; the target axis is a
+            // federation-`@tenant` concern resolved in the gateway.
+            None,
         )
         .await
     };
@@ -611,6 +694,15 @@ pub(super) fn set_forwarded_headers(request: &mut Request, client_ip: IpAddr) {
 /// path}{?query}` so the handler sees its own path (not the `/_sites/<site>/…`
 /// or host-routed form) and `wasi:http` gets a well-formed request.
 #[cfg(feature = "handlers")]
+/// Extract a raw query-parameter value from a `key=value&…` query string (no URL-decoding — a slug
+/// is simple; a value carrying escapes simply won't match the registry and fails closed).
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
 fn rewrite_request_uri(request: &mut Request, request_path: &str) {
     let authority = request
         .headers()
@@ -809,6 +901,76 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+/// The host-issued anonymous session cookie name (R3, PLAN-tenancy-principal).
+const SESSION_COOKIE_NAME: &str = "br_session";
+/// The anon-session cookie lifetime (a **long** returning-visitor identity — a privacy/consent
+/// ceiling, not a security one, since the disjoint `session_id` column confines it to `tenant IS
+/// NULL` rows). 30 days.
+const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// A random 16-byte session id (hex, OS CSPRNG) — unguessable so the anonymous partition can't be
+/// enumerated (the cookie is a bearer for its own `tenant IS NULL` rows). **Fail-closed**: an RNG
+/// failure returns `None` (no cookie minted) rather than a predictable/all-zero sid that would
+/// collide two visitors' partitions — mirroring the token layer's `random_cti`.
+fn new_session_sid() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        tracing::error!("getrandom failed generating a session id — not minting a session cookie");
+        return None;
+    }
+    Some(hex::encode(bytes))
+}
+
+/// Resolve (or mint) the R3 anonymous session cookie for a request: `.0` is the cookie value to feed
+/// the tenancy resolver (the `Session` fact), `.1` is a `Set-Cookie` header value to add to the
+/// response when a fresh cookie was minted. Returns `(None, None)` — issuing NO cookie — unless the
+/// project declares an R3 `session_key` AND the node wired a session signer (fail-safe: no signer /
+/// no R3 ⇒ no anon session axis). A valid incoming cookie is reused (no re-issue); an
+/// absent/invalid/expired one is replaced with a fresh CSPRNG cookie. `HttpOnly; Secure;
+/// SameSite=Lax`.
+#[cfg(feature = "handlers")]
+async fn resolve_or_mint_session(
+    headers: &HeaderMap,
+    inner: &HandlerRuntimeInner,
+    project: boatramp_core::project::ProjectRef<'_>,
+) -> (Option<String>, Option<String>) {
+    let Some(signer) = inner.session_signer.get() else {
+        return (None, None); // the node issues no session cookies
+    };
+    // Only for projects that adopted R3 (declared a session_key) — a small KV read.
+    let uses_r3 = matches!(
+        boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await,
+        Ok(Some(schema)) if schema.session_key.is_some()
+    );
+    if !uses_r3 {
+        return (None, None);
+    }
+    let anchor = signer.public_key();
+    let now = boatramp_core::time::now_unix();
+    // Reuse a still-valid incoming cookie (its own per-fact lifetime); else mint fresh.
+    if let Some(cookie) = cookie_value(headers, SESSION_COOKIE_NAME) {
+        if boatramp_core::cose::verify_session(&cookie, &anchor, now).is_ok() {
+            return (Some(cookie), None);
+        }
+    }
+    let Some(sid) = new_session_sid() else {
+        return (None, None); // fail-closed on an RNG failure — no cookie rather than a weak one
+    };
+    match boatramp_core::cose::mint_session(&sid, SESSION_TTL_SECS, now, signer.as_ref()).await {
+        Ok(cookie) => {
+            let set = format!(
+                "{SESSION_COOKIE_NAME}={cookie}; Path=/; Max-Age={SESSION_TTL_SECS}; \
+                 HttpOnly; Secure; SameSite=Lax"
+            );
+            (Some(cookie), Some(set))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "minting an anonymous session cookie failed");
+            (None, None)
+        }
+    }
+}
+
 /// The origin (`scheme://host[:port]`) of a `Referer` URL, if parseable (the CSRF fallback when
 /// no `Origin` header is present).
 fn referer_origin(referer: &str) -> Option<String> {
@@ -927,6 +1089,13 @@ pub(super) async fn build_bindings(
     // context tag for a domain source). Background triggers pass `None` for both.
     bearer: Option<&str>,
     domain_context: Option<&str>,
+    // R3 session-cookie value from the request (already verified/minted by the caller); the verify
+    // anchor is the runtime's own session signer. `None` ⇒ no session fact on this invocation.
+    session_cookie: Option<&str>,
+    // R4/D8 5c: the PUBLIC handle/slug the request named (from the `?handle=` query param on a
+    // `Tenancy::Target` route with a `handle` source), used to resolve `B` against the operator's
+    // handle registry — read-only, world-public only. `None` ⇒ no handle named.
+    target_handle: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -983,22 +1152,129 @@ pub(super) async fn build_bindings(
             .as_ref()
             .and_then(|g| g.data.as_ref())
             .and_then(|d| d.claims_from_token.as_ref());
-        let inputs = crate::tenant_resolve::TenantSourceInputs {
-            bearer,
-            domain_context,
-            token_cfg,
+        // The R3 session-cookie verify anchor is the runtime's own session signer's public half
+        // (set at startup from the node issuer). Absent ⇒ no session fact.
+        let session_anchor = inner.session_signer.get().map(|s| s.public_key());
+        // The project per-table tenancy schema (R2/D2), loaded from the KV — needed by BOTH the own
+        // path (`with_schema`) and a target route (per-table keys + public subsets + eligibility).
+        // Absent ⇒ the legacy single-column `Uniform` scoping; present-but-unreadable ⇒ **fail
+        // closed** with a deny-all schema (every table refused), never a silent downgrade.
+        let schema =
+            match boatramp_core::deploy::load_project_tenancy(inner.kv.as_ref(), project).await {
+                Ok(s) => s,
+                Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
+            };
+        let tenancy: Option<boatramp_handlers::HostTenancy> = match site_handlers.tenancy.as_ref() {
+            // R4/D8 plain-wasm TARGET route: bind a target scope for a SECOND tenant `B`'s public
+            // subset (the non-federated analog of a `@tenant(scope: target)` field). `B` is
+            // host-derived from the routed domain (5a's carried-domain source); the guest never
+            // names it. Confinement rides on BOTH the `orm` binding (PerTableTarget) and the raw-SQL
+            // `{scope}` marker. Fail-closed on every gap (not eligible / no domain / no schema).
+            Some(boatramp_core::tenancy::Tenancy::Target { via, public, write }) => {
+                // Operator ceiling: the site must be listed in target_eligible_fields.
+                if !schema
+                    .as_ref()
+                    .is_some_and(|s| s.target_field_eligible(site))
+                {
+                    return Err(format!(
+                        "tenancy: site `{site}` is not an operator-permitted target-tenant route \
+                         (add it to the project's target_eligible_fields)"
+                    ));
+                }
+                // The named `public` subset MUST be declared (deny-by-default). Without this the
+                // raw-SQL marker would degrade OPEN — `tenant = B` with no visibility restriction,
+                // exposing B's private rows — so a missing/typo'd subset name is refused at bind,
+                // never bound. (The orm path is already deny-by-default per table.)
+                if schema
+                    .as_ref()
+                    .and_then(|s| s.public_subset(public))
+                    .is_none()
+                {
+                    return Err(format!(
+                        "tenancy: target route `{site}` names public subset `{public}` which the \
+                         project schema does not declare (deny-by-default)"
+                    ));
+                }
+                // G3 (schema-admission fact): the `handle` source is admissible ONLY on a
+                // `world_public` subset — regardless of the via list. A route that lists `handle` on
+                // a non-world-public subset is a misconfiguration that could expose non-public data,
+                // so refuse it at bind rather than silently letting handle be inert.
+                if via.contains(&boatramp_core::tenancy::TargetSource::Handle)
+                    && !schema
+                        .as_ref()
+                        .is_some_and(|s| s.subset_is_world_public(public))
+                {
+                    return Err(format!(
+                        "tenancy: target route `{site}` lists the `handle` source but its public \
+                         subset `{public}` is not `world_public` (deny-by-default; a public handle \
+                         may only reach world-public data)"
+                    ));
+                }
+                // R4/D8 5c: resolve `B` from the first applicable `via` source (first-resolves-wins).
+                // `domain` = the host-stamped routed-domain context tag; `capability` = the request
+                // bearer verified as a signed capability envelope bound to THIS project + this route's
+                // `public` subset (both honor the route's `write` grant); `handle` = a guest-named
+                // public slug resolved against the operator's registry, read-only + world-public only.
+                let resolved = schema.as_ref().and_then(|sc| {
+                    crate::tenant_resolve::resolve_target_via(
+                        via,
+                        public,
+                        write,
+                        sc,
+                        domain_context,
+                        // Under a target route the bearer is a capability candidate (an app bearer
+                        // simply fails the capability kind/audience check → no capability fact).
+                        bearer,
+                        session_anchor.as_ref(),
+                        target_handle,
+                        project.as_str(),
+                        boatramp_core::time::now_unix(),
+                    )
+                });
+                match (resolved, schema.as_ref()) {
+                    (Some(rt), Some(sc)) => Some(boatramp_handlers::HostTenancy::target(
+                        boatramp_core::sql::SqlValue::Text(rt.value),
+                        boatramp_core::tenancy::AccessMode::Own,
+                        sc,
+                        public,
+                        // The effective write-allowlist: the route's grant for domain/capability,
+                        // forced empty (read-only, G1) for a handle source. Raw-SQL writes refused.
+                        &rt.write,
+                    )),
+                    // No `via` source resolved ⇒ refuse (a target route must never fall back to an
+                    // own/plain — that would read the caller's own or every tenant's rows).
+                    _ => {
+                        return Err(
+                            "tenancy: this target route could not resolve a target tenant \
+                                    (no routed domain, no valid capability, and no resolvable handle)"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            // Own / session / disabled: today's path.
+            other => {
+                let inputs = crate::tenant_resolve::TenantSourceInputs {
+                    bearer,
+                    domain_context,
+                    token_cfg,
+                    session_cookie,
+                    session_anchor: session_anchor.as_ref(),
+                    // The serving path is the synchronous request lane, not the durable async lane,
+                    // so it never carries a signed-context envelope (that source resolves on a drain).
+                    signed_context: None,
+                    context_anchor: None,
+                };
+                crate::tenant_resolve::resolve_host_tenancy(other, imports_db, posture, inputs)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map(|h| h.with_schema(schema.as_ref()))
+            }
         };
-        let tenancy = crate::tenant_resolve::resolve_host_tenancy(
-            site_handlers.tenancy.as_ref(),
-            imports_db,
-            posture,
-            inputs,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
         bindings = bindings.with_tenancy(tenancy.clone());
-        // Carry the resolved tenant value so a sibling this handler invokes inherits it.
-        tenancy.and_then(|h| h.value().cloned())
+        // Carry the resolved principal (axis-tagged facts) so a sibling this handler invokes
+        // inherits it (each fact keeps its axis).
+        tenancy.map(|h| h.facts().to_vec()).unwrap_or_default()
     };
     if granted("wasi:messaging") {
         // Plain topics are namespaced under the binding `scope` (the site, or the
@@ -1006,10 +1282,16 @@ pub(super) async fn build_bindings(
         // previews can't touch live topics; `bus:<topic>` publishes route to the
         // shared, project-scoped bus.
         if let Some(messaging) = &inner.messaging {
+            // Stamp this handler's resolved own-tenant onto every message it publishes (R1,
+            // guest-blind), so a consumer declaring `sources: [signed_context]` resolves it on the
+            // async lane. `None` for an unscoped handler ⇒ the message carries no context.
+            let signed_context =
+                super::function_runtime::mint_producer_context(inner, &handler_caller_tenant).await;
             bindings = bindings.with_messaging(
                 format!("{scope}/"),
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
+                signed_context,
             );
         }
     }

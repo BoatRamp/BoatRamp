@@ -473,6 +473,60 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Fetch the project's tenancy schema (the per-table tenant-key map). A project
+    /// that declared none returns the default schema (`tenant_id`, no tables).
+    pub async fn get_project_tenancy(&self) -> Result<boatramp_core::tenancy::TenancySchema> {
+        let seg = project_seg(&self.project, "tenancy");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        Ok(client
+            .get(format!("{server}/api/{seg}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Replace the project's tenancy schema (`Project·Admin`).
+    pub async fn put_project_tenancy(
+        &self,
+        schema: &boatramp_core::tenancy::TenancySchema,
+    ) -> Result<()> {
+        let seg = project_seg(&self.project, "tenancy");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        client
+            .put(format!("{server}/api/{seg}"))
+            .json(schema)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Clear the project's tenancy schema (revert to legacy `Uniform` scoping).
+    pub async fn clear_project_tenancy(&self) -> Result<()> {
+        let seg = project_seg(&self.project, "tenancy");
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        client
+            .delete(format!("{server}/api/{seg}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Start (or fetch the existing) ownership challenge for a host.
     pub async fn start_domain_verification(
         &self,

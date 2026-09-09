@@ -42,10 +42,11 @@ pub(crate) use admin_api::auth_exchange;
 pub(crate) use admin_api::{
     activate_deployment, cert_status, compute_dns, compute_dns_resolve, compute_exec, compute_ipam,
     compute_netdiag, compute_reconcile, compute_restart, compute_set_health, compute_status,
-    create_deployment, current_deployment, delete_compute, delete_compute_volume, delete_site,
-    get_compute, get_daemon_config, get_deployment, get_site_config, invalidate_cache,
-    list_aliases, list_compute, list_compute_volumes, list_deployments, list_sites, prune_delete,
-    prune_report, put_blob, put_compute, put_daemon_config, put_site_config, remove_alias,
+    create_deployment, current_deployment, delete_compute, delete_compute_volume,
+    delete_project_tenancy, delete_site, get_compute, get_daemon_config, get_deployment,
+    get_project_tenancy, get_site_config, invalidate_cache, list_aliases, list_compute,
+    list_compute_volumes, list_deployments, list_sites, prune_delete, prune_report, put_blob,
+    put_compute, put_daemon_config, put_project_tenancy, put_site_config, remove_alias,
     rollback_daemon_config, scrub_blobs, set_alias, sql_exec, sql_ping, sql_query,
 };
 #[cfg(feature = "handlers")]
@@ -408,6 +409,11 @@ struct HandlerRuntimeInner {
     /// knobs.)
     #[cfg(feature = "session")]
     session_store: std::sync::OnceLock<session_store::SessionStore>,
+    /// The fleet [`Signer`] used to **mint + verify** anonymous session cookies (R3,
+    /// PLAN-tenancy-principal — the `ScopeAxis::Session` fact). Set once at startup from the node's
+    /// `issuer` (its public half is the verify anchor). **Unset ⇒ no session cookies are issued or
+    /// verified** (the R3 disjunct then has only the tenant arm — fail-safe: no anon session axis).
+    session_signer: std::sync::OnceLock<Arc<dyn Signer>>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -474,6 +480,7 @@ impl HandlerRuntime {
                 admin_surfaces: std::sync::OnceLock::new(),
                 #[cfg(feature = "session")]
                 session_store: std::sync::OnceLock::new(),
+                session_signer: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -612,6 +619,18 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.require_tenancy_declaration.set(require_declaration);
             let _ = inner.allow_cross_tenant_db.set(allow_cross_tenant);
+        }
+    }
+
+    /// Wire the fleet [`Signer`] used to mint + verify anonymous session cookies (R3). Pass the
+    /// node's issuing signer (typically the same `issuer` that mints control-plane tokens); its
+    /// public half becomes the session-cookie verify anchor. Set once at startup; **unset ⇒ the
+    /// host issues/verifies no session cookies** (the `Session` scope axis stays dormant — a
+    /// project's `TenantOrSession` reads then carry only the tenant arm). No-op on a plain runtime.
+    #[cfg(feature = "handlers")]
+    pub fn set_session_signer(&self, signer: Arc<dyn Signer>) {
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.session_signer.set(signer);
         }
     }
 
@@ -1726,6 +1745,8 @@ fn deploy_error_response(err: DeployError) -> Response {
         DeployError::Conflict(_) => StatusCode::CONFLICT,
         // An ambiguous preview-id prefix is not a usable capability → not found.
         DeployError::Ambiguous(_) => StatusCode::NOT_FOUND,
+        // A submitted config failed content validation (e.g. an empty target public predicate).
+        DeployError::Invalid(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     tracing::warn!(error = %err, "request failed");
@@ -4029,6 +4050,8 @@ mod tests {
                     env,
                     &[],
                     0,
+                    None,
+                    None,
                     None,
                     None,
                     None,

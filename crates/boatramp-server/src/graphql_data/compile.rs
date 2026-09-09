@@ -12,7 +12,7 @@
 //! subquery), so tenant isolation is enforced at compile time, at every depth.
 
 use super::dialect::{sql_string_literal, Dialect};
-use super::policy::{Claims, DataPolicy, PolicyError, RowOp};
+use super::policy::{Claims, DataPolicy, PolicyError, TargetScope};
 use super::schema::{DbSchema, RelKind, Relationship, Table};
 use async_graphql_parser::types::{
     DocumentOperations, ExecutableDocument, Field, OperationDefinition, OperationType, Selection,
@@ -158,6 +158,31 @@ pub(crate) fn is_entities_query(query: &str) -> bool {
             .any(|s| matches!(&s.node, Selection::Field(f) if f.node.name.node == "_entities"))
 }
 
+/// Lower a resolved row-predicate term to a `WHERE` fragment against `qualified_col` (already
+/// qualified + quoted by the caller): `<col> <op> <?param>` for a comparison (the value bound as a
+/// parameter — never interpolated), or `<col> IS [NOT] NULL` for a null test. Shared by every
+/// per-table injection seam so an own filter (`tenant = X`) and a target public subset
+/// (`published = ? AND deleted_at IS NULL`) lower identically at every depth.
+fn resolved_term_where(
+    term: &super::policy::ResolvedTerm,
+    qualified_col: &str,
+    cx: &mut Cx,
+) -> String {
+    use super::policy::ResolvedTerm;
+    match term {
+        ResolvedTerm::Cmp { op, value, .. } => {
+            let ph = cx.bind(value.clone());
+            format!("{qualified_col} {} {ph}", op.symbol())
+        }
+        ResolvedTerm::Null { negated, .. } => {
+            format!(
+                "{qualified_col} IS {}NULL",
+                if *negated { "NOT " } else { "" }
+            )
+        }
+    }
+}
+
 /// Compile a federation `_entities` fetch into one keyed `SELECT`. The `... on <Type>`
 /// selection names the entity table; each representation supplies the key. The row filter
 /// still applies, so a subgraph only resolves entities it's allowed to see.
@@ -168,6 +193,7 @@ pub(crate) fn compile_entities(
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
+    target: Option<&TargetScope>,
 ) -> Result<EntitiesPlan, CompileError> {
     let doc =
         async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
@@ -242,8 +268,9 @@ pub(crate) fn compile_entities(
         alias_seq: 1,
     };
     let qualifier = dialect.quote_ident(&type_name);
-    let (mut exprs, projection, delegations) =
-        compile_selection(inner, table, &qualifier, schema, policy, claims, &mut cx)?;
+    let (mut exprs, projection, delegations) = compile_selection(
+        inner, table, &qualifier, schema, policy, claims, target, &mut cx,
+    )?;
     // Ensure the key columns are selected, so a row can be matched to its representation.
     let mut key_indices = Vec::with_capacity(table.primary_key.len());
     for pk in &table.primary_key {
@@ -286,11 +313,10 @@ pub(crate) fn compile_entities(
             clauses.push(format!("({cols}) IN ({})", tuples.join(", ")));
         }
     }
-    if let Some(filter) = policy.row_filter(&type_name, claims)? {
-        for term in filter.terms {
-            let col = qualify(&qualifier, &term.column, dialect);
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} = {ph}"));
+    if let Some(filter) = policy.row_filter_with_target(&type_name, claims, target)? {
+        for term in &filter.terms {
+            let col = qualify(&qualifier, term.column(), dialect);
+            clauses.push(resolved_term_where(term, &col, &mut cx));
         }
     }
 
@@ -349,6 +375,7 @@ pub(crate) fn compile(
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
+    target: Option<&TargetScope>,
 ) -> Result<PlannedSql, CompileError> {
     let doc =
         async_graphql_parser::parse_query(query).map_err(|e| CompileError::Parse(e.to_string()))?;
@@ -373,6 +400,7 @@ pub(crate) fn compile(
             policy,
             claims,
             dialect,
+            target,
         )?);
     }
     Ok(PlannedSql { roots })
@@ -493,14 +521,27 @@ fn compile_insert(
         columns.push(col.to_string());
         values.push(resolve_value(val, cx.variables)?);
     }
-    // A new row must belong to the tenant: force the row-filter columns to the claim values.
-    if let Some(filter) = policy.row_filter(&table.name, claims)? {
+    // A new row must belong to the tenant: force the row-filter columns to the claim values. An
+    // insert can only force an equality term (`column = value`); a non-equality / null row-filter
+    // term is refused (fail-closed) — the own path is always equality, and a richer target-write
+    // filter lands with target writes (a later stage).
+    if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
         for term in filter.terms {
-            match columns.iter().position(|c| *c == term.column) {
-                Some(pos) => values[pos] = term.value,
+            let super::policy::ResolvedTerm::Cmp {
+                column,
+                op: super::policy::RowOp::Eq,
+                value,
+            } = term
+            else {
+                return Err(CompileError::Unsupported(
+                    "a non-equality row filter cannot be forced onto an insert".into(),
+                ));
+            };
+            match columns.iter().position(|c| *c == column) {
+                Some(pos) => values[pos] = value,
                 None => {
-                    columns.push(term.column);
-                    values.push(term.value);
+                    columns.push(column);
+                    values.push(value);
                 }
             }
         }
@@ -601,11 +642,10 @@ fn compile_write_where(
             clauses.push(expr);
         }
     }
-    if let Some(filter) = policy.row_filter(&table.name, claims)? {
-        for term in filter.terms {
-            let col = cx.dialect.quote_ident(&term.column);
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} = {ph}"));
+    if let Some(filter) = policy.row_filter_with_target(&table.name, claims, None)? {
+        for term in &filter.terms {
+            let col = cx.dialect.quote_ident(term.column());
+            clauses.push(resolved_term_where(term, &col, cx));
         }
     }
     Ok(if clauses.is_empty() {
@@ -646,6 +686,7 @@ fn compile_root(
     policy: &DataPolicy,
     claims: &Claims,
     dialect: &dyn Dialect,
+    target: Option<&TargetScope>,
 ) -> Result<RootQuery, CompileError> {
     let response_key = field_response_key(field);
     let field_name = field.name.node.as_str();
@@ -679,19 +720,17 @@ fn compile_root(
         schema,
         policy,
         claims,
+        target,
         &mut cx,
     )?;
 
-    // WHERE = the policy row filter, plus the `_by_pk` key equality or the list `where` arg.
+    // WHERE = the policy row filter (own claim-bound, or the target `tenant=B AND public`), plus
+    // the `_by_pk` key equality or the list `where` arg.
     let mut clauses: Vec<String> = Vec::new();
-    if let Some(filter) = policy.row_filter(table_name, claims)? {
-        for term in filter.terms {
-            let op = match term.op {
-                RowOp::Eq => "=",
-            };
-            let col = format!("{qualifier}.{}", dialect.quote_ident(&term.column));
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} {op} {ph}"));
+    if let Some(filter) = policy.row_filter_with_target(table_name, claims, target)? {
+        for term in &filter.terms {
+            let col = format!("{qualifier}.{}", dialect.quote_ident(term.column()));
+            clauses.push(resolved_term_where(term, &col, &mut cx));
         }
     }
     if single {
@@ -757,6 +796,7 @@ fn compile_root(
 /// expression list, the output projection, and any delegated fields. A scalar field is a
 /// qualified column; a relationship field is a correlated JSON subquery; a delegated field
 /// is resolved by a wasm function after the query; `__typename` is a constant.
+#[allow(clippy::too_many_arguments)]
 fn compile_selection(
     items: &[Positioned<Selection>],
     table: &Table,
@@ -764,6 +804,7 @@ fn compile_selection(
     schema: &DbSchema,
     policy: &DataPolicy,
     claims: &Claims,
+    target: Option<&TargetScope>,
     cx: &mut Cx<'_>,
 ) -> Result<CompiledSelection, CompileError> {
     let relationships = schema.relationships(&table.name);
@@ -793,7 +834,8 @@ fn compile_selection(
                     table.name
                 )));
             }
-            let subquery = relationship_subquery(rel, f, qualifier, schema, policy, claims, cx)?;
+            let subquery =
+                relationship_subquery(rel, f, qualifier, schema, policy, claims, target, cx)?;
             let idx = exprs.len();
             exprs.push(subquery);
             projection.push(OutField {
@@ -804,6 +846,16 @@ fn compile_selection(
         }
         // A field resolved by a wasm function (the config allowlist), not a column.
         if let Some(function) = policy.delegated(&table.name, f_name) {
+            // R4/D8 fail-closed: a delegated (wasm-resolved) field is NOT confined by the target
+            // public subset (it invokes a function with the row keys, outside the per-table
+            // `tenant = B AND <public>` injection), so it is refused under a target read rather than
+            // resolved un-confined. Own reads delegate as before.
+            if target.is_some() {
+                return Err(CompileError::Unsupported(format!(
+                    "delegated field `{}.{f_name}` is not permitted under a target-tenant read",
+                    table.name
+                )));
+            }
             delegations.push(compile_delegation(
                 f,
                 function,
@@ -920,6 +972,7 @@ fn serialize_field(field: &Field) -> String {
 /// Lower a relationship field to a correlated JSON subquery selecting the target's scalar
 /// fields, joined to the outer row and filtered by the target's row policy. The target
 /// selection must be scalar-only — a relationship nested beyond one level is rejected.
+#[allow(clippy::too_many_arguments)]
 fn relationship_subquery(
     rel: &Relationship,
     field: &Field,
@@ -927,12 +980,13 @@ fn relationship_subquery(
     schema: &DbSchema,
     policy: &DataPolicy,
     claims: &Claims,
+    target: Option<&TargetScope>,
     cx: &mut Cx<'_>,
 ) -> Result<String, CompileError> {
     if !policy.is_table_exposed(&rel.target_table) {
         return Err(CompileError::UnknownField(rel.field.clone()));
     }
-    let target = schema
+    let tbl = schema
         .table(&rel.target_table)
         .ok_or_else(|| CompileError::UnknownField(rel.field.clone()))?;
     let alias = cx.next_alias();
@@ -956,8 +1010,7 @@ fn relationship_subquery(
                 "a relationship nested beyond one level".into(),
             ));
         }
-        if target.column(sf_name).is_none() || !policy.is_column_exposed(&rel.target_table, sf_name)
-        {
+        if tbl.column(sf_name).is_none() || !policy.is_column_exposed(&rel.target_table, sf_name) {
             return Err(CompileError::UnknownField(format!(
                 "{}.{sf_name}",
                 rel.target_table
@@ -976,11 +1029,10 @@ fn relationship_subquery(
             cx.dialect.quote_ident(local)
         ));
     }
-    if let Some(filter) = policy.row_filter(&rel.target_table, claims)? {
-        for term in filter.terms {
-            let col = format!("{qalias}.{}", cx.dialect.quote_ident(&term.column));
-            let ph = cx.bind(term.value);
-            clauses.push(format!("{col} = {ph}"));
+    if let Some(filter) = policy.row_filter_with_target(&rel.target_table, claims, target)? {
+        for term in &filter.terms {
+            let col = format!("{qalias}.{}", cx.dialect.quote_ident(term.column()));
+            clauses.push(resolved_term_where(term, &col, cx));
         }
     }
     let where_sql = clauses.join(" AND ");
@@ -1254,7 +1306,7 @@ fn json_to_sql(value: &serde_json::Value) -> Result<SqlValue, CompileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::policy::{DataPolicy, RowPredicate, RowTerm, RowValue, TablePolicy};
+    use super::super::policy::{DataPolicy, RowOp, RowPredicate, RowTerm, RowValue, TablePolicy};
     use super::super::schema::{Column, DbSchema, ForeignKey, ScalarType, Table};
     use super::*;
     use std::collections::BTreeMap;
@@ -1333,6 +1385,7 @@ mod tests {
             policy,
             claims,
             &super::super::dialect::Sqlite,
+            None,
         )?;
         Ok(planned.roots.remove(0))
     }
@@ -1557,6 +1610,7 @@ mod tests {
             &open_policy(),
             &Claims::default(),
             &super::super::dialect::Sqlite,
+            None,
         )
         .unwrap();
         let root = planned.roots.remove(0);
@@ -1573,6 +1627,7 @@ mod tests {
             &open_policy(),
             &Claims::default(),
             &super::super::dialect::Sqlite,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, CompileError::Unsupported(m) if m.contains("mutation")));
@@ -1609,6 +1664,7 @@ mod tests {
             &policy,
             &Claims::default(),
             &super::super::dialect::Sqlite,
+            None,
         )
         .unwrap();
         // Exact full SQL: only `name` was asked, but the key column `id` is selected (for
@@ -1747,5 +1803,118 @@ mod tests {
         .unwrap();
         assert_eq!(stmt.sql, r#"DELETE FROM "users" WHERE "id" = ?1"#);
         assert_eq!(stmt.params, vec![SqlValue::Text("9".into())]);
+    }
+
+    #[test]
+    fn a_target_read_emits_tenant_b_and_the_public_subset_incl_a_null_test() {
+        use super::super::policy::{ResolvedTerm, TargetScope, TargetTable};
+        use std::collections::BTreeMap;
+        // A target read of tenant `B` confines `users` to `tenant_id = B AND published = ? AND
+        // deleted_at IS NULL` — proving the richer public predicate (equality + null test) lowers
+        // correctly at the root, with the tenant + literal bound as parameters (never interpolated)
+        // and the null test binding nothing.
+        let target = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::from([(
+                "users".to_string(),
+                TargetTable {
+                    tenant_column: "tenant_id".into(),
+                    public: vec![
+                        ResolvedTerm::Cmp {
+                            column: "published".into(),
+                            op: RowOp::Eq,
+                            value: SqlValue::Boolean(true),
+                        },
+                        ResolvedTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+            )]),
+        };
+        let mut planned = compile(
+            "{ users { id } }",
+            &serde_json::json!({}),
+            &schema(),
+            &open_policy(),
+            &Claims::default(),
+            &super::super::dialect::Sqlite,
+            Some(&target),
+        )
+        .unwrap();
+        let root = planned.roots.remove(0);
+        assert!(
+            root.sql.contains(r#""users"."tenant_id" = ?"#),
+            "tenant scoped to B: {}",
+            root.sql
+        );
+        assert!(
+            root.sql.contains(r#""users"."published" = ?"#),
+            "public equality term: {}",
+            root.sql
+        );
+        assert!(
+            root.sql.contains(r#""users"."deleted_at" IS NULL"#),
+            "public null test (no placeholder): {}",
+            root.sql
+        );
+        assert!(root.params.contains(&SqlValue::Text("tenant_B".into())));
+        assert!(root.params.contains(&SqlValue::Boolean(true)));
+    }
+
+    #[test]
+    fn a_delegated_field_is_refused_under_a_target_read() {
+        use super::super::policy::{ResolvedTerm, RowOp, TargetScope, TargetTable};
+        use std::collections::BTreeMap;
+        // `users.reviews` delegates to a wasm resolver. A delegated field runs OUTSIDE the per-table
+        // `tenant = B AND <public>` injection, so a target read must refuse it (fail-closed), while
+        // an own read still delegates.
+        let policy = DataPolicy::new().with_table(
+            "users",
+            TablePolicy::columns(["id", "name"]).with_resolver("reviews", "reviews"),
+        );
+        let target = TargetScope {
+            tenant_value: SqlValue::Text("tenant_B".into()),
+            tables: BTreeMap::from([(
+                "users".to_string(),
+                TargetTable {
+                    tenant_column: "tenant_id".into(),
+                    public: vec![ResolvedTerm::Cmp {
+                        column: "published".into(),
+                        op: RowOp::Eq,
+                        value: SqlValue::Boolean(true),
+                    }],
+                },
+            )]),
+        };
+        let err = compile(
+            "{ users { name reviews { body } } }",
+            &serde_json::json!({}),
+            &schema(),
+            &policy,
+            &Claims::default(),
+            &super::super::dialect::Sqlite,
+            Some(&target),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, CompileError::Unsupported(m) if m.contains("delegated") && m.contains("target-tenant")),
+            "a delegated field must be refused under a target read, got {err:?}"
+        );
+        // The SAME query on the OWN path (target = None) still delegates.
+        assert!(
+            compile(
+                "{ users { name reviews { body } } }",
+                &serde_json::json!({}),
+                &schema(),
+                &policy,
+                &Claims::default(),
+                &super::super::dialect::Sqlite,
+                None,
+            )
+            .is_ok(),
+            "an own read still delegates"
+        );
     }
 }

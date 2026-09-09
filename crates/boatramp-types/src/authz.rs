@@ -284,6 +284,21 @@ impl Right {
                     Some(proj.to_string()),
                     if get { Action::Read } else { Action::Write },
                 ),
+                // The project's tenancy schema defines the tenant-isolation boundary
+                // that scopes **every** guest query — which column keys each table,
+                // and deny-by-default on undeclared tables. Weakening it (marking a
+                // sensitive table `Unscoped`, or repointing a tenant key) would expose
+                // cross-tenant rows, so it is an owner-level act: read with
+                // `Project·Read`, but **mutate with `Project·Admin`** — never the
+                // deploy-grade publisher right the general project-owned mapping below
+                // would grant (a publisher who can ship code must not be able to
+                // redraw the isolation boundary). Gated explicitly, above that
+                // catch-all, so a `project_publisher` token cannot reach it.
+                Some((&"tenancy", _)) => Self::new(
+                    Resource::Project,
+                    Some(proj.to_string()),
+                    if get { Action::Read } else { Action::Admin },
+                ),
                 // Project-owned resources (functions/compute/workflows/config/…):
                 // read with `Project·Read`, mutate with `Project·Deploy`.
                 Some(_) => Self::new(
@@ -1751,6 +1766,49 @@ mod tests {
                 Some("default".into()),
                 Action::Read
             ))
+        );
+    }
+
+    /// The project tenancy schema is the tenant-isolation boundary: reading it is a
+    /// `Project·Read`, but **mutating it demands `Project·Admin`** — never the
+    /// deploy-grade publisher right the general project-owned catch-all would grant.
+    /// A `project_publisher` (who holds `Project·Deploy`) must therefore be refused,
+    /// while a `project_admin` is allowed — so a code-shipping role cannot redraw the
+    /// isolation boundary out from under the tenants.
+    #[test]
+    fn tenancy_schema_read_is_project_read_but_write_is_project_admin() {
+        assert_eq!(
+            Right::required("GET", "/api/projects/acme/tenancy"),
+            Some(Right::new(
+                Resource::Project,
+                Some("acme".into()),
+                Action::Read
+            ))
+        );
+        for method in ["PUT", "POST", "DELETE"] {
+            assert_eq!(
+                Right::required(method, "/api/projects/acme/tenancy"),
+                Some(Right::new(
+                    Resource::Project,
+                    Some("acme".into()),
+                    Action::Admin
+                )),
+                "{method} /tenancy must require Project·Admin, not Deploy",
+            );
+        }
+        // A publisher (Project·Deploy on acme) can ship code but MUST NOT rewrite the
+        // isolation boundary; an admin can.
+        let put_tenancy = Right::required("PUT", "/api/projects/acme/tenancy").unwrap();
+        let policy = AuthzPolicy::default_policy();
+        let publisher = policy.rights_for(&[GrantedRole::scoped("project_publisher", "acme")]);
+        assert!(
+            !publisher.allows(&put_tenancy),
+            "a project_publisher must not be able to PUT the tenancy schema",
+        );
+        let admin = policy.rights_for(&[GrantedRole::scoped("project_admin", "acme")]);
+        assert!(
+            admin.allows(&put_tenancy),
+            "a project_admin must be able to PUT the tenancy schema",
         );
     }
 

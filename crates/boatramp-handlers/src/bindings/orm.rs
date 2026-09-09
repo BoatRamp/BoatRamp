@@ -27,6 +27,8 @@ mod generated {
                 "[method]database.update",
                 "[method]database.delete",
                 "[method]database.delete-returning",
+                "[method]database.promote",
+                "[method]database.attach-reference",
             ],
         },
         with: {
@@ -83,7 +85,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let read = self.scope_for(crate::tenant::Axis::Read)?;
         let mut core = to_core_select(&q)?;
         if let Some(s) = &read {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -114,7 +116,8 @@ impl wit::HostDatabase for OrmHost<'_> {
         // Only force when in-site tenancy is active (either axis resolved a scope); otherwise the
         // insert stays plain. `all` on an axis resolves to `None`, correctly clearing that axis.
         if self.session.tenancy().is_some() {
-            core.force_scope(write.as_ref(), read.as_ref());
+            core.force_scope(write.as_ref(), read.as_ref())
+                .map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -131,7 +134,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_update(&q)?;
         if let Some(s) = &write {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -148,7 +151,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_delete(&q)?;
         if let Some(s) = &write {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -168,7 +171,7 @@ impl wit::HostDatabase for OrmHost<'_> {
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_delete(&q)?;
         if let Some(s) = &write {
-            core.force_scope(s);
+            core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
@@ -183,6 +186,66 @@ impl wit::HostDatabase for OrmHost<'_> {
                 })
                 .collect(),
         })
+    }
+
+    async fn promote(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        table: String,
+    ) -> Result<u64, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        // Promotion (D7) needs the resolved principal carrying BOTH a tenant fact and a session
+        // fact — the write axis carries both. No in-site tenancy (or an `all`/no-scope axis) ⇒
+        // nothing to promote, so refuse; `compile_promote` further requires both facts present AND
+        // a `TenantOrSession` target, and emits the `tenant IS NULL` anti-widening guard.
+        let scope = self
+            .scope_for(crate::tenant::Axis::Write)?
+            .ok_or_else(|| compile_err(core::OrmError::TenancyNoPrincipal))?;
+        let (sql, params) = core::compile_promote(&scope, &table, dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        txn.execute(&sql, &params).await.map_err(backend_err)
+    }
+
+    async fn attach_reference(
+        &mut self,
+        db: Resource<OrmDatabase>,
+        q: wit::AttachReferenceQuery,
+    ) -> Result<u64, wit::Error> {
+        let name = self.name_of(&db)?;
+        let dialect = self.session.dialect(&name);
+        // attach_reference is a host-mediated WRITE (5d): the caller's write axis must grant a write.
+        // A read-only route (no in-site tenancy, an `all`/no-scope axis, or a `handle`-resolved target
+        // whose write axis is `None` — G1) resolves no write scope here and is refused.
+        let scope = self
+            .scope_for(crate::tenant::Axis::Write)?
+            .ok_or_else(|| compile_err(core::OrmError::TenancyNoPrincipal))?;
+        // The `ref-value` selector must be a bound literal (a row selector inside the caller's scope,
+        // never an arbitrary expression / subquery).
+        let ref_value = match build_expr(&q.exprs, &[], q.ref_value, q.exprs.len())? {
+            core::Expr::Value(v) => v,
+            _ => {
+                return Err(wit::Error::Syntax(
+                    "attach_reference ref-value must be a literal".into(),
+                ))
+            }
+        };
+        let set = q
+            .set
+            .iter()
+            .map(|a| to_core_assignment(&q.exprs, &[], a))
+            .collect::<Result<Vec<_>, _>>()?;
+        let spec = core::AttachReference {
+            child: q.child,
+            parent: q.parent,
+            ref_column: q.ref_column,
+            ref_value,
+            set,
+        };
+        let (sql, params) =
+            core::compile_attach_reference(&scope, &spec, dialect).map_err(compile_err)?;
+        let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
+        txn.execute(&sql, &params).await.map_err(backend_err)
     }
 
     fn drop(&mut self, db: Resource<OrmDatabase>) -> wasmtime::Result<()> {
@@ -1601,5 +1664,214 @@ mod tests {
             }
         }
         assert_frozen(wit::Value::Null);
+    }
+
+    // ---- 5b: target WRITE binding-level wiring (the WIT insert/update/delete entry points) -----
+
+    /// An orm session whose tenancy is a **target write** principal for tenant `B` on `products`
+    /// (public subset `published = true AND deleted_at IS NULL`), with the given SET-allowlist.
+    fn target_write_session(log: &Log, write: &[&str]) -> SqlSession {
+        use boatramp_core::tenancy::{
+            PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm, TableScope,
+            TenancySchema,
+        };
+        use std::collections::BTreeMap;
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("products".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "products".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![
+                        PublicTerm::Cmp {
+                            column: "published".into(),
+                            op: PublicCmp::Eq,
+                            value: PublicLiteral::Bool(true),
+                        },
+                        PublicTerm::Null {
+                            column: "deleted_at".into(),
+                            negated: false,
+                        },
+                    ],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        session(log).with_tenancy(Some(crate::tenant::HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            boatramp_core::tenancy::AccessMode::Own,
+            &schema,
+            "products",
+            &write.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )))
+    }
+
+    /// The WIT `insert` entry point, under a target write grant on `title`, force-stamps tenant=B +
+    /// the public-visibility columns and reaches the backend confined — the guest set only `title`.
+    #[tokio::test]
+    async fn target_insert_via_the_binding_confines_to_b_public() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &["title"]);
+        let mut table = ResourceTable::new();
+        {
+            let mut host = OrmHost::new(&mut table, &mut sess);
+            let db = host.open(String::new()).unwrap();
+            let ins = wit::InsertQuery {
+                exprs: vec![lit(text("Hello"))],
+                table: "products".into(),
+                rows: vec![wit::RowValues {
+                    cells: vec![wit::Assignment {
+                        column: "title".into(),
+                        value: 0,
+                    }],
+                }],
+                conflict: None,
+                scope: None,
+                returning: vec![],
+                select_source: None,
+            };
+            host.insert(db, ins).await.unwrap();
+        }
+        let log = log.lock().unwrap();
+        let ran = log
+            .iter()
+            .find(|l| l.starts_with("execute|INSERT"))
+            .expect("an insert ran");
+        // Every forced column reaches the backend; the guest title too.
+        assert!(ran.contains("tenant_id"), "{ran}");
+        assert!(ran.contains("published"), "{ran}");
+        assert!(ran.contains("deleted_at"), "{ran}");
+        assert!(ran.contains("tenant_B") && ran.contains("Hello"), "{ran}");
+    }
+
+    /// The binding refuses a target INSERT that sets a non-allowlisted column, and never reaches the
+    /// backend.
+    #[tokio::test]
+    async fn target_insert_via_the_binding_refuses_a_non_allowlisted_column() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &["title"]);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let ins = wit::InsertQuery {
+            exprs: vec![lit(wit::Value::Integer(9))],
+            table: "products".into(),
+            rows: vec![wit::RowValues {
+                cells: vec![wit::Assignment {
+                    column: "price".into(),
+                    value: 0,
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            select_source: None,
+        };
+        assert!(
+            host.insert(db, ins).await.is_err(),
+            "non-allowlisted column must be refused"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("execute|")),
+            "nothing reached the backend"
+        );
+    }
+
+    /// A read-only target route (empty allowlist) denies the write axis at `scope_for(Write)`.
+    #[tokio::test]
+    async fn target_insert_via_the_binding_refuses_a_read_only_route() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &[]);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let ins = wit::InsertQuery {
+            exprs: vec![lit(text("x"))],
+            table: "products".into(),
+            rows: vec![wit::RowValues {
+                cells: vec![wit::Assignment {
+                    column: "title".into(),
+                    value: 0,
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            select_source: None,
+        };
+        assert!(
+            host.insert(db, ins).await.is_err(),
+            "a read-only target denies writes"
+        );
+    }
+
+    /// attach_reference via the binding is refused on a READ-ONLY target route (no write axis) — the
+    /// binding's `scope_for(Write)` gate (which a `handle`-resolved target also hits, G1). Never
+    /// reaches the backend.
+    #[tokio::test]
+    async fn target_attach_reference_via_the_binding_refuses_a_read_only_route() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &[]); // read-only target
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let q = wit::AttachReferenceQuery {
+            exprs: vec![lit(text("prod_1")), lit(text("nice"))],
+            child: "favorites".into(),
+            parent: "products".into(),
+            ref_column: "id".into(),
+            ref_value: 0,
+            set: vec![wit::Assignment {
+                column: "note".into(),
+                value: 1,
+            }],
+        };
+        assert!(
+            host.attach_reference(db, q).await.is_err(),
+            "attach_reference on a read-only target route is refused"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("execute|")),
+            "nothing reached the backend"
+        );
+    }
+
+    /// A target DELETE via the binding is refused (target writes are INSERT/UPDATE only).
+    #[tokio::test]
+    async fn target_delete_via_the_binding_is_refused() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut sess = target_write_session(&log, &["title"]);
+        let mut table = ResourceTable::new();
+        let mut host = OrmHost::new(&mut table, &mut sess);
+        let db = host.open(String::new()).unwrap();
+        let del = wit::DeleteQuery {
+            exprs: vec![col("id"), lit(text("p1"))],
+            preds: vec![cmp(0, wit::CmpOp::Eq, 1)],
+            table: "products".into(),
+            filter: 0,
+            scope: None,
+            returning: vec![],
+        };
+        assert!(
+            host.delete(db, del).await.is_err(),
+            "a target DELETE is refused"
+        );
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("execute|")),
+            "nothing reached the backend"
+        );
     }
 }

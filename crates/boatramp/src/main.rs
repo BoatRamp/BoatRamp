@@ -87,6 +87,7 @@ mod security;
 mod security_headers;
 mod serve;
 mod sync;
+mod tenancy;
 mod token;
 
 use error::CliError;
@@ -160,6 +161,9 @@ enum Command {
     Token(token::TokenArgs),
     /// Manage a project's internal, sealed secret store (`secrets set|ls|rm|rotate`).
     Secrets(secrets::SecretsArgs),
+    /// Manage a project's tenancy schema — the per-table tenant-key map that scopes
+    /// guest queries (`tenancy show|apply <file>|clear`).
+    Tenancy(tenancy::TenancyArgs),
     /// Manage a project's SMTP delivery profiles (`email set|ls|show|rm`).
     #[cfg(feature = "email")]
     Email(email::EmailArgs),
@@ -476,6 +480,7 @@ async fn async_main() -> Result<(), CliError> {
         Command::Graphql(args) => graphql::run(args, &config).await?,
         Command::Token(args) => token::run(args, &config).await?,
         Command::Secrets(args) => secrets::run(args, &config).await?,
+        Command::Tenancy(args) => tenancy::run(args, &config).await?,
         #[cfg(feature = "email")]
         Command::Email(args) => email::run(args, &config).await?,
         Command::Cluster(args) => cluster::run(args, &config).await?,
