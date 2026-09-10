@@ -955,6 +955,7 @@ mod tests {
             &schema,
             "products",
             &[],
+            true,
         )))
     }
 

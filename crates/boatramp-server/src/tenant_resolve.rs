@@ -997,6 +997,7 @@ mod tests {
             &schema,
             "products",
             &[],
+            true,
         );
 
         // (1) The `orm` path: force the target scope onto a Select, compile, run.
@@ -1172,6 +1173,7 @@ mod tests {
             &schema,
             "products",
             &["name".to_string()],
+            true,
         );
         let write = ht.orm_scope(TenantAxis::Write).unwrap().unwrap();
         let read = ht.orm_scope(TenantAxis::Read).unwrap().unwrap();
@@ -1333,6 +1335,7 @@ mod tests {
             &schema,
             "products",
             &[],
+            true,
         );
         assert!(
             ro.orm_scope(TenantAxis::Write).is_err(),
@@ -1438,6 +1441,7 @@ mod tests {
             &schema,
             "products",
             &["note".to_string(), "product_id".to_string()],
+            true,
         );
         let write = ht.orm_scope(TenantAxis::Write).unwrap().unwrap();
 
@@ -1503,6 +1507,119 @@ mod tests {
             "PLAIN-WASM TARGET ATTACH-REFERENCE ISOLATION OK: attach_reference stamped the child's \
              tenant from B's reachable public parent (never tenant A, never B's draft) and was a \
              fail-closed no-op for every unreachable parent, on a real libsql engine"
+        );
+    }
+
+    /// **Live** proof (R4/D8 5c ruling A) that a **`via: [capability]`-only** target field with NO
+    /// declared public subset confines to `tenant = B` alone — the capability is the authorization —
+    /// on a REAL libsql engine: both the `orm` and the raw-`sql` (AST-rewritten) reads return ALL of
+    /// tenant B's rows (across clients — the per-client filter is the app's, in-guest) and NEVER
+    /// tenant A's. Proves the exemption does not widen past the one tenant `B`. `#[ignore]`d
+    /// (static-musl libsql segfault); the `test-target-plain-wasm` CI job runs it + greps the marker.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn plain_wasm_target_capability_confines_to_tenant_b_without_a_subset_on_a_real_engine() {
+        use boatramp_core::orm::{Expr, Select, SelectItem};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, TableScope, TenancySchema};
+        use boatramp_handlers::{HostTenancy, TenantAxis};
+        use std::collections::BTreeMap;
+
+        let dir =
+            std::env::temp_dir().join(format!("boatramp-target-capability-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "shop", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE invoices (id TEXT PRIMARY KEY, tenant_id TEXT, client_id TEXT, amount INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, client, amount) in [
+                ("b1", "tenant_B", "cli_1", 10i64),
+                ("b2", "tenant_B", "cli_2", 20), // a DIFFERENT client within B (per-client is in-guest)
+                ("a1", "tenant_A", "cli_9", 99),
+            ] {
+                tx.execute(
+                    "INSERT INTO invoices (id, tenant_id, client_id, amount) VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(client.into()),
+                        SqlValue::Integer(amount),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // `invoices` is a Tenant table with NO declared public subset. A capability-only field
+        // (require_public = false) confines it to `tenant = B` alone.
+        let schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("invoices".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        let ht = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema,
+            "client-invoices", // a scope LABEL (matched against the capability's grant); not a subset
+            &[],
+            false, // capability-only: no visibility subset required
+        );
+
+        // (1) orm: SELECT id FROM invoices → confined to tenant = B (both of B's clients; never A).
+        let mut q = Select {
+            columns: vec![SelectItem {
+                expr: Expr::col("id"),
+                alias: None,
+            }],
+            ..Select::from("invoices")
+        };
+        q.force_scope(&ht.orm_scope(TenantAxis::Read).unwrap().unwrap())
+            .unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let orm_rows = run_text_rows(tx.as_mut(), &sql, &params).await;
+        assert_eq!(
+            orm_rows,
+            vec!["b1".to_string(), "b2".to_string()],
+            "capability orm read = ALL of tenant B (across clients), never A: {sql}"
+        );
+        tx.commit().await.unwrap();
+        assert!(
+            !sql.contains("published") && !sql.contains("client_id"),
+            "no visibility/per-client predicate injected — confinement is tenant-only: {sql}"
+        );
+
+        // (2) raw SQL (AST-rewritten) → tenant = B, no visibility predicate.
+        let rewritten = ht
+            .rewrite_target_read("SELECT id FROM invoices", Dialect::Sqlite)
+            .unwrap();
+        assert!(
+            rewritten.contains("invoices.tenant_id = 'tenant_B'")
+                && !rewritten.contains("published"),
+            "raw-sql capability read confines tenant-only: {rewritten}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let raw_rows = run_text_rows(tx.as_mut(), &rewritten, &[]).await;
+        assert_eq!(
+            raw_rows,
+            vec!["b1".to_string(), "b2".to_string()],
+            "raw-sql capability read = tenant B only: {rewritten}"
+        );
+        tx.commit().await.unwrap();
+
+        println!(
+            "PLAIN-WASM CAPABILITY TARGET ISOLATION OK: a via:[capability]-only field with no declared \
+             public subset confines its orm AND raw-sql reads to tenant B alone (all of B's rows, \
+             never tenant A's; the per-client filter stays in-guest), on a real libsql engine"
         );
     }
 

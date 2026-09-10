@@ -160,6 +160,7 @@ pub fn rewrite_target_select(
     tenant_value: &SqlValue,
     keys: &BTreeMap<String, ResolvedScope>,
     public: &BTreeMap<String, Vec<PublicTermSql>>,
+    require_public: bool,
     dialect: Dialect,
 ) -> Result<String, TargetRewriteError> {
     let sp: Box<dyn SpDialect> = match dialect {
@@ -183,6 +184,7 @@ pub fn rewrite_target_select(
     let mut rewriter = Rewriter {
         keys,
         public,
+        require_public,
         bound,
     };
     if let ControlFlow::Break(err) = statements[0].visit(&mut rewriter) {
@@ -199,6 +201,10 @@ pub fn rewrite_target_select(
 struct Rewriter<'a> {
     keys: &'a BTreeMap<String, ResolvedScope>,
     public: &'a BTreeMap<String, Vec<PublicTermSql>>,
+    /// Whether a per-table public subset is mandatory (R4/D8 5c ruling A): `true` for domain/handle
+    /// (an undeclared subset ⇒ refuse); `false` for a `capability`-only field (an undeclared subset ⇒
+    /// confine to `tenant = B` alone — the capability is the authorization).
+    require_public: bool,
     /// The host-resolved target tenant `B`, pre-rendered as a literal expression.
     bound: Expr,
 }
@@ -288,13 +294,20 @@ impl Rewriter<'_> {
         }
         let mut confinement: Option<Expr> = None;
         for (qualifier, table) in &bases {
-            let pred = self.table_confinement(table, qualifier)?;
+            // A table may need no predicate (a capability field's global `Unscoped` reference table);
+            // skip it — the confined tables still gate the row set.
+            let Some(pred) = self.table_confinement(table, qualifier)? else {
+                continue;
+            };
             confinement = Some(match confinement.take() {
                 Some(acc) => and(acc, pred),
                 None => pred,
             });
         }
-        let confinement = confinement.expect("bases is non-empty");
+        // Every base table needed no predicate (all global under a capability field) ⇒ no WHERE added.
+        let Some(confinement) = confinement else {
+            return Ok(());
+        };
         select.selection = Some(match select.selection.take() {
             // Parenthesise the guest's predicate: `(<guest WHERE>) AND <confinement>` — a top-level
             // OR in the guest predicate can never escape the tenant/public gate (closes M2).
@@ -357,18 +370,29 @@ impl Rewriter<'_> {
     }
 
     /// The confinement predicate for one base table: `qualifier.tenant = B` (unless the table is
-    /// `Unscoped`) `AND` the table's public-subset terms (each qualified). Deny-by-default: a table
-    /// with no declared public subset, or no declared tenant key, is refused.
+    /// `Unscoped`) `AND` the table's public-subset terms (each qualified). `Ok(None)` when the table
+    /// needs no predicate at all (a `capability`-only field's global/`Unscoped` reference table).
+    /// Deny-by-default: a table with no declared tenant key is refused; under `require_public`
+    /// (domain/handle) a table with no declared public subset is refused.
     fn table_confinement(
         &self,
         table: &str,
         qualifier: &Ident,
-    ) -> Result<Expr, TargetRewriteError> {
-        // Deny-by-default: a target read may only reach a table with a declared public subset.
-        let terms = self
-            .public
-            .get(table)
-            .ok_or_else(|| TargetRewriteError::PublicSubsetUndeclared(table.to_string()))?;
+    ) -> Result<Option<Expr>, TargetRewriteError> {
+        // The public terms. Under `require_public` (domain/handle) an undeclared subset is refused
+        // (the visibility predicate is the only guard for an anonymous actor); under a
+        // `capability`-only field (ruling A) an undeclared subset ⇒ no visibility terms (confine to
+        // `tenant = B` alone — the capability is the authorization).
+        let empty: Vec<PublicTermSql> = Vec::new();
+        let terms = match self.public.get(table) {
+            Some(t) => t,
+            None if !self.require_public => &empty,
+            None => {
+                return Err(TargetRewriteError::PublicSubsetUndeclared(
+                    table.to_string(),
+                ))
+            }
+        };
         let resolved = self
             .keys
             .get(table)
@@ -419,13 +443,16 @@ impl Rewriter<'_> {
                 }
             }
         }
-        // AND all parts. Empty only if the table is `Unscoped` with no public terms — which the
-        // schema validator rejects (an empty public predicate matches every row); refuse defensively.
+        // AND all parts. Empty ⇒ no confinement for this table: an `Unscoped` global reference table
+        // under a `capability`-only field (no tenant column, no declared subset) — read globally,
+        // exactly as the own/GDC paths treat `Unscoped`. Under `require_public` this is unreachable
+        // (a Column table always adds `tenant = B`; an `Unscoped`/undeclared-subset table was already
+        // refused), so a domain/handle read can never end up unconfined.
         let mut it = parts.into_iter();
         let Some(first) = it.next() else {
-            return Err(TargetRewriteError::EmptyConfinement(table.to_string()));
+            return Ok(None);
         };
-        Ok(it.fold(first, and))
+        Ok(Some(it.fold(first, and)))
     }
 }
 
@@ -558,7 +585,14 @@ mod tests {
     }
 
     fn rewrite(sql: &str) -> Result<String, TargetRewriteError> {
-        rewrite_target_select(sql, &b(), &keys(), &public(), Dialect::Sqlite)
+        // Default helper tests the anonymous (domain/handle) path: public subset mandatory.
+        rewrite_target_select(sql, &b(), &keys(), &public(), true, Dialect::Sqlite)
+    }
+
+    /// Rewrite under a `capability`-only field (`require_public = false`): a table with no declared
+    /// public subset confines to `tenant = B` alone.
+    fn rewrite_cap(sql: &str) -> Result<String, TargetRewriteError> {
+        rewrite_target_select(sql, &b(), &keys(), &public(), false, Dialect::Sqlite)
     }
 
     #[test]
@@ -567,6 +601,53 @@ mod tests {
         assert_eq!(
             out,
             "SELECT id FROM products WHERE products.tenant_id = 'tenant_B' AND products.published = true"
+        );
+    }
+
+    #[test]
+    fn capability_confines_tenant_only_when_no_subset_but_domain_handle_refuses() {
+        use std::collections::BTreeMap;
+        // `orders` is a plain tenant table with NO declared public subset.
+        let keys = BTreeMap::from([(
+            "orders".to_string(),
+            ResolvedScope::Column("tenant_id".to_string()),
+        )]);
+        let public = BTreeMap::new();
+        // capability-only (require_public = false): confine to `tenant = B` alone (no visibility
+        // predicate) — the capability is the authorization; per-client stays in-guest.
+        let out = rewrite_target_select(
+            "SELECT id FROM orders WHERE total > 10",
+            &b(),
+            &keys,
+            &public,
+            false,
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM orders WHERE (total > 10) AND orders.tenant_id = 'tenant_B'"
+        );
+        // domain/handle (require_public = true): the SAME table is refused — an anonymous actor needs
+        // the visibility predicate as its only guard.
+        let err = rewrite_target_select(
+            "SELECT id FROM orders",
+            &b(),
+            &keys,
+            &public,
+            true,
+            Dialect::Sqlite,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TargetRewriteError::PublicSubsetUndeclared(ref t) if t == "orders"),
+            "{err:?}"
+        );
+        // A table that DOES declare a subset is still confined by it under capability.
+        let out = rewrite_cap("SELECT id FROM products").unwrap();
+        assert!(
+            out.contains("products.tenant_id = 'tenant_B' AND products.published = true"),
+            "{out}"
         );
     }
 
@@ -724,6 +805,7 @@ mod tests {
             &b(),
             &keys(),
             &public(),
+            true,
             Dialect::Postgres,
         )
         .unwrap_err();
@@ -742,6 +824,7 @@ mod tests {
             &SqlValue::Text("x' OR '1'='1".to_string()),
             &keys(),
             &public(),
+            true,
             Dialect::Sqlite,
         )
         .unwrap();

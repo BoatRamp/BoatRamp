@@ -5,6 +5,23 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.4] - 2026-09-10
+
+### Changed
+- **Target axis: a `via: [capability]`-only field no longer requires a visibility `public_subset`.**
+  The target-tenant model (v0.4.3) required every target field to declare a non-empty visibility
+  predicate, confining reads/writes to `tenant = B AND <predicate>`. That fits the *anonymous* sources
+  (`domain`/`handle`), where the predicate is the only guard against reading `B`'s private rows — but
+  not the *authenticated* `capability` source, where the host-verified, audience-bound envelope (which
+  names `tid = B` and the granted scope) IS the authorization and the data isn't world-public (e.g. an
+  embed reading a specific client's own invoices within tenant `B`). A field whose source is exactly
+  `via: [capability]` is now exempt: the host confines to `tenant = B` alone and the within-tenant,
+  per-client filter stays in the guest's own query (it's within-tenant authz, not a tenancy axis). The
+  anonymous sources are unchanged — a `domain`/`handle` field (or any field reachable by one) still
+  requires the visibility subset (deny-by-default). Exactly one tenant `B`, never `all`; the exemption
+  drops only the visibility conjunct, never the `tenant = B` confinement. Applies to the `orm` reads +
+  writes (the SET-allowlist and DELETE-refusal are unchanged) and the raw-SQL AST-rewritten reads.
+
 ## [0.4.3] - 2026-09-09
 
 ### Added

@@ -1181,14 +1181,29 @@ pub(super) async fn build_bindings(
                          (add it to the project's target_eligible_fields)"
                     ));
                 }
-                // The named `public` subset MUST be declared (deny-by-default). Without this the
-                // raw-SQL marker would degrade OPEN — `tenant = B` with no visibility restriction,
-                // exposing B's private rows — so a missing/typo'd subset name is refused at bind,
-                // never bound. (The orm path is already deny-by-default per table.)
-                if schema
-                    .as_ref()
-                    .and_then(|s| s.public_subset(public))
-                    .is_none()
+                // Ruling A (5c): the visibility `public_subset` is mandatory only for an ANONYMOUS
+                // source (`domain`/`handle`) — for an unauthenticated actor the visibility predicate
+                // is the only guard against reaching B's private rows. A `via: [capability]`-only
+                // field is EXEMPT: the host-verified, audience-bound capability (naming `tid = B` +
+                // the granted scope) IS the authorization, so the confinement is `tenant = B` and the
+                // within-tenant per-client filter stays in-guest.
+                let require_public = via.iter().any(|s| {
+                    matches!(
+                        s,
+                        boatramp_core::tenancy::TargetSource::Domain
+                            | boatramp_core::tenancy::TargetSource::Handle
+                    )
+                });
+                // Under an anonymous source the named `public` subset MUST be declared
+                // (deny-by-default) — a missing/typo'd subset name would degrade the raw-SQL/orm
+                // confinement OPEN, exposing B's private rows. For a capability-only field the `public`
+                // is just a scope label matched against the capability's own grant, so a declared
+                // predicate is not required.
+                if require_public
+                    && schema
+                        .as_ref()
+                        .and_then(|s| s.public_subset(public))
+                        .is_none()
                 {
                     return Err(format!(
                         "tenancy: target route `{site}` names public subset `{public}` which the \
@@ -1240,6 +1255,8 @@ pub(super) async fn build_bindings(
                         // The effective write-allowlist: the route's grant for domain/capability,
                         // forced empty (read-only, G1) for a handle source. Raw-SQL writes refused.
                         &rt.write,
+                        // Mandatory visibility subset for anonymous sources; exempt for capability-only.
+                        require_public,
                     )),
                     // No `via` source resolved ⇒ refuse (a target route must never fall back to an
                     // own/plain — that would read the caller's own or every tenant's rows).

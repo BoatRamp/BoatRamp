@@ -389,12 +389,9 @@ pub enum TableKeys {
     #[default]
     Uniform,
     PerTable(std::collections::BTreeMap<String, ResolvedScope>),
-    /// A **target read/write** (R4/D8): the same per-table tenant keys as `PerTable`, PLUS a per-table
-    /// PUBLIC-subset confinement conjoined onto every accessed table. Deny-by-default — a table
-    /// accessed under this variant with **no** entry in `public` is refused
-    /// ([`OrmError::PublicSubsetUndeclared`]), the strict analog of an undeclared tenant key: a
-    /// target read can only ever see rows that satisfy the host-held public predicate of *each*
-    /// table it touches (root + every joined/subquery ref). Built only by the host for a
+    /// A **target read/write** (R4/D8): the same per-table tenant keys as `PerTable`, PLUS (when
+    /// [`require_public`](TableKeys::PerTableTarget::require_public)) a per-table PUBLIC-subset
+    /// confinement conjoined onto every accessed table. Built only by the host for a
     /// `TenancyClass::Target` fetch; never by a guest.
     PerTableTarget {
         keys: std::collections::BTreeMap<String, ResolvedScope>,
@@ -402,11 +399,21 @@ pub enum TableKeys {
         /// **Target WRITE SET-allowlist (5b), deny-by-default.** The columns a target INSERT/UPDATE
         /// may set. **Empty ⇒ read-only** — any write force-scoped under this variant is refused
         /// ([`OrmError::TargetWriteNotGranted`]). Non-empty ⇒ an INSERT force-stamps `tenant = B` and
-        /// the public-visibility columns and accepts ONLY these columns from the guest; an UPDATE
-        /// confines its `WHERE` to `tenant = B AND <public>` and may set ONLY these columns; a DELETE
-        /// is always refused. The tenant/visibility columns are never in this set, so a target write
-        /// can neither change ownership nor flip a row's visibility.
+        /// (when `require_public`) the public-visibility columns and accepts ONLY these columns from
+        /// the guest; an UPDATE confines its `WHERE` to `tenant = B AND <public>` and may set ONLY
+        /// these columns; a DELETE is always refused. The tenant/visibility columns are never in this
+        /// set, so a target write can neither change ownership nor flip a row's visibility.
         write: std::collections::BTreeSet<String>,
+        /// Whether a per-table PUBLIC subset is **mandatory** (R4/D8 5c ruling A). `true` for the
+        /// **anonymous** target sources (`domain`/`handle`): a table accessed with **no** declared
+        /// public subset is refused ([`OrmError::PublicSubsetUndeclared`]) — for an unauthenticated
+        /// actor the visibility predicate is the ONLY guard against reaching `B`'s private rows.
+        /// `false` for a **`capability`-only** field: the host-verified, audience-bound capability
+        /// (naming `tid = B` + the granted scope) IS the authorization, so a table with no declared
+        /// subset confines to `tenant = B` alone (no visibility conjunct, no refusal) and the app's
+        /// within-tenant per-client filter stays in-guest. A table that DOES declare a subset is still
+        /// confined by it either way. Never `all`; still exactly one tenant `B`.
+        require_public: bool,
     },
 }
 
@@ -500,22 +507,33 @@ impl Scope {
 
     /// The PUBLIC-subset confinement to conjoin for `table` under a **target read** (R4/D8):
     /// `Ok(None)` when the scope is not a target read (own/session — no public confinement, today's
-    /// behavior). Under a target read, a table with **no** declared public subset is refused
-    /// ([`OrmError::PublicSubsetUndeclared`], deny-by-default); otherwise the host-held terms are
-    /// built as a qualified `AND` (each column qualified by `qualifier` for a join/subquery ref, so
-    /// the confinement composes across every reachable table). An empty term list ⇒ no predicate
-    /// (a match-all public subset — the schema loader is responsible for rejecting an empty one).
+    /// behavior). Under a target read where `require_public` (domain/handle), a table with **no**
+    /// declared public subset is refused ([`OrmError::PublicSubsetUndeclared`], deny-by-default);
+    /// under a `capability`-only target (`!require_public`) an undeclared subset ⇒ `Ok(None)` (confine
+    /// to `tenant = B` alone — the capability is the authorization). A declared subset is built as a
+    /// qualified `AND` (each column qualified by `qualifier` for a join/subquery ref, so the
+    /// confinement composes across every reachable table) either way. An empty term list ⇒ no
+    /// predicate (a match-all public subset — the schema loader rejects an empty declared one).
     fn public_pred(
         &self,
         table: &str,
         qualifier: Option<&str>,
     ) -> Result<Option<Predicate>, OrmError> {
-        let TableKeys::PerTableTarget { public, .. } = &self.keys else {
+        let TableKeys::PerTableTarget {
+            public,
+            require_public,
+            ..
+        } = &self.keys
+        else {
             return Ok(None);
         };
-        let terms = public
-            .get(table)
-            .ok_or_else(|| OrmError::PublicSubsetUndeclared(table.to_string()))?;
+        let terms = match public.get(table) {
+            Some(t) => t,
+            // Capability-only target (ruling A): no declared subset ⇒ tenant-only confinement.
+            None if !require_public => return Ok(None),
+            // domain/handle: the visibility predicate is mandatory (deny-by-default).
+            None => return Err(OrmError::PublicSubsetUndeclared(table.to_string())),
+        };
         let mut preds = Vec::with_capacity(terms.len());
         for term in terms {
             match term {
@@ -714,14 +732,24 @@ impl Scope {
     /// literal)`, each `column IS NULL` term contributes `(column, NULL)`. A public term the host
     /// cannot pin to a single value (a range comparison, or `IS NOT NULL`) is not forceable — the
     /// host cannot guarantee publicness — so the INSERT is refused ([`PublicSubsetNotForceable`]).
-    /// Deny-by-default: a table with no declared public subset is refused ([`PublicSubsetUndeclared`]).
+    /// When `require_public` (domain/handle) a table with no declared subset is refused
+    /// ([`PublicSubsetUndeclared`]); under a `capability`-only target (`!require_public`) an undeclared
+    /// subset forces no visibility columns (the row is `tenant = B` + the guest's allowlisted columns —
+    /// the capability is the authorization).
     fn public_force_cells(&self, table: &str) -> Result<Vec<(String, SqlValue)>, OrmError> {
-        let TableKeys::PerTableTarget { public, .. } = &self.keys else {
+        let TableKeys::PerTableTarget {
+            public,
+            require_public,
+            ..
+        } = &self.keys
+        else {
             return Ok(Vec::new());
         };
-        let terms = public
-            .get(table)
-            .ok_or_else(|| OrmError::PublicSubsetUndeclared(table.to_string()))?;
+        let terms = match public.get(table) {
+            Some(t) => t,
+            None if !require_public => return Ok(Vec::new()),
+            None => return Err(OrmError::PublicSubsetUndeclared(table.to_string())),
+        };
         let mut out = Vec::with_capacity(terms.len());
         for term in terms {
             match term {
@@ -760,6 +788,7 @@ impl Scope {
             keys,
             public,
             write,
+            ..
         } = &self.keys
         else {
             return Ok(());
@@ -1244,11 +1273,14 @@ impl Update {
             for a in &self.set {
                 scope.assert_target_settable(&self.table, &a.column)?;
             }
-            // Confine to the public subset (the `tenant = B` half is added by the compiler). A target
-            // table with no declared public predicate is refused (deny-by-default).
-            match scope.public_pred(&self.table, None)? {
-                Some(pred) => conjoin_front(&mut self.filter, Some(pred)),
-                None => return Err(OrmError::PublicSubsetUndeclared(self.table.clone())),
+            // Confine to the public subset (the `tenant = B` half is added by the compiler via
+            // `single_scope_pred`). `public_pred` already enforces deny-by-default for an anonymous
+            // (`require_public`) target — a subset-less table there returns `Err(PublicSubsetUndeclared)`.
+            // A `None` here therefore means the capability-only exemption (5c ruling A): no visibility
+            // conjunct, so the UPDATE is confined to `tenant = B` alone (+ the SET-allowlist above),
+            // exactly like the capability read/INSERT paths.
+            if let Some(pred) = scope.public_pred(&self.table, None)? {
+                conjoin_front(&mut self.filter, Some(pred));
             }
         }
         self.scope = Some(scope.clone());
@@ -4158,6 +4190,7 @@ mod tests {
                 keys: keys.clone(),
                 public: public.clone(),
                 write: std::collections::BTreeSet::new(),
+                require_public: true,
             },
         })
         .unwrap();
@@ -4196,6 +4229,7 @@ mod tests {
                 keys,
                 public: BTreeMap::new(), // no public subset for secret_table
                 write: std::collections::BTreeSet::new(),
+                require_public: true,
             },
         };
         let mut q = Select::from("secret_table");
@@ -4269,6 +4303,7 @@ mod tests {
                     .iter()
                     .map(ToString::to_string)
                     .collect::<BTreeSet<_>>(),
+                require_public: true,
             },
         }
     }
@@ -4416,6 +4451,62 @@ mod tests {
         );
         assert!(sql.contains("SET title = ?"), "{sql}");
         assert!(params.contains(&t("tenant_B")), "{params:?}");
+    }
+
+    #[test]
+    fn target_update_capability_no_subset_confines_tenant_only_not_refused() {
+        // 5c ruling A: a capability-only (require_public=false) UPDATE on a table with NO declared
+        // public subset confines to `tenant = B` (+ the SET-allowlist) — NOT refused (v0.4.3 bug the
+        // review caught: it errored PublicSubsetUndeclared, breaking capability write-embeds).
+        use std::collections::{BTreeMap, BTreeSet};
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([(
+                    "invoices".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                )]),
+                public: BTreeMap::new(), // no subset for invoices
+                write: BTreeSet::from(["amount".to_string()]),
+                require_public: false, // capability
+            },
+        };
+        let mut upd = Update {
+            table: "invoices".into(),
+            set: vec![Assignment {
+                column: "amount".into(),
+                value: Expr::val(SqlValue::Integer(5)),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("inv1")),
+            scope: None,
+            returning: vec![],
+        };
+        upd.force_scope(&scope).unwrap();
+        let (sql, _params) = upd.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("tenant_id = ?"),
+            "tenant=B confinement present: {sql}"
+        );
+        assert!(!sql.contains("published"), "no visibility conjunct: {sql}");
+        assert!(sql.contains("SET amount = ?"), "{sql}");
+        // A non-allowlisted column is still refused under the exemption.
+        let mut bad = Update {
+            table: "invoices".into(),
+            set: vec![Assignment {
+                column: "tenant_id".into(),
+                value: Expr::val(t("evil")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("inv1")),
+            scope: None,
+            returning: vec![],
+        };
+        assert!(
+            bad.force_scope(&scope).is_err(),
+            "tenant column still un-settable"
+        );
     }
 
     #[test]
@@ -4577,6 +4668,7 @@ mod tests {
                     ),
                 ]),
                 write: BTreeSet::from(["note".to_string()]),
+                require_public: true,
             },
         };
         let (sql, params) =
@@ -4644,6 +4736,7 @@ mod tests {
                     ),
                 ]),
                 write: BTreeSet::from(["note".to_string()]),
+                require_public: true,
             },
         };
         // `price` isn't allowlisted; `visible` is a visibility column — both refused.

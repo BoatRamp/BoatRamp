@@ -1707,6 +1707,7 @@ mod tests {
             &schema,
             "products",
             &write.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            true,
         )))
     }
 

@@ -370,7 +370,7 @@ jobs:
           cargo test -p boatramp-server --features handlers,oidc --lib \
             plain_wasm_target \
             -- --ignored --nocapture 2>&1 | tee target-plainwasm.log
-          grep -qE 'test result: ok\. 3 passed' target-plainwasm.log \
+          grep -qE 'test result: ok\. 4 passed' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant isolation tests did not all pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET ISOLATION OK' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant READ never reached its success marker (an orm/raw-sql target-read isolation breach or a skipped test)" >&2; exit 1; }
@@ -378,6 +378,8 @@ jobs:
             || { echo "::error::plain-wasm target-tenant WRITE never reached its success marker (a target-write isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET ATTACH-REFERENCE ISOLATION OK' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant attach_reference never reached its success marker (a derived-tenant isolation breach or a skipped test)" >&2; exit 1; }
+          grep -q 'PLAIN-WASM CAPABILITY TARGET ISOLATION OK' target-plainwasm.log \
+            || { echo "::error::plain-wasm capability target never reached its success marker (a capability-exemption isolation breach or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder
