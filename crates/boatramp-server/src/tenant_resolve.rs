@@ -686,9 +686,17 @@ mod tests {
         schema.handles.insert("acme".into(), "tenant_B".into());
 
         // A capability granting tenant_B's `products` subset, redeemable at project `shop`.
-        let cap = mint_capability("tenant_B", "shop", "products", 300, now, &signer)
-            .await
-            .unwrap();
+        let cap = mint_capability(
+            "tenant_B",
+            "shop",
+            "products",
+            &Default::default(),
+            300,
+            now,
+            &signer,
+        )
+        .await
+        .unwrap();
 
         let call = |via: &[TargetSource],
                     public: &str,
