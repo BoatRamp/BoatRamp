@@ -1060,7 +1060,14 @@ pub fn verify_capability(
     expected_audience: &str,
 ) -> Result<CapabilityGrant, TokenError> {
     let claims = verify_envelope(token, public)?;
-    check_exp(&claims, now_unix)?;
+    // A capability crosses the tenant boundary, so its expiry is a HARD verify-side invariant (R5):
+    // an `exp`-less capability would never expire. `check_exp` treats an absent `exp` as "no expiry"
+    // (fine for other kinds), so require its presence here — regardless of who minted the token.
+    if check_exp(&claims, now_unix)?.is_none() {
+        return Err(TokenError::Claims(
+            "capability has no expiry (exp is mandatory for a target capability)".into(),
+        ));
+    }
     // Audience binding: a capability is redeemable ONLY at the project it names — never replayed
     // across projects. Absent or mismatched audience fails closed.
     if claims.audience.as_deref() != Some(expected_audience) {
@@ -1713,6 +1720,71 @@ mod tests {
             .await
             .is_err(),
             "over-large app-context must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_app_context_cannot_shadow_reserved_claims() {
+        use std::collections::BTreeMap;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        // A hostile issuer names app-context keys identical to the reserved top-level claims. They are
+        // nested under `br_app`, so they can NEVER shadow the real tenant/subset/kind/audience — the
+        // grant's tenant/public/audience are unaffected and the keys appear ONLY inside grant.context.
+        let evil: BTreeMap<String, String> = BTreeMap::from([
+            ("br_ctx".into(), "tenant_EVIL".into()),
+            ("br_pub".into(), "admin".into()),
+            ("br_kind".into(), "role".into()),
+            ("aud".into(), "other-project".into()),
+        ]);
+        let cap = mint_capability("tenant_B", "shop", "storefront", &evil, 300, 1000, &signer)
+            .await
+            .unwrap();
+        let grant = verify_capability(&cap, &pubkey, 1000, "shop").unwrap();
+        // The real target facts win; the shadow keys did not leak into them.
+        assert_eq!(grant.tenant, "tenant_B");
+        assert_eq!(grant.public, "storefront");
+        // The shadow values are confined to the opaque app-context.
+        assert_eq!(
+            grant.context.get("br_ctx").map(String::as_str),
+            Some("tenant_EVIL")
+        );
+        assert_eq!(
+            grant.context.get("aud").map(String::as_str),
+            Some("other-project")
+        );
+        // And the token still only redeems at its real audience.
+        assert!(verify_capability(&cap, &pubkey, 1000, "other-project").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_capability_with_no_expiry_is_refused() {
+        // Belt-and-suspenders on R5: even a fleet-signed capability that somehow carried no `exp`
+        // (a future minter / a bug) must be refused at verify — an unexpiring cross-tenant bearer is
+        // never acceptable. Forge one by signing a capability-shaped ClaimsSet WITHOUT exp.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        let claims = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(1000))
+            .cwt_id(random_cti().unwrap())
+            .audience("shop".to_string())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_CAPABILITY.to_string()),
+            )
+            .text_claim(
+                CLAIM_CTX.to_string(),
+                CborValue::Text("tenant_B".to_string()),
+            )
+            .text_claim(
+                CLAIM_PUB.to_string(),
+                CborValue::Text("storefront".to_string()),
+            )
+            .build();
+        let token = sign_claims(claims, &signer).await.unwrap();
+        assert!(
+            verify_capability(&token, &pubkey, 1000, "shop").is_err(),
+            "an exp-less capability must be refused (R5 enforced at verify)"
         );
     }
 
