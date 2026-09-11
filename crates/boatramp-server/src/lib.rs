@@ -414,6 +414,13 @@ struct HandlerRuntimeInner {
     /// `issuer` (its public half is the verify anchor). **Unset ⇒ no session cookies are issued or
     /// verified** (the R3 disjunct then has only the tenant arm — fail-safe: no anon session axis).
     session_signer: std::sync::OnceLock<Arc<dyn Signer>>,
+    /// The operator ceiling (seconds) on a guest-minted capability's TTL (R5,
+    /// PLAN-delegable-capabilities). Set at startup **only when** the `allow_guest_mint_capability`
+    /// posture is on and a positive ceiling is configured; **unset ⇒ guest capability minting is not
+    /// offered** (the `capability` binding is never attached). The fleet signer is reused from
+    /// [`session_signer`](Self::session_signer).
+    #[cfg(feature = "capability")]
+    capability_max_ttl_secs: std::sync::OnceLock<u64>,
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -481,6 +488,8 @@ impl HandlerRuntime {
                 #[cfg(feature = "session")]
                 session_store: std::sync::OnceLock::new(),
                 session_signer: std::sync::OnceLock::new(),
+                #[cfg(feature = "capability")]
+                capability_max_ttl_secs: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -631,6 +640,22 @@ impl HandlerRuntime {
     pub fn set_session_signer(&self, signer: Arc<dyn Signer>) {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.session_signer.set(signer);
+        }
+    }
+
+    /// Enable guest capability minting (`boatramp:handlers/capability`, PLAN-delegable-capabilities)
+    /// with an operator TTL ceiling (seconds). Call **only when** the `allow_guest_mint_capability`
+    /// posture is on and `max_ttl_secs > 0`; unset (or `0`) ⇒ the `capability` binding is never
+    /// attached and a guest `mint` returns `access-denied`. Minting reuses the fleet
+    /// [`set_session_signer`](Self::set_session_signer) key (a capability is verified against the same
+    /// anchor), so wire that too. No-op on a plain runtime.
+    #[cfg(feature = "capability")]
+    pub fn set_capability_minting(&self, max_ttl_secs: u64) {
+        if max_ttl_secs == 0 {
+            return;
+        }
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.capability_max_ttl_secs.set(max_ttl_secs);
         }
     }
 

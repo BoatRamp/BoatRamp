@@ -41,6 +41,16 @@ const CLAIM_CTX: &str = "br_ctx";
 /// The public-subset name a target-capability envelope grants (5c) — binds the capability to a
 /// specific declared `PublicSubset`, so a capability minted for one subset can't reach another.
 const CLAIM_PUB: &str = "br_pub";
+/// An **opaque, app-authored context** map a target-capability carries (PLAN-delegable-capabilities):
+/// integrity-protected by the fleet signature, **never interpreted by the host**, and surfaced back to
+/// the issuing guest so it can apply its own within-tenant filter (e.g. a per-client `sub`). The host
+/// treats every key/value as an opaque string.
+const CLAIM_APP: &str = "br_app";
+
+/// Bounds on the opaque app-context (R6): a capability may carry at most this many entries, and its
+/// keys+values may total at most this many bytes. Enforced at mint so a guest can't inflate a token.
+const MAX_APP_CONTEXT_ENTRIES: usize = 16;
+const MAX_APP_CONTEXT_BYTES: usize = 4096;
 
 /// Token kind: an RBAC role-bearing control-plane token (the `/api/*` bearer).
 pub const KIND_ROLE: &str = "role";
@@ -948,6 +958,41 @@ pub struct CapabilityGrant {
     /// The public-subset name (`br_pub`) the capability is scoped to — must match the route's
     /// declared `public` at bind (a capability for one subset can't be redeemed for another).
     pub public: String,
+    /// The **opaque app-authored context** (`br_app`) the issuer attached — host-carried with
+    /// integrity, **never interpreted by the host**, surfaced back to the issuing guest for its own
+    /// within-tenant filtering (e.g. a per-client `sub`). Empty when the capability carried none.
+    pub context: std::collections::BTreeMap<String, String>,
+}
+
+/// Encode an opaque app-context map as a CBOR text→text map (deterministic key order). Only present
+/// when non-empty. The host never reads the values — this is app-authored, app-read data.
+fn app_context_to_cbor(context: &std::collections::BTreeMap<String, String>) -> CborValue {
+    CborValue::Map(
+        context
+            .iter()
+            .map(|(k, v)| (CborValue::Text(k.clone()), CborValue::Text(v.clone())))
+            .collect(),
+    )
+}
+
+/// Decode the app-context from the CBOR produced by [`app_context_to_cbor`]; non-text or malformed
+/// entries are ignored (never a panic on a hostile token). Bounded on decode too (defense in depth).
+fn cbor_to_app_context(value: &CborValue) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let CborValue::Map(entries) = value else {
+        return out;
+    };
+    for (k, v) in entries.iter().take(MAX_APP_CONTEXT_ENTRIES) {
+        if let (CborValue::Text(k), CborValue::Text(v)) = (k, v) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// Total serialized size (keys + values) of an app-context, for the [`MAX_APP_CONTEXT_BYTES`] bound.
+fn app_context_bytes(context: &std::collections::BTreeMap<String, String>) -> usize {
+    context.iter().map(|(k, v)| k.len() + v.len()).sum()
 }
 
 /// Mint a host-signed **target capability** envelope (5c): `br_kind = "capability"`, the target tenant
@@ -959,11 +1004,24 @@ pub async fn mint_capability(
     target_tenant: &str,
     audience: &str,
     public_subset: &str,
+    app_context: &std::collections::BTreeMap<String, String>,
     ttl_secs: u64,
     now_unix: u64,
     signer: &dyn Signer,
 ) -> Result<String, TokenError> {
-    let claims = ClaimsSetBuilder::new()
+    // R6: the opaque app-context is bounded so a guest can't inflate a token. Enforced at mint.
+    if app_context.len() > MAX_APP_CONTEXT_ENTRIES {
+        return Err(TokenError::Claims(format!(
+            "capability app-context has {} entries (max {MAX_APP_CONTEXT_ENTRIES})",
+            app_context.len()
+        )));
+    }
+    if app_context_bytes(app_context) > MAX_APP_CONTEXT_BYTES {
+        return Err(TokenError::Claims(format!(
+            "capability app-context exceeds {MAX_APP_CONTEXT_BYTES} bytes"
+        )));
+    }
+    let mut builder = ClaimsSetBuilder::new()
         .issued_at(Timestamp::WholeSeconds(now_unix as i64))
         .cwt_id(random_cti()?)
         .audience(audience.to_string())
@@ -981,9 +1039,12 @@ pub async fn mint_capability(
         .text_claim(
             CLAIM_PUB.to_string(),
             CborValue::Text(public_subset.to_string()),
-        )
-        .build();
-    sign_claims(claims, signer).await
+        );
+    // Only carry the app-context claim when the issuer attached one.
+    if !app_context.is_empty() {
+        builder = builder.text_claim(CLAIM_APP.to_string(), app_context_to_cbor(app_context));
+    }
+    sign_claims(builder.build(), signer).await
 }
 
 /// Verify a target-capability envelope against the fleet public key at `now_unix`, requiring the
@@ -999,7 +1060,14 @@ pub fn verify_capability(
     expected_audience: &str,
 ) -> Result<CapabilityGrant, TokenError> {
     let claims = verify_envelope(token, public)?;
-    check_exp(&claims, now_unix)?;
+    // A capability crosses the tenant boundary, so its expiry is a HARD verify-side invariant (R5):
+    // an `exp`-less capability would never expire. `check_exp` treats an absent `exp` as "no expiry"
+    // (fine for other kinds), so require its presence here — regardless of who minted the token.
+    if check_exp(&claims, now_unix)?.is_none() {
+        return Err(TokenError::Claims(
+            "capability has no expiry (exp is mandatory for a target capability)".into(),
+        ));
+    }
     // Audience binding: a capability is redeemable ONLY at the project it names — never replayed
     // across projects. Absent or mismatched audience fails closed.
     if claims.audience.as_deref() != Some(expected_audience) {
@@ -1010,14 +1078,18 @@ pub fn verify_capability(
     let mut kind = None;
     let mut ctx = None;
     let mut pubname = None;
+    let mut context = std::collections::BTreeMap::new();
     for (name, value) in &claims.rest {
-        if let (coset::cwt::ClaimName::Text(t), CborValue::Text(v)) = (name, value) {
-            match t.as_str() {
-                CLAIM_KIND => kind = Some(v.clone()),
-                CLAIM_CTX => ctx = Some(v.clone()),
-                CLAIM_PUB => pubname = Some(v.clone()),
-                _ => {}
-            }
+        let coset::cwt::ClaimName::Text(t) = name else {
+            continue;
+        };
+        match (t.as_str(), value) {
+            (CLAIM_KIND, CborValue::Text(v)) => kind = Some(v.clone()),
+            (CLAIM_CTX, CborValue::Text(v)) => ctx = Some(v.clone()),
+            (CLAIM_PUB, CborValue::Text(v)) => pubname = Some(v.clone()),
+            // The opaque app-context — decoded verbatim, never interpreted by the host.
+            (CLAIM_APP, m @ CborValue::Map(_)) => context = cbor_to_app_context(m),
+            _ => {}
         }
     }
     if kind.as_deref() != Some(KIND_CAPABILITY) {
@@ -1027,6 +1099,7 @@ pub fn verify_capability(
         tenant: ctx.ok_or_else(|| TokenError::Claims("capability has no target tenant".into()))?,
         public: pubname
             .ok_or_else(|| TokenError::Claims("capability has no public subset".into()))?,
+        context,
     })
 }
 
@@ -1559,13 +1632,22 @@ mod tests {
         let pubkey = signer.public_key();
         // Mint a capability granting target tenant B's `storefront` subset, redeemable at project
         // `shop`, ttl 300 ⇒ exp 1300.
-        let cap = mint_capability("tenant_B", "shop", "storefront", 300, 1000, &signer)
-            .await
-            .unwrap();
-        // Round-trip at the right audience returns B + the granted subset name.
+        let cap = mint_capability(
+            "tenant_B",
+            "shop",
+            "storefront",
+            &Default::default(),
+            300,
+            1000,
+            &signer,
+        )
+        .await
+        .unwrap();
+        // Round-trip at the right audience returns B + the granted subset name; no app-context ⇒ empty.
         let grant = verify_capability(&cap, &pubkey, 1000, "shop").unwrap();
         assert_eq!(grant.tenant, "tenant_B");
         assert_eq!(grant.public, "storefront");
+        assert!(grant.context.is_empty(), "no app-context was minted");
         // Audience binding: presented at a DIFFERENT project ⇒ refused (no cross-project replay).
         assert!(verify_capability(&cap, &pubkey, 1000, "other-project").is_err());
         // Expired ⇒ refused.
@@ -1578,6 +1660,132 @@ mod tests {
         let ctx = mint_context("tenant_B", 300, 1000, &signer).await.unwrap();
         assert!(verify_capability(&ctx, &pubkey, 1000, "shop").is_err());
         assert!(verify_context(&cap, &pubkey, 1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn capability_carries_opaque_app_context_round_trip_and_is_bounded() {
+        use std::collections::BTreeMap;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        // The issuer (a guest) attaches an opaque per-client context; the host carries it verbatim.
+        let ctx: BTreeMap<String, String> = BTreeMap::from([
+            ("sub".into(), "client-42".into()),
+            ("plan".into(), "pro".into()),
+        ]);
+        let cap = mint_capability("tenant_B", "shop", "storefront", &ctx, 300, 1000, &signer)
+            .await
+            .unwrap();
+        // The verified grant surfaces the app-context verbatim (host never interprets it) alongside B.
+        let grant = verify_capability(&cap, &pubkey, 1000, "shop").unwrap();
+        assert_eq!(grant.tenant, "tenant_B");
+        assert_eq!(
+            grant.context.get("sub").map(String::as_str),
+            Some("client-42")
+        );
+        assert_eq!(grant.context.get("plan").map(String::as_str), Some("pro"));
+        // The context is integrity-protected: a stranger's key can't verify (so it can't be forged).
+        let stranger = LocalSigner::generate(TokenAlg::Es256);
+        assert!(verify_capability(&cap, &stranger.public_key(), 1000, "shop").is_err());
+
+        // R6 bounds are enforced at mint: too many entries, or too many bytes, are refused.
+        let too_many: BTreeMap<String, String> = (0..MAX_APP_CONTEXT_ENTRIES + 1)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        assert!(
+            mint_capability(
+                "tenant_B",
+                "shop",
+                "storefront",
+                &too_many,
+                300,
+                1000,
+                &signer
+            )
+            .await
+            .is_err(),
+            "over-many app-context entries must be refused"
+        );
+        let too_big: BTreeMap<String, String> =
+            BTreeMap::from([("big".into(), "x".repeat(MAX_APP_CONTEXT_BYTES + 1))]);
+        assert!(
+            mint_capability(
+                "tenant_B",
+                "shop",
+                "storefront",
+                &too_big,
+                300,
+                1000,
+                &signer
+            )
+            .await
+            .is_err(),
+            "over-large app-context must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_app_context_cannot_shadow_reserved_claims() {
+        use std::collections::BTreeMap;
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        // A hostile issuer names app-context keys identical to the reserved top-level claims. They are
+        // nested under `br_app`, so they can NEVER shadow the real tenant/subset/kind/audience — the
+        // grant's tenant/public/audience are unaffected and the keys appear ONLY inside grant.context.
+        let evil: BTreeMap<String, String> = BTreeMap::from([
+            ("br_ctx".into(), "tenant_EVIL".into()),
+            ("br_pub".into(), "admin".into()),
+            ("br_kind".into(), "role".into()),
+            ("aud".into(), "other-project".into()),
+        ]);
+        let cap = mint_capability("tenant_B", "shop", "storefront", &evil, 300, 1000, &signer)
+            .await
+            .unwrap();
+        let grant = verify_capability(&cap, &pubkey, 1000, "shop").unwrap();
+        // The real target facts win; the shadow keys did not leak into them.
+        assert_eq!(grant.tenant, "tenant_B");
+        assert_eq!(grant.public, "storefront");
+        // The shadow values are confined to the opaque app-context.
+        assert_eq!(
+            grant.context.get("br_ctx").map(String::as_str),
+            Some("tenant_EVIL")
+        );
+        assert_eq!(
+            grant.context.get("aud").map(String::as_str),
+            Some("other-project")
+        );
+        // And the token still only redeems at its real audience.
+        assert!(verify_capability(&cap, &pubkey, 1000, "other-project").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_capability_with_no_expiry_is_refused() {
+        // Belt-and-suspenders on R5: even a fleet-signed capability that somehow carried no `exp`
+        // (a future minter / a bug) must be refused at verify — an unexpiring cross-tenant bearer is
+        // never acceptable. Forge one by signing a capability-shaped ClaimsSet WITHOUT exp.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let pubkey = signer.public_key();
+        let claims = ClaimsSetBuilder::new()
+            .issued_at(Timestamp::WholeSeconds(1000))
+            .cwt_id(random_cti().unwrap())
+            .audience("shop".to_string())
+            .text_claim(
+                CLAIM_KIND.to_string(),
+                CborValue::Text(KIND_CAPABILITY.to_string()),
+            )
+            .text_claim(
+                CLAIM_CTX.to_string(),
+                CborValue::Text("tenant_B".to_string()),
+            )
+            .text_claim(
+                CLAIM_PUB.to_string(),
+                CborValue::Text("storefront".to_string()),
+            )
+            .build();
+        let token = sign_claims(claims, &signer).await.unwrap();
+        assert!(
+            verify_capability(&token, &pubkey, 1000, "shop").is_err(),
+            "an exp-less capability must be refused (R5 enforced at verify)"
+        );
     }
 
     #[tokio::test]

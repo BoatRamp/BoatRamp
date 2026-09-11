@@ -45,6 +45,11 @@ email = ["handlers", "boatramp-handlers/email"]
 # `ServerAdminController`. Implies `handlers`. On in batteries-included builds, off in lean.
 admin = ["handlers", "boatramp-handlers/admin"]
 
+# The guest capability-minting capability (`boatramp:handlers/capability`, PLAN-delegable-capabilities):
+# a guest mints a fleet-signed, own-project-only target capability via the `ServerCapabilityMinter`
+# (which reaches the fleet signer). Implies `handlers`. On in batteries-included builds, off in lean.
+capability = ["handlers", "boatramp-handlers/capability"]
+
 # The duplex/resumable session capability (`boatramp:handlers/session`, PLAN-session-primitive):
 # a long-lived, client-addressable, bidirectional, resumable channel the host drives via
 # event-driven re-entry over the durable async lane. Implies `handlers`. Experimental.

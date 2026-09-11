@@ -82,6 +82,12 @@ pub struct HostTenancy {
     /// `PerTableTarget` ⇒ a target read (the `orm` path confines every table per its public subset,
     /// and raw SQL is AST-rewritten by [`rewrite_target_read`](Self::rewrite_target_read)).
     keys: boatramp_core::orm::TableKeys,
+    /// The opaque, app-authored context a verified **capability** carried (its `br_app` claim) —
+    /// surfaced back to the resolver via the `target-context` binding so it can apply its own
+    /// within-tenant filter (e.g. `client_id = sub`). The host NEVER interprets it, and it is NEVER a
+    /// scope predicate. Empty for an own/session principal or an anonymous `domain`/`handle` target.
+    /// (PLAN-delegable-capabilities Stage D.)
+    target_context: std::collections::BTreeMap<String, String>,
 }
 
 impl HostTenancy {
@@ -122,6 +128,7 @@ impl HostTenancy {
             read,
             write,
             keys: boatramp_core::orm::TableKeys::Uniform,
+            target_context: std::collections::BTreeMap::new(),
         }
     }
 
@@ -197,7 +204,29 @@ impl HostTenancy {
                 write: write.iter().cloned().collect(),
                 require_public,
             },
+            target_context: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Attach the verified capability's opaque app-context (its `br_app` claim) to a target
+    /// principal — a builder so the common (empty) path and every test caller need not name it. The
+    /// production dispatch calls this with the resolved capability's context; it is surfaced to the
+    /// guest via the `target-context` binding for its own within-tenant filtering, and is NEVER a
+    /// scope predicate nor interpreted by the host. (PLAN-delegable-capabilities Stage D.)
+    #[must_use]
+    pub fn with_target_context(
+        mut self,
+        context: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.target_context = context;
+        self
+    }
+
+    /// The opaque, app-authored context a verified capability carried (empty otherwise) — surfaced to
+    /// the guest via the `target-context` binding for its own within-tenant filtering. Never a scope
+    /// predicate, never interpreted by the host. (PLAN-delegable-capabilities Stage D.)
+    pub fn target_context(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.target_context
     }
 
     /// The resolved principal's fact set (axis-tagged). The host **carries** this down an in-project

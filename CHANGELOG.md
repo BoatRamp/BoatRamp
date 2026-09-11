@@ -5,6 +5,50 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.5] - 2026-09-11
+
+### Added
+- **Delegable, attenuable capabilities — a guest can mint a fleet-signed target capability
+  (`boatramp:handlers/capability`).** This completes boatramp's target-tenant axis into an
+  object-capability primitive: a project **attenuates a bounded slice of its own authority** into a
+  signed bearer it hands to a third party (an embed / share link / chain handoff), which redeems it on
+  a `via: [capability]` route to read (or, with a grant, write) tenant `B`'s subset. The primitive
+  stands on its own — share links, delegated agent-to-agent tokens, scoped third-party access all fall
+  out of it. Security-sensitive; shipped behind a Security-Engineer review to convergence **and** a
+  CI-hard live gate on a real engine.
+  - **Mint (attenuation), deny-by-default.** A guest with the `capability` grant calls
+    `mint-capability(target-tenant, public-subset, app-context, ttl)`; the host signs it with the fleet
+    key. The audience is **host-forced to the guest's own project** (the guest never names it, so a
+    token is never redeemable elsewhere), the TTL is **clamped to an operator ceiling**
+    (`max_guest_capability_ttl_secs`), and minting is off unless the `allow_guest_mint_capability`
+    posture is on (off under `multi-tenant`). The guest never sees the signing key.
+  - **The attenuation ceiling is enforced at redeem, not mint.** `resolve_target_via` already binds
+    `audience == project`, requires the capability's subset to equal an **operator-declared,
+    target-eligible** route's `public`, and takes the write-allowlist from the **route** (the
+    capability carries none) — so a minted token is inert anywhere the operator didn't open a matching
+    route. A guest can never mint past the operator's declaration, for another project, or for more
+    than the project already holds. `exp` is now a hard **verify-side** requirement for a capability (a
+    capability that ever lacked an expiry would be an unexpiring cross-tenant bearer — refused).
+  - **Opaque app-context + read-back (`boatramp:handlers/target-context`).** The capability carries an
+    opaque, size-bounded app-authored context (e.g. a per-client `sub`) the host **never interprets**;
+    at redeem the resolver reads it back via `target-context` to apply its own **within-tenant** filter
+    (`client_id = sub`) in-guest. Only the app-authored context round-trips — the host-forced tenant
+    `B` is never exposed, preserving guest-blindness for host facts. `sub` stays an in-guest filter,
+    never a tenancy axis.
+- The live gate proves the full round-trip on a real libsql engine: mint → cross-project-inert redeem →
+  `sub` surfaced (never `B`) → the host confines the read to tenant `B` → the guest's `client_id = sub`
+  filter narrows to the one client **within** `B` (never tenant `A`'s row that shares the same
+  `client_id`) — the host-tenancy floor and the in-guest per-client authz compose.
+
+### Changed
+- **A target write to a `TenantOrSession` (anonymous-session-keyed) table is now refused
+  (fail-closed).** A target principal carries only the target tenant `B` (no session fact), so such a
+  write could only stamp `tenant = B` — silently claiming an anon/session-owned row for `B` and
+  breaking the anon→promotion model. It is refused early and self-describingly across every target-write
+  path (INSERT / UPDATE), with a backstop at the tenant-stamp chokepoint. Ruling: a resolver mixing a
+  target-tenant write and anon-session writes must **split** — the session-keyed rows are written on the
+  own/session path, never under a target scope.
+
 ## [0.4.4] - 2026-09-10
 
 ### Changed

@@ -366,11 +366,13 @@ jobs:
       - name: Live plain-wasm target-tenant read + write isolation on a real libsql engine
         run: |
           set -eo pipefail
-          # Both plain-wasm target gates: the READ isolation (5a) and the WRITE isolation (5b).
+          # The plain-wasm target gates: READ isolation (5a), WRITE isolation (5b), attach_reference,
+          # the capability-only exemption, and the delegable-capability context round-trip (v0.4.5:
+          # mint -> redeem surfaces sub -> read-back -> in-guest client filter, on a real engine).
           cargo test -p boatramp-server --features handlers,oidc --lib \
             plain_wasm_target \
             -- --ignored --nocapture 2>&1 | tee target-plainwasm.log
-          grep -qE 'test result: ok\. 4 passed' target-plainwasm.log \
+          grep -qE 'test result: ok\. 5 passed' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant isolation tests did not all pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET ISOLATION OK' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant READ never reached its success marker (an orm/raw-sql target-read isolation breach or a skipped test)" >&2; exit 1; }
@@ -380,6 +382,8 @@ jobs:
             || { echo "::error::plain-wasm target-tenant attach_reference never reached its success marker (a derived-tenant isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'PLAIN-WASM CAPABILITY TARGET ISOLATION OK' target-plainwasm.log \
             || { echo "::error::plain-wasm capability target never reached its success marker (a capability-exemption isolation breach or a skipped test)" >&2; exit 1; }
+          grep -q 'PLAIN-WASM CAPABILITY CONTEXT ROUNDTRIP OK' target-plainwasm.log \
+            || { echo "::error::plain-wasm capability context round-trip never reached its success marker (a mint/redeem/read-back regression, a cross-project redeem, or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

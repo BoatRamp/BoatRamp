@@ -23,6 +23,8 @@ use boatramp_core::Storage;
 #[cfg(feature = "admin")]
 pub mod admin;
 pub mod blobstore;
+#[cfg(feature = "capability")]
+pub mod capability;
 #[cfg(feature = "email")]
 pub mod email;
 #[cfg(feature = "graphql")]
@@ -38,6 +40,8 @@ pub mod orm;
 pub mod session;
 #[cfg(feature = "sql")]
 pub mod sql;
+#[cfg(feature = "sql")]
+pub mod target_context;
 pub mod wasi_logging;
 
 /// The per-site capability handles for one handler invocation.
@@ -77,6 +81,10 @@ pub struct Bindings {
     /// the granted config surfaces. `None` = admin not granted.
     #[cfg(feature = "admin")]
     admin: Option<admin::AdminBinding>,
+    /// The `capability` grant (mint a fleet-signed target capability): the project-scoped minter +
+    /// the operator TTL ceiling. `None` = capability minting not granted.
+    #[cfg(feature = "capability")]
+    capability: Option<capability::CapabilityBinding>,
     /// The `session` grant (duplex/resumable session): the controller bound to the current
     /// session. `None` = session not granted.
     #[cfg(feature = "session")]
@@ -147,6 +155,22 @@ impl Bindings {
     #[cfg(feature = "sql")]
     pub(crate) fn tenancy(&self) -> Option<crate::tenant::HostTenancy> {
         self.tenancy.clone()
+    }
+
+    /// The resolved TARGET capability's opaque app-context for this invocation as `(key, value)`
+    /// pairs (empty when there is no capability target) — the data the `target-context` binding hands
+    /// back to a resolver (Stage D). Only the app-authored context; never the host-forced tenant `B`.
+    #[cfg(feature = "sql")]
+    pub(crate) fn tenancy_target_context(&self) -> Vec<(String, String)> {
+        self.tenancy
+            .as_ref()
+            .map(|t| {
+                t.target_context()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The granted blob binding, if any.
@@ -326,6 +350,30 @@ impl Bindings {
     #[cfg(feature = "admin")]
     pub(crate) fn admin(&self) -> Option<&admin::AdminBinding> {
         self.admin.as_ref()
+    }
+
+    /// Grant the `capability` capability: `minter` signs a target capability (reaching the fleet
+    /// key host-side), `project` is host-stamped as the token's forced audience, and `max_ttl_secs`
+    /// is the operator ceiling the mint clamps to. The guest mints a bounded, own-project-only token.
+    #[cfg(feature = "capability")]
+    pub fn with_capability(
+        mut self,
+        project: impl Into<String>,
+        minter: Arc<dyn capability::CapabilityMinter>,
+        max_ttl_secs: u64,
+    ) -> Self {
+        self.capability = Some(capability::CapabilityBinding {
+            project: project.into(),
+            minter,
+            max_ttl_secs,
+        });
+        self
+    }
+
+    /// The granted capability binding, if any.
+    #[cfg(feature = "capability")]
+    pub(crate) fn capability(&self) -> Option<&capability::CapabilityBinding> {
+        self.capability.as_ref()
     }
 
     /// Bind the `session` grant: the controller for the current session (host-bound, so the guest

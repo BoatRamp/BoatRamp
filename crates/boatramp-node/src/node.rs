@@ -228,6 +228,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     if let Some(issuer) = options.issuer.clone() {
         handlers.set_session_signer(issuer);
     }
+    // Enable guest capability minting (`boatramp:handlers/capability`, PLAN-delegable-capabilities)
+    // when the operator posture allows it. A minted capability is verified against the same fleet
+    // signer as the session cookie (wired just above), so this only enables the mint path + the TTL
+    // ceiling; posture-off (or a zero ceiling) ⇒ not offered (a guest `mint` is access-denied).
+    #[cfg(feature = "capability")]
+    if options.posture.allow_guest_mint_capability {
+        handlers.set_capability_minting(options.posture.max_guest_capability_ttl_secs);
+    }
     // Wire the guest project self-config capability (`boatramp:handlers/admin`) when the
     // operator posture enables at least one surface. The controller reuses the same in-process
     // domain-verify / email-profile / secret / site-config subsystems + the real domain probe;

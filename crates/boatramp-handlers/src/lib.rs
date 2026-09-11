@@ -18,6 +18,8 @@ pub mod tenant;
 
 #[cfg(feature = "admin")]
 pub use bindings::admin::{AdminController, AdminError, DomainChallenge, Surface as AdminSurface};
+#[cfg(feature = "capability")]
+pub use bindings::capability::{CapabilityBinding, CapabilityMinter};
 #[cfg(feature = "email")]
 pub use bindings::email::{EmailSpool, LettreBackend, OutboundEmail, SmtpBackend};
 #[cfg(feature = "graphql")]

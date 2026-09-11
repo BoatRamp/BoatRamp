@@ -120,6 +120,8 @@ impl SecurityProfile {
                 require_domain_verification: true,
                 allow_env_secret_refs: false,
                 allow_guest_email: false,
+                allow_guest_mint_capability: false,
+                max_guest_capability_ttl_secs: 900,
                 allow_guest_admin_domains: false,
                 allow_guest_admin_email: false,
                 allow_guest_admin_site: false,
@@ -147,6 +149,8 @@ impl SecurityProfile {
                 require_domain_verification: true,
                 allow_env_secret_refs: true,
                 allow_guest_email: true,
+                allow_guest_mint_capability: true,
+                max_guest_capability_ttl_secs: 3600,
                 allow_guest_admin_domains: true,
                 allow_guest_admin_email: true,
                 allow_guest_admin_site: true,
@@ -175,6 +179,8 @@ impl SecurityProfile {
                 require_domain_verification: false,
                 allow_env_secret_refs: true,
                 allow_guest_email: true,
+                allow_guest_mint_capability: true,
+                max_guest_capability_ttl_secs: 3600,
                 allow_guest_admin_domains: true,
                 allow_guest_admin_email: true,
                 allow_guest_admin_site: true,
@@ -257,6 +263,12 @@ pub struct PostureOverrides {
     /// Permit a guest handler/function's `email` capability to send. Off under
     /// `multi-tenant`; on under `single-tenant`/`dev`.
     pub allow_guest_email: Option<bool>,
+    /// Permit a guest's `capability` capability to MINT fleet-signed target-capability tokens
+    /// (PLAN-delegable-capabilities). Off under `multi-tenant`; on under `single-tenant`/`dev`.
+    pub allow_guest_mint_capability: Option<bool>,
+    /// The operator's ceiling on the TTL (seconds) a guest-minted capability may request (R5). A
+    /// mint requesting more is clamped to this value.
+    pub max_guest_capability_ttl_secs: Option<u64>,
     /// Permit a guest's `admin` capability to manage the project's domains.
     pub allow_guest_admin_domains: Option<bool>,
     /// Permit a guest's `admin` capability to manage the project's SMTP email profiles.
@@ -406,6 +418,16 @@ impl SecurityConfig {
             o.allow_guest_email.is_some(),
         );
         row(
+            "allow_guest_mint_capability",
+            p.allow_guest_mint_capability.to_string(),
+            o.allow_guest_mint_capability.is_some(),
+        );
+        row(
+            "max_guest_capability_ttl_secs",
+            p.max_guest_capability_ttl_secs.to_string(),
+            o.max_guest_capability_ttl_secs.is_some(),
+        );
+        row(
             "allow_guest_admin_domains",
             p.allow_guest_admin_domains.to_string(),
             o.allow_guest_admin_domains.is_some(),
@@ -520,6 +542,18 @@ pub struct SecurityPosture {
     /// to the SSRF rule (a private/loopback relay is refused unless
     /// [`allow_guest_private_egress`](Self::allow_guest_private_egress) is on).
     pub allow_guest_email: bool,
+    /// Permit a **guest**'s `capability` capability to MINT fleet-signed target-capability tokens
+    /// (`boatramp:handlers/capability`, PLAN-delegable-capabilities). A minted token is bounded:
+    /// its audience is host-forced to the guest's OWN project (never redeemable elsewhere), its TTL
+    /// is clamped to [`max_guest_capability_ttl_secs`](Self::max_guest_capability_ttl_secs), and its
+    /// power is fully gated at redeem by the operator's target-eligible route config (a token is inert
+    /// anywhere no matching `via:[capability]` route is opened). Off under `multi-tenant` (an untrusted
+    /// tenant can't mint); on under `single-tenant`/`dev`. When off, the binding is absent and `mint`
+    /// returns `access-denied`.
+    pub allow_guest_mint_capability: bool,
+    /// The operator's ceiling (seconds) on a guest-minted capability's TTL (R5). A `mint` requesting a
+    /// larger TTL is clamped to this; `0` disables minting (any request is refused). Defaults to 1h.
+    pub max_guest_capability_ttl_secs: u64,
     /// Permit a **guest**'s `admin` capability to manage the project's **domains** (add /
     /// verify / attach-verified / remove) via `boatramp:handlers/admin`. Off under
     /// `multi-tenant`, on under `single-tenant`/`dev`. Per-surface + operator-set (a tenant
@@ -616,6 +650,12 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_email {
         base.allow_guest_email = v;
+    }
+    if let Some(v) = o.allow_guest_mint_capability {
+        base.allow_guest_mint_capability = v;
+    }
+    if let Some(v) = o.max_guest_capability_ttl_secs {
+        base.max_guest_capability_ttl_secs = v;
     }
     if let Some(v) = o.allow_guest_admin_domains {
         base.allow_guest_admin_domains = v;

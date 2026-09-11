@@ -848,6 +848,16 @@ impl HandlerEngine {
         bindings::admin::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::admin::AdminHost::new(state.bindings.admin())
         })?;
+        #[cfg(feature = "capability")]
+        bindings::capability::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::capability::CapabilityHost::new(state.bindings.capability())
+        })?;
+        #[cfg(feature = "sql")]
+        bindings::target_context::add_to_linker(&mut linker, |state: &mut HostState| {
+            bindings::target_context::TargetContextHost::new(
+                state.bindings.tenancy_target_context(),
+            )
+        })?;
         #[cfg(feature = "session")]
         bindings::session::add_to_linker(&mut linker, |state: &mut HostState| {
             bindings::session::SessionHost::new(state.bindings.session())

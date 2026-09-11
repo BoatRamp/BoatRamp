@@ -244,6 +244,7 @@ const KNOWN_IMPORTS: &[&str] = &[
     "invoke",
     "graphql",
     "email",
+    "capability",
     "wasi:http",
     "wasi:io",
     "wasi:keyvalue",
