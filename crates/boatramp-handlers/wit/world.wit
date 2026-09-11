@@ -587,6 +587,58 @@ world email-host {
   import email-sender;
 }
 
+/// Value types for the `capability` capability: a guest **mints a fleet-signed target capability**
+/// (PLAN-delegable-capabilities). The project attenuates a bounded slice of its OWN authority into a
+/// signed bearer it can hand to a third party (an embed/share client). The token is bounded — its
+/// audience is host-forced to the guest's own project (never redeemable elsewhere), its TTL is clamped
+/// to the operator ceiling, and it carries an opaque, size-bounded app-context the host never
+/// interprets — and its power is fully gated at redeem by the operator's target-eligible route config.
+/// Deny-by-default: an ungranted guest (or posture-off) has no binding and `mint` returns
+/// `access-denied`. The guest never sees the fleet signing key.
+interface capability-types {
+  /// A request to mint a target capability. The audience is NOT named here — the host forces it to
+  /// the minting project.
+  record mint-request {
+    /// The target tenant `B` the capability grants access to (the app's tenant tag). Redeemable only
+    /// within the minting project, over that project's own data.
+    target-tenant: string,
+    /// The public-subset name the capability is scoped to; must match a redeeming route's declared
+    /// `public` (use the reserved tenant-only subset for a capability-only field).
+    public-subset: string,
+    /// Opaque, app-authored context (e.g. a per-client `sub`) carried with integrity and handed back
+    /// to the resolver — the host never interprets it. Bounded by the host (entries + total bytes).
+    app-context: list<tuple<string, string>>,
+    /// Requested lifetime in seconds; the host clamps it to the operator's max.
+    ttl-seconds: u64,
+  }
+
+  /// Why a mint failed.
+  variant mint-error {
+    /// The `capability` capability was not granted, or the `allow_guest_mint_capability` posture is
+    /// off (deny-by-default).
+    access-denied,
+    /// The request was malformed (empty tenant/subset, a zero TTL, or an over-bounded app-context).
+    invalid-request(string),
+    /// The host failed to sign the token.
+    failed(string),
+  }
+}
+
+/// The `capability` capability: mint a fleet-signed target capability redeemable only at this guest's
+/// OWN project. The returned string is the encoded token (an opaque bearer to hand to a client).
+interface capability-minter {
+  use capability-types.{mint-request, mint-error};
+
+  /// Mint a bounded, fleet-signed target capability. The audience is host-forced to this project; the
+  /// TTL is clamped to the operator ceiling; the app-context is size-bounded.
+  mint: func(request: mint-request) -> result<string, mint-error>;
+}
+
+/// The capability-minting world (imported into request handlers / functions).
+world capability-host {
+  import capability-minter;
+}
+
 /// Value types for the `admin` capability: a guest **reconfigures its own project** (add a
 /// domain, set an SMTP profile, write site config, write a secret) without a boatramp token.
 /// The grant is conferred at deploy time (per-surface `admin:<surface>` import + the operator's

@@ -56,6 +56,7 @@ default = [
   "orm-subquery",
   "email",
   "admin",
+  "capability",
   "session",
   "cluster",
   "operator",
@@ -179,6 +180,15 @@ email = ["handlers", "boatramp-node/email", "boatramp-server/email"]
 # Implies `handlers`; forwards to the node + server `admin` features. In the batteries-included
 # default; drop it for a build with no guest self-config.
 admin = ["handlers", "boatramp-node/admin", "boatramp-server/admin"]
+# The guest capability-minting capability (`boatramp:handlers/capability`, PLAN-delegable-capabilities)
+# — a guest mints a fleet-signed, own-project-only target capability (audience host-forced, TTL-clamped,
+# deny-by-default). Implies `handlers`; forwards to the node + server `capability` features. In the
+# batteries-included default; drop it for a build with no guest capability minting.
+capability = [
+  "handlers",
+  "boatramp-node/capability",
+  "boatramp-server/capability",
+]
 session = ["handlers", "boatramp-server/session"]
 # Self-hosted **cluster mode** (`boatramp serve --mode cluster`): embedded Raft
 # over the HTTP peer mesh, durable per-node Raft stores, and the RaftKv /

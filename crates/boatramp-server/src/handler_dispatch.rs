@@ -1388,6 +1388,24 @@ pub(super) async fn build_bindings(
             bindings = bindings.with_admin(controller.scoped(project), surfaces);
         }
     }
+    // Guest capability minting (`boatramp:handlers/capability`, PLAN-delegable-capabilities): a guest
+    // mints a fleet-signed target capability redeemable ONLY at its own project. Granted when the site
+    // allows `capability`, the handler imports it, the operator posture set a positive TTL ceiling (via
+    // `set_capability_minting` at startup, gated by `allow_guest_mint_capability`), AND the fleet signer
+    // is wired. The audience is host-forced to `project` by the binding; the TTL is clamped to the
+    // ceiling. Deny-by-default: absent any of these, no binding is attached and `mint` is access-denied.
+    #[cfg(feature = "capability")]
+    if granted("capability") {
+        if let (Some(max_ttl), Some(signer)) = (
+            inner.capability_max_ttl_secs.get(),
+            inner.session_signer.get(),
+        ) {
+            let minter = std::sync::Arc::new(ServerCapabilityMinter {
+                signer: signer.clone(),
+            });
+            bindings = bindings.with_capability(project.as_str(), minter, *max_ttl);
+        }
+    }
     // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested
     // import, but host-side observability. Tagged by `site` (so a site's live + preview output
     // aggregates under it), rate-capped per the site's `maxLogRate`, and correlated with the
@@ -1793,6 +1811,41 @@ mod sql_grant_tests {
         // A site-side `sql:*` is not a concrete name — the site must enumerate — so it grants
         // nothing named even to a wildcard handler.
         assert!(granted_sql_databases(&v(&["sql:*"]), &v(&["sql:*"])).is_empty());
+    }
+}
+
+/// The host-side capability minter (PLAN-delegable-capabilities): signs a target capability with the
+/// fleet [`Signer`](boatramp_core::cose::Signer), stamping the audience to the minting project. The
+/// audience host-forcing (R1), the TTL clamp (R5), and the app-context bounds (R6) are enforced by the
+/// [`CapabilityBinding`](boatramp_handlers::CapabilityBinding) before this is called; `mint_capability`
+/// re-checks the context bounds authoritatively.
+#[cfg(feature = "capability")]
+struct ServerCapabilityMinter {
+    signer: Arc<dyn boatramp_core::cose::Signer>,
+}
+
+#[cfg(feature = "capability")]
+#[async_trait::async_trait]
+impl boatramp_handlers::CapabilityMinter for ServerCapabilityMinter {
+    async fn mint(
+        &self,
+        project: &str,
+        target_tenant: &str,
+        public_subset: &str,
+        app_context: &std::collections::BTreeMap<String, String>,
+        ttl_secs: u64,
+    ) -> Result<String, String> {
+        boatramp_core::cose::mint_capability(
+            target_tenant,
+            project, // audience = the minting project (host-forced by the binding, R1)
+            public_subset,
+            app_context,
+            ttl_secs,
+            boatramp_core::time::now_unix(),
+            self.signer.as_ref(),
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 }
 

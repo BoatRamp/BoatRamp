@@ -89,6 +89,14 @@ email = ["handlers", "boatramp-server/email"]
 # ServerAdminController at startup for the posture-enabled surfaces. Enables the server's
 # `admin` feature (which pulls `boatramp-handlers/admin`); implies handlers.
 admin = ["handlers", "boatramp-server/admin", "boatramp-handlers/admin"]
+# The guest capability-minting capability (`boatramp:handlers/capability`,
+# PLAN-delegable-capabilities): the node enables minting at startup when the posture allows, reusing
+# the fleet session signer. Enables the server's `capability` feature; implies handlers.
+capability = [
+  "handlers",
+  "boatramp-server/capability",
+  "boatramp-handlers/capability",
+]
 s3 = ["dep:boatramp-storage", "boatramp-storage/s3"]
 slatedb = ["dep:boatramp-storage", "boatramp-storage/slatedb"]
 tls = []
