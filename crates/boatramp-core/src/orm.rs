@@ -698,6 +698,14 @@ impl Scope {
                 if matches!(self.mode, ScopeMode::All) {
                     return Ok(None);
                 }
+                // A TARGET write carries only the target tenant `B` (no session fact). Stamping
+                // `tenant = B` onto a session-keyed row would silently claim an anon/session-owned row
+                // for `B` and break the anon→promotion model, so refuse deny-by-default
+                // (PLAN-delegable-capabilities, Stage A): a `TenantOrSession` table is written on the
+                // caller's own/session-scoped path, never under a target scope.
+                if self.is_target() {
+                    return Err(OrmError::TargetWriteToSessionTable(table.to_string()));
+                }
                 // Prefer the tenant axis when authenticated; else the session axis for an anon write.
                 if let Some(v) = self.value.clone() {
                     Ok(Some((tenant, v)))
@@ -725,6 +733,24 @@ impl Scope {
             TableKeys::PerTableTarget { write, .. } => Some(write),
             _ => None,
         }
+    }
+
+    /// Refuse a **target** write to a `TenantOrSession` (anonymous-session-keyed) table. A target
+    /// principal carries only the target tenant `B` (no session fact), so such a row could only be
+    /// stamped `tenant = B` — silently claiming an anon/session-owned row for `B` and breaking the
+    /// anon→promotion model. Called at the top of every target-write path (INSERT/UPDATE) so the
+    /// refusal is **early and self-describing** rather than surfacing later as a public-subset error;
+    /// a no-op for an own scope (a `TenantOrSession` write on the own/session path is legitimate).
+    /// `write_target` keeps the equivalent guard as a fail-closed backstop.
+    /// (PLAN-delegable-capabilities, Stage A.)
+    fn assert_target_table_writable(&self, table: &str) -> Result<(), OrmError> {
+        if !self.is_target() {
+            return Ok(());
+        }
+        if let ResolvedScope::TenantOrSession { .. } = self.resolve_table(table)? {
+            return Err(OrmError::TargetWriteToSessionTable(table.to_string()));
+        }
+        Ok(())
     }
 
     /// The `(column, value)` pairs a target **INSERT** must force so the inserted row lands in
@@ -1024,6 +1050,9 @@ impl Insert {
         scope: &Scope,
         empty_allowlist: bool,
     ) -> Result<(), OrmError> {
+        // A target write may not touch a TenantOrSession (anon-session) table — refuse early and
+        // self-describingly, before the allowlist/public-subset checks (Stage A).
+        scope.assert_target_table_writable(&self.table)?;
         if empty_allowlist {
             return Err(OrmError::TargetWriteNotGranted(self.table.clone()));
         }
@@ -1267,6 +1296,8 @@ impl Update {
     /// flip a row in or out of the public subset. A read-only target (empty allowlist) is refused.
     pub fn force_scope(&mut self, scope: &Scope) -> Result<(), OrmError> {
         if let Some(allow) = scope.target_write_allowlist() {
+            // A target write may not touch a TenantOrSession (anon-session) table (Stage A).
+            scope.assert_target_table_writable(&self.table)?;
             if allow.is_empty() {
                 return Err(OrmError::TargetWriteNotGranted(self.table.clone()));
             }
@@ -1380,6 +1411,14 @@ pub enum OrmError {
     /// plain `VALUES` INSERT / a confined UPDATE — the rest are refused (deny-by-default).
     #[error("tenancy: unsupported target write shape ({0}); target writes are a plain INSERT or a confined UPDATE only")]
     TargetWriteUnsupported(&'static str),
+    /// A target write (INSERT/UPDATE) touched a `TenantOrSession` (anonymous-session-keyed) table. A
+    /// target principal carries only the target tenant `B` (no session fact), so the host cannot write
+    /// such a row session-scoped — it could only stamp `tenant = B`, which would silently claim an
+    /// anon/session-owned row for `B` and break the anon→promotion model. Refused deny-by-default:
+    /// write a `TenantOrSession` table on the caller's own/session-scoped path, never under a target
+    /// scope. (PLAN-delegable-capabilities, Stage A.)
+    #[error("tenancy: target write may not touch TenantOrSession table {0:?} (no session fact under a target scope — write it on the session-scoped path)")]
+    TargetWriteToSessionTable(String),
 }
 
 /// The compiled statement: `?N` SQL plus its bound parameters, in placeholder order.
@@ -4398,6 +4437,69 @@ mod tests {
         assert!(
             matches!(err, OrmError::TargetWriteNotGranted(ref t) if t == "products"),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn target_write_to_a_tenant_or_session_table_is_refused() {
+        use std::collections::{BTreeMap, BTreeSet};
+        // `state_scope` is a TenantOrSession (anon-session) table. A target principal carries only
+        // tenant B (no session fact), so a target write here could only stamp `tenant = B` — silently
+        // claiming an anon/session-owned row for B and breaking anon→promotion. It must be refused
+        // early + self-describingly (Stage A), NOT surfaced as a public-subset error and NOT silently
+        // stamped. Both INSERT and UPDATE are covered.
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([(
+                    "state_scope".to_string(),
+                    ResolvedScope::TenantOrSession {
+                        tenant: "tenant_id".to_string(),
+                        session: "session_id".to_string(),
+                    },
+                )]),
+                public: BTreeMap::new(),
+                write: BTreeSet::from(["note".to_string()]),
+                require_public: true,
+            },
+        };
+        // INSERT
+        let mut ins = Insert {
+            table: "state_scope".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "note".into(),
+                    value: Expr::val(t("x")),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        let err = ins.force_scope(Some(&scope), Some(&scope)).unwrap_err();
+        assert!(
+            matches!(err, OrmError::TargetWriteToSessionTable(ref x) if x == "state_scope"),
+            "INSERT should refuse a target write to a TenantOrSession table: {err:?}"
+        );
+        // UPDATE
+        let mut upd = Update {
+            table: "state_scope".into(),
+            set: vec![Assignment {
+                column: "note".into(),
+                value: Expr::val(t("y")),
+            }],
+            filter: cmp("id", CmpOp::Eq, t("s1")),
+            scope: None,
+            returning: vec![],
+        };
+        let err = upd.force_scope(&scope).unwrap_err();
+        assert!(
+            matches!(err, OrmError::TargetWriteToSessionTable(ref x) if x == "state_scope"),
+            "UPDATE should refuse a target write to a TenantOrSession table: {err:?}"
         );
     }
 
