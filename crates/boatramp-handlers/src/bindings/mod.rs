@@ -40,6 +40,8 @@ pub mod orm;
 pub mod session;
 #[cfg(feature = "sql")]
 pub mod sql;
+#[cfg(feature = "sql")]
+pub mod target_context;
 pub mod wasi_logging;
 
 /// The per-site capability handles for one handler invocation.
@@ -153,6 +155,22 @@ impl Bindings {
     #[cfg(feature = "sql")]
     pub(crate) fn tenancy(&self) -> Option<crate::tenant::HostTenancy> {
         self.tenancy.clone()
+    }
+
+    /// The resolved TARGET capability's opaque app-context for this invocation as `(key, value)`
+    /// pairs (empty when there is no capability target) — the data the `target-context` binding hands
+    /// back to a resolver (Stage D). Only the app-authored context; never the host-forced tenant `B`.
+    #[cfg(feature = "sql")]
+    pub(crate) fn tenancy_target_context(&self) -> Vec<(String, String)> {
+        self.tenancy
+            .as_ref()
+            .map(|t| {
+                t.target_context()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The granted blob binding, if any.

@@ -639,6 +639,24 @@ world capability-host {
   import capability-minter;
 }
 
+/// The `target-context` capability (PLAN-delegable-capabilities Stage D): a resolver reads back the
+/// opaque app-context a verified TARGET **capability** carried (its `br_app` claim — e.g. a per-client
+/// `sub`), so it can apply its OWN within-tenant filter (`client_id = sub`). The host-forced target
+/// tenant `B` is **never** exposed — only the app-authored context round-trips, preserving
+/// guest-blindness for host facts. No grant is required (it returns only the guest's own signed
+/// context); the empty list means the request was not resolved via a capability target
+/// (own / session / domain / handle).
+interface target-context {
+  /// The verified capability's app-context for this invocation, as `(key, value)` pairs (empty when
+  /// there is no capability target).
+  get: func() -> list<tuple<string, string>>;
+}
+
+/// The target-context world (imported into request handlers / subgraph resolvers).
+world target-context-host {
+  import target-context;
+}
+
 /// Value types for the `admin` capability: a guest **reconfigures its own project** (add a
 /// domain, set an SMTP profile, write site config, write a secret) without a boatramp token.
 /// The grant is conferred at deploy time (per-surface `admin:<surface>` import + the operator's

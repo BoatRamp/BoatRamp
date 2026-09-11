@@ -1247,17 +1247,22 @@ pub(super) async fn build_bindings(
                     )
                 });
                 match (resolved, schema.as_ref()) {
-                    (Some(rt), Some(sc)) => Some(boatramp_handlers::HostTenancy::target(
-                        boatramp_core::sql::SqlValue::Text(rt.value),
-                        boatramp_core::tenancy::AccessMode::Own,
-                        sc,
-                        public,
-                        // The effective write-allowlist: the route's grant for domain/capability,
-                        // forced empty (read-only, G1) for a handle source. Raw-SQL writes refused.
-                        &rt.write,
-                        // Mandatory visibility subset for anonymous sources; exempt for capability-only.
-                        require_public,
-                    )),
+                    (Some(rt), Some(sc)) => Some(
+                        boatramp_handlers::HostTenancy::target(
+                            boatramp_core::sql::SqlValue::Text(rt.value),
+                            boatramp_core::tenancy::AccessMode::Own,
+                            sc,
+                            public,
+                            // The effective write-allowlist: the route's grant for domain/capability,
+                            // forced empty (read-only, G1) for a handle source. Raw-SQL writes refused.
+                            &rt.write,
+                            // Mandatory visibility subset for anonymous sources; exempt for capability-only.
+                            require_public,
+                        )
+                        // The verified capability's opaque app-context (empty for domain/handle),
+                        // surfaced to the resolver via `target-context` for its within-tenant filter.
+                        .with_target_context(rt.context),
+                    ),
                     // No `via` source resolved ⇒ refuse (a target route must never fall back to an
                     // own/plain — that would read the caller's own or every tenant's rows).
                     _ => {

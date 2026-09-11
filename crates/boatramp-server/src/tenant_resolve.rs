@@ -142,6 +142,11 @@ pub(crate) async fn resolve_host_tenancy(
 pub(crate) struct ResolvedTarget {
     pub value: String,
     pub write: Vec<String>,
+    /// The opaque, app-authored context carried by a verified **capability** (its `br_app` claim) —
+    /// handed back to the resolver for its own within-tenant filter (e.g. a per-client `sub`), never
+    /// interpreted by the host. Empty for the anonymous `domain`/`handle` sources (which carry no
+    /// app-context). (PLAN-delegable-capabilities Stage D.)
+    pub context: std::collections::BTreeMap<String, String>,
 }
 
 /// Resolve the target tenant `B` from the first applicable [`TargetSource`] in `via`
@@ -181,6 +186,7 @@ pub(crate) fn resolve_target_via(
                     return Some(ResolvedTarget {
                         value: ctx.to_string(),
                         write: route_write.to_vec(),
+                        context: std::collections::BTreeMap::new(),
                     });
                 }
             }
@@ -195,6 +201,9 @@ pub(crate) fn resolve_target_via(
                             return Some(ResolvedTarget {
                                 value: grant.tenant,
                                 write: route_write.to_vec(),
+                                // Hand the capability's opaque app-context back to the resolver
+                                // (Stage D) — the host never interprets it.
+                                context: grant.context,
                             });
                         }
                     }
@@ -214,6 +223,7 @@ pub(crate) fn resolve_target_via(
                     return Some(ResolvedTarget {
                         value: ctx.to_string(),
                         write: Vec::new(), // G1: a handle is always read-only.
+                        context: std::collections::BTreeMap::new(),
                     });
                 }
             }
