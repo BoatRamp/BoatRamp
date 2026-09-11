@@ -1641,6 +1641,182 @@ mod tests {
         );
     }
 
+    /// **Live** proof (Stages B→C→D, PLAN-delegable-capabilities) that the delegable-capability
+    /// round-trip works end to end on a real libsql engine: a capability carrying an opaque app-context
+    /// (`sub`) is redeemed on a `via:[capability]` route → the host confines the read to `tenant = B`
+    /// AND surfaces `sub` back to the guest via `HostTenancy::target_context` (never the tenant `B`
+    /// itself) → the guest's own in-guest `client_id = sub` filter narrows within B, and crucially
+    /// never reaches tenant A's row that happens to share the same `client_id`. Plus the negative
+    /// control: the same capability is INERT at another project (no cross-project redeem). `#[ignore]`d
+    /// (static-musl libsql segfault); the `test-target-plain-wasm` CI job runs it + greps the marker.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn plain_wasm_target_capability_context_roundtrips_sub_on_a_real_engine() {
+        use boatramp_core::cose::{mint_capability, LocalSigner, Signer, TokenAlg};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, TableScope, TargetSource, TenancySchema};
+        use boatramp_handlers::HostTenancy;
+        use std::collections::BTreeMap;
+
+        // Real engine: tenant B has two clients (cli_1, cli_2); tenant A is a DIFFERENT tenant whose
+        // row shares client_id cli_1 — the host `tenant = B` floor must exclude it regardless.
+        let dir =
+            std::env::temp_dir().join(format!("boatramp-target-capctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "shop", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE invoices (id TEXT PRIMARY KEY, tenant_id TEXT, client_id TEXT, amount INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, client, amount) in [
+                ("b1", "tenant_B", "cli_1", 10i64),
+                ("b2", "tenant_B", "cli_2", 20),
+                ("a1", "tenant_A", "cli_1", 99), // SAME client_id, different tenant — must never leak
+            ] {
+                tx.execute(
+                    "INSERT INTO invoices (id, tenant_id, client_id, amount) VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(client.into()),
+                        SqlValue::Integer(amount),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // MINT (Stage C outcome): a capability for tenant B, redeemable at project `shop`, carrying the
+        // opaque per-client context sub=cli_1. `shop` is the audience the mint binding host-forces.
+        let signer = LocalSigner::generate(TokenAlg::Es256);
+        let anchor = signer.public_key();
+        let app_context = BTreeMap::from([("sub".to_string(), "cli_1".to_string())]);
+        let cap = mint_capability(
+            "tenant_B",
+            "shop",
+            "client-invoices",
+            &app_context,
+            300,
+            1000,
+            &signer,
+        )
+        .await
+        .unwrap();
+
+        // `invoices` is a Tenant table with no declared public subset (a capability-only field).
+        let schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("invoices".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+
+        // REDEEM (Stage B verify + resolve): the capability resolves tenant B AND surfaces the context.
+        let rt = resolve_target_via(
+            &[TargetSource::Capability],
+            "client-invoices", // route public label, matched against the capability's grant
+            &[],               // read-only route
+            &schema,
+            None,
+            Some(cap.as_str()),
+            Some(&anchor),
+            None,
+            "shop",
+            1000,
+        )
+        .expect("the capability resolves at its own project");
+        assert_eq!(rt.value, "tenant_B", "redeem resolves tenant B");
+        assert_eq!(
+            rt.context.get("sub").map(String::as_str),
+            Some("cli_1"),
+            "the opaque sub is surfaced from the verified capability"
+        );
+
+        // Negative control: the SAME capability is inert at a DIFFERENT project (no cross-project redeem).
+        assert!(
+            resolve_target_via(
+                &[TargetSource::Capability],
+                "client-invoices",
+                &[],
+                &schema,
+                None,
+                Some(cap.as_str()),
+                Some(&anchor),
+                None,
+                "other-project",
+                1000,
+            )
+            .is_none(),
+            "a capability minted for `shop` must not resolve at `other-project`"
+        );
+
+        // Build the target principal + carry the app-context (Stage D), exactly as dispatch does.
+        let ht = HostTenancy::target(
+            SqlValue::Text(rt.value.clone()),
+            AccessMode::Own,
+            &schema,
+            "client-invoices",
+            &rt.write,
+            false, // capability-only: no visibility subset
+        )
+        .with_target_context(rt.context.clone());
+
+        // READ-BACK (Stage D): the guest reads sub; the host-forced tenant B is NEVER exposed.
+        let ctx = ht.target_context();
+        assert_eq!(ctx.get("sub").map(String::as_str), Some("cli_1"));
+        assert!(
+            !ctx.values().any(|v| v == "tenant_B") && !ctx.contains_key("tenant_id"),
+            "the read-back exposes ONLY the app-context, never the host-forced tenant B: {ctx:?}"
+        );
+
+        // (1) Host confinement: an unfiltered read returns ALL of tenant B (both clients), never A.
+        let unfiltered = ht
+            .rewrite_target_read("SELECT id FROM invoices", Dialect::Sqlite)
+            .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        assert_eq!(
+            run_text_rows(tx.as_mut(), &unfiltered, &[]).await,
+            vec!["b1".to_string(), "b2".to_string()],
+            "host confines to tenant B across clients: {unfiltered}"
+        );
+        tx.commit().await.unwrap();
+
+        // (2) The guest applies its OWN per-client filter using the read-back sub → only cli_1's row
+        // within B (b1). The host `tenant = B` floor still excludes tenant A's a1 despite the SAME
+        // client_id — proving the two-layer isolation (host tenancy + in-guest authz) composes.
+        let sub = ctx.get("sub").unwrap();
+        let filtered = ht
+            .rewrite_target_read(
+                &format!("SELECT id FROM invoices WHERE client_id = '{sub}'"),
+                Dialect::Sqlite,
+            )
+            .unwrap();
+        assert!(
+            filtered.contains("invoices.tenant_id = 'tenant_B'") && filtered.contains("client_id"),
+            "both the host tenant floor and the guest client filter are present: {filtered}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        assert_eq!(
+            run_text_rows(tx.as_mut(), &filtered, &[]).await,
+            vec!["b1".to_string()],
+            "the in-guest sub filter narrows to cli_1 WITHIN B (b1), never tenant A's a1: {filtered}"
+        );
+        tx.commit().await.unwrap();
+
+        println!(
+            "PLAIN-WASM CAPABILITY CONTEXT ROUNDTRIP OK: a capability carrying an opaque sub redeems to \
+             tenant B (inert cross-project), surfaces sub via target-context (never leaking B), the host \
+             confines the read to tenant B, and the guest's in-guest client_id = sub filter narrows to \
+             the one client within B (never tenant A's same-client_id row), on a real libsql engine"
+        );
+    }
+
     /// Run a compiled `(sql, params)` returning the single text column, sorted.
     async fn run_text_rows(
         tx: &mut dyn boatramp_core::sql::SqlTransaction,
