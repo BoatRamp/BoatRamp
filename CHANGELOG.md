@@ -5,6 +5,30 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.6] - 2026-09-12
+
+### Added
+- **`graphql::run` propagates the caller's resolved principal to federated sub-fetches — the async lane
+  can now drive a tenant-scoped supergraph read/write with no request bearer.** Previously a guest's
+  `graphql::run` forwarded only the caller's *bearer*; a federated sub-fetch to a function subgraph
+  carried no in-site tenant, so an `own`-scoped resolver reached this way failed closed. It now carries
+  the caller's host-resolved **principal** (the axis-tagged fact set), exactly as `emit::invoke` does —
+  so a subgraph resolver reached over the supergraph inherits the caller's tenancy and runs `own`-scoped.
+  This unblocks background components (message consumers, jobs, workflow steps) that resolve their own
+  tenant via [`TenantSource::SignedContext`] and then delegate a tenant-scoped transition through a
+  `public` GraphQL resolver — no bearer to carry. Axis-preserving (an inherited `Target`/`Session` fact
+  keeps its axis), so it never widens a scope; the GraphQL data-connector's row policy still governs
+  SQL-backed subgraphs, and the external `/graphql` gateway is unchanged. Security-reviewed to
+  convergence + a CI-hard live gate proving the round-trip over a compiled subgraph on a real engine
+  (a principal-carrying `graphql::run` reads only tenant B's rows; with no principal it fails closed).
+
+### Fixed
+- **Doc: `TenantSource::SignedContext` is not reserved — it has been wired since v0.4.3.** The variant's
+  doc-comment still said "resolution is not yet wired … fails closed until it lands", which is stale: the
+  producer host-stamps its verified own-tenant onto an outgoing message/job at publish, and a consumer
+  declaring `sources: [signed_context]` resolves it (verified against the fleet anchor). Corrected so
+  async-lane components aren't misled into thinking the source is unavailable.
+
 ## [0.4.5] - 2026-09-11
 
 ### Added

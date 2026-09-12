@@ -1343,7 +1343,10 @@ pub(super) async fn build_bindings(
     // next hop against the depth budget shared with invoke.
     if granted("graphql") {
         if let Some(runner) = inner.federation_runner.get() {
-            bindings = bindings.with_graphql(runner.scoped(project), depth);
+            // Propagate the handler's resolved principal so a `graphql::run` sub-fetch inherits its
+            // tenancy (symmetric to `with_invoke` above), rather than failing closed on an `own` op.
+            bindings =
+                bindings.with_graphql(runner.scoped(project, handler_caller_tenant.clone()), depth);
         }
     }
     // Per-project SMTP email gateway: a handler may submit a finished message to one

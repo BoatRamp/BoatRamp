@@ -525,6 +525,14 @@ impl SubgraphFetcher for BackendRouter {
 pub(crate) struct FederationRunner {
     runtime: std::sync::Weak<crate::HandlerRuntimeInner>,
     project: String,
+    /// The caller's host-resolved **principal** (the axis-tagged fact set), propagated onto every
+    /// federated sub-fetch so a subgraph resolver reached via `graphql::run` inherits the caller's
+    /// tenancy — symmetric to how `emit::invoke` inherits it (PLAN-async-lane-propagation). This is
+    /// what lets a background `signed_context`-resolved consumer drive a tenant-scoped write through a
+    /// `public` resolver on the async lane (no request bearer to carry). Empty ⇒ no inherited
+    /// principal (an `own` sub-fetch then fails closed, the pre-v0.4.6 behavior). Host-carried +
+    /// axis-preserving (a `Target`/`Session` fact keeps its axis), so it never widens a scope.
+    caller_tenant: Vec<boatramp_handlers::ScopeFact>,
 }
 
 impl FederationRunner {
@@ -533,18 +541,23 @@ impl FederationRunner {
         Self {
             runtime,
             project: boatramp_core::project::DEFAULT_PROJECT.to_string(),
+            caller_tenant: Vec::new(),
         }
     }
 
-    /// A runner scoped to `project` (all registry/plan/execute lookups are project-qualified),
-    /// as the guest grant needs — mirrors the invoker's per-tenant scoping.
+    /// A runner scoped to `project` (all registry/plan/execute lookups are project-qualified) and
+    /// carrying the caller's resolved `caller_tenant` principal — mirrors the invoker's per-tenant
+    /// scoping ([`FunctionInvoker::scoped`](crate::function_runtime)), so a `graphql::run` sub-fetch
+    /// inherits the caller's tenancy exactly like an `emit::invoke` callee does.
     pub(crate) fn scoped(
         &self,
         project: boatramp_core::project::ProjectRef<'_>,
+        caller_tenant: Vec<boatramp_handlers::ScopeFact>,
     ) -> std::sync::Arc<dyn boatramp_handlers::SupergraphRunner> {
         std::sync::Arc::new(Self {
             runtime: self.runtime.clone(),
             project: project.as_str().to_string(),
+            caller_tenant,
         })
     }
 }
@@ -626,9 +639,16 @@ impl boatramp_handlers::SupergraphRunner for FederationRunner {
             .as_deref()
             .map(|raw| strip_bearer(raw).to_string());
         let router = BackendRouter::new(
-            // A federated sub-fetch doesn't propagate an in-site tenant (the GDC row policy governs
-            // data); a scoped sibling fail-closes for an `own` op.
-            invoker.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()),
+            // Propagate the caller's resolved principal onto federated sub-fetches, so a subgraph
+            // resolver reached via `graphql::run` inherits the caller's tenancy (an `own` field runs
+            // as the caller's tenant) — symmetric to `emit::invoke`. Empty ⇒ an `own` sub-fetch fails
+            // closed (pre-v0.4.6). The GDC's own row policy still governs SQL-backed subgraphs; this
+            // only supplies the inherited principal to function subgraphs. Axis-preserving (a target
+            // fact stays target), so it never widens a scope. (PLAN-async-lane-propagation.)
+            invoker.scoped(
+                boatramp_core::project::ProjectRef::new(project),
+                self.caller_tenant.clone(),
+            ),
             project.to_string(),
             inner.sql.clone(),
             sql_subgraphs,

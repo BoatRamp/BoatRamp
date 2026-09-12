@@ -723,7 +723,10 @@ pub(super) async fn build_function_bindings(
     // that itself runs an op counts against the shared cap).
     if granted("graphql") {
         if let Some(runner) = inner.federation_runner.get() {
-            bindings = bindings.with_graphql(runner.scoped(project), depth);
+            // Propagate the caller's resolved principal so a `graphql::run` sub-fetch inherits the
+            // caller's tenancy (symmetric to `with_invoke` above) — the async lane's own-scoped
+            // supergraph writes then resolve instead of failing closed.
+            bindings = bindings.with_graphql(runner.scoped(project, caller_tenant.clone()), depth);
         }
     }
     // Per-project SMTP email gateway: a function may submit a finished message to
