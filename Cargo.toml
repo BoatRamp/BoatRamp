@@ -36,6 +36,7 @@ exclude = [
   "examples/handlers/graphql-accounts",
   "examples/handlers/graphql-reviews",
   "examples/handlers/graphql-agent",
+  "examples/handlers/graphql-scope-probe",
   "examples/compose/edge",
   "examples/compose/plugin",
   "crates/boatramp-console",
