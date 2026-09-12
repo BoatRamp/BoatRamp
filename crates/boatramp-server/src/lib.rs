@@ -3381,7 +3381,7 @@ mod tests {
             .federation_runner
             .get()
             .unwrap()
-            .scoped(ProjectRef::new("default"));
+            .scoped(ProjectRef::new("default"), Vec::new());
 
         let req = |query: &str| GraphqlRequest {
             query: Some(query.to_string()),

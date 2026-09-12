@@ -33,9 +33,14 @@ pub enum TenantSource {
     /// ([`crate::project::DomainOwner`]'s context). Storefront / public-render paths — no
     /// app-side `Host`→slug lookup.
     Domain,
-    /// A host-verifiable signed context token carried on a job/message (async workers).
-    /// **Reserved**: declared for completeness; resolution is not yet wired, so a function that
-    /// requires "own" via this source fails closed until it lands (never runs unscoped).
+    /// A host-verifiable signed-context envelope carried on a job/message — the **async-lane "own"**
+    /// (message consumers, cron, webhooks, workflow steps, fan-out workers), the async analog of
+    /// `Token`. The producer's verified own-tenant is host-stamped onto the outgoing
+    /// message/invoke at publish (guest-blind, [`boatramp_core::cose::mint_context`]); a consumer
+    /// declaring this source resolves that tenant by verifying the envelope against the fleet anchor.
+    /// A forged/expired/absent envelope resolves no value ⇒ an "own" op fails closed (never
+    /// unscoped). The guest never names a tenant. Wired since v0.4.3 (producer-stamp at publish +
+    /// consumer resolution in `tenant_resolve.rs`).
     SignedContext,
     /// Truly anonymous / non-token auth (funnel reads, HMAC webhooks): there is no "own" tenant,
     /// so only the `null`/`all` access modes are meaningful (an "own" mode fails closed).
