@@ -384,6 +384,20 @@ jobs:
             || { echo "::error::plain-wasm capability target never reached its success marker (a capability-exemption isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'PLAIN-WASM CAPABILITY CONTEXT ROUNDTRIP OK' target-plainwasm.log \
             || { echo "::error::plain-wasm capability context round-trip never reached its success marker (a mint/redeem/read-back regression, a cross-project redeem, or a skipped test)" >&2; exit 1; }
+      - name: Live graphql::run principal-propagation on a real libsql engine (v0.4.6)
+        run: |
+          set -eo pipefail
+          # v0.4.6 (PLAN-async-lane-propagation): a compiled subgraph function reached via the REAL
+          # FederationRunner inherits the caller's resolved principal (returns only tenant B's rows);
+          # with no principal it fails closed. Proves the async lane can drive a tenant-scoped
+          # supergraph read/write with no request bearer, symmetric to emit::invoke.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            graphql_run_propagates_caller_principal_to_a_scoped_subfetch \
+            -- --ignored --nocapture 2>&1 | tee gqlprop.log
+          grep -qE 'test result: ok\. 1 passed' gqlprop.log \
+            || { echo "::error::graphql::run propagation test did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'GRAPHQL-RUN PRINCIPAL PROPAGATION OK' gqlprop.log \
+            || { echo "::error::graphql::run principal propagation never reached its success marker (a propagation regression, a widening, or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

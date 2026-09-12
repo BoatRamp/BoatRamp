@@ -3423,6 +3423,170 @@ mod tests {
         ));
     }
 
+    /// **Live gate (v0.4.6, PLAN-async-lane-propagation):** `graphql::run` propagates the caller's
+    /// resolved **principal** to a federated sub-fetch, so a subgraph resolver reached over the
+    /// supergraph with NO request bearer still resolves its own-tenancy from the inherited principal
+    /// (symmetric to `emit::invoke`). Drives the REAL `FederationRunner` → invoke → engine over a REAL
+    /// libsql-backed subgraph function (`graphql-scope-probe`, whose `items` field is host-scoped via
+    /// the `{scope}` marker): running as tenant B returns ONLY B's rows; running with no principal
+    /// fails closed (the pre-v0.4.6 behavior — never a leak). `#[ignore]`d (static-musl libsql
+    /// segfault); the CI job runs it on the host toolchain + greps the marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI graphql-propagation gate"]
+    async fn graphql_run_propagates_caller_principal_to_a_scoped_subfetch() {
+        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::function::{
+            Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, ScopeAxis, Tenancy, TenantSource};
+        use boatramp_handlers::{GraphqlRequest, HandlerEngine, Limits, ScopeFact};
+
+        // The compiled subgraph probe: its one root field `items` is host-tenancy-scoped
+        // (`SELECT id FROM items WHERE {scope}`), so its response reveals which tenant the host
+        // resolved for it, and it fails closed with no principal.
+        const PROBE: &[u8] = include_bytes!("../tests/fixtures/graphql-scope-probe.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // A real per-site libsql backend; seed tenant A + B rows in the probe's OWN function DB
+        // (`fn/<name>` — the exact identity `build_function_bindings` opens for `sql_query::open("")`).
+        let sql_dir = std::env::temp_dir().join(format!("br-gqlprop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        let db = backends
+            .database("default", "fn/scopeprobe", "")
+            .await
+            .unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, tenant_id TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant) in [("a1", "tenant_A"), ("b1", "tenant_B"), ("b2", "tenant_B")] {
+                tx.execute(
+                    "INSERT INTO items (id, tenant_id) VALUES (?1, ?2)",
+                    &[SqlValue::Text(id.into()), SqlValue::Text(tenant.into())],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = Arc::new(backends);
+
+        // Deploy the probe as an invocable subgraph function, scoped on `tenant_id` (read own). The
+        // declared source is irrelevant on the INHERITED path — the principal comes from the caller.
+        let hash = sha256_hex(PROBE);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(PROBE)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let function = Function {
+            name: "scopeprobe".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: FunctionConfig {
+                imports: vec!["sql".into()],
+                tenancy: Some(Tenancy::Scoped {
+                    column: "tenant_id".into(),
+                    sources: vec![TenantSource::None],
+                    read: AccessMode::Own,
+                    write: AccessMode::None,
+                }),
+                ..Default::default()
+            },
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        // Register it as a subgraph (default Function backend) + safelist the op.
+        crate::graphql_registry::publish(
+            kv.as_ref(),
+            "default",
+            "scopeprobe",
+            "type Query { items: [Item!]! }\ntype Item @key(fields: \"id\") { id: ID! }",
+        )
+        .await
+        .unwrap();
+        let query = "{ items { id } }";
+        let op_hash = crate::graphql_apq::sha256_hex(query);
+        kv.put(
+            &format!("hapq/default/{op_hash}"),
+            query.as_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage, Some(sql), None);
+        rt.set_invoker(deploy.clone());
+        let fed = rt
+            .inner
+            .as_ref()
+            .unwrap()
+            .federation_runner
+            .get()
+            .unwrap()
+            .clone();
+        let req = || GraphqlRequest {
+            query: Some(query.to_string()),
+            persisted_hash: None,
+            variables: "{}".to_string(),
+            operation_name: None,
+            authorization: None,
+        };
+
+        // (1) Propagation: run as tenant B → the subgraph inherits B → returns ONLY B's rows.
+        let runner_b = fed.scoped(
+            ProjectRef::new("default"),
+            vec![ScopeFact {
+                axis: ScopeAxis::Tenant,
+                value: SqlValue::Text("tenant_B".into()),
+            }],
+        );
+        let body_b = String::from_utf8_lossy(&runner_b.run(req(), 0).await.unwrap()).into_owned();
+        assert!(
+            body_b.contains("\"b1\"") && body_b.contains("\"b2\"") && !body_b.contains("\"a1\""),
+            "graphql::run propagated principal B → the subgraph read ONLY tenant B's rows: {body_b}"
+        );
+
+        // (2) Control: run with NO principal → the subgraph's own read fails closed → no rows leak
+        // (the pre-v0.4.6 behavior for the empty-caller_tenant path).
+        let runner_empty = fed.scoped(ProjectRef::new("default"), Vec::new());
+        let body_none =
+            String::from_utf8_lossy(&runner_empty.run(req(), 0).await.unwrap()).into_owned();
+        assert!(
+            !body_none.contains("\"a1\"")
+                && !body_none.contains("\"b1\"")
+                && !body_none.contains("\"b2\""),
+            "with NO propagated principal the subgraph fails closed — no rows leak: {body_none}"
+        );
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!(
+            "GRAPHQL-RUN PRINCIPAL PROPAGATION OK: graphql::run carried the caller's resolved principal \
+             (tenant B) to a federated subgraph sub-fetch, which resolved its own-tenancy from the \
+             inherited principal and returned ONLY tenant B's rows over a real libsql engine; with no \
+             principal the same sub-fetch failed closed (no rows) — the async lane can drive a \
+             tenant-scoped supergraph read/write with no request bearer, symmetric to emit::invoke"
+        );
+    }
+
     /// Tenant isolation (Step 7a): the background scheduler fans out over every
     /// project, so a **non-default** project's queued async invocation is drained
     /// and metered **within that project** — never leaking into `default`. Before
