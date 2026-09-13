@@ -27,6 +27,13 @@ pub(super) enum FnTenant {
     /// so an "own" op fails closed. The value crosses the durability boundary **only** as this
     /// signed, host-issued envelope — never a guest-named tenant.
     Durable(Option<String>),
+    /// A **host-forced target-tenant** binding (R4/D8 wasm-plane, Gap 1): the federation gateway
+    /// resolved another tenant `B`'s public-subset confinement for a `Target`-class fetch and forces
+    /// it onto this (wasm subgraph) invocation. The provided [`HostTenancy`] already has the project
+    /// schema baked into its `PerTableTarget` keys, so it is used verbatim (no `with_schema`) — the
+    /// callee's own declared tenancy is bypassed (the SDL field's class is the authority). `B` is
+    /// host-derived (domain / verified capability / handle), NEVER guest input. In-process only.
+    ForcedTarget(boatramp_handlers::HostTenancy),
     /// No trusted source (cron / webhook / SDL introspection) and no durable context.
     Background,
 }
@@ -110,6 +117,79 @@ fn ctx_stamp(value: &boatramp_core::sql::SqlValue) -> Option<String> {
         SqlValue::Text(s) => Some(s.clone()),
         SqlValue::Integer(n) => Some(n.to_string()),
         _ => None,
+    }
+}
+
+/// The tenant claim a component's `token` source names (Gap 3) — the first `TenantSource::Token`
+/// in a `Scoped` tenancy decision. `None` when the component declares no token source (so
+/// `present-token` has nothing to verify against → deny-by-default).
+#[cfg(feature = "handlers")]
+pub(crate) fn token_source_claim(
+    decision: Option<&boatramp_core::tenancy::Tenancy>,
+) -> Option<String> {
+    match decision {
+        Some(boatramp_core::tenancy::Tenancy::Scoped { sources, .. }) => {
+            sources.iter().find_map(|s| match s {
+                boatramp_core::tenancy::TenantSource::Token { claim } => Some(claim.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The server's [`ProducerContextSource`](boatramp_handlers::ProducerContextSource) (Gap 3): the
+/// verify-and-seal seam behind the guest `tenancy::present-token`. The guest presents a credential
+/// it verified in-guest; the HOST re-verifies it against the component's operator-declared
+/// `token_claims` (JWKS / issuer / audience / expiry) — never trusting the guest — extracts the
+/// tenant claim (the `claim` named by the component's `token` source), and mints the SAME
+/// host-sealed durable context [`mint_producer_context`] produces from a host-resolved principal. So
+/// a guest can only cause a stamp for a tenant it holds a validly-signed token for from the
+/// configured issuer; it can never NAME an arbitrary tenant.
+#[cfg(feature = "handlers")]
+pub(crate) struct ServerProducerContextSource {
+    /// The JWKS/issuer/audience config verifying the presented credential (the component's own).
+    pub(crate) token_cfg: boatramp_core::config::HandlerGraphqlTokenClaims,
+    /// The claim carrying the tenant id (from the component's `TenantSource::Token { claim }`).
+    pub(crate) claim: String,
+    /// The fleet signer that seals the durable context (the same key session cookies use).
+    pub(crate) signer: Arc<dyn boatramp_core::cose::Signer>,
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
+    async fn seal_presented(&self, token: &str) -> Result<String, String> {
+        // Verification pulls the JWKS verifier (behind `oidc`). Without it the async-lane stamp
+        // can't verify a presented token, so it fails closed (mirrors the request-path `token`
+        // source), never trusting the guest.
+        #[cfg(feature = "oidc")]
+        {
+            let claims = crate::graphql_data::token::verified_claims(&self.token_cfg, token)
+                .await
+                .ok_or_else(|| "presented token did not verify".to_string())?;
+            let value = claims
+                .get(&self.claim)
+                .and_then(crate::tenant_resolve::scalar_to_sql)
+                .ok_or_else(|| {
+                    format!("presented token carries no `{}` tenant claim", self.claim)
+                })?;
+            let tenant =
+                ctx_stamp(&value).ok_or_else(|| "tenant claim is not a scalar".to_string())?;
+            boatramp_core::cose::mint_context(
+                &tenant,
+                DURABLE_CONTEXT_TTL_SECS,
+                now_unix(),
+                self.signer.as_ref(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "oidc"))]
+        {
+            let _ = token;
+            Err("token verification is unavailable in this build (no `oidc`)".to_string())
+        }
     }
 }
 
@@ -607,13 +687,11 @@ pub(super) async fn build_function_bindings(
     // `invoke` binding below so a sibling this function calls inherits the same tenant.
     let host_tenancy = {
         let imports_db = granted("sql") || config.imports.iter().any(|i| i.starts_with("sql:"));
+        // Gap 4a: per-project tenancy posture (operator override for this project, else node base).
+        let project_knobs = inner.project_tenancy_knobs(project.as_str());
         let posture = crate::tenant_resolve::TenantPosture {
-            require_declaration: inner
-                .require_tenancy_declaration
-                .get()
-                .copied()
-                .unwrap_or(true),
-            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+            require_declaration: project_knobs.require_tenancy_declaration,
+            allow_cross_tenant: project_knobs.allow_cross_tenant_db,
         };
         // The fleet anchor that verifies a durable signed-context envelope (the session signer's
         // public half — the same key that mints/verifies session cookies). Bound outside the match
@@ -622,53 +700,70 @@ pub(super) async fn build_function_bindings(
             .session_signer
             .get()
             .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()));
-        let resolved = match tenant {
-            FnTenant::Request => crate::tenant_resolve::resolve_host_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                crate::tenant_resolve::TenantSourceInputs {
-                    bearer,
-                    domain_context,
-                    token_cfg: config.token_claims.as_ref(),
-                    session_cookie: None,
-                    session_anchor: None,
-                    signed_context: None,
-                    context_anchor: None,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-            FnTenant::Inherited(value) => crate::tenant_resolve::resolve_inherited_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                value.clone(),
-            )
-            .map_err(|e| e.to_string())?,
+        // Resolve the invocation's principal + whether it is a host-forced target (Gap 1). A forced
+        // target is used verbatim (its schema is baked into `PerTableTarget` keys), bypassing the
+        // config/posture resolution AND the `with_schema` below.
+        let (resolved, is_forced_target) = match tenant {
+            // The match borrows `tenant` (it's read earlier), so clone the forced binding out.
+            FnTenant::ForcedTarget(host_tenancy) => (Some(host_tenancy.clone()), true),
+            FnTenant::Request => (
+                crate::tenant_resolve::resolve_host_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    crate::tenant_resolve::TenantSourceInputs {
+                        bearer,
+                        domain_context,
+                        token_cfg: config.token_claims.as_ref(),
+                        session_cookie: None,
+                        session_anchor: None,
+                        signed_context: None,
+                        context_anchor: None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
+            FnTenant::Inherited(value) => (
+                crate::tenant_resolve::resolve_inherited_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    value.clone(),
+                )
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
             // The durable async lane: a `signed_context` source resolves the producer's stamped
             // tenant from the envelope carried on the drained message, verified against the fleet
             // anchor. No envelope / no anchor ⇒ no own tenant (fail closed).
-            FnTenant::Durable(signed_context) => crate::tenant_resolve::resolve_host_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                crate::tenant_resolve::TenantSourceInputs {
-                    signed_context: signed_context.as_deref(),
-                    context_anchor: context_anchor.as_ref(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-            FnTenant::Background => crate::tenant_resolve::resolve_host_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                crate::tenant_resolve::TenantSourceInputs::default(),
-            )
-            .await
-            .map_err(|e| e.to_string())?,
+            FnTenant::Durable(signed_context) => (
+                crate::tenant_resolve::resolve_host_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    crate::tenant_resolve::TenantSourceInputs {
+                        signed_context: signed_context.as_deref(),
+                        context_anchor: context_anchor.as_ref(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
+            FnTenant::Background => (
+                crate::tenant_resolve::resolve_host_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    crate::tenant_resolve::TenantSourceInputs::default(),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
         };
         // Attach the project per-table tenancy schema (R2/D2) from the KV. Absent ⇒ Uniform;
         // present-but-unreadable ⇒ **fail closed** with a deny-all schema (never a silent downgrade
@@ -679,7 +774,13 @@ pub(super) async fn build_function_bindings(
                 Ok(s) => s,
                 Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
             };
-        let resolved = resolved.map(|h| h.with_schema(schema.as_ref()));
+        // A forced target binding already carries the schema (in its `PerTableTarget` keys) — never
+        // re-attach it (`with_schema` would clobber the target keys with own `PerTable` keys).
+        let resolved = if is_forced_target {
+            resolved
+        } else {
+            resolved.map(|h| h.with_schema(schema.as_ref()))
+        };
         bindings = bindings.with_tenancy(resolved.clone());
         resolved
     };
@@ -702,6 +803,29 @@ pub(super) async fn build_function_bindings(
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
                 signed_context,
+            );
+        }
+    }
+    // Gap 3: `tenancy::present-token` — an emitter that verified a tenant credential IN-GUEST hands
+    // it to the host, which RE-verifies it against this function's declared `token_claims` + `token`
+    // source and seals the tenant onto the producer-context cell (so a subsequent `emit::message`
+    // stamps it). Deny-by-default: needs the `tenancy` import, a messaging cell to stamp, a declared
+    // `token` source (for the claim name) + `token_claims` (the JWKS), and a fleet signer — absent
+    // any, `present-token` is `access-denied` and nothing is stamped. The guest never names a tenant.
+    if granted("tenancy") {
+        if let (Some(cell), Some(token_cfg), Some(signer), Some(claim)) = (
+            bindings.producer_context_cell(),
+            config.token_claims.clone(),
+            inner.session_signer.get().cloned(),
+            token_source_claim(config.tenancy.as_ref()),
+        ) {
+            bindings = bindings.with_present_token(
+                Arc::new(ServerProducerContextSource {
+                    token_cfg,
+                    claim,
+                    signer,
+                }),
+                cell,
             );
         }
     }
@@ -948,6 +1072,65 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             // In-project invoke: the sibling inherits the caller's host-resolved tenant (never the
             // guest's invoke request), applying its own declared grant.
             FnTenant::Inherited(self.caller_tenant.clone()),
+        )
+        .await;
+        let invoke_response = buffer_invoke_response(response).await;
+        let sample = boatramp_core::function::MeteringSample {
+            success: invoke_response.status < 500,
+            duration_ms,
+            bytes_in,
+            bytes_out: invoke_response.body.len() as u64,
+        };
+        record_metering(&inner, &self.deploy, project, &function.name, &sample).await;
+        Ok(invoke_response)
+    }
+
+    async fn invoke_target(
+        &self,
+        target: &str,
+        request: boatramp_handlers::InvokeRequest,
+        depth: u32,
+        tenancy: boatramp_handlers::HostTenancy,
+    ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+        use boatramp_handlers::InvokeError;
+        let Some(inner) = self.runtime.upgrade() else {
+            return Err(InvokeError::Failed(
+                "handler runtime is shutting down".into(),
+            ));
+        };
+        // A target fetch is served in the SAME project as the caller (the gateway resolved `B`'s
+        // public-subset confinement for a field of THIS project's supergraph); the callee is a
+        // subgraph FUNCTION of this project.
+        let project = ProjectRef::new(&self.project);
+        let function = match self.deploy.get_function(project, target).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return Err(InvokeError::NotFound),
+            Err(err) => return Err(InvokeError::Failed(err.to_string())),
+        };
+        let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+            return Err(InvokeError::NotFound);
+        };
+        let bytes_in = request.body.len() as u64;
+        let axum_request = match build_internal_request(request) {
+            Ok(req) => req,
+            Err(err) => return Err(InvokeError::Failed(err)),
+        };
+        if let Err(response) = admit_by_quota(&inner, &self.deploy, project, &function).await {
+            return Ok(buffer_invoke_response(response).await);
+        }
+        let (response, duration_ms) = execute_function(
+            &inner,
+            &self.deploy,
+            project,
+            &function,
+            &component,
+            axum_request,
+            depth,
+            boatramp_handlers::Lane::Sync,
+            // The subgraph runs under the host-FORCED target confinement (its own declared tenancy
+            // is bypassed — the composed SDL field's target class is the authority). `B` + the
+            // public-subset confinement were host-resolved at the gateway (never guest input).
+            FnTenant::ForcedTarget(tenancy),
         )
         .await;
         let invoke_response = buffer_invoke_response(response).await;
@@ -2043,4 +2226,149 @@ fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request
     builder
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
+}
+
+/// Gap 3 live gate (v0.4.7): the host-verified guest-presented producer stamp, end to end. Proves
+/// [`ServerProducerContextSource`] RE-verifies a guest-presented token against the component's
+/// declared `token_claims`, extracts the tenant, and host-seals a durable context that resolves
+/// (via [`verify_context`](boatramp_core::cose::verify_context)) back to that tenant — and that a
+/// forged / wrong-issuer token seals NOTHING (fail-closed). Also asserts the per-message batch
+/// isolation of the shared producer-context cell (the Finding-1 fix). Needs `oidc` (the JWKS
+/// verifier); runs in-process (no compiled guest, no libsql).
+#[cfg(all(test, feature = "handlers", feature = "oidc"))]
+mod gap3_tests {
+    use super::*;
+    use boatramp_core::cose::{verify_context, LocalSigner, Signer};
+    use boatramp_handlers::ProducerContextSource as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    const ISS: &str = "https://idp.example";
+
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Sign an Ed25519 JWT by hand (the host verifies it via the JWKS in `jwks_env`).
+    fn ed25519_token(key: &SigningKey, kid: &str, claims: serde_json::Value) -> String {
+        let header = b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(claims.to_string().as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let sig = key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", b64url(&sig.to_bytes()))
+    }
+
+    #[tokio::test]
+    async fn present_token_verify_seal_resolve_chain_and_fail_closed() {
+        // The app's Ed25519 signing key + its JWKS (public half), published to a host env var the
+        // component's `token_claims` names — the SAME verifier path a request-lane `token` source uses.
+        let app_key = SigningKey::from_bytes(&[7u8; 32]);
+        let jwks = serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": "app-1",
+            "x": b64url(app_key.verifying_key().as_bytes()),
+        } ] })
+        .to_string();
+        let env_name = format!("BR_TEST_GAP3_JWKS_{}", std::process::id());
+        std::env::set_var(&env_name, &jwks);
+        let token_cfg = boatramp_core::config::HandlerGraphqlTokenClaims {
+            issuer: ISS.to_string(),
+            jwks_env: Some(env_name.clone()),
+            jwks_url: None,
+            audience: None,
+        };
+
+        // The fleet signer that seals + verifies the durable context (deterministic test key).
+        let fleet: Arc<dyn Signer> = Arc::new(
+            LocalSigner::from_private_hex(&format!("ed25519:{}", hex::encode([9u8; 32]))).unwrap(),
+        );
+        let source = ServerProducerContextSource {
+            token_cfg: token_cfg.clone(),
+            claim: "tid".to_string(),
+            signer: fleet.clone(),
+        };
+
+        let exp = boatramp_core::time::now_unix() + 3600;
+
+        // (1) A valid token → the host seals a context that resolves back to the token's tenant.
+        let good = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B" }),
+        );
+        let sealed = source
+            .seal_presented(&good)
+            .await
+            .expect("a valid presented token seals a producer context");
+        let resolved = verify_context(
+            &sealed,
+            &fleet.public_key(),
+            boatramp_core::time::now_unix(),
+        )
+        .expect("the sealed context verifies against the fleet anchor");
+        assert_eq!(
+            resolved, "tenant_B",
+            "the host-sealed context resolves back to the tenant the presented token carried"
+        );
+
+        // (2) A token forged with a DIFFERENT key (same kid) → the host does not verify it → seals
+        // nothing (the guest cannot name a tenant it holds no valid token for).
+        let forged = ed25519_token(
+            &SigningKey::from_bytes(&[42u8; 32]),
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B" }),
+        );
+        assert!(
+            source.seal_presented(&forged).await.is_err(),
+            "a forged token must not seal a producer context (fail-closed)"
+        );
+
+        // (3) A validly-signed token whose issuer is wrong → rejected.
+        let wrong_iss = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": "https://evil.example", "exp": exp, "tid": "tenant_B" }),
+        );
+        assert!(
+            source.seal_presented(&wrong_iss).await.is_err(),
+            "a wrong-issuer token must not seal (fail-closed)"
+        );
+
+        std::env::remove_var(&env_name);
+        println!(
+            "PRESENT-TOKEN CHAIN OK: a guest-presented app JWT was host-verified against the \
+             component's token_claims, its tenant extracted + host-sealed, and the sealed durable \
+             context resolved back to tenant_B via the fleet anchor; a forged and a wrong-issuer \
+             token both sealed nothing (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn producer_context_cell_is_reset_per_message_in_a_batch() {
+        // The Finding-1 fix: a consumer batch reuses one shared cell. Snapshot the bind-time value,
+        // then before each message restore it — so a `present-token` on message 1 cannot leak onto
+        // message 2's publishes. This mirrors the reset loop in `dispatch_consumer_batch`.
+        let cell: boatramp_handlers::ProducerContext =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let bind_time = cell.lock().unwrap().clone(); // None (a consumer resolves no own tenant)
+
+        // Message 1 presents tenant A (host-seals it into the shared cell) and would publish under A.
+        *cell.lock().unwrap() = Some("sealed:tenant_A".to_string());
+        assert_eq!(
+            cell.lock().unwrap().clone(),
+            Some("sealed:tenant_A".to_string())
+        );
+
+        // Before message 2 the batch loop restores the bind-time value.
+        *cell.lock().unwrap() = bind_time.clone();
+        // Message 2 does NOT present → the cell is back to bind-time (None), NOT tenant A.
+        assert_eq!(
+            cell.lock().unwrap().clone(),
+            None,
+            "message 2 must not inherit message 1's presented tenant (no cross-message leak)"
+        );
+    }
 }

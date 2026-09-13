@@ -174,6 +174,10 @@ async fn invoke_subgraph(
     variables: Value,
     bearer: Option<&str>,
     depth: u32,
+    // R4/D8 wasm-plane (Gap 1): when `Some`, the fetch is `Target`-class and the callee runs under
+    // this host-forced target-tenant confinement (its own declared tenancy is bypassed). `None` ⇒ an
+    // `Own` fetch (today's path).
+    target_tenancy: Option<boatramp_handlers::HostTenancy>,
 ) -> Value {
     let body = json!({ "query": query, "variables": variables })
         .to_string()
@@ -191,7 +195,15 @@ async fn invoke_subgraph(
         headers,
         body,
     };
-    match invoker.invoke(subgraph, request, depth).await {
+    let result = match target_tenancy {
+        Some(tenancy) => {
+            invoker
+                .invoke_target(subgraph, request, depth, tenancy)
+                .await
+        }
+        None => invoker.invoke(subgraph, request, depth).await,
+    };
+    match result {
         Ok(resp) => serde_json::from_slice(&resp.body).unwrap_or_else(|_| {
             json!({ "errors": [{ "message": format!("subgraph `{subgraph}` returned invalid JSON") }] })
         }),
@@ -345,11 +357,29 @@ pub(crate) struct BackendRouter {
     /// request (the root); a guest-initiated run sets its own depth so the shared cap counts
     /// its sub-fetches. See [`BackendRouter::at_depth`].
     depth: u32,
-    /// The request's host-resolved **target-tenant scope** (R4/D8), if any: read another tenant
-    /// `B`'s public subset, confined by the project schema. `Some` only when the edge resolved a
-    /// target identity for this request (5a: from the carried domain). A `Target`-class fetch with
-    /// no resolved target scope here **fails closed** — a target read never runs un-confined.
-    target: Option<crate::graphql_data::policy::TargetScope>,
+    /// Inputs to resolve a `Target`-class fetch's tenant `B` **per fetch** (R4/D8 wasm-plane, Gap 1):
+    /// the planner splits fetches by tenancy class, and this router binds the scope per fetch from
+    /// the fetch's own `@tenant(via, public, write)` (carried on [`TenancyClass::Target`]) against
+    /// these host-trusted inputs. `None`/unset ⇒ a `Target` fetch fails closed. `B` is host-derived
+    /// (the routed domain tag / a verified capability / a public handle), NEVER guest input.
+    target_inputs: Option<TargetInputs>,
+}
+
+/// Host-trusted inputs the [`BackendRouter`] uses to resolve a target fetch's tenant `B` per fetch
+/// (Gap 1). Built by the edge (the federation gateway / a guest `graphql::run`); all fields are
+/// host-derived, never guest-supplied.
+#[derive(Clone)]
+pub(crate) struct TargetInputs {
+    /// The project tenancy schema (public subsets, per-table keys, handle registry, world-public
+    /// flags). Loaded fresh at the edge so an eligibility/subset change takes effect immediately.
+    pub schema: std::sync::Arc<boatramp_core::tenancy::TenancySchema>,
+    /// The routed domain's host-stamped context tag (the `domain` source) — unforgeable.
+    pub domain_context: Option<String>,
+    /// The public handle/slug the request named (`?handle=`, the `handle` source) — read-only,
+    /// world-public only, resolved against the operator registry.
+    pub target_handle: Option<String>,
+    /// The fleet anchor that verifies a `capability` source (the session signer's public half).
+    pub capability_anchor: Option<boatramp_core::cose::TokenPublicKey>,
 }
 
 impl BackendRouter {
@@ -370,7 +400,7 @@ impl BackendRouter {
             sql_subgraphs,
             bearer,
             depth: 0,
-            target: None,
+            target_inputs: None,
         }
     }
 
@@ -382,15 +412,12 @@ impl BackendRouter {
         self
     }
 
-    /// Bind the request's host-resolved target-tenant scope (R4/D8) — used to serve a
-    /// `Target`-class fetch (read another tenant `B`'s public subset). Absent ⇒ a `Target` fetch
-    /// fails closed. Set by the edge once it has resolved the target identity + built the confinement
-    /// from the project schema.
-    pub(crate) fn with_target(
-        mut self,
-        target: Option<crate::graphql_data::policy::TargetScope>,
-    ) -> Self {
-        self.target = target;
+    /// Bind the host-trusted inputs used to resolve each `Target`-class fetch's tenant `B` **per
+    /// fetch** (R4/D8 wasm-plane, Gap 1) — the schema + the domain/handle/capability sources. Absent
+    /// ⇒ every `Target` fetch fails closed. Set by the edge (the federation gateway) once it has the
+    /// project schema + the request's host-derived target sources.
+    pub(crate) fn with_target_inputs(mut self, inputs: Option<TargetInputs>) -> Self {
+        self.target_inputs = inputs;
         self
     }
 
@@ -473,45 +500,105 @@ impl SubgraphFetcher for BackendRouter {
         variables: Value,
         class: &boatramp_core::tenancy::TenancyClass,
     ) -> Value {
-        // Resolve the host scope to bind for this fetch (R4/D8). `Own` ⇒ today's path. `Target` ⇒
-        // this request's host-resolved target scope, or **fail closed** if none was resolved — a
-        // target read never runs un-confined.
-        let target = match class {
-            boatramp_core::tenancy::TenancyClass::Own => None,
-            boatramp_core::tenancy::TenancyClass::Target { .. } => match &self.target {
-                Some(ts) => Some(ts),
-                None => {
-                    return json!({ "errors": [{ "message":
-                        "target-tenant scope was not resolved for this request (fail-closed)" }] })
+        // Resolve the host scope to bind for this fetch (R4/D8). The planner splits fetches by class,
+        // so each fetch is single-class and this binds the scope per fetch (never guest-selectable).
+        match class {
+            // `Own` ⇒ today's path: SQL runs un-target-scoped (its own GDC row policy governs), a
+            // wasm subgraph inherits the caller's principal via the scoped invoker (v0.4.6).
+            boatramp_core::tenancy::TenancyClass::Own => {
+                if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
+                    return self
+                        .run_sql(subgraph, site, config, query, variables, None)
+                        .await;
                 }
-            },
+                invoke_subgraph(
+                    self.invoker.as_ref(),
+                    subgraph,
+                    query,
+                    variables,
+                    self.bearer.as_deref(),
+                    self.depth,
+                    None,
+                )
+                .await
+            }
+            // `Target` ⇒ resolve `B` from THIS fetch's own `@tenant(via, public, write)` against the
+            // host-trusted inputs (domain/capability/handle), then confine the fetch. Fail closed on
+            // any gap — a target read/write never runs un-confined.
+            boatramp_core::tenancy::TenancyClass::Target { via, public, write } => {
+                let Some(inputs) = &self.target_inputs else {
+                    return json!({ "errors": [{ "message":
+                        "target-tenant scope was not resolved for this request (fail-closed)" }] });
+                };
+                // Ruling A (v0.4.4): the visibility subset is mandatory only for an ANONYMOUS source
+                // (`domain`/`handle`) — for `capability`-only the host-verified capability IS the
+                // authorization. A missing named subset under an anonymous source ⇒ fail closed.
+                let require_public = via.iter().any(|s| {
+                    matches!(
+                        s,
+                        boatramp_core::tenancy::TargetSource::Domain
+                            | boatramp_core::tenancy::TargetSource::Handle
+                    )
+                });
+                if require_public && inputs.schema.public_subset(public).is_none() {
+                    return json!({ "errors": [{ "message": format!(
+                        "target field names public subset `{public}` which the project schema does \
+                         not declare (deny-by-default)") }] });
+                }
+                let Some(resolved) = crate::tenant_resolve::resolve_target_via(
+                    via,
+                    public,
+                    write,
+                    &inputs.schema,
+                    inputs.domain_context.as_deref(),
+                    self.bearer.as_deref(),
+                    inputs.capability_anchor.as_ref(),
+                    inputs.target_handle.as_deref(),
+                    &self.project,
+                    boatramp_core::time::now_unix(),
+                ) else {
+                    return json!({ "errors": [{ "message":
+                        "target-tenant could not be resolved (no routed domain, no valid capability, \
+                         and no resolvable handle) — fail-closed" }] });
+                };
+                if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
+                    // SQL subgraph: confine the GDC compile to `B`'s public subset.
+                    let scope = build_target_scope(
+                        &inputs.schema,
+                        boatramp_core::sql::SqlValue::Text(resolved.value),
+                    );
+                    return self
+                        .run_sql(subgraph, site, config, query, variables, Some(&scope))
+                        .await;
+                }
+                // WASM subgraph (Gap 1): force a `HostTenancy::target` binding onto the invocation so
+                // the guest's `sql`/`orm` is confined to `tenant = B AND <public subset>` — identical
+                // confinement to a plain-wasm target route, reached over the federated gateway.
+                let tenancy = boatramp_handlers::HostTenancy::target(
+                    boatramp_core::sql::SqlValue::Text(resolved.value),
+                    boatramp_core::tenancy::AccessMode::Own,
+                    &inputs.schema,
+                    public,
+                    &resolved.write,
+                    require_public,
+                )
+                .with_target_context(resolved.context);
+                invoke_subgraph(
+                    self.invoker.as_ref(),
+                    subgraph,
+                    query,
+                    variables,
+                    self.bearer.as_deref(),
+                    self.depth,
+                    Some(tenancy),
+                )
+                .await
+            }
             // `TenancyClass` is `#[non_exhaustive]`: any future class the host doesn't yet bind a
             // scope for fails closed rather than running under the own (or no) scope.
-            _ => {
-                return json!({ "errors": [{ "message":
-                    "unsupported tenancy class for this fetch (fail-closed)" }] })
-            }
-        };
-        if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
-            return self
-                .run_sql(subgraph, site, config, query, variables, target)
-                .await;
+            _ => json!({ "errors": [{ "message":
+                "unsupported tenancy class for this fetch (fail-closed)" }] }),
         }
-        // A wasm subgraph carries no target confinement in this stage, so a `Target` fetch to one is
-        // refused (target reads are served by SQL/GDC subgraphs). An `Own` wasm fetch is unchanged.
-        if class.is_target() {
-            return json!({ "errors": [{ "message":
-                "target-tenant reads are supported on SQL subgraphs only" }] });
-        }
-        invoke_subgraph(
-            self.invoker.as_ref(),
-            subgraph,
-            query,
-            variables,
-            self.bearer.as_deref(),
-            self.depth,
-        )
-        .await
     }
 }
 
@@ -1261,6 +1348,117 @@ mod tests {
             msg.contains("target-tenant scope was not resolved"),
             "a target fetch with no resolved scope must fail closed, got: {msg}"
         );
+    }
+
+    /// An [`Invoker`](boatramp_handlers::Invoker) that reflects the **host-forced target** binding it
+    /// received (Gap 1): `invoke_target` echoes the resolved tenant `B` + the capability app-context,
+    /// while a plain `invoke` (an Own fetch) reports it got no forced target. Lets a test prove the
+    /// gateway resolves `B` per fetch and forces the confinement onto the wasm subgraph invocation.
+    struct TargetEchoInvoker;
+
+    #[async_trait::async_trait]
+    impl boatramp_handlers::Invoker for TargetEchoInvoker {
+        async fn invoke(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![],
+                body: br#"{"data":{"forced":false}}"#.to_vec(),
+            })
+        }
+        async fn invoke_target(
+            &self,
+            _target: &str,
+            _request: boatramp_handlers::InvokeRequest,
+            _depth: u32,
+            tenancy: boatramp_handlers::HostTenancy,
+        ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+            let b = tenancy
+                .facts()
+                .iter()
+                .find(|f| f.axis == boatramp_core::tenancy::ScopeAxis::TargetTenant)
+                .map(|f| match &f.value {
+                    boatramp_core::sql::SqlValue::Text(s) => s.clone(),
+                    other => format!("{other:?}"),
+                })
+                .unwrap_or_default();
+            let ctx = tenancy
+                .target_context()
+                .get("sub")
+                .cloned()
+                .unwrap_or_default();
+            Ok(boatramp_handlers::InvokeResponse {
+                status: 200,
+                headers: vec![],
+                body: format!(r#"{{"data":{{"forced":true,"b":{b:?},"ctx":{ctx:?}}}}}"#)
+                    .into_bytes(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_target_fetch_to_a_wasm_subgraph_forces_the_resolved_confinement() {
+        use boatramp_core::tenancy::{PublicPredicate, PublicSubset, PublicTerm, TableScope};
+        // A schema with a `storefront` world-public subset on a Tenant table.
+        let mut schema = boatramp_core::tenancy::TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: std::collections::BTreeMap::from([("items".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "storefront".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![PublicTerm::Null {
+                        column: "deleted_at".into(),
+                        negated: false,
+                    }],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        // The router has target inputs with a `domain` source resolving B = "tenant_b".
+        let router = BackendRouter::new(
+            std::sync::Arc::new(TargetEchoInvoker),
+            "shop".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .with_target_inputs(Some(TargetInputs {
+            schema: std::sync::Arc::new(schema),
+            domain_context: Some("tenant_b".into()),
+            target_handle: None,
+            capability_anchor: None,
+        }));
+        let target_class = boatramp_core::tenancy::TenancyClass::Target {
+            via: vec![boatramp_core::tenancy::TargetSource::Domain],
+            public: "storefront".into(),
+            write: vec![],
+        };
+        // A wasm subgraph (not in sql_subgraphs) target fetch: the gateway resolves B and forces the
+        // confinement onto the invocation — the echo invoker sees TargetTenant = "tenant_b".
+        let resp = router
+            .fetch("portal", "{ items { id } }", json!({}), &target_class)
+            .await;
+        assert_eq!(resp["data"]["forced"], json!(true), "resp: {resp}");
+        assert_eq!(resp["data"]["b"], json!("tenant_b"), "resp: {resp}");
+
+        // An Own fetch to the same wasm subgraph carries NO forced target (plain invoke).
+        let own_resp = router
+            .fetch(
+                "portal",
+                "{ items { id } }",
+                json!({}),
+                &boatramp_core::tenancy::TenancyClass::Own,
+            )
+            .await;
+        assert_eq!(own_resp["data"]["forced"], json!(false), "resp: {own_resp}");
     }
 
     #[tokio::test]

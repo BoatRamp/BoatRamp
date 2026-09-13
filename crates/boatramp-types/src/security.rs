@@ -283,6 +283,41 @@ pub struct PostureOverrides {
     pub allow_cross_tenant_db: Option<bool>,
 }
 
+/// A **per-project** override (Gap 4a) of the tenancy/capability posture sub-knobs, from
+/// `[security.projects.<project>]` in `boatramp.cfg`. ONLY these four knobs are per-project; the
+/// rest of the posture (egress, upload caps, domain verification, …) stays fleet-wide node policy.
+///
+/// A per-project override tunes only that project's OWN in-project tenancy strictness + its guests'
+/// capability-mint ceiling. It can never widen reach into **another** project — cross-project
+/// isolation is structural (project = database), not a posture knob. So one serve process can host a
+/// strict-isolation project alongside a looser one on a shared, multi-project machine.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectPostureOverride {
+    /// Override [`SecurityPosture::require_tenancy_declaration`] for this project.
+    pub require_tenancy_declaration: Option<bool>,
+    /// Override [`SecurityPosture::allow_cross_tenant_db`] for this project.
+    pub allow_cross_tenant_db: Option<bool>,
+    /// Override [`SecurityPosture::allow_guest_mint_capability`] for this project.
+    pub allow_guest_mint_capability: Option<bool>,
+    /// Override [`SecurityPosture::max_guest_capability_ttl_secs`] for this project.
+    pub max_guest_capability_ttl_secs: Option<u64>,
+}
+
+/// The resolved per-project tenancy/capability knobs (base posture ⊕ an optional project override),
+/// consulted at each in-project enforcement point (tenancy declaration, cross-tenant `all`, guest
+/// capability minting). Cheap `Copy` so it can be looked up per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedProjectTenancy {
+    /// Whether a sql/orm importer in this project must declare an explicit tenancy decision.
+    pub require_tenancy_declaration: bool,
+    /// Whether an `all` in-site grant may reach across sub-tenants within this project's database.
+    pub allow_cross_tenant_db: bool,
+    /// `Some(ttl)` ⇒ guest capability minting is enabled for this project, clamped to `ttl` seconds;
+    /// `None` ⇒ minting disabled (a guest `mint` is `access-denied`).
+    pub capability_max_ttl_secs: Option<u64>,
+}
+
 /// The raw `[security]` config section as written in `boatramp.cfg` (RON).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -294,6 +329,11 @@ pub struct SecurityConfig {
     pub profiles: BTreeMap<String, PostureOverrides>,
     /// Individual knob overrides applied over the selected profile (these win).
     pub overrides: PostureOverrides,
+    /// **Per-project** overrides (Gap 4a) of the tenancy/capability sub-knobs — project name →
+    /// override. Layered over the resolved fleet posture for that project only; every other project
+    /// (and every non-tenancy knob) uses the fleet posture. Lets a shared, multi-project serve
+    /// process run e.g. a strict-isolation production project alongside a looser preview project.
+    pub projects: BTreeMap<String, ProjectPostureOverride>,
 }
 
 impl SecurityConfig {
@@ -592,6 +632,40 @@ impl Default for SecurityPosture {
     }
 }
 
+impl SecurityPosture {
+    /// The base (no per-project override) resolved tenancy/capability knobs for this posture.
+    pub fn base_project_tenancy(&self) -> ResolvedProjectTenancy {
+        ResolvedProjectTenancy {
+            require_tenancy_declaration: self.require_tenancy_declaration,
+            allow_cross_tenant_db: self.allow_cross_tenant_db,
+            capability_max_ttl_secs: (self.allow_guest_mint_capability
+                && self.max_guest_capability_ttl_secs > 0)
+                .then_some(self.max_guest_capability_ttl_secs),
+        }
+    }
+
+    /// Apply a [`ProjectPostureOverride`] over this posture's base tenancy knobs (Gap 4a). Each
+    /// `Some` field of the override wins; the rest fall through to the fleet posture. Only affects
+    /// this project's own in-project tenancy + capability-mint ceiling — never cross-project reach.
+    pub fn project_tenancy(&self, ovr: &ProjectPostureOverride) -> ResolvedProjectTenancy {
+        let mint = ovr
+            .allow_guest_mint_capability
+            .unwrap_or(self.allow_guest_mint_capability);
+        let ttl = ovr
+            .max_guest_capability_ttl_secs
+            .unwrap_or(self.max_guest_capability_ttl_secs);
+        ResolvedProjectTenancy {
+            require_tenancy_declaration: ovr
+                .require_tenancy_declaration
+                .unwrap_or(self.require_tenancy_declaration),
+            allow_cross_tenant_db: ovr
+                .allow_cross_tenant_db
+                .unwrap_or(self.allow_cross_tenant_db),
+            capability_max_ttl_secs: (mint && ttl > 0).then_some(ttl),
+        }
+    }
+}
+
 /// Apply a set of overrides over a base posture (each `Some` field wins).
 fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     if let Some(v) = o.allow_unauthenticated_public_bind {
@@ -690,6 +764,54 @@ fn fmt_cap(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_project_override_tunes_only_the_named_project() {
+        // Base: strict multi-tenant (declaration required, no cross-tenant, no guest mint).
+        let base = SecurityProfile::MultiTenant.preset();
+        let b = base.base_project_tenancy();
+        assert!(b.require_tenancy_declaration);
+        assert!(!b.allow_cross_tenant_db);
+        assert_eq!(b.capability_max_ttl_secs, None);
+
+        // A project override permits the `all` twins + guest capability minting WHILE keeping
+        // strict declaration — the three knobs compose (Gap 4.3).
+        let ovr = ProjectPostureOverride {
+            require_tenancy_declaration: None, // inherit (stays true)
+            allow_cross_tenant_db: Some(true),
+            allow_guest_mint_capability: Some(true),
+            max_guest_capability_ttl_secs: Some(1800),
+        };
+        let r = base.project_tenancy(&ovr);
+        assert!(r.require_tenancy_declaration); // inherited strict
+        assert!(r.allow_cross_tenant_db); // opted in
+        assert_eq!(r.capability_max_ttl_secs, Some(1800)); // minting enabled + clamped
+
+        // Minting stays OFF when only a TTL is given without enabling the knob.
+        let ttl_only = ProjectPostureOverride {
+            max_guest_capability_ttl_secs: Some(3600),
+            ..Default::default()
+        };
+        assert_eq!(
+            base.project_tenancy(&ttl_only).capability_max_ttl_secs,
+            None
+        );
+
+        // A tighter project override (disable minting the base had enabled) also holds.
+        let looser = SecurityProfile::SingleTenant.preset();
+        assert!(looser
+            .base_project_tenancy()
+            .capability_max_ttl_secs
+            .is_some());
+        let tighten = ProjectPostureOverride {
+            allow_guest_mint_capability: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            looser.project_tenancy(&tighten).capability_max_ttl_secs,
+            None
+        );
+    }
 
     #[test]
     fn default_posture_is_multi_tenant_strict() {

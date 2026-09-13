@@ -305,6 +305,19 @@ pub struct ApplyFunction {
     /// Optional resource limits (memory / timeout / fuel).
     #[serde(default)]
     pub limits: Option<HandlerLimits>,
+    /// In-site tenancy decision (Dimension 0) for this function's `sql`/`orm` — maps straight to
+    /// the internal `FunctionConfig.tenancy`. Absent ⇒ *undeclared* (refused under `multi-tenant`,
+    /// `Disabled` under single-tenant/dev). E.g. `(mode: "scoped", column: "tenant_id", sources:
+    /// [(kind: "token", claim: "tid")], read: "own", write: "own")`, `(mode: "disabled")`, or an
+    /// async worker's `(mode: "scoped", sources: [(kind: "signed_context")], read: "own", write:
+    /// "own")`. Parsed via the [`boatramp_core::tenancy::de_opt_tenancy`] bridge (RON can't parse
+    /// the internally-tagged enum directly — see that fn).
+    #[serde(default, deserialize_with = "boatramp_core::tenancy::de_opt_tenancy")]
+    pub tenancy: Option<boatramp_core::tenancy::Tenancy>,
+    /// JWKS/issuer config verifying the app bearer when this function's tenancy names a `token`
+    /// source (the function analogue of a site's `[handlers.graphql.data].claims_from_token`).
+    #[serde(default)]
+    pub token_claims: Option<boatramp_core::config::HandlerGraphqlTokenClaims>,
 }
 
 /// One compute workload in the manifest.
@@ -580,6 +593,14 @@ async fn apply_function<C: ControlPlane>(
     if let Some(limits) = &function.limits {
         cfg.insert("limits".to_string(), json!(limits));
     }
+    // In-site tenancy + token-verification config map straight onto the internal FunctionConfig
+    // (`tenancy`/`token_claims`); the server enforces them at instantiation (Dimension 0).
+    if let Some(tenancy) = &function.tenancy {
+        cfg.insert("tenancy".to_string(), json!(tenancy));
+    }
+    if let Some(token_claims) = &function.token_claims {
+        cfg.insert("token_claims".to_string(), json!(token_claims));
+    }
     // Top-level functions carry their own independent version line.
     let body = json!({
         "component": hash,
@@ -751,6 +772,8 @@ mod tests {
             secrets: Default::default(),
             invoke_targets: vec![],
             limits: None,
+            tenancy: None,
+            token_claims: None,
         }
     }
 
@@ -877,6 +900,80 @@ mod tests {
             Some(&TableScope::TenantKeyed { key: "id".into() })
         );
         assert_eq!(schema.tables.get("countries"), Some(&TableScope::Unscoped));
+    }
+
+    /// A per-function `tenancy` + `token_claims` round-trips through the RON manifest surface
+    /// (Gap 2) — proving the canonical spelling: the internally-tagged `Tenancy`/`TenantSource`
+    /// enums are written **fully quoted** (`mode: "scoped"`, `kind: "token"`, `read: "all"`),
+    /// byte-identical to the JSON the control plane stores, and parse via the `de_opt_tenancy`
+    /// `ron::Value` bridge (a direct RON parse of the internally-tagged enum is impossible — see
+    /// `de_opt_tenancy`). Maps straight onto the internal `FunctionConfig` shape.
+    #[test]
+    fn manifest_parses_per_function_tenancy() {
+        use boatramp_core::tenancy::{AccessMode, Tenancy, TenantSource};
+        let manifest = ApplyManifest::parse(
+            r#"(
+                project: "acme",
+                functions: [
+                    (
+                        name: "identity",
+                        component: "identity.wasm",
+                        imports: ["sql"],
+                        tenancy: (mode: "scoped", column: "tenant_id",
+                                  sources: [(kind: "token", claim: "tid")],
+                                  read: "all", write: "own"),
+                        token_claims: (issuer: "https://idp.example",
+                                       jwks_url: "https://idp.example/jwks.json",
+                                       audience: "acme"),
+                    ),
+                    (
+                        name: "concept-worker",
+                        component: "worker.wasm",
+                        imports: ["sql"],
+                        tenancy: (mode: "scoped", column: "tenant_id",
+                                  sources: [(kind: "signed_context")],
+                                  read: "own", write: "own"),
+                    ),
+                    (name: "public", component: "public.wasm", tenancy: (mode: "disabled")),
+                ],
+            )"#,
+        )
+        .expect("manifest with per-function tenancy parses");
+        let identity = &manifest.functions[0];
+        match identity.tenancy.as_ref().expect("identity tenancy") {
+            Tenancy::Scoped {
+                column,
+                sources,
+                read,
+                write,
+            } => {
+                assert_eq!(column, "tenant_id");
+                assert_eq!(
+                    sources,
+                    &vec![TenantSource::Token {
+                        claim: "tid".into()
+                    }]
+                );
+                assert_eq!(*read, AccessMode::All);
+                assert_eq!(*write, AccessMode::Own);
+            }
+            other => panic!("expected scoped, got {other:?}"),
+        }
+        assert_eq!(
+            identity.token_claims.as_ref().map(|c| c.issuer.as_str()),
+            Some("https://idp.example")
+        );
+        // The async worker resolves its own tenant from the producer-stamped signed context.
+        match manifest.functions[1].tenancy.as_ref().unwrap() {
+            Tenancy::Scoped { sources, .. } => {
+                assert_eq!(sources, &vec![TenantSource::SignedContext]);
+            }
+            other => panic!("expected scoped, got {other:?}"),
+        }
+        assert!(matches!(
+            manifest.functions[2].tenancy.as_ref().unwrap(),
+            Tenancy::Disabled
+        ));
     }
 
     #[tokio::test]

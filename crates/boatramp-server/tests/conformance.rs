@@ -1552,6 +1552,8 @@ async fn handler_route_dispatches_through_engine() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            tenancy: None,
+            token_claims: None,
             route: "/count".to_string(),
             methods: Vec::new(),
             component: "handlers/counter.wasm".to_string(),
@@ -1669,6 +1671,8 @@ async fn cookie_auth_csrf_gate_fires_in_the_pipeline() {
     );
     let config = DeployConfig {
         handlers: vec![HandlerConfig {
+            tenancy: None,
+            token_claims: None,
             route: "/api".to_string(),
             methods: Vec::new(),
             component: "h.wasm".to_string(),
@@ -3142,6 +3146,8 @@ async fn activation_during_traffic_drops_no_requests() {
         },
     );
     let handler = HandlerConfig {
+        tenancy: None,
+        token_claims: None,
         route: "/count".to_string(),
         methods: Vec::new(),
         component: "handlers/counter.wasm".to_string(),
@@ -3302,6 +3308,8 @@ async fn preview_runs_handlers_scoped_off_live_state() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/count".to_string(),
                 methods: Vec::new(),
                 component: "handlers/counter.wasm".to_string(),
@@ -3424,6 +3432,8 @@ async fn activation_refuses_broken_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/x".to_string(),
                 methods: Vec::new(),
                 component: "handlers/bad.wasm".to_string(),
@@ -3533,6 +3543,8 @@ async fn activation_refuses_a_non_consumer_component() {
         files,
         config: DeployConfig {
             consumers: vec![ConsumerConfig {
+                tenancy: None,
+                token_claims: None,
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: Vec::new(),
@@ -3641,6 +3653,8 @@ async fn activation_refuses_disallowed_import() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/count".to_string(),
                 methods: Vec::new(),
                 component: "handlers/counter.wasm".to_string(),
@@ -3740,6 +3754,8 @@ async fn activation_refuses_oversized_component() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/count".to_string(),
                 methods: Vec::new(),
                 component: "handlers/counter.wasm".to_string(),
@@ -3842,6 +3858,8 @@ async fn handler_route_with_sql_dispatches_through_engine() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/count".to_string(),
                 methods: Vec::new(),
                 component: "handlers/sql.wasm".to_string(),
@@ -3968,6 +3986,8 @@ async fn handler_opens_named_sql_databases_with_least_privilege() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/sql".to_string(),
                 methods: Vec::new(),
                 component: "h.wasm".to_string(),
@@ -4093,6 +4113,8 @@ async fn per_site_timeout_cap_applies() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/loop".to_string(),
                 methods: Vec::new(),
                 component: "h.wasm".to_string(),
@@ -4601,6 +4623,8 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/count".to_string(),
                 methods: Vec::new(),
                 component: "counter.wasm".to_string(),
@@ -4611,6 +4635,8 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 invoke_targets: Vec::new(),
             }],
             consumers: vec![ConsumerConfig {
+                tenancy: None,
+                token_claims: None,
                 topic: "orders/created".to_string(),
                 component: "consumer.wasm".to_string(),
                 imports: vec!["wasi:keyvalue".to_string()],
@@ -4741,6 +4767,8 @@ async fn guest_logs_captured_and_served() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/log".to_string(),
                 methods: Vec::new(),
                 component: "h.wasm".to_string(),
@@ -4872,6 +4900,8 @@ async fn guest_logs_suppressed_when_capture_disabled() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/log".to_string(),
                 methods: Vec::new(),
                 component: "h.wasm".to_string(),
@@ -5065,6 +5095,8 @@ async fn handler_env_injected_host_env_not_inherited() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/env".to_string(),
                 methods: Vec::new(),
                 component: "h.wasm".to_string(),
@@ -6563,6 +6595,8 @@ async fn mesh_dispatch(
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/run".into(),
                 methods: Vec::new(),
                 component: "caller.wasm".into(),
@@ -6744,6 +6778,8 @@ async fn federation_gateway_stitches_real_subgraph_functions() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -6880,6 +6916,8 @@ async fn federation_gateway_executes_a_mutation_forwarding_its_argument() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -7077,6 +7115,8 @@ async fn graphql_data_connector_serves_from_the_database_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -7318,6 +7358,8 @@ async fn graphql_data_connector_delegates_a_field_to_a_wasm_function() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -7462,6 +7504,8 @@ async fn graphql_data_connector_mutations_write_with_row_isolation() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -7675,6 +7719,8 @@ async fn federation_composes_a_sql_subgraph_with_a_wasm_subgraph() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -7823,6 +7869,8 @@ async fn registering_a_sql_subgraph_via_the_admin_api_composes_and_serves() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),
@@ -8070,6 +8118,8 @@ async fn graphql_data_connector_isolates_by_a_verified_app_token_claim() {
         files,
         config: DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/graphql".into(),
                 methods: Vec::new(),
                 component: "gw.wasm".into(),

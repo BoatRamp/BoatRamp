@@ -358,15 +358,20 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     // compiled — so the ABI gate (a component's `requires = ["session"]` vs the host's advertised
     // set) enforces host support at activation, while this keeps `imports: ["session"]` from being
     // rejected offline regardless of which host build the deploy targets.
+    // `tenancy` (Gap 3 `present-token`) is accepted here but, like `session`, intentionally NOT in
+    // `KNOWN_IMPORTS`: the host advertises it as Experimental only when the `messaging` feature is
+    // compiled, so the `requires` ABI gate enforces host support at activation while a deploy
+    // targeting any host build still parses offline.
     if KNOWN_IMPORTS.contains(&import)
         || import == "session"
+        || import == "tenancy"
         || is_named_sql_import(import)
         || is_named_admin_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, `session`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }
@@ -510,6 +515,23 @@ pub struct HandlerConfig {
     /// `allow_imports` permits it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invoke_targets: Vec<String>,
+    /// Per-handler in-site tenancy decision (Dimension 0), overriding the site-level
+    /// [`HandlersSiteConfig::tenancy`] for this route. Absent ⇒ inherit the site decision. When
+    /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
+    /// — a widening is refused fail-closed at bind. Lets one site host handlers at different modes
+    /// (e.g. an `own` page handler beside an `all` admin handler under a site ceiling of `all`).
+    #[serde(
+        default,
+        deserialize_with = "crate::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
+    /// Per-handler JWKS/issuer config verifying the app bearer for a
+    /// [`crate::tenancy::TenantSource::Token`] tenant source, overriding the site's
+    /// `[handlers.graphql.data].claims_from_token`. Absent ⇒ inherit the site's. Only consulted when
+    /// this handler's `tenancy` (or the inherited site tenancy) names a `token` source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_claims: Option<HandlerGraphqlTokenClaims>,
 }
 
 /// Per-handler resource limits.
@@ -564,6 +586,22 @@ pub struct ConsumerConfig {
     /// `earliest`). Ignored for the default work-queue.
     #[serde(default, skip_serializing_if = "crate::config::is_default_start")]
     pub start: StartPosition,
+    /// In-site tenancy decision (Dimension 0) for this consumer's `sql`/`orm` when a drained
+    /// message is processed. The async-lane analog of a function's tenancy: typically
+    /// `Scoped { sources: [signed_context], .. }` so the consumer resolves the tenant the producer
+    /// stamped on the message. Absent ⇒ *undeclared* (refused under `multi-tenant`, `Disabled`
+    /// under single-tenant/dev).
+    #[serde(
+        default,
+        deserialize_with = "crate::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tenancy: Option<crate::tenancy::Tenancy>,
+    /// JWKS/issuer config verifying an app bearer for a [`crate::tenancy::TenantSource::Token`]
+    /// tenant source (rare on the async lane, but supported for a consumer invoked with a
+    /// forwarded bearer). Absent ⇒ the token source can't verify (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_claims: Option<HandlerGraphqlTokenClaims>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -645,7 +683,11 @@ pub struct SessionConfig {
     /// In-site tenancy decision for this session's `sql`/`orm` (Dimension 0). Resolved once at
     /// **open** from the verified source and carried across every re-entry, so a frame-triggered
     /// query is host-scoped identically to a normal handler. Absent ⇒ plain (project = database).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tenancy: Option<crate::tenancy::Tenancy>,
     /// JWKS/issuer verifying the app bearer for a `token`-sourced tenant (same as a function's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -808,7 +850,11 @@ pub struct HandlersSiteConfig {
     /// may narrow within it but not widen it (e.g. a site pinned to `read: own` can't be raised
     /// to `all` by a function). Absent ⇒ *undeclared* (refused under `multi-tenant`, treated as
     /// `Disabled` under single-tenant/dev).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tenancy: Option<crate::tenancy::Tenancy>,
 }
 
@@ -1245,6 +1291,8 @@ mod tests {
         use std::collections::BTreeMap;
         let config = DeployConfig {
             handlers: vec![HandlerConfig {
+                tenancy: None,
+                token_claims: None,
                 route: "/h".into(),
                 methods: Vec::new(),
                 component: "h.wasm".into(),

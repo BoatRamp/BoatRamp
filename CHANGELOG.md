@@ -5,6 +5,61 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.7] - 2026-09-13
+
+Four first-adopter tenancy-cutover gaps, shipped as one release behind a converged security review
+and CI-hard live gates.
+
+### Added
+- **The external `/graphql` gateway now serves target-tenant fields on WASM subgraphs (reads *and*
+  writes)** — completing the D8 "the host binds the scope per fetch" promise for the wasm plane
+  (v0.4.3 shipped SQL/GDC subgraphs only). The federation planner splits fetches by tenancy class;
+  the gateway now resolves the target tenant `B` **per fetch** from that fetch's own
+  `@tenant(via, public, write)` over the full source model (`domain` / `capability` / `handle`), and
+  **forces** a host-built `tenant = B AND <public subset>` confinement onto the wasm subgraph's own
+  `sql`/`orm` — identical confinement to a plain-wasm target route, now reachable over the federated
+  supergraph. `B` and the confinement are always host-resolved (never guest input); the callee's own
+  declared tenancy is bypassed (the composed SDL field's class is the authority); a `via:[capability]`
+  field keeps the v0.4.4 `public_subset` exemption on the gateway. Fail-closed on every gap.
+- **Per-component tenancy in `apply.cfg` / `project.cfg`.** A `tenancy` (+ `token_claims`) block can
+  now be declared on a top-level function (`[[functions]]`), a route handler, and a bus consumer —
+  not just at the project or site level. A per-handler decision must **narrow within** its site
+  ceiling (a widening — e.g. removing scoping — is refused fail-closed at bind). One canonical
+  fully-quoted RON spelling parses in `apply.cfg`/`project.cfg` *and* is byte-identical to the stored
+  JSON (e.g. `tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")],
+  read: "own", write: "own")`). *(This also fixes a latent bug: the internally-tagged `Tenancy` enum
+  could not be parsed from RON at all — nested enum values collapsed — so any RON-sourced tenancy
+  field silently failed; a `ron::Value` bridge now parses it losslessly.)*
+- **Per-project security posture.** The four tenancy/capability posture sub-knobs
+  (`require_tenancy_declaration`, `allow_cross_tenant_db`, `allow_guest_mint_capability`,
+  `max_guest_capability_ttl_secs`) can now be overridden **per project** via
+  `[security.projects.<project>]` in `boatramp.cfg`, so one serve process can host a strict-isolation
+  project beside a looser one on a shared, multi-project machine. Only these in-project knobs are
+  per-project; cross-project isolation stays structural (project = database), never a knob. The four
+  knobs are also now `BOATRAMP_SECURITY_*` **env-settable** (previously file-only), and compose (strict
+  declaration + opt-in `all` twins + guest capability minting simultaneously).
+- **`boatramp:handlers/tenancy` — an in-guest-verified emitter can stamp the async-lane producer
+  context (`present-token`).** `signed_context` resolves the async-lane own-tenant on the *consumer*,
+  but only if the *producer* stamped a tenant — and the host stamps only a tenant it resolved (a
+  request bearer / routed domain). An emitter whose authority is verified in-guest (an app JWT in a
+  POST body, a portal cookie's bearer) left the host with no fact to stamp. `present-token` closes
+  that gap **without handing tenancy authority to the guest**: the guest presents the credential, the
+  **host** re-verifies it against the component's declared `token_claims` (JWKS / issuer / audience /
+  expiry), extracts the tenant claim, and host-seals it onto the messages this invocation publishes.
+  The guest never names a tenant — it can only cause a stamp for a tenant it holds a validly-signed
+  token for (host-forced tenancy intact; the async-lane analog of the request-path `token` source).
+  Deny-by-default; a new off-by-default guest import, admitted via the `requires` ABI gate so pinned
+  older hosts refuse a requiring guest cleanly.
+
+### Security
+- Whole-surface Security Engineer review to convergence (Gaps 1/3/4a/2). One High finding fixed
+  before release: the shared producer-context cell is now reset per message in a consumer batch, so a
+  `present-token` on one message cannot leak onto another message's publishes. CI-hard live gates:
+  the gateway wasm-plane target confinement over a real libsql engine (returns only tenant `B`'s
+  *public* rows, never `B`'s private rows nor another tenant's; fail-closed with no resolved target),
+  and the `present-token` verify → seal → resolve chain with fail-closed on a forged/wrong-issuer
+  token + per-message batch isolation.
+
 ## [0.4.6] - 2026-09-12
 
 ### Added

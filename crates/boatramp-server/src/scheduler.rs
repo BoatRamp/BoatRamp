@@ -386,6 +386,11 @@ pub(super) async fn run_scheduler_tick(
                             // No HTTP request ⇒ no `?handle=` slug (a background trigger is never a
                             // handle-sourced target route).
                             None,
+                            // Per-consumer tenancy (Gap 2). A `signed_context` source resolves only
+                            // on the durable function-drain path (`FnTenant::Durable`), so on this
+                            // path it fails closed — here it honors non-signed-context modes.
+                            consumer.tenancy.as_ref(),
+                            consumer.token_claims.as_ref(),
                         )
                         .await
                         {
@@ -597,6 +602,9 @@ async fn fire_cron(
         None,
         // No HTTP request ⇒ no `?handle=` slug on a cron trigger.
         None,
+        // Per-handler tenancy (Gap 2) for a cron-triggered handler, narrowing within the site.
+        handler.tenancy.as_ref(),
+        handler.token_claims.as_ref(),
     )
     .await
     {

@@ -203,6 +203,13 @@ pub(super) async fn dispatch_handler(
                         .extensions
                         .get::<crate::DomainContext>()
                         .map(|c| c.0.clone());
+                    // R4/D8 5c: a target field with a `handle` source resolves `B` from a PUBLIC slug
+                    // the request names in `?handle=` (read-only, world-public only). `None` ⇒ none.
+                    let target_handle = parts
+                        .uri
+                        .query()
+                        .and_then(|q| query_value(q, "handle"))
+                        .map(str::to_string);
                     // GraphQL subscription: serve it as a graphql-sse event stream,
                     // deriving the messaging topic from the subscription's root field. A
                     // producer (a mutation, a function) publishes each execution result to
@@ -235,6 +242,7 @@ pub(super) async fn dispatch_handler(
                             &variables,
                             bearer.as_deref(),
                             domain_context.as_deref(),
+                            target_handle.as_deref(),
                         )
                         .await;
                     }
@@ -366,6 +374,8 @@ pub(super) async fn dispatch_handler(
         domain_context.as_deref(),
         session_cookie.as_deref(),
         target_handle.as_deref(),
+        handler.tenancy.as_ref(),
+        handler.token_claims.as_ref(),
     )
     .await
     {
@@ -479,6 +489,7 @@ async fn federation_gateway(
     variables: &serde_json::Value,
     bearer: Option<&str>,
     domain_context: Option<&str>,
+    target_handle: Option<&str>,
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
@@ -533,11 +544,11 @@ async fn federation_gateway(
     // R4/D8: when the plan has any `target`-class fetch, (1) enforce the operator ceiling — every
     // target root field this query uses must be listed in the project's `target_eligible_fields`,
     // else refuse (the app's SDL alone can never make a field cross to another tenant) — and (2)
-    // bind the request's confinement so those fetches read only B's public subset. For 5a, `B` is
-    // the terminating domain's context tag (a same-origin funnel on B's host) — never guest input;
-    // the full `via` source model (handle/capability) lands in 5c. The schema is loaded FRESH here
-    // (not the cached supergraph), so removing a field's eligibility takes effect immediately. No
-    // domain, or no project schema, ⇒ no target scope ⇒ every target fetch fails closed.
+    // bind the host-trusted inputs the router uses to resolve each fetch's `B` per fetch from that
+    // fetch's own `@tenant(via, public, write)`, over the full source model (domain/capability/handle,
+    // Gap 1 — SQL *and* wasm subgraphs). The schema is loaded FRESH here (not the cached supergraph),
+    // so removing a field's eligibility takes effect immediately. No project schema ⇒ no target inputs
+    // ⇒ every target fetch fails closed.
     if plan.fetches.iter().any(|f| f.class.is_target()) {
         let schema = boatramp_core::deploy::load_project_tenancy(
             inner.kv.as_ref(),
@@ -557,11 +568,16 @@ async fn federation_gateway(
                 ));
             }
         }
-        if let (Some(schema), Some(b)) = (schema, domain_context.filter(|c| !c.is_empty())) {
-            runner = runner.with_target(Some(crate::graphql_gateway::build_target_scope(
-                &schema,
-                boatramp_core::sql::SqlValue::Text(b.to_string()),
-            )));
+        if let Some(schema) = schema {
+            // The fleet anchor that verifies a `capability` source (the session signer's public half),
+            // exactly as the plain-wasm target route uses.
+            let capability_anchor = inner.session_signer.get().map(|s| s.public_key());
+            runner = runner.with_target_inputs(Some(crate::graphql_gateway::TargetInputs {
+                schema: std::sync::Arc::new(schema),
+                domain_context: domain_context.map(str::to_string),
+                target_handle: target_handle.map(str::to_string),
+                capability_anchor,
+            }));
         }
     }
     axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()
@@ -1096,6 +1112,14 @@ pub(super) async fn build_bindings(
     // `Tenancy::Target` route with a `handle` source), used to resolve `B` against the operator's
     // handle registry — read-only, world-public only. `None` ⇒ no handle named.
     target_handle: Option<&str>,
+    // Gap 2: per-handler tenancy override for the matched route. When `Some`, it replaces the
+    // site-level decision for THIS invocation — after a fail-closed check that it narrows within
+    // the site ceiling (a per-handler value may tighten but never widen `HandlersSiteConfig::tenancy`).
+    // `None` ⇒ inherit the site decision (today's behavior).
+    handler_tenancy: Option<&boatramp_core::tenancy::Tenancy>,
+    // Gap 2: per-handler `token` verification config, overriding the site's `claims_from_token`
+    // when this handler's (own or inherited) tenancy names a `token` source. `None` ⇒ inherit.
+    handler_token_claims: Option<&boatramp_core::config::HandlerGraphqlTokenClaims>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -1139,19 +1163,21 @@ pub(super) async fn build_bindings(
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
     let handler_caller_tenant = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
+        // Gap 4a: the tenancy posture for THIS project — the operator's per-project override if any,
+        // else the node base. `project` is host-routed (never guest input), so it can't be spoofed.
+        let project_knobs = inner.project_tenancy_knobs(project.as_str());
         let posture = crate::tenant_resolve::TenantPosture {
-            require_declaration: inner
-                .require_tenancy_declaration
-                .get()
-                .copied()
-                .unwrap_or(true),
-            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+            require_declaration: project_knobs.require_tenancy_declaration,
+            allow_cross_tenant: project_knobs.allow_cross_tenant_db,
         };
-        let token_cfg = site_handlers
-            .graphql
-            .as_ref()
-            .and_then(|g| g.data.as_ref())
-            .and_then(|d| d.claims_from_token.as_ref());
+        // Per-handler token config (Gap 2) wins over the site's `claims_from_token`.
+        let token_cfg = handler_token_claims.or_else(|| {
+            site_handlers
+                .graphql
+                .as_ref()
+                .and_then(|g| g.data.as_ref())
+                .and_then(|d| d.claims_from_token.as_ref())
+        });
         // The R3 session-cookie verify anchor is the runtime's own session signer's public half
         // (set at startup from the node issuer). Absent ⇒ no session fact.
         let session_anchor = inner.session_signer.get().map(|s| s.public_key());
@@ -1164,7 +1190,26 @@ pub(super) async fn build_bindings(
                 Ok(s) => s,
                 Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
             };
-        let tenancy: Option<boatramp_handlers::HostTenancy> = match site_handlers.tenancy.as_ref() {
+        // Gap 2: the effective in-site tenancy for this route — the per-handler override when it
+        // narrows within the site ceiling (a widening is refused fail-closed), else the site
+        // decision. The posture (`resolve_host_tenancy`) still caps `All` + refuses undeclared on
+        // top of this.
+        let effective_tenancy = match handler_tenancy {
+            Some(h) => {
+                if let Some(ceiling) = site_handlers.tenancy.as_ref() {
+                    if !h.narrows_within(ceiling) {
+                        return Err(format!(
+                            "tenancy: a handler on site `{site}` declares a tenancy that widens the \
+                             site ceiling (a per-handler decision may narrow within the site's \
+                             `tenancy`, never widen it)"
+                        ));
+                    }
+                }
+                Some(h)
+            }
+            None => site_handlers.tenancy.as_ref(),
+        };
+        let tenancy: Option<boatramp_handlers::HostTenancy> = match effective_tenancy {
             // R4/D8 plain-wasm TARGET route: bind a target scope for a SECOND tenant `B`'s public
             // subset (the non-federated analog of a `@tenant(scope: target)` field). `B` is
             // host-derived from the routed domain (5a's carried-domain source); the guest never
@@ -1317,6 +1362,36 @@ pub(super) async fn build_bindings(
             );
         }
     }
+    // Gap 3: `tenancy::present-token` — a site handler that verified a tenant credential IN-GUEST
+    // (a POST-body app JWT, a cookie bearer) hands it to the host, which RE-verifies it against this
+    // handler's effective `token_claims` + `token` source and seals the tenant onto the
+    // producer-context cell (so a subsequent `emit::message` stamps it). Deny-by-default: needs the
+    // `tenancy` import, a messaging cell, a declared `token` source + `token_claims`, and a signer.
+    if granted("tenancy") {
+        let effective_token_claims = handler_token_claims.or_else(|| {
+            site_handlers
+                .graphql
+                .as_ref()
+                .and_then(|g| g.data.as_ref())
+                .and_then(|d| d.claims_from_token.as_ref())
+        });
+        let effective_tenancy = handler_tenancy.or(site_handlers.tenancy.as_ref());
+        if let (Some(cell), Some(token_cfg), Some(signer), Some(claim)) = (
+            bindings.producer_context_cell(),
+            effective_token_claims.cloned(),
+            inner.session_signer.get().cloned(),
+            super::function_runtime::token_source_claim(effective_tenancy),
+        ) {
+            bindings = bindings.with_present_token(
+                std::sync::Arc::new(super::function_runtime::ServerProducerContextSource {
+                    token_cfg,
+                    claim,
+                    signer,
+                }),
+                cell,
+            );
+        }
+    }
     // Function-to-function invoke (FI): a site handler reached over HTTP can call
     // sibling functions in-process — mirroring the top-level-function path
     // (`function_runtime::build_function_bindings`). Granted only when the site allows
@@ -1404,14 +1479,18 @@ pub(super) async fn build_bindings(
     // ceiling. Deny-by-default: absent any of these, no binding is attached and `mint` is access-denied.
     #[cfg(feature = "capability")]
     if granted("capability") {
+        // Gap 4a: the per-project capability-mint ceiling (operator override, else node base). A
+        // project may enable minting the fleet base leaves off, or disable one the base enables.
         if let (Some(max_ttl), Some(signer)) = (
-            inner.capability_max_ttl_secs.get(),
+            inner
+                .project_tenancy_knobs(project.as_str())
+                .capability_max_ttl_secs,
             inner.session_signer.get(),
         ) {
             let minter = std::sync::Arc::new(ServerCapabilityMinter {
                 signer: signer.clone(),
             });
-            bindings = bindings.with_capability(project.as_str(), minter, *max_ttl);
+            bindings = bindings.with_capability(project.as_str(), minter, max_ttl);
         }
     }
     // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested
@@ -1691,7 +1770,22 @@ pub(super) async fn dispatch_consumer_batch(
         }
     };
     let mut acked = 0;
+    // Gap 3 isolation: the batch reuses one `Bindings` (hence one shared producer-context cell)
+    // across every message. A `tenancy::present-token` earlier in the batch host-seals that cell,
+    // so WITHOUT this reset a later message that does not present (or whose token fails) would
+    // publish under the PRIOR message's tenant — a cross-tenant misattribution on the async lane.
+    // Snapshot the bind-time value and restore it before each message so `present-token` is
+    // strictly per-message (never carried across a batch).
+    let bind_time_context = bindings
+        .producer_context_cell()
+        .and_then(|cell| cell.lock().ok().and_then(|guard| guard.clone()));
     for msg in claimed {
+        // Reset the shared producer-context cell to its bind-time value before each message.
+        if let Some(cell) = bindings.producer_context_cell() {
+            if let Ok(mut guard) = cell.lock() {
+                *guard = bind_time_context.clone();
+            }
+        }
         let guest_topic = msg.topic.strip_prefix(scope_prefix).unwrap_or(&msg.topic);
         let start = std::time::Instant::now();
         let result = engine

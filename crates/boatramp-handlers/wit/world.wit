@@ -657,6 +657,43 @@ world target-context-host {
   import target-context;
 }
 
+/// The `tenancy` capability (PLAN-first-adopter-cutover-gaps, Gap 3): an emitter that verified a
+/// tenant credential IN-GUEST (an app JWT in a POST body, a portal cookie's bearer) hands that
+/// credential to the HOST, which RE-verifies it against the component's declared `token_claims`
+/// (JWKS / issuer / audience / expiry), extracts the tenant claim, and stamps THAT tenant onto the
+/// messages this invocation subsequently publishes — so a downstream consumer declaring
+/// `sources: [signed_context]` resolves it on the async lane. The guest NEVER names a tenant value;
+/// it only presents a signed credential the host validates against operator-declared config
+/// (host-forced tenancy intact — the async-lane analog of the request-path `token` source, differing
+/// only in WHERE the token rides). Deny-by-default: no granted capability, no declared `token_claims`,
+/// or an invalid/expired token ⇒ the call refuses and nothing is stamped.
+interface tenancy {
+  /// Why presenting a token failed.
+  variant tenancy-error {
+    /// The `tenancy` capability was not granted, or the component declares no `token_claims` /
+    /// `token` source to verify against (deny-by-default).
+    access-denied,
+    /// The presented token did not verify (bad signature / issuer / audience, expired) or carried
+    /// no tenant claim.
+    invalid-token(string),
+    /// The host failed to seal the producer context (e.g. no fleet signer wired).
+    failed(string),
+  }
+
+  /// Present a tenant credential the guest verified in-guest, for the host to RE-verify against the
+  /// component's declared `token_claims` + `token` source. On success the extracted tenant is
+  /// host-sealed and stamped onto every message this invocation subsequently publishes. Idempotent
+  /// within an invocation (the last successful call wins). Returns before any publish so the guest
+  /// can present, then emit.
+  present-token: func(token: string) -> result<_, tenancy-error>;
+}
+
+/// The tenancy world (imported into handlers / functions that fan tenant-scoped work onto the async
+/// lane after verifying the tenant credential in-guest).
+world tenancy-host {
+  import tenancy;
+}
+
 /// Value types for the `admin` capability: a guest **reconfigures its own project** (add a
 /// domain, set an SMTP profile, write site config, write a secret) without a boatramp token.
 /// The grant is conferred at deploy time (per-surface `admin:<surface>` import + the operator's

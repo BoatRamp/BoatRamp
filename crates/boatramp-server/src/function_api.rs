@@ -257,6 +257,16 @@ pub fn host_capability_features_detailed() -> Vec<CapabilityFeature> {
             lifecycle: Experimental,
         });
     }
+    // The `tenancy` (`present-token`) capability (Gap 3): an in-guest-verified emitter host-seals a
+    // tenant onto the async lane. Available whenever handlers are compiled (which pulls the
+    // messaging binding it rides); experimental until the shape settles. A guest declares
+    // `requires = ["tenancy"]`; a deploy against a host without it is refused cleanly.
+    if cfg!(feature = "handlers") {
+        f.push(CapabilityFeature {
+            name: "tenancy",
+            lifecycle: Experimental,
+        });
+    }
     if cfg!(feature = "orm-subquery") {
         // Correlated roll-ups ship off-by-default (the riskiest query surface) — experimental
         // until the shape settles.

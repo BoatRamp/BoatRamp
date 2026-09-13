@@ -48,8 +48,9 @@ sql = ["engine"]
 orm-subquery = ["sql"]
 # The `wasi:messaging` producer binding: publish to boatramp's internal
 # `boatramp_core::messaging::Messaging` substrate. (Consumer dispatch is the
-# server's job.)
-messaging = ["engine"]
+# server's job.) Needs async-trait for the object-safe `ProducerContextSource`
+# (Gap 3 `present-token`, which host-seals a producer context).
+messaging = ["engine", "dep:async-trait"]
 # The `invoke` binding: one function calls another in-process via the server's
 # `Invoker` (resolution + metering live a layer up). Needs async-trait for the
 # object-safe `Invoker` trait.
