@@ -29,9 +29,11 @@ pub use bindings::invoke::{
     InvokeError, InvokeRequest, InvokeResponse, InvokeStreamResponse, Invoker, MAX_INVOKE_DEPTH,
 };
 #[cfg(feature = "messaging")]
-pub use bindings::messaging::BUS_TOPIC_SELECTOR;
+pub use bindings::messaging::{ProducerContext, BUS_TOPIC_SELECTOR};
 #[cfg(feature = "session")]
 pub use bindings::session::{SessionBinding, SessionController, SessionError};
+#[cfg(feature = "messaging")]
+pub use bindings::tenancy::ProducerContextSource;
 #[cfg(feature = "engine")]
 pub use bindings::Bindings;
 #[cfg(feature = "session")]

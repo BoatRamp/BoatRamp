@@ -1362,6 +1362,36 @@ pub(super) async fn build_bindings(
             );
         }
     }
+    // Gap 3: `tenancy::present-token` — a site handler that verified a tenant credential IN-GUEST
+    // (a POST-body app JWT, a cookie bearer) hands it to the host, which RE-verifies it against this
+    // handler's effective `token_claims` + `token` source and seals the tenant onto the
+    // producer-context cell (so a subsequent `emit::message` stamps it). Deny-by-default: needs the
+    // `tenancy` import, a messaging cell, a declared `token` source + `token_claims`, and a signer.
+    if granted("tenancy") {
+        let effective_token_claims = handler_token_claims.or_else(|| {
+            site_handlers
+                .graphql
+                .as_ref()
+                .and_then(|g| g.data.as_ref())
+                .and_then(|d| d.claims_from_token.as_ref())
+        });
+        let effective_tenancy = handler_tenancy.or(site_handlers.tenancy.as_ref());
+        if let (Some(cell), Some(token_cfg), Some(signer), Some(claim)) = (
+            bindings.producer_context_cell(),
+            effective_token_claims.cloned(),
+            inner.session_signer.get().cloned(),
+            super::function_runtime::token_source_claim(effective_tenancy),
+        ) {
+            bindings = bindings.with_present_token(
+                std::sync::Arc::new(super::function_runtime::ServerProducerContextSource {
+                    token_cfg,
+                    claim,
+                    signer,
+                }),
+                cell,
+            );
+        }
+    }
     // Function-to-function invoke (FI): a site handler reached over HTTP can call
     // sibling functions in-process — mirroring the top-level-function path
     // (`function_runtime::build_function_bindings`). Granted only when the site allows

@@ -42,6 +42,10 @@ pub mod session;
 pub mod sql;
 #[cfg(feature = "sql")]
 pub mod target_context;
+/// Gap 3: `present-token` host-seals an in-guest-verified tenant onto the producer-context cell the
+/// `messaging` binding stamps — a messaging-lane concern, so gated with `messaging`.
+#[cfg(feature = "messaging")]
+pub mod tenancy;
 pub mod wasi_logging;
 
 /// The per-site capability handles for one handler invocation.
@@ -89,6 +93,10 @@ pub struct Bindings {
     /// session. `None` = session not granted.
     #[cfg(feature = "session")]
     session: Option<session::SessionBinding>,
+    /// The `tenancy` grant (Gap 3): host-verify a guest-presented tenant credential + seal it onto
+    /// the producer-context cell. `None` = not granted (`present-token` ⇒ `access-denied`).
+    #[cfg(feature = "messaging")]
+    tenancy_present: Option<tenancy::TenancyBinding>,
     /// Where this invocation's captured stdout/stderr is sent.
     /// `None` = the guest's stdio is left inherited (host stdio).
     logging: Option<crate::logging::LoggingBinding>,
@@ -249,7 +257,9 @@ impl Bindings {
             messaging,
             prefix: prefix.into(),
             bus_prefix: bus_prefix.into(),
-            signed_context,
+            // Wrap the bind-time value in a shared cell so a `tenancy::present-token` (Gap 3) can
+            // host-seal + update it mid-invocation before the guest publishes.
+            signed_context: Arc::new(std::sync::Mutex::new(signed_context)),
         });
         self
     }
@@ -258,6 +268,15 @@ impl Bindings {
     #[cfg(feature = "messaging")]
     pub(crate) fn messaging(&self) -> Option<&messaging::MessagingBinding> {
         self.messaging.as_ref()
+    }
+
+    /// The messaging binding's shared **producer-context cell** (Gap 3), if messaging is granted —
+    /// so the caller can hand the SAME cell to [`with_tenancy`](Self::with_tenancy) and let a
+    /// `present-token` host-seal a tenant onto the messages this invocation publishes. `None` ⇒ no
+    /// messaging binding (a `present-token` then seals into its own cell, a no-op for publishing).
+    #[cfg(feature = "messaging")]
+    pub fn producer_context_cell(&self) -> Option<messaging::ProducerContext> {
+        self.messaging.as_ref().map(|m| m.signed_context.clone())
     }
 
     /// Grant the `invoke` capability: `invoker` resolves + runs a target,
@@ -388,5 +407,27 @@ impl Bindings {
     #[cfg(feature = "session")]
     pub(crate) fn session(&self) -> Option<&session::SessionBinding> {
         self.session.as_ref()
+    }
+
+    /// Grant the `tenancy` capability (Gap 3): `source` host-verifies a guest-presented tenant
+    /// credential (against the component's declared `token_claims` + `token` source) and seals it,
+    /// and `context` is the SHARED producer-context cell it updates — pass
+    /// [`producer_context_cell`](Self::producer_context_cell) so a successful `present-token` stamps
+    /// the messages this invocation publishes. Deny-by-default: ungranted ⇒ `present-token` is
+    /// `access-denied`.
+    #[cfg(feature = "messaging")]
+    pub fn with_present_token(
+        mut self,
+        source: Arc<dyn tenancy::ProducerContextSource>,
+        context: messaging::ProducerContext,
+    ) -> Self {
+        self.tenancy_present = Some(tenancy::TenancyBinding { source, context });
+        self
+    }
+
+    /// The granted `tenancy` (`present-token`) binding, if any.
+    #[cfg(feature = "messaging")]
+    pub(crate) fn tenancy_present(&self) -> Option<&tenancy::TenancyBinding> {
+        self.tenancy_present.as_ref()
     }
 }

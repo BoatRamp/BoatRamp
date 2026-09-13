@@ -358,15 +358,20 @@ fn check_import(import: &str) -> Result<(), ConfigError> {
     // compiled — so the ABI gate (a component's `requires = ["session"]` vs the host's advertised
     // set) enforces host support at activation, while this keeps `imports: ["session"]` from being
     // rejected offline regardless of which host build the deploy targets.
+    // `tenancy` (Gap 3 `present-token`) is accepted here but, like `session`, intentionally NOT in
+    // `KNOWN_IMPORTS`: the host advertises it as Experimental only when the `messaging` feature is
+    // compiled, so the `requires` ABI gate enforces host support at activation while a deploy
+    // targeting any host build still parses offline.
     if KNOWN_IMPORTS.contains(&import)
         || import == "session"
+        || import == "tenancy"
         || is_named_sql_import(import)
         || is_named_admin_import(import)
     {
         Ok(())
     } else {
         Err(ConfigError::parse(format!(
-            "unknown handler import {import:?}; allowed: {}, `session`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
+            "unknown handler import {import:?}; allowed: {}, `session`, `tenancy`, a named SQL binding `sql:<name>` / `sql:*`, or an admin surface `admin:{{domains,email,site,secrets}}`",
             KNOWN_IMPORTS.join(", ")
         )))
     }

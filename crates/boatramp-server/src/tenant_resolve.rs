@@ -383,9 +383,10 @@ async fn resolve_value(
 }
 
 /// Convert a verified JSON claim scalar into a bound SQL value. Non-scalars (arrays/objects/null)
-/// are rejected — a tenant id is always a scalar. Only reached from the `oidc` token branch.
+/// are rejected — a tenant id is always a scalar. Only reached from the `oidc` token branch (the
+/// request-path `token` source + the async-lane `present-token` producer stamp, Gap 3).
 #[cfg(feature = "oidc")]
-fn scalar_to_sql(v: &serde_json::Value) -> Option<boatramp_core::sql::SqlValue> {
+pub(crate) fn scalar_to_sql(v: &serde_json::Value) -> Option<boatramp_core::sql::SqlValue> {
     use boatramp_core::sql::SqlValue;
     match v {
         serde_json::Value::String(s) => Some(SqlValue::Text(s.clone())),

@@ -44,11 +44,19 @@ pub struct MessagingBinding {
     pub(crate) bus_prefix: String,
     /// The host-minted **durable signed-context** envelope (R1) stamped onto every message this
     /// producer publishes — the producer's own-tenant, sealed for the async lane so a consumer
-    /// declaring `sources: [signed_context]` resolves it. Fixed at bind time from the invocation's
-    /// resolved principal (the guest never names a tenant); `None` when the producer had no resolved
-    /// own-tenant, so the published message carries no context (the consumer then fails closed).
-    pub(crate) signed_context: Option<String>,
+    /// declaring `sources: [signed_context]` resolves it. Initialized at bind time from the
+    /// invocation's resolved principal (the guest never names a tenant); `None` when the producer had
+    /// no resolved own-tenant. A **shared cell** so a `tenancy::present-token` (Gap 3) can host-seal a
+    /// tenant the emitter verified in-guest and update it mid-invocation, before the guest publishes;
+    /// read fresh on each publish. Empty ⇒ the message carries no context (the consumer fails closed).
+    pub(crate) signed_context: ProducerContext,
 }
+
+/// A per-invocation, shared cell holding the current host-sealed producer-context envelope (Gap 3).
+/// Shared between the `messaging` binding (reads it at publish) and the `tenancy` binding
+/// (`present-token` host-seals + writes it). Always host-minted — the guest never writes a tenant
+/// value into it. `None` ⇒ an unscoped producer.
+pub type ProducerContext = Arc<std::sync::Mutex<Option<String>>>;
 
 /// Per-invocation view over the (optional) messaging grant.
 pub struct MessagingHost<'a> {
@@ -77,12 +85,19 @@ impl messaging_producer::Host for MessagingHost<'_> {
             Some(bus_topic) => format!("{}{bus_topic}", binding.bus_prefix),
             None => format!("{}{topic}", binding.prefix),
         };
-        // The guest names no tenant; the host stamps the producer's own-tenant signed context
-        // (fixed at bind time) onto the message so a declaring consumer resolves it on the async
-        // lane. `None` ⇒ an unscoped producer, identical to a plain publish.
+        // The guest names no tenant; the host stamps the producer's own-tenant signed context onto
+        // the message so a declaring consumer resolves it on the async lane. Read FRESH from the
+        // shared cell so a `tenancy::present-token` earlier in this invocation (Gap 3) is reflected.
+        // `None` ⇒ an unscoped producer, identical to a plain publish. The lock is released before
+        // the await (a quick clone).
+        let signed_context = binding
+            .signed_context
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
         binding
             .messaging
-            .publish_ctx(&namespaced, &data, binding.signed_context.as_deref())
+            .publish_ctx(&namespaced, &data, signed_context.as_deref())
             .await
             .map_err(|err| messaging_types::Error::Other(err.to_string()))
     }
@@ -164,7 +179,7 @@ mod tests {
             messaging: backend,
             prefix: "blog/production/".to_string(),
             bus_prefix: "acme/bus/".to_string(),
-            signed_context,
+            signed_context: Arc::new(std::sync::Mutex::new(signed_context)),
         }
     }
 

@@ -120,6 +120,79 @@ fn ctx_stamp(value: &boatramp_core::sql::SqlValue) -> Option<String> {
     }
 }
 
+/// The tenant claim a component's `token` source names (Gap 3) — the first `TenantSource::Token`
+/// in a `Scoped` tenancy decision. `None` when the component declares no token source (so
+/// `present-token` has nothing to verify against → deny-by-default).
+#[cfg(feature = "handlers")]
+pub(crate) fn token_source_claim(
+    decision: Option<&boatramp_core::tenancy::Tenancy>,
+) -> Option<String> {
+    match decision {
+        Some(boatramp_core::tenancy::Tenancy::Scoped { sources, .. }) => {
+            sources.iter().find_map(|s| match s {
+                boatramp_core::tenancy::TenantSource::Token { claim } => Some(claim.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The server's [`ProducerContextSource`](boatramp_handlers::ProducerContextSource) (Gap 3): the
+/// verify-and-seal seam behind the guest `tenancy::present-token`. The guest presents a credential
+/// it verified in-guest; the HOST re-verifies it against the component's operator-declared
+/// `token_claims` (JWKS / issuer / audience / expiry) — never trusting the guest — extracts the
+/// tenant claim (the `claim` named by the component's `token` source), and mints the SAME
+/// host-sealed durable context [`mint_producer_context`] produces from a host-resolved principal. So
+/// a guest can only cause a stamp for a tenant it holds a validly-signed token for from the
+/// configured issuer; it can never NAME an arbitrary tenant.
+#[cfg(feature = "handlers")]
+pub(crate) struct ServerProducerContextSource {
+    /// The JWKS/issuer/audience config verifying the presented credential (the component's own).
+    pub(crate) token_cfg: boatramp_core::config::HandlerGraphqlTokenClaims,
+    /// The claim carrying the tenant id (from the component's `TenantSource::Token { claim }`).
+    pub(crate) claim: String,
+    /// The fleet signer that seals the durable context (the same key session cookies use).
+    pub(crate) signer: Arc<dyn boatramp_core::cose::Signer>,
+}
+
+#[cfg(feature = "handlers")]
+#[async_trait::async_trait]
+impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
+    async fn seal_presented(&self, token: &str) -> Result<String, String> {
+        // Verification pulls the JWKS verifier (behind `oidc`). Without it the async-lane stamp
+        // can't verify a presented token, so it fails closed (mirrors the request-path `token`
+        // source), never trusting the guest.
+        #[cfg(feature = "oidc")]
+        {
+            let claims = crate::graphql_data::token::verified_claims(&self.token_cfg, token)
+                .await
+                .ok_or_else(|| "presented token did not verify".to_string())?;
+            let value = claims
+                .get(&self.claim)
+                .and_then(crate::tenant_resolve::scalar_to_sql)
+                .ok_or_else(|| {
+                    format!("presented token carries no `{}` tenant claim", self.claim)
+                })?;
+            let tenant =
+                ctx_stamp(&value).ok_or_else(|| "tenant claim is not a scalar".to_string())?;
+            boatramp_core::cose::mint_context(
+                &tenant,
+                DURABLE_CONTEXT_TTL_SECS,
+                now_unix(),
+                self.signer.as_ref(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "oidc"))]
+        {
+            let _ = token;
+            Err("token verification is unavailable in this build (no `oidc`)".to_string())
+        }
+    }
+}
+
 /// Query of `POST /api/functions/:name/invoke`.
 #[cfg(feature = "handlers")]
 #[derive(serde::Deserialize)]
@@ -730,6 +803,29 @@ pub(super) async fn build_function_bindings(
                 format!("{}/", project.qualified("bus")),
                 messaging.clone(),
                 signed_context,
+            );
+        }
+    }
+    // Gap 3: `tenancy::present-token` — an emitter that verified a tenant credential IN-GUEST hands
+    // it to the host, which RE-verifies it against this function's declared `token_claims` + `token`
+    // source and seals the tenant onto the producer-context cell (so a subsequent `emit::message`
+    // stamps it). Deny-by-default: needs the `tenancy` import, a messaging cell to stamp, a declared
+    // `token` source (for the claim name) + `token_claims` (the JWKS), and a fleet signer — absent
+    // any, `present-token` is `access-denied` and nothing is stamped. The guest never names a tenant.
+    if granted("tenancy") {
+        if let (Some(cell), Some(token_cfg), Some(signer), Some(claim)) = (
+            bindings.producer_context_cell(),
+            config.token_claims.clone(),
+            inner.session_signer.get().cloned(),
+            token_source_claim(config.tenancy.as_ref()),
+        ) {
+            bindings = bindings.with_present_token(
+                Arc::new(ServerProducerContextSource {
+                    token_cfg,
+                    claim,
+                    signer,
+                }),
+                cell,
             );
         }
     }
