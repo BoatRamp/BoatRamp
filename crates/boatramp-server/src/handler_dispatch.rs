@@ -1770,7 +1770,22 @@ pub(super) async fn dispatch_consumer_batch(
         }
     };
     let mut acked = 0;
+    // Gap 3 isolation: the batch reuses one `Bindings` (hence one shared producer-context cell)
+    // across every message. A `tenancy::present-token` earlier in the batch host-seals that cell,
+    // so WITHOUT this reset a later message that does not present (or whose token fails) would
+    // publish under the PRIOR message's tenant — a cross-tenant misattribution on the async lane.
+    // Snapshot the bind-time value and restore it before each message so `present-token` is
+    // strictly per-message (never carried across a batch).
+    let bind_time_context = bindings
+        .producer_context_cell()
+        .and_then(|cell| cell.lock().ok().and_then(|guard| guard.clone()));
     for msg in claimed {
+        // Reset the shared producer-context cell to its bind-time value before each message.
+        if let Some(cell) = bindings.producer_context_cell() {
+            if let Ok(mut guard) = cell.lock() {
+                *guard = bind_time_context.clone();
+            }
+        }
         let guest_topic = msg.topic.strip_prefix(scope_prefix).unwrap_or(&msg.topic);
         let start = std::time::Instant::now();
         let result = engine
