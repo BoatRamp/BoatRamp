@@ -95,26 +95,38 @@ Tenancy lives at two grains, and the domain source is wired in a third place:
 
 - **Site ceiling** — [`SiteConfig.handlers.tenancy`](../reference/siteconfig.md#handlerstenancy).
   The maximum a site's handlers may reach. PUT with the rest of site config.
-- **Per top-level function** — the `tenancy` (+ `token_claims`) block on a
-  [function](./apply.md) in `apply.cfg` / `function deploy`. It narrows **within** the
-  site ceiling; it can never widen it.
+- **Per component** — the `tenancy` (+ `token_claims`) block on a top-level **function**, a
+  route **handler**, or a bus **consumer** in `apply.cfg` (since v0.4.7). A per-handler value
+  narrows **within** the site ceiling; it can never widen it (a widening — e.g. `disabled`
+  removing scoping under a `scoped` ceiling — is refused fail-closed at bind). This lets one
+  site host, say, a `payments.wasm` handler at `all` beside a `portal.wasm` handler at `own`.
 - **Domain context tags** — [`domains.contexts`](./custom-domain.md#map-each-host-to-a-tenant-domainscontexts)
   in site config supplies the value for the `domain` source: host-or-wildcard → an opaque
   tenant tag.
 
-The wire shape is a tagged `mode` (JSON for the admin API / SiteConfig; the RON equivalent
-in `apply.cfg`):
+The wire shape is a tagged `mode`. In the **admin API / SiteConfig** it is JSON:
 
 ```json
 { "mode": "scoped",
   "column": "tenant_id",
-  "source": { "kind": "token", "claim": "tid" },
+  "sources": [{ "kind": "token", "claim": "tid" }],
   "read":  "own_or_null",
   "write": "own" }
 ```
 
-```json
-{ "mode": "disabled" }
+In **`apply.cfg` / `project.cfg`** (RON) it is the byte-identical, **fully-quoted** form —
+the enum tags/values are quoted strings, not bare identifiers (`column` is required for
+`scoped`):
+
+```ron
+tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own_or_null", write: "own")
+tenancy: (mode: "disabled")
+```
+
+An async worker resolves its own tenant from the producer-stamped context:
+
+```ron
+tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "signed_context")], read: "own", write: "own")
 ```
 
 ## Both query surfaces are scoped the same way
@@ -149,6 +161,35 @@ re-resolve from a request it never saw, and the caller cannot inject a different
 sibling then applies **its own** declared modes over that inherited value (posture-capped
 as usual). Background paths with no caller tenant (a cron, a queue drain) fail closed for
 an `own` mode rather than run unscoped.
+
+## Async lane: stamp the tenant an emitter verified in-guest (`present-token`)
+
+A message **consumer** resolves its own tenant on the async lane from a `signed_context`
+source — but only if the **producer** stamped one on the message. The host stamps the
+producer's own tenant automatically when it resolved one (a request bearer, a routed
+domain). When the emitter's tenant authority is verified **in-guest** instead — an app JWT
+in a POST body, a portal cookie's bearer — it hands the credential to the host with the
+`tenancy` capability (since v0.4.7):
+
+```rust
+// The emitter declares `imports: ["tenancy"]` + a `token` source + `token_claims`.
+boatramp::handlers::tenancy::present_token(&handoff_jwt)?; // host RE-verifies, extracts the tenant
+emit::message("bus:handoff.confirmed", &payload)?;         // now carries that tenant's context
+```
+
+The **host** re-verifies the presented token against the component's declared `token_claims`
+(JWKS / issuer / audience / expiry) and stamps the extracted tenant — the guest never names
+a tenant value; it can only cause a stamp for a tenant it holds a validly-signed token for.
+Deny-by-default (no grant / no `token_claims` / an invalid token stamps nothing).
+
+## Cross-tenant reads: target fields (another tenant's public subset)
+
+Reading **another** tenant `B`'s *public* subset (an embed, a storefront funnel, a handoff)
+is the separate **target** axis, declared on a GraphQL field with
+`@tenant(scope: target, via: […], public: …)`. Since v0.4.7 the external `/graphql` gateway
+serves these on **wasm** subgraphs too (reads and writes), resolving `B` per fetch from
+`domain` / `capability` / `handle` and confining the subgraph's own `sql`/`orm` to
+`tenant = B AND <public subset>`. See [GraphQL](./graphql.md) for the target-field model.
 
 ## Worked example — a multi-storefront SaaS
 

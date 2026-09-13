@@ -44,6 +44,36 @@ security: (
 The full knob list is in the
 [boatramp.cfg schema](../reference/boatramp-cfg.md#security).
 
+## Per-project overrides (v0.4.7)
+
+The four **tenancy/capability** knobs — `require_tenancy_declaration`, `allow_cross_tenant_db`,
+`allow_guest_mint_capability`, `max_guest_capability_ttl_secs` — can be overridden **per project**,
+so one serve process can host a strict-isolation project beside a looser one on a shared,
+multi-project machine:
+
+```ron
+security: (
+    profile: "multi-tenant",                 // the fleet default
+    projects: {
+        "acme-preview": (                     // looser, just for this project
+            allow_cross_tenant_db: true,
+            allow_guest_mint_capability: true,
+        ),
+    },
+)
+```
+
+Only these four in-project knobs are per-project; every other knob (egress, upload caps, domain
+verification, …) stays fleet-wide. **Cross-project isolation is structural** (project = database) —
+never a knob, so a per-project override can only tune that project's own in-project strictness and
+its guests' capability-mint ceiling, never its reach into another project. The three knobs
+**compose**: you can require an explicit tenancy declaration *and* permit specific components to be
+`all` *and* allow guest capability minting, all at once.
+
+These four knobs (and the other posture bools) are also `BOATRAMP_SECURITY_*` env-settable — e.g.
+`BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB=true` — so a 12-factor deploy needn't ship a `boatramp.cfg`
+just to tune them. (Per-project overrides are config-file only.)
+
 ## Inspect the resolved posture
 
 `security explain` prints the effective posture — every knob's value and where it
