@@ -203,6 +203,13 @@ pub(super) async fn dispatch_handler(
                         .extensions
                         .get::<crate::DomainContext>()
                         .map(|c| c.0.clone());
+                    // R4/D8 5c: a target field with a `handle` source resolves `B` from a PUBLIC slug
+                    // the request names in `?handle=` (read-only, world-public only). `None` ⇒ none.
+                    let target_handle = parts
+                        .uri
+                        .query()
+                        .and_then(|q| query_value(q, "handle"))
+                        .map(str::to_string);
                     // GraphQL subscription: serve it as a graphql-sse event stream,
                     // deriving the messaging topic from the subscription's root field. A
                     // producer (a mutation, a function) publishes each execution result to
@@ -235,6 +242,7 @@ pub(super) async fn dispatch_handler(
                             &variables,
                             bearer.as_deref(),
                             domain_context.as_deref(),
+                            target_handle.as_deref(),
                         )
                         .await;
                     }
@@ -481,6 +489,7 @@ async fn federation_gateway(
     variables: &serde_json::Value,
     bearer: Option<&str>,
     domain_context: Option<&str>,
+    target_handle: Option<&str>,
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
@@ -535,11 +544,11 @@ async fn federation_gateway(
     // R4/D8: when the plan has any `target`-class fetch, (1) enforce the operator ceiling — every
     // target root field this query uses must be listed in the project's `target_eligible_fields`,
     // else refuse (the app's SDL alone can never make a field cross to another tenant) — and (2)
-    // bind the request's confinement so those fetches read only B's public subset. For 5a, `B` is
-    // the terminating domain's context tag (a same-origin funnel on B's host) — never guest input;
-    // the full `via` source model (handle/capability) lands in 5c. The schema is loaded FRESH here
-    // (not the cached supergraph), so removing a field's eligibility takes effect immediately. No
-    // domain, or no project schema, ⇒ no target scope ⇒ every target fetch fails closed.
+    // bind the host-trusted inputs the router uses to resolve each fetch's `B` per fetch from that
+    // fetch's own `@tenant(via, public, write)`, over the full source model (domain/capability/handle,
+    // Gap 1 — SQL *and* wasm subgraphs). The schema is loaded FRESH here (not the cached supergraph),
+    // so removing a field's eligibility takes effect immediately. No project schema ⇒ no target inputs
+    // ⇒ every target fetch fails closed.
     if plan.fetches.iter().any(|f| f.class.is_target()) {
         let schema = boatramp_core::deploy::load_project_tenancy(
             inner.kv.as_ref(),
@@ -559,11 +568,16 @@ async fn federation_gateway(
                 ));
             }
         }
-        if let (Some(schema), Some(b)) = (schema, domain_context.filter(|c| !c.is_empty())) {
-            runner = runner.with_target(Some(crate::graphql_gateway::build_target_scope(
-                &schema,
-                boatramp_core::sql::SqlValue::Text(b.to_string()),
-            )));
+        if let Some(schema) = schema {
+            // The fleet anchor that verifies a `capability` source (the session signer's public half),
+            // exactly as the plain-wasm target route uses.
+            let capability_anchor = inner.session_signer.get().map(|s| s.public_key());
+            runner = runner.with_target_inputs(Some(crate::graphql_gateway::TargetInputs {
+                schema: std::sync::Arc::new(schema),
+                domain_context: domain_context.map(str::to_string),
+                target_handle: target_handle.map(str::to_string),
+                capability_anchor,
+            }));
         }
     }
     axum::Json(crate::graphql_gateway::execute(&plan, &runner, variables).await).into_response()

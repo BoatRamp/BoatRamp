@@ -145,6 +145,27 @@ pub trait Invoker: Send + Sync {
         depth: u32,
     ) -> Result<InvokeResponse, InvokeError>;
 
+    /// Invoke `target` under a **host-forced target-tenant** binding (R4/D8 wasm-plane, Gap 1). The
+    /// caller (the federation gateway) has resolved another tenant `B`'s public-subset confinement
+    /// for this fetch; the callee's `sql`/`orm` MUST run under exactly that [`HostTenancy`] — its own
+    /// declared tenancy is bypassed for this invocation, because the field is target-class per the
+    /// composed SDL (the authority), not per the callee's config. `B` and the confinement are
+    /// host-derived (never guest input).
+    ///
+    /// The default **refuses** (fail-closed): an invoker that cannot apply a forced target must never
+    /// run the callee un-confined. Only the server's `FunctionInvoker` overrides it.
+    async fn invoke_target(
+        &self,
+        _target: &str,
+        _request: InvokeRequest,
+        _depth: u32,
+        _tenancy: crate::HostTenancy,
+    ) -> Result<InvokeResponse, InvokeError> {
+        Err(InvokeError::Failed(
+            "this invoker does not support host-forced target-tenant invocation".into(),
+        ))
+    }
+
     /// Invoke `target` and return its response as a **stream**: status + headers up
     /// front, the body pulled incrementally. The default buffers via
     /// [`Invoker::invoke`] then yields the whole body as one chunk — correct but not

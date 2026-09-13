@@ -27,6 +27,13 @@ pub(super) enum FnTenant {
     /// so an "own" op fails closed. The value crosses the durability boundary **only** as this
     /// signed, host-issued envelope — never a guest-named tenant.
     Durable(Option<String>),
+    /// A **host-forced target-tenant** binding (R4/D8 wasm-plane, Gap 1): the federation gateway
+    /// resolved another tenant `B`'s public-subset confinement for a `Target`-class fetch and forces
+    /// it onto this (wasm subgraph) invocation. The provided [`HostTenancy`] already has the project
+    /// schema baked into its `PerTableTarget` keys, so it is used verbatim (no `with_schema`) — the
+    /// callee's own declared tenancy is bypassed (the SDL field's class is the authority). `B` is
+    /// host-derived (domain / verified capability / handle), NEVER guest input. In-process only.
+    ForcedTarget(boatramp_handlers::HostTenancy),
     /// No trusted source (cron / webhook / SDL introspection) and no durable context.
     Background,
 }
@@ -620,53 +627,70 @@ pub(super) async fn build_function_bindings(
             .session_signer
             .get()
             .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()));
-        let resolved = match tenant {
-            FnTenant::Request => crate::tenant_resolve::resolve_host_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                crate::tenant_resolve::TenantSourceInputs {
-                    bearer,
-                    domain_context,
-                    token_cfg: config.token_claims.as_ref(),
-                    session_cookie: None,
-                    session_anchor: None,
-                    signed_context: None,
-                    context_anchor: None,
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-            FnTenant::Inherited(value) => crate::tenant_resolve::resolve_inherited_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                value.clone(),
-            )
-            .map_err(|e| e.to_string())?,
+        // Resolve the invocation's principal + whether it is a host-forced target (Gap 1). A forced
+        // target is used verbatim (its schema is baked into `PerTableTarget` keys), bypassing the
+        // config/posture resolution AND the `with_schema` below.
+        let (resolved, is_forced_target) = match tenant {
+            // The match borrows `tenant` (it's read earlier), so clone the forced binding out.
+            FnTenant::ForcedTarget(host_tenancy) => (Some(host_tenancy.clone()), true),
+            FnTenant::Request => (
+                crate::tenant_resolve::resolve_host_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    crate::tenant_resolve::TenantSourceInputs {
+                        bearer,
+                        domain_context,
+                        token_cfg: config.token_claims.as_ref(),
+                        session_cookie: None,
+                        session_anchor: None,
+                        signed_context: None,
+                        context_anchor: None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
+            FnTenant::Inherited(value) => (
+                crate::tenant_resolve::resolve_inherited_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    value.clone(),
+                )
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
             // The durable async lane: a `signed_context` source resolves the producer's stamped
             // tenant from the envelope carried on the drained message, verified against the fleet
             // anchor. No envelope / no anchor ⇒ no own tenant (fail closed).
-            FnTenant::Durable(signed_context) => crate::tenant_resolve::resolve_host_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                crate::tenant_resolve::TenantSourceInputs {
-                    signed_context: signed_context.as_deref(),
-                    context_anchor: context_anchor.as_ref(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-            FnTenant::Background => crate::tenant_resolve::resolve_host_tenancy(
-                config.tenancy.as_ref(),
-                imports_db,
-                posture,
-                crate::tenant_resolve::TenantSourceInputs::default(),
-            )
-            .await
-            .map_err(|e| e.to_string())?,
+            FnTenant::Durable(signed_context) => (
+                crate::tenant_resolve::resolve_host_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    crate::tenant_resolve::TenantSourceInputs {
+                        signed_context: signed_context.as_deref(),
+                        context_anchor: context_anchor.as_ref(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
+            FnTenant::Background => (
+                crate::tenant_resolve::resolve_host_tenancy(
+                    config.tenancy.as_ref(),
+                    imports_db,
+                    posture,
+                    crate::tenant_resolve::TenantSourceInputs::default(),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                false,
+            ),
         };
         // Attach the project per-table tenancy schema (R2/D2) from the KV. Absent ⇒ Uniform;
         // present-but-unreadable ⇒ **fail closed** with a deny-all schema (never a silent downgrade
@@ -677,7 +701,13 @@ pub(super) async fn build_function_bindings(
                 Ok(s) => s,
                 Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
             };
-        let resolved = resolved.map(|h| h.with_schema(schema.as_ref()));
+        // A forced target binding already carries the schema (in its `PerTableTarget` keys) — never
+        // re-attach it (`with_schema` would clobber the target keys with own `PerTable` keys).
+        let resolved = if is_forced_target {
+            resolved
+        } else {
+            resolved.map(|h| h.with_schema(schema.as_ref()))
+        };
         bindings = bindings.with_tenancy(resolved.clone());
         resolved
     };
@@ -946,6 +976,65 @@ impl boatramp_handlers::Invoker for FunctionInvoker {
             // In-project invoke: the sibling inherits the caller's host-resolved tenant (never the
             // guest's invoke request), applying its own declared grant.
             FnTenant::Inherited(self.caller_tenant.clone()),
+        )
+        .await;
+        let invoke_response = buffer_invoke_response(response).await;
+        let sample = boatramp_core::function::MeteringSample {
+            success: invoke_response.status < 500,
+            duration_ms,
+            bytes_in,
+            bytes_out: invoke_response.body.len() as u64,
+        };
+        record_metering(&inner, &self.deploy, project, &function.name, &sample).await;
+        Ok(invoke_response)
+    }
+
+    async fn invoke_target(
+        &self,
+        target: &str,
+        request: boatramp_handlers::InvokeRequest,
+        depth: u32,
+        tenancy: boatramp_handlers::HostTenancy,
+    ) -> Result<boatramp_handlers::InvokeResponse, boatramp_handlers::InvokeError> {
+        use boatramp_handlers::InvokeError;
+        let Some(inner) = self.runtime.upgrade() else {
+            return Err(InvokeError::Failed(
+                "handler runtime is shutting down".into(),
+            ));
+        };
+        // A target fetch is served in the SAME project as the caller (the gateway resolved `B`'s
+        // public-subset confinement for a field of THIS project's supergraph); the callee is a
+        // subgraph FUNCTION of this project.
+        let project = ProjectRef::new(&self.project);
+        let function = match self.deploy.get_function(project, target).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return Err(InvokeError::NotFound),
+            Err(err) => return Err(InvokeError::Failed(err.to_string())),
+        };
+        let Some(component) = function.resolve(&function.active).map(str::to_owned) else {
+            return Err(InvokeError::NotFound);
+        };
+        let bytes_in = request.body.len() as u64;
+        let axum_request = match build_internal_request(request) {
+            Ok(req) => req,
+            Err(err) => return Err(InvokeError::Failed(err)),
+        };
+        if let Err(response) = admit_by_quota(&inner, &self.deploy, project, &function).await {
+            return Ok(buffer_invoke_response(response).await);
+        }
+        let (response, duration_ms) = execute_function(
+            &inner,
+            &self.deploy,
+            project,
+            &function,
+            &component,
+            axum_request,
+            depth,
+            boatramp_handlers::Lane::Sync,
+            // The subgraph runs under the host-FORCED target confinement (its own declared tenancy
+            // is bypassed — the composed SDL field's target class is the authority). `B` + the
+            // public-subset confinement were host-resolved at the gateway (never guest input).
+            FnTenant::ForcedTarget(tenancy),
         )
         .await;
         let invoke_response = buffer_invoke_response(response).await;
