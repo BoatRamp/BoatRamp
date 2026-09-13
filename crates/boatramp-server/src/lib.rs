@@ -421,6 +421,45 @@ struct HandlerRuntimeInner {
     /// [`session_signer`](Self::session_signer).
     #[cfg(feature = "capability")]
     capability_max_ttl_secs: std::sync::OnceLock<u64>,
+    /// Per-project overrides (Gap 4a) of the resolved tenancy/capability knobs, project name →
+    /// resolved knobs (base posture ⊕ the operator's `[security.projects.<p>]` override). Consulted
+    /// at each in-project enforcement point via [`HandlerRuntimeInner::project_tenancy_knobs`];
+    /// **unset / a project not listed ⇒ the node base** (today's behavior). Set once at startup.
+    #[cfg(feature = "handlers")]
+    tenancy_posture_overrides: std::sync::OnceLock<
+        Arc<std::collections::BTreeMap<String, boatramp_core::security::ResolvedProjectTenancy>>,
+    >,
+}
+
+#[cfg(feature = "handlers")]
+impl HandlerRuntimeInner {
+    /// Resolve the tenancy/capability knobs for `project` (Gap 4a): the operator's per-project
+    /// override if one was declared, else the node base. The lookup key is the **host-routed**
+    /// project (never guest input), so it can't be spoofed. Consulted at every in-project
+    /// enforcement point (tenancy-declaration + cross-tenant `all` in `build_bindings` /
+    /// `function_runtime`; the guest capability-mint gate).
+    pub(crate) fn project_tenancy_knobs(
+        &self,
+        project: &str,
+    ) -> boatramp_core::security::ResolvedProjectTenancy {
+        if let Some(map) = self.tenancy_posture_overrides.get() {
+            if let Some(knobs) = map.get(project) {
+                return *knobs;
+            }
+        }
+        boatramp_core::security::ResolvedProjectTenancy {
+            require_tenancy_declaration: self
+                .require_tenancy_declaration
+                .get()
+                .copied()
+                .unwrap_or(true),
+            allow_cross_tenant_db: self.allow_cross_tenant_db.get().copied().unwrap_or(false),
+            #[cfg(feature = "capability")]
+            capability_max_ttl_secs: self.capability_max_ttl_secs.get().copied(),
+            #[cfg(not(feature = "capability"))]
+            capability_max_ttl_secs: None,
+        }
+    }
 }
 
 /// Predicate gating cron firing to the cluster leader (see
@@ -490,6 +529,8 @@ impl HandlerRuntime {
                 session_signer: std::sync::OnceLock::new(),
                 #[cfg(feature = "capability")]
                 capability_max_ttl_secs: std::sync::OnceLock::new(),
+                #[cfg(feature = "handlers")]
+                tenancy_posture_overrides: std::sync::OnceLock::new(),
             })),
         }
     }
@@ -628,6 +669,28 @@ impl HandlerRuntime {
         if let Some(inner) = self.inner.as_ref() {
             let _ = inner.require_tenancy_declaration.set(require_declaration);
             let _ = inner.allow_cross_tenant_db.set(allow_cross_tenant);
+        }
+    }
+
+    /// Wire per-project tenancy/capability posture overrides (Gap 4a): project name → the resolved
+    /// knobs (fleet base ⊕ the operator's `[security.projects.<p>]` override). A project not in the
+    /// map uses the node base ([`set_tenancy_posture`](Self::set_tenancy_posture) +
+    /// [`set_capability_minting`](Self::set_capability_minting)). Set once at startup; a per-project
+    /// override tunes only that project's own in-project isolation + guest capability-mint ceiling
+    /// (cross-project isolation is structural, never a knob). No-op on a plain runtime / empty map.
+    #[cfg(feature = "handlers")]
+    pub fn set_project_tenancy_overrides(
+        &self,
+        overrides: std::collections::BTreeMap<
+            String,
+            boatramp_core::security::ResolvedProjectTenancy,
+        >,
+    ) {
+        if overrides.is_empty() {
+            return;
+        }
+        if let Some(inner) = self.inner.as_ref() {
+            let _ = inner.tenancy_posture_overrides.set(Arc::new(overrides));
         }
     }
 
@@ -4192,6 +4255,45 @@ mod tests {
         // No cron fired (a follower); the counter was never written.
         assert!(handles.is_empty(), "a non-leader must not fire crons");
         assert_eq!(kv.get("hkv/blog/hits").await.unwrap(), None);
+    }
+
+    /// Gap 4a: `project_tenancy_knobs` returns the operator's per-project override for a listed
+    /// project and falls back to the node base for any unlisted project — the runtime half of
+    /// per-project posture (the resolution half is `security::per_project_override_*`).
+    #[tokio::test]
+    async fn project_tenancy_knobs_override_wins_else_node_base() {
+        use boatramp_core::security::ResolvedProjectTenancy;
+        use boatramp_handlers::{HandlerEngine, Limits};
+
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let storage: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, None, None);
+        // Node base: strict multi-tenant (declaration required, no cross-tenant `all`).
+        rt.set_tenancy_posture(true, false);
+        // One project relaxes cross-tenant (its `all` twins) while KEEPING strict declaration.
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "preview".to_string(),
+            ResolvedProjectTenancy {
+                require_tenancy_declaration: true,
+                allow_cross_tenant_db: true,
+                capability_max_ttl_secs: Some(1800),
+            },
+        );
+        rt.set_project_tenancy_overrides(overrides);
+        let inner = rt.inner.as_ref().unwrap();
+
+        // Listed project → the override.
+        let p = inner.project_tenancy_knobs("preview");
+        assert!(p.require_tenancy_declaration);
+        assert!(p.allow_cross_tenant_db);
+        assert_eq!(p.capability_max_ttl_secs, Some(1800));
+        // Unlisted project → the node base (strict, no cross-tenant, no minting wired).
+        let b = inner.project_tenancy_knobs("prod");
+        assert!(b.require_tenancy_declaration);
+        assert!(!b.allow_cross_tenant_db);
+        assert_eq!(b.capability_max_ttl_secs, None);
     }
 
     /// Named SQL binding dispatch through the real `build_bindings` + a real (libsql) provider:

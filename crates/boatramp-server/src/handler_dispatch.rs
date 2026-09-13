@@ -1149,13 +1149,12 @@ pub(super) async fn build_bindings(
     // resolved value is carried into the `invoke` binding below so a sibling inherits it.
     let handler_caller_tenant = {
         let imports_db = !granted_sql_databases(imports, &site_handlers.allow_imports).is_empty();
+        // Gap 4a: the tenancy posture for THIS project — the operator's per-project override if any,
+        // else the node base. `project` is host-routed (never guest input), so it can't be spoofed.
+        let project_knobs = inner.project_tenancy_knobs(project.as_str());
         let posture = crate::tenant_resolve::TenantPosture {
-            require_declaration: inner
-                .require_tenancy_declaration
-                .get()
-                .copied()
-                .unwrap_or(true),
-            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+            require_declaration: project_knobs.require_tenancy_declaration,
+            allow_cross_tenant: project_knobs.allow_cross_tenant_db,
         };
         // Per-handler token config (Gap 2) wins over the site's `claims_from_token`.
         let token_cfg = handler_token_claims.or_else(|| {
@@ -1436,14 +1435,18 @@ pub(super) async fn build_bindings(
     // ceiling. Deny-by-default: absent any of these, no binding is attached and `mint` is access-denied.
     #[cfg(feature = "capability")]
     if granted("capability") {
+        // Gap 4a: the per-project capability-mint ceiling (operator override, else node base). A
+        // project may enable minting the fleet base leaves off, or disable one the base enables.
         if let (Some(max_ttl), Some(signer)) = (
-            inner.capability_max_ttl_secs.get(),
+            inner
+                .project_tenancy_knobs(project.as_str())
+                .capability_max_ttl_secs,
             inner.session_signer.get(),
         ) {
             let minter = std::sync::Arc::new(ServerCapabilityMinter {
                 signer: signer.clone(),
             });
-            bindings = bindings.with_capability(project.as_str(), minter, *max_ttl);
+            bindings = bindings.with_capability(project.as_str(), minter, max_ttl);
         }
     }
     // Capture stdout/stderr (+ `wasi:logging`) for every invocation — not a guest-requested

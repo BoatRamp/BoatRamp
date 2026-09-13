@@ -607,13 +607,11 @@ pub(super) async fn build_function_bindings(
     // `invoke` binding below so a sibling this function calls inherits the same tenant.
     let host_tenancy = {
         let imports_db = granted("sql") || config.imports.iter().any(|i| i.starts_with("sql:"));
+        // Gap 4a: per-project tenancy posture (operator override for this project, else node base).
+        let project_knobs = inner.project_tenancy_knobs(project.as_str());
         let posture = crate::tenant_resolve::TenantPosture {
-            require_declaration: inner
-                .require_tenancy_declaration
-                .get()
-                .copied()
-                .unwrap_or(true),
-            allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
+            require_declaration: project_knobs.require_tenancy_declaration,
+            allow_cross_tenant: project_knobs.allow_cross_tenant_db,
         };
         // The fleet anchor that verifies a durable signed-context envelope (the session signer's
         // public half — the same key that mints/verifies session cookies). Bound outside the match

@@ -236,6 +236,29 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     if options.posture.allow_guest_mint_capability {
         handlers.set_capability_minting(options.posture.max_guest_capability_ttl_secs);
     }
+    // Per-project tenancy/capability posture overrides (Gap 4a): resolve each
+    // `[security.projects.<p>]` override against the fleet base so one serve process can run a
+    // strict-isolation project beside a looser one on a shared, multi-project machine. Empty ⇒
+    // every project uses the node base wired just above. Only these four in-project knobs are
+    // per-project; cross-project isolation stays structural (project = database).
+    #[cfg(feature = "handlers")]
+    {
+        let base = &options.posture;
+        let overrides: std::collections::BTreeMap<
+            String,
+            boatramp_core::security::ResolvedProjectTenancy,
+        > = config
+            .security
+            .as_ref()
+            .map(|s| {
+                s.projects
+                    .iter()
+                    .map(|(project, ovr)| (project.clone(), base.project_tenancy(ovr)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        handlers.set_project_tenancy_overrides(overrides);
+    }
     // Wire the guest project self-config capability (`boatramp:handlers/admin`) when the
     // operator posture enables at least one surface. The controller reuses the same in-process
     // domain-verify / email-profile / secret / site-config subsystems + the real domain probe;
