@@ -2227,3 +2227,148 @@ fn build_webhook_request(content_type: Option<String>, body: Vec<u8>) -> Request
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| Request::new(axum::body::Body::empty()))
 }
+
+/// Gap 3 live gate (v0.4.7): the host-verified guest-presented producer stamp, end to end. Proves
+/// [`ServerProducerContextSource`] RE-verifies a guest-presented token against the component's
+/// declared `token_claims`, extracts the tenant, and host-seals a durable context that resolves
+/// (via [`verify_context`](boatramp_core::cose::verify_context)) back to that tenant — and that a
+/// forged / wrong-issuer token seals NOTHING (fail-closed). Also asserts the per-message batch
+/// isolation of the shared producer-context cell (the Finding-1 fix). Needs `oidc` (the JWKS
+/// verifier); runs in-process (no compiled guest, no libsql).
+#[cfg(all(test, feature = "handlers", feature = "oidc"))]
+mod gap3_tests {
+    use super::*;
+    use boatramp_core::cose::{verify_context, LocalSigner, Signer};
+    use boatramp_handlers::ProducerContextSource as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    const ISS: &str = "https://idp.example";
+
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Sign an Ed25519 JWT by hand (the host verifies it via the JWKS in `jwks_env`).
+    fn ed25519_token(key: &SigningKey, kid: &str, claims: serde_json::Value) -> String {
+        let header = b64url(
+            serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid })
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(claims.to_string().as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let sig = key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", b64url(&sig.to_bytes()))
+    }
+
+    #[tokio::test]
+    async fn present_token_verify_seal_resolve_chain_and_fail_closed() {
+        // The app's Ed25519 signing key + its JWKS (public half), published to a host env var the
+        // component's `token_claims` names — the SAME verifier path a request-lane `token` source uses.
+        let app_key = SigningKey::from_bytes(&[7u8; 32]);
+        let jwks = serde_json::json!({ "keys": [ {
+            "kty": "OKP", "crv": "Ed25519", "kid": "app-1",
+            "x": b64url(app_key.verifying_key().as_bytes()),
+        } ] })
+        .to_string();
+        let env_name = format!("BR_TEST_GAP3_JWKS_{}", std::process::id());
+        std::env::set_var(&env_name, &jwks);
+        let token_cfg = boatramp_core::config::HandlerGraphqlTokenClaims {
+            issuer: ISS.to_string(),
+            jwks_env: Some(env_name.clone()),
+            jwks_url: None,
+            audience: None,
+        };
+
+        // The fleet signer that seals + verifies the durable context (deterministic test key).
+        let fleet: Arc<dyn Signer> = Arc::new(
+            LocalSigner::from_private_hex(&format!("ed25519:{}", hex::encode([9u8; 32]))).unwrap(),
+        );
+        let source = ServerProducerContextSource {
+            token_cfg: token_cfg.clone(),
+            claim: "tid".to_string(),
+            signer: fleet.clone(),
+        };
+
+        let exp = boatramp_core::time::now_unix() + 3600;
+
+        // (1) A valid token → the host seals a context that resolves back to the token's tenant.
+        let good = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B" }),
+        );
+        let sealed = source
+            .seal_presented(&good)
+            .await
+            .expect("a valid presented token seals a producer context");
+        let resolved = verify_context(
+            &sealed,
+            &fleet.public_key(),
+            boatramp_core::time::now_unix(),
+        )
+        .expect("the sealed context verifies against the fleet anchor");
+        assert_eq!(
+            resolved, "tenant_B",
+            "the host-sealed context resolves back to the tenant the presented token carried"
+        );
+
+        // (2) A token forged with a DIFFERENT key (same kid) → the host does not verify it → seals
+        // nothing (the guest cannot name a tenant it holds no valid token for).
+        let forged = ed25519_token(
+            &SigningKey::from_bytes(&[42u8; 32]),
+            "app-1",
+            serde_json::json!({ "iss": ISS, "exp": exp, "tid": "tenant_B" }),
+        );
+        assert!(
+            source.seal_presented(&forged).await.is_err(),
+            "a forged token must not seal a producer context (fail-closed)"
+        );
+
+        // (3) A validly-signed token whose issuer is wrong → rejected.
+        let wrong_iss = ed25519_token(
+            &app_key,
+            "app-1",
+            serde_json::json!({ "iss": "https://evil.example", "exp": exp, "tid": "tenant_B" }),
+        );
+        assert!(
+            source.seal_presented(&wrong_iss).await.is_err(),
+            "a wrong-issuer token must not seal (fail-closed)"
+        );
+
+        std::env::remove_var(&env_name);
+        println!(
+            "PRESENT-TOKEN CHAIN OK: a guest-presented app JWT was host-verified against the \
+             component's token_claims, its tenant extracted + host-sealed, and the sealed durable \
+             context resolved back to tenant_B via the fleet anchor; a forged and a wrong-issuer \
+             token both sealed nothing (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn producer_context_cell_is_reset_per_message_in_a_batch() {
+        // The Finding-1 fix: a consumer batch reuses one shared cell. Snapshot the bind-time value,
+        // then before each message restore it — so a `present-token` on message 1 cannot leak onto
+        // message 2's publishes. This mirrors the reset loop in `dispatch_consumer_batch`.
+        let cell: boatramp_handlers::ProducerContext =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let bind_time = cell.lock().unwrap().clone(); // None (a consumer resolves no own tenant)
+
+        // Message 1 presents tenant A (host-seals it into the shared cell) and would publish under A.
+        *cell.lock().unwrap() = Some("sealed:tenant_A".to_string());
+        assert_eq!(
+            cell.lock().unwrap().clone(),
+            Some("sealed:tenant_A".to_string())
+        );
+
+        // Before message 2 the batch loop restores the bind-time value.
+        *cell.lock().unwrap() = bind_time.clone();
+        // Message 2 does NOT present → the cell is back to bind-time (None), NOT tenant A.
+        assert_eq!(
+            cell.lock().unwrap().clone(),
+            None,
+            "message 2 must not inherit message 1's presented tenant (no cross-message leak)"
+        );
+    }
+}

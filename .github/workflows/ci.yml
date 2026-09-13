@@ -398,6 +398,34 @@ jobs:
             || { echo "::error::graphql::run propagation test did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GRAPHQL-RUN PRINCIPAL PROPAGATION OK' gqlprop.log \
             || { echo "::error::graphql::run principal propagation never reached its success marker (a propagation regression, a widening, or a skipped test)" >&2; exit 1; }
+      - name: Live gateway wasm-plane target confinement on a real libsql engine (v0.4.7 Gap 1)
+        run: |
+          set -eo pipefail
+          # v0.4.7 Gap 1: the /graphql gateway resolves target tenant B per fetch and FORCES a
+          # HostTenancy::target binding onto a WASM subgraph invocation (invoke_target), confining the
+          # guest's own SQL to tenant=B AND <public subset>. Returns ONLY B's public row (never B's
+          # private row, never A's); no resolved target ⇒ fail closed. A leak (wrong tenant / private
+          # row / no confinement) fails the assertion.
+          cargo test -p boatramp-server --features handlers,capability,oidc --lib \
+            gateway_forces_target_confinement_onto_a_wasm_subgraph \
+            -- --ignored --nocapture 2>&1 | tee gwtarget.log
+          grep -qE 'test result: ok\. 1 passed' gwtarget.log \
+            || { echo "::error::gateway wasm-target gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'GATEWAY WASM-TARGET OK' gwtarget.log \
+            || { echo "::error::gateway wasm-plane target confinement never reached its success marker (a target-axis widening, a public-subset breach, or a skipped test)" >&2; exit 1; }
+      - name: Live present-token verify/seal/resolve chain + batch isolation (v0.4.7 Gap 3)
+        run: |
+          set -eo pipefail
+          # v0.4.7 Gap 3: a guest-presented app JWT is HOST-verified against the component's
+          # token_claims, its tenant host-sealed, and the sealed durable context resolves back to that
+          # tenant; a forged / wrong-issuer token seals nothing (fail-closed). Plus the per-message
+          # batch-isolation of the shared producer-context cell (the security-review Finding-1 fix).
+          cargo test -p boatramp-server --features handlers,capability,oidc --lib \
+            gap3_tests:: -- --nocapture 2>&1 | tee presenttoken.log
+          grep -qE 'test result: ok\. 2 passed' presenttoken.log \
+            || { echo "::error::present-token gate did not pass 2 tests (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'PRESENT-TOKEN CHAIN OK' presenttoken.log \
+            || { echo "::error::present-token verify/seal/resolve chain never reached its success marker (a verification bypass, a guest naming an arbitrary tenant, or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

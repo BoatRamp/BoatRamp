@@ -3652,6 +3652,193 @@ mod tests {
         );
     }
 
+    /// Gap 1 live gate (v0.4.7): the external `/graphql` federation gateway serves a **target-tenant**
+    /// field on a **WASM subgraph** — the gateway resolves `B` per fetch (domain source) and FORCES a
+    /// `HostTenancy::target` binding onto the subgraph FUNCTION invocation via `invoke_target`, so the
+    /// guest's own `sql` is confined to `tenant = B AND <public subset>`. Drives the REAL
+    /// `BackendRouter` → `invoke_target` → engine over the REAL libsql-backed probe: a request whose
+    /// routed domain resolves tenant B returns ONLY B's PUBLIC rows (never A's, never B's PRIVATE
+    /// rows); with no resolved target it fails closed. `#[ignore]`d (static-musl libsql segfault); the
+    /// CI job runs it on the host toolchain + greps the marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI gateway-target gate"]
+    async fn gateway_forces_target_confinement_onto_a_wasm_subgraph() {
+        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::function::{
+            Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicPredicate, PublicSubset, PublicTerm, TableScope, Tenancy,
+            TenancySchema, TenantSource,
+        };
+        use boatramp_handlers::{HandlerEngine, Limits};
+
+        // The SAME compiled probe as the propagation gate — its `items` field runs
+        // `SELECT id FROM items WHERE {scope}`. Under a FORCED TARGET binding the host neutralises
+        // `{scope}` to `1=1` and AST-rewrites the statement to confine `items` to `tenant = B AND
+        // <public predicate>` — so the probe's own declared tenancy is irrelevant (the gateway forces
+        // the target); the fixture needs no change.
+        const PROBE: &[u8] = include_bytes!("../tests/fixtures/graphql-scope-probe.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // Seed the probe's OWN function DB with A's row + B's PUBLIC and PRIVATE rows, so the gate
+        // proves BOTH the tenant confinement (no A) AND the public-subset confinement (no B-private).
+        let sql_dir = std::env::temp_dir().join(format!("br-gwtarget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        let db = backends
+            .database("default", "fn/scopeprobe", "")
+            .await
+            .unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, tenant_id TEXT, published INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, published) in [
+                ("a_pub", "tenant_A", 1),
+                ("b_pub", "tenant_B", 1),
+                ("b_priv", "tenant_B", 0),
+            ] {
+                tx.execute(
+                    "INSERT INTO items (id, tenant_id, published) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Integer(published),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = Arc::new(backends);
+
+        // Deploy the probe as a subgraph FUNCTION (its Scoped-own config is bypassed under a forced
+        // target — the composed SDL field's target class is the authority).
+        let hash = sha256_hex(PROBE);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(PROBE)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let function = Function {
+            name: "scopeprobe".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: FunctionConfig {
+                imports: vec!["sql".into()],
+                tenancy: Some(Tenancy::Scoped {
+                    column: "tenant_id".into(),
+                    sources: vec![TenantSource::None],
+                    read: AccessMode::Own,
+                    write: AccessMode::None,
+                }),
+                ..Default::default()
+            },
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        // Compose a supergraph whose `items` field is a TARGET field (via the routed domain), plan
+        // the op, and build a router with the host-trusted target inputs resolving B = "tenant_B".
+        let sdl = "type Query { items: [Item!]! @tenant(scope: target, via: [domain], public: \"items\") }\n\
+                   type Item @key(fields: \"id\") { id: ID! }";
+        let sg = crate::graphql_federation::compose(&[("scopeprobe".into(), sdl.into())]).unwrap();
+        let plan = crate::graphql_plan::plan("{ items { id } }", &sg).unwrap();
+
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: std::collections::BTreeMap::from([("items".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "items".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![PublicTerm::Cmp {
+                        column: "published".into(),
+                        op: boatramp_core::tenancy::PublicCmp::Eq,
+                        value: boatramp_core::tenancy::PublicLiteral::Int(1),
+                    }],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage, Some(sql), None);
+        rt.set_invoker(deploy.clone());
+        let inner = rt.inner.as_ref().unwrap();
+        let invoker = inner.invoker.get().unwrap().clone();
+
+        let make_router = |domain: Option<&str>| {
+            crate::graphql_gateway::BackendRouter::new(
+                invoker.scoped(ProjectRef::new("default"), Vec::new()),
+                "default".to_string(),
+                inner.sql.clone(),
+                std::collections::BTreeMap::new(),
+                None,
+            )
+            .with_target_inputs(Some(crate::graphql_gateway::TargetInputs {
+                schema: Arc::new(schema.clone()),
+                domain_context: domain.map(str::to_string),
+                target_handle: None,
+                capability_anchor: None,
+            }))
+        };
+
+        // (1) Domain resolves B → the forced target confines the wasm subgraph to B's PUBLIC rows.
+        let router_b = make_router(Some("tenant_B"));
+        let out_b = crate::graphql_gateway::execute(&plan, &router_b, &serde_json::json!({})).await;
+        let body_b = out_b.to_string();
+        assert!(
+            body_b.contains("\"b_pub\"")
+                && !body_b.contains("\"b_priv\"")
+                && !body_b.contains("\"a_pub\""),
+            "gateway forced target B onto the wasm subgraph → ONLY B's PUBLIC row (b_pub), never B's \
+             private row nor A's: {body_b}"
+        );
+
+        // (2) No resolved target (no domain, no capability, no handle) → fail closed, no rows.
+        let router_none = make_router(None);
+        let out_none =
+            crate::graphql_gateway::execute(&plan, &router_none, &serde_json::json!({})).await;
+        let body_none = out_none.to_string();
+        assert!(
+            !body_none.contains("\"a_pub\"")
+                && !body_none.contains("\"b_pub\"")
+                && !body_none.contains("\"b_priv\""),
+            "with no resolved target the wasm-subgraph target fetch fails closed — no rows: {body_none}"
+        );
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!(
+            "GATEWAY WASM-TARGET OK: the /graphql gateway resolved target tenant B from the routed \
+             domain and FORCED a HostTenancy::target binding onto the wasm subgraph invocation \
+             (invoke_target), confining the guest's own SQL to tenant=B AND published=1 over a real \
+             libsql engine — returned ONLY B's public row (b_pub), never B's private row (b_priv) nor \
+             tenant A's (a_pub); with no resolved target the fetch failed closed"
+        );
+    }
+
     /// Tenant isolation (Step 7a): the background scheduler fans out over every
     /// project, so a **non-default** project's queued async invocation is drained
     /// and metered **within that project** — never leaking into `default`. Before
