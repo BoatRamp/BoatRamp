@@ -553,6 +553,8 @@ mod imp {
 
             let config = DeployConfig {
                 handlers: vec![HandlerConfig {
+                    tenancy: None,
+                    token_claims: None,
                     route: "/intake/status".into(),
                     methods: vec!["GET".into()],
                     component: "portal.wasm".into(),

@@ -120,8 +120,14 @@ pub struct FunctionConfig {
     pub invoke_targets: Vec<String>,
     /// In-site tenancy decision for this function's `sql`/`orm` access (Dimension 0). Absent ⇒
     /// *undeclared* (refused under the `multi-tenant` posture, treated as `Disabled` — plain
-    /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// queries — under single-tenant/dev). `Scoped` opts into host-injected row scoping. Parsed via
+    /// the [`crate::tenancy::de_opt_tenancy`] bridge so it reads from RON (`project.cfg`) as well as
+    /// the stored JSON.
+    #[serde(
+        default,
+        deserialize_with = "crate::tenancy::de_opt_tenancy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tenancy: Option<crate::tenancy::Tenancy>,
     /// JWKS/issuer config verifying the app bearer for a [`crate::tenancy::TenantSource::Token`]
     /// tenant source when this function is invoked over HTTP (the function analogue of a site's
@@ -195,14 +201,19 @@ impl FunctionConfig {
             quota: FunctionQuota::default(),
             webhook: None,
             invoke_targets: Vec::new(),
-            // A desugared handler-function inherits its tenancy from the site config.
-            tenancy: None,
-            token_claims: None,
+            // A desugared handler-function carries its own per-handler tenancy when declared;
+            // absent ⇒ inherit the site config (the dispatch path applies the site decision).
+            tenancy: h.tenancy.clone(),
+            token_claims: h.token_claims.clone(),
         }
     }
     fn from_consumer(c: &ConsumerConfig) -> Self {
         Self {
             imports: c.imports.clone(),
+            // A consumer's own tenancy (typically `signed_context` on the async lane) + token
+            // claims are carried onto the desugared function it runs as.
+            tenancy: c.tenancy.clone(),
+            token_claims: c.token_claims.clone(),
             ..Default::default()
         }
     }
@@ -921,6 +932,8 @@ mod tests {
 
     fn handler(route: &str, component: &str, methods: &[&str], imports: &[&str]) -> HandlerConfig {
         HandlerConfig {
+            tenancy: None,
+            token_claims: None,
             route: route.into(),
             methods: methods
                 .iter()
@@ -957,6 +970,8 @@ mod tests {
                 handler("/api/report", "report.wasm", &[], &[]),
             ],
             consumers: vec![ConsumerConfig {
+                tenancy: None,
+                token_claims: None,
                 topic: "orders".into(),
                 component: "orders.wasm".into(),
                 imports: vec!["sql".into()],

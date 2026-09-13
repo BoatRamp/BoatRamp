@@ -261,10 +261,56 @@ impl AccessMode {
     pub fn needs_own_value(self) -> bool {
         matches!(self, Self::Own | Self::OwnOrNull)
     }
+    /// Whether the row-set this mode reaches is a **subset** of `ceiling`'s row-set — i.e. this
+    /// mode is a narrowing (or equal), never a widening. Used to enforce that a per-component
+    /// access grant stays within its site ceiling. The modes form a subset lattice, not a total
+    /// order: `Own` and `Null` are disjoint (neither contains the other), so this is a real
+    /// containment test, not a rank comparison.
+    pub fn within(self, ceiling: AccessMode) -> bool {
+        use AccessMode::*;
+        match self {
+            None => true, // {} ⊆ anything
+            Null => matches!(ceiling, Null | OwnOrNull | All),
+            Own => matches!(ceiling, Own | OwnOrNull | All),
+            OwnOrNull => matches!(ceiling, OwnOrNull | All),
+            All => matches!(ceiling, All),
+        }
+    }
 }
 
 fn default_own() -> AccessMode {
     AccessMode::Own
+}
+
+/// Deserialize an `Option<Tenancy>` config field from **either RON or JSON**, via a `ron::Value`
+/// bridge.
+///
+/// `Tenancy` is an internally-tagged enum (`tag = "mode"`) whose variants carry **enum-valued
+/// fields** (`read`/`write` = [`AccessMode`], `sources` = [`TenantSource`], `via` =
+/// [`TargetSource`]). serde's internally-tagged deserialization buffers the content through
+/// `deserialize_any`, and RON's `deserialize_any` collapses a bare/nested enum value to a *unit*
+/// — so a direct `Tenancy::deserialize` from RON fails (`expected variant identifier, found a unit
+/// value`) in every spelling. serde_json has no such issue.
+///
+/// Routing through [`ron::Value`] — a faithful intermediate that both the RON and the serde_json
+/// deserializers populate correctly — and reconstructing with [`ron::Value::into_rust`] parses one
+/// canonical spelling everywhere:
+/// `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own",
+/// write: "own")` in `project.cfg`/`apply.cfg`, and the byte-identical `{"mode":"scoped",…}` the
+/// control plane stores. (Serialization is unaffected — the derived `Serialize` still emits the
+/// internally-tagged form.)
+pub fn de_opt_tenancy<'de, D>(deserializer: D) -> Result<Option<Tenancy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    match Option::<ron::Value>::deserialize(deserializer)? {
+        Some(value) => value
+            .into_rust::<Tenancy>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
 }
 
 /// A function/site's in-site tenancy decision. Its **presence** (`Some`) is the explicit
@@ -340,6 +386,49 @@ impl Tenancy {
     /// own — the plain-wasm analog of a `@tenant(scope: target)` field.
     pub fn is_target(&self) -> bool {
         matches!(self, Self::Target { .. })
+    }
+
+    /// Whether `self` (a **per-component** decision, e.g. a per-handler tenancy) stays **within**
+    /// `ceiling` (the **site-level** decision) — never widening the reachable tenant-set. Enforced
+    /// fail-closed at bind so a per-handler value can narrow within its site ceiling but not widen
+    /// it (`HandlersSiteConfig::tenancy`). Both are deploy-author config; this guards against an
+    /// accidental widening, and it is the sole security-relevant relationship because the operator
+    /// posture separately caps [`AccessMode::All`].
+    ///
+    /// Subset semantics (not a rank): `Disabled` is the **broadest** in-site policy (plain queries,
+    /// no tenant filter → reaches every row in the project db), so removing scoping under a scoped
+    /// ceiling is a widening. The `Target` axis is governed by the operator's separate
+    /// `target_eligible_fields` allowlist, so a target-vs-own axis mismatch across the ceiling is
+    /// refused (fail-closed) rather than silently reinterpreted.
+    pub fn narrows_within(&self, ceiling: &Tenancy) -> bool {
+        use Tenancy::*;
+        match (self, ceiling) {
+            // A site doing no in-site scoping already reaches every row, so any per-handler
+            // decision is a narrowing-or-equal.
+            (_, Disabled) => true,
+            // Removing scoping under a scoped/target ceiling is a WIDENING — refuse.
+            (Disabled, _) => false,
+            // Same-axis in-site scoping: same tenant column, and each grant is a subset.
+            (
+                Scoped {
+                    column: c,
+                    read: r,
+                    write: w,
+                    ..
+                },
+                Scoped {
+                    column: cc,
+                    read: rc,
+                    write: wc,
+                    ..
+                },
+            ) => c == cc && r.within(*rc) && w.within(*wc),
+            // The target axis is operator-gated (`target_eligible_fields`); a target handler under a
+            // target ceiling is within.
+            (Target { .. }, Target { .. }) => true,
+            // Any own-vs-target axis mismatch across the ceiling is a misdeclaration — refuse.
+            _ => false,
+        }
     }
 }
 
@@ -859,5 +948,152 @@ mod tests {
         assert!(schema.target_eligible_fields.is_empty());
         assert!(schema.public_subsets.is_empty());
         assert!(!schema.target_field_eligible("anything"));
+    }
+
+    #[test]
+    fn access_mode_subset_lattice() {
+        use AccessMode::*;
+        // {} ⊆ anything.
+        for c in [None, Null, Own, OwnOrNull, All] {
+            assert!(None.within(c));
+        }
+        // Own and Null are disjoint — neither is within the other.
+        assert!(!Own.within(Null));
+        assert!(!Null.within(Own));
+        // Own ⊆ {Own, OwnOrNull, All}; Null ⊆ {Null, OwnOrNull, All}.
+        assert!(Own.within(Own) && Own.within(OwnOrNull) && Own.within(All));
+        assert!(Null.within(Null) && Null.within(OwnOrNull) && Null.within(All));
+        // OwnOrNull ⊆ {OwnOrNull, All} only; not within Own or Null.
+        assert!(OwnOrNull.within(OwnOrNull) && OwnOrNull.within(All));
+        assert!(!OwnOrNull.within(Own) && !OwnOrNull.within(Null));
+        // All ⊆ All only.
+        assert!(All.within(All));
+        assert!(!All.within(OwnOrNull) && !All.within(Own));
+    }
+
+    fn scoped(read: AccessMode, write: AccessMode) -> Tenancy {
+        Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::Token {
+                claim: "tid".into(),
+            }],
+            read,
+            write,
+        }
+    }
+
+    #[test]
+    fn tenancy_narrows_within_ceiling() {
+        use AccessMode::*;
+        // Scoped narrows a Scoped ceiling: same column, read/write are subsets.
+        assert!(scoped(Own, Own).narrows_within(&scoped(All, All)));
+        assert!(scoped(All, Own).narrows_within(&scoped(All, All)));
+        assert!(scoped(All, All).narrows_within(&scoped(All, All)));
+        // A broader read/write than the ceiling is a widening — refused.
+        assert!(!scoped(All, Own).narrows_within(&scoped(Own, Own)));
+        assert!(!scoped(Own, All).narrows_within(&scoped(Own, Own)));
+        // A different tenant column is not a narrowing (fail-closed).
+        assert!(!Tenancy::Scoped {
+            column: "org_id".into(),
+            sources: vec![TenantSource::None],
+            read: Own,
+            write: Own,
+        }
+        .narrows_within(&scoped(All, All)));
+    }
+
+    #[test]
+    fn tenancy_disabled_widening_is_refused() {
+        use AccessMode::*;
+        // A `Disabled` site (plain queries, no scoping) is the broadest — anything is within it.
+        assert!(scoped(Own, Own).narrows_within(&Tenancy::Disabled));
+        assert!(Tenancy::Disabled.narrows_within(&Tenancy::Disabled));
+        // But `Disabled` under a scoped ceiling REMOVES scoping = widening = refused.
+        assert!(!Tenancy::Disabled.narrows_within(&scoped(Own, Own)));
+        // Own axis vs target axis across the ceiling is a misdeclaration — refused both ways.
+        let target = Tenancy::Target {
+            via: vec![TargetSource::Domain],
+            public: "storefront".into(),
+            write: vec![],
+        };
+        assert!(!target.narrows_within(&scoped(All, All)));
+        assert!(!scoped(Own, Own).narrows_within(&target));
+        // A target handler under a target ceiling is within (operator-gated separately).
+        assert!(target.narrows_within(&target));
+    }
+
+    #[test]
+    fn de_opt_tenancy_bridges_ron_and_json() {
+        use serde::Deserialize;
+        #[derive(Debug, Deserialize)]
+        struct W {
+            #[serde(default, deserialize_with = "de_opt_tenancy")]
+            tenancy: Option<Tenancy>,
+        }
+        let ron_opts = ron::Options::default()
+            .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
+
+        // Scoped, fully-quoted internally-tagged spelling — the canonical apply.cfg/project.cfg form.
+        let scoped_ron: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "scoped", column: "tenant_id",
+                    sources: [(kind: "token", claim: "tid"), (kind: "signed_context")],
+                    read: "all", write: "own"))"#,
+            )
+            .expect("scoped RON parses via the bridge");
+        // Byte-identical JSON the control plane stores, through the SAME bridge.
+        let scoped_json: W = serde_json::from_str(
+            r#"{"tenancy":{"mode":"scoped","column":"tenant_id",
+                "sources":[{"kind":"token","claim":"tid"},{"kind":"signed_context"}],
+                "read":"all","write":"own"}}"#,
+        )
+        .expect("scoped JSON parses via the bridge");
+        assert_eq!(scoped_ron.tenancy, scoped_json.tenancy);
+        match scoped_ron.tenancy.unwrap() {
+            Tenancy::Scoped {
+                column,
+                sources,
+                read,
+                write,
+            } => {
+                assert_eq!(column, "tenant_id");
+                assert_eq!(
+                    sources,
+                    vec![
+                        TenantSource::Token {
+                            claim: "tid".into()
+                        },
+                        TenantSource::SignedContext
+                    ]
+                );
+                assert_eq!(read, AccessMode::All);
+                assert_eq!(write, AccessMode::Own);
+            }
+            other => panic!("expected scoped, got {other:?}"),
+        }
+
+        // Target variant (nested TargetSource enum + write allowlist) also bridges.
+        let target_ron: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "target", via: ["domain"], public: "storefront",
+                    write: ["status"]))"#,
+            )
+            .expect("target RON parses");
+        match target_ron.tenancy.unwrap() {
+            Tenancy::Target { via, public, write } => {
+                assert_eq!(via, vec![TargetSource::Domain]);
+                assert_eq!(public, "storefront");
+                assert_eq!(write, vec!["status".to_string()]);
+            }
+            other => panic!("expected target, got {other:?}"),
+        }
+
+        // Disabled + absent.
+        let disabled: W = ron_opts
+            .from_str(r#"(tenancy: (mode: "disabled"))"#)
+            .expect("disabled RON parses");
+        assert_eq!(disabled.tenancy, Some(Tenancy::Disabled));
+        let absent: W = ron_opts.from_str(r#"()"#).expect("absent parses");
+        assert_eq!(absent.tenancy, None);
     }
 }

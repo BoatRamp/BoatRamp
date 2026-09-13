@@ -355,6 +355,21 @@ impl ServerConfig {
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS")? {
                 o.allow_env_secret_refs = Some(v);
             }
+            // The multi-tenant sub-knobs (Gap 4b): previously file-only, now env-settable so a
+            // 12-factor deployment can tune tenancy isolation + guest capability minting without a
+            // `boatramp.cfg`. Fleet-scoped (a per-project override still lives in the config file).
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION")? {
+                o.require_tenancy_declaration = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB")? {
+                o.allow_cross_tenant_db = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY")? {
+                o.allow_guest_mint_capability = Some(v);
+            }
+            if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS")? {
+                o.max_guest_capability_ttl_secs = Some(v);
+            }
         }
 
         // --- handler sql (`handlers.bindings.sql`) ---------------------------
@@ -632,6 +647,10 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_REQUIRE_POP",
     "BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION",
     "BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS",
+    "BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION",
+    "BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY",
+    "BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS",
 ];
 
 /// The `BOATRAMP_*` variables that populate `handlers.bindings.sql`.
@@ -2347,6 +2366,32 @@ mod tests {
             .resolve()
             .expect("resolves");
         assert!(posture.allow_env_secret_refs);
+    }
+
+    #[test]
+    fn env_wires_the_multi_tenant_subknobs_over_the_default() {
+        // Gap 4b: the four multi-tenant sub-knobs were file-only; env now sets them (env > the
+        // multi-tenant preset default), so a 12-factor deploy can tune tenancy isolation + guest
+        // capability minting with no `boatramp.cfg`. Verified: strict declaration stays on while
+        // cross-tenant `all` twins + guest cap-mint are permitted (they compose — Gap 4.3).
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_SECURITY_PROFILE", "multi-tenant"),
+            ("BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY", "true"),
+            ("BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS", "1800"),
+        ]))
+        .expect("valid env overrides apply");
+        let posture = cfg
+            .security
+            .expect("security materialised from env")
+            .resolve()
+            .expect("resolves");
+        assert!(posture.require_tenancy_declaration);
+        assert!(posture.allow_cross_tenant_db);
+        assert!(posture.allow_guest_mint_capability);
+        assert_eq!(posture.max_guest_capability_ttl_secs, 1800);
     }
 
     #[test]

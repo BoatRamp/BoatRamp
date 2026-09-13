@@ -756,6 +756,8 @@ mod tests {
     fn handler_matching_respects_route_and_methods() {
         use crate::config::HandlerConfig;
         let handler = |route: &str, methods: &[&str]| HandlerConfig {
+            tenancy: None,
+            token_claims: None,
             route: route.into(),
             methods: methods
                 .iter()

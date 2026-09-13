@@ -3203,6 +3203,8 @@ mod tests {
             files,
             config: DeployConfig {
                 consumers: vec![ConsumerConfig {
+                    tenancy: None,
+                    token_claims: None,
                     topic: "orders/created".into(),
                     component: "consumer.wasm".into(),
                     imports: vec!["wasi:keyvalue".into()],
@@ -3991,6 +3993,8 @@ mod tests {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    tenancy: None,
+                    token_claims: None,
                     route: "/".into(),
                     methods: Vec::new(),
                     component: "counter.wasm".into(),
@@ -4123,6 +4127,8 @@ mod tests {
             files,
             config: DeployConfig {
                 handlers: vec![HandlerConfig {
+                    tenancy: None,
+                    token_claims: None,
                     route: "/".into(),
                     methods: Vec::new(),
                     component: "counter.wasm".into(),
@@ -4239,6 +4245,8 @@ mod tests {
                     env,
                     &[],
                     0,
+                    None,
+                    None,
                     None,
                     None,
                     None,

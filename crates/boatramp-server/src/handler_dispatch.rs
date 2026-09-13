@@ -366,6 +366,8 @@ pub(super) async fn dispatch_handler(
         domain_context.as_deref(),
         session_cookie.as_deref(),
         target_handle.as_deref(),
+        handler.tenancy.as_ref(),
+        handler.token_claims.as_ref(),
     )
     .await
     {
@@ -1096,6 +1098,14 @@ pub(super) async fn build_bindings(
     // `Tenancy::Target` route with a `handle` source), used to resolve `B` against the operator's
     // handle registry — read-only, world-public only. `None` ⇒ no handle named.
     target_handle: Option<&str>,
+    // Gap 2: per-handler tenancy override for the matched route. When `Some`, it replaces the
+    // site-level decision for THIS invocation — after a fail-closed check that it narrows within
+    // the site ceiling (a per-handler value may tighten but never widen `HandlersSiteConfig::tenancy`).
+    // `None` ⇒ inherit the site decision (today's behavior).
+    handler_tenancy: Option<&boatramp_core::tenancy::Tenancy>,
+    // Gap 2: per-handler `token` verification config, overriding the site's `claims_from_token`
+    // when this handler's (own or inherited) tenancy names a `token` source. `None` ⇒ inherit.
+    handler_token_claims: Option<&boatramp_core::config::HandlerGraphqlTokenClaims>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -1147,11 +1157,14 @@ pub(super) async fn build_bindings(
                 .unwrap_or(true),
             allow_cross_tenant: inner.allow_cross_tenant_db.get().copied().unwrap_or(false),
         };
-        let token_cfg = site_handlers
-            .graphql
-            .as_ref()
-            .and_then(|g| g.data.as_ref())
-            .and_then(|d| d.claims_from_token.as_ref());
+        // Per-handler token config (Gap 2) wins over the site's `claims_from_token`.
+        let token_cfg = handler_token_claims.or_else(|| {
+            site_handlers
+                .graphql
+                .as_ref()
+                .and_then(|g| g.data.as_ref())
+                .and_then(|d| d.claims_from_token.as_ref())
+        });
         // The R3 session-cookie verify anchor is the runtime's own session signer's public half
         // (set at startup from the node issuer). Absent ⇒ no session fact.
         let session_anchor = inner.session_signer.get().map(|s| s.public_key());
@@ -1164,7 +1177,26 @@ pub(super) async fn build_bindings(
                 Ok(s) => s,
                 Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
             };
-        let tenancy: Option<boatramp_handlers::HostTenancy> = match site_handlers.tenancy.as_ref() {
+        // Gap 2: the effective in-site tenancy for this route — the per-handler override when it
+        // narrows within the site ceiling (a widening is refused fail-closed), else the site
+        // decision. The posture (`resolve_host_tenancy`) still caps `All` + refuses undeclared on
+        // top of this.
+        let effective_tenancy = match handler_tenancy {
+            Some(h) => {
+                if let Some(ceiling) = site_handlers.tenancy.as_ref() {
+                    if !h.narrows_within(ceiling) {
+                        return Err(format!(
+                            "tenancy: a handler on site `{site}` declares a tenancy that widens the \
+                             site ceiling (a per-handler decision may narrow within the site's \
+                             `tenancy`, never widen it)"
+                        ));
+                    }
+                }
+                Some(h)
+            }
+            None => site_handlers.tenancy.as_ref(),
+        };
+        let tenancy: Option<boatramp_handlers::HostTenancy> = match effective_tenancy {
             // R4/D8 plain-wasm TARGET route: bind a target scope for a SECOND tenant `B`'s public
             // subset (the non-federated analog of a `@tenant(scope: target)` field). `B` is
             // host-derived from the routed domain (5a's carried-domain source); the guest never
