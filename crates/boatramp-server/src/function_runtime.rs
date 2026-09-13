@@ -187,7 +187,10 @@ impl boatramp_handlers::ProducerContextSource for ServerProducerContextSource {
         }
         #[cfg(not(feature = "oidc"))]
         {
-            let _ = token;
+            // Without `oidc` there is no JWKS verifier, so a presented token can't be verified —
+            // fail closed. Reference the fields so a handlers-without-oidc build doesn't flag them
+            // dead (they're only read on the `oidc` verify path above).
+            let _ = (token, &self.token_cfg, &self.claim, &self.signer);
             Err("token verification is unavailable in this build (no `oidc`)".to_string())
         }
     }
