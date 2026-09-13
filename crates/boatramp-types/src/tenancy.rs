@@ -266,7 +266,7 @@ impl AccessMode {
     /// access grant stays within its site ceiling. The modes form a subset lattice, not a total
     /// order: `Own` and `Null` are disjoint (neither contains the other), so this is a real
     /// containment test, not a rank comparison.
-    pub fn within(self, ceiling: AccessMode) -> bool {
+    pub fn within(self, ceiling: Self) -> bool {
         use AccessMode::*;
         match self {
             None => true, // {} ⊆ anything
@@ -400,7 +400,7 @@ impl Tenancy {
     /// ceiling is a widening. The `Target` axis is governed by the operator's separate
     /// `target_eligible_fields` allowlist, so a target-vs-own axis mismatch across the ceiling is
     /// refused (fail-closed) rather than silently reinterpreted.
-    pub fn narrows_within(&self, ceiling: &Tenancy) -> bool {
+    pub fn narrows_within(&self, ceiling: &Self) -> bool {
         use Tenancy::*;
         match (self, ceiling) {
             // A site doing no in-site scoping already reaches every row, so any per-handler
