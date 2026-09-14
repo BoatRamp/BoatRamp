@@ -758,6 +758,128 @@ async fn run_session_disjunct_battery(
     );
 }
 
+/// A tenant-scoped **upsert** (`INSERT … ON CONFLICT … DO UPDATE`) on real Postgres — the gate for
+/// construens' P48 cutover bug. The host injects an own-partition guard into the `DO UPDATE`
+/// (`WHERE <table>.<tenant_col> = $own`) so a guest upsert can't overwrite ANOTHER tenant's row via
+/// a conflict on a NON-tenant unique key. That guard column must be **target-table-qualified**:
+/// bare, it is ambiguous inside `DO UPDATE` on Postgres (the target table and the `excluded`
+/// pseudo-relation both expose the column) and the whole upsert errors — which broke every
+/// tenant-scoped upsert on PG. SQLite tolerates the bare form, so this can ONLY be proven on a real
+/// Postgres engine. Postgres-only: a scoped upsert is refused at compile on MySQL (fail-closed,
+/// unit-tested), so there is nothing to execute there.
+#[cfg(feature = "sql-postgres")]
+async fn run_upsert_guard_battery(backend: Arc<dyn SqlBackend>, engine: &str) {
+    let dialect = Dialect::Postgres;
+    // `module` is a shared (non-tenant) unique key: two tenants contend for the same key, so the
+    // DO UPDATE guard is the ONLY thing keeping tenant A off tenant B's row.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS module_config",
+            "CREATE TABLE module_config (module VARCHAR(64) PRIMARY KEY, tenant_id VARCHAR(64), enabled VARCHAR(8))",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        // globex owns the shared key `mod_shared`; acme owns its own `mod_acme`.
+        tx.execute(
+            "INSERT INTO module_config (module, tenant_id, enabled) VALUES \
+             ('mod_shared','globex','on'),('mod_acme','acme','on')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Build a scoped upsert as acme: INSERT (module, enabled) stamping tenant_id=acme, and on a
+    // conflict flip `enabled` to the proposed value (`excluded.enabled`). The tenant stamp + the
+    // DO UPDATE own-guard are host-injected by `force_scope`.
+    let acme_upsert = |module: &str, enabled: &str| {
+        let mut ins = Insert {
+            table: "module_config".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "module".into(),
+                        value: Expr::val(t(module)),
+                    },
+                    Assignment {
+                        column: "enabled".into(),
+                        value: Expr::val(t(enabled)),
+                    },
+                ],
+            }],
+            conflict: Some(boatramp_core::orm::OnConflict {
+                conflict_columns: vec!["module".into()],
+                update: vec![Assignment {
+                    column: "enabled".into(),
+                    value: Expr::col("excluded.enabled"),
+                }],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(
+            Some(&scope(ScopeMode::Own, "acme")),
+            Some(&scope(ScopeMode::Own, "acme")),
+        )
+        .unwrap();
+        ins.compile(dialect).unwrap()
+    };
+
+    // 1) Cross-tenant protection: acme upserts the SHARED key globex owns. The statement must EXECUTE
+    //    (before the fix it errored `column reference "tenant_id" is ambiguous`), and globex's row
+    //    must be UNTOUCHED (the own-guard excludes it — no clobber, no insert).
+    {
+        let (sql, params) = acme_upsert("mod_shared", "off");
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(&sql, &params)
+            .await
+            .expect("scoped upsert must execute on Postgres (guard column must be qualified)");
+        let row = tx
+            .query(
+                "SELECT tenant_id, enabled FROM module_config WHERE module = 'mod_shared'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (row.rows[0][0].clone(), row.rows[0][1].clone()),
+            (t("globex"), t("on")),
+            "[{engine}] acme's upsert on the shared key must NOT clobber globex's row"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    // 2) Own flip works: acme upserts its OWN key → the guard matches, the DO UPDATE flips `enabled`
+    //    (construens' enableModule/disableModule on-conflict flip, confined to the caller's tenant).
+    {
+        let (sql, params) = acme_upsert("mod_acme", "off");
+        let mut tx = backend.begin().await.unwrap();
+        tx.execute(&sql, &params).await.unwrap();
+        let row = tx
+            .query(
+                "SELECT enabled FROM module_config WHERE module = 'mod_acme' AND tenant_id = 'acme'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.rows[0][0],
+            t("off"),
+            "[{engine}] acme's upsert on its own key must flip enabled on conflict"
+        );
+        tx.commit().await.unwrap();
+    }
+
+    println!(
+        "ORM UPSERT GUARD OK [{engine}]: a tenant-scoped ON CONFLICT DO UPDATE executes on Postgres \
+         (the own-guard column is target-qualified, not ambiguous); acme's upsert on a shared \
+         non-tenant key cannot clobber globex's row; acme's upsert on its own key flips on conflict"
+    );
+}
+
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_orm_scope_isolates_on_a_real_engine() {
@@ -768,7 +890,8 @@ async fn postgres_orm_scope_isolates_on_a_real_engine() {
     let backend = connect(ExternalSqlKind::Postgres, &ExternalSqlOptions::new(url)).unwrap();
     run_battery(backend.clone(), Dialect::Postgres, "postgres").await;
     run_pertable_battery(backend.clone(), Dialect::Postgres, "postgres").await;
-    run_session_disjunct_battery(backend, Dialect::Postgres, "postgres").await;
+    run_session_disjunct_battery(backend.clone(), Dialect::Postgres, "postgres").await;
+    run_upsert_guard_battery(backend, "postgres").await;
 }
 
 #[cfg(feature = "sql-mysql")]

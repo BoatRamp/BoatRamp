@@ -507,6 +507,13 @@ jobs:
             || { echo "::error::Postgres R3 TenantOrSession disjunct never reached its marker (anon/tenant/session breach or skip)" >&2; exit 1; }
           grep -q 'ORM TENANT-OR-SESSION DISJUNCT OK \[mysql\]' orm-sqlx.log \
             || { echo "::error::MySQL R3 TenantOrSession disjunct never reached its marker (anon/tenant/session breach or skip)" >&2; exit 1; }
+          # v0.4.9: a tenant-scoped upsert (ON CONFLICT DO UPDATE) executes on Postgres (the
+          # host-injected own-guard column is target-qualified, not ambiguous) AND can't clobber
+          # another tenant's row via a shared non-tenant conflict key. Postgres-only: a scoped
+          # upsert is refused at compile on MySQL (fail-closed). SQLite tolerates the bare form,
+          # so the ambiguity — and thus this regression — is only observable on a real Postgres.
+          grep -q 'ORM UPSERT GUARD OK \[postgres\]' orm-sqlx.log \
+            || { echo "::error::Postgres scoped-upsert guard never reached its marker (a DO-UPDATE ambiguity regression or a cross-tenant upsert clobber, or a skip)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in
