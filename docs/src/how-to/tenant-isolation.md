@@ -191,6 +191,37 @@ serves these on **wasm** subgraphs too (reads and writes), resolving `B` per fet
 `domain` / `capability` / `handle` and confining the subgraph's own `sql`/`orm` to
 `tenant = B AND <public subset>`. See [GraphQL](./graphql.md) for the target-field model.
 
+### Include the shared baseline: `target_or_null`
+
+`scope: target_or_null` is the target-axis analog of `own_or_null` (Dimension 2): it widens a
+target **read** from `tenant = B AND <public subset>` to
+`(tenant = B OR tenant IS NULL) AND <public subset>` — tenant `B`'s public rows **plus** the
+shared `NULL`-tenant baseline (catalog defaults, reference data, seeded rows every tenant
+shares). Use it when the storefront you embed layers a customer's own public rows over a
+common base catalog and you want both in one field.
+
+- **Read-only.** The write axis on a target field is `own`/`none` regardless — a write still
+  stamps `tenant = B` and can never land in the shared baseline. `target_or_null` widens
+  reads only.
+- **Same confinement, wider tenant predicate.** The public-subset filter still applies to
+  **both** arms; only the tenant equality is relaxed to `(= B OR IS NULL)`. Tenant `A` is
+  never reachable.
+- **The public subset is mandatory here even under a capability.** For plain `target`, a
+  `via: [capability]` field is exempt from the subset (the audience-bound capability naming
+  `tid = B` *is* the authorization). `target_or_null` removes that exemption: the shared
+  `NULL`-base rows are a different trust partition than the capability-authorized `B`, so the
+  base arm must be visibility-gated. A `target_or_null` field over a table with no declared
+  public subset is refused deny-by-default.
+- **Plain-Column tables only.** Like `own_or_null` (Dimension 2), the OR-null widening applies
+  only to a straight tenant-column table — never a session-keyed or unscoped table (no
+  `NULL`-row to safely share). The SQL/GDC subgraph path (AND-only terms) fails closed rather
+  than approximate the disjunction.
+
+```graphql
+# B's published products layered over the shared base catalog
+baseProducts: [Product!]! @tenant(scope: target_or_null, via: [domain], public: "products")
+```
+
 ## Worked example — a multi-storefront SaaS
 
 One deployment serves every customer on their own domain, all rows in one database
