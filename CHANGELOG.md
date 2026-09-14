@@ -5,6 +5,23 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.9] - 2026-09-14
+
+A tenant-isolation bug fix behind a security review and a CI-hard live gate on real Postgres.
+
+### Fixed
+- **Tenant-scoped upserts now execute on Postgres.** The host-injected own-partition guard on a
+  tenant-scoped `INSERT … ON CONFLICT … DO UPDATE` rendered the tenant column **unqualified**
+  (`WHERE tenant_id = $x`), which is ambiguous inside a `DO UPDATE` clause on Postgres — the target
+  table and the `excluded` pseudo-relation both expose the column — so the statement errored
+  (`column reference "tenant_id" is ambiguous`) and **every** tenant-scoped upsert failed at
+  execution on a Postgres backend. The guard column is now qualified with the target table
+  (`WHERE <table>.<tenant_col> = $x`), for both the `= value` and the `IS NULL` (null-baseline)
+  variants. The guard stays load-bearing — it is what stops a guest upsert from overwriting another
+  tenant's row via a conflict on a non-tenant unique key — so it is **qualified, not dropped**.
+  MySQL scoped upserts remain refused at compile (fail-closed). SQLite tolerated the bare form, so
+  the bug only surfaced on Postgres; a live gate on a real Postgres engine now covers it.
+
 ## [0.4.8] - 2026-09-14
 
 A small, focused tenancy addition behind a converged security review and a CI-hard live gate.

@@ -2079,6 +2079,7 @@ impl Insert {
             let mut sql = format!("INSERT INTO {table} ({}) {select_sql}", col_sql.join(", "));
             sql.push_str(&render_conflict(
                 self.conflict.as_ref(),
+                table,
                 stamp.as_ref().map(|(c, v)| (c.as_str(), v)),
                 &mut params,
                 dialect,
@@ -2142,6 +2143,7 @@ impl Insert {
 
         sql.push_str(&render_conflict(
             self.conflict.as_ref(),
+            table,
             stamp.as_ref().map(|(c, v)| (c.as_str(), v)),
             &mut params,
             dialect,
@@ -2161,6 +2163,7 @@ impl Insert {
 /// UPDATE` can't carry that bound, so a scoped upsert on MySQL is refused (fail-closed).
 fn render_conflict(
     conflict: Option<&OnConflict>,
+    table: &str,
     stamp: Option<(&str, &SqlValue)>,
     params: &mut Params,
     dialect: Dialect,
@@ -2209,7 +2212,12 @@ fn render_conflict(
         ident(col)?;
         // Bound the DO UPDATE to the actor's own partition (Postgres/SQLite support a trailing
         // WHERE), keyed on the stamped column — `= value`, or `IS NULL` for the null baseline.
-        let col_expr = Expr::Column(col.to_string());
+        // **Qualify with the target table** (`<table>.<col>`): inside `DO UPDATE` the target table
+        // and the `excluded` pseudo-relation both expose the tenant column, so a bare `<col>` is
+        // ambiguous on Postgres (`column reference "<col>" is ambiguous`) and the whole upsert fails.
+        // `excluded` is never the guard's subject — the guard bounds the row being *updated* — so
+        // target-qualifying is always correct. (The target table is `ident`-validated by the caller.)
+        let col_expr = Expr::Column(format!("{table}.{col}"));
         let pred = if matches!(value, SqlValue::Null) {
             Predicate::Null {
                 expr: col_expr,
@@ -3114,7 +3122,7 @@ mod tests {
         assert_eq!(
             sql,
             "INSERT INTO orders (id, tenant_id) VALUES (?1, ?2) \
-             ON CONFLICT (id) DO UPDATE SET total = ?3 WHERE tenant_id = ?4"
+             ON CONFLICT (id) DO UPDATE SET total = ?3 WHERE orders.tenant_id = ?4"
         );
         // The inserted row stamps OWN; the DO UPDATE is bounded to OWN; VICTIM never binds.
         assert_eq!(
@@ -3127,6 +3135,70 @@ mod tests {
             ins.compile(Dialect::Mysql),
             Err(OrmError::BadExpr(_))
         ));
+    }
+
+    #[test]
+    fn upsert_do_update_guard_is_target_table_qualified() {
+        // The host-injected DO UPDATE partition guard names `<table>.<col>`, never a bare column:
+        // inside `DO UPDATE` the target table AND the `excluded` pseudo-relation both expose the
+        // tenant column, so a bare guard is ambiguous on Postgres and the whole upsert fails at
+        // execution (construens' P48 cutover bug — reproduced on real PG 16). SQLite tolerates the
+        // bare form, which is why this only surfaced on a Postgres backend.
+        let build = |mode, value: Option<SqlValue>| {
+            let mut ins = Insert {
+                table: "module_config".into(),
+                rows: vec![RowValues {
+                    cells: vec![Assignment {
+                        column: "module".into(),
+                        value: Expr::val(t("m")),
+                    }],
+                }],
+                // A NON-tenant conflict key: the guard is LOAD-BEARING here — it is the only thing
+                // stopping a guest upsert from overwriting another tenant's row via the shared key,
+                // so the fix must qualify it, not drop it.
+                conflict: Some(OnConflict {
+                    conflict_columns: vec!["module".into()],
+                    update: vec![Assignment {
+                        column: "enabled".into(),
+                        value: Expr::col("excluded.enabled"),
+                    }],
+                }),
+                scope: None,
+                returning: vec![],
+                from_select: None,
+            };
+            let s = Scope {
+                column: "tenant_id".into(),
+                value,
+                session: None,
+                mode,
+                keys: TableKeys::Uniform,
+            };
+            ins.force_scope(Some(&s), Some(&s)).unwrap();
+            ins
+        };
+        // own → `= value`, target-qualified — on BOTH the real (Postgres) backend and SQLite.
+        for d in [Dialect::Postgres, Dialect::Sqlite] {
+            let (sql, _) = build(ScopeMode::Own, Some(t("OWN"))).compile(d).unwrap();
+            assert!(
+                sql.ends_with(
+                    "ON CONFLICT (module) DO UPDATE SET enabled = excluded.enabled \
+                     WHERE module_config.tenant_id = ?3"
+                ),
+                "{d:?}: {sql}"
+            );
+        }
+        // null baseline → `IS NULL`, also target-qualified (the identical ambiguity).
+        let (sql, _) = build(ScopeMode::NullOnly, None)
+            .compile(Dialect::Postgres)
+            .unwrap();
+        assert!(
+            sql.ends_with(
+                "ON CONFLICT (module) DO UPDATE SET enabled = excluded.enabled \
+                 WHERE module_config.tenant_id IS NULL"
+            ),
+            "{sql}"
+        );
     }
 
     #[test]
