@@ -538,13 +538,18 @@ impl SubgraphFetcher for BackendRouter {
                 // Ruling A (v0.4.4): the visibility subset is mandatory only for an ANONYMOUS source
                 // (`domain`/`handle`) — for `capability`-only the host-verified capability IS the
                 // authorization. A missing named subset under an anonymous source ⇒ fail closed.
-                let require_public = via.iter().any(|s| {
-                    matches!(
-                        s,
-                        boatramp_core::tenancy::TargetSource::Domain
-                            | boatramp_core::tenancy::TargetSource::Handle
-                    )
-                });
+                // v0.4.8: `null_base` ALSO forces the subset — the shared `NULL`-base rows are not the
+                // tenant `B` a capability authorizes (they're a different trust partition), so a
+                // `target_or_null` read must visibility-gate the base arm; a subset-less table is
+                // refused deny-by-default even under a capability (never expose an unfiltered floor).
+                let require_public = *null_base
+                    || via.iter().any(|s| {
+                        matches!(
+                            s,
+                            boatramp_core::tenancy::TargetSource::Domain
+                                | boatramp_core::tenancy::TargetSource::Handle
+                        )
+                    });
                 if require_public && inputs.schema.public_subset(public).is_none() {
                     return json!({ "errors": [{ "message": format!(
                         "target field names public subset `{public}` which the project schema does \

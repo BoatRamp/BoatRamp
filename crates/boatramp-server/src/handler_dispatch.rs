@@ -1237,13 +1237,18 @@ pub(super) async fn build_bindings(
                 // field is EXEMPT: the host-verified, audience-bound capability (naming `tid = B` +
                 // the granted scope) IS the authorization, so the confinement is `tenant = B` and the
                 // within-tenant per-client filter stays in-guest.
-                let require_public = via.iter().any(|s| {
-                    matches!(
-                        s,
-                        boatramp_core::tenancy::TargetSource::Domain
-                            | boatramp_core::tenancy::TargetSource::Handle
-                    )
-                });
+                // v0.4.8: `null_base` forces the subset (like an anonymous source) — the shared
+                // `NULL`-base rows are a different trust partition than the capability-authorized `B`,
+                // so a `target_or_null` read must visibility-gate the base arm (a subset-less table is
+                // refused deny-by-default even under a capability). Plain `target` keeps the A-exemption.
+                let require_public = *null_base
+                    || via.iter().any(|s| {
+                        matches!(
+                            s,
+                            boatramp_core::tenancy::TargetSource::Domain
+                                | boatramp_core::tenancy::TargetSource::Handle
+                        )
+                    });
                 // Under an anonymous source the named `public` subset MUST be declared
                 // (deny-by-default) — a missing/typo'd subset name would degrade the raw-SQL/orm
                 // confinement OPEN, exposing B's private rows. For a capability-only field the `public`
