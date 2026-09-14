@@ -377,7 +377,19 @@ impl HostTenancy {
         let b = self
             .fact(ScopeAxis::TargetTenant)
             .ok_or(TargetRewriteError::MissingTarget)?;
-        rewrite_target_select(statement, b, keys, public, *require_public, dialect)
+        // `target_or_null` (v0.4.8): the target READ mode `OwnOrNull` widens each plain tenant
+        // table's confinement to `(col = B OR col IS NULL)` — B's rows ⊕ the shared `NULL` base —
+        // mirroring the orm path's `tenant_pred`. `Own` (the default) reads `B` alone.
+        let null_base = matches!(self.read, AccessMode::OwnOrNull);
+        rewrite_target_select(
+            statement,
+            b,
+            keys,
+            public,
+            *require_public,
+            null_base,
+            dialect,
+        )
     }
 
     /// Whether raw SQL on `axis` must carry the [`SCOPE_MARKER`]. True whenever the axis actually

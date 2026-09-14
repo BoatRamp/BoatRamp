@@ -155,12 +155,17 @@ impl TargetRewriteError {
 /// parser. Returns the rewritten SQL text (the guest's own positional params are untouched — `B`
 /// and the public literals are injected as escaped literals), or a [`TargetRewriteError`]
 /// (fail-closed — the read does not run).
+#[allow(clippy::too_many_arguments)] // a confinement rewriter: each arg is a distinct host input.
 pub fn rewrite_target_select(
     statement: &str,
     tenant_value: &SqlValue,
     keys: &BTreeMap<String, ResolvedScope>,
     public: &BTreeMap<String, Vec<PublicTermSql>>,
     require_public: bool,
+    // `target_or_null` (v0.4.8): when `true`, a plain tenant (`Column`) table's confinement is
+    // `(col = B OR col IS NULL)` — B's rows ⊕ the shared `NULL`-tenant base rows — instead of
+    // `col = B`. Read-only; ONLY plain `Column` tables (never `TenantOrSession`/`Unscoped`).
+    null_base: bool,
     dialect: Dialect,
 ) -> Result<String, TargetRewriteError> {
     let sp: Box<dyn SpDialect> = match dialect {
@@ -186,6 +191,7 @@ pub fn rewrite_target_select(
         public,
         require_public,
         bound,
+        null_base,
     };
     if let ControlFlow::Break(err) = statements[0].visit(&mut rewriter) {
         return Err(err);
@@ -207,6 +213,9 @@ struct Rewriter<'a> {
     require_public: bool,
     /// The host-resolved target tenant `B`, pre-rendered as a literal expression.
     bound: Expr,
+    /// `target_or_null` (v0.4.8): widen a plain `Column` table's tenant confinement from `col = B`
+    /// to `(col = B OR col IS NULL)` — B ⊕ the shared `NULL`-tenant base rows.
+    null_base: bool,
 }
 
 impl VisitorMut for Rewriter<'_> {
@@ -402,11 +411,22 @@ impl Rewriter<'_> {
         match resolved {
             ResolvedScope::Column(col) => {
                 check_ident(col)?;
-                parts.push(binop(
+                let eq = binop(
                     col_expr(qualifier, col),
                     BinaryOperator::Eq,
                     self.bound.clone(),
-                ));
+                );
+                // `target_or_null`: `(col = B OR col IS NULL)` — B's rows ⊕ the shared base. ONLY on
+                // a plain `Column` (tenant) table; the `TenantOrSession` arm below never ORs in NULL
+                // (its NULL partition is session rows, not shared base — that would leak).
+                parts.push(if self.null_base {
+                    Expr::Nested(Box::new(or(
+                        eq,
+                        Expr::IsNull(Box::new(col_expr(qualifier, col))),
+                    )))
+                } else {
+                    eq
+                });
             }
             // A globally-readable table carries no tenant predicate — only its public subset (which
             // must still be declared and non-empty, exactly as the ORM target path requires).
@@ -473,6 +493,11 @@ fn binop(left: Expr, op: BinaryOperator, right: Expr) -> Expr {
 /// `left AND right`.
 fn and(left: Expr, right: Expr) -> Expr {
     binop(left, BinaryOperator::And, right)
+}
+
+/// `left OR right` — the `target_or_null` tenant disjunct (`col = B OR col IS NULL`).
+fn or(left: Expr, right: Expr) -> Expr {
+    binop(left, BinaryOperator::Or, right)
 }
 
 fn cmp_operator(op: CmpOp) -> BinaryOperator {
@@ -586,13 +611,35 @@ mod tests {
 
     fn rewrite(sql: &str) -> Result<String, TargetRewriteError> {
         // Default helper tests the anonymous (domain/handle) path: public subset mandatory.
-        rewrite_target_select(sql, &b(), &keys(), &public(), true, Dialect::Sqlite)
+        rewrite_target_select(sql, &b(), &keys(), &public(), true, false, Dialect::Sqlite)
     }
 
     /// Rewrite under a `capability`-only field (`require_public = false`): a table with no declared
     /// public subset confines to `tenant = B` alone.
     fn rewrite_cap(sql: &str) -> Result<String, TargetRewriteError> {
-        rewrite_target_select(sql, &b(), &keys(), &public(), false, Dialect::Sqlite)
+        rewrite_target_select(sql, &b(), &keys(), &public(), false, false, Dialect::Sqlite)
+    }
+
+    /// Rewrite under `target_or_null` (`null_base = true`): a plain tenant table's confinement widens
+    /// to `(col = B OR col IS NULL)` — B's rows ⊕ the shared base — still AND the public subset.
+    fn rewrite_null_base(sql: &str) -> Result<String, TargetRewriteError> {
+        rewrite_target_select(sql, &b(), &keys(), &public(), true, true, Dialect::Sqlite)
+    }
+
+    #[test]
+    fn target_or_null_widens_a_tenant_table_to_include_the_null_base() {
+        // The base⊕B read: B's rows OR the shared `NULL`-tenant base rows, still confined to the
+        // public subset. The OR is parenthesized so the AND-ed public term can't rebind it.
+        let out = rewrite_null_base("SELECT id FROM products").unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM products WHERE (products.tenant_id = 'tenant_B' OR products.tenant_id IS NULL) AND products.published = true"
+        );
+        // `target` (null_base = false) still reads B alone — no base leak into the non-null-base case.
+        assert_eq!(
+            rewrite("SELECT id FROM products").unwrap(),
+            "SELECT id FROM products WHERE products.tenant_id = 'tenant_B' AND products.published = true"
+        );
     }
 
     #[test]
@@ -621,6 +668,7 @@ mod tests {
             &keys,
             &public,
             false,
+            false,
             Dialect::Sqlite,
         )
         .unwrap();
@@ -636,6 +684,7 @@ mod tests {
             &keys,
             &public,
             true,
+            false,
             Dialect::Sqlite,
         )
         .unwrap_err();
@@ -806,6 +855,7 @@ mod tests {
             &keys(),
             &public(),
             true,
+            false,
             Dialect::Postgres,
         )
         .unwrap_err();
@@ -825,6 +875,7 @@ mod tests {
             &keys(),
             &public(),
             true,
+            false,
             Dialect::Sqlite,
         )
         .unwrap();

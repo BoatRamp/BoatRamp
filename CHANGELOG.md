@@ -5,6 +5,30 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.8] - 2026-09-14
+
+A small, focused tenancy addition behind a converged security review and a CI-hard live gate.
+
+### Added
+- **`scope: target_or_null` — the target-axis analog of `own_or_null`.** A cross-tenant target
+  **read** can now include the shared `NULL`-tenant baseline alongside tenant `B`'s public rows:
+  the confinement widens from `tenant = B AND <public subset>` to
+  `(tenant = B OR tenant IS NULL) AND <public subset>`. Declared on a GraphQL field as
+  `@tenant(scope: target_or_null, via: […], public: …)`; served on the external `/graphql` gateway's
+  wasm subgraphs and on plain-wasm target routes. Use it when a customer's own public rows layer over
+  a common base catalog / reference data. The public-subset filter still applies to **both** arms, so
+  tenant `A` is never reachable.
+  - **Read-only widening.** The write axis stays `own`/`none`; a target write still stamps
+    `tenant = B` and can never land in the shared baseline.
+  - **The public subset is mandatory even under a capability.** Unlike plain `target` (where a
+    `via:[capability]` field is exempt from the visibility subset — the audience-bound capability
+    naming `tid = B` *is* the authorization), `target_or_null` removes that exemption: the shared
+    `NULL`-base rows are a distinct trust partition from the capability-authorized `B`, so the base
+    arm must be visibility-gated. A subset-less table is refused deny-by-default.
+  - **Plain-Column tables only.** The OR-null widening applies only to a straight tenant-column table
+    (never a session-keyed or unscoped table). The SQL/GDC subgraph path (AND-only terms) fails closed
+    rather than approximate the disjunction.
+
 ## [0.4.7] - 2026-09-13
 
 Four first-adopter tenancy-cutover gaps, shipped as one release behind a converged security review

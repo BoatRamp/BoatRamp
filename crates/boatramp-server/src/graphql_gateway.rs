@@ -525,7 +525,12 @@ impl SubgraphFetcher for BackendRouter {
             // `Target` ⇒ resolve `B` from THIS fetch's own `@tenant(via, public, write)` against the
             // host-trusted inputs (domain/capability/handle), then confine the fetch. Fail closed on
             // any gap — a target read/write never runs un-confined.
-            boatramp_core::tenancy::TenancyClass::Target { via, public, write } => {
+            boatramp_core::tenancy::TenancyClass::Target {
+                via,
+                public,
+                write,
+                null_base,
+            } => {
                 let Some(inputs) = &self.target_inputs else {
                     return json!({ "errors": [{ "message":
                         "target-tenant scope was not resolved for this request (fail-closed)" }] });
@@ -533,13 +538,18 @@ impl SubgraphFetcher for BackendRouter {
                 // Ruling A (v0.4.4): the visibility subset is mandatory only for an ANONYMOUS source
                 // (`domain`/`handle`) — for `capability`-only the host-verified capability IS the
                 // authorization. A missing named subset under an anonymous source ⇒ fail closed.
-                let require_public = via.iter().any(|s| {
-                    matches!(
-                        s,
-                        boatramp_core::tenancy::TargetSource::Domain
-                            | boatramp_core::tenancy::TargetSource::Handle
-                    )
-                });
+                // v0.4.8: `null_base` ALSO forces the subset — the shared `NULL`-base rows are not the
+                // tenant `B` a capability authorizes (they're a different trust partition), so a
+                // `target_or_null` read must visibility-gate the base arm; a subset-less table is
+                // refused deny-by-default even under a capability (never expose an unfiltered floor).
+                let require_public = *null_base
+                    || via.iter().any(|s| {
+                        matches!(
+                            s,
+                            boatramp_core::tenancy::TargetSource::Domain
+                                | boatramp_core::tenancy::TargetSource::Handle
+                        )
+                    });
                 if require_public && inputs.schema.public_subset(public).is_none() {
                     return json!({ "errors": [{ "message": format!(
                         "target field names public subset `{public}` which the project schema does \
@@ -562,6 +572,16 @@ impl SubgraphFetcher for BackendRouter {
                          and no resolvable handle) — fail-closed" }] });
                 };
                 if let Some((site, config)) = self.sql_subgraphs.get(subgraph) {
+                    // `target_or_null` (base⊕B) on a SQL/GDC subgraph is not served in this release —
+                    // the GDC row filter is a flat AND of terms with no OR, so the `NULL`-base
+                    // disjunct can't be expressed there yet. Refuse fail-closed rather than silently
+                    // confine to `B` alone (dropping the base floor). WASM subgraphs are fully
+                    // supported below; a SQL-subgraph `target_or_null` awaits a GDC OR term.
+                    if *null_base {
+                        return json!({ "errors": [{ "message":
+                            "scope: target_or_null is not yet supported on a SQL/GDC subgraph \
+                             (serve this field from a wasm subgraph) — fail-closed" }] });
+                    }
                     // SQL subgraph: confine the GDC compile to `B`'s public subset.
                     let scope = build_target_scope(
                         &inputs.schema,
@@ -574,9 +594,17 @@ impl SubgraphFetcher for BackendRouter {
                 // WASM subgraph (Gap 1): force a `HostTenancy::target` binding onto the invocation so
                 // the guest's `sql`/`orm` is confined to `tenant = B AND <public subset>` — identical
                 // confinement to a plain-wasm target route, reached over the federated gateway.
+                // `target_or_null` (v0.4.8) widens the READ to `(B OR NULL) AND <public>` by binding
+                // the `OwnOrNull` read mode (the tenant-axis OR-null falls out of `tenant_pred`); the
+                // write axis is untouched (still `B`).
+                let read = if *null_base {
+                    boatramp_core::tenancy::AccessMode::OwnOrNull
+                } else {
+                    boatramp_core::tenancy::AccessMode::Own
+                };
                 let tenancy = boatramp_handlers::HostTenancy::target(
                     boatramp_core::sql::SqlValue::Text(resolved.value),
-                    boatramp_core::tenancy::AccessMode::Own,
+                    read,
                     &inputs.schema,
                     public,
                     &resolved.write,
@@ -1339,6 +1367,7 @@ mod tests {
             via: vec![boatramp_core::tenancy::TargetSource::Domain],
             public: "storefront".into(),
             write: vec![],
+            null_base: false,
         };
         let resp = router
             .fetch("accounts", "{ me { id } }", json!({}), &target_class)
@@ -1440,6 +1469,7 @@ mod tests {
             via: vec![boatramp_core::tenancy::TargetSource::Domain],
             public: "storefront".into(),
             write: vec![],
+            null_base: false,
         };
         // A wasm subgraph (not in sql_subgraphs) target fetch: the gateway resolves B and forces the
         // confinement onto the invocation — the echo invoker sees TargetTenant = "tenant_b".

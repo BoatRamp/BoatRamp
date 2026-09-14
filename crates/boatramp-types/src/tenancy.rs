@@ -135,6 +135,15 @@ pub enum TenancyClass {
         public: String,
         #[serde(default)]
         write: Vec<String>,
+        /// **`target_or_null`** (the target-axis analog of [`AccessMode::OwnOrNull`]): when `true`, a
+        /// target READ confines to `(<tenant col> = B OR <tenant col> IS NULL) AND <public subset>` —
+        /// `B`'s public rows PLUS the shared `NULL`-tenant **base/reference** rows (the inheritance
+        /// floor a public funnel needs) — instead of `tenant = B` alone. Read-only: a target WRITE
+        /// still stamps `B` (never the base). The `NULL` disjunct is added ONLY on plain tenant
+        /// (`Column`) tables, never a `TenantOrSession` table (its `NULL` partition is session rows,
+        /// not shared base) nor an `Unscoped` global. Surfaced in the SDL as `scope: target_or_null`.
+        #[serde(default)]
+        null_base: bool,
     },
 }
 
@@ -372,6 +381,14 @@ pub enum Tenancy {
         /// this list.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         write: Vec<String>,
+        /// **`target_or_null`** (the target-axis analog of [`AccessMode::OwnOrNull`]): when `true`, a
+        /// target READ confines to `(<tenant col> = B OR <tenant col> IS NULL) AND <public subset>` —
+        /// `B`'s public rows PLUS the shared `NULL`-tenant **base/reference** rows (a public funnel's
+        /// inheritance floor) — instead of `tenant = B` alone. Read-only: a target WRITE still stamps
+        /// `B`. The `NULL` disjunct is added ONLY on plain tenant (`Column`) tables, never a
+        /// `TenantOrSession` (its `NULL` partition is session rows) nor an `Unscoped` global.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        null_base: bool,
     },
 }
 
@@ -850,6 +867,7 @@ mod tests {
             via: vec![TargetSource::Domain, TargetSource::Handle],
             public: "storefront".into(),
             write: vec![],
+            null_base: false,
         };
         assert!(tgt.is_target());
         // Round-trips (the class rides on the composed supergraph).
@@ -1015,6 +1033,7 @@ mod tests {
             via: vec![TargetSource::Domain],
             public: "storefront".into(),
             write: vec![],
+            null_base: false,
         };
         assert!(!target.narrows_within(&scoped(All, All)));
         assert!(!scoped(Own, Own).narrows_within(&target));
@@ -1080,13 +1099,43 @@ mod tests {
             )
             .expect("target RON parses");
         match target_ron.tenancy.unwrap() {
-            Tenancy::Target { via, public, write } => {
+            Tenancy::Target {
+                via,
+                public,
+                write,
+                null_base,
+            } => {
                 assert_eq!(via, vec![TargetSource::Domain]);
                 assert_eq!(public, "storefront");
                 assert_eq!(write, vec!["status".to_string()]);
+                assert!(
+                    !null_base,
+                    "absent null_base defaults to false (plain target)"
+                );
             }
             other => panic!("expected target, got {other:?}"),
         }
+        // `target_or_null` (null_base: true) round-trips through the bridge from RON and JSON.
+        let ton_ron: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "target", via: ["domain"], public: "vocab", null_base: true))"#,
+            )
+            .expect("target_or_null RON parses");
+        let ton_json: W = serde_json::from_str(
+            r#"{"tenancy":{"mode":"target","via":["domain"],"public":"vocab","null_base":true}}"#,
+        )
+        .expect("target_or_null JSON parses");
+        assert_eq!(ton_ron.tenancy, ton_json.tenancy);
+        assert!(
+            matches!(
+                ton_ron.tenancy,
+                Some(Tenancy::Target {
+                    null_base: true,
+                    ..
+                })
+            ),
+            "null_base survives the bridge"
+        );
 
         // Disabled + absent.
         let disabled: W = ron_opts
