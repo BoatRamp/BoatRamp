@@ -250,7 +250,10 @@ fn parse_tenant_directive(
     let scope = arg("scope").map(const_ident).transpose()?;
     match scope.as_deref() {
         None | Some("own") => Ok(Some(TenancyClass::Own)),
-        Some("target") => {
+        // `target_or_null` (the target-axis analog of `own_or_null`) reads `B` ⊕ the shared
+        // `NULL`-tenant base rows; `target` reads `B` alone. Both parse identically otherwise.
+        scope @ (Some("target") | Some("target_or_null")) => {
+            let null_base = scope == Some("target_or_null");
             let public = match arg("public") {
                 Some(ConstValue::String(s)) => s.clone(),
                 _ => {
@@ -289,9 +292,16 @@ fn parse_tenant_directive(
                         .to_string(),
                 );
             }
-            Ok(Some(TenancyClass::Target { via, public, write }))
+            Ok(Some(TenancyClass::Target {
+                via,
+                public,
+                write,
+                null_base,
+            }))
         }
-        Some(other) => Err(format!("unknown scope `{other}` (expected own|target)")),
+        Some(other) => Err(format!(
+            "unknown scope `{other}` (expected own|target|target_or_null)"
+        )),
     }
 }
 
@@ -615,6 +625,39 @@ extend schema @link(
                 via: vec![TargetSource::Domain, TargetSource::Handle],
                 public: "storefront".into(),
                 write: vec![],
+                null_base: false,
+            })
+        );
+    }
+
+    #[test]
+    fn scope_target_or_null_records_the_null_base_flag() {
+        // `scope: target_or_null` records a Target class with `null_base = true` (base⊕B read); plain
+        // `scope: target` records `null_base = false` (B alone). Everything else parses identically.
+        let sdl = r#"
+            type Query {
+              funnel: [V] @tenant(scope: target_or_null, via: [domain], public: "vocab")
+              onlyB: [V] @tenant(scope: target, via: [domain], public: "vocab")
+            }
+            type V @key(fields: "id") { id: ID! }
+        "#;
+        let sg = compose(&[sub("shop", sdl)]).unwrap();
+        assert_eq!(
+            sg.root_tenancy.get("funnel"),
+            Some(&TenancyClass::Target {
+                via: vec![TargetSource::Domain],
+                public: "vocab".into(),
+                write: vec![],
+                null_base: true,
+            })
+        );
+        assert_eq!(
+            sg.root_tenancy.get("onlyB"),
+            Some(&TenancyClass::Target {
+                via: vec![TargetSource::Domain],
+                public: "vocab".into(),
+                write: vec![],
+                null_base: false,
             })
         );
     }

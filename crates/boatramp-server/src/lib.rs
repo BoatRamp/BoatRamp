@@ -3839,6 +3839,177 @@ mod tests {
         );
     }
 
+    /// v0.4.8 live gate: `scope: target_or_null` on a WASM subgraph reads `B` ⊕ the shared
+    /// `NULL`-tenant **base** rows (the funnel inheritance floor), still confined to the public
+    /// subset on BOTH — a base-only tenant sees the base floor, never another tenant's rows nor any
+    /// private (non-public) row. Drives the REAL gateway → invoke_target → libsql over the probe.
+    /// `#[ignore]`d (static-musl libsql segfault); the CI job runs it on the host toolchain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI gateway-target gate"]
+    async fn gateway_target_or_null_includes_the_shared_base() {
+        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::function::{
+            Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicPredicate, PublicSubset, PublicTerm, TableScope, Tenancy,
+            TenancySchema, TenantSource,
+        };
+        use boatramp_handlers::{HandlerEngine, Limits};
+
+        const PROBE: &[u8] = include_bytes!("../tests/fixtures/graphql-scope-probe.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        let sql_dir = std::env::temp_dir().join(format!("br-gwton-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        let db = backends
+            .database("default", "fn/scopeprobe", "")
+            .await
+            .unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, tenant_id TEXT, published INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            // base_pub: shared floor (NULL tenant, public) → visible. base_priv: NULL but NOT public
+            // → excluded (the subset conjoins the base too). b_pub: B public → visible. b_priv: B
+            // private → excluded. a_pub: another tenant → excluded (never A's rows).
+            for (id, tenant, published) in [
+                ("base_pub", None, 1),
+                ("base_priv", None, 0),
+                ("b_pub", Some("tenant_B"), 1),
+                ("b_priv", Some("tenant_B"), 0),
+                ("a_pub", Some("tenant_A"), 1),
+            ] {
+                tx.execute(
+                    "INSERT INTO items (id, tenant_id, published) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        tenant
+                            .map(|t| SqlValue::Text(t.into()))
+                            .unwrap_or(SqlValue::Null),
+                        SqlValue::Integer(published),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = Arc::new(backends);
+
+        let hash = sha256_hex(PROBE);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(PROBE)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let function = Function {
+            name: "scopeprobe".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: FunctionConfig {
+                imports: vec!["sql".into()],
+                tenancy: Some(Tenancy::Scoped {
+                    column: "tenant_id".into(),
+                    sources: vec![TenantSource::None],
+                    read: AccessMode::Own,
+                    write: AccessMode::None,
+                }),
+                ..Default::default()
+            },
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        // The funnel field: `scope: target_or_null` — base⊕B.
+        let sdl = "type Query { items: [Item!]! @tenant(scope: target_or_null, via: [domain], public: \"items\") }\n\
+                   type Item @key(fields: \"id\") { id: ID! }";
+        let sg = crate::graphql_federation::compose(&[("scopeprobe".into(), sdl.into())]).unwrap();
+        let plan = crate::graphql_plan::plan("{ items { id } }", &sg).unwrap();
+
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: std::collections::BTreeMap::from([("items".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "items".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![PublicTerm::Cmp {
+                        column: "published".into(),
+                        op: boatramp_core::tenancy::PublicCmp::Eq,
+                        value: boatramp_core::tenancy::PublicLiteral::Int(1),
+                    }],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage, Some(sql), None);
+        rt.set_invoker(deploy.clone());
+        let inner = rt.inner.as_ref().unwrap();
+        let router = crate::graphql_gateway::BackendRouter::new(
+            inner
+                .invoker
+                .get()
+                .unwrap()
+                .clone()
+                .scoped(ProjectRef::new("default"), Vec::new()),
+            "default".to_string(),
+            inner.sql.clone(),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .with_target_inputs(Some(crate::graphql_gateway::TargetInputs {
+            schema: Arc::new(schema),
+            domain_context: Some("tenant_B".into()),
+            target_handle: None,
+            capability_anchor: None,
+        }));
+
+        let out = crate::graphql_gateway::execute(&plan, &router, &serde_json::json!({})).await;
+        let body = out.to_string();
+        assert!(
+            body.contains("\"base_pub\"") && body.contains("\"b_pub\""),
+            "target_or_null returned B's public row AND the shared base floor: {body}"
+        );
+        assert!(
+            !body.contains("\"base_priv\"")
+                && !body.contains("\"b_priv\"")
+                && !body.contains("\"a_pub\""),
+            "the public subset confines BOTH B and base (no base_priv, no b_priv), and no other \
+             tenant's rows (no a_pub): {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!(
+            "GATEWAY TARGET-OR-NULL OK: scope:target_or_null on a wasm subgraph read tenant B's \
+             public row (b_pub) PLUS the shared NULL-tenant base floor (base_pub), each confined to \
+             published=1 — never B's private row (b_priv), never a non-public base row (base_priv), \
+             never another tenant's row (a_pub); the base-only funnel keeps its inheritance floor"
+        );
+    }
+
     /// Tenant isolation (Step 7a): the background scheduler fans out over every
     /// project, so a **non-default** project's queued async invocation is drained
     /// and metered **within that project** — never leaking into `default`. Before

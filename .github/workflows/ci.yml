@@ -413,6 +413,19 @@ jobs:
             || { echo "::error::gateway wasm-target gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GATEWAY WASM-TARGET OK' gwtarget.log \
             || { echo "::error::gateway wasm-plane target confinement never reached its success marker (a target-axis widening, a public-subset breach, or a skipped test)" >&2; exit 1; }
+      - name: Live gateway target_or_null (base⊕target) on a real libsql engine (v0.4.8)
+        run: |
+          set -eo pipefail
+          # v0.4.8: scope:target_or_null reads B's public rows PLUS the shared NULL-tenant base floor,
+          # each confined to the public subset — never B's private row, never a non-public base row,
+          # never another tenant's row. A base-floor loss (no base_pub) OR a leak fails the assertion.
+          cargo test -p boatramp-server --features handlers,capability,oidc --lib \
+            gateway_target_or_null_includes_the_shared_base \
+            -- --ignored --nocapture 2>&1 | tee gwton.log
+          grep -qE 'test result: ok\. 1 passed' gwton.log \
+            || { echo "::error::gateway target_or_null gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'GATEWAY TARGET-OR-NULL OK' gwton.log \
+            || { echo "::error::gateway target_or_null never reached its marker (base floor lost, a public-subset breach, or a cross-tenant leak)" >&2; exit 1; }
       - name: Live present-token verify/seal/resolve chain + batch isolation (v0.4.7 Gap 3)
         run: |
           set -eo pipefail
