@@ -66,9 +66,9 @@ security: (
 Only these four in-project knobs are per-project; every other knob (egress, upload caps, domain
 verification, …) stays fleet-wide. **Cross-project isolation is structural** (project = database) —
 never a knob, so a per-project override can only tune that project's own in-project strictness and
-its guests' capability-mint ceiling, never its reach into another project. The three knobs
+its guests' capability-mint ceiling, never its reach into another project. The four knobs
 **compose**: you can require an explicit tenancy declaration *and* permit specific components to be
-`all` *and* allow guest capability minting, all at once.
+`all` *and* allow guest capability minting (clamped by `max_guest_capability_ttl_secs`), all at once.
 
 These four knobs (and the other posture bools) are also `BOATRAMP_SECURITY_*` env-settable — e.g.
 `BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB=true` — so a 12-factor deploy needn't ship a `boatramp.cfg`

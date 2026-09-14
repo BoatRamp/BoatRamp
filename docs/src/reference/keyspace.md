@@ -81,6 +81,8 @@ re-keying (a migration — see [Upgrade a store to project scoping](../how-to/mi
 | `project/<proj>/compute_state/<workload>/<replica>` | a replica's lifecycle/snapshot state |
 | `project/<proj>/workflows/<name>` | a declarative workflow definition |
 | `project/<proj>/workflows/<name>/runs/<id>` | a workflow run |
+| `project/<proj>/secret/<name>` | a sealed internal secret value (`boatramp:<name>`; sealed at rest by the `[secrets]` key envelope, 0.3.10) |
+| `project/<proj>/email/<name>` | a sealed SMTP email profile (relay config + sealed password, 0.3.18) |
 
 ### Mesh membership (cluster mode, replicated)
 
@@ -106,6 +108,16 @@ every node (and a restart) converges. See
 The `<topic>` is project-qualified for a non-`default` project (`<proj>/<topic>`),
 so two projects' same-named topics stay isolated; the `default` project's topics are
 unprefixed (byte-identical to pre-0.2.0).
+
+### Sessions (handler `boatramp:handlers/session`)
+
+| Key prefix | Value |
+| --- | --- |
+| `session/<project>/<id>` | a duplex guest-session record (host-stamped principal, project, route + ordering/resume state, 0.4.2) |
+
+The `<project>` and `<id>` are host-stamped (never guest-forgeable), so a session is
+isolated to the project that opened it; the session reaper scans `session/<project>/`
+to expire records.
 
 ### Cluster Raft store (cluster mode only)
 

@@ -27,13 +27,15 @@ does not satisfy any right on `site`.
 
 ## Resources
 
-Two resources are target-scoped: `site` (target `<project>/<site>`) and `project`
-(target `<project>`, since 0.2.0). The other five are global.
+Three resources are target-scoped: `site` (target `<project>/<site>`), `project`
+(target `<project>`, since 0.2.0), and `secrets` (target `<project>`, since 0.3.10).
+The other five are global.
 
 | Resource | Scoped | Governs |
 | --- | --- | --- |
 | `site` | `<project>/<site>` | Per-site deployments, config, aliases, domain verification, per-site observability. |
 | `project` | `<project>` | The project entity plus the resources it owns — its functions, compute workloads, workflows, and GraphQL admin surface (subgraph registry + safelist). A `project` grant is the tenant boundary: a token scoped to one project cannot touch a sibling. |
+| `secrets` | `<project>` | The project's sealed secret store — its `boatramp:<name>` values and SMTP email profiles. Separate from `project` so managing credentials is a distinct, admin-gated right, auditable on its own (since 0.3.10). |
 | `blobs` | global | Content-addressed blob uploads. |
 | `tokens` | global | API token management. |
 | `certs` | global | TLS certificate status. |
@@ -54,7 +56,7 @@ global right.
 | `deployer` | site | `read`, `deploy` on `site` *(site)*; `deploy` on `blobs` *(any)*. No config write. |
 | `viewer` | site | `read` on `site` *(site)*. |
 | `operator` | global | `read` on `system` *(any)*; `read` on `certs` *(any)*; `write` on `cache` *(any)*. No site access. |
-| `project_admin` | project | `admin` on `project` *(project)*; `admin` on `site` *(project/\*)*; `deploy` on `blobs` *(any)*. Full control of one project and everything it owns. |
+| `project_admin` | project | `admin` on `project` *(project)*; `admin` on `secrets` *(project)*; `admin` on `site` *(project/\*)*; `deploy` on `blobs` *(any)*. Full control of one project and everything it owns — including managing its sealed secrets and email profiles (a publisher can only *reference* a `boatramp:<name>`, not manage it). |
 | `project_publisher` | project | `read`, `write`, `deploy` on `project` *(project)* and on `site` *(project/\*)*; `deploy` on `blobs` *(any)*. Ships sites/functions/compute in the project; cannot admin the project entity. |
 | `project_viewer` | project | `read` on `project` *(project)* and on `site` *(project/\*)*. Read-only across one project. |
 
@@ -113,6 +115,12 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `DELETE` | `/api/projects/<proj>` | `project` · `admin` *(proj)* |
 | `GET` | `/api/projects/<proj>/{functions,compute,workflows,graphql}[/…]` | `project` · `read` *(proj)* |
 | `POST`/`PUT`/`DELETE` | `/api/projects/<proj>/{functions,compute,workflows,graphql}/…` | `project` · `deploy` *(proj)* |
+| `GET` | `/api/projects/<proj>/secrets` | `secrets` · `read` *(proj)* |
+| `POST`/`DELETE` | `/api/projects/<proj>/secrets[/<name>]` | `secrets` · `write` *(proj)* |
+| `GET` | `/api/projects/<proj>/email/profiles[/<name>]` | `secrets` · `read` *(proj)* |
+| `PUT`/`DELETE` | `/api/projects/<proj>/email/profiles/<name>` | `secrets` · `write` *(proj)* |
+| `GET` | `/api/projects/<proj>/tenancy` | `project` · `read` *(proj)* |
+| `PUT`/`DELETE` | `/api/projects/<proj>/tenancy` | `project` · `admin` *(proj)* — mutating the tenant-isolation boundary is owner-level, above the publisher's `deploy` |
 | `POST` | `/api/[projects/<proj>/]sites/<site>/deployments` | `site` · `deploy` *(target)* |
 | `GET` | `/api/[projects/<proj>/]sites/<site>/deployments[/<id>]` | `site` · `read` *(target)* |
 | `POST` | `/api/[projects/<proj>/]sites/<site>/deployments/<id>/activate` | `site` · `deploy` *(target)* |
@@ -121,6 +129,12 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `PUT`/`DELETE` | `/api/[projects/<proj>/]sites/<site>/aliases/<name>` | `site` · `write` *(target)* |
 | `GET` | `/api/{functions,compute,workflows,graphql}[/…]` (legacy) | `project` · `read` *(default)* |
 | `POST`/`PUT`/`DELETE` | `/api/{functions,compute,workflows,graphql}/…` (legacy) | `project` · `deploy` *(default)* |
+| `GET` | `/api/functions/<name>/_boatramp/logs[/stream]` | `project` · `read` *(default; `proj` for the project-scoped path)* |
+| `POST` | `/api/compute/<name>/exec` | `project` · `deploy` *(default)* — additionally gated at the handler by the `allow_compute_exec` posture |
+| `POST` | `/api/sql/<db>/{exec,query,ping}` | `project` · `deploy` *(default)* — SQL writes are additionally posture-gated |
+| `GET`/`DELETE` | `/api/compute/volumes[/<name>]` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
+| `GET`/`POST` | `/api/compute/{status,ipam,dns[/resolve],reconcile}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
+| `POST` | `/api/compute/maintenance/{set-health,restart,netdiag}` | `system` · `admin` (node-global — **not** the per-project `/api/compute/*` right) |
 | `POST`/`DELETE` | `/api/tokens[/<id>]` | `tokens` · `admin` |
 | `GET` | `/api/certs` | `certs` · `read` |
 | `POST` | `/api/cache/invalidate` | `cache` · `write` |
@@ -128,6 +142,16 @@ path scopes to `<proj>` (or `<proj>/<site>` for its sites).
 | `GET`/`POST` | `/api/prune`, `/api/scrub` | `system` · `admin` |
 | any | `/api/authz/*` | `system` · `admin` |
 | any | other `/api/*` | `system` · `admin` (deny-safe) |
+
+**Node-global compute endpoints are `system` · `admin`, never the per-project
+`/api/compute/*` right.** The persistent-volume (`compute/volumes[/<name>]`) and
+maintenance/diagnostic (`compute/{status,ipam,dns,reconcile}` and
+`compute/maintenance/*`) surfaces operate across *every* tenant on the node — they
+enumerate and remove volumes, and observe and override the reconcile plane, for all
+projects. They are gated explicitly at `system` · `admin`, above the general
+`/api/compute/*` mapping that a project-scoped grant would otherwise satisfy, in both
+the direct (`/api/compute/…`) and project-scoped (`/api/projects/<proj>/compute/…`)
+path forms — so a project token can never reach another tenant's volumes or state.
 
 ## The policy document
 

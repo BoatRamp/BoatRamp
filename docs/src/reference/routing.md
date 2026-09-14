@@ -36,6 +36,7 @@ project.cfg: routing OK (2 redirects, 1 handler)
 | `consumers` | list\<ConsumerConfig\> | `[]` | Message-consumer components, invoked per message on a topic. |
 | `crons` | list\<CronConfig\> | `[]` | Scheduled handler invocations. |
 | `streams` | list\<StreamConfig\> | `[]` | Host-level SSE / WebSocket endpoints fanning out topics. |
+| `sessions` | list\<SessionConfig\> | `[]` | Duplex, resumable session routes served by a guest `session-handler` — see [`sessions`](#sessions). |
 
 Pattern fields (`from`, `matches`, handler `route`) use the
 [path matcher](#patterns) syntax and are compiled at `validate`/`sync`, so a bad
@@ -200,9 +201,12 @@ Matched after redirects, before static lookup. See
 | `methods` | list\<string\> | `[]` (all) | HTTP methods answered (`GET`, `POST`, …). |
 | `component` | string | — | Path to the component `.wasm` within the deployment. |
 | `imports` | list\<string\> | `[]` | Requested capabilities — see [imports](#imports). |
+| `streaming` | bool | `false` | A **streaming** handler: the guest writes its response body incrementally (SSE, chunked, agent token streaming) via a `#[handler(stream)]` body. Served on the isolated streaming lane (its own concurrency budget + a much larger wall-clock), so a long-lived stream never holds a fast-request slot. |
 | `limits` | HandlerLimits | — | Optional resource caps, intersected with the site caps at activation. |
 | `env` | map\<string, string\> | `{}` | Static environment variables. **Never secrets** — a credential-shaped value is rejected at validate; use `[handlers].secrets` in `boatramp.cfg` for those. |
 | `invoke_targets` | list\<string\> | `[]` | Function names this handler may call via the `invoke` import — see [invoke_targets](#invoke_targets). |
+| `tenancy` | Tenancy? | `None` (inherit site) | Per-handler in-site [tenancy decision](./siteconfig.md#handlerstenancy) for this route, overriding the site-level ceiling. Absent ⇒ inherit the site decision. When present it must **narrow within** the site ceiling — a widening is refused fail-closed at bind. Same canonical RON shape as the site's, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. |
+| `token_claims` | HandlerGraphqlTokenClaims? | `None` (inherit) | Per-handler JWKS/issuer config verifying the app bearer for a `token` tenant source, overriding the site's `[handlers.graphql.data].claims_from_token`. Only consulted when this handler's (or the inherited) `tenancy` names a `token` source. Fields: `issuer`, `jwks_env`/`jwks_url`, optional `audience`. |
 
 ### `imports`
 
@@ -212,6 +216,9 @@ rejected at validate.
 | Import | Grants |
 | --- | --- |
 | `invoke` | Call sibling functions by name, gated by [`invoke_targets`](#invoke_targets). |
+| `graphql` | Run a GraphQL operation against the project's supergraph (`graphql::run`), propagating the caller's resolved principal to sub-fetches. |
+| `email` | Send mail through a per-project SMTP profile (`boatramp:handlers/email`). Gated by the `allow_guest_email` posture knob — off under `multi-tenant`. |
+| `capability` | Mint fleet-signed target-capability tokens (`boatramp:handlers/capability`). Gated by the `allow_guest_mint_capability` posture knob — off under `multi-tenant`. |
 | `wasi:http` | Outbound HTTP. |
 | `wasi:keyvalue` | Per-site KV store. |
 | `wasi:blobstore` | Per-site blob store. |
@@ -219,6 +226,9 @@ rejected at validate.
 | `sql` | The **default** per-site SQL database (managed libsql), opened as `sql.open("")`. |
 | `sql:<name>` | A specific operator-configured [named database](../how-to/handler-bindings.md#bring-your-own-database-external-postgres--mysql) (e.g. `sql:analytics`), opened as `sql.open("<name>")` — its own connection + role, for least-privilege isolation. |
 | `sql:*` | Every named database the site exposes (a convenience grant; the site's `allow_imports` is still the hard ceiling). |
+| `admin:domains` / `admin:email` / `admin:site` / `admin:secrets` | A guest project-self-config surface via `boatramp:handlers/admin`. Each is a **specific** surface grant (a bare `admin` and `admin:*` are deliberately not accepted — deny-by-default, least-privilege) and is additionally gated by the matching `allow_guest_admin_*` posture knob (all off under `multi-tenant`). |
+| `session` | A duplex/resumable [session](#sessions) route's per-frame session binding. Accepted in `imports` but advertised only when the host is built with the `session` feature (the `requires` ABI gate enforces host support at activation). |
+| `tenancy` | Host-verify a guest-presented token to seal an async-lane producer context (`boatramp:handlers/tenancy` `present-token`). Accepted in `imports` but advertised only when the host is built with the `messaging` feature. |
 | `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:logging` | Standard host facilities (`wasi:logging` messages are captured into the site's logs alongside stdout/stderr). |
 
 The site's [`allow_imports`](./siteconfig.md#handlers) is the allowlist; a
@@ -263,6 +273,8 @@ A component invoked once per message on a topic. See
 | `imports` | list\<string\> | Requested capabilities. |
 | `group` | string | Consumer group. Empty (default) = the competing-consumer **work-queue** (one consumer handles each message); a non-empty name = a durable **fan-out** subscriber that receives *every* message on its own cursor, independent of other groups. |
 | `start` | `latest` \| `earliest` | Where a non-empty `group` starts on first subscription: `latest` (default — only new events) or `earliest` (replay the retained backlog). Ignored for the work-queue. |
+| `tenancy` | Tenancy? | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this consumer's `sql`/`orm` when a drained message is processed — the async-lane analog of a function's tenancy. Typically resolves from the `signed_context` source the producer stamped, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "signed_context")], read: "own", write: "own")`. Absent ⇒ *undeclared* (refused under `multi-tenant`, `disabled` under single-tenant/dev). |
+| `token_claims` | HandlerGraphqlTokenClaims? | JWKS/issuer config verifying an app bearer for a `token` tenant source (rare on the async lane, but supported when a consumer is invoked with a forwarded bearer). Absent ⇒ the `token` source can't verify (fail-closed). |
 
 ## `crons`
 
@@ -284,6 +296,26 @@ A host-level endpoint that fans out messaging topics to connected clients.
 | `topics` | list\<string\> | — | Topics broadcast to clients (server→client). |
 | `websocket` | bool | `false` | Serve as a WebSocket instead of SSE (adds a client→server direction). |
 | `publish_topic` | string? | — | For a WebSocket, the topic client→server messages publish to. Omitted = receive-only. |
+
+## `sessions`
+
+A **duplex, resumable session** route: a long-lived, client-addressable, bidirectional channel
+served by a guest component's `session-handler` export, which the host re-enters per inbound frame.
+The host opens the session on `route` (SSE-out + POST-in), binds the verified principal, orders +
+resumes outbound frames, and persists a checkpoint. Frames are opaque bytes. Unlike a
+[`stream`](#streams) (host-only pub/sub fan-out), a session runs guest code and carries a
+backchannel.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `route` | pattern | — | Route the session is opened at (the client `GET`s it for the SSE stream and `POST`s inbound frames to it). |
+| `component` | string | — | Path to the session component `.wasm` (exports `session-handler`). |
+| `imports` | list\<string\> | `[]` | Requested capabilities — a session handler declares `session` plus whatever `sql`/`invoke`/… it uses per frame. See [imports](#imports). |
+| `limits` | HandlerLimits | — | Optional resource caps, capped by site config at activation. |
+| `env` | map\<string, string\> | `{}` | Static environment variables (never secrets). |
+| `invoke_targets` | list\<string\> | `[]` | Function names the session may call via `invoke` (same contract as a handler's [`invoke_targets`](#invoke_targets)). |
+| `tenancy` | Tenancy? | `None` (plain) | In-site [tenancy decision](./siteconfig.md#handlerstenancy) for this session's `sql`/`orm`. Resolved once at **open** from the verified source and carried across every re-entry, e.g. `(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`. |
+| `token_claims` | HandlerGraphqlTokenClaims? | `None` (inherit) | JWKS/issuer config verifying the app bearer for a `token`-sourced tenant (same as a handler's). |
 
 ## Patterns
 

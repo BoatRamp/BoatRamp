@@ -26,9 +26,13 @@ point of the portability claim. The same `.wasm` runs unmodified on boatramp, on
 another WASI 0.2 host (`wasmtime`, Spin, `workerd`), and — because the contract is
 the component model, not a boatramp API — it is not locked to us. Instantiation is
 sub-millisecond, the memory footprint is small, and the sandbox is strong: the
-guest can only touch the host capabilities you grant (`wasi:keyvalue`,
-`sql`, `wasi:blobstore`, `wasi:messaging`, and `invoke` — calling another
-function in-process). Reach for a function first.
+guest can only touch the host capabilities you grant — including `wasi:keyvalue`,
+`sql`, `wasi:blobstore`, `wasi:messaging`, `invoke` (calling another function
+in-process), `graphql` (run the project's supergraph), `session` (a duplex
+resumable channel), `email` (send through a project SMTP profile), `capability`
++ `target-context` (mint / read back a delegated capability), `tenancy` (present a
+tenant credential for the async lane), and `admin` (self-configure the project).
+Reach for a function first.
 
 ## Triggers: the many doors to one function
 

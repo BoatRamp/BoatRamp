@@ -267,6 +267,33 @@ first boot runs `initdb` before it opens its port. Override it per binding with
 `startup_grace_secs` (or the env var
 `BOATRAMP_HANDLERS_SQL_DB_<NAME>_STARTUP_GRACE_SECS`); omit it for the engine default.
 
+## Run a command inside a workload (`compute exec`)
+
+`compute exec` runs a one-off command inside a running workload replica, docker-exec
+style — the practical way to run a migration, take a `pg_dump`, or drop into a shell
+to debug. It is available on the **container** and **docker** backends (not the
+microVM backend), and is gated by the server's `allow_compute_exec` security posture
+knob (a `501` when it is off). Since 0.3.9.
+
+Everything after `--` is the command's argv, so flags pass through untouched:
+
+```sh
+boatramp compute exec pg -- psql -U app -d appdb -c '\dt'
+```
+
+Pipe a file into the command's standard input with `--stdin` — the classic way to
+apply a migration or restore a dump:
+
+```sh
+boatramp compute exec pg --stdin -- psql -U app -d appdb < migration.sql
+boatramp compute exec pg --stdin -- pg_restore -U app -d appdb < dump.pgc
+```
+
+The command's stdout and stderr are printed and `boatramp` exits with the command's
+own exit code. It runs against a live, healthy replica; there is no guarantee of
+which replica for a multi-replica workload, so target a single-replica workload (a
+managed database is one) for state-changing commands.
+
 ## Reach a sibling workload by name (internal DNS)
 
 A workload can reach another workload **in the same project** — or that project's

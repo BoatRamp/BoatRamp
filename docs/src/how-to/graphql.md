@@ -371,4 +371,77 @@ subgraph — the schema semantics stay in your code.
 > (`@interfaceObject`, progressive `@override`, deep `@requires` chains) are not
 > yet planned; a query that needs them will not compose or plan.
 
+## Cross-tenant target fields
+
+A root Query/Mutation field can serve **another** tenant `B`'s *public* subset — a
+storefront funnel, an embed, a share/handoff link — while every other field keeps serving
+the caller's own tenant. You declare it with the `@tenant` field directive; the host resolves
+`B` and forces the confinement **before your resolver runs**, so the field can never reach
+`B`'s private rows (or a third tenant). This is the GraphQL face of the **target** axis — see
+[Isolate tenants](./tenant-isolation.md) for the access-mode model it sits beside.
+
+```graphql
+type Query {
+  # B's published products, resolved from the routed storefront domain
+  publicProducts: [Product!]!
+    @tenant(scope: target, via: [domain, handle], public: "storefront")
+}
+```
+
+The directive's arguments (parsed at composition — a malformed one **refuses the publish**):
+
+| Argument | Values | Meaning |
+| --- | --- | --- |
+| `scope` | `own` (default) \| `target` \| `target_or_null` | `own` = the caller's own tenant (today's behavior). `target` = read `B`'s public subset. `target_or_null` = `B`'s public rows **plus** the shared `NULL`-tenant baseline (below). |
+| `via` | a non-empty list of `domain` \| `capability` \| `handle` | How the host resolves `B` per fetch, first-resolves-wins (below). |
+| `public` | a subset name (string) | Names the host-held visibility subset the read/write confines to. Mandatory for anonymous sources; a `via: [capability]`-only field is exempt (below). |
+| `write` | a list of column names (default empty) | The SET-allowlist for a target **write**; empty ⇒ read-only. `handle` may never appear in `via` of a write field (a public slug carries no write authorization). |
+
+**`scope: target` confines to exactly `B`.** The host binds `tenant = B AND <public subset>`
+onto the field's `sql`/`orm` — one tenant, never `all`. A target **write** (non-empty `write`)
+force-stamps `tenant = B` and the visibility columns, confines an `UPDATE`'s `WHERE`, and refuses
+a `DELETE` or a raw-SQL write.
+
+**The `via` source model — how `B` is resolved per fetch:**
+
+- **`domain`** — the terminating request domain's context tag (a storefront served on the
+  tenant's own host). Anonymous, so `public` is mandatory.
+- **`handle`** — a public slug from a third-party origin (embed / aggregator). **Read-only**, and
+  admissible only on a subset the operator flagged `world_public`; the slug resolves `B` only from
+  the operator's `handles` registry (deny-by-default). `public` is mandatory.
+- **`capability`** — a host-verified, audience-bound capability token that names `tid = B` and the
+  granted subset. The token **is** the authorization, so a `via: [capability]`-only field is
+  **exempt** from the mandatory `public` subset: the host confines to `tenant = B` alone and the
+  within-tenant per-client filter stays in your resolver (this is the v0.4.4 ruling). To mint one,
+  see [Mint a delegated capability](./delegated-capabilities.md).
+
+**The external `/graphql` gateway serves these on wasm subgraphs (since v0.4.7).** The federation
+planner splits fetches by tenancy class; the gateway resolves `B` **per fetch** from that fetch's
+own `via`/`public`/`write` and forces the `tenant = B AND <public subset>` confinement onto the
+wasm subgraph's own `sql`/`orm` — reads **and** writes, identical to a plain-wasm target route. `B`
+and the confinement are always host-resolved, never guest input; the callee's own declared tenancy
+is bypassed (the composed SDL field's class is the authority).
+
+### Include the shared baseline: `scope: target_or_null`
+
+`scope: target_or_null` (v0.4.8) widens a target **read** to
+`(tenant = B OR tenant IS NULL) AND <public subset>` — `B`'s public rows plus the shared
+`NULL`-tenant baseline (a common base catalog, reference data, seeded rows every tenant shares).
+Use it when a customer's own public rows layer over a shared base.
+
+```graphql
+baseProducts: [Product!]!
+  @tenant(scope: target_or_null, via: [domain], public: "products")
+```
+
+- **Read-only.** The write axis stays `own`/`none`; a target write still stamps `tenant = B` and
+  never lands in the shared baseline.
+- **The public subset is mandatory on BOTH arms even under a capability.** Unlike plain `target`, a
+  `via: [capability]` field is **not** exempt here: the `NULL`-base rows are a different trust
+  partition than the capability-authorized `B`, so the base arm must be visibility-gated. A
+  `target_or_null` field over a table with no declared public subset is refused deny-by-default.
+- **Plain-Column tables only.** The `OR NULL` widening applies only to a straight tenant-column
+  table — never a session-keyed or unscoped table. The SQL/GDC subgraph path (AND-only terms) fails
+  closed rather than approximate the disjunction.
+
 [async-graphql]: https://github.com/async-graphql/async-graphql

@@ -48,6 +48,13 @@ flags unique to each command:
 | [`domain`](#boatramp-domain) | Attach/detach hostnames to a site. |
 | [`alias`](#boatramp-alias) | Manage named pointers to deployments. |
 | [`access`](#boatramp-access) | Configure visitor access control. |
+| [`handlers`](#boatramp-handlers) | Manage a site's handler policy (enable/disable, import allowlist, caps, edge cache, cookie auth). |
+| [`function`](#boatramp-function) | Manage top-level functions (deploy, invoke, triggers, local dev). |
+| [`graphql`](#boatramp-graphql) | Manage a project's GraphQL admin (persisted-op safelist + federation subgraphs). |
+| [`tenancy`](#boatramp-tenancy) | Manage a project's tenancy schema (the per-table tenant-key map). |
+| [`secrets`](#boatramp-secrets) | Manage a project's internal sealed secret store. |
+| [`email`](#boatramp-email) | Manage a project's SMTP delivery profiles (`email` feature). |
+| [`sql`](#boatramp-sql) | Operator SQL to a managed database (apply a migration, run a query, probe reachability). |
 | [`token`](#boatramp-token) | Manage control-plane API tokens. |
 | [`cluster`](#boatramp-cluster) | Operate a cluster's dynamic-join membership. |
 | [`operator`](#boatramp-operator) | Run the in-binary Kubernetes operator / print its manifests. |
@@ -318,6 +325,109 @@ Configure visitor access control. See
 | `rate-limit set\|off` | Set the per-client requests/second (+ optional burst) or disable it. |
 | `trusted-proxy add\|clear` | Trust a reverse proxy by CIDR so its `X-Forwarded-For` is believed. |
 
+## `boatramp handlers`
+
+Manage a site's handler policy — enable/disable, the import allowlist, resource
+caps, the edge response cache, and browser cookie auth. See
+[Handler host bindings](../how-to/handler-bindings.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `show` | Show the site's current handler policy. |
+| `enable [--allow <import>…] [--max-memory-mb <n>] [--max-timeout-ms <n>] [--max-concurrency <n>] [--max-fuel <n>]` | Enable handlers on the site. `--allow` (repeatable) **replaces** the whole import allowlist when given; the cap flags are optional. |
+| `disable` | Disable handlers on the site (keeps the allowlist + caps for a later re-enable). |
+| `allow <import>…` | Add interface(s) to the site's import allowlist. |
+| `deny <import>…` | Remove interface(s) from the site's import allowlist. |
+| `cache enable [--max-entry-bytes <n>] [--max-ttl-secs <n>]` / `cache disable` | Configure the edge response cache for handler routes. |
+| `cookie-auth set --cookie-name <c> [--allowed-origin <o>…]` / `cookie-auth clear` | Treat the named cookie as the application bearer (with an optional cross-origin CSRF allowlist), or turn cookie session auth off. |
+
+## `boatramp function`
+
+Manage top-level [functions](../how-to/functions.md) — deploy, roll back/alias,
+invoke, triggers, and the local dev harness. Takes a `--server` flag; site-scoped
+sub-actions also read `--site`.
+
+| Sub-action | Description |
+| --- | --- |
+| `ls [--site <s>]` | List functions (optionally for one site). |
+| `get <site>/<name>` | Show one function by its `<site>/<name>`. |
+| `deploy <name> <wasm> [--substrate wasm\|microvm\|container] [--webhook-secret-env <var>] [--webhook-ingress-topic <t>]` | Deploy a version of a function from a component `.wasm` (uploaded as a blob). |
+| `rollback <name> --to <version>` | Roll a function's active version back to a specific version. |
+| `alias <name> <label> <version>` | Point an alias label (e.g. `prod`, `staging`) at a version. |
+| `rm <name>` | Remove a top-level function. |
+| `invoke <name> [--data <body>\|--data-file <path>] [--content-type <ct>] [--async] [--idempotency-key <k>] [--version <v>]` | Invoke a function; reads the body from `--data`/`--data-file`/stdin and prints the response. `--async` enqueues and prints an invocation id. |
+| `invocation <name> <id>` | Show a durable (async) invocation's status/result by id. |
+| `usage <name>` | Show a function's usage aggregate (invocations, duration, bytes). |
+| `trigger add\|ls\|rm` | Manage a function's scheduled/event triggers: `add` takes exactly one of `--cron` / `--queue` / `--blob`. |
+| `init <name> [--lang rust\|js\|python] [--dir <path>]` | Scaffold a new function project from a language template. |
+| `build [<dir>]` | Build a function project to a `wasi:http` component; prints the produced `.wasm` path. |
+| `test <wasm> [--path <p>] [--method <m>] [--body <b>] [--content-type <ct>] [--expect-status <n>] [--expect-body <substr>]` | Run a component locally against one request and assert on the response. |
+| `dev <wasm> [--port <n>]` | Serve a component locally on an HTTP port (the local dev harness). |
+
+## `boatramp graphql`
+
+Manage a project's GraphQL admin — the persisted-operation safelist and the
+federation subgraph registry. See [Serve a GraphQL API](../how-to/graphql.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `safelist add [<op>\|--file <path>]` | Register a trusted operation (query text inline or from a file). |
+| `safelist ls` | List the registered trusted operations. |
+| `safelist rm <hash>` | Remove a trusted operation by its hash. |
+| `subgraph put <name> <sdl-file>` | Publish (or replace) a Wasm subgraph from its SDL file. |
+| `subgraph sql <name> <json-file>` | Publish (or replace) a SQL subgraph from a request JSON file (`{site, config}`). |
+| `subgraph function <name>` | Register (or refresh) a function subgraph by introspecting the deployed function of the same name. |
+| `subgraph rm <name>` | Remove a subgraph. |
+| `supergraph` | Print the composed supergraph SDL. |
+
+## `boatramp tenancy`
+
+Manage a project's [tenancy schema](./siteconfig.md#tenancyschema) — the per-table
+tenant-key map that scopes guest `sql`/`orm` queries. `Project·Admin`. See
+[Isolate tenants in one database](../how-to/tenant-isolation.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `show` | Print the project's current tenancy schema as JSON (a project with none prints the default `tenant_id`/no-tables schema). |
+| `apply <file>` | Replace the project's tenancy schema from a JSON file (as produced by `tenancy show`). |
+| `clear` | Clear the schema, reverting to legacy single-column scoping. Idempotent. |
+
+## `boatramp secrets`
+
+Manage a project's internal, sealed [secret store](../how-to/handler-bindings.md)
+(a guest names a secret as `boatramp:<name>` in its `secrets` map). The store
+holds only sealed bytes — the API never returns a value.
+
+| Sub-action | Description |
+| --- | --- |
+| `set <name> [--stdin\|--file <path>\|--value <v>]` | Seal `value` under `name` (setting an existing name rotates it). Prefer `--stdin`/`--file` so the plaintext doesn't hit argv/history. |
+| `rotate <name> …` | Alias for `set` (overwrite in place), for intent-clarity. |
+| `ls` | List the project's secrets: name / revision / last-updated (never a value). |
+| `rm <name>` | Remove a secret by name. |
+
+## `boatramp email`
+
+Manage a project's SMTP delivery profiles (a guest's `email` capability selects
+one by name). Needs the `email` feature. Passwords stay sealed — never returned.
+See [Send email from a function](../how-to/email.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `set <name> [--host <h>] [--port <n>] [--security starttls\|tls\|plaintext] [--username <u>] [--password/--password-stdin] [--no-auth] [--from <addr>] [--durable <bool>]` | Create or **update** an SMTP profile — fields you pass overwrite, fields you omit keep their stored value (the sealed password is preserved unless you pass a new one). `--host` + `--from` are required on create. |
+| `ls` | List the project's SMTP profiles (redacted). |
+| `show <name>` | Show one profile's redacted config. |
+| `rm <name>` | Remove a profile by name. |
+
+## `boatramp sql`
+
+Operator SQL to a managed database. See [Handler bindings](../how-to/handler-bindings.md).
+
+| Sub-action | Description |
+| --- | --- |
+| `exec [--db <name>] [--file <path>]` | Apply a migration **script** (multiple statements — `CREATE EXTENSION`, tables, RLS, chained DDL/DML) to a managed database, from `--file` or stdin. `--db` is the binding name (empty = the site's default database). |
+| `query <sql> [--db <name>] [--format table\|json]` | Run one row-returning query and print the result. |
+| `ping [--db <name>]` | Actively TCP-probe each replica of a managed database — a reachability check that bypasses the stored-health gate `query` trips on (distinguishes "the DB is down" from "up but the resolver won't serve it"). Admin-scoped. |
+
 ## `boatramp token`
 
 Manage control-plane API tokens. See
@@ -427,8 +537,17 @@ Manage Firecracker microVM compute workloads. See
 | `set <name> …` | Create/update a workload from already-pushed rootfs/kernel blobs. |
 | `build <name> …` | Build an ext4 rootfs from an OCI image, upload it, and set the workload (needs `mke2fs`). |
 | `rm <name>` | Remove a workload (its replicas are stopped). Its persistent volume is left on disk — reclaim it with `compute volume rm`. |
+| `exec <name> -- <cmd…>` | Run a command inside a running workload replica (docker-exec style) — e.g. pipe a SQL file into `psql`, or run `pg_dump`. `--stdin` feeds this process's stdin to the command. Requires the `allow_compute_exec` posture; container + docker backends only. |
 | `volume ls` | List persistent volumes on the node (`NAME`, `SIZE`, and whether a registered workload still references it). |
 | `volume rm <name>` | Remove a persistent volume. Refused (`409`) while a registered workload's active spec still mounts it, unless `--force`. |
+| `status [<workload>] [--format table\|json]` | Show observed per-replica runtime state — stored health, lifecycle phase, assigned IP:port, age vs startup grace, backend (the record the endpoint resolver reads). Node-global; admin-scoped. |
+| `set-health <workload> <replica> --healthy <true\|false>` | Force one replica's stored health flag — the escape hatch when a recovered replica is stuck `healthy=false` and the resolver won't serve it. Node-global; admin-scoped. |
+| `reconcile` | Force the reconcile loop to run a convergence pass now (the "kick it" lever for a workload stuck mid-reconcile). Fire-and-forget; follow with `compute status`. Node-global; admin-scoped. |
+| `restart <workload> <replica>` | Stop one replica and let the reconcile loop relaunch a fresh one (re-running IP allocation) — the live workaround for a wedged replica or a stale IP. Node-global; admin-scoped. |
+| `ip ls` | List every replica's assigned IP (`IP`/`OWNER`/`HEALTHY`), flagging duplicate-IP collisions. Node-global; admin-scoped. |
+| `dns ls` | List internal service-discovery names and the healthy replica IPs each resolves to. Node-global; admin-scoped. |
+| `dns resolve <workload>` | Resolve one workload's internal name (in the `--project` tenant) to its healthy replica IPs — exactly as a same-project peer's lookup would. Node-global; admin-scoped. |
+| `netdiag <workload>` | Actively TCP-probe a workload's replicas from the node, alongside their stored state — `REACHABLE=yes` + `HEALTHY=no` is the reachable-but-not-served signature. Node-global; admin-scoped. |
 
 `set` takes exactly one **root-filesystem source** (matched to the substrate);
 `build` instead takes `--image` + `--size-mib` and produces a `--rootfs` source:
@@ -525,11 +644,13 @@ credentials from the environment (see [DNS providers](./dns-providers.md)).
 
 ## `boatramp logs`
 
-Tail a site's captured guest stdout/stderr. See
+Tail a site's — or a standalone function's — captured guest stdout/stderr. See
 [Observe a running server](../how-to/observe.md).
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--site <name>` | `BOATRAMP_SITE` | Site whose guest logs to tail. Mutually exclusive with `--function`. |
+| `--function <name>` | — | Tail a **standalone function**'s captured stdout/stderr instead of a site (a GraphQL subgraph, auth function, or worker invoked via `invoke`, whose `println!`/`eprintln!` is otherwise unreadable). Scoped to `--project`; **takes precedence over `--site`**. |
 | `--stream <stdout\|stderr>` | both | Only show one stream. |
 | `--limit <n>` | `200` | Number of recent lines to show. |
 | `-f`, `--follow` | — | Keep polling for new lines (like `tail -f`). |

@@ -150,6 +150,16 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_ALLOW_IMPLICIT_ROUTING` | `overrides.allow_implicit_routing` | Resolve an unmatched `Host` to a site without an explicit domain registration. |
 | `BOATRAMP_SECURITY_REQUIRE_POP` | `overrides.require_pop` | Require every token to be `cnf`-bound and PoP-proven fleet-wide. |
 | `BOATRAMP_SECURITY_REQUIRE_DOMAIN_VERIFICATION` | `overrides.require_domain_verification` | Refuse to serve a non-local `Host` that isn't a verified, attached virtualhost. |
+| `BOATRAMP_SECURITY_ALLOW_ENV_SECRET_REFS` | `overrides.allow_env_secret_refs` | Permit a handler's / function's `secrets` map to name a bare / `env:`-scheme reference into the serve process's own environment. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_REQUIRE_TENANCY_DECLARATION` | `overrides.require_tenancy_declaration` | Require every `sql`/`orm`-opening component to make an explicit in-site tenancy decision (`disabled` or `scoped`). On under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB` | `overrides.allow_cross_tenant_db` | Permit a component to declare a cross-tenant (`all`) read/write access mode. Off under `multi-tenant` (capped to `own`). |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY` | `overrides.allow_guest_mint_capability` | Permit a guest's `capability` capability to mint fleet-signed target-capability tokens. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS` | `overrides.max_guest_capability_ttl_secs` | Operator ceiling (seconds) on a guest-minted capability's TTL; a larger request is clamped. `0` disables minting. |
+
+The four tenancy/capability variables above set the **fleet** posture; a **per-project** override of
+the same knobs is config-file only (see
+[`security.projects`](./boatramp-cfg.md#securityprojects)). Guest-admin surface knobs
+(`allow_guest_admin_*`) and `allow_guest_email` are **file-only** — not env-settable.
 
 ## Handler backends
 
@@ -261,7 +271,7 @@ only — are env-settable too, so wildcard DNS-01 can be configured with no conf
 
 | Variable | Flag | Description |
 | --- | --- | --- |
-| `BOATRAMP_TLS` | `--tls` | Listener TLS mode: `off` (default), `custom`, `acme`, `acme-dns`, `acme-tls`, `rpk`. Use `acme-dns` for wildcard certs. |
+| `BOATRAMP_TLS` | `--tls` | Listener TLS mode: `off` (default), `custom`, `acme`, `acme-dns`, `rpk`. Use `acme-dns` for wildcard certs. |
 | `BOATRAMP_ACME_DOMAINS` | `--acme-domain` | Comma-separated domains to certify. An explicit wildcard (`*.example.com`) is issued via DNS-01. |
 | `BOATRAMP_ACME_DNS_PROVIDER` | `--acme-dns-provider` | DNS-01 provider: `manual`, `cloudflare`, `route53`, `oci`, `digitalocean`, `hetzner`, `ns1`, `dnsimple`, `gcp`, `azure`, `akamai`. |
 | `BOATRAMP_ACME_CONTACT` | `--acme-contact` | Contact email for the ACME account. |

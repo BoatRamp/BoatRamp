@@ -8,7 +8,7 @@ on the same route; boatramp owns the ordering, buffering, resume, and lifetime, 
 instance. Every frame is **opaque bytes** — boatramp never parses your protocol, so
 you can carry AG-UI events, JSON, or anything else.
 
-A session differs from a [stream](./background-work.md#stream-a-topic-to-the-browser)
+A session differs from a [stream](../reference/routing.md#streams)
 (host-only pub/sub fan-out, no guest, no backchannel) and from a plain streaming
 [handler](./deploy-handler.md) (one request, one response body): a session runs *your*
 code per client message and streams results back, across reconnects.
@@ -35,9 +35,9 @@ routing: (
           // Host-forced tenancy for any sql/orm the handler runs per frame, resolved
           // ONCE at open from the verified bearer and carried across every re-entry
           // (identical to a handler — see Isolate tenants within a project).
-          tenancy: ( column: "tenant_id", source: Token ),
+          tenancy: (mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "org")], read: "own", write: "own"),
           token_claims: ( jwks_url: "https://issuer/.well-known/jwks.json",
-                          issuer: "https://issuer/", claim: "org" ) ),
+                          issuer: "https://issuer/" ) ),
     ],
 ),
 ```

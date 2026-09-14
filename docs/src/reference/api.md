@@ -148,9 +148,81 @@ scopes to another project.
 | --- | --- | --- |
 | `GET` | `/api/compute` | List compute workloads. |
 | `GET`/`PUT`/`DELETE` | `/api/compute/:name` | Manage one workload. |
+| `POST` | `/api/compute/:name/exec` | Run a command inside a running replica (docker-exec style; posture-gated by `allow_compute_exec`). Since 0.3.9. |
 
-Requires KVM on the serving host; the control-plane surface is uniform whether or
-not execution is available. See [Run compute workloads](../how-to/compute.md).
+The control-plane surface is uniform whether or not execution is available on the
+node. Only the **microVM** backend needs `/dev/kvm`; the native **container** backend
+instead needs the `br-boatramp` bridge and `CAP_NET_ADMIN` (both compute backends are
+Linux-only). On macOS / Windows compute runs through the remote-docker backend. See
+[Run compute workloads](../how-to/compute.md).
+
+### Compute operations (node-global)
+
+These operate across **every** tenant on the node and are gated at `system` · `admin`
+— not the per-project `/api/compute/*` right. Since 0.3.9 (volumes: 0.3.11;
+maintenance/diagnostics: 0.3.14).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/compute/volumes` | List persistent volumes (in-use vs orphaned). |
+| `DELETE` | `/api/compute/volumes/:name` | Reclaim a volume (`?force=true` to remove one still referenced). |
+| `GET` | `/api/compute/status` | Observed per-replica runtime state (health, lifecycle phase, IP:port, backend). |
+| `GET` | `/api/compute/ipam` | The compute-bridge IP-pool allocation. |
+| `GET` | `/api/compute/dns` | The internal-DNS fleet view. |
+| `POST` | `/api/compute/dns/resolve` | Resolve an internal name as a container would (diagnostic). |
+| `POST` | `/api/compute/reconcile` | Force a reconcile pass. |
+| `POST` | `/api/compute/maintenance/set-health` | Override a replica's stored health. |
+| `POST` | `/api/compute/maintenance/restart` | Stop + relaunch a replica. |
+| `POST` | `/api/compute/maintenance/netdiag` | Run a network diagnostic. |
+
+See [Diagnose compute](../how-to/diagnose-compute.md).
+
+## Managed SQL (operator)
+
+Run a migration script or a single query against a managed co-located database via
+its sealed credential (resolved server-side). Project-owned (`project` · `deploy`);
+writes are additionally posture-gated. Top-level paths target the `default` project;
+`/api/projects/:project/sql/…` scopes to another project. Since 0.3.9 (`ping`: 0.3.14).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/sql/:db/exec` | Run a migration / statement script against the managed database `:db`. |
+| `POST` | `/api/sql/:db/query` | Run a single query and return its rows. |
+| `POST` | `/api/sql/:db/ping` | Active per-replica reachability probe (bypasses the stored-health gate). |
+
+## Secrets & email profiles
+
+Project-scoped credential stores, gated by the `secrets` right (see
+[RBAC](./rbac.md#request-to-right-mapping)). A value never leaves over the API — the
+list/show responses are metadata-only (secrets) or redacted (email). Present only
+when a `[secrets]` key envelope is configured (else a clear `501`). Secrets since
+0.3.10; email profiles since 0.3.18.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/projects/:project/secrets` | Set (seal) a secret `{ name, value }`; returns metadata, never the value. |
+| `GET` | `/api/projects/:project/secrets` | List secret names + metadata (no values). |
+| `DELETE` | `/api/projects/:project/secrets/:name` | Delete a secret. |
+| `PUT` | `/api/projects/:project/email/profiles/:name` | Set / partial-update an SMTP profile (sealed password); returns the redacted profile. |
+| `GET` | `/api/projects/:project/email/profiles[/:name]` | List / show email profiles (redacted). |
+| `DELETE` | `/api/projects/:project/email/profiles/:name` | Delete an email profile. |
+
+See [Store secrets](../how-to/secrets.md) and [Send email](../how-to/send-email.md).
+
+## Tenancy schema
+
+The project's per-table tenant-key map — the isolation boundary that scopes every
+guest query. Read with `project` · `read`; replace/clear with `project` · `admin`
+(above the publisher's deploy right, so a publisher cannot redraw the boundary).
+Since 0.4.3.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/projects/:project/tenancy` | Read the tenancy schema. |
+| `PUT` | `/api/projects/:project/tenancy` | Replace the tenancy schema. |
+| `DELETE` | `/api/projects/:project/tenancy` | Clear it (back to deny-by-default). |
+
+See [Isolate tenants](../how-to/tenant-isolation.md).
 
 ## GraphQL
 
@@ -172,18 +244,21 @@ A function that self-declares a subgraph auto-registers on deploy; pass
 `?register_subgraph=false` to `PUT /api/functions/:name` to opt a deploy out. See
 [Federation](../how-to/graphql.md#federation).
 
-## Per-site observability
+## Observability
 
 Present with the `handlers` feature.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/sites/:site/_boatramp/handlers` | Per-handler operator stats. |
-| `GET` | `/api/sites/:site/_boatramp/logs` | Captured guest logs. |
-| `GET` | `/api/sites/:site/_boatramp/logs/stream` | Stream logs (SSE). |
+| `GET` | `/api/sites/:site/_boatramp/logs` | Captured per-site guest logs. |
+| `GET` | `/api/sites/:site/_boatramp/logs/stream` | Stream per-site logs (SSE). |
 | `POST` | `/api/sites/:site/_boatramp/dlq` | Dead-letter-queue operations. |
+| `GET` | `/api/functions/:name/_boatramp/logs` | Captured per-function guest logs (project-owned read). Since 0.3.17. |
+| `GET` | `/api/functions/:name/_boatramp/logs/stream` | Stream per-function logs (SSE). Since 0.3.17. |
 
-See [Observe a running server](../how-to/observe.md).
+The function-logs endpoints have a `/api/projects/:project/functions/…` counterpart
+scoped to another project. See [Observe a running server](../how-to/observe.md).
 
 ## Agent (MCP)
 

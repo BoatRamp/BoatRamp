@@ -48,7 +48,7 @@ and bound once per invocation:
 | --- | --- | --- |
 | `token` | A verified JWT claim (default `tid`) on the app's **own** bearer token, checked against a configured JWKS/issuer. | Authenticated console/portal paths. |
 | `domain` | The routed request domain's [context tag](./custom-domain.md#map-each-host-to-a-tenant-domainscontexts) (`domains.contexts`). | Storefronts / public-render paths — one deployment, many customer domains, no app-side `Host`→tenant lookup. |
-| `signed_context` | A host-verifiable signed context on an async job/message. **Reserved** — not yet wired; a function requiring "own" via it fails closed. | (future) async workers. |
+| `signed_context` | A host-verifiable signed context stamped on an async job/message. The producer host-stamps its own verified tenant at publish; a consumer declaring `sources: [(kind: "signed_context")]` resolves that tenant on the async lane (verified against the fleet anchor). A forged/expired/absent context resolves nothing, so an "own" op fails closed. Wired since v0.4.3. | Message consumers, cron, webhooks, workflow steps, fan-out workers. |
 | `none` | There is no "own" tenant (truly anonymous / HMAC-webhook auth). Only the `null`/`all` access modes are meaningful; an "own" mode fails closed. | Funnel reads, unauthenticated webhooks. |
 
 For the **`token`** source, configure the JWKS/issuer that verifies the app bearer with a
@@ -189,7 +189,8 @@ is the separate **target** axis, declared on a GraphQL field with
 `@tenant(scope: target, via: […], public: …)`. Since v0.4.7 the external `/graphql` gateway
 serves these on **wasm** subgraphs too (reads and writes), resolving `B` per fetch from
 `domain` / `capability` / `handle` and confining the subgraph's own `sql`/`orm` to
-`tenant = B AND <public subset>`. See [GraphQL](./graphql.md) for the target-field model.
+`tenant = B AND <public subset>`. See
+[Cross-tenant target fields](./graphql.md#cross-tenant-target-fields) for the target-field model.
 
 ### Include the shared baseline: `target_or_null`
 
@@ -240,7 +241,7 @@ discriminated by `tenant_id`:
 
    ```json
    { "mode": "scoped", "column": "tenant_id",
-     "source": { "kind": "domain" }, "read": "own", "write": "own" }
+     "sources": [ { "kind": "domain" } ], "read": "own", "write": "own" }
    ```
 
 3. **Write ordinary handlers.** A request to `acme.shops.example.com` runs with the tenant
@@ -249,8 +250,8 @@ discriminated by `tenant_id`:
    by attaching a domain and tagging it, no redeploy.
 
 For a **token**-authenticated console over the same data, declare a second function with
-`source: { "kind": "token", "claim": "tid" }` + a `token_claims` block, and (if it needs an
-admin view across tenants) `read: all` — which the operator must enable fleet-wide with
+`sources: [ { "kind": "token", "claim": "tid" } ]` + a `token_claims` block, and (if it needs
+an admin view across tenants) `read: all` — which the operator must enable fleet-wide with
 `allow_cross_tenant_db`.
 
 ## Migrating from pre-0.4

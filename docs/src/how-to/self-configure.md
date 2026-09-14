@@ -52,9 +52,13 @@ handlers: [(
 boatramp handlers set --site app --allow-imports admin:domains,admin:email
 ```
 
-Declare the requirement in a function manifest's `requires` too, so a deploy is
-**refused** on a host where the posture disables `admin`, rather than failing at first
-call.
+The admin surfaces are gated at **runtime**, not by the `requires` ABI gate: if the
+`allow_guest_admin_<surface>` posture is off (the default under `multi-tenant`), the admin
+binding never attaches and the verb returns `access-denied` at call time. `requires` is for
+capabilities whose *availability varies by host build* (e.g. [`session`](./sessions.md),
+`tenancy`) — an `admin:<surface>` is not an advertised build feature, so listing it in
+`requires` would make **every** deploy fail as unmet. Gate the surface through
+`imports ∩ allow_imports ∩ posture` instead.
 
 ## Use it from a guest
 

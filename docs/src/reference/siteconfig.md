@@ -150,7 +150,7 @@ with a `__Host-` prefix. See
 The site's **in-site tenancy decision** — how the host scopes `sql`/`orm` row access across
 sub-tenants sharing one database. Absent (`None`) means *undeclared*: refused at activation for a
 `sql`/`orm`-importing site under the `multi-tenant` posture (which requires an explicit decision),
-treated as `disabled` under single-tenant/dev. Two shapes (a tagged `mode`):
+treated as `disabled` under single-tenant/dev. Three shapes (a tagged `mode`):
 
 ```json
 { "mode": "disabled" }
@@ -161,18 +161,25 @@ isolation). The explicit "single-tenant / no tenancy" declaration.
 ```json
 { "mode": "scoped",
   "column": "tenant_id",
-  "source": { "kind": "token", "claim": "tid" },
+  "sources": [ { "kind": "token", "claim": "tid" } ],
   "read":  "own",
   "write": "own" }
 ```
-In-site sub-tenancy on `column`, resolving "own" from `source`, at per-axis access grants.
+In-site sub-tenancy on `column`, resolving "own" from the first applicable `sources` entry, at
+per-axis access grants. In `project.cfg` / `apply.cfg` RON the canonical spelling is
+`(mode: "scoped", column: "tenant_id", sources: [(kind: "token", claim: "tid")], read: "own", write: "own")`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `column` | string | — | The tenant column the host scopes on (validated as an identifier). |
-| `source` | TenantSource | `{"kind":"none"}` | How the host resolves "own": `{"kind":"token","claim":"tid"}` (a verified JWT claim), `{"kind":"domain"}` (the routed domain's [`contexts`](#domains) tag), `{"kind":"signed_context"}` (reserved), or `{"kind":"none"}` (anonymous). |
+| `sources` | list\<TenantSource\> | `[{"kind":"none"}]` | Host-verified sources the "own" tenant resolves from, in **priority order** — the host picks the first whose current-trigger input is present (a `token` on an authenticated request, `domain` on a storefront, `signed_context` on an async job), so one component serves multiple trigger kinds. The pre-Stage-2 singular `source: {…}` field is still accepted (a one-element list) for back-compat. |
 | `read` | AccessMode | `own` | Which tenant-set reads may reach. |
 | `write` | AccessMode | `own` | Which tenant-set writes may reach. |
+
+Each `TenantSource` is `{"kind":"token","claim":"tid"}` (a verified JWT claim, `claim` default
+`tid`), `{"kind":"domain"}` (the routed domain's [`contexts`](#domains) tag), `{"kind":"signed_context"}`
+(a host-verifiable envelope on an async job/message — the async-lane "own"), or `{"kind":"none"}`
+(anonymous — an "own" grant then fails closed).
 
 `AccessMode` is one of `none` (deny), `null` (the `tenant_id IS NULL` shared baseline only), `own`
 (the resolved tenant), `own_or_null` (both), or `all` (cross-tenant — default-deny, gated by the
@@ -180,6 +187,42 @@ In-site sub-tenancy on `column`, resolving "own" from `source`, at per-axis acce
 on the **write** axis degrades to `own` (a write never touches the shared baseline). A top-level
 function's own [`tenancy`](../how-to/apply.md) block narrows within this site ceiling. Full model:
 [Isolate tenants in one database](../how-to/tenant-isolation.md).
+
+```json
+{ "mode": "target",
+  "via": [ "domain" ],
+  "public": "storefront",
+  "write": [ "status" ],
+  "null_base": false }
+```
+**Target**: this route reads (and, with a non-empty `write` allowlist, writes) a **second** tenant
+`B`'s PUBLIC subset — never the caller's own tenant. The host resolves `B` from the first applicable
+`via` source and binds the target scope before the guest runs, confining every access to
+`tenant = B AND <public subset>`. Gated by the operator's [`target_eligible_fields`](#tenancyschema)
+allowlist.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `via` | list\<TargetSource\> | — | Prioritized target-source list (first-resolves-wins): `"domain"` (the terminating request domain, write-capable), `"handle"` (a public slug from a third-party origin — **read-only**, admissible only on a `world_public` subset), or `"capability"` (a host-verified capability token carrying `tid`/`sub` — the token is the authorization, can back a target write). |
+| `public` | string | — | Names the host-held [public subset](#tenancyschema) (a table in the project's `public_subsets`) accesses confine to. |
+| `write` | list\<string\> | `[]` | Deny-by-default SET-allowlist of columns a target write (INSERT/UPDATE via the typed `orm` only) may set. **Empty ⇒ read-only.** The tenant + visibility columns must not appear here (a target write can't change ownership or flip visibility); a DELETE and any raw-SQL write are refused. |
+| `null_base` | bool | `false` | `target_or_null`: when `true`, a target READ confines to `(<tenant col> = B OR <tenant col> IS NULL) AND <public subset>` — `B`'s public rows plus the shared `NULL`-tenant base/reference rows. Read-only (a target write still stamps `B`); the `NULL` disjunct is added only on plain tenant-column tables. |
+
+### `TenancySchema`
+
+The **project-level** tenant-isolation schema — the host-held facts the scope injector keys off,
+declared per project (not per component) with [`boatramp tenancy apply`](./cli.md#boatramp-tenancy),
+not in `SiteConfig`. A `target` tenancy decision (above) needs the operator to have opened the axis
+in this schema; a project that declares none uses the legacy single-column scoping. Key fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `default_tenant_key` | string | The tenant column for a `tenant`-scoped table (default `tenant_id`). |
+| `session_key` | string? | The anonymous-session column for `tenant_or_session` tables, present iff the project uses the session axis. |
+| `tables` | map\<string, TableScope\> | Per-table scope facts, authoritative + exhaustive when present (a table with no entry is refused, deny-by-default). A `TableScope` is `tenant`, `tenant_keyed { key }`, `unscoped`, or `tenant_or_session`. |
+| `target_eligible_fields` | set\<string\> | The operator's allowlist ceiling: which root Query/Mutation fields (and plain-wasm route ids) may carry a `target` scope at all. Empty ⇒ no field may be target (deny-by-default). |
+| `public_subsets` | map\<string, PublicSubset\> | Per-table PUBLIC subset definitions a target read/write confines to: a visibility `predicate` (a closed conjunction of `column <op> literal` / null-test terms) plus the deny-by-default `world_public` (admits the anonymous `handle` source) and `listable` (handle-discoverable) flags. A `target` field over a table with no entry is refused. |
+| `handles` | map\<string, string\> | Operator-curated PUBLIC handle/slug → target tenant context tag `B`. A `handle` target source resolves `B` only for a slug listed here (deny-by-default) and only when the route's `public` subset is `world_public`. |
 
 ## `compression`
 

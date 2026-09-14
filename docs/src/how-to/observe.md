@@ -100,6 +100,23 @@ boatramp logs my-site --follow
 2026-07-09T12:04:19Z my-site queue/emails        stderr  retry 1: upstream timeout
 ```
 
+### Tail a function's logs
+
+A standalone **function** — a GraphQL subgraph, an auth function, or a worker
+invoked through `emit::invoke` rather than served under a site — captures its guest
+output the same way, but under its own scope. Tail it with `--function` (since
+0.3.17); the flag takes precedence over `--site` / `BOATRAMP_SITE`, and `--project`
+scopes it to a non-`default` project:
+
+```sh
+boatramp logs --function my-worker --follow
+```
+
+The logs read from `GET /api/functions/<name>/_boatramp/logs` (and `/stream` when
+`--follow` is set) — the same captured-log store as the per-site endpoint, under the
+function's project-qualified scope, so a project-scoped token reaches only its own
+functions' logs.
+
 Read invocation counts, consumer lag, and dead-letter totals:
 
 ```sh

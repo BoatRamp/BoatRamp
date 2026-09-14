@@ -83,6 +83,7 @@ posture with `boatramp security explain`.
 | `profile` | string | `multi-tenant` | `multi-tenant` (strict), `single-tenant` (one trusted operator), `dev` (loopback-loose), or a name from `profiles`. |
 | `overrides` | knob table | — | Individual knobs; a knob is the source of truth, a profile is sugar. |
 | `profiles` | map | — | Custom named profiles, each a set of overrides over the strict baseline. |
+| `projects` | map | — | Per-project overrides of the four tenancy/capability sub-knobs — see [Per-project posture](#securityprojects). |
 
 Override knobs (byte caps: `0` = unlimited):
 
@@ -103,8 +104,52 @@ Override knobs (byte caps: `0` = unlimited):
 | `ratelimit_fail_open` | Serve rather than reject if the rate-limit store is unavailable. |
 | `allow_implicit_routing` | Resolve an unmatched host to a site without a registered domain (first-label `<site>.host` / sole site). Off under `multi-tenant`; a loopback bind enables it regardless. See [addressing](../explanation/addressing.md). |
 | `require_pop` | Require **every** control-plane token to be holder-bound (`cnf`) and present a valid per-request proof-of-possession. Off by default (a `cnf` token always requires a proof regardless; this knob additionally bans plain bearer tokens fleet-wide). Needs `pop_origin` set. See [PoP-bind a token](../how-to/pop-tokens.md). |
+| `require_domain_verification` | Refuse to serve a **non-local** `Host` that isn't a verified, attached virtualhost — the request gets the "verification pending" holding page instead of any `default_site`/implicit fallback. **On under `multi-tenant`/`single-tenant`, off under `dev`** (which serves arbitrary local test hosts). Local hosts (`localhost`/`*.localhost`/`*.local`/IP literals) always serve. Disable it fleet-wide here, or exclude one host with `domain add <host> --unverified`. |
+| `allow_compute_exec` | Permit `boatramp compute exec` — running a command inside a running workload (docker-exec style), i.e. arbitrary code execution in the workload. **Off in every profile but `dev`**; opt in for migrations/backups/debug. Container + docker backends only. |
+| `allow_env_secret_refs` | Permit a handler's / function's `secrets` map to name a **bare** / `env:`-scheme reference into the serve process's own (the *operator's*) environment. **Off under `multi-tenant`** (an untrusted config author could exfiltrate any host env var — another tenant's DB password, a cloud key), on under `single-tenant`/`dev`. When off, such a reference is refused fail-closed. |
+| `allow_guest_email` | Permit a guest handler/function's `email` capability to actually send. **Off under `multi-tenant`** (an untrusted tenant can't use the shared node's SMTP egress), on under `single-tenant`/`dev`. When off the `send` verb is absent and returns `access-denied`. Independent of the guest-HTTP egress knobs; the SMTP relay host is still held to the SSRF rule. |
+| `allow_guest_mint_capability` | Permit a guest's `capability` capability to **mint** fleet-signed target-capability tokens. A minted token's audience is host-forced to the guest's own project and its TTL clamped to `max_guest_capability_ttl_secs`. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. When off the `mint` verb is absent and returns `access-denied`. |
+| `max_guest_capability_ttl_secs` | Operator ceiling (seconds) on a guest-minted capability's TTL; a `mint` requesting more is clamped to this. `0` disables minting outright. Default `900` (multi-tenant) / `3600` (single-tenant/dev). |
+| `allow_guest_admin_domains` | Permit a guest's `admin` capability (`admin:domains` import) to manage the project's **domains** (add/verify/attach-verified/remove) via `boatramp:handlers/admin`. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. Domain attach still runs the real ownership probe; there is no guest path to the unverified-attach route. |
+| `allow_guest_admin_email` | Permit a guest's `admin` capability (`admin:email`) to manage the project's **SMTP email profiles** (set/delete). Passwords stay sealed, never returned to the guest. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. |
+| `allow_guest_admin_site` | Permit a guest's `admin` capability (`admin:site`) to write the project's **site config + aliases** (routing, headers, cache). A config write can't attach an unverified domain. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. |
+| `allow_guest_admin_secrets` | Permit a guest's `admin` capability (`admin:secrets`) to write the project's **sealed secrets** (set/rotate/delete — write-only, redacted). The most sensitive admin surface; an operator can withhold it while still allowing domains/email/site. **Off under `multi-tenant`**, on under `single-tenant`/`dev`. |
 | `require_tenancy_declaration` | Require every function/handler that opens a `sql`/`orm` database to make an **explicit** in-site tenancy decision (`disabled` or `scoped`) — an undeclared importer is refused at activation, so serving a database unscoped is always a reviewed choice, never an accidental omission. **On under `multi-tenant`**, off under `single-tenant`/`dev` (which treat undeclared as `disabled`). See [Isolate tenants within a project](../how-to/tenant-isolation.md). |
 | `allow_cross_tenant_db` | Permit a function/handler to declare a cross-tenant (`all`) read/write access mode — reaching every tenant's rows in a shared database. **Off under `multi-tenant`** (an `all` mode is capped down to `own`, so no guest can read across tenants even if it asks), on under `single-tenant`/`dev`. See [Isolate tenants within a project](../how-to/tenant-isolation.md). |
+
+### `security.projects` (per-project posture, v0.4.7)
+
+A `[security.projects.<project>]` block overrides the **four tenancy/capability sub-knobs** for one
+project only, layered over the resolved fleet posture. It lets a single serve process host a
+strict-isolation project beside a looser one on a shared, multi-project machine.
+
+```ron
+security: (
+    profile: "multi-tenant",                 // the fleet default
+    projects: {
+        "acme-preview": (                     // looser, just this project
+            allow_cross_tenant_db: true,
+            allow_guest_mint_capability: true,
+        ),
+    },
+)
+```
+
+| Per-project knob | Description |
+| --- | --- |
+| `require_tenancy_declaration` | Override the fleet `require_tenancy_declaration` for this project. |
+| `allow_cross_tenant_db` | Override the fleet `allow_cross_tenant_db` for this project. |
+| `allow_guest_mint_capability` | Override the fleet `allow_guest_mint_capability` for this project. |
+| `max_guest_capability_ttl_secs` | Override the fleet `max_guest_capability_ttl_secs` (the mint TTL ceiling) for this project. |
+
+Only these four in-project knobs are per-project-overridable; every other knob (egress, upload caps,
+domain verification, guest-admin surfaces, …) stays fleet-wide. Each `Some` field of the override
+wins; the rest fall through to the fleet posture, so the override **composes** with the global one.
+**Cross-project isolation is structural** (project = database) — never a knob, so a per-project
+override can only tune that project's own in-project strictness and its guests' capability-mint
+ceiling, never its reach into another project. These four knobs are also `BOATRAMP_SECURITY_*`
+env-settable at the **fleet** level (see [env.md](./env.md#security-posture)); per-project overrides
+are config-file only.
 
 See [Choose & inspect a security posture](../how-to/security-posture.md) and
 [The security posture model](../explanation/security-posture.md).
