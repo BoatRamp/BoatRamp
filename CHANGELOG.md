@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.10] - 2026-09-14
+
+A `boatramp sync` CLI fix.
+
+### Fixed
+- **`boatramp sync` now accepts the v0.4.x handler capabilities.** The client-side interface-policy
+  pre-check (`handler_validate.rs`) mapped only the older `boatramp:handlers` interfaces to their
+  declarable import tokens; the newer ones fell through to "component imports disallowed interface
+  boatramp:handlers/<iface>", so a component that uses `@tenant` target fields (`target-context`),
+  capability minting (`capability-types`/`capability-minter`), email (`email-types`/`email-sender`),
+  sessions (`session-types`/`session`), or project self-config (`admin`/`admin-types`) could not be
+  deployed via `sync` even when the deploy declared the right token. Each interface now maps to the
+  same token the server gates it behind (`email` → `email`, `capability` → `capability`,
+  `target-context`/`tenancy` → `tenancy`, `session` → `session`, `admin` → `admin` — the per-surface
+  `admin:<surface>` grant satisfies it). The `None`-refusal for genuinely ungrantable interfaces
+  (`wasi:filesystem`, `wasi:sockets`, any unknown `boatramp:handlers` interface) is unchanged, and the
+  server remains the source of truth for the actual grant. `apply` was never affected (it does not run
+  this validator). The advertised `boatramp:handlers` surface revision is bumped to `0.4.0`.
+
 ## [0.4.9] - 2026-09-14
 
 A tenant-isolation bug fix behind a security review and a CI-hard live gate on real Postgres.

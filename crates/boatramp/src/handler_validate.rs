@@ -139,6 +139,27 @@ mod imp {
             // project's composed supergraph). Always linked, so it is gated only by
             // declaration (there is no server-level backend to reject against).
             ("boatramp:handlers", "graphql" | "graphql-types") => Some("graphql"),
+            // The `email` capability — send via the host SMTP gateway (server gate:
+            // `granted("email")`, in `KNOWN_IMPORTS`). A guest `use`s `email-types`
+            // and imports `email-sender`; both label as this token.
+            ("boatramp:handlers", "email-types" | "email-sender") => Some("email"),
+            // The delegable `capability` capability — mint a fleet-signed target
+            // capability (server gate: `granted("capability")`, in `KNOWN_IMPORTS`).
+            // `use`s `capability-types`, imports `capability-minter`.
+            ("boatramp:handlers", "capability-types" | "capability-minter") => Some("capability"),
+            // The `tenancy` surface: `present-token` (async-lane tenant stamp) and the
+            // `target-context` read-back a `@tenant(scope: target*)` resolver reads (server
+            // gate: `granted("tenancy")` / the resolved target binding). Both label as the
+            // `tenancy` token.
+            ("boatramp:handlers", "tenancy" | "target-context") => Some("tenancy"),
+            // The duplex/resumable `session` capability. `use`s `session-types`, imports
+            // `session`. (`session-handler` is an EXPORT — the guest's frame handler — so it
+            // is not seen on the import path.)
+            ("boatramp:handlers", "session-types" | "session") => Some("session"),
+            // The guest project self-config `admin` capability. Granted per-surface
+            // (`admin:domains|email|site|secrets`), so it maps to the `admin` token here and
+            // the declared per-surface grant satisfies it via the `token:`-prefix match above.
+            ("boatramp:handlers", "admin-types" | "admin") => Some("admin"),
             _ => None,
         }
     }
@@ -150,7 +171,7 @@ mod imp {
     /// function-manifest `requires`, checked at deploy — see
     /// `PLAN-capability-contract-versioning-v2`. Bump when the capability surface
     /// changes so operators can see it; it links nothing.
-    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 3, 0);
+    const HOST_HANDLERS_VERSION: (u64, u64, u64) = (0, 4, 0);
 
     /// The capability surface a host advertises (see the crate-level re-export).
     #[derive(Debug, serde::Serialize)]
@@ -479,6 +500,59 @@ mod imp {
             );
             let err = check_interface_policy(&gql, &exports, &[], Role::Handler).unwrap_err();
             assert!(err.contains("`graphql`"), "{err}");
+        }
+
+        #[test]
+        fn policy_gates_the_newer_handlers_interfaces_by_their_declarable_token() {
+            // The v0.4.x `boatramp:handlers` surface a `sync` deploy can legitimately declare —
+            // each interface maps to the SAME token the server gates it behind (`granted(...)` /
+            // `KNOWN_IMPORTS`). Before this, these fell through to `None` → "disallowed interface",
+            // so a component using target fields / capability minting / email / session / admin
+            // could not deploy via `sync` even with the right token declared.
+            let exports = [lbl("wasi:http", "incoming-handler")];
+            // (imported interfaces, declarable token, a wrong token that must still be refused)
+            let cases: &[(&[&str], &str, &str)] = &[
+                (&["email-types", "email-sender"], "email", "sql"),
+                (
+                    &["capability-types", "capability-minter"],
+                    "capability",
+                    "email",
+                ),
+                // present-token (async-lane stamp) AND the target-context read-back.
+                (&["tenancy", "target-context"], "tenancy", "capability"),
+                (&["session-types", "session"], "session", "tenancy"),
+            ];
+            for (ifaces, token, wrong) in cases {
+                let imports: Vec<_> = ifaces.iter().map(|i| lbl("boatramp:handlers", i)).collect();
+                assert!(
+                    check_interface_policy(&imports, &exports, &[(*token).into()], Role::Handler)
+                        .is_ok(),
+                    "{token}: declaring the token must satisfy {ifaces:?}"
+                );
+                // Undeclared → refused, and the message names the token.
+                let err =
+                    check_interface_policy(&imports, &exports, &[], Role::Handler).unwrap_err();
+                assert!(err.contains(&format!("`{token}`")), "{token}: {err}");
+                // A DIFFERENT capability's token does not satisfy it.
+                assert!(
+                    check_interface_policy(&imports, &exports, &[(*wrong).into()], Role::Handler)
+                        .is_err(),
+                    "{token}: the `{wrong}` token must NOT satisfy {ifaces:?}"
+                );
+            }
+            // `admin` is granted PER-SURFACE; a declared `admin:<surface>` satisfies the `admin`
+            // import via the `token:`-prefix match (a bare `admin` grants nothing server-side).
+            let admin = [
+                lbl("boatramp:handlers", "admin"),
+                lbl("boatramp:handlers", "admin-types"),
+            ];
+            assert!(
+                check_interface_policy(&admin, &exports, &["admin:domains".into()], Role::Handler)
+                    .is_ok(),
+                "a per-surface admin grant must satisfy the admin import"
+            );
+            let err = check_interface_policy(&admin, &exports, &[], Role::Handler).unwrap_err();
+            assert!(err.contains("`admin`"), "{err}");
         }
 
         #[test]
