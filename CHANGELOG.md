@@ -5,6 +5,25 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.12] - 2026-09-15
+
+An ORM/value-model soundness fix behind an architecture review, a security review, and a CI-hard
+live gate on real Postgres.
+
+### Fixed
+- **A `SqlValue::Json` value now binds as Postgres `jsonb`, so it type-unifies with a `jsonb` column
+  in `COALESCE` / comparison / `||`, not only on `INSERT`.** The portable JSON-document value bound
+  to Postgres as `json` (which assignment-casts into a `jsonb` column on write) but did not unify
+  with a `jsonb` column elsewhere — `COALESCE(<jsonb col>, <json literal>)`, `WHERE <jsonb col> =
+  <literal>`, and `<jsonb col> || <literal>` all errored (`COALESCE types jsonb and json cannot be
+  matched`). It now binds as `jsonb` (the canonical, validated, operator- and index-capable
+  document type — the natural target of the portable "JSON document" value, analogous to MySQL's
+  binary `JSON` and SQLite's json1 text, both unchanged), so those unify and execute. Two
+  consequences: (1) Postgres now **validates JSON on write** (malformed text is rejected rather than
+  silently stored as raw `json`), a fail-closed improvement; (2) a genuine Postgres `json`-typed
+  (not `jsonb`) column is outside the portable model — `COALESCE`/comparison against a portable JSON
+  literal type-mismatches; use raw SQL with an explicit `::json` cast for it.
+
 ## [0.4.11] - 2026-09-15
 
 A cutover-critical tenant-propagation fix behind a security review and a CI-hard live gate.

@@ -42,9 +42,14 @@ pub enum SqlValue {
     Text(String),
     /// A byte string.
     Blob(Vec<u8>),
-    /// A JSON document (its JSON text). Bound with the engine's JSON column type
-    /// (`jsonb`/`json` on Postgres, a JSON string on MySQL, text on SQLite), so a
-    /// guest can write a `jsonb` column with no `::jsonb` cast. Read back as
+    /// A JSON document (its JSON text) — the portable "JSON document" value, bound to
+    /// each engine's canonical document type: `jsonb` on Postgres (validated,
+    /// canonical, operator- and index-capable), the binary `JSON` type on MySQL, text
+    /// (json1) on SQLite. So a guest writes a `jsonb`/`JSON` column with no `::` cast,
+    /// AND the value **type-unifies** with such a column in `COALESCE`/comparison/`||`,
+    /// not only on INSERT. Note Postgres `jsonb` validates on write (malformed JSON is
+    /// rejected). Postgres's raw-text `json` type is out of the portable model — use
+    /// raw SQL with an explicit `::json` cast for it. Read back as
     /// [`Text`](Self::Text) (the engines stringify JSON on the way out).
     Json(String),
 }

@@ -880,6 +880,99 @@ async fn run_upsert_guard_battery(backend: Arc<dyn SqlBackend>, engine: &str) {
     );
 }
 
+/// v0.4.12: a portable `SqlValue::Json` binds as Postgres **`jsonb`** (OID 3802), so it TYPE-UNIFIES
+/// with a `jsonb` column — `COALESCE`, `=`/comparison, and `||` concat — not only on INSERT. The
+/// pre-v0.4.12 `json` (OID 114) binding assignment-cast on write but errored
+/// `COALESCE types jsonb and json cannot be matched` (and the analogous comparison/`||` mismatch),
+/// so a jsonb column could be written but not defaulted/compared against a literal. Postgres-only:
+/// MySQL's binary `JSON` and SQLite's text json1 are already the canonical document type.
+#[cfg(feature = "sql-postgres")]
+async fn run_json_jsonb_battery(backend: Arc<dyn SqlBackend>, engine: &str) {
+    let j = |s: &str| SqlValue::Json(s.to_string());
+    {
+        let mut tx = backend.begin().await.unwrap();
+        for ddl in [
+            "DROP TABLE IF EXISTS bramp_jsonb_unify",
+            "CREATE TABLE bramp_jsonb_unify (id TEXT PRIMARY KEY, doc JSONB)",
+        ] {
+            tx.execute(ddl, &[]).await.unwrap();
+        }
+        // A real doc (for comparison/concat) + a NULL doc (for the COALESCE fallback). The INSERT
+        // itself proves a Json value binds into a jsonb column (jsonb→jsonb, direct).
+        tx.execute(
+            "INSERT INTO bramp_jsonb_unify (id, doc) VALUES (?1, ?2)",
+            &[t("has"), j(r#"{"k":1}"#)],
+        )
+        .await
+        .expect("a Json value must bind into a jsonb column (INSERT)");
+        tx.execute(
+            "INSERT INTO bramp_jsonb_unify (id, doc) VALUES (?1, NULL)",
+            &[t("nil")],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // (1) COALESCE(<jsonb col>, <jsonb literal>) — the reported gap. Must EXECUTE (pre-v0.4.12:
+    //     "COALESCE types jsonb and json cannot be matched") and fall back to the literal.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        let rows = tx
+            .query(
+                "SELECT COALESCE(doc, ?1)->>'d' AS v FROM bramp_jsonb_unify WHERE id = 'nil'",
+                &[j(r#"{"d":"fallback"}"#)],
+            )
+            .await
+            .expect("COALESCE(jsonb, Json literal) must type-unify and execute on Postgres");
+        assert!(
+            matches!(&rows.rows[0][0], SqlValue::Text(s) if s == "fallback"),
+            "[{engine}] COALESCE fell back to the jsonb literal: {:?}",
+            rows.rows[0][0]
+        );
+        tx.commit().await.unwrap();
+    }
+    // (2) WHERE <jsonb col> = <jsonb literal> — comparison must unify and match.
+    {
+        let mut tx = backend.begin().await.unwrap();
+        let rows = tx
+            .query(
+                "SELECT id FROM bramp_jsonb_unify WHERE doc = ?1",
+                &[j(r#"{"k":1}"#)],
+            )
+            .await
+            .expect("WHERE jsonb = Json literal must type-unify and execute on Postgres");
+        assert!(
+            rows.rows
+                .iter()
+                .any(|r| matches!(&r[0], SqlValue::Text(s) if s == "has")),
+            "[{engine}] jsonb = jsonb literal matched the row"
+        );
+        tx.commit().await.unwrap();
+    }
+    // (3) <jsonb col> || <jsonb literal> — concat/merge must unify (jsonb || jsonb).
+    {
+        let mut tx = backend.begin().await.unwrap();
+        let rows = tx
+            .query(
+                "SELECT (doc || ?1)->>'m' AS v FROM bramp_jsonb_unify WHERE id = 'has'",
+                &[j(r#"{"m":"merged"}"#)],
+            )
+            .await
+            .expect("jsonb || Json literal must type-unify and execute on Postgres");
+        assert!(
+            matches!(&rows.rows[0][0], SqlValue::Text(s) if s == "merged"),
+            "[{engine}] jsonb || jsonb literal merged: {:?}",
+            rows.rows[0][0]
+        );
+        tx.commit().await.unwrap();
+    }
+    println!(
+        "ORM JSONB LITERAL OK [{engine}]: a portable SqlValue::Json binds as Postgres jsonb — \
+         INSERT into a jsonb column, COALESCE(jsonb, literal), WHERE jsonb = literal, and \
+         jsonb || literal all type-unify and execute (not only INSERT)"
+    );
+}
+
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_orm_scope_isolates_on_a_real_engine() {
@@ -891,7 +984,8 @@ async fn postgres_orm_scope_isolates_on_a_real_engine() {
     run_battery(backend.clone(), Dialect::Postgres, "postgres").await;
     run_pertable_battery(backend.clone(), Dialect::Postgres, "postgres").await;
     run_session_disjunct_battery(backend.clone(), Dialect::Postgres, "postgres").await;
-    run_upsert_guard_battery(backend, "postgres").await;
+    run_upsert_guard_battery(backend.clone(), "postgres").await;
+    run_json_jsonb_battery(backend, "postgres").await;
 }
 
 #[cfg(feature = "sql-mysql")]

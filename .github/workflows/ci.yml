@@ -522,6 +522,11 @@ jobs:
             || { echo "::error::Postgres R3 TenantOrSession disjunct never reached its marker (anon/tenant/session breach or skip)" >&2; exit 1; }
           grep -q 'ORM TENANT-OR-SESSION DISJUNCT OK \[mysql\]' orm-sqlx.log \
             || { echo "::error::MySQL R3 TenantOrSession disjunct never reached its marker (anon/tenant/session breach or skip)" >&2; exit 1; }
+          # v0.4.12: a portable SqlValue::Json binds as Postgres jsonb, so it type-unifies with a
+          # jsonb column in COALESCE / comparison / || (not only INSERT). A regression (the pre-fix
+          # "jsonb and json cannot be matched") fails the assertion. Postgres-only.
+          grep -q 'ORM JSONB LITERAL OK \[postgres\]' orm-sqlx.log \
+            || { echo "::error::Postgres jsonb-literal unification never reached its marker (a json/jsonb type-unification regression or a skip)" >&2; exit 1; }
           # v0.4.9: a tenant-scoped upsert (ON CONFLICT DO UPDATE) executes on Postgres (the
           # host-injected own-guard column is target-qualified, not ambiguous) AND can't clobber
           # another tenant's row via a shared non-tenant conflict key. Postgres-only: a scoped
