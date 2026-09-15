@@ -46,8 +46,8 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
-    Value, VisitMut, VisitorMut,
+    BinaryOperator, Expr, Ident, JoinConstraint, JoinOperator, Query, Select, SetExpr, Statement,
+    TableFactor, Value, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{Dialect as SpDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -94,6 +94,11 @@ pub enum TargetRewriteError {
     /// `TargetTenant` fact). Unreachable by construction — a target principal always resolves `B` —
     /// but refused fail-closed rather than run unconfined.
     MissingTarget,
+    /// A join the target-read confinement cannot soundly place: a RIGHT/FULL OUTER join (the driving
+    /// side is nullable), a semi/anti/apply/asof join, or a LEFT OUTER join with a `USING`/`NATURAL`/
+    /// no constraint (no `ON` to inject the confinement into). Refused fail-closed — the ORM target
+    /// path is INNER + LEFT-`ON` only, and the same read is expressible as a `LEFT … ON` join.
+    UnsupportedJoin(String),
     /// The statement used a `WITH` (CTE). CTEs are refused in a raw-SQL target read (deny-by-default,
     /// matching the ORM target path, which does not support CTEs): a non-recursive CTE's body may
     /// reference the base table under the CTE's own name, and a recursive CTE references itself, so a
@@ -143,6 +148,10 @@ impl TargetRewriteError {
                  derived table)"
                     .into()
             }
+            Self::UnsupportedJoin(k) => format!(
+                "tenancy(target): a {k} join is not allowed in a target read (use an INNER join or a \
+                 LEFT … ON join)"
+            ),
         }
     }
 }
@@ -284,37 +293,56 @@ impl Rewriter<'_> {
         }
     }
 
-    /// Conjoin `tenant = B AND <public>` for each base table in this `SELECT`'s `FROM` onto its
+    /// Conjoin `tenant = B AND <public>` for each base table in this `SELECT` onto the RIGHT
+    /// position: the driving relation and every INNER/CROSS-joined table go onto the top-level
     /// `WHERE` (the guest's own `WHERE` parenthesised first, so a top-level `OR` cannot widen past
-    /// the gate). CTE references and derived tables are skipped (confined at their own level).
+    /// the gate — closes M2); a **LEFT-OUTER**-joined table's confinement goes onto that join's own
+    /// `ON` (its guest `ON` parenthesised first). Confining a LEFT-joined table in the top-level
+    /// `WHERE` would collapse the LEFT JOIN to an INNER JOIN — dropping the driving row when there is
+    /// no match — so a routed tenant with no matching joined row would vanish and a SELECT-list
+    /// `COALESCE(joined.col, driving.col)` fallback would never fire. In the `ON`, an unmatched /
+    /// other-tenant row instead becomes `NULL` (never a cross-tenant bleed — the tenant/public gate
+    /// is AND-ed into the join condition), and the fallback correctly resolves to the (confined)
+    /// driving value. CTE references and derived tables are skipped (confined at their own level).
+    /// RIGHT/FULL OUTER, semi/anti/apply/asof joins, and a LEFT OUTER with a `USING`/`NATURAL`/no
+    /// constraint are refused fail-closed: the ORM target path is INNER + LEFT-`ON` only, and the
+    /// same read is expressible as a `LEFT … ON` join.
     fn confine_select(&self, select: &mut Select) -> Result<(), TargetRewriteError> {
         // `SELECT … INTO t` materialises a table — a write in a read position.
         if select.into.is_some() {
             return Err(TargetRewriteError::WriteInReadPosition);
         }
-        let mut bases: Vec<(Ident, String)> = Vec::new();
-        for twj in &select.from {
-            self.collect_bases(twj, &mut bases)?;
+        // Confinement destined for the top-level `WHERE`: the non-nullable positions — the driving
+        // relation and every INNER/CROSS join. A LEFT-OUTER join injects into its own `ON` below.
+        let mut where_conf: Option<Expr> = None;
+        for twj in &mut select.from {
+            self.accumulate_relation(&twj.relation, &mut where_conf)?;
+            for join in &mut twj.joins {
+                match &mut join.join_operator {
+                    JoinOperator::Inner(_) | JoinOperator::CrossJoin => {
+                        self.accumulate_relation(&join.relation, &mut where_conf)?;
+                    }
+                    JoinOperator::LeftOuter(JoinConstraint::On(on)) => {
+                        let mut on_conf: Option<Expr> = None;
+                        self.accumulate_relation(&join.relation, &mut on_conf)?;
+                        if let Some(conf) = on_conf {
+                            // `(<guest ON>) AND <confinement>` — the same OR-escape closure as the
+                            // WHERE path, in the join's own ON so LEFT-JOIN semantics are preserved.
+                            let existing = on.clone();
+                            *on = and(Expr::Nested(Box::new(existing)), conf);
+                        }
+                    }
+                    other => {
+                        return Err(TargetRewriteError::UnsupportedJoin(
+                            join_operator_kind(other).into(),
+                        ))
+                    }
+                }
+            }
         }
-        if bases.is_empty() {
-            // No base table (e.g. `SELECT 1`, or a FROM of only CTE refs / derived tables) — nothing
-            // to confine at this level.
-            return Ok(());
-        }
-        let mut confinement: Option<Expr> = None;
-        for (qualifier, table) in &bases {
-            // A table may need no predicate (a capability field's global `Unscoped` reference table);
-            // skip it — the confined tables still gate the row set.
-            let Some(pred) = self.table_confinement(table, qualifier)? else {
-                continue;
-            };
-            confinement = Some(match confinement.take() {
-                Some(acc) => and(acc, pred),
-                None => pred,
-            });
-        }
-        // Every base table needed no predicate (all global under a capability field) ⇒ no WHERE added.
-        let Some(confinement) = confinement else {
+        let Some(confinement) = where_conf else {
+            // No base table needed a WHERE predicate (all confinement landed in LEFT-join ONs, or a
+            // capability field's global reference tables) — nothing to add here.
             return Ok(());
         };
         select.selection = Some(match select.selection.take() {
@@ -326,24 +354,16 @@ impl Rewriter<'_> {
         Ok(())
     }
 
-    /// Collect the base tables of a `FROM` entry (its relation + each join's relation), recursing
-    /// through nested joins. Derived tables and CTE references are skipped.
-    fn collect_bases(
-        &self,
-        twj: &TableWithJoins,
-        out: &mut Vec<(Ident, String)>,
-    ) -> Result<(), TargetRewriteError> {
-        self.collect_factor(&twj.relation, out)?;
-        for join in &twj.joins {
-            self.collect_factor(&join.relation, out)?;
-        }
-        Ok(())
-    }
-
-    fn collect_factor(
+    /// Accumulate (via `AND`) the confinement predicate for every base table in a `FROM` factor —
+    /// its own table, plus, for a `NESTED JOIN`, each nested relation — into `acc`. Derived tables
+    /// and CTE references are skipped (confined at their own query level). A table-valued function,
+    /// a schema-qualified name, or any un-confinable source is refused fail-closed. (A base table
+    /// that needs no predicate — a `capability` field's global `Unscoped` reference table — adds
+    /// nothing; the confined tables still gate the row set.)
+    fn accumulate_relation(
         &self,
         factor: &TableFactor,
-        out: &mut Vec<(Ident, String)>,
+        acc: &mut Option<Expr>,
     ) -> Result<(), TargetRewriteError> {
         match factor {
             TableFactor::Table { args: Some(_), .. } => Err(
@@ -363,7 +383,12 @@ impl Rewriter<'_> {
                     .as_ref()
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| name.0[0].clone());
-                out.push((qualifier, base));
+                if let Some(pred) = self.table_confinement(&base, &qualifier)? {
+                    *acc = Some(match acc.take() {
+                        Some(a) => and(a, pred),
+                        None => pred,
+                    });
+                }
                 Ok(())
             }
             // A derived table is a nested `Query` — confined by its own `pre_visit_query`; its alias
@@ -371,7 +396,13 @@ impl Rewriter<'_> {
             TableFactor::Derived { .. } => Ok(()),
             TableFactor::NestedJoin {
                 table_with_joins, ..
-            } => self.collect_bases(table_with_joins, out),
+            } => {
+                self.accumulate_relation(&table_with_joins.relation, acc)?;
+                for join in &table_with_joins.joins {
+                    self.accumulate_relation(&join.relation, acc)?;
+                }
+                Ok(())
+            }
             other => Err(TargetRewriteError::UnsupportedTableSource(
                 table_factor_kind(other).into(),
             )),
@@ -566,6 +597,22 @@ fn table_factor_kind(factor: &TableFactor) -> &'static str {
     }
 }
 
+/// A short, guest-safe name for a join operator the target-read confinement refuses (used only in
+/// the `UnsupportedJoin` error). INNER + `CROSS` + LEFT-`ON` are handled and never reach here.
+fn join_operator_kind(op: &JoinOperator) -> &'static str {
+    match op {
+        JoinOperator::RightOuter(_) => "RIGHT OUTER",
+        JoinOperator::FullOuter(_) => "FULL OUTER",
+        JoinOperator::LeftOuter(_) => "LEFT OUTER (USING/NATURAL)",
+        JoinOperator::Semi(_) | JoinOperator::LeftSemi(_) | JoinOperator::RightSemi(_) => "SEMI",
+        JoinOperator::Anti(_) | JoinOperator::LeftAnti(_) | JoinOperator::RightAnti(_) => "ANTI",
+        JoinOperator::CrossApply | JoinOperator::OuterApply => "APPLY",
+        JoinOperator::AsOf { .. } => "ASOF",
+        // INNER + CROSS are handled; LEFT-`ON` is handled. Anything else is an unsupported outer join.
+        JoinOperator::Inner(_) | JoinOperator::CrossJoin => "unsupported",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +773,69 @@ mod tests {
             out.contains("r.tenant_id = 'tenant_B' AND r.visible = true"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn left_join_confines_the_joined_table_in_its_own_on_not_the_where() {
+        // A LEFT JOIN's joined table is confined in its OWN `ON` (so an unmatched / other-tenant row
+        // becomes NULL, never dropping the driving row or bleeding) — the driving table stays in the
+        // WHERE. Confining the joined table in the WHERE would collapse the LEFT JOIN to an INNER
+        // JOIN (dropping a no-config driving row so a SELECT-list COALESCE fallback never fires).
+        let out = rewrite(
+            "SELECT p.id, COALESCE(r.body, p.fallback) FROM products p \
+             LEFT JOIN reviews r ON r.product_id = p.id",
+        )
+        .unwrap();
+        // The joined `reviews` confinement is in the ON (parenthesising the guest ON), AND-ed on:
+        assert!(
+            out.contains(
+                "LEFT JOIN reviews AS r ON (r.product_id = p.id) AND r.tenant_id = 'tenant_B' AND r.visible = true"
+            ),
+            "joined table confined in the ON: {out}"
+        );
+        // ...the driving `products` is in the WHERE, and `reviews` is NOT confined in the WHERE.
+        assert!(
+            out.contains("WHERE p.tenant_id = 'tenant_B' AND p.published = true"),
+            "driving table confined in the WHERE: {out}"
+        );
+        assert!(
+            !out.contains("WHERE p.tenant_id = 'tenant_B' AND p.published = true AND r."),
+            "the LEFT-joined table must NOT be in the WHERE (would collapse to INNER): {out}"
+        );
+    }
+
+    #[test]
+    fn a_left_join_with_a_top_level_or_in_its_on_cannot_escape_the_gate() {
+        // The guest's ON is parenthesised before the confinement is AND-ed, so a top-level OR in it
+        // can never widen past `tenant = B AND <public>` (the join-ON analog of the M2 WHERE closure).
+        let out = rewrite(
+            "SELECT p.id FROM products p LEFT JOIN reviews r ON r.product_id = p.id OR 1 = 1",
+        )
+        .unwrap();
+        assert!(
+            out.contains(
+                "ON (r.product_id = p.id OR 1 = 1) AND r.tenant_id = 'tenant_B' AND r.visible = true"
+            ),
+            "the guest ON's top-level OR is parenthesised inside the gate: {out}"
+        );
+    }
+
+    #[test]
+    fn a_right_or_full_outer_join_is_refused() {
+        // RIGHT/FULL OUTER (nullable driving side) can't be soundly confined in the WHERE or a single
+        // join ON — refused fail-closed (the same read is a LEFT … ON join).
+        for sql in [
+            "SELECT p.id FROM products p RIGHT JOIN reviews r ON r.product_id = p.id",
+            "SELECT p.id FROM products p FULL OUTER JOIN reviews r ON r.product_id = p.id",
+        ] {
+            assert!(
+                matches!(
+                    rewrite(sql).unwrap_err(),
+                    TargetRewriteError::UnsupportedJoin(_)
+                ),
+                "must refuse: {sql}"
+            );
+        }
     }
 
     #[test]

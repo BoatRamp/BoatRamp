@@ -937,7 +937,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
     async fn plain_wasm_target_confines_orm_and_raw_sql_to_b_public_on_a_real_engine() {
-        use boatramp_core::orm::{Expr, Select, SelectItem};
+        use boatramp_core::orm::{
+            CmpOp, Expr, Func, Join, JoinKind, Predicate, Select, SelectItem,
+        };
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
         use boatramp_core::tenancy::{
             AccessMode, PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm,
@@ -1095,11 +1097,113 @@ mod tests {
             "a self-named CTE must be refused, not passed through unconfined"
         );
 
+        // v0.4.13: a LEFT JOIN confines the joined table in its OWN `ON`, not the top-level WHERE —
+        // else the LEFT JOIN collapses to an INNER JOIN and a routed tenant with no matching joined
+        // row is dropped (its `COALESCE(joined, driving)` fallback never fires). Prove on the real
+        // engine that (a) a no-config tenant B still gets its OWN driving-row fallback, and (b)
+        // tenant A's joined row never leaks — on BOTH the orm and raw-sql target paths.
+        {
+            {
+                let mut tx = db.begin().await.unwrap();
+                tx.execute(
+                    "CREATE TABLE config (tenant_id TEXT, theme TEXT, published INTEGER)",
+                    &[],
+                )
+                .await
+                .unwrap();
+                // Only tenant A has a config row; tenant B has NONE (the no-config fallback case).
+                tx.execute(
+                    "INSERT INTO config (tenant_id, theme, published) VALUES ('tenant_A', 'A-theme', 1)",
+                    &[],
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+            let mut schema2 = schema.clone();
+            schema2.tables.insert("config".into(), TableScope::Tenant);
+            schema2.public_subsets.insert(
+                "config".into(),
+                PublicSubset {
+                    predicate: PublicPredicate {
+                        terms: vec![PublicTerm::Cmp {
+                            column: "published".into(),
+                            op: PublicCmp::Eq,
+                            value: PublicLiteral::Int(1),
+                        }],
+                    },
+                    world_public: true,
+                    listable: true,
+                },
+            );
+            let ht2 = HostTenancy::target(
+                SqlValue::Text("tenant_B".into()),
+                AccessMode::Own,
+                &schema2,
+                "products",
+                &[],
+                true,
+            );
+            // orm: products p LEFT JOIN config c ON c.tenant_id = p.tenant_id, SELECT
+            // COALESCE(c.theme, p.name) — B has no config, so it must fall back to B's own p.name.
+            let mut q = Select {
+                table: "products".into(),
+                table_alias: Some("p".into()),
+                columns: vec![SelectItem {
+                    expr: Expr::Func(
+                        Func::Coalesce,
+                        vec![Expr::col("c.theme"), Expr::col("p.name")],
+                    ),
+                    alias: None,
+                }],
+                joins: vec![Join {
+                    kind: JoinKind::Left,
+                    table: "config".into(),
+                    alias: Some("c".into()),
+                    on: Predicate::Cmp {
+                        left: Expr::col("c.tenant_id"),
+                        op: CmpOp::Eq,
+                        right: Expr::col("p.tenant_id"),
+                    },
+                }],
+                ..Select::from("products")
+            };
+            q.force_scope(&ht2.orm_scope(TenantAxis::Read).unwrap().unwrap())
+                .unwrap();
+            let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let orm_rows = run_text_rows(tx.as_mut(), &sql, &params).await;
+            tx.commit().await.unwrap();
+            assert_eq!(
+                orm_rows,
+                vec!["B public".to_string()],
+                "orm LEFT JOIN: no-config tenant B falls back to its own driving row, never A's theme: {sql}"
+            );
+            // raw-SQL: the same shape, AST-rewritten (joined table confined in the ON).
+            let rw = ht2
+                .rewrite_target_read(
+                    "SELECT COALESCE(c.theme, p.name) FROM products p \
+                     LEFT JOIN config c ON c.tenant_id = p.tenant_id",
+                    Dialect::Sqlite,
+                )
+                .unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let raw_rows = run_text_rows(tx.as_mut(), &rw, &[]).await;
+            tx.commit().await.unwrap();
+            assert_eq!(
+                raw_rows,
+                vec!["B public".to_string()],
+                "raw-sql LEFT JOIN: no-config tenant B falls back to its own driving row, never A's theme: {rw}"
+            );
+        }
+
         println!(
             "PLAIN-WASM TARGET ISOLATION OK: a target route's orm AND raw-sql reads each return only \
              tenant B's published+non-deleted rows (never tenant A's, never B's draft/removed) on a \
              real libsql engine — the raw-SQL path is AST-rewritten so multi-table joins, subqueries, \
-             and OR-escapes are all confined, and an undeclared table is refused"
+             and OR-escapes are all confined, and an undeclared table is refused; a LEFT JOIN confines \
+             the joined table in its own ON so a no-config tenant falls back to its own row via \
+             COALESCE (never another tenant's, never a dropped row)"
         );
     }
 

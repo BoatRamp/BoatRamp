@@ -46,6 +46,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
+      # Read (+ push) the boatramp.cachix.org binary cache as a substituter, so the
+      # Rust/Nix closures nightly + cache.yml already built download instead of
+      # recompiling from source. Token absent (fork PR) ⇒ reads still work, push skips.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Build the console SPA
         run: |
           set -euo pipefail
@@ -108,6 +115,15 @@ jobs:
       - name: Install Nix (Linux)
         if: matrix.kind == 'linux'
         uses: DeterminateSystems/nix-installer-action@main
+      # Substitute the `boatramp-static` (= boatrampMuslBin) closure nightly cached
+      # instead of recompiling it on the Linux release leg. macOS/Windows build via
+      # cargo (no Nix), so this is Linux-only like the installer above.
+      - name: Nix binary cache (Linux)
+        if: matrix.kind == 'linux'
+        uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Build
         shell: bash
         run: |
@@ -280,6 +296,14 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
       - uses: DeterminateSystems/nix-installer-action@main
+      # THE big win: `.#container`/`.#container-cloudflare` wrap `boatrampMuslBin`,
+      # the exact closure nightly pushes to boatramp.cachix.org. With the cache as a
+      # substituter the Rust build downloads and only the thin `mkImage` layer builds
+      # — the GHCR step collapses to (layer + skopeo push) instead of a full recompile.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: Use a v2 registries.conf for skopeo
         run: |
           # The runner ships a v1 /etc/containers/registries.conf that nixpkgs'

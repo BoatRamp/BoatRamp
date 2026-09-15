@@ -1904,11 +1904,12 @@ impl Select {
     }
 
     /// The scope predicate to conjoin into this SELECT's `WHERE`. With **no joins** it's the
-    /// single-table (unqualified) predicate. With joins, the per-mode predicate is applied to
-    /// **every** table reference — the FROM table plus each join, qualified by its alias-or-name —
-    /// so a guest can't read a joined table's cross-tenant rows through the projection (a
-    /// join to a table lacking the tenant column then fails closed at the DB, not leaks).
-    /// `all`/no-scope ⇒ `None`.
+    /// single-table (unqualified) predicate. With joins, the per-mode predicate is applied to the
+    /// FROM table plus each **INNER** join, qualified by its alias-or-name, so a guest can't read a
+    /// joined table's cross-tenant rows through the projection (a join to a table lacking the tenant
+    /// column then fails closed at the DB, not leaks). A **LEFT-OUTER** join is confined in its own
+    /// `ON` at [`Select::force_scope`] instead — a WHERE predicate on the nullable side would
+    /// collapse the LEFT JOIN to an INNER JOIN — so it is skipped here. `all`/no-scope ⇒ `None`.
     fn scope_where_pred(&self) -> Result<Option<Predicate>, OrmError> {
         let Some(scope) = &self.scope else {
             return Ok(None);
@@ -1918,10 +1919,11 @@ impl Select {
             // `None` for an `Unscoped` global; deny-by-default / no-principal fail closed).
             return scope.read_pred(&self.table, None);
         }
-        // Joined: each table reference is scoped on its OWN resolved key, qualified by alias-or-name,
-        // so a guest can't read a joined table's cross-tenant rows through the projection. A ref
-        // whose table is undeclared fails closed (deny-by-default); an `Unscoped` ref adds no
-        // predicate (it is global by declaration).
+        // Joined: the FROM table and each INNER-joined table are scoped on their OWN resolved key,
+        // qualified by alias-or-name, so a guest can't read a joined table's cross-tenant rows
+        // through the projection. LEFT-joined tables are confined in their own `ON` (force_scope),
+        // NOT here. A ref whose table is undeclared fails closed (deny-by-default); an `Unscoped`
+        // ref adds no predicate (it is global by declaration).
         let refs: Vec<(&str, &str)> = std::iter::once((
             self.table.as_str(),
             self.table_alias.as_deref().unwrap_or(&self.table),
@@ -1929,6 +1931,7 @@ impl Select {
         .chain(
             self.joins
                 .iter()
+                .filter(|j| matches!(j.kind, JoinKind::Inner))
                 .map(|j| (j.table.as_str(), j.alias.as_deref().unwrap_or(&j.table))),
         )
         .collect();
@@ -1991,9 +1994,27 @@ impl Select {
             if let Some(a) = &j.alias {
                 sql.push_str(&format!(" AS {}", ident(a)?));
             }
+            // A **LEFT**-joined table is confined in its OWN `ON`, not the top-level `WHERE`
+            // (`scope_where_pred` scopes the FROM table + INNER joins there and deliberately SKIPS
+            // LEFT joins): a WHERE predicate on the nullable side would collapse the LEFT JOIN to an
+            // INNER JOIN — dropping the driving row when there is no match, so a
+            // `COALESCE(joined.col, driving.col)` fallback would never fire. Conjoined into the `ON`,
+            // an unmatched / other-tenant row instead becomes `NULL` — never a cross-tenant bleed
+            // (the tenant/public gate is AND-ed into the join condition, and the structured predicate
+            // renders with correct precedence, so a top-level OR in the guest `ON` cannot widen past
+            // the gate). Applied at RENDER (not `force_scope`), so confinement never depends on which
+            // entry point set the scope. INNER joins are confined in the WHERE by `scope_where_pred`.
+            let qual = j.alias.as_deref().unwrap_or(&j.table);
+            let on = match (&self.scope, j.kind) {
+                (Some(scope), JoinKind::Left) => match scope.read_pred(&j.table, Some(qual))? {
+                    Some(conf) => Predicate::And(vec![j.on.clone(), conf]),
+                    None => j.on.clone(),
+                },
+                _ => j.on.clone(),
+            };
             sql.push_str(&format!(
                 " ON {}",
-                render_pred(&j.on, &mut *params, false, dialect)?
+                render_pred(&on, &mut *params, false, dialect)?
             ));
         }
 
@@ -2898,6 +2919,9 @@ mod tests {
     fn scoped_select_scopes_every_joined_table() {
         // A guest joins a victim table hoping to read its cross-tenant rows via the projection.
         // force_scope must scope the FROM table AND every joined table (qualified by alias/name).
+        // A LEFT-joined victim is confined in its OWN `ON` (not the WHERE — that would collapse the
+        // LEFT JOIN to an INNER JOIN): a cross-tenant victim row then fails the ON and yields NULL,
+        // never leaking through the projection.
         let mut q = Select {
             table: "orders".into(),
             table_alias: Some("o".into()),
@@ -2926,7 +2950,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT v.secret FROM orders AS o LEFT JOIN victim AS v ON v.order_id = o.id \
-             WHERE o.tenant_id = ?1 AND v.tenant_id = ?2"
+             AND v.tenant_id = ?1 WHERE o.tenant_id = ?2"
         );
         assert_eq!(params, vec![t("ten_1"), t("ten_1")]);
     }

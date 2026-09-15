@@ -129,6 +129,22 @@ fn self_egress_addrs(
     }
 }
 
+/// Whether a node with **no configured control-plane issuer** should auto-provision an ephemeral
+/// in-memory fleet signer (for host session cookies + delegable capabilities) from its serve bind.
+///
+/// The fleet signer is a distinct trust domain from control-plane admin auth, so a DEV / loopback
+/// node with auth disabled should still be able to sign/verify session cookies and capabilities. It
+/// is gated **strictly to a loopback bind** (`127.0.0.1`/`::1`) or an in-process embedder with no
+/// bind address (`None`): NEVER a public or wildcard (`0.0.0.0`/`::`, reachable off-host) bind,
+/// where an ephemeral key would silently invalidate live capabilities across a restart — a
+/// public node that wants guest capabilities without control-plane auth must supply a persistent
+/// key. (`is_loopback()` is already `false` for a wildcard/unspecified address, so a `0.0.0.0` bind
+/// correctly does NOT auto-provision.)
+#[cfg(feature = "handlers")]
+fn should_autoprovision_fleet_signer(serve_addr: Option<std::net::SocketAddr>) -> bool {
+    serve_addr.is_none_or(|a| a.ip().is_loopback())
+}
+
 /// Wire [`NodeInput`] into a [`RunningNode`]: build the handler runtime, the
 /// deploy store (materializing the reserved `default` project), the compute
 /// backends + reconcile loop, and the domain-verify reconcile loop.
@@ -220,13 +236,41 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
     )
     .await?;
     // Wire the fleet session-cookie signer (R3, PLAN-tenancy-principal): the same issuer that mints
-    // control-plane tokens signs + verifies the host-issued anonymous session cookie. Absent
-    // issuer (a verify-only node) ⇒ no session cookies are issued (the `Session` scope axis stays
-    // dormant), which is fail-safe. Handlers-gated: the session-cookie machinery lives on the
-    // handler runtime, so a lean (no-handlers) build has nothing to wire.
+    // control-plane tokens signs + verifies the host-issued anonymous session cookie AND the
+    // delegable capabilities (PLAN-delegable-capabilities). Handlers-gated: the session-cookie
+    // machinery lives on the handler runtime, so a lean (no-handlers) build has nothing to wire.
+    //
+    // The fleet signer is a DIFFERENT trust domain from control-plane admin auth (signing a
+    // customer's session cookie / an embed capability is not the authority to admit an operator to
+    // the control plane), but production derives it from the control-plane issuer for convenience.
+    // For a DEV / loopback node with control-plane auth disabled (`options.issuer` is `None`),
+    // auto-provision an EPHEMERAL in-memory Ed25519 fleet key so the guest-facing signer just works
+    // — session cookies + capability mint/verify — WITHOUT turning on control-plane auth. Strictly
+    // gated to a loopback bind (or an in-process embedder with no bind address): never on a public
+    // bind, where an ephemeral key would silently invalidate live capabilities across a restart (a
+    // public node that wants guest capabilities without control-plane auth must supply a persistent
+    // key). Ephemeral = issue + verify within one process run; nothing persisted, no cross-process
+    // or cross-deploy trust. Production is byte-identical: a real deploy supplies a control-plane key
+    // ⇒ `issuer` is `Some` ⇒ this fallback is never taken.
     #[cfg(feature = "handlers")]
-    if let Some(issuer) = options.issuer.clone() {
-        handlers.set_session_signer(issuer);
+    {
+        let fleet_signer = options.issuer.clone().or_else(|| {
+            should_autoprovision_fleet_signer(serve_addr).then(|| {
+                tracing::warn!(
+                    "control-plane auth is disabled and no signer is configured; auto-provisioning \
+                     an EPHEMERAL in-memory fleet signer (Ed25519) for host session cookies + \
+                     delegable capabilities on this loopback/dev node — regenerated each start, \
+                     never persisted. Configure a control-plane key (or a dedicated signer) for \
+                     production."
+                );
+                Arc::new(boatramp_core::cose::LocalSigner::generate(
+                    boatramp_core::cose::TokenAlg::Ed25519,
+                )) as Arc<dyn boatramp_core::cose::Signer>
+            })
+        });
+        if let Some(issuer) = fleet_signer {
+            handlers.set_session_signer(issuer);
+        }
     }
     // Enable guest capability minting (`boatramp:handlers/capability`, PLAN-delegable-capabilities)
     // when the operator posture allows it. A minted capability is verified against the same fleet
@@ -635,6 +679,33 @@ mod tests {
     use super::*;
     use boatramp_core::kv::MemoryKv;
     use boatramp_core::security::SecurityProfile;
+
+    /// The dev/loopback ephemeral fleet-signer auto-provision is gated STRICTLY to a loopback bind
+    /// (or an in-process embedder with no bind): a public / wildcard / private-network bind must
+    /// NOT silently provision an ephemeral signing key (it would invalidate live capabilities on a
+    /// restart — such a node must supply a persistent key). This is the security-critical boundary.
+    #[cfg(feature = "handlers")]
+    #[test]
+    fn ephemeral_fleet_signer_auto_provisions_only_on_loopback_or_in_process() {
+        use std::net::SocketAddr;
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        // In-process (no listener) and loopback → auto-provision the dev fleet signer.
+        assert!(should_autoprovision_fleet_signer(None));
+        assert!(should_autoprovision_fleet_signer(Some(sa(
+            "127.0.0.1:8080"
+        ))));
+        assert!(should_autoprovision_fleet_signer(Some(sa("[::1]:8080"))));
+        // Off-host-reachable binds MUST NOT auto-provision an ephemeral key: a public IP, a
+        // private-network IP, and a wildcard bind (`0.0.0.0`/`::`, reachable off-host).
+        assert!(!should_autoprovision_fleet_signer(Some(sa(
+            "203.0.113.5:8080"
+        ))));
+        assert!(!should_autoprovision_fleet_signer(Some(sa(
+            "10.0.0.4:8080"
+        ))));
+        assert!(!should_autoprovision_fleet_signer(Some(sa("0.0.0.0:8080"))));
+        assert!(!should_autoprovision_fleet_signer(Some(sa("[::]:8080"))));
+    }
 
     /// The headline in-process fidelity check (PLAN-node-library N2b.3): `assemble`
     /// over a temp `FsStorage` + `MemoryKv` produces a `RunningNode` whose deploy
