@@ -188,10 +188,12 @@ async fn postgres_null_binds_untyped_into_nontext_columns() {
 }
 
 /// §1b: a `SqlValue::Json` binds into a `jsonb` (and `json`) column with **no
-/// `::jsonb` cast in the query** — it goes out as Postgres `json` (raw text),
-/// which assignment-casts to `jsonb`. The `->>'a'` read proves it stored as real
-/// JSON (a text column would reject the operator / not parse), and JSON reads
-/// back as `Text`.
+/// `::` cast in the query** — it goes out as Postgres `jsonb` (OID 3802) directly,
+/// and into a `json` column via the jsonb→json assignment cast. The `->>'a'` read
+/// proves it stored as real JSON (a text column would reject the operator / not
+/// parse), and JSON reads back as `Text`. (The `jsonb` type-unification — COALESCE
+/// / comparison / `||` against a `jsonb` column — is gated live in
+/// `orm_tenant_isolation_sqlx_live::run_json_jsonb_battery`.)
 #[cfg(feature = "sql-postgres")]
 #[tokio::test]
 async fn postgres_json_writes_to_jsonb_without_a_cast() {

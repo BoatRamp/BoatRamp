@@ -52,11 +52,15 @@
 //! with their natural type.
 //!
 //! ## `JSON` binding
-//! A `SqlValue::Json` (JSON text) is bound so it reaches a JSON column with no
-//! `::jsonb` cast in the query: on Postgres as `json` (OID 114, whose wire format
-//! is the raw text — see `PgJson`), which lands in a `json` column directly and in
-//! a `jsonb` column via the json→jsonb assignment cast; on MySQL as text (a valid
-//! JSON string is accepted by a `JSON` column). SQLite/libsql store it as text.
+//! A `SqlValue::Json` (JSON text) is the portable "JSON document" value; it binds to
+//! each engine's canonical document type with no `::` cast in the query: on Postgres
+//! as **`jsonb`** (OID 3802 — validated/canonical/operator- and index-capable — see
+//! `PgJsonb`), so it type-unifies with a `jsonb` column everywhere (`COALESCE`,
+//! comparison, `||`), not only on INSERT, and still assigns into a `json` column via
+//! the jsonb→json assignment cast; on MySQL as its binary `JSON` type; on
+//! SQLite/libsql as text (json1 operates on text). Postgres's raw-text `json` type
+//! (byte/key-order fidelity, no operators) is out of the portable model — reach it
+//! with raw SQL + an explicit `::json` cast if you truly need it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -513,23 +517,35 @@ mod postgres_backend {
         }
     }
 
-    /// A JSON document bound as Postgres `json` (OID 114) — whose binary wire
-    /// format is the raw JSON text — so it lands in a `json` column directly and in
-    /// a `jsonb` column via the built-in json→jsonb assignment cast, with no
-    /// `::jsonb` in the query. Non-JSON values are unaffected.
-    struct PgJson<'a>(&'a str);
+    /// A JSON document bound as Postgres **`jsonb`** (OID 3802). `jsonb` is the
+    /// canonical JSON-document type — validated, canonicalized, operator- and
+    /// index-capable — and it is the type boatramp's portable `SqlValue::Json` maps
+    /// to on Postgres (the analog of MySQL's `JSON` and SQLite's json1 text). Binding
+    /// as `jsonb` (not `json`, OID 114) means a `Json` value **type-unifies** with a
+    /// `jsonb` column everywhere — `COALESCE`, `=`/comparison, and `||` concat — not
+    /// only on INSERT (where `json` reached `jsonb` via the assignment cast). It still
+    /// assigns into a `json`-typed column via the built-in jsonb→json assignment cast.
+    /// One consequence: `jsonb` **validates on write**, so malformed JSON text is now
+    /// rejected at the server (it was silently stored as raw `json` bytes before).
+    ///
+    /// The `jsonb` binary wire format is a 1-byte version header (`0x01`) followed by
+    /// the JSON text — so the encoder prepends that byte (a bare OID swap would send
+    /// the text as-is and Postgres would read `{` as an unsupported version number).
+    struct PgJsonb<'a>(&'a str);
 
-    impl sqlx::Type<Postgres> for PgJson<'_> {
+    impl sqlx::Type<Postgres> for PgJsonb<'_> {
         fn type_info() -> sqlx::postgres::PgTypeInfo {
-            sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(114))
+            sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(3802))
         }
     }
 
-    impl<'q> sqlx::Encode<'q, Postgres> for PgJson<'q> {
+    impl<'q> sqlx::Encode<'q, Postgres> for PgJsonb<'q> {
         fn encode_by_ref(
             &self,
             buf: &mut sqlx::postgres::PgArgumentBuffer,
         ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+            // jsonb send format: version byte (always 1) + the JSON text.
+            buf.push(1);
             buf.extend_from_slice(self.0.as_bytes());
             Ok(sqlx::encode::IsNull::No)
         }
@@ -640,7 +656,7 @@ mod postgres_backend {
                 sqlx::query(stmt.sql.as_ref()),
                 bound.as_ref(),
                 PgUntypedNull,
-                PgJson,
+                PgJsonb,
             );
             let rows = q.fetch_all(&mut *self.conn).await.map_err(map_err)?;
             rows_to_sql(&rows)
@@ -657,7 +673,7 @@ mod postgres_backend {
                 sqlx::query(stmt.sql.as_ref()),
                 bound.as_ref(),
                 PgUntypedNull,
-                PgJson,
+                PgJsonb,
             );
             let done = q.execute(&mut *self.conn).await.map_err(map_err)?;
             Ok(done.rows_affected())
