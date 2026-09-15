@@ -507,13 +507,19 @@ impl Scope {
 
     /// The PUBLIC-subset confinement to conjoin for `table` under a **target read** (R4/D8):
     /// `Ok(None)` when the scope is not a target read (own/session — no public confinement, today's
-    /// behavior). Under a target read where `require_public` (domain/handle), a table with **no**
-    /// declared public subset is refused ([`OrmError::PublicSubsetUndeclared`], deny-by-default);
-    /// under a `capability`-only target (`!require_public`) an undeclared subset ⇒ `Ok(None)` (confine
-    /// to `tenant = B` alone — the capability is the authorization). A declared subset is built as a
-    /// qualified `AND` (each column qualified by `qualifier` for a join/subquery ref, so the
-    /// confinement composes across every reachable table) either way. An empty term list ⇒ no
-    /// predicate (a match-all public subset — the schema loader rejects an empty declared one).
+    /// behavior). Under a target read where `require_public` (domain/handle, or any `target_or_null`),
+    /// a table with **no** declared public subset is refused ([`OrmError::PublicSubsetUndeclared`],
+    /// deny-by-default) and a declared subset is built as a qualified `AND` (each column qualified by
+    /// `qualifier` for a join/subquery ref, so the confinement composes across every reachable table).
+    /// Under a `capability`-only target (`!require_public`, ruling A) the subset is INERT ⇒ `Ok(None)`:
+    /// confine to `tenant = B` alone (added separately by [`read_pred`](Self::read_pred)) — the
+    /// host-verified, project-audience-bound, label-scoped capability plus the resolver's own in-guest
+    /// per-`sub` filter IS the authorization. This holds whether or not the table DECLARES a subset,
+    /// because a subset authored for the anonymous domain/handle funnel (e.g. `client_id IS NULL`)
+    /// must not narrow a capability read — it would collide with the resolver's own filter and empty
+    /// the result. An empty declared term list ⇒ no predicate (the schema loader rejects an empty
+    /// declared subset). NB: `target_or_null` forces `require_public` (v0.4.8), so its shared
+    /// NULL-base arm still visibility-gates even under a capability; the exemption is plain `target`.
     fn public_pred(
         &self,
         table: &str,
@@ -527,11 +533,16 @@ impl Scope {
         else {
             return Ok(None);
         };
+        // Ruling A (v0.4.4), made COMPLETE: on the capability axis the visibility subset is inert —
+        // NO per-table subset is applied, not even a DECLARED one. `tenant = B` (applied separately)
+        // + the capability + the resolver's own in-guest filter is the authorization.
+        if !require_public {
+            return Ok(None);
+        }
         let terms = match public.get(table) {
             Some(t) => t,
-            // Capability-only target (ruling A): no declared subset ⇒ tenant-only confinement.
-            None if !require_public => return Ok(None),
-            // domain/handle: the visibility predicate is mandatory (deny-by-default).
+            // domain/handle (or target_or_null): the visibility predicate is the ONLY guard for an
+            // anonymous/base-arm actor, so a declared subset is mandatory (deny-by-default).
             None => return Err(OrmError::PublicSubsetUndeclared(table.to_string())),
         };
         let mut preds = Vec::with_capacity(terms.len());
@@ -4401,6 +4412,90 @@ mod tests {
         assert!(
             !sql.contains("published") && !sql.contains("IS NULL"),
             "own read must carry no public confinement: {sql}"
+        );
+    }
+
+    #[test]
+    fn target_read_capability_drops_a_declared_subset_confining_tenant_only() {
+        // construens embed bug (ruling A made COMPLETE): under a capability-only target read
+        // (require_public=false), a table that DECLARES a public subset (authored for the anonymous
+        // funnel) must confine to `tenant = B` ALONE — the subset is NOT AND-ed on, so a resolver's
+        // own within-tenant filter on that column isn't collided into the empty set. `tenant = B`
+        // (applied separately) stays mandatory on the base ref AND every joined ref.
+        use std::collections::BTreeMap;
+        let keys = BTreeMap::from([
+            (
+                "products".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+            (
+                "reviews".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+        ]);
+        let public = BTreeMap::from([
+            (
+                "products".to_string(),
+                vec![
+                    PublicTermSql::Cmp {
+                        column: "published".into(),
+                        op: CmpOp::Eq,
+                        value: SqlValue::Boolean(true),
+                    },
+                    PublicTermSql::Null {
+                        column: "deleted_at".into(),
+                        negated: false,
+                    },
+                ],
+            ),
+            (
+                "reviews".to_string(),
+                vec![PublicTermSql::Cmp {
+                    column: "visible".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Boolean(true),
+                }],
+            ),
+        ]);
+        let cap = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys,
+                public,
+                write: std::collections::BTreeSet::new(),
+                require_public: false, // capability axis (ruling A)
+            },
+        };
+        let mut q = Select {
+            table_alias: Some("p".into()),
+            joins: vec![Join {
+                kind: JoinKind::Inner,
+                table: "reviews".into(),
+                alias: Some("r".into()),
+                on: Predicate::Cmp {
+                    left: Expr::col("r.product_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::col("p.id"),
+                },
+            }],
+            ..Select::from("products")
+        };
+        q.force_scope(&cap).unwrap();
+        let (sql, _p) = q.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("p.tenant_id = ?"),
+            "base tenant scope kept: {sql}"
+        );
+        assert!(
+            sql.contains("r.tenant_id = ?"),
+            "joined tenant scope kept: {sql}"
+        );
+        assert!(
+            !sql.contains("published") && !sql.contains("deleted_at") && !sql.contains("visible"),
+            "no declared subset term may appear on the capability axis: {sql}"
         );
     }
 

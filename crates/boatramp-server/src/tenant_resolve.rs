@@ -1642,9 +1642,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
     async fn plain_wasm_target_capability_confines_to_tenant_b_without_a_subset_on_a_real_engine() {
-        use boatramp_core::orm::{Expr, Select, SelectItem};
+        use boatramp_core::orm::{CmpOp, Expr, Predicate, Select, SelectItem};
         use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
-        use boatramp_core::tenancy::{AccessMode, TableScope, TenancySchema};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicPredicate, PublicSubset, PublicTerm, TableScope, TenancySchema,
+        };
         use boatramp_handlers::{HostTenancy, TenantAxis};
         use std::collections::BTreeMap;
 
@@ -1739,10 +1741,125 @@ mod tests {
         );
         tx.commit().await.unwrap();
 
+        // (3) v0.4.14 — ruling A COMPLETE: a table that DECLARES a public subset for the anonymous
+        // funnel must NOT have it applied on the capability axis. `documents` declares
+        // `client_id IS NULL` (the unclaimed-storefront funnel reveal). A capability read that adds
+        // its OWN within-tenant `client_id = 'cli_1'` filter must return cli_1's CLAIMED docs — NOT
+        // the empty set the old `client_id = 'cli_1' AND client_id IS NULL` collision produced — and
+        // still never tenant A's row (even one sharing the same client_id).
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE documents (id TEXT PRIMARY KEY, tenant_id TEXT, client_id TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, client) in [
+                ("d_b1", "tenant_B", Some("cli_1")),
+                ("d_b2", "tenant_B", Some("cli_2")), // another client within B
+                ("d_bpub", "tenant_B", None),        // an unclaimed (funnel-public) row
+                ("d_a1", "tenant_A", Some("cli_1")), // tenant A, SAME client label — must never leak
+            ] {
+                tx.execute(
+                    "INSERT INTO documents (id, tenant_id, client_id) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        client.map_or(SqlValue::Null, |c| SqlValue::Text(c.into())),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let mut schema_docs = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("documents".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        schema_docs.public_subsets.insert(
+            "documents".into(),
+            PublicSubset {
+                // The funnel subset: unclaimed rows are the anonymous-public ones.
+                predicate: PublicPredicate {
+                    terms: vec![PublicTerm::Null {
+                        column: "client_id".into(),
+                        negated: false,
+                    }],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+        // Capability axis (require_public = false) even though a subset is DECLARED.
+        let ht_docs = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema_docs,
+            "client-documents", // scope label matched to the capability grant
+            &[],
+            false,
+        );
+
+        // orm: the resolver's OWN in-guest filter `client_id = 'cli_1'`.
+        let mut qd = Select {
+            columns: vec![SelectItem {
+                expr: Expr::col("id"),
+                alias: None,
+            }],
+            filter: Some(Predicate::Cmp {
+                left: Expr::col("client_id"),
+                op: CmpOp::Eq,
+                right: Expr::Value(SqlValue::Text("cli_1".into())),
+            }),
+            ..Select::from("documents")
+        };
+        qd.force_scope(&ht_docs.orm_scope(TenantAxis::Read).unwrap().unwrap())
+            .unwrap();
+        let (sqld, paramsd) = qd.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            !sqld.contains("IS NULL"),
+            "the declared `client_id IS NULL` subset must NOT be applied on the capability axis: {sqld}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let doc_rows = run_text_rows(tx.as_mut(), &sqld, &paramsd).await;
+        assert_eq!(
+            doc_rows,
+            vec!["d_b1".to_string()],
+            "capability orm read returns cli_1's CLAIMED doc (declared subset NOT AND-ed on), never \
+             cli_2/unclaimed, never tenant A: {sqld}"
+        );
+        tx.commit().await.unwrap();
+
+        // raw sql: same — the guest's `client_id = 'cli_1'` survives, the funnel subset is dropped.
+        let rewritten_docs = ht_docs
+            .rewrite_target_read(
+                "SELECT id FROM documents WHERE client_id = 'cli_1'",
+                Dialect::Sqlite,
+            )
+            .unwrap();
+        assert!(
+            rewritten_docs.contains("documents.tenant_id = 'tenant_B'")
+                && rewritten_docs.contains("client_id = 'cli_1'")
+                && !rewritten_docs.contains("IS NULL"),
+            "raw-sql capability read keeps tenant=B + the guest filter, drops the funnel subset: {rewritten_docs}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let raw_doc_rows = run_text_rows(tx.as_mut(), &rewritten_docs, &[]).await;
+        assert_eq!(
+            raw_doc_rows,
+            vec!["d_b1".to_string()],
+            "raw-sql capability read of a declared-subset table = cli_1's claimed doc only: {rewritten_docs}"
+        );
+        tx.commit().await.unwrap();
+
         println!(
-            "PLAIN-WASM CAPABILITY TARGET ISOLATION OK: a via:[capability]-only field with no declared \
-             public subset confines its orm AND raw-sql reads to tenant B alone (all of B's rows, \
-             never tenant A's; the per-client filter stays in-guest), on a real libsql engine"
+            "PLAIN-WASM CAPABILITY TARGET ISOLATION OK: a via:[capability]-only field confines its \
+             orm AND raw-sql reads to tenant B alone — with NO declared subset (all of B's rows) AND \
+             with a DECLARED funnel subset that is dropped so the resolver's own client_id filter \
+             returns the claimed rows (never the empty set, never tenant A), on a real libsql engine"
         );
     }
 

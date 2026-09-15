@@ -419,18 +419,27 @@ impl Rewriter<'_> {
         table: &str,
         qualifier: &Ident,
     ) -> Result<Option<Expr>, TargetRewriteError> {
-        // The public terms. Under `require_public` (domain/handle) an undeclared subset is refused
-        // (the visibility predicate is the only guard for an anonymous actor); under a
-        // `capability`-only field (ruling A) an undeclared subset ⇒ no visibility terms (confine to
-        // `tenant = B` alone — the capability is the authorization).
+        // The public terms. Ruling A (v0.4.4), made COMPLETE: under a `capability`-only field
+        // (`!require_public`) the visibility subset is INERT — confine to `tenant = B` alone
+        // (applied below) and apply NO per-table subset, not even a DECLARED one. A subset authored
+        // for the anonymous domain/handle funnel (e.g. `client_id IS NULL`) must not narrow a
+        // capability read: it collides with the resolver's own in-guest per-`sub` filter and would
+        // empty the result. The host-verified, project-audience-bound capability + that in-guest
+        // filter is the authorization. Under `require_public` (domain/handle — the visibility
+        // predicate is the only guard for an anonymous actor; and any `target_or_null`, whose shared
+        // NULL-base arm v0.4.8 forces the subset even under a capability) a declared subset is
+        // applied and an undeclared one is refused (deny-by-default).
         let empty: Vec<PublicTermSql> = Vec::new();
-        let terms = match self.public.get(table) {
-            Some(t) => t,
-            None if !self.require_public => &empty,
-            None => {
-                return Err(TargetRewriteError::PublicSubsetUndeclared(
-                    table.to_string(),
-                ))
+        let terms = if !self.require_public {
+            &empty
+        } else {
+            match self.public.get(table) {
+                Some(t) => t,
+                None => {
+                    return Err(TargetRewriteError::PublicSubsetUndeclared(
+                        table.to_string(),
+                    ))
+                }
             }
         };
         let resolved = self
@@ -739,11 +748,40 @@ mod tests {
             matches!(err, TargetRewriteError::PublicSubsetUndeclared(ref t) if t == "orders"),
             "{err:?}"
         );
-        // A table that DOES declare a subset is still confined by it under capability.
+        // Ruling A COMPLETE: a table that DOES declare a subset is confined to `tenant = B` ALONE
+        // under a capability — the declared subset (authored for the anonymous funnel) is NOT applied.
         let out = rewrite_cap("SELECT id FROM products").unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM products WHERE products.tenant_id = 'tenant_B'"
+        );
         assert!(
-            out.contains("products.tenant_id = 'tenant_B' AND products.published = true"),
-            "{out}"
+            !out.contains("published"),
+            "declared subset must be inert on the capability axis: {out}"
+        );
+    }
+
+    #[test]
+    fn capability_drops_declared_subset_so_a_resolver_filter_on_that_column_survives() {
+        // The construens embed bug: `products` declares `published = true` for the anonymous funnel,
+        // but a capability read filters on that same column for its own within-tenant purpose. The
+        // declared subset must NOT be AND-ed on (it would collide), and the guest's own predicate is
+        // preserved verbatim inside its parenthesised group — confined only by `tenant = B`.
+        let out = rewrite_cap("SELECT id FROM products WHERE published = false").unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM products WHERE (published = false) AND products.tenant_id = 'tenant_B'"
+        );
+        // Every joined table that declares a subset is ALSO confined to `tenant = B` alone (the
+        // reviews subset `visible = true` is not applied), so a capability read across a join is not
+        // silently emptied by a funnel subset on the joined table.
+        let out = rewrite_cap("SELECT p.id FROM products p JOIN reviews r ON r.product_id = p.id")
+            .unwrap();
+        assert!(out.contains("p.tenant_id = 'tenant_B'"), "{out}");
+        assert!(out.contains("r.tenant_id = 'tenant_B'"), "{out}");
+        assert!(
+            !out.contains("published") && !out.contains("visible"),
+            "no declared subset on either table under a capability: {out}"
         );
     }
 
