@@ -5,6 +5,42 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.13] - 2026-09-15
+
+Two independent fixes, each behind a security review and a CI-hard gate: a target-read LEFT-JOIN
+correctness fix and a dev-ergonomics decoupling of the guest-facing fleet signer.
+
+### Fixed
+- **A cross-tenant `target` read over a LEFT JOIN no longer drops the driving row.** The target-read
+  confinement (both the `orm` `PerTableTarget` path and the raw-SQL `rewrite_target_read` AST
+  rewriter) confined a LEFT-joined table by conjoining `tenant = B AND <public subset>` into the
+  top-level `WHERE`, which silently collapses the LEFT JOIN to an INNER JOIN — so a routed tenant
+  with a driving row but no matching (public, same-tenant) joined row was dropped entirely, and a
+  SELECT-list `COALESCE(joined.col, driving.col)` fallback never fired. A LEFT-joined table is now
+  confined in that join's own `ON` (`LEFT JOIN t ON (<guest ON>) AND t.tenant = B AND <public>`);
+  the driving table and INNER joins stay in the WHERE. An unmatched / other-tenant / non-public
+  joined row becomes `NULL` (never a cross-tenant bleed — the gate is AND-ed into the join condition
+  and the guest `ON` is parenthesised so a top-level `OR` can't widen past it), and the fallback
+  resolves to the confined driving value. RIGHT/FULL OUTER, semi/anti/apply/asof joins, and a LEFT
+  OUTER with a `USING`/`NATURAL` constraint are refused fail-closed in a raw-SQL target read (the
+  same read is expressible as a `LEFT … ON` join). *(This was investigated from a report of a
+  suspected cross-tenant leak — verified NOT a leak: every table and expression-nested column
+  reference was already confined to tenant `B`; the defect was the LEFT-JOIN correctness collapse.)*
+
+### Changed
+- **The guest-facing fleet signer is decoupled from control-plane admin auth on a dev/loopback
+  node.** The fleet signer (host-issued anonymous session cookies + delegable capabilities) was only
+  ever wired from the control-plane issuer, so a loopback node running the control plane
+  unauthenticated had no signer — the capability mint/verify and anonymous-session surfaces were
+  dormant, blocking local end-to-end testing of them. When no control-plane issuer is configured,
+  the node now auto-provisions an **ephemeral in-memory Ed25519 fleet key** so those surfaces work
+  without enabling control-plane auth — **strictly** on a loopback bind (`127.0.0.1`/`::1`) or an
+  in-process embedder (no bind address), **never** on a public / wildcard / private-network bind
+  (where an ephemeral key would silently invalidate live capabilities across a restart — such a node
+  must supply a persistent key). The key is per-process and never persisted. Production is unchanged
+  (a real deploy supplies a control-plane key, so the issuer is present and this fallback is never
+  taken); control-plane auth and its public-bind guard are untouched.
+
 ## [0.4.12] - 2026-09-15
 
 An ORM/value-model soundness fix behind an architecture review, a security review, and a CI-hard
