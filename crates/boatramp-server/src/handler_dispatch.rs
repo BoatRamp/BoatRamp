@@ -231,6 +231,33 @@ pub(super) async fn dispatch_handler(
                         )
                         .await;
                     }
+                    // Both server-side GraphQL paths (the federation gateway and the data
+                    // connector's delegated-field invoke) fan out to subgraph/sibling FUNCTIONS
+                    // whose host-forced `own` reads no longer self-scope (post-P48) — so both must
+                    // propagate the caller's resolved OWN principal (from the /graphql route's token
+                    // source + token_claims, symmetric to a normal handler). Resolved once here;
+                    // anon resolves none and every `own` fetch fail-closes (never widened). A plain
+                    // GraphQL handler component (neither path) computes its own principal downstream,
+                    // so skip the resolution (and its schema load) for it.
+                    let runs_server_graphql =
+                        gql.federated || gql.data.as_ref().is_some_and(|d| d.enabled);
+                    let caller_own = if runs_server_graphql {
+                        match resolve_gateway_caller_facts(
+                            inner,
+                            project,
+                            handler,
+                            site_handlers,
+                            bearer.as_deref(),
+                            domain_context.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(facts) => facts,
+                            Err(resp) => return resp,
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     // Federation gateway: plan the query against the project's registered
                     // subgraphs and execute it by dispatching fetches to the subgraph
                     // functions, instead of running a single handler component.
@@ -243,6 +270,7 @@ pub(super) async fn dispatch_handler(
                             bearer.as_deref(),
                             domain_context.as_deref(),
                             target_handle.as_deref(),
+                            caller_own,
                         )
                         .await;
                     }
@@ -257,6 +285,7 @@ pub(super) async fn dispatch_handler(
                             query,
                             &variables,
                             bearer.as_deref(),
+                            caller_own,
                         )
                         .await;
                     }
@@ -482,6 +511,107 @@ pub(super) async fn dispatch_handler(
 /// it, execute the plan by dispatching each fetch to its subgraph function over the
 /// in-process invoke path, and return the stitched `{ "data": … }` response.
 #[cfg(feature = "handlers")]
+/// Resolve the caller's OWN-axis principal (axis-tagged `ScopeFact`s) for the federated `/graphql`
+/// gateway, symmetric to the `handler_caller_tenant` a normal handler resolves and already
+/// propagates on the in-process `graphql::run` path (v0.4.6). The gateway fans out to wasm subgraphs
+/// whose host-forced `own` reads no longer self-scope (post-P48), so they depend on this principal;
+/// propagating an EMPTY set (the pre-v0.4.11 `Vec::new()`) fail-closed EVERY federated `own` read.
+///
+/// A SQL subgraph ignores these facts (its GDC `row_filter` binds the forwarded bearer); a `target`
+/// fetch resolves `B` per-fetch (`with_target_inputs`), independent of this own principal — so this
+/// changes only the own-axis wasm path.
+///
+/// Fail-closed is preserved: an anonymous caller (no verifiable bearer, no resolvable source)
+/// resolves no facts, so a wasm `own` fetch still refuses — the gateway never widens anon access.
+#[cfg(feature = "handlers")]
+async fn resolve_gateway_caller_facts(
+    inner: &HandlerRuntimeInner,
+    project: &str,
+    handler: &boatramp_core::config::HandlerConfig,
+    site_handlers: &boatramp_core::config::HandlersSiteConfig,
+    bearer: Option<&str>,
+    domain_context: Option<&str>,
+) -> std::result::Result<Vec<boatramp_handlers::ScopeFact>, Response> {
+    // The effective in-site tenancy for the `/graphql` route: the per-handler decision when it
+    // narrows within the site ceiling (a widening is refused fail-closed), else the site decision.
+    let effective = match handler.tenancy.as_ref() {
+        Some(h) => {
+            if let Some(ceiling) = site_handlers.tenancy.as_ref() {
+                if !h.narrows_within(ceiling) {
+                    return Err(graphql_guard::error_response(
+                        "tenancy: the /graphql handler declares a tenancy that widens the site ceiling",
+                    ));
+                }
+            }
+            Some(h)
+        }
+        None => site_handlers.tenancy.as_ref(),
+    };
+    // A `target`-class route tenancy is resolved PER FETCH by the gateway (`with_target_inputs`), not
+    // as a caller own principal — so the own facts are empty here (any own fetch then fail-closes,
+    // which is correct: a target route names no own tenant).
+    if matches!(
+        effective,
+        Some(boatramp_core::tenancy::Tenancy::Target { .. })
+    ) {
+        return Ok(Vec::new());
+    }
+    let knobs = inner.project_tenancy_knobs(project);
+    let posture = crate::tenant_resolve::TenantPosture {
+        require_declaration: knobs.require_tenancy_declaration,
+        allow_cross_tenant: knobs.allow_cross_tenant_db,
+    };
+    // The `token` source's JWKS/issuer config: the per-handler `token_claims` wins over the site's
+    // `[handlers.graphql.data].claims_from_token`.
+    let token_cfg = handler.token_claims.as_ref().or_else(|| {
+        site_handlers
+            .graphql
+            .as_ref()
+            .and_then(|g| g.data.as_ref())
+            .and_then(|d| d.claims_from_token.as_ref())
+    });
+    let session_anchor = inner.session_signer.get().map(|s| s.public_key());
+    // The per-table tenancy schema (fail-closed to deny-all if unreadable), attached to the resolved
+    // principal so a per-table-keyed subgraph read scopes on its own key.
+    let schema = match boatramp_core::deploy::load_project_tenancy(
+        inner.kv.as_ref(),
+        boatramp_core::project::ProjectRef::new(project),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => Some(boatramp_core::tenancy::TenancySchema::deny_all()),
+    };
+    let inputs = crate::tenant_resolve::TenantSourceInputs {
+        bearer,
+        domain_context,
+        token_cfg,
+        // The gateway resolves the token/own (and domain) axis; a cookie-auth caller already had its
+        // cookie injected as the bearer upstream. An R3 anonymous-session principal is out of scope
+        // for the federated gateway and fail-closes here — never widened.
+        session_cookie: None,
+        session_anchor: session_anchor.as_ref(),
+        signed_context: None,
+        context_anchor: None,
+    };
+    // `imports_db = false`: the gateway component itself runs no `orm`/`sql` (it fans out); the
+    // "undeclared tenancy refused under strict posture" check applies to a handler that DIRECTLY
+    // queries. An undeclared gateway tenancy therefore yields no own facts (own fetches fail-closed),
+    // never a hard refusal of the whole query.
+    let facts = crate::tenant_resolve::resolve_host_tenancy(effective, false, posture, inputs)
+        .await
+        .map_err(|_| {
+            graphql_guard::error_response(
+                "tenancy: the /graphql route requires a tenancy declaration under this project's posture",
+            )
+        })?
+        .map(|h| h.with_schema(schema.as_ref()))
+        .map(|h| h.facts().to_vec())
+        .unwrap_or_default();
+    Ok(facts)
+}
+
+#[allow(clippy::too_many_arguments)] // host-trusted inputs threaded from dispatch; grouping them into a struct would only obscure the plumbing
 async fn federation_gateway(
     inner: &HandlerRuntimeInner,
     project: &str,
@@ -490,6 +620,7 @@ async fn federation_gateway(
     bearer: Option<&str>,
     domain_context: Option<&str>,
     target_handle: Option<&str>,
+    caller_own: Vec<boatramp_handlers::ScopeFact>,
 ) -> Response {
     // Compose + plan, memoized per project by composition version (and the operation hash for
     // the plan) — the same `graphql_cache` the in-process `graphql::run` path uses, so neither
@@ -533,9 +664,13 @@ async fn federation_gateway(
     // subgraph and a GraphQL→Wasi subgraph compose in one supergraph.
     let sql_subgraphs = (*cached.sql_subgraphs).clone();
     let mut runner = crate::graphql_gateway::BackendRouter::new(
-        // A federated sub-fetch to a sibling doesn't propagate an in-site tenant (the GDC's own
-        // row policy governs data access); a scoped sibling fail-closes for an `own` op.
-        invoker.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()),
+        // v0.4.11: propagate the caller's resolved OWN principal to every wasm subgraph fetch,
+        // symmetric to the in-process `graphql::run` path. A post-P48 wasm subgraph's `own` read is
+        // host-forced and no longer self-scopes, so it needs this principal; the pre-v0.4.11 empty
+        // set (`Vec::new()`) fail-closed every federated `own` read. A SQL subgraph ignores it (its
+        // GDC `row_filter` binds the forwarded bearer); a `target` fetch resolves `B` per-fetch. An
+        // anonymous caller resolves no facts, so an `own` fetch still refuses (anon is not widened).
+        invoker.scoped(boatramp_core::project::ProjectRef::new(project), caller_own),
         project.to_string(),
         inner.sql.clone(),
         sql_subgraphs,
@@ -591,6 +726,7 @@ async fn federation_gateway(
 /// `project` claim, plus any claims from a verified app bearer token (`bearer`) when the site
 /// configures `claims_from_token`.
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)] // host-trusted inputs threaded from dispatch; a params struct would only obscure the plumbing
 async fn data_connector_serve(
     inner: &HandlerRuntimeInner,
     project: &str,
@@ -599,6 +735,7 @@ async fn data_connector_serve(
     query: &str,
     variables: &serde_json::Value,
     bearer: Option<&str>,
+    caller_own: Vec<boatramp_handlers::ScopeFact>,
 ) -> Response {
     let Some(provider) = &inner.sql else {
         return (
@@ -654,11 +791,16 @@ async fn data_connector_serve(
         }
     } else {
         // A delegated field is resolved by a sibling function over the invoke path (scoped to
-        // this project); the connector is the root of that call chain (depth 0).
-        let invoker = inner
-            .invoker
-            .get()
-            .map(|inv| inv.scoped(boatramp_core::project::ProjectRef::new(project), Vec::new()));
+        // this project); the connector is the root of that call chain (depth 0). v0.4.11: carry the
+        // caller's resolved OWN principal so a delegated `own`-scoped wasm resolver inherits it —
+        // symmetric to the federation gateway; the pre-v0.4.11 empty set fail-closed every delegated
+        // `own` read post-P48. Anon resolves none, so the delegated `own` fetch still refuses.
+        let invoker = inner.invoker.get().map(|inv| {
+            inv.scoped(
+                boatramp_core::project::ProjectRef::new(project),
+                caller_own.clone(),
+            )
+        });
         crate::graphql_data::runner::execute(
             backend.as_ref(),
             &dialect,

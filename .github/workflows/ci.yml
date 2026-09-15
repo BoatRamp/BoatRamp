@@ -426,6 +426,21 @@ jobs:
             || { echo "::error::gateway target_or_null gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GATEWAY TARGET-OR-NULL OK' gwton.log \
             || { echo "::error::gateway target_or_null never reached its marker (base floor lost, a public-subset breach, or a cross-tenant leak)" >&2; exit 1; }
+      - name: Live gateway OWN-principal propagation on a real libsql engine (v0.4.11)
+        run: |
+          set -eo pipefail
+          # v0.4.11: the EXTERNAL /graphql federation gateway propagates the caller's resolved OWN
+          # principal to a wasm subgraph fetch, so a post-P48 host-forced `own` read returns the
+          # caller's tenant rows instead of failing closed. Caller principal = tenant B ⇒ ONLY B's
+          # rows; an empty (anon) principal ⇒ fail closed (anon NOT widened). A regression (empty
+          # principal again, a cross-tenant leak, or an anon widening) fails the assertion.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            gateway_propagates_caller_own_principal_to_a_wasm_subgraph \
+            -- --ignored --nocapture 2>&1 | tee gwown.log
+          grep -qE 'test result: ok\. 1 passed' gwown.log \
+            || { echo "::error::gateway own-propagation gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'GATEWAY OWN-PROPAGATION OK' gwown.log \
+            || { echo "::error::gateway own-principal propagation never reached its marker (a dropped principal, a cross-tenant leak, or an anon widening)" >&2; exit 1; }
       - name: Live present-token verify/seal/resolve chain + batch isolation (v0.4.7 Gap 3)
         run: |
           set -eo pipefail
