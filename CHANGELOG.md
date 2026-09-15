@@ -5,6 +5,24 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.11] - 2026-09-15
+
+A cutover-critical tenant-propagation fix behind a security review and a CI-hard live gate.
+
+### Fixed
+- **The federated `/graphql` gateway now propagates the caller's tenant to wasm subgraphs.** The
+  external federated gateway dispatched every wasm subgraph fetch with an **empty** in-site
+  principal, so a host-forced `own` read in a wasm subgraph (post-0.4.0 they no longer self-scope)
+  **failed closed** (`no verified tenant source`) when reached through the gateway — i.e. every
+  authenticated federated `own` read returned no rows. The gateway now resolves the caller's own
+  principal from the `/graphql` route's `token` source + `token_claims` (the same resolution a normal
+  handler runs, symmetric to the in-process `graphql::run` path) and propagates it to each fetch. A
+  SQL subgraph is unaffected (its data-connector `row_filter` binds the forwarded bearer); a
+  cross-tenant `target` field resolves its tenant per-fetch, independent of this. Fail-closed is
+  preserved: an anonymous caller resolves no principal, so a wasm `own` fetch still refuses — the
+  gateway never widens anonymous access. The same dropped-principal is fixed on the data connector's
+  delegated-field path (a delegated `own`-scoped resolver likewise inherited an empty principal).
+
 ## [0.4.10] - 2026-09-14
 
 A `boatramp sync` CLI fix.

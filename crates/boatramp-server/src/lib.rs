@@ -3839,6 +3839,155 @@ mod tests {
         );
     }
 
+    /// **Live gate (v0.4.11):** the EXTERNAL `/graphql` federation gateway propagates the caller's
+    /// resolved OWN principal to a WASM subgraph fetch, so a post-P48 host-forced `own` read reached
+    /// through the gateway returns the CALLER's tenant rows instead of failing closed (the
+    /// production topology: an authed console query fans across `own`-scoped wasm subgraphs). Drives
+    /// the REAL `BackendRouter` → invoke → engine over the REAL libsql-backed probe (its `items`
+    /// field is `own`-scoped via `{scope}`): caller principal = tenant B ⇒ ONLY B's rows; an EMPTY
+    /// principal (anon) ⇒ fail closed (the pre-v0.4.11 bug — every federated `own` read returned
+    /// nothing). `#[ignore]`d (static-musl libsql segfault); the CI job runs it on the host toolchain
+    /// + greps the marker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI gateway-own-propagation gate"]
+    async fn gateway_propagates_caller_own_principal_to_a_wasm_subgraph() {
+        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::function::{
+            Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, ScopeAxis, Tenancy, TenantSource};
+        use boatramp_handlers::{HandlerEngine, Limits, ScopeFact};
+
+        // The SAME compiled probe — its `items` field runs `SELECT id FROM items WHERE {scope}`. On
+        // the INHERITED (own) path the host injects the caller's principal into `{scope}`, so the
+        // response reveals which tenant the gateway propagated (and fails closed with none).
+        const PROBE: &[u8] = include_bytes!("../tests/fixtures/graphql-scope-probe.wasm");
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        let sql_dir = std::env::temp_dir().join(format!("br-gwown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        let db = backends
+            .database("default", "fn/scopeprobe", "")
+            .await
+            .unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, tenant_id TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant) in [("a1", "tenant_A"), ("b1", "tenant_B"), ("b2", "tenant_B")] {
+                tx.execute(
+                    "INSERT INTO items (id, tenant_id) VALUES (?1, ?2)",
+                    &[SqlValue::Text(id.into()), SqlValue::Text(tenant.into())],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = Arc::new(backends);
+
+        // Deploy the probe as an `own`-scoped subgraph FUNCTION (source `None` — on the inherited
+        // path the principal comes from the caller, not a declared source).
+        let hash = sha256_hex(PROBE);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(PROBE)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let function = Function {
+            name: "scopeprobe".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: FunctionConfig {
+                imports: vec!["sql".into()],
+                tenancy: Some(Tenancy::Scoped {
+                    column: "tenant_id".into(),
+                    sources: vec![TenantSource::None],
+                    read: AccessMode::Own,
+                    write: AccessMode::None,
+                }),
+                ..Default::default()
+            },
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        // A PLAIN (own) supergraph — no `@tenant(scope: target)` — so the fetch takes the ordinary
+        // inherited-principal `invoke` path (not `invoke_target`).
+        let sdl = "type Query { items: [Item!]! }\ntype Item @key(fields: \"id\") { id: ID! }";
+        let sg = crate::graphql_federation::compose(&[("scopeprobe".into(), sdl.into())]).unwrap();
+        let plan = crate::graphql_plan::plan("{ items { id } }", &sg).unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv.clone(), storage, Some(sql), None);
+        rt.set_invoker(deploy.clone());
+        let inner = rt.inner.as_ref().unwrap();
+        let invoker = inner.invoker.get().unwrap().clone();
+
+        // The exact construction `federation_gateway` performs: a BackendRouter over an invoker
+        // scoped to the caller's OWN principal (v0.4.11 — previously `Vec::new()`).
+        let make_router = |facts: Vec<ScopeFact>| {
+            crate::graphql_gateway::BackendRouter::new(
+                invoker.scoped(ProjectRef::new("default"), facts),
+                "default".to_string(),
+                inner.sql.clone(),
+                std::collections::BTreeMap::new(),
+                None,
+            )
+        };
+
+        // (1) Caller principal = tenant B → the wasm subgraph inherits B → returns ONLY B's rows.
+        let router_b = make_router(vec![ScopeFact {
+            axis: ScopeAxis::Tenant,
+            value: SqlValue::Text("tenant_B".into()),
+        }]);
+        let body_b = crate::graphql_gateway::execute(&plan, &router_b, &serde_json::json!({}))
+            .await
+            .to_string();
+        assert!(
+            body_b.contains("\"b1\"") && body_b.contains("\"b2\"") && !body_b.contains("\"a1\""),
+            "gateway propagated principal B → the wasm subgraph read ONLY tenant B's rows: {body_b}"
+        );
+
+        // (2) Empty principal (anonymous) → the own fetch fails closed — no rows, anon NOT widened.
+        let router_anon = make_router(Vec::new());
+        let body_anon =
+            crate::graphql_gateway::execute(&plan, &router_anon, &serde_json::json!({}))
+                .await
+                .to_string();
+        assert!(
+            !body_anon.contains("\"a1\"")
+                && !body_anon.contains("\"b1\"")
+                && !body_anon.contains("\"b2\""),
+            "with an empty principal the wasm-subgraph own fetch fails closed — no rows: {body_anon}"
+        );
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!(
+            "GATEWAY OWN-PROPAGATION OK: the /graphql gateway propagated the caller's resolved OWN \
+             principal (tenant B) to a wasm subgraph fetch, which scoped its own read to the \
+             inherited principal and returned ONLY tenant B's rows over a real libsql engine; with \
+             an empty principal the same own fetch failed closed (no rows) — anon is never widened"
+        );
+    }
+
     /// v0.4.8 live gate: `scope: target_or_null` on a WASM subgraph reads `B` ⊕ the shared
     /// `NULL`-tenant **base** rows (the funnel inheritance floor), still confined to the public
     /// subset on BOTH — a base-only tenant sees the base floor, never another tenant's rows nor any
