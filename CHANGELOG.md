@@ -5,6 +5,32 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.14] - 2026-09-16
+
+A target-read confinement fix that completes ruling A (the `via: [capability]` visibility-subset
+exemption), behind a security review and the CI-hard capability live gate.
+
+### Fixed
+- **A `via: [capability]` target read no longer applies a table's DECLARED public visibility subset.**
+  Ruling A (v0.4.4) exempts a capability-authorized target read from the mandatory visibility subset —
+  the host-verified, project-audience-bound, label-scoped capability plus the resolver's own in-guest
+  per-`sub` filter is the authorization, so the host confines to `tenant = B` alone. That exemption
+  was only half applied: it dropped an **undeclared** subset but still AND-ed on a **declared** one —
+  even when that subset was authored for a *different* (anonymous domain/handle funnel) use of the
+  same table. A capability read of a table whose funnel subset is, e.g., `client_id IS NULL` then
+  collided with the resolver's own `client_id = <sub>` filter (`... AND client_id = 'x' AND client_id
+  IS NULL`), emptying the result. Now, on the capability axis (`require_public == false`), **no**
+  per-table visibility subset is applied — not even a declared one — while `tenant = B` (and the
+  `TenantOrSession` tenant arm) stays mandatory on every base ref, join, subquery, derived table, and
+  set-operation arm. Both read paths are fixed identically: the `orm` `PerTableTarget` path
+  (`public_pred`) and the raw-SQL `rewrite_target_read` AST rewriter (`table_confinement`).
+  `target_or_null` is unchanged: it forces the subset even under a capability (v0.4.8), because its
+  shared `NULL`-base arm is a different trust partition than the capability-authorized `B`
+  (`require_public` is forced `true` whenever `null_base`, so the exemption is plain `target` only).
+  The **write** path is intentionally out of scope (a capability INSERT/UPDATE still force-stamps the
+  declared subset — strictly safe, tracked as a follow-up), as is the SQL/GDC subgraph path (a
+  capability read served by a SQL subgraph still applies the subset — over-confinement, never a leak).
+
 ## [0.4.13] - 2026-09-15
 
 Two independent fixes, each behind a security review and a CI-hard gate: a target-read LEFT-JOIN
