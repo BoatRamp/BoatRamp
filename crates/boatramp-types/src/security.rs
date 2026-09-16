@@ -107,6 +107,7 @@ impl SecurityProfile {
                 allow_site_private_upstreams: false,
                 allow_guest_private_egress: false,
                 allow_guest_self_egress: true,
+                allow_guest_egress_extra_ca: false,
                 max_handler_blob_bytes: MT_MAX_BLOB,
                 max_component_bytes: MT_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -136,6 +137,7 @@ impl SecurityProfile {
                 allow_site_private_upstreams: true,
                 allow_guest_private_egress: true,
                 allow_guest_self_egress: true,
+                allow_guest_egress_extra_ca: true,
                 max_handler_blob_bytes: ST_MAX_BLOB,
                 max_component_bytes: ST_MAX_COMPONENT,
                 oidc_require_audience: true,
@@ -165,6 +167,7 @@ impl SecurityProfile {
                 allow_site_private_upstreams: true,
                 allow_guest_private_egress: true,
                 allow_guest_self_egress: true,
+                allow_guest_egress_extra_ca: true,
                 max_handler_blob_bytes: 0,
                 max_component_bytes: 0,
                 oidc_require_audience: false,
@@ -212,6 +215,11 @@ pub struct PostureOverrides {
     pub allow_guest_private_egress: Option<bool>,
     /// Permit a guest handler's outbound `wasi:http` to reach this instance's own serve socket.
     pub allow_guest_self_egress: Option<bool>,
+    /// Permit a guest handler's outbound `wasi:http` TLS client to trust an operator-supplied EXTRA
+    /// CA (`guest_egress_extra_ca_file`), on top of the webpki roots — a dev/single-tenant lever for
+    /// a hermetic HTTPS test double. Verification is still fully performed; this only widens the CA
+    /// set. Off (and refused) under `multi-tenant`. No effect unless a CA file is also configured.
+    pub allow_guest_egress_extra_ca: Option<bool>,
     /// Cap on handler blobstore host reads/ranges/copies in bytes (`0` = unlimited).
     pub max_handler_blob_bytes: Option<u64>,
     /// Cap on a Wasm component blob in bytes (`0` = unlimited).
@@ -398,6 +406,11 @@ impl SecurityConfig {
             o.allow_guest_self_egress.is_some(),
         );
         row(
+            "allow_guest_egress_extra_ca",
+            p.allow_guest_egress_extra_ca.to_string(),
+            o.allow_guest_egress_extra_ca.is_some(),
+        );
+        row(
             "max_handler_blob_bytes",
             fmt_cap(p.max_handler_blob_bytes),
             o.max_handler_blob_bytes.is_some(),
@@ -533,6 +546,11 @@ pub struct SecurityPosture {
     /// posture. (For depth-capped, allowlisted function-to-function calls, prefer the `invoke`
     /// binding, which is unaffected by any egress knob.)
     pub allow_guest_self_egress: bool,
+    /// Whether a guest's outbound `wasi:http` TLS client trusts an operator-supplied EXTRA CA
+    /// (`guest_egress_extra_ca_file`) on top of the webpki roots. Off under `multi-tenant`; a
+    /// trusted single-tenant/dev fleet may opt in (e.g. to reach a hermetic HTTPS test double under
+    /// a test CA). Verification is still fully performed — this only widens the accepted CA set.
+    pub allow_guest_egress_extra_ca: bool,
     /// Cap on handler blobstore host reads/ranges/copies, `0` = unlimited.
     pub max_handler_blob_bytes: u64,
     /// Cap on a Wasm component blob, `0` = unlimited.
@@ -685,6 +703,9 @@ fn apply(mut base: SecurityPosture, o: &PostureOverrides) -> SecurityPosture {
     }
     if let Some(v) = o.allow_guest_self_egress {
         base.allow_guest_self_egress = v;
+    }
+    if let Some(v) = o.allow_guest_egress_extra_ca {
+        base.allow_guest_egress_extra_ca = v;
     }
     if let Some(v) = o.max_handler_blob_bytes {
         base.max_handler_blob_bytes = v;

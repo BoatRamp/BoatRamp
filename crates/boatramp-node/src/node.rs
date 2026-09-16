@@ -214,6 +214,14 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         ))
     });
 
+    // Dev-posture guest-egress extra CA(s): when the posture permits (off/refused under
+    // multi-tenant) AND the operator pointed `BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE` at a PEM, parse
+    // it into trust anchors the guest's outbound `wasi:http` TLS client trusts on TOP of the webpki
+    // roots (for a hermetic HTTPS test double). Empty otherwise. A configured-but-unreadable/
+    // unparsable file is a hard config error (fail closed), never a silent no-trust.
+    let guest_egress_extra_roots =
+        load_guest_egress_extra_roots(options.posture.allow_guest_egress_extra_ca)?;
+
     // The handler runtime reuses the same blob/KV backends (per-site prefixed)
     // for its wasi:blobstore/keyvalue bindings; the sql binding is selected by
     // `[handlers.bindings.sql]` (default: per-site libsql files under <data-dir>).
@@ -227,6 +235,7 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
         max_component_bytes,
         allow_guest_private_egress,
         self_egress_addrs,
+        guest_egress_extra_roots,
         allow_env_secret_refs,
         allow_guest_email,
         options.posture.require_tenancy_declaration,
@@ -631,6 +640,50 @@ pub async fn assemble(input: NodeInput<'_>) -> Result<RunningNode> {
 
 /// Build the `[secrets]` envelope (secrets-at-rest wrapping) from `boatramp.cfg`'s
 /// `[secrets]` section: `local` (a machine-local AES-256-GCM KEK) or `vault` (Vault
+/// Env var an operator points at a PEM file of extra CA(s) the guest's outbound `wasi:http` TLS
+/// client should trust on top of the webpki roots — honored only under the
+/// `allow_guest_egress_extra_ca` posture (a hermetic HTTPS test double lever).
+const GUEST_EGRESS_EXTRA_CA_ENV: &str = "BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE";
+
+/// Parse the operator's guest-egress extra-CA PEM ([`GUEST_EGRESS_EXTRA_CA_ENV`]) into rustls trust
+/// anchors, gated by the `allow_guest_egress_extra_ca` posture (`allow`). No env set ⇒ empty (the
+/// default). `allow == false` (e.g. multi-tenant) with a file set ⇒ empty + a warning (the posture
+/// refuses it). Set + readable + ≥1 cert ⇒ those certs. Set-but-unreadable / no valid cert ⇒ a hard
+/// error (fail closed — a configured-but-broken CA must not silently degrade to no-trust).
+fn load_guest_egress_extra_roots(
+    allow: bool,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let path = match std::env::var(GUEST_EGRESS_EXTRA_CA_ENV) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return Ok(Vec::new()),
+    };
+    if !allow {
+        tracing::warn!(
+            env = GUEST_EGRESS_EXTRA_CA_ENV,
+            "ignoring a guest-egress extra CA: the security posture forbids it \
+             (allow_guest_egress_extra_ca is off — e.g. under multi-tenant)"
+        );
+        return Ok(Vec::new());
+    }
+    let pem =
+        std::fs::read(&path).map_err(|e| Error::GuestEgressCa(format!("reading {path:?}: {e}")))?;
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(&pem[..]))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::GuestEgressCa(format!("parsing {path:?}: {e}")))?;
+    if certs.is_empty() {
+        return Err(Error::GuestEgressCa(format!(
+            "{path:?} contained no PEM certificate"
+        )));
+    }
+    tracing::info!(
+        env = GUEST_EGRESS_EXTRA_CA_ENV,
+        count = certs.len(),
+        path = %path,
+        "guest egress trusts operator extra CA(s) (dev-posture; webpki roots still apply)"
+    );
+    Ok(certs)
+}
+
 /// Transit). `None`/empty ⇒ no wrapping. The Vault token is read from the
 /// environment (`token_env`), never a file. This seals a managed SQL credential at
 /// rest; a managed database fails closed without it.

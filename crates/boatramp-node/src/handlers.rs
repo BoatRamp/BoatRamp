@@ -57,6 +57,10 @@ pub async fn build_handler_runtime(
     allow_guest_private_egress: bool,
     // Posture: the instance's own serve socket(s) a guest self-call may reach (empty ⇒ off).
     self_egress_addrs: Vec<std::net::SocketAddr>,
+    // Dev-posture guest-egress extra CA(s), DER-encoded (empty ⇒ stock webpki-only egress trust).
+    // Parsed + posture-gated by the caller (`node.rs`), so an empty vec here means either the
+    // posture forbids it (multi-tenant) or no CA file was configured.
+    guest_egress_extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     // Posture: whether a site handler's / function's `secrets` map may resolve a bare /
     // `env:` reference against the serve process's own environment (on under single-tenant/
     // dev, off under multi-tenant — an untrusted tenant must not name arbitrary host env vars).
@@ -133,7 +137,8 @@ pub async fn build_handler_runtime(
     .with_streaming_limits(streaming_limits)
     .with_outbound_timeout(outbound_timeout)
     .with_private_egress(allow_guest_private_egress)
-    .with_self_egress(self_egress_addrs);
+    .with_self_egress(self_egress_addrs)
+    .with_guest_egress_extra_roots(guest_egress_extra_roots);
     let sql = build_sql_backends(
         handlers_cfg.and_then(|h| h.bindings.sql.as_ref()),
         data_dir,
@@ -409,6 +414,7 @@ pub async fn build_handler_runtime(
     // Kept in lockstep with the `#[cfg(feature = "handlers")]` signature + the single
     // node.rs caller (the caller passes the posture value unconditionally); a lean
     // node has no guest to gate, so it is ignored.
+    _guest_egress_extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     _allow_env_secret_refs: bool,
     _allow_guest_email: bool,
     _require_tenancy_declaration: bool,

@@ -1549,3 +1549,89 @@ mod tests {
         ));
     }
 }
+
+/// The dev-posture guest-egress extra-CA gate: a REAL loopback TLS handshake proving
+/// [`guest_egress_client_config`] trusts an operator-supplied CA **only when supplied**, and never
+/// bypasses verification. This is the boatramp-side hard gate for the extra-CA feature (construens'
+/// compiled-guest OIDC back-channel test is the end-to-end companion).
+#[cfg(test)]
+mod egress_tls_tests {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+
+    /// Mint a throwaway CA + a `localhost` leaf signed by it. Returns (ca_der, server_chain, key).
+    fn ca_and_leaf() -> (
+        CertificateDer<'static>,
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+    ) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let ca_der = ca_cert.der().clone();
+        let chain = vec![leaf_cert.der().clone(), ca_cert.der().clone()];
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        (ca_der, chain, key)
+    }
+
+    /// A one-shot loopback rustls server presenting `chain`/`key`; returns its bound addr.
+    async fn spawn_tls_server(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> std::net::SocketAddr {
+        let cfg = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await; // drive the handshake; result unused
+            }
+        });
+        addr
+    }
+
+    /// Does a guest-egress client trusting `extra` complete a TLS handshake to `addr`?
+    async fn handshakes(addr: std::net::SocketAddr, extra: &[CertificateDer<'static>]) -> bool {
+        let Ok(cfg) = guest_egress_client_config(extra) else {
+            return false;
+        };
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
+            return false;
+        };
+        let name = ServerName::try_from("localhost").unwrap();
+        connector.connect(name, tcp).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn guest_egress_extra_ca_is_trusted_only_when_supplied() {
+        let (ca, chain, key) = ca_and_leaf();
+        // WITH the operator CA in the extra set → the handshake to the test-CA server succeeds
+        // (the CA is a new trust anchor, so the leaf verifies — real HTTPS, just an added root).
+        let addr = spawn_tls_server(chain.clone(), key.clone_key()).await;
+        assert!(
+            handshakes(addr, std::slice::from_ref(&ca)).await,
+            "an operator-supplied extra CA is trusted ⇒ the handshake succeeds"
+        );
+        // WITHOUT it (the default, webpki-only trust) → the SAME server is rejected: verification is
+        // still fully performed, so an unknown-CA cert fails the handshake (never a bypass).
+        let addr2 = spawn_tls_server(chain, key).await;
+        assert!(
+            !handshakes(addr2, &[]).await,
+            "no extra CA ⇒ the test-CA server is rejected (verification is not bypassed)"
+        );
+    }
+}
