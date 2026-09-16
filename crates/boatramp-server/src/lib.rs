@@ -5082,6 +5082,53 @@ mod tests {
             "a forged envelope fails the scoped op closed"
         );
 
+        // (4) EXPIRED: a valid fleet signature whose envelope has already expired → NO principal →
+        // fail closed (a stale producer stamp can never keep scoping the consumer past its TTL).
+        let expired = mint_context("acme", 3600, now.saturating_sub(7200), signer.as_ref())
+            .await
+            .unwrap();
+        let expired_b = rebuild.bindings_for(Some(&expired)).await.unwrap();
+        let ht = expired_b
+            .resolved_tenancy()
+            .expect("the tenancy decision is present (but factless)");
+        assert!(
+            ht.value().is_none()
+                && matches!(ht.orm_scope(TenantAxis::Read), Err(TenantDenied::NoSource)),
+            "an expired envelope resolves no own tenant and fails the scoped op closed"
+        );
+
+        // (5) INTERLEAVING (per-message isolation across a batch): rebuild message A (acme) then a
+        // DIFFERENT sealed message B (globex), and confirm each resolves to ITS OWN tenant and scopes
+        // the engine to only that tenant's row — the resolve carries no state between messages, so a
+        // batch mixing tenants can never cross-attribute (acme's binding is never reused for globex).
+        let env_b = mint_context("globex", 3600, now, signer.as_ref())
+            .await
+            .unwrap();
+        let a = rebuild.bindings_for(Some(&env)).await.unwrap();
+        let b = rebuild.bindings_for(Some(&env_b)).await.unwrap();
+        let ht_a = a.resolved_tenancy().unwrap();
+        let ht_b = b.resolved_tenancy().unwrap();
+        assert_eq!(ht_a.value(), Some(&SqlValue::Text("acme".into())));
+        assert_eq!(ht_b.value(), Some(&SqlValue::Text("globex".into())));
+        assert_eq!(
+            read_bodies(
+                db.as_ref(),
+                &ht_a.orm_scope(TenantAxis::Read).unwrap().unwrap()
+            )
+            .await,
+            vec!["acme-note".to_string()],
+            "message A stays scoped to acme"
+        );
+        assert_eq!(
+            read_bodies(
+                db.as_ref(),
+                &ht_b.orm_scope(TenantAxis::Read).unwrap().unwrap()
+            )
+            .await,
+            vec!["globex-note".to_string()],
+            "message B (interleaved) scopes to globex ONLY — no bleed from A's binding"
+        );
+
         println!(
             "CONSUMER SIGNED-CONTEXT DISPATCH OK: the site-consumers async lane resolves each \
              claimed message's host-sealed signed_context per message; a valid fleet-signed \
