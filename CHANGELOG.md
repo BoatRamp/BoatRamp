@@ -5,6 +5,31 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.15] - 2026-09-16
+
+A target-write shape addition (own↔target parity), behind a security review and the CI-hard
+plain-wasm target-write live gate.
+
+### Added
+- **A confined `ON CONFLICT … DO UPDATE` upsert is now a valid `via: [capability]` target write.**
+  A target write previously refused every upsert (`INSERT … ON CONFLICT`), so an app that shared one
+  latest-wins upsert helper across its own-scoped and capability-target paths (the natural, DRY
+  design — e.g. a client re-submitting a project survey) hit an own↔target asymmetry. A
+  capability-axis upsert is now admitted and confined from the pieces the target-write path already
+  had: the INSERT arm force-stamps `tenant = B` + the public-visibility columns and accepts only the
+  write-allowlisted cells; the `DO UPDATE SET` arm is confined to the same write allowlist (never the
+  tenant or a visibility column) and is guarded to `tenant = B` at compile (the existing v0.4.9
+  qualified conflict-guard, via the write stamp), so a conflict-row update can never touch another
+  tenant's row. Two requirements keep it sound and are refused fail-closed otherwise: (1) the upsert
+  is admitted **only on the capability axis** — an anonymous `domain`/`handle` source (or any
+  `target_or_null`, whose shared `NULL`-base arm forces the subset) still refuses it, because the
+  `tenant = B` DO-UPDATE guard carries no visibility subset and could otherwise touch `B`'s non-public
+  row; (2) the `ON CONFLICT` target must include the tenant column (bare, not `t.col`), so a conflict
+  is always the target tenant's own row — `B`'s INSERT still lands when another tenant holds the same
+  tenant-agnostic natural key, with no cross-tenant no-op or existence oracle. Plain target
+  INSERT/UPDATE/DELETE, the own-scoped upsert (v0.4.9), and MySQL's fail-closed refusal of a
+  tenant-guarded upsert are all unchanged.
+
 ## [0.4.14] - 2026-09-16
 
 A target-read confinement fix that completes ruling A (the `via: [capability]` visibility-subset

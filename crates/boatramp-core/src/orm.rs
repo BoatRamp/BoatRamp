@@ -746,6 +746,35 @@ impl Scope {
         }
     }
 
+    /// Whether a target read/write must apply the per-table PUBLIC visibility subset: `true` for an
+    /// anonymous `domain`/`handle` source or any `target_or_null` (the shared `NULL`-base arm), where
+    /// the subset is the only guard; `false` for a plain `capability`-only target (ruling A — the
+    /// capability is the authorization, so the confinement is `tenant = B` alone). `false` when this
+    /// is not a target scope. Read by the upsert confinement to admit an `ON CONFLICT DO UPDATE` only
+    /// where the DO-UPDATE's `tenant = B` guard matches the (subset-less) plain-UPDATE confinement.
+    fn target_require_public(&self) -> bool {
+        matches!(
+            &self.keys,
+            TableKeys::PerTableTarget {
+                require_public: true,
+                ..
+            }
+        )
+    }
+
+    /// The resolved tenant column for `table` under a target scope (the per-table key, or `None` when
+    /// this is not a target scope or the table has no plain-`Column` tenant key). Used to require that
+    /// a target upsert's conflict target includes the tenant column.
+    fn target_tenant_column(&self, table: &str) -> Option<String> {
+        match &self.keys {
+            TableKeys::PerTableTarget { keys, .. } => match keys.get(table) {
+                Some(ResolvedScope::Column(c)) => Some(c.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Refuse a **target** write to a `TenantOrSession` (anonymous-session-keyed) table. A target
     /// principal carries only the target tenant `B` (no session fact), so such a row could only be
     /// stamped `tenant = B` — silently claiming an anon/session-owned row for `B` and breaking the
@@ -1050,12 +1079,18 @@ impl Insert {
         Ok(())
     }
 
-    /// Confine a **target INSERT** (5b): the guest may set ONLY the route's SET-allowlisted columns,
-    /// and the host force-stamps the table's public-visibility columns so the inserted row lands in
-    /// `B`'s public subset. Refused fail-closed on: a read-only target (`empty_allowlist`), an
-    /// `INSERT … SELECT` / `ON CONFLICT` (shapes that could reach beyond the public subset), a guest
-    /// cell outside the allowlist (or the tenant/visibility columns), or a public subset that cannot
-    /// be forced to a concrete row. (`tenant = B` itself is stamped by the shared own-write path.)
+    /// Confine a **target INSERT / upsert** (5b): the guest may set ONLY the route's SET-allowlisted
+    /// columns, and the host force-stamps the table's public-visibility columns so the inserted row
+    /// lands in `B`'s public subset. A **capability-axis `ON CONFLICT … DO UPDATE` upsert** is
+    /// supported (own↔target parity): the INSERT arm is confined exactly as a plain target INSERT,
+    /// and the DO UPDATE arm is confined to the write allowlist here + guarded to `tenant = B` at
+    /// compile (`render_conflict`, via the write stamp), so the conflict-row update can never touch
+    /// another tenant's row. Refused fail-closed on: a read-only target (`empty_allowlist`), an
+    /// `INSERT … SELECT`, an upsert on an anonymous (`require_public`) target (the DO-UPDATE guard
+    /// carries no visibility subset — see below), an upsert whose conflict target omits the tenant
+    /// column, a guest cell outside the allowlist (or the tenant/visibility columns), or a public
+    /// subset that cannot be forced to a concrete row. (`tenant = B` is stamped by the shared
+    /// own-write path.)
     fn confine_target_insert(
         &mut self,
         scope: &Scope,
@@ -1070,8 +1105,44 @@ impl Insert {
         if self.from_select.is_some() {
             return Err(OrmError::TargetWriteUnsupported("INSERT … SELECT"));
         }
-        if self.conflict.is_some() {
-            return Err(OrmError::TargetWriteUnsupported("ON CONFLICT upsert"));
+        // A confined `ON CONFLICT … DO UPDATE` upsert IS a valid target write on the CAPABILITY axis
+        // (the request's `embedSubmitSurvey` latest-wins pattern; own↔target parity). Two hard
+        // requirements keep it sound; a target upsert that fails either is refused fail-closed:
+        if let Some(oc) = &self.conflict {
+            // (a) Capability axis only. On an anonymous `domain`/`handle` source (or any
+            //     `target_or_null`) a plain UPDATE confines to `tenant = B AND <public subset>`, but
+            //     the DO-UPDATE guard is `tenant = B` alone (render_conflict has no subset), so such
+            //     an upsert could update `B`'s NON-public row on a conflict. Refuse it (unchanged
+            //     from before — only the capability axis, whose plain UPDATE is likewise `tenant = B`
+            //     alone post-ruling-A, is newly admitted).
+            if scope.target_require_public() {
+                return Err(OrmError::TargetWriteUnsupported(
+                    "ON CONFLICT upsert on an anonymous domain/handle/target_or_null target",
+                ));
+            }
+            // A conflict-target column must be a BARE name (never `t.col`): a qualified name is
+            // invalid in an `ON CONFLICT` inference clause AND could let a `.`-spelling slip past the
+            // tenant-key check below on `same_col`'s last-segment compare. Refuse it self-describingly
+            // at compile (mirrors gate 0 on the SET LHS in `assert_target_settable`).
+            for c in &oc.conflict_columns {
+                if c.contains('.') {
+                    return Err(OrmError::TargetWriteColumnDenied(c.clone()));
+                }
+            }
+            // (b) The conflict target must include the tenant column, so a conflict is always the
+            //     target tenant's OWN row: `B`'s INSERT still lands when another tenant holds the
+            //     same tenant-agnostic natural key, and there is no cross-tenant no-op / existence
+            //     oracle. (The `tenant = B` guard + dropping any SET on the tenant column are applied
+            //     at compile by render_conflict via the write stamp — belt-and-suspenders here.)
+            match scope.target_tenant_column(&self.table) {
+                Some(tcol) if oc.conflict_columns.iter().any(|c| same_col(c, &tcol)) => {}
+                _ => return Err(OrmError::TargetUpsertKeyMissingTenant(self.table.clone())),
+            }
+            // The DO UPDATE SET is confined exactly like a target UPDATE: only allowlisted, non-tenant,
+            // non-visibility columns may be assigned.
+            for a in &oc.update {
+                scope.assert_target_settable(&self.table, &a.column)?;
+            }
         }
         // Every guest-supplied cell must be a granted, non-tenant, non-visibility column.
         for row in &self.rows {
@@ -1417,11 +1488,21 @@ pub enum OrmError {
     #[error("tenancy: target INSERT cannot force table {0:?} into its public subset (a non-equality/non-null public term); refused")]
     PublicSubsetNotForceable(String),
     /// A target write used a shape the confinement does not support: an `INSERT … SELECT`, an
-    /// `ON CONFLICT` upsert, or a `promote`. These could reach rows outside the public subset (a
-    /// selected source, or an existing private row on conflict), so a target write is restricted to a
-    /// plain `VALUES` INSERT / a confined UPDATE — the rest are refused (deny-by-default).
-    #[error("tenancy: unsupported target write shape ({0}); target writes are a plain INSERT or a confined UPDATE only")]
+    /// `ON CONFLICT` upsert on an anonymous (domain/handle/`target_or_null`) target, or a `promote`.
+    /// These could reach rows outside the public subset (a selected source; or a conflict-row DO
+    /// UPDATE whose `tenant = B` guard carries no visibility subset, so an anonymous upsert could
+    /// touch `B`'s non-public row). A **capability**-axis `ON CONFLICT … DO UPDATE` upsert IS
+    /// supported (own↔target parity — see [`Insert::confine_target_insert`]); the rest are refused.
+    #[error("tenancy: unsupported target write shape ({0}); target writes are a plain INSERT, a confined UPDATE, or a capability-axis ON CONFLICT DO UPDATE upsert")]
     TargetWriteUnsupported(&'static str),
+    /// A capability-axis target upsert (`ON CONFLICT … DO UPDATE`) whose conflict target does NOT
+    /// include the table's tenant column. Required so a conflict is always a same-tenant (`B`) row:
+    /// otherwise `B`'s INSERT could conflict with another tenant `A`'s row on a tenant-agnostic
+    /// natural key, and the `tenant = B`-guarded DO UPDATE would silently no-op — dropping `B`'s
+    /// write AND leaking that `A` holds that key (a cross-tenant existence oracle). Refused
+    /// fail-closed; add the tenant column to the conflict target (e.g. `(tenant_id, …)`).
+    #[error("tenancy: a target upsert's ON CONFLICT target must include the tenant column for table {0:?} (so a conflict is always the target tenant's own row)")]
+    TargetUpsertKeyMissingTenant(String),
     /// A target write (INSERT/UPDATE) touched a `TenantOrSession` (anonymous-session-keyed) table. A
     /// target principal carries only the target tenant `B` (no session fact), so the host cannot write
     /// such a row session-scoped — it could only stamp `tenant = B`, which would silently claim an
@@ -4538,6 +4619,31 @@ mod tests {
         }
     }
 
+    /// A **capability-axis** target-WRITE scope for `client_survey` (`require_public = false`, ruling
+    /// A): tenant key `tenant_id`, NO declared public subset, SET-allowlist = the given columns. This
+    /// is the axis on which an `ON CONFLICT … DO UPDATE` upsert is admitted.
+    fn target_write_scope_cap(write: &[&str]) -> Scope {
+        use std::collections::{BTreeMap, BTreeSet};
+        Scope {
+            column: "tenant_id".into(),
+            value: Some(t("tenant_B")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTableTarget {
+                keys: BTreeMap::from([(
+                    "client_survey".to_string(),
+                    ResolvedScope::Column("tenant_id".to_string()),
+                )]),
+                public: BTreeMap::new(), // capability axis: no visibility subset (ruling A)
+                write: write
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+                require_public: false,
+            },
+        }
+    }
+
     fn target_insert(cells: Vec<Assignment>) -> Insert {
         Insert {
             table: "products".into(),
@@ -4706,17 +4812,174 @@ mod tests {
             ins.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
             OrmError::TargetWriteUnsupported("INSERT … SELECT")
         ));
+        // An upsert on an ANONYMOUS (require_public — domain/handle/target_or_null) target stays
+        // refused: the DO-UPDATE `tenant = B` guard carries no visibility subset.
         let mut ins2 = target_insert(vec![Assignment {
             column: "title".into(),
             value: Expr::val(t("x")),
         }]);
         ins2.conflict = Some(OnConflict {
-            conflict_columns: vec![],
-            update: vec![],
+            conflict_columns: vec!["tenant_id".into(), "id".into()],
+            update: vec![Assignment {
+                column: "title".into(),
+                value: Expr::col("excluded.title"),
+            }],
         });
         assert!(matches!(
             ins2.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
-            OrmError::TargetWriteUnsupported("ON CONFLICT upsert")
+            OrmError::TargetWriteUnsupported(
+                "ON CONFLICT upsert on an anonymous domain/handle/target_or_null target"
+            )
+        ));
+    }
+
+    #[test]
+    fn target_upsert_capability_confines_do_update_and_guards_tenant_b() {
+        // v0.4.15 (own↔target parity): a capability-axis `ON CONFLICT (tenant_id, …) DO UPDATE`
+        // upsert compiles — the INSERT stamps tenant=B, the DO UPDATE SET is allowlisted, and the
+        // conflict-update is guarded to `tenant = B` so it can never touch another tenant's row.
+        // The natural-key cells (project_id, client_id) are inserted by the guest, so they're in the
+        // write-allowlist alongside the mutated `score` (a target INSERT cell must be allowlisted).
+        let scope = target_write_scope_cap(&["score", "comment", "project_id", "client_id"]);
+        let mut ins = Insert {
+            table: "client_survey".into(),
+            rows: vec![RowValues {
+                cells: vec![
+                    Assignment {
+                        column: "project_id".into(),
+                        value: Expr::val(t("p1")),
+                    },
+                    Assignment {
+                        column: "client_id".into(),
+                        value: Expr::val(t("cli_a")),
+                    },
+                    Assignment {
+                        column: "score".into(),
+                        value: Expr::val(SqlValue::Integer(5)),
+                    },
+                ],
+            }],
+            conflict: Some(OnConflict {
+                conflict_columns: vec!["tenant_id".into(), "project_id".into(), "client_id".into()],
+                update: vec![Assignment {
+                    column: "score".into(),
+                    value: Expr::col("excluded.score"),
+                }],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (sql, params) = ins.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            sql.contains("ON CONFLICT (tenant_id, project_id, client_id) DO UPDATE SET"),
+            "upsert compiled: {sql}"
+        );
+        assert!(
+            sql.contains("score = excluded.score"),
+            "SET allowlisted col: {sql}"
+        );
+        assert!(
+            sql.contains("client_survey.tenant_id ="),
+            "DO UPDATE guarded to tenant = B (qualified): {sql}"
+        );
+        assert!(
+            params.iter().filter(|p| **p == t("tenant_B")).count() >= 2,
+            "tenant B stamped on INSERT AND bound in the DO-UPDATE guard: {params:?}"
+        );
+    }
+
+    #[test]
+    fn target_upsert_capability_requires_tenant_in_conflict_key() {
+        // Deny-by-default: a capability upsert whose conflict target OMITS the tenant column is
+        // refused — else B's INSERT could conflict with tenant A's row on a tenant-agnostic key.
+        let scope = target_write_scope_cap(&["score", "project_id", "client_id"]);
+        let mut ins = Insert {
+            table: "client_survey".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "score".into(),
+                    value: Expr::val(SqlValue::Integer(5)),
+                }],
+            }],
+            conflict: Some(OnConflict {
+                conflict_columns: vec!["project_id".into(), "client_id".into()], // NO tenant_id
+                update: vec![Assignment {
+                    column: "score".into(),
+                    value: Expr::col("excluded.score"),
+                }],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        assert!(matches!(
+            ins.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetUpsertKeyMissingTenant(t) if t == "client_survey"
+        ));
+        // A `.`-qualified conflict-key column is refused self-describingly at compile (invalid ON
+        // CONFLICT syntax + can't be allowed to slip past the tenant-key check on a last-segment match).
+        let mut qual = Insert {
+            table: "client_survey".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "score".into(),
+                    value: Expr::val(SqlValue::Integer(5)),
+                }],
+            }],
+            conflict: Some(OnConflict {
+                conflict_columns: vec!["cs.tenant_id".into(), "project_id".into()],
+                update: vec![Assignment {
+                    column: "score".into(),
+                    value: Expr::col("excluded.score"),
+                }],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        assert!(matches!(
+            qual.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(c) if c == "cs.tenant_id"
+        ));
+    }
+
+    #[test]
+    fn target_upsert_capability_refuses_a_non_allowlisted_or_tenant_do_update_set() {
+        // The DO UPDATE SET is confined exactly like a target UPDATE: a non-allowlisted column, or the
+        // tenant column, in the SET is refused (can't change ownership or touch a non-granted column).
+        let scope = target_write_scope_cap(&["score"]);
+        let mk = |set_col: &str| Insert {
+            table: "client_survey".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "score".into(),
+                    value: Expr::val(SqlValue::Integer(5)),
+                }],
+            }],
+            conflict: Some(OnConflict {
+                conflict_columns: vec!["tenant_id".into(), "project_id".into()],
+                update: vec![Assignment {
+                    column: set_col.into(),
+                    value: Expr::val(SqlValue::Integer(9)),
+                }],
+            }),
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        let mut bad_col = mk("secret"); // not in the allowlist
+        assert!(matches!(
+            bad_col.force_scope(Some(&scope), Some(&scope)).unwrap_err(),
+            OrmError::TargetWriteColumnDenied(_)
+        ));
+        let mut tenant_set = mk("tenant_id"); // the tenant column itself
+        assert!(matches!(
+            tenant_set
+                .force_scope(Some(&scope), Some(&scope))
+                .unwrap_err(),
+            OrmError::TargetWriteColumnDenied(_)
         ));
     }
 
