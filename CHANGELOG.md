@@ -5,6 +5,26 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.18] - 2026-09-17
+
+Env-var parity for the guest-feature posture knobs, behind a security review (clean, ship) and
+config-resolution guard tests.
+
+### Fixed
+- **Six guest-feature posture knobs are now settable via `BOATRAMP_SECURITY_*` env vars.** They could
+  be set in a `boatramp.cfg` `[security.overrides]` block but had no env var, so an env-only
+  (12-factor) fleet had no lever to opt them back on under the `multi-tenant` preset (which defaults
+  them off). Most acutely, **`allow_guest_email`** — flipping a fleet to `multi-tenant` silently
+  disabled guest SMTP delivery with no env override (the fallback is best-effort, so signup still
+  returned `ok` while emails quietly stopped). Added `BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL`,
+  `…_ALLOW_GUEST_EGRESS_EXTRA_CA` (shipped config-only in v0.4.17 — the same gap class), and the four
+  `…_ALLOW_GUEST_ADMIN_{DOMAINS,EMAIL,SITE,SECRETS}` self-config knobs. Pure env-source parity: the
+  override field, `apply()`, `explain()`, and the resolved posture already existed for each; only the
+  env→override mapping (and its `SECURITY_ENV_VARS` registration) was missing, so enforcement and the
+  secondary gates (an SMTP profile + secrets envelope still gate actual email delivery) are unchanged.
+  A new exhaustive guard test enumerates every `PostureOverrides` field and asserts each has an env
+  mapping, so a future knob can't silently ship env-unsettable.
+
 ## [0.4.17] - 2026-09-16
 
 Two independent async-lane / egress fixes, each behind one combined security review (clean, first
