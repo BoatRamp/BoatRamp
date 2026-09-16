@@ -1465,11 +1465,130 @@ mod tests {
             "a read-only target route denies the write axis outright"
         );
 
+        // (6) v0.4.15 — a CAPABILITY-axis `ON CONFLICT … DO UPDATE` upsert (own↔target parity, the
+        // embedSubmitSurvey latest-wins pattern). The conflict key is tenant-scoped
+        // `(tenant_id, project_id, client_id)`; the DO UPDATE is guarded to `tenant = B`. A first
+        // submit inserts (stamped B), a second upserts the same (B,key) row (latest wins), and a
+        // pre-seeded tenant-A row sharing the natural key is neither updated nor duplicated.
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE client_survey (tenant_id TEXT, project_id TEXT, client_id TEXT, \
+                 score INTEGER, PRIMARY KEY (tenant_id, project_id, client_id))",
+                &[],
+            )
+            .await
+            .unwrap();
+            // tenant A already rated (proj1, cli_a) = 1 — must never be touched by B's capability upsert.
+            tx.execute(
+                "INSERT INTO client_survey (tenant_id, project_id, client_id, score) \
+                 VALUES ('tenant_A','proj1','cli_a',1)",
+                &[],
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let survey_schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("client_survey".into(), TableScope::Tenant)]),
+            ..Default::default()
+        };
+        // Capability axis: require_public = false (no visibility subset); the guest may set the
+        // natural-key cells + score.
+        let ht_cap = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &survey_schema,
+            "survey",
+            &[
+                "project_id".to_string(),
+                "client_id".to_string(),
+                "score".to_string(),
+            ],
+            false,
+        );
+        let write_cap = ht_cap.orm_scope(TenantAxis::Write).unwrap().unwrap();
+        let read_cap = ht_cap.orm_scope(TenantAxis::Read).unwrap().unwrap();
+        let submit = |score: i64| {
+            let mut ins = Insert {
+                table: "client_survey".into(),
+                rows: vec![RowValues {
+                    cells: vec![
+                        Assignment {
+                            column: "project_id".into(),
+                            value: Expr::val(SqlValue::Text("proj1".into())),
+                        },
+                        Assignment {
+                            column: "client_id".into(),
+                            value: Expr::val(SqlValue::Text("cli_a".into())),
+                        },
+                        Assignment {
+                            column: "score".into(),
+                            value: Expr::val(SqlValue::Integer(score)),
+                        },
+                    ],
+                }],
+                conflict: Some(boatramp_core::orm::OnConflict {
+                    conflict_columns: vec![
+                        "tenant_id".into(),
+                        "project_id".into(),
+                        "client_id".into(),
+                    ],
+                    update: vec![Assignment {
+                        column: "score".into(),
+                        value: Expr::col("excluded.score"),
+                    }],
+                }),
+                scope: None,
+                returning: vec![],
+                from_select: None,
+            };
+            ins.force_scope(Some(&write_cap), Some(&read_cap)).unwrap();
+            ins.compile(Dialect::Sqlite).unwrap()
+        };
+        for score in [5i64, 9] {
+            let (sql, params) = submit(score);
+            assert!(
+                sql.contains("client_survey.tenant_id ="),
+                "DO UPDATE guarded to tenant = B: {sql}"
+            );
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(&sql, &params).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        let mut tx = db.begin().await.unwrap();
+        let survey = tx
+            .query(
+                "SELECT tenant_id, score FROM client_survey ORDER BY tenant_id",
+                &[],
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // Exactly two rows: tenant A's untouched (score 1) and tenant B's latest-wins (score 9).
+        assert_eq!(
+            survey.rows.len(),
+            2,
+            "no cross-tenant row created: {survey:?}"
+        );
+        assert_eq!(
+            survey.rows[0],
+            vec![SqlValue::Text("tenant_A".into()), SqlValue::Integer(1)],
+            "tenant A's survey untouched by B's capability upsert"
+        );
+        assert_eq!(
+            survey.rows[1],
+            vec![SqlValue::Text("tenant_B".into()), SqlValue::Integer(9)],
+            "tenant B's survey upserted latest-wins (5 -> 9) on the (B,key) row"
+        );
+
         println!(
             "PLAIN-WASM TARGET WRITE ISOLATION OK: a target route's orm writes land only in tenant \
              B's public subset (INSERT force-stamps tenant=B + visibility; UPDATE confined to B's \
-             public rows, only the allowlisted column settable), and a DELETE / visibility-flip / \
-             read-only write are all refused, on a real libsql engine"
+             public rows, only the allowlisted column settable), a DELETE / visibility-flip / \
+             read-only write are all refused, AND a capability-axis ON CONFLICT DO UPDATE upsert is \
+             latest-wins on the (B,key) row with tenant A untouched/unduplicated, on a real libsql engine"
         );
     }
 
