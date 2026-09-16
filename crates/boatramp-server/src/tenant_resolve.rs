@@ -1207,6 +1207,196 @@ mod tests {
         );
     }
 
+    /// **Live** proof (v0.4.16) that a per-table **`TenantOrBase`** scope folds a table's shared
+    /// `tenant IS NULL` base into reads on BOTH the own and target axes, on a REAL libsql engine,
+    /// WITHOUT widening a sibling plain-tenant table: an own read as A returns A's rows ⊕ the base
+    /// (never B's); a target read for B returns B's public rows ⊕ the base (never A's, never B's
+    /// non-public draft); a write stamps the resolved tenant (never a NULL base row). orm + raw-SQL.
+    /// `#[ignore]`d (static-musl libsql segfault); the `test-target-plain-wasm` CI job runs it +
+    /// greps the marker.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn plain_wasm_target_or_base_folds_shared_base_on_own_and_target_on_a_real_engine() {
+        use boatramp_core::orm::{Expr, ScopeMode, Select, SelectItem, TableKeys};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{
+            AccessMode, PublicCmp, PublicLiteral, PublicPredicate, PublicSubset, PublicTerm,
+            TableScope, TenancySchema,
+        };
+        use boatramp_handlers::{HostTenancy, TenantAxis};
+        use std::collections::BTreeMap;
+
+        let dir =
+            std::env::temp_dir().join(format!("boatramp-target-orbase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "shop", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE pack (id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, published INTEGER)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, name, published) in [
+                ("base1", None, "base pack", 1i64), // shared base (tenant_id NULL)
+                ("a1", Some("tenant_A"), "A pack", 1),
+                ("b1", Some("tenant_B"), "B pack", 1),
+                ("b2", Some("tenant_B"), "B draft", 0), // B's non-public row (target subset excludes)
+            ] {
+                tx.execute(
+                    "INSERT INTO pack (id, tenant_id, name, published) VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        tenant.map_or(SqlValue::Null, |t| SqlValue::Text(t.into())),
+                        SqlValue::Text(name.into()),
+                        SqlValue::Integer(published),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let mut schema = TenancySchema {
+            default_tenant_key: "tenant_id".into(),
+            tables: BTreeMap::from([("pack".into(), TableScope::TenantOrBase)]),
+            ..Default::default()
+        };
+        schema.public_subsets.insert(
+            "pack".into(),
+            PublicSubset {
+                predicate: PublicPredicate {
+                    terms: vec![PublicTerm::Cmp {
+                        column: "published".into(),
+                        op: PublicCmp::Eq,
+                        value: PublicLiteral::Int(1),
+                    }],
+                },
+                world_public: true,
+                listable: true,
+            },
+        );
+
+        let name_q = || Select {
+            columns: vec![SelectItem {
+                expr: Expr::col("name"),
+                alias: None,
+            }],
+            ..Select::from("pack")
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+
+        // (1) OWN axis as tenant A: (tenant = A OR tenant IS NULL) — A's rows ⊕ the shared base,
+        // never B's. (No public subset on the own axis.)
+        let own_a = boatramp_core::orm::Scope {
+            column: "tenant_id".into(),
+            value: Some(SqlValue::Text("tenant_A".into())),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(schema.table_key_map()),
+        };
+        let mut q = name_q();
+        q.force_scope(&own_a).unwrap();
+        let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let rows = run_text_rows(tx.as_mut(), &sql, &params).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sorted(rows),
+            vec!["A pack".to_string(), "base pack".to_string()],
+            "own read as A = A's rows ⊕ shared base, never B's: {sql}"
+        );
+
+        // (2) TARGET axis for tenant B (domain source, require_public): (tenant = B OR tenant IS NULL)
+        // AND published = 1 — B's PUBLIC row ⊕ the public base, never A's, never B's draft.
+        let ht = HostTenancy::target(
+            SqlValue::Text("tenant_B".into()),
+            AccessMode::Own,
+            &schema,
+            "pack",
+            &[],
+            true,
+        );
+        let mut tq = name_q();
+        tq.force_scope(&ht.orm_scope(TenantAxis::Read).unwrap().unwrap())
+            .unwrap();
+        let (tsql, tparams) = tq.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let trows = run_text_rows(tx.as_mut(), &tsql, &tparams).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sorted(trows),
+            vec!["B pack".to_string(), "base pack".to_string()],
+            "target orm read for B = B's public rows ⊕ public base, never A, never B's draft: {tsql}"
+        );
+
+        // (3) raw-SQL target read (AST-rewritten): identical confinement.
+        let rewritten = ht
+            .rewrite_target_read("SELECT name FROM pack", Dialect::Sqlite)
+            .unwrap();
+        assert!(
+            rewritten.contains("pack.tenant_id = 'tenant_B' OR pack.tenant_id IS NULL"),
+            "raw-sql folds the base under a plain target read: {rewritten}"
+        );
+        let mut tx = db.begin().await.unwrap();
+        let rrows = run_text_rows(tx.as_mut(), &rewritten, &[]).await;
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sorted(rrows),
+            vec!["B pack".to_string(), "base pack".to_string()],
+            "raw-sql target read for B = B's public rows ⊕ public base: {rewritten}"
+        );
+
+        // (4) WRITE (own axis as A) stamps tenant = A, never a NULL base row.
+        let mut ins = boatramp_core::orm::Insert {
+            table: "pack".into(),
+            rows: vec![boatramp_core::orm::RowValues {
+                cells: vec![
+                    boatramp_core::orm::Assignment {
+                        column: "id".into(),
+                        value: Expr::val(SqlValue::Text("a_new".into())),
+                    },
+                    boatramp_core::orm::Assignment {
+                        column: "name".into(),
+                        value: Expr::val(SqlValue::Text("A wrote".into())),
+                    },
+                ],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&own_a), Some(&own_a)).unwrap();
+        let (isql, iparams) = ins.compile(Dialect::Sqlite).unwrap();
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&isql, &iparams).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let stamped = tx
+            .query("SELECT tenant_id FROM pack WHERE id = 'a_new'", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            stamped.rows[0][0],
+            SqlValue::Text("tenant_A".into()),
+            "an own write to a base-inclusive table stamps tenant = A, never a NULL base row"
+        );
+
+        println!(
+            "PLAIN-WASM TENANT-OR-BASE OK: a per-table TenantOrBase scope folds a table's shared \
+             tenant-NULL base into reads on both the own axis (A ⊕ base, never B) and the target axis \
+             (B's public rows ⊕ public base, never A, never B's draft), orm AND raw-sql, while a \
+             write stamps the resolved tenant (never a NULL base row), on a real libsql engine"
+        );
+    }
+
     /// **Live** proof (R4/D8, Stage 5b) that a **plain-wasm** target route's WRITES land ONLY in
     /// tenant `B`'s PUBLIC subset on a REAL libsql engine: an INSERT force-stamps `tenant = B` + the
     /// visibility columns (so the row is B's and public) and takes only the SET-allowlisted column

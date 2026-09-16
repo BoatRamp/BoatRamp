@@ -367,15 +367,18 @@ jobs:
         run: |
           set -eo pipefail
           # The plain-wasm target gates: READ isolation (5a), WRITE isolation (5b), attach_reference,
-          # the capability-only exemption, and the delegable-capability context round-trip (v0.4.5:
-          # mint -> redeem surfaces sub -> read-back -> in-guest client filter, on a real engine).
+          # the capability-only exemption, the delegable-capability context round-trip (v0.4.5:
+          # mint -> redeem surfaces sub -> read-back -> in-guest client filter), and the per-table
+          # TenantOrBase base⊕own/target fold (v0.4.16) — all on a real engine.
           cargo test -p boatramp-server --features handlers,oidc --lib \
             plain_wasm_target \
             -- --ignored --nocapture 2>&1 | tee target-plainwasm.log
-          grep -qE 'test result: ok\. 5 passed' target-plainwasm.log \
+          grep -qE 'test result: ok\. 6 passed' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant isolation tests did not all pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET ISOLATION OK' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant READ never reached its success marker (an orm/raw-sql target-read isolation breach or a skipped test)" >&2; exit 1; }
+          grep -q 'PLAIN-WASM TENANT-OR-BASE OK' target-plainwasm.log \
+            || { echo "::error::plain-wasm TenantOrBase base-fold never reached its success marker (a base⊕own/target confinement breach or a skipped test)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET WRITE ISOLATION OK' target-plainwasm.log \
             || { echo "::error::plain-wasm target-tenant WRITE never reached its success marker (a target-write isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'PLAIN-WASM TARGET ATTACH-REFERENCE ISOLATION OK' target-plainwasm.log \

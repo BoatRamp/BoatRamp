@@ -485,6 +485,21 @@ pub enum TableScope {
     /// belt-and-suspenders: a raw-SQL migration or an `all`-grant write that set BOTH columns on one
     /// row would let a session reader match a row a tenant also owns.
     TenantOrSession,
+    /// A **base-inclusive** table: rows with `default_tenant_key IS NULL` are **shared base** data
+    /// (global reference rows — e.g. base EP-vocabulary packs), readable by every tenant, while
+    /// non-NULL rows are the usual per-tenant rows. A READ confines to
+    /// `(default_tenant_key = <resolved own/target> OR default_tenant_key IS NULL)` (AND the public
+    /// subset on the target axis) on BOTH the own and target axes — the shared base is folded in
+    /// regardless of the *field's* scope, so a mixed-table field can fold the base into only the
+    /// tables that declare it (unlike the field-level `own_or_null`/`target_or_null`, which widen
+    /// every table the field reads). A WRITE stamps the resolved tenant exactly like [`Tenant`] — a
+    /// guest can never create or update a `NULL`-tenant base row (base rows are operator-seeded via a
+    /// privileged path). This is the per-**table** analog of the field-level NULL-base modes, and the
+    /// base-partition sibling of [`TenantOrSession`] (whose NULL partition is anonymous-session rows
+    /// instead of shared base). Unlike [`Unscoped`], the per-tenant (non-NULL) rows keep the
+    /// `tenant = <resolved>` boundary — only the NULL rows are shared — so a tenant can never read
+    /// another tenant's owned rows.
+    TenantOrBase,
 }
 
 /// The effective, host-resolved scope for one table (from [`TenancySchema::resolve`]) — the input
@@ -504,6 +519,14 @@ pub enum ResolvedScope {
         tenant: String,
         /// The anonymous-session column (`session_key`).
         session: String,
+    },
+    /// A base-inclusive table ([`TableScope::TenantOrBase`]): a READ confines to
+    /// `(tenant = <resolved> OR tenant IS NULL)` (the NULL rows are shared base, folded in on both
+    /// the own and target axes regardless of the field mode); a WRITE stamps `tenant = <resolved>`
+    /// exactly like [`Column`](ResolvedScope::Column) (never a NULL-base row).
+    TenantOrBase {
+        /// The tenant column (`default_tenant_key`); its `NULL` rows are the shared base.
+        tenant: String,
     },
 }
 
@@ -651,6 +674,9 @@ impl TenancySchema {
                 tenant: self.default_tenant_key.clone(),
                 session: self.session_key.clone()?,
             }),
+            TableScope::TenantOrBase => Some(ResolvedScope::TenantOrBase {
+                tenant: self.default_tenant_key.clone(),
+            }),
         }
     }
 
@@ -672,6 +698,9 @@ impl TenancySchema {
                     TableScope::TenantOrSession => ResolvedScope::TenantOrSession {
                         tenant: self.default_tenant_key.clone(),
                         session: self.session_key.clone()?, // no session_key ⇒ omit ⇒ deny
+                    },
+                    TableScope::TenantOrBase => ResolvedScope::TenantOrBase {
+                        tenant: self.default_tenant_key.clone(),
                     },
                 };
                 Some((table.clone(), resolved))
@@ -705,6 +734,32 @@ mod tests {
         );
         assert_eq!(schema.resolve("countries"), Some(ResolvedScope::Unscoped));
         assert_eq!(schema.resolve("secrets_table"), None); // undeclared → deny-by-default
+    }
+
+    #[test]
+    fn tenant_or_base_resolves_to_the_default_tenant_key_and_round_trips_json() {
+        // `{"kind":"tenant_or_base"}` → a base-inclusive table keyed on the default tenant column.
+        let schema: TenancySchema = serde_json::from_str(
+            r#"{"default_tenant_key":"tenant_id","tables":{"pack":{"kind":"tenant_or_base"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(schema.tables.get("pack"), Some(&TableScope::TenantOrBase));
+        assert_eq!(
+            schema.resolve("pack"),
+            Some(ResolvedScope::TenantOrBase {
+                tenant: "tenant_id".into()
+            })
+        );
+        assert_eq!(
+            schema.table_key_map().get("pack"),
+            Some(&ResolvedScope::TenantOrBase {
+                tenant: "tenant_id".into()
+            })
+        );
+        // Serializes back with the snake_case tag.
+        assert!(serde_json::to_string(&TableScope::TenantOrBase)
+            .unwrap()
+            .contains("tenant_or_base"));
     }
 
     #[test]
