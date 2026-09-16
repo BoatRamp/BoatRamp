@@ -440,7 +440,7 @@ async fn send_with_extra_roots(
             request
                 .uri()
                 .path_and_query()
-                .map(|p| p.as_str())
+                .map(http::uri::PathAndQuery::as_str)
                 .unwrap_or("/"),
         )
         .build()
