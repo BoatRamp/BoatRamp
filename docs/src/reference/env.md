@@ -139,6 +139,7 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS` | `overrides.allow_site_private_upstreams` | Permit site-declared gateway upstreams to private/loopback IPs. |
 | `BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS` | `overrides.allow_guest_private_egress` | Permit a guest's outbound `wasi:http` to reach private/loopback IPs. |
 | `BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS` | `overrides.allow_guest_self_egress` | Permit a guest's outbound `wasi:http` to reach this instance's own serve socket. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA` | `overrides.allow_guest_egress_extra_ca` | Permit the guest egress TLS client to trust an operator-supplied extra CA (`BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE`) on top of the webpki roots. Widens trust, never bypasses verification. Off under `multi-tenant`. |
 | `BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES` | `overrides.max_handler_blob_bytes` | Cap on handler blobstore host reads/ranges/copies (`0` = unlimited). |
 | `BOATRAMP_SECURITY_MAX_COMPONENT_BYTES` | `overrides.max_component_bytes` | Cap on a Wasm component blob (`0` = unlimited). |
 | `BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE` | `overrides.oidc_require_audience` | Require an OIDC audience when OIDC is enabled. |
@@ -155,6 +156,11 @@ See [boatramp.cfg](./boatramp-cfg.md) and
 | `BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB` | `overrides.allow_cross_tenant_db` | Permit a component to declare a cross-tenant (`all`) read/write access mode. Off under `multi-tenant` (capped to `own`). |
 | `BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY` | `overrides.allow_guest_mint_capability` | Permit a guest's `capability` capability to mint fleet-signed target-capability tokens. Off under `multi-tenant`. |
 | `BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS` | `overrides.max_guest_capability_ttl_secs` | Operator ceiling (seconds) on a guest-minted capability's TTL; a larger request is clamped. `0` disables minting. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL` | `overrides.allow_guest_email` | Permit a guest handler's/function's `email` capability to send. Off under `multi-tenant` (an SMTP profile + secrets envelope still gate actual delivery). |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS` | `overrides.allow_guest_admin_domains` | Permit a guest's `admin` capability to manage the project's domains. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_EMAIL` | `overrides.allow_guest_admin_email` | Permit a guest's `admin` capability to manage the project's SMTP email profiles. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SITE` | `overrides.allow_guest_admin_site` | Permit a guest's `admin` capability to write the project's site config + aliases. Off under `multi-tenant`. |
+| `BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS` | `overrides.allow_guest_admin_secrets` | Permit a guest's `admin` capability to write the project's sealed secrets. Off under `multi-tenant`. |
 
 The four tenancy/capability variables above set the **fleet** posture; a **per-project** override of
 the same knobs is config-file only (see

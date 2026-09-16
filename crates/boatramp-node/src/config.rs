@@ -319,6 +319,9 @@ impl ServerConfig {
             if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS")? {
                 o.allow_guest_self_egress = Some(v);
             }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA")? {
+                o.allow_guest_egress_extra_ca = Some(v);
+            }
             if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES")? {
                 o.max_handler_blob_bytes = Some(v);
             }
@@ -369,6 +372,26 @@ impl ServerConfig {
             }
             if let Some(v) = source.parse("BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS")? {
                 o.max_guest_capability_ttl_secs = Some(v);
+            }
+            // Remaining guest-feature knobs — env parity for a 12-factor fleet that runs env-only
+            // (no `boatramp.cfg`). Each preset defaults these OFF under `multi-tenant`, so an
+            // env-only multi-tenant deployment had no lever to opt a guest feature back on. The
+            // override field + `apply()` + `explain()` already exist for every one; only the env
+            // mapping was missing (`allow_guest_email` regressed prod SMTP on the P48 cutover).
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL")? {
+                o.allow_guest_email = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS")? {
+                o.allow_guest_admin_domains = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_EMAIL")? {
+                o.allow_guest_admin_email = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SITE")? {
+                o.allow_guest_admin_site = Some(v);
+            }
+            if let Some(v) = source.parse_bool("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS")? {
+                o.allow_guest_admin_secrets = Some(v);
             }
         }
 
@@ -635,6 +658,7 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_SITE_PRIVATE_UPSTREAMS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_PRIVATE_EGRESS",
     "BOATRAMP_SECURITY_ALLOW_GUEST_SELF_EGRESS",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA",
     "BOATRAMP_SECURITY_MAX_HANDLER_BLOB_BYTES",
     "BOATRAMP_SECURITY_MAX_COMPONENT_BYTES",
     "BOATRAMP_SECURITY_OIDC_REQUIRE_AUDIENCE",
@@ -651,6 +675,11 @@ const SECURITY_ENV_VARS: &[&str] = &[
     "BOATRAMP_SECURITY_ALLOW_CROSS_TENANT_DB",
     "BOATRAMP_SECURITY_ALLOW_GUEST_MINT_CAPABILITY",
     "BOATRAMP_SECURITY_MAX_GUEST_CAPABILITY_TTL_SECS",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_EMAIL",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SITE",
+    "BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS",
 ];
 
 /// The `BOATRAMP_*` variables that populate `handlers.bindings.sql`.
@@ -2392,6 +2421,121 @@ mod tests {
         assert!(posture.allow_cross_tenant_db);
         assert!(posture.allow_guest_mint_capability);
         assert_eq!(posture.max_guest_capability_ttl_secs, 1800);
+    }
+
+    #[test]
+    fn env_wires_the_remaining_guest_feature_knobs_over_the_multi_tenant_default() {
+        // v0.4.18 env parity: `allow_guest_email` (which regressed prod SMTP on the P48 cutover —
+        // multi-tenant defaults it OFF and there was no env lever), its egress sibling
+        // `allow_guest_egress_extra_ca` (shipped config-only in v0.4.17), and the four
+        // `allow_guest_admin_*` self-config knobs were all missing from the env map. Each preset
+        // defaults them OFF under `multi-tenant`; the env knob must now flip each back on for a
+        // 12-factor env-only fleet, exactly like `allow_guest_mint_capability`.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_SECURITY_PROFILE", "multi-tenant"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_EMAIL", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SITE", "true"),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS", "true"),
+        ]))
+        .expect("valid env overrides apply");
+        let security = cfg.security.expect("security materialised from env");
+        let posture = security.resolve().expect("resolves");
+        // Every one flips on over the multi-tenant preset default (which is `false` for all six).
+        assert!(posture.allow_guest_email, "guest email re-enabled via env");
+        assert!(posture.allow_guest_egress_extra_ca);
+        assert!(posture.allow_guest_admin_domains);
+        assert!(posture.allow_guest_admin_email);
+        assert!(posture.allow_guest_admin_site);
+        assert!(posture.allow_guest_admin_secrets);
+        // `security explain` attributes each to the override/env source (not the profile preset).
+        let explained = security.explain().expect("explains");
+        for knob in [
+            "allow_guest_email",
+            "allow_guest_egress_extra_ca",
+            "allow_guest_admin_domains",
+            "allow_guest_admin_email",
+            "allow_guest_admin_site",
+            "allow_guest_admin_secrets",
+        ] {
+            assert!(
+                explained
+                    .lines()
+                    .any(|l| l.contains(knob) && l.contains("true") && l.contains("(override)")),
+                "explain shows {knob} = true (override): \n{explained}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_guest_feature_env_var_moves_its_own_posture_field() {
+        // Cross-wiring guard: set each of the six guest-feature vars ALONE over the multi-tenant
+        // default and assert THAT var's own resolved field flips — so a copy-paste arm mapping a var
+        // to the wrong field (or an unregistered var that never materialises the section) fails here.
+        // Complements `every_posture_override_field_has_an_env_mapping` below (which proves coverage
+        // by field name but not that each arm targets the right field).
+        for (var, check) in [
+            (
+                "BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL",
+                (|p: &boatramp_core::security::SecurityPosture| p.allow_guest_email)
+                    as fn(&boatramp_core::security::SecurityPosture) -> bool,
+            ),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_EGRESS_EXTRA_CA", |p| {
+                p.allow_guest_egress_extra_ca
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_DOMAINS", |p| {
+                p.allow_guest_admin_domains
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_EMAIL", |p| {
+                p.allow_guest_admin_email
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SITE", |p| {
+                p.allow_guest_admin_site
+            }),
+            ("BOATRAMP_SECURITY_ALLOW_GUEST_ADMIN_SECRETS", |p| {
+                p.allow_guest_admin_secrets
+            }),
+        ] {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env_overrides(&env(&[
+                ("BOATRAMP_SECURITY_PROFILE", "multi-tenant"),
+                (var, "true"),
+            ]))
+            .unwrap_or_else(|e| panic!("{var} applies: {e}"));
+            let posture = cfg
+                .security
+                .unwrap_or_else(|| panic!("{var} materialises the security section"))
+                .resolve()
+                .expect("resolves");
+            assert!(check(&posture), "{var} did not flip the resolved posture");
+        }
+    }
+
+    #[test]
+    fn every_posture_override_field_has_an_env_mapping() {
+        // Exhaustive guard against the EXACT class of gap v0.4.18 closes — a `PostureOverrides`
+        // field a 12-factor fleet can set in `[security.overrides]` but NOT via env — for EVERY
+        // field, now and in the future. Enumerate the struct's fields structurally (serialize a
+        // default instance; every field renders as a key) and assert each maps to a registered
+        // `BOATRAMP_SECURITY_<UPPER(field)>` in `SECURITY_ENV_VARS`. A new override field added
+        // without an env var (or a var left out of the registry) fails here — so the omission that
+        // regressed `allow_guest_email` can't silently recur. The registry entry is load-bearing:
+        // `apply_env_overrides` only materialises the section when `source.any(SECURITY_ENV_VARS)`.
+        let all = serde_json::to_value(boatramp_core::security::PostureOverrides::default())
+            .expect("PostureOverrides serializes");
+        let fields = all.as_object().expect("a struct is a JSON object");
+        assert!(!fields.is_empty(), "expected some override fields");
+        for field in fields.keys() {
+            let var = format!("BOATRAMP_SECURITY_{}", field.to_uppercase());
+            assert!(
+                SECURITY_ENV_VARS.contains(&var.as_str()),
+                "PostureOverrides field `{field}` has no env mapping — add `{var}` to \
+                 SECURITY_ENV_VARS + an arm in apply_env_overrides (the v0.4.18 forgot-a-knob guard)"
+            );
+        }
     }
 
     #[test]
