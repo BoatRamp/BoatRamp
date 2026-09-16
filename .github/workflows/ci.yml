@@ -457,6 +457,37 @@ jobs:
             || { echo "::error::present-token gate did not pass 2 tests (silent skip or failure?)" >&2; exit 1; }
           grep -q 'PRESENT-TOKEN CHAIN OK' presenttoken.log \
             || { echo "::error::present-token verify/seal/resolve chain never reached its success marker (a verification bypass, a guest naming an arbitrary tenant, or a skipped test)" >&2; exit 1; }
+      - name: Live consumer signed-context dispatch isolation on a real libsql engine (v0.4.17)
+        run: |
+          set -eo pipefail
+          # v0.4.17: the site-consumers async lane resolves EACH claimed message's host-sealed
+          # signed_context into that message's binding (the R1 producer-stamp the consumer never
+          # read). Through the exact new seam (ConsumerRebuild::bindings_for): a valid fleet-signed
+          # envelope scopes a real libsql engine to the originator's tenant ONLY; an unsealed OR a
+          # forged message resolves no principal and fails an own op closed (never cross-tenant,
+          # never unscoped). The resolved principal is the same value that propagates onto a
+          # graphql::run sub-fetch. A leak / a widening / a fail-open regression fails the assertion.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            consumer_signed_context_dispatch_resolves_per_message_tenant_on_a_real_engine \
+            -- --nocapture 2>&1 | tee consumer-sctx.log
+          grep -qE 'test result: ok\. 1 passed' consumer-sctx.log \
+            || { echo "::error::consumer signed-context dispatch gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'CONSUMER SIGNED-CONTEXT DISPATCH OK' consumer-sctx.log \
+            || { echo "::error::consumer signed-context dispatch never reached its marker (a dropped per-message resolve, a cross-tenant leak, or a fail-open on an unsealed/forged message)" >&2; exit 1; }
+      - name: Live guest-egress extra-CA TLS trust on a real loopback handshake (v0.4.17)
+        run: |
+          set -eo pipefail
+          # v0.4.17: the dev-posture guest-egress extra-CA option makes the guest's outbound wasi:http
+          # TLS client trust an operator-supplied extra root ON TOP of the webpki roots (a hermetic
+          # HTTPS test-double lever). A REAL loopback TLS handshake to a test-CA server succeeds WITH
+          # the extra CA supplied and is REJECTED without it — trust is widened, never bypassed (full
+          # certificate verification always runs). A verification-bypass regression fails the assertion.
+          cargo test -p boatramp-handlers --features engine --lib \
+            egress_tls_tests:: -- --nocapture 2>&1 | tee egress-ca.log
+          grep -qE 'test result: ok\. 1 passed' egress-ca.log \
+            || { echo "::error::guest-egress extra-CA gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'GUEST-EGRESS EXTRA-CA OK' egress-ca.log \
+            || { echo "::error::guest-egress extra-CA never reached its marker (a verification bypass, trust not actually widened, or a skipped test)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder

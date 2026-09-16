@@ -1633,5 +1633,11 @@ mod egress_tls_tests {
             !handshakes(addr2, &[]).await,
             "no extra CA ⇒ the test-CA server is rejected (verification is not bypassed)"
         );
+        println!(
+            "GUEST-EGRESS EXTRA-CA OK: the guest outbound TLS client trusts an operator-supplied \
+             extra CA ONLY when supplied (a real loopback handshake to a test-CA server succeeds \
+             with it, is rejected without it); trust is WIDENED, never bypassed — the webpki roots \
+             still apply and full certificate verification is always performed."
+        );
     }
 }

@@ -1935,7 +1935,7 @@ impl ConsumerRebuild<'_> {
     /// message's host-sealed envelope). Mirrors the scheduler's once-per-tick `build_bindings` call
     /// exactly (consumers get no `env`, no `invoke` capability, no request context) — only the
     /// `signed_context` differs, per message.
-    async fn bindings_for(
+    pub(super) async fn bindings_for(
         &self,
         signed_context: Option<&str>,
     ) -> Result<boatramp_handlers::Bindings, String> {
