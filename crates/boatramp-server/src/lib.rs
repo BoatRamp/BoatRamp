@@ -3114,6 +3114,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -3145,6 +3147,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::ZERO,
                 2,
@@ -3191,6 +3195,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -3215,6 +3221,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -4854,6 +4862,7 @@ mod tests {
                     env,
                     &[],
                     0,
+                    None,
                     None,
                     None,
                     None,

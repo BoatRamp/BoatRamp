@@ -405,6 +405,8 @@ pub(super) async fn dispatch_handler(
         target_handle.as_deref(),
         handler.tenancy.as_ref(),
         handler.token_claims.as_ref(),
+        // Synchronous request lane — no durable signed-context envelope.
+        None,
     )
     .await
     {
@@ -1262,6 +1264,11 @@ pub(super) async fn build_bindings(
     // Gap 2: per-handler `token` verification config, overriding the site's `claims_from_token`
     // when this handler's (own or inherited) tenancy names a `token` source. `None` ⇒ inherit.
     handler_token_claims: Option<&boatramp_core::config::HandlerGraphqlTokenClaims>,
+    // R1 async lane: the durable `signed_context` envelope carried on a drained message, so a
+    // **consumer** declaring `sources: [signed_context]` resolves the producer's sealed tenant
+    // (host-verified against the fleet anchor, guest-blind). `None` on every synchronous request/
+    // handler path (that lane carries no envelope) — passed per-message by the consumer dispatch.
+    signed_context: Option<&str>,
 ) -> Result<boatramp_handlers::Bindings, String> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
@@ -1478,18 +1485,26 @@ pub(super) async fn build_bindings(
                     }
                 }
             }
-            // Own / session / disabled: today's path.
+            // Own / session / signed-context / disabled: today's path, plus the R1 async-lane
+            // `signed_context` source (resolved only when a consumer dispatch passes the drained
+            // message's envelope; `None` on every synchronous request/handler path).
             other => {
+                // The signed-context verify anchor is the fleet signer's public half (same key that
+                // mints/verifies the durable envelope) — present only when a signer is wired.
+                let context_anchor = signed_context.and_then(|_| {
+                    inner
+                        .session_signer
+                        .get()
+                        .map(|s| boatramp_core::cose::Signer::public_key(s.as_ref()))
+                });
                 let inputs = crate::tenant_resolve::TenantSourceInputs {
                     bearer,
                     domain_context,
                     token_cfg,
                     session_cookie,
                     session_anchor: session_anchor.as_ref(),
-                    // The serving path is the synchronous request lane, not the durable async lane,
-                    // so it never carries a signed-context envelope (that source resolves on a drain).
-                    signed_context: None,
-                    context_anchor: None,
+                    signed_context,
+                    context_anchor: context_anchor.as_ref(),
                 };
                 crate::tenant_resolve::resolve_host_tenancy(other, imports_db, posture, inputs)
                     .await
@@ -1897,6 +1912,57 @@ fn parse_secret_ref(secret_ref: &str) -> SecretRef<'_> {
 /// The guest sees its *scope-relative* topic (the `scope_prefix` is stripped),
 /// matching the topic it declared in its `consumers` config. Driven by the
 /// background scheduler (`run_scheduler_tick`) per active consumer.
+/// The inputs needed to rebuild a consumer's [`Bindings`] **per message** — required for a consumer
+/// that declares the R1 `signed_context` source, whose tenancy (and therefore the `graphql::run`
+/// caller principal, baked at bind time from the resolved facts) must reflect EACH drained message's
+/// sealed originator tenant. A consumer that does not declare `signed_context` resolves identically
+/// with or without an envelope, so it reuses the once-per-tick binding instead (no rebuild).
+#[cfg(feature = "handlers")]
+pub(super) struct ConsumerRebuild<'a> {
+    pub inner: &'a HandlerRuntimeInner,
+    pub project: boatramp_core::project::ProjectRef<'a>,
+    pub site: &'a str,
+    pub scope: &'a str,
+    pub imports: &'a [String],
+    pub site_handlers: &'a boatramp_core::config::HandlersSiteConfig,
+    pub tenancy: Option<&'a boatramp_core::tenancy::Tenancy>,
+    pub token_claims: Option<&'a boatramp_core::config::HandlerGraphqlTokenClaims>,
+}
+
+#[cfg(feature = "handlers")]
+impl ConsumerRebuild<'_> {
+    /// Build the consumer's bindings resolving its tenancy against `signed_context` (the drained
+    /// message's host-sealed envelope). Mirrors the scheduler's once-per-tick `build_bindings` call
+    /// exactly (consumers get no `env`, no `invoke` capability, no request context) — only the
+    /// `signed_context` differs, per message.
+    async fn bindings_for(
+        &self,
+        signed_context: Option<&str>,
+    ) -> Result<boatramp_handlers::Bindings, String> {
+        build_bindings(
+            self.inner,
+            self.project,
+            self.site,
+            self.scope,
+            None,
+            self.imports,
+            self.site_handlers,
+            &std::collections::BTreeMap::new(),
+            &[],
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            self.tenancy,
+            self.token_claims,
+            signed_context,
+        )
+        .await
+    }
+}
+
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_consumer_batch(
@@ -1913,6 +1979,10 @@ pub(super) async fn dispatch_consumer_batch(
     component_hash: &str,
     component: &[u8],
     bindings: &boatramp_handlers::Bindings,
+    // `Some` for a consumer declaring `sources: [signed_context]`: rebuild the bindings per message
+    // from that message's sealed envelope (the `bindings` above is then unused). `None` ⇒ reuse the
+    // built-once `bindings` (non-signed-context consumer).
+    rebuild: Option<&ConsumerRebuild<'_>>,
     limits: boatramp_handlers::Limits,
     lease: Duration,
     max_attempts: u32,
@@ -1939,12 +2009,35 @@ pub(super) async fn dispatch_consumer_batch(
         .producer_context_cell()
         .and_then(|cell| cell.lock().ok().and_then(|guard| guard.clone()));
     for msg in claimed {
-        // Reset the shared producer-context cell to its bind-time value before each message.
-        if let Some(cell) = bindings.producer_context_cell() {
-            if let Ok(mut guard) = cell.lock() {
-                *guard = bind_time_context.clone();
+        // Per-message bindings. A `signed_context` consumer (R1 async lane) is rebuilt from THIS
+        // message's host-sealed envelope, so the originator's tenant resolves onto its orm/sql scope
+        // AND the `graphql::run` caller principal — symmetric to the `FnTenant::Durable` drain path,
+        // and per-message-isolated for free (a fresh binding, own producer-context cell). A consumer
+        // that does not declare `signed_context` reuses the built-once binding; its shared cell is
+        // reset to bind-time first (Gap 3: a `present-token` earlier in the batch must not carry to a
+        // later message that doesn't present — a cross-tenant misattribution on the async lane).
+        let per_msg_bindings = match rebuild {
+            Some(rb) => match rb.bindings_for(msg.signed_context.as_deref()).await {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::warn!(
+                        id = msg.id,
+                        %err,
+                        "consumer per-message bindings refused; redelivering"
+                    );
+                    let _ = messaging.nack(&msg).await;
+                    continue;
+                }
+            },
+            None => {
+                if let Some(cell) = bindings.producer_context_cell() {
+                    if let Ok(mut guard) = cell.lock() {
+                        *guard = bind_time_context.clone();
+                    }
+                }
+                bindings.clone()
             }
-        }
+        };
         let guest_topic = msg.topic.strip_prefix(scope_prefix).unwrap_or(&msg.topic);
         let start = std::time::Instant::now();
         let result = engine
@@ -1953,7 +2046,7 @@ pub(super) async fn dispatch_consumer_batch(
                 component,
                 guest_topic,
                 &msg.payload,
-                bindings.clone(),
+                per_msg_bindings,
                 limits,
             )
             .await;

@@ -386,11 +386,14 @@ pub(super) async fn run_scheduler_tick(
                             // No HTTP request ⇒ no `?handle=` slug (a background trigger is never a
                             // handle-sourced target route).
                             None,
-                            // Per-consumer tenancy (Gap 2). A `signed_context` source resolves only
-                            // on the durable function-drain path (`FnTenant::Durable`), so on this
-                            // path it fails closed — here it honors non-signed-context modes.
+                            // Per-consumer tenancy (Gap 2). This once-per-tick build has no message,
+                            // so `signed_context` is `None` here; a consumer declaring that source is
+                            // rebuilt PER MESSAGE in `dispatch_consumer_batch` with the drained
+                            // envelope (below), and this prebuilt binding is used only for
+                            // non-signed-context consumers.
                             consumer.tenancy.as_ref(),
                             consumer.token_claims.as_ref(),
+                            None,
                         )
                         .await
                         {
@@ -418,6 +421,25 @@ pub(super) async fn run_scheduler_tick(
                             }
                             None => (format!("{scope}/{}", consumer.topic), format!("{scope}/")),
                         };
+                        // R1 async lane: a consumer declaring `sources: [signed_context]` must resolve
+                        // EACH message's sealed originator tenant, so its bindings are rebuilt per
+                        // message from that message's envelope (the built-once `bindings` above can't
+                        // carry a per-message context). A consumer that does not declare it reuses the
+                        // built-once binding (`rebuild = None`), unchanged.
+                        let rebuild = consumer
+                            .tenancy
+                            .as_ref()
+                            .filter(|t| t.declares_signed_context())
+                            .map(|_| crate::handler_dispatch::ConsumerRebuild {
+                                inner,
+                                project,
+                                site: &site,
+                                scope: &scope,
+                                imports: &consumer.imports,
+                                site_handlers,
+                                tenancy: consumer.tenancy.as_ref(),
+                                token_claims: consumer.token_claims.as_ref(),
+                            });
                         acked += dispatch_consumer_batch(
                             &inner.engine,
                             messaging.as_ref(),
@@ -430,6 +452,7 @@ pub(super) async fn run_scheduler_tick(
                             &entry.hash,
                             wasm,
                             &bindings,
+                            rebuild.as_ref(),
                             site_limits(site_handlers),
                             CONSUMER_LEASE,
                             CONSUMER_MAX_ATTEMPTS,
@@ -605,6 +628,8 @@ async fn fire_cron(
         // Per-handler tenancy (Gap 2) for a cron-triggered handler, narrowing within the site.
         handler.tenancy.as_ref(),
         handler.token_claims.as_ref(),
+        // A cron trigger is not a messaging drain — no signed-context envelope.
+        None,
     )
     .await
     {
