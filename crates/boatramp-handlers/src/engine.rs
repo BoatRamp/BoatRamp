@@ -230,6 +230,9 @@ struct HostState {
     /// The instance's own serve socket(s) a guest self-call may reach (empty ⇒ self-egress
     /// off). Copied from the engine.
     self_egress_addrs: Arc<[SocketAddr]>,
+    /// Operator-supplied EXTRA trust anchors for this invocation's guest egress TLS client (copied
+    /// from the engine's `guest_egress_extra_roots`). Empty ⇒ the stock webpki-only sender.
+    guest_egress_extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
     /// This invocation's inbound self-egress recursion depth: 0 for an external request, or
     /// the value a parent self-call stamped (validated against [`egress_nonce`](Self::egress_nonce)).
     egress_depth: u32,
@@ -280,6 +283,7 @@ impl WasiHttpView for HostState {
         let self_addrs = self.self_egress_addrs.clone();
         let egress_depth = self.egress_depth;
         let egress_nonce = self.egress_nonce;
+        let extra_roots = self.guest_egress_extra_roots.clone();
         let handle = wasmtime_wasi::runtime::spawn(async move {
             let mut request = request;
             let result = match egress_target_allowed(
@@ -299,7 +303,16 @@ impl WasiHttpView for HostState {
                             request.headers_mut().insert(SELF_EGRESS_DEPTH_HEADER, v);
                         }
                     }
-                    wasmtime_wasi_http::types::default_send_request_handler(request, config).await
+                    // Dev-posture extra-CA: when an operator supplied extra roots AND this is a TLS
+                    // request, send through our own handler that trusts webpki ⊕ those roots.
+                    // Otherwise (the default, and every plaintext request) use the stock sender
+                    // verbatim — production trust is byte-identical.
+                    if use_tls && !extra_roots.is_empty() {
+                        send_with_extra_roots(request, config, &extra_roots).await
+                    } else {
+                        wasmtime_wasi_http::types::default_send_request_handler(request, config)
+                            .await
+                    }
                 }
                 Err(code) => Err(code),
             };
@@ -307,6 +320,146 @@ impl WasiHttpView for HostState {
         });
         Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
     }
+}
+
+/// Replicates wasmtime-wasi-http's crate-private `dns_error` (a `DnsError` with the given rcode).
+fn egress_dns_error(
+    rcode: String,
+    info_code: u16,
+) -> wasmtime_wasi_http::bindings::http::types::ErrorCode {
+    wasmtime_wasi_http::bindings::http::types::ErrorCode::DnsError(
+        wasmtime_wasi_http::bindings::http::types::DnsErrorPayload {
+            rcode: Some(rcode),
+            info_code: Some(info_code),
+        },
+    )
+}
+
+/// Build the guest-egress TLS client config trusting the webpki roots **⊕** the operator's `extra_roots`.
+///
+/// This is the security-critical core of the dev-posture extra-CA option, factored out so it can be
+/// exercised by a real loopback-TLS handshake test. It **adds** trust anchors — server-certificate
+/// verification is still fully performed by rustls against the (widened) root set; it never disables
+/// verification or accepts an unpinned cert. With `extra_roots` empty this is exactly the stock trust
+/// set (webpki only). An explicit aws-lc-rs provider is used so the config does not depend on a
+/// process-default `CryptoProvider` having been installed.
+fn guest_egress_client_config(
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<rustls::ClientConfig, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let mut root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    // Append the operator CA(s). A malformed entry is ignored (the webpki roots remain, so public
+    // hosts still verify); a valid one becomes an additional trust anchor.
+    let (_added, _ignored) = root_store.add_parsable_certificates(extra_roots.iter().cloned());
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| {
+        tracing::warn!("guest egress TLS config error: {e:?}");
+        ErrorCode::InternalError(Some("guest egress TLS config".into()))
+    })
+    .map(|b| b.with_root_certificates(root_store).with_no_client_auth())
+}
+
+/// Send a guest outbound **TLS** request trusting webpki ⊕ the operator's `extra_roots`. A faithful
+/// copy of wasmtime-wasi-http 30.0.2's `default_send_request_handler` TLS branch, differing ONLY in
+/// the root store (via [`guest_egress_client_config`]) — reached only when an operator supplied
+/// extra roots (the dev-posture option), otherwise the stock sender runs. Version-coupled: on a
+/// wasmtime-wasi-http bump, re-diff this against `default_send_request_handler`.
+async fn send_with_extra_roots(
+    mut request: http::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+    config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use http_body_util::BodyExt;
+    use rustls::pki_types::ServerName;
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+
+    let authority = match request.uri().authority() {
+        Some(a) if a.port().is_some() => a.to_string(),
+        // This path is TLS-only (the caller gates on `use_tls`), so default to 443.
+        Some(a) => format!("{a}:443"),
+        None => return Err(ErrorCode::HttpRequestUriInvalid),
+    };
+    let tcp_stream = tokio::time::timeout(
+        config.connect_timeout,
+        tokio::net::TcpStream::connect(&authority),
+    )
+    .await
+    .map_err(|_| ErrorCode::ConnectionTimeout)?
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::AddrNotAvailable => {
+            egress_dns_error("address not available".to_string(), 0)
+        }
+        _ if e
+            .to_string()
+            .starts_with("failed to lookup address information") =>
+        {
+            egress_dns_error("address not available".to_string(), 0)
+        }
+        _ => ErrorCode::ConnectionRefused,
+    })?;
+
+    let tls_config = guest_egress_client_config(extra_roots)?;
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+    let host = authority.split(':').next().unwrap_or(&authority);
+    let domain = ServerName::try_from(host)
+        .map_err(|e| {
+            tracing::warn!("guest egress dns name error: {e:?}");
+            egress_dns_error("invalid dns name".to_string(), 0)
+        })?
+        .to_owned();
+    let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+        tracing::warn!("guest egress tls protocol error: {e:?}");
+        ErrorCode::TlsProtocolError
+    })?;
+    let stream = hyper_util::rt::TokioIo::new(stream);
+
+    let (mut sender, conn) = tokio::time::timeout(
+        config.connect_timeout,
+        hyper::client::conn::http1::handshake(stream),
+    )
+    .await
+    .map_err(|_| ErrorCode::ConnectionTimeout)?
+    .map_err(wasmtime_wasi_http::hyper_request_error)?;
+    let worker = wasmtime_wasi::runtime::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::warn!("guest egress connection dropped: {e}");
+        }
+    });
+
+    // Origin-form: strip scheme+authority (SendRequest::send_request does not).
+    *request.uri_mut() = http::Uri::builder()
+        .path_and_query(
+            request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/"),
+        )
+        .build()
+        .expect("comes from a valid request");
+
+    let resp = tokio::time::timeout(config.first_byte_timeout, sender.send_request(request))
+        .await
+        .map_err(|_| ErrorCode::ConnectionReadTimeout)?
+        .map_err(wasmtime_wasi_http::hyper_request_error)?
+        .map(|body| {
+            body.map_err(wasmtime_wasi_http::hyper_request_error)
+                .boxed()
+        });
+
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: Some(worker),
+        between_bytes_timeout: config.between_bytes_timeout,
+    })
 }
 
 /// The request header carrying a guest self-egress call's recursion depth, stamped with the
@@ -435,6 +588,13 @@ pub struct HandlerEngine {
     /// Empty ⇒ self-egress off. Loopback normalization (`0.0.0.0` ⇒ `127.0.0.1`/`::1`) is done
     /// by the caller (`build_handler_runtime`).
     self_egress_addrs: Arc<[SocketAddr]>,
+    /// Operator-supplied EXTRA trust anchors for a guest's outbound `wasi:http` TLS client — the
+    /// dev-posture `allow_guest_egress_extra_ca` option (default OFF; refused under `multi-tenant`).
+    /// Empty ⇒ the stock wasmtime-wasi-http sender (webpki roots only) is used verbatim, so
+    /// production trust is byte-identical. Non-empty ⇒ the guest egress TLS client trusts webpki
+    /// roots **⊕** these certs (see [`guest_egress_client_config`]); still fully verified, just
+    /// against an additional operator CA (e.g. a hermetic HTTPS test double).
+    guest_egress_extra_roots: Arc<[rustls::pki_types::CertificateDer<'static>]>,
     /// A per-process random nonce stamped on the self-egress depth header so an external
     /// client can't forge it. Generated once at engine build.
     egress_nonce: u64,
@@ -498,6 +658,10 @@ impl HandlerEngine {
             outbound_timeout: None,
             allow_private_egress: false,
             self_egress_addrs: Arc::from([] as [SocketAddr; 0]),
+            // Default: no extra roots ⇒ the stock webpki-only egress sender (prod-identical).
+            guest_egress_extra_roots: Arc::from(
+                [] as [rustls::pki_types::CertificateDer<'static>; 0]
+            ),
             egress_nonce: {
                 let mut b = [0u8; 8];
                 // A failure here would only weaken the anti-forgery nonce, never break
@@ -557,6 +721,21 @@ impl HandlerEngine {
     #[must_use]
     pub fn with_private_egress(mut self, allow: bool) -> Self {
         self.allow_private_egress = allow;
+        self
+    }
+
+    /// Add operator-supplied EXTRA trust anchors (DER certs) to a guest's outbound `wasi:http` TLS
+    /// client — the dev-posture `allow_guest_egress_extra_ca` option. The guest egress client then
+    /// trusts webpki roots **⊕** these certs; server verification is still fully performed (this
+    /// only widens the accepted CA set, never disables verification). Empty (the default) keeps the
+    /// stock webpki-only sender, so production trust is unchanged unless an operator opts in. The
+    /// caller (`boatramp-node`) parses the PEM and passes the certs only when the posture permits.
+    #[must_use]
+    pub fn with_guest_egress_extra_roots(
+        mut self,
+        roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Self {
+        self.guest_egress_extra_roots = Arc::from(roots);
         self
     }
 
@@ -937,6 +1116,7 @@ impl HandlerEngine {
             outbound_timeout: self.outbound_timeout,
             allow_private_egress: self.allow_private_egress,
             self_egress_addrs: self.self_egress_addrs.clone(),
+            guest_egress_extra_roots: self.guest_egress_extra_roots.clone(),
             egress_depth: 0,
             egress_nonce: self.egress_nonce,
             #[cfg(feature = "sql")]
@@ -1367,5 +1547,97 @@ mod tests {
             egress_priv("/relative-only", false).await,
             Err(ErrorCode::HttpRequestUriInvalid)
         ));
+    }
+}
+
+/// The dev-posture guest-egress extra-CA gate: a REAL loopback TLS handshake proving
+/// [`guest_egress_client_config`] trusts an operator-supplied CA **only when supplied**, and never
+/// bypasses verification. This is the boatramp-side hard gate for the extra-CA feature (construens'
+/// compiled-guest OIDC back-channel test is the end-to-end companion).
+#[cfg(test)]
+mod egress_tls_tests {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+
+    /// Mint a throwaway CA + a `localhost` leaf signed by it. Returns (ca_der, server_chain, key).
+    fn ca_and_leaf() -> (
+        CertificateDer<'static>,
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+    ) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let ca_der = ca_cert.der().clone();
+        let chain = vec![leaf_cert.der().clone(), ca_cert.der().clone()];
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        (ca_der, chain, key)
+    }
+
+    /// A one-shot loopback rustls server presenting `chain`/`key`; returns its bound addr.
+    async fn spawn_tls_server(
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> std::net::SocketAddr {
+        let cfg = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await; // drive the handshake; result unused
+            }
+        });
+        addr
+    }
+
+    /// Does a guest-egress client trusting `extra` complete a TLS handshake to `addr`?
+    async fn handshakes(addr: std::net::SocketAddr, extra: &[CertificateDer<'static>]) -> bool {
+        let Ok(cfg) = guest_egress_client_config(extra) else {
+            return false;
+        };
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
+            return false;
+        };
+        let name = ServerName::try_from("localhost").unwrap();
+        connector.connect(name, tcp).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn guest_egress_extra_ca_is_trusted_only_when_supplied() {
+        let (ca, chain, key) = ca_and_leaf();
+        // WITH the operator CA in the extra set → the handshake to the test-CA server succeeds
+        // (the CA is a new trust anchor, so the leaf verifies — real HTTPS, just an added root).
+        let addr = spawn_tls_server(chain.clone(), key.clone_key()).await;
+        assert!(
+            handshakes(addr, std::slice::from_ref(&ca)).await,
+            "an operator-supplied extra CA is trusted ⇒ the handshake succeeds"
+        );
+        // WITHOUT it (the default, webpki-only trust) → the SAME server is rejected: verification is
+        // still fully performed, so an unknown-CA cert fails the handshake (never a bypass).
+        let addr2 = spawn_tls_server(chain, key).await;
+        assert!(
+            !handshakes(addr2, &[]).await,
+            "no extra CA ⇒ the test-CA server is rejected (verification is not bypassed)"
+        );
+        println!(
+            "GUEST-EGRESS EXTRA-CA OK: the guest outbound TLS client trusts an operator-supplied \
+             extra CA ONLY when supplied (a real loopback handshake to a test-CA server succeeds \
+             with it, is rejected without it); trust is WIDENED, never bypassed — the webpki roots \
+             still apply and full certificate verification is always performed."
+        );
     }
 }

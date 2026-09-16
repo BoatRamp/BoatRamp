@@ -48,6 +48,9 @@ thiserror.workspace = true
 # Naming the detached reconcile `JoinHandle`s that `assemble` returns.
 tokio.workspace = true
 tracing.workspace = true
+# Parse the operator's guest-egress extra-CA PEM into rustls trust anchors (dev-posture option).
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 # Generating the managed SQL credential (PLAN-managed-compute-sql; only used under
 # the sql features, but a tiny dep so it stays unconditional).
 getrandom.workspace = true

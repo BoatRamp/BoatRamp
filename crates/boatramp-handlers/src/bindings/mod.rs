@@ -165,6 +165,16 @@ impl Bindings {
         self.tenancy.clone()
     }
 
+    /// A read-only view of the host-resolved tenancy (the same value the engine applies to the
+    /// `sql`/`orm` session AND that propagates onto an `invoke`/`graphql::run` caller principal).
+    /// Guest-blind and host-owned; exposed so a host-side test can assert what a per-message
+    /// rebuild resolved (e.g. the async-lane `signed_context` consumer dispatch). `None` ⇒ this
+    /// invocation carries no tenant fact, so a scoped op fails closed.
+    #[cfg(feature = "sql")]
+    pub fn resolved_tenancy(&self) -> Option<crate::tenant::HostTenancy> {
+        self.tenancy.clone()
+    }
+
     /// The resolved TARGET capability's opaque app-context for this invocation as `(key, value)`
     /// pairs (empty when there is no capability target) — the data the `target-context` binding hands
     /// back to a resolver (Stage D). Only the app-authored context; never the host-forced tenant `B`.

@@ -405,6 +405,16 @@ impl Tenancy {
         matches!(self, Self::Target { .. })
     }
 
+    /// Whether this (own) decision names the R1 async-lane [`SignedContext`](TenantSource::SignedContext)
+    /// source — i.e. a **consumer** that resolves the originator's sealed tenant from a drained
+    /// message's `signed_context`. A consumer that declares it must have its bindings rebuilt PER
+    /// MESSAGE with that message's envelope (the site-`consumers` dispatch); a decision that does not
+    /// declare it resolves identically whether or not an envelope is present, so it uses the efficient
+    /// built-once binding. `false` for `Target`/`Disabled`.
+    pub fn declares_signed_context(&self) -> bool {
+        matches!(self, Self::Scoped { sources, .. } if sources.contains(&TenantSource::SignedContext))
+    }
+
     /// Whether `self` (a **per-component** decision, e.g. a per-handler tenancy) stays **within**
     /// `ceiling` (the **site-level** decision) — never widening the reachable tenant-set. Enforced
     /// fail-closed at bind so a per-handler value can narrow within its site ceiling but not widen
@@ -1094,6 +1104,39 @@ mod tests {
         assert!(!scoped(Own, Own).narrows_within(&target));
         // A target handler under a target ceiling is within (operator-gated separately).
         assert!(target.narrows_within(&target));
+    }
+
+    #[test]
+    fn declares_signed_context_detects_the_async_lane_source() {
+        // A consumer declaring `signed_context` (alone or alongside another source) → true, so its
+        // bindings are rebuilt per drained message; anything else → false (built-once path).
+        let ctx = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::SignedContext],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        assert!(ctx.declares_signed_context());
+        let mixed = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![
+                TenantSource::Token {
+                    claim: "tid".into(),
+                },
+                TenantSource::SignedContext,
+            ],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        assert!(mixed.declares_signed_context());
+        let no_ctx = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::None],
+            read: AccessMode::Null,
+            write: AccessMode::Null,
+        };
+        assert!(!no_ctx.declares_signed_context());
+        assert!(!Tenancy::Disabled.declares_signed_context());
     }
 
     #[test]

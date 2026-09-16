@@ -6,6 +6,12 @@
 /// produces them, matching the crate's forwarded features.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The operator-supplied guest-egress extra-CA file (`BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE`,
+    /// permitted by the `allow_guest_egress_extra_ca` posture) could not be read or held no valid
+    /// PEM certificate. Fail-closed: a configured-but-broken CA is a hard error, never a silent
+    /// no-trust.
+    #[error("guest egress extra CA ({0})")]
+    GuestEgressCa(String),
     /// A token root **private** key (hex) failed to parse, or an external signer
     /// (KMS/HSM/Vault) failed to build / resolve its public key.
     #[error("invalid auth root private key: {0}")]

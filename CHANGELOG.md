@@ -5,6 +5,48 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.17] - 2026-09-16
+
+Two independent async-lane / egress fixes, each behind one combined security review (clean, first
+pass) and a CI-hard live gate. Plus a release-signing speed-up.
+
+### Fixed
+- **Site `consumers` now resolve each message's `signed_context` (the R1 async-lane producer stamp
+  the consumer never read).** A background messaging worker declaring `sources: [signed_context]`
+  is meant to resolve the *originator's* tenant from a host-sealed COSE envelope carried on the
+  drained message. But the site-`consumers` dispatch built the consumer's bindings **once** per
+  scheduler tick with no message context, so the seal was never inspected — every such worker
+  failed closed (`no verified tenant source`) on its first scoped op. `dispatch_consumer_batch` now
+  rebuilds the per-message `Bindings` from **that** message's `signed_context` (host-verified
+  against the fleet anchor, guest-blind) for a signed-context consumer, symmetric to the durable
+  function-drain `FnTenant::Durable` path. The resolved principal scopes the guest's SQL/ORM **and**
+  propagates onto its `graphql::run`/`invoke` caller principal (the v0.4.6 mechanism), so a
+  signed-context worker can drive an `own` supergraph write on the async lane. Per-message isolated
+  (a fresh binding + producer-context cell per message); a non-signed-context consumer is unchanged
+  (built-once binding, with the pre-existing Gap 3 cell reset). An unsealed, forged, or expired
+  envelope resolves no principal and fails an own op closed — never cross-tenant, never unscoped.
+
+### Added
+- **A dev/single-tenant posture option to trust an operator-supplied extra CA for guest outbound
+  TLS (`allow_guest_egress_extra_ca`).** wasmtime-wasi-http's send handler hardcodes the webpki
+  Mozilla roots with no hook, so a hermetic test (or a private PKI) can't stand up an HTTPS endpoint
+  a guest's `wasi:http` trusts. When this posture flag is on (**off and refused under
+  `multi-tenant`**; on under `single-tenant`/`dev`) **and** the operator points
+  `BOATRAMP_GUEST_EGRESS_EXTRA_CA_FILE` at a PEM, those certs are **added** to the webpki root set
+  for the guest egress TLS client. This is the TLS-trust sibling of `allow_guest_private_egress`
+  (IP-routability): it **widens** the accepted CA set, never bypasses verification — full
+  server-certificate verification still runs against the (widened) roots, and public hosts keep
+  verifying from the webpki roots regardless. A configured-but-unreadable / certificate-less file is
+  a hard config error (fail closed), never a silent no-trust. Scoped strictly to the guest
+  `wasi:http` send path (the gateway upstream client, cluster mTLS, and control-plane are
+  untouched).
+
+### Changed
+- **The release image-signing step no longer re-pulls each image or re-evaluates nixpkgs per
+  operation.** `cosign`/`syft` are resolved once and the SBOM is generated from the local
+  `docker-archive` instead of `docker://<ref>` (which round-tripped every layer back over the
+  network), cutting the sign step from ~7.6 min.
+
 ## [0.4.16] - 2026-09-16
 
 A per-table tenancy-schema scope (`TenantOrBase`), behind a security review and the CI-hard

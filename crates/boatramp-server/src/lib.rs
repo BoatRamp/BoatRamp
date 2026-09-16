@@ -3114,6 +3114,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -3145,6 +3147,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::ZERO,
                 2,
@@ -3191,6 +3195,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -3215,6 +3221,8 @@ mod tests {
                 &hash,
                 EVENT_CONSUMER,
                 &bindings,
+                // No signed_context consumer in this test — reuse the built-once binding.
+                None,
                 Limits::default(),
                 Duration::from_secs(30),
                 5,
@@ -4861,6 +4869,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("no secrets → resolves")
@@ -4880,6 +4889,254 @@ mod tests {
         assert!(build(&["sql:secret"]).await.is_empty());
         // No bare `sql` → the default `""` database is not granted either.
         assert_eq!(build(&["sql:product"]).await, vec!["product"]);
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+    }
+
+    /// **Consumer signed-context dispatch live gate (v0.4.17).** The site-`consumers` async lane
+    /// now resolves EACH claimed message's host-sealed `signed_context` into that message's binding
+    /// — the fix for the R1 producer-stamp the consumer never read (`dispatch_consumer_batch` built
+    /// its bindings once, contextless). Exercised through the exact new seam
+    /// (`ConsumerRebuild::bindings_for`, which every claimed message flows through) on a REAL libsql
+    /// engine:
+    ///   * a message carrying a VALID fleet-signed envelope for tenant `acme` resolves `acme` as the
+    ///     consumer's own principal → a scoped read returns ONLY acme's row (never globex);
+    ///   * an UNSEALED message (a plain background drain) resolves NO principal → the same scoped op
+    ///     fails closed (`NoSource`), never runs unscoped;
+    ///   * a FORGED (stranger-signed) envelope also resolves NO principal → fail closed;
+    ///   * the resolved principal is the SAME value `build_bindings` threads onto an
+    ///     `invoke`/`graphql::run` caller principal, so a signed-context worker drives an `own`
+    ///     supergraph write on the async lane (the v0.4.6 propagation mechanism).
+    #[tokio::test]
+    async fn consumer_signed_context_dispatch_resolves_per_message_tenant_on_a_real_engine() {
+        use crate::handler_dispatch::ConsumerRebuild;
+        use boatramp_core::config::HandlersSiteConfig;
+        use boatramp_core::cose::{mint_context, Signer};
+        use boatramp_core::orm::{Expr, Select, SelectItem};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, Tenancy, TenantSource};
+        use boatramp_handlers::{HandlerEngine, Limits, TenantAxis, TenantDenied};
+
+        // A real per-site libsql provider; seed `notes` with an acme row and a globex row.
+        let sql_dir =
+            std::env::temp_dir().join(format!("boatramp-consumer-sctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        let db = backends.database("default", "worker", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE notes (id TEXT PRIMARY KEY, tenant_id TEXT, body TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, body) in [("n1", "acme", "acme-note"), ("n2", "globex", "globex-note")]
+            {
+                tx.execute(
+                    "INSERT INTO notes (id, tenant_id, body) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(body.into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let kv: Arc<dyn boatramp_core::kv::KvStore> = Arc::new(boatramp_core::kv::MemoryKv::new());
+        let storage: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+        let sql: Arc<dyn boatramp_core::sql::SqlBackends> =
+            Arc::new(boatramp_storage::LibsqlSqlBackends::local(&sql_dir));
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+        // Strict multi-tenant posture: the consumer must resolve its tenant from the SIGNATURE alone
+        // (the async lane carries no bearer/domain/session), and undeclared tenancy is refused.
+        rt.set_tenancy_posture(true, false);
+        // The fleet signer's public half is BOTH the mint key and the consumer's verify anchor.
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        rt.set_session_signer(signer.clone());
+        let stranger: Arc<dyn Signer> = Arc::new(LocalSigner::generate(TokenAlg::Es256));
+        let inner = rt.inner.as_ref().unwrap();
+
+        // The consumer declares `sources: [signed_context]` (own read+write) — the async-lane keystone.
+        let tenancy = Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::SignedContext],
+            read: AccessMode::Own,
+            write: AccessMode::Own,
+        };
+        let site = HandlersSiteConfig {
+            enabled: true,
+            allow_imports: vec!["sql".into()],
+            // No site-level tenancy ceiling; the per-consumer decision is the whole story here.
+            ..Default::default()
+        };
+        let imports = vec!["sql".to_string()];
+        let rebuild = ConsumerRebuild {
+            inner,
+            project: ProjectRef::new("default"),
+            site: "worker",
+            scope: "worker",
+            imports: &imports,
+            site_handlers: &site,
+            tenancy: Some(&tenancy),
+            token_claims: None,
+        };
+
+        // Force the resolved own-read scope onto a SELECT and run it on the real engine.
+        async fn read_bodies(
+            db: &dyn boatramp_core::sql::SqlBackend,
+            scope: &boatramp_core::orm::Scope,
+        ) -> Vec<String> {
+            let mut q = Select {
+                columns: vec![SelectItem {
+                    expr: Expr::col("body"),
+                    alias: None,
+                }],
+                ..Select::from("notes")
+            };
+            q.force_scope(scope).unwrap();
+            let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+            let mut tx = db.begin().await.unwrap();
+            let rows = tx.query(&sql, &params).await.expect("query runs");
+            tx.commit().await.unwrap();
+            let mut out: Vec<String> = rows
+                .rows
+                .into_iter()
+                .flatten()
+                .filter_map(|v| match v {
+                    SqlValue::Text(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        let now = boatramp_core::time::now_unix();
+
+        // (1) SEALED: a valid fleet-signed envelope for `acme` → the consumer resolves `acme`.
+        let env = mint_context("acme", 3600, now, signer.as_ref())
+            .await
+            .unwrap();
+        let sealed = rebuild.bindings_for(Some(&env)).await.unwrap();
+        let ht = sealed
+            .resolved_tenancy()
+            .expect("a signed-context consumer resolves a tenancy");
+        assert_eq!(
+            ht.value(),
+            Some(&SqlValue::Text("acme".into())),
+            "the sealed envelope's tenant is the consumer's own principal"
+        );
+        // The same principal `build_bindings` threads onto the invoke/graphql caller principal.
+        assert!(
+            ht.facts()
+                .iter()
+                .any(|f| f.value == SqlValue::Text("acme".into())),
+            "the resolved fact carries acme (this is the graphql::run caller principal too)"
+        );
+        let read_scope = ht.orm_scope(TenantAxis::Read).unwrap().unwrap();
+        assert_eq!(
+            read_bodies(db.as_ref(), &read_scope).await,
+            vec!["acme-note".to_string()],
+            "the resolved tenant scopes a real engine to acme's row ONLY (never globex)"
+        );
+        // The write axis resolves acme too (a signed-context worker lands an `own` write on it).
+        assert!(
+            ht.orm_scope(TenantAxis::Write).unwrap().is_some(),
+            "the write axis resolves the sealed tenant"
+        );
+
+        // (2) UNSEALED: a plain background drain carries no envelope → NO principal → fail closed.
+        let plain = rebuild.bindings_for(None).await.unwrap();
+        let ht = plain
+            .resolved_tenancy()
+            .expect("the tenancy decision is present (but factless)");
+        assert!(
+            ht.value().is_none(),
+            "an unsealed message resolves no own tenant"
+        );
+        assert!(
+            matches!(ht.orm_scope(TenantAxis::Read), Err(TenantDenied::NoSource)),
+            "a scoped op with no resolved tenant fails closed (never runs unscoped)"
+        );
+
+        // (3) FORGED: a stranger-signed envelope fails verification → NO principal → fail closed.
+        let forged = mint_context("globex", 3600, now, stranger.as_ref())
+            .await
+            .unwrap();
+        let forged_b = rebuild.bindings_for(Some(&forged)).await.unwrap();
+        let ht = forged_b
+            .resolved_tenancy()
+            .expect("the tenancy decision is present (but factless)");
+        assert!(
+            ht.value().is_none(),
+            "a stranger-signed envelope resolves no own tenant (never masquerades as globex)"
+        );
+        assert!(
+            matches!(ht.orm_scope(TenantAxis::Read), Err(TenantDenied::NoSource)),
+            "a forged envelope fails the scoped op closed"
+        );
+
+        // (4) EXPIRED: a valid fleet signature whose envelope has already expired → NO principal →
+        // fail closed (a stale producer stamp can never keep scoping the consumer past its TTL).
+        let expired = mint_context("acme", 3600, now.saturating_sub(7200), signer.as_ref())
+            .await
+            .unwrap();
+        let expired_b = rebuild.bindings_for(Some(&expired)).await.unwrap();
+        let ht = expired_b
+            .resolved_tenancy()
+            .expect("the tenancy decision is present (but factless)");
+        assert!(
+            ht.value().is_none()
+                && matches!(ht.orm_scope(TenantAxis::Read), Err(TenantDenied::NoSource)),
+            "an expired envelope resolves no own tenant and fails the scoped op closed"
+        );
+
+        // (5) INTERLEAVING (per-message isolation across a batch): rebuild message A (acme) then a
+        // DIFFERENT sealed message B (globex), and confirm each resolves to ITS OWN tenant and scopes
+        // the engine to only that tenant's row — the resolve carries no state between messages, so a
+        // batch mixing tenants can never cross-attribute (acme's binding is never reused for globex).
+        let env_b = mint_context("globex", 3600, now, signer.as_ref())
+            .await
+            .unwrap();
+        let a = rebuild.bindings_for(Some(&env)).await.unwrap();
+        let b = rebuild.bindings_for(Some(&env_b)).await.unwrap();
+        let ht_a = a.resolved_tenancy().unwrap();
+        let ht_b = b.resolved_tenancy().unwrap();
+        assert_eq!(ht_a.value(), Some(&SqlValue::Text("acme".into())));
+        assert_eq!(ht_b.value(), Some(&SqlValue::Text("globex".into())));
+        assert_eq!(
+            read_bodies(
+                db.as_ref(),
+                &ht_a.orm_scope(TenantAxis::Read).unwrap().unwrap()
+            )
+            .await,
+            vec!["acme-note".to_string()],
+            "message A stays scoped to acme"
+        );
+        assert_eq!(
+            read_bodies(
+                db.as_ref(),
+                &ht_b.orm_scope(TenantAxis::Read).unwrap().unwrap()
+            )
+            .await,
+            vec!["globex-note".to_string()],
+            "message B (interleaved) scopes to globex ONLY — no bleed from A's binding"
+        );
+
+        println!(
+            "CONSUMER SIGNED-CONTEXT DISPATCH OK: the site-consumers async lane resolves each \
+             claimed message's host-sealed signed_context per message; a valid fleet-signed \
+             envelope scopes a real libsql engine to the originator's tenant ONLY, while an \
+             unsealed or forged message resolves no principal and fails an own op closed (never \
+             cross-tenant, never unscoped). The resolved principal is the same value that \
+             propagates onto a graphql::run sub-fetch."
+        );
 
         let _ = std::fs::remove_dir_all(&sql_dir);
     }
