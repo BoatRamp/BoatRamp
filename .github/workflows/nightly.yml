@@ -5,9 +5,16 @@ name: Nightly
 # every push. Runs daily, or on demand (Run workflow ▸).
 #   • test (all features)  — runs the whole feature matrix's test suite (a network-
 #                            capable runner, which the nix sandbox can't provide)
-#   • nix flake check      — reproducible checks incl. `musl-clippy` (all-features
-#                            workspace clippy for the SHIPPED musl target, cachix-cached)
-#                            + the NixOS-service VM + the static musl release artifact
+#   • nix (…)              — the reproducible nix checks + the release-cache warm, FANNED
+#                            OUT across parallel runners (was one serial `nix flake check`
+#                            job that summed to ~1h43m): glibc clippy, musl clippy (all-
+#                            features, shipped target), the NixOS-service VM, and the
+#                            static-musl + OCI-image release artifacts — each ALONE on its
+#                            own runner so it uses all cores and the critical path is the
+#                            slowest single leg, not their sum. The crane dep closure is
+#                            shared via cachix (each leg substitutes it, never recompiles).
+#   • nix (flake eval …)   — whole-flake eval hygiene (`--no-build`) + the fast pre-commit
+#                            check (rustfmt · typos · anyhow-ban), kept off the heavy legs.
 # all-features *compile* coverage on musl lives in the nix `musl-clippy` check; the
 # per-push fast CI compiles + tests the shipped surface on musl. So the only thing left
 # on the host toolchain here is this all-features test *run* (target-agnostic logic).
@@ -77,13 +84,42 @@ jobs:
       - name: Test (all features)
         run: cargo test --workspace --all-features
 
+  # The heavy nix work, FANNED OUT across parallel runners. Was a single serial job
+  # (`nix flake check` then the release-cache warm) that summed to ~1h43m; each leg now
+  # runs ALONE on its own 4-vCPU/16 GB runner, so the critical path is the slowest single
+  # leg (~30m) instead of the sum. `fail-fast: false` so one failing leg still lets the
+  # others report. The crane dep closure is shared through cachix — each leg substitutes
+  # it rather than recompiling the third-party graph.
+  #
+  # The `release artifacts` leg builds the EXACT Linux release outputs — the fully-static
+  # musl + jemalloc binary AND both OCI images. Per-push CI compiles glibc only, so a
+  # musl-only breakage (e.g. a dep constructing `cmsghdr`/`msghdr` with struct literals
+  # that omit musl's private fields) sails through every green gate and only surfaces at
+  # release time. Building `.#container` / `.#container-cloudflare` here (not just
+  # `.#boatramp-static`) also warms the release GHCR cache: in v0.4.15 the GHCR job's
+  # `.#container` resolved its embedded binary to a DIFFERENT store path than the cached
+  # `.#boatramp-static` (static = cavx8…, container = 6vqi…, same tag), so caching only the
+  # bare binary left GHCR cold — a ~36 min recompile. Building the exact container closure
+  # here (pushed to cachix via the post-step) lets the release GHCR job substitute it.
   nix:
-    name: nix flake check
+    name: nix (${{ matrix.leg.label }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg:
+          - label: glibc clippy
+            build: .#checks.x86_64-linux.clippy
+          - label: musl clippy
+            build: .#checks.x86_64-linux.musl-clippy
+          - label: nixos-service vm
+            build: .#checks.x86_64-linux.nixos-service
+          - label: release artifacts + OCI images
+            build: .#boatramp-static .#container .#container-cloudflare
     steps:
       - uses: actions/checkout@v5
-      # The flake check compiles the whole workspace + a NixOS VM into /nix/store
-      # on the runner's cramped root disk. Reclaim the preinstalled toolchains
+      # A leg compiles the whole workspace (and, for the VM leg, a NixOS image) into
+      # /nix/store on the runner's cramped root disk. Reclaim the preinstalled toolchains
       # (Android SDK, .NET, GHC, CodeQL) for ~25 GB of headroom.
       - name: Free disk space
         run: |
@@ -91,9 +127,9 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
-      # The flake check compiles the whole workspace + a NixOS VM; peak memory
-      # exceeds the runner's 7 GB and the build gets OOM-killed (signal 9). Swap on
-      # the roomy /mnt disk absorbs the spikes (paired with `--cores` below).
+      # An all-features compile peaks above the runner's 16 GB RAM and rustc gets
+      # OOM-killed (signal 9); swap on the roomy /mnt disk absorbs the spikes so a leg can
+      # safely use all cores (`--cores 4` below).
       - name: Add swap
         run: |
           sudo swapoff -a || true
@@ -104,43 +140,38 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
       - uses: DeterminateSystems/nix-installer-action@main
-      # Pull the compiled dependency closure from the project's own Cachix (kept warm
-      # by `cache.yml` on every push to main), and push newly-built check derivations
-      # back so later runs reuse them. Replaces `flakehub-cache-action`, which began
-      # failing FlakeHub auth and fell back to the GitHub-throttled Magic Nix Cache
-      # (HTTP 418) — with no cache hits the flake check rebuilt the whole Rust closure
-      # from source and the nix daemon OOM-crashed mid-build.
+      # Pull the compiled dependency closure from the project's own Cachix (kept warm by
+      # `cache.yml` on every push to main), and push newly-built derivations back so later
+      # runs — and the release GHCR job — reuse them.
       - uses: cachix/cachix-action@v15
         with:
           name: boatramp
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      # `--max-jobs 1` serializes the heavy derivations (the workspace clippy check
-      # and the NixOS-VM package build are each a full compile) so two never run at
-      # once; `--cores 2` caps cargo's `-j` inside each build so a burst of parallel
-      # rustc can't blow past RAM+swap.
-      - name: Flake check
-        run: nix flake check --print-build-logs --max-jobs 1 --cores 2
+      # Each leg is the only heavy build on its runner, so `--cores 4` uses the whole box
+      # (swap absorbs the RAM spike). `--max-jobs 1` still serializes any uncached
+      # sub-derivations (e.g. the release leg's static-binary → container chain) so a cold
+      # cache can't run two full compiles at once and OOM.
+      - name: Build ${{ matrix.leg.label }}
+        run: nix build ${{ matrix.leg.build }} --print-build-logs --max-jobs 1 --cores 4
 
-      # Build the exact Linux release artifacts — the fully-static musl + jemalloc
-      # binary AND the two OCI images the release ships. The per-push CI compiles
-      # glibc only, so a musl-only breakage (e.g. a dependency that constructs
-      # `cmsghdr`/`msghdr` with struct literals that omit musl's private fields)
-      # sails through every green gate and only surfaces at release time. Building
-      # them here — before the release tag — closes that gap.
-      #
-      # Crucially, we build `.#container` / `.#container-cloudflare` too (not just
-      # `.#boatramp-static`): the release GHCR job builds THOSE derivations. In v0.4.15
-      # the GHCR job's `.#container` resolved its embedded binary to a DIFFERENT store
-      # path than the cached `.#boatramp-static` output (observed: static = cavx8…,
-      # container = 6vqi…, same tag), so caching only the bare binary left the GHCR job
-      # cold — it recompiled the whole musl workspace (~36 min). Building the exact
-      # container closure the release consumes here (and pushing it to cachix via the
-      # cachix-action post-step) lets the release GHCR job substitute it in seconds,
-      # regardless of why `.#container`'s binary diverges from `.#boatramp-static`.
-      - name: Build static musl release artifacts + OCI images (warm the release cache)
-        run: |
-          nix build .#boatramp-static .#container .#container-cloudflare \
-            --print-build-logs --max-jobs 1 --cores 2
+  # Whole-flake eval hygiene (every output on every system evaluates — catches a broken
+  # devShell / package / nixosModule that the per-leg builds above don't force) plus the
+  # fast pre-commit check (rustfmt · typos · anyhow-ban). Both cheap, kept off the heavy
+  # legs so they report in ~1-2 min.
+  nix-eval:
+    name: nix (flake eval + pre-commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/cachix-action@v15
+        with:
+          name: boatramp
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Flake eval (all outputs, no build)
+        run: nix flake check --no-build --print-build-logs
+      - name: Pre-commit check (rustfmt, typos, anyhow ban)
+        run: nix build .#checks.x86_64-linux.pre-commit --print-build-logs --max-jobs 1 --cores 4
 
   k8s-e2e:
     name: operator e2e (kind)

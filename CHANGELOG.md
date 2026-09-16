@@ -46,6 +46,12 @@ pass) and a CI-hard live gate. Plus a release-signing speed-up.
   operation.** `cosign`/`syft` are resolved once and the SBOM is generated from the local
   `docker-archive` instead of `docker://<ref>` (which round-tripped every layer back over the
   network), cutting the sign step from ~7.6 min.
+- **The nightly's serial `nix flake check` is fanned out across parallel runners.** It ran every
+  heavy check (glibc clippy, musl clippy, the NixOS-service VM) plus the release-cache warm on one
+  runner, one derivation at a time on 2 cores — ~1h43m. Each is now its own runner leg (so the
+  critical path is the slowest single leg, not the sum), each alone on its box so it uses all 4
+  cores, with a separate cheap flake-eval + pre-commit leg. No coverage lost — the same checks run,
+  just concurrently; the crane dependency closure is shared through cachix.
 
 ## [0.4.16] - 2026-09-16
 
