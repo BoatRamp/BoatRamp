@@ -468,6 +468,22 @@ impl Rewriter<'_> {
                     eq
                 });
             }
+            // A base-inclusive table folds its shared `tenant IS NULL` base into EVERY target read:
+            // `(col = B OR col IS NULL)`, regardless of the field's `null_base` — the per-table analog
+            // of `target_or_null`. The per-tenant (non-NULL) rows keep the `tenant = B` boundary; only
+            // the NULL rows are shared. (The public subset below still applies on the target axis.)
+            ResolvedScope::TenantOrBase { tenant } => {
+                check_ident(tenant)?;
+                let eq = binop(
+                    col_expr(qualifier, tenant),
+                    BinaryOperator::Eq,
+                    self.bound.clone(),
+                );
+                parts.push(Expr::Nested(Box::new(or(
+                    eq,
+                    Expr::IsNull(Box::new(col_expr(qualifier, tenant))),
+                ))));
+            }
             // A globally-readable table carries no tenant predicate — only its public subset (which
             // must still be declared and non-empty, exactly as the ORM target path requires).
             ResolvedScope::Unscoped => {}
@@ -695,6 +711,67 @@ mod tests {
         assert_eq!(
             rewrite("SELECT id FROM products").unwrap(),
             "SELECT id FROM products WHERE products.tenant_id = 'tenant_B' AND products.published = true"
+        );
+    }
+
+    #[test]
+    fn tenant_or_base_table_folds_the_null_base_under_a_plain_target_read() {
+        // v0.4.16: a PER-TABLE base-inclusive `pack` folds `(tenant = B OR tenant IS NULL)` even under
+        // a plain `target` field (null_base = false) — B's packs ⊕ the shared base — while a plain
+        // `products` table in the SAME read stays `tenant = B` alone. No field-level widening.
+        let keys = BTreeMap::from([
+            (
+                "pack".to_string(),
+                ResolvedScope::TenantOrBase {
+                    tenant: "tenant_id".to_string(),
+                },
+            ),
+            (
+                "products".to_string(),
+                ResolvedScope::Column("tenant_id".to_string()),
+            ),
+        ]);
+        let public = BTreeMap::from([
+            (
+                "pack".to_string(),
+                vec![PublicTermSql::Cmp {
+                    column: "published".to_string(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Boolean(true),
+                }],
+            ),
+            (
+                "products".to_string(),
+                vec![PublicTermSql::Cmp {
+                    column: "published".to_string(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Boolean(true),
+                }],
+            ),
+        ]);
+        // Plain `target` read (require_public = true, null_base = false) over a join of both tables.
+        let out = rewrite_target_select(
+            "SELECT p.id FROM pack p JOIN products x ON x.id = p.product_id",
+            &b(),
+            &keys,
+            &public,
+            true,
+            false,
+            Dialect::Sqlite,
+        )
+        .unwrap();
+        // `pack` (base-inclusive): (p.tenant_id = B OR p.tenant_id IS NULL) AND p.published.
+        assert!(
+            out.contains(
+                "(p.tenant_id = 'tenant_B' OR p.tenant_id IS NULL) AND p.published = true"
+            ),
+            "base-inclusive pack folds the NULL base: {out}"
+        );
+        // `products` (plain tenant): x.tenant_id = B alone — no base fold on the sibling table.
+        assert!(
+            out.contains("x.tenant_id = 'tenant_B' AND x.published = true")
+                && !out.contains("x.tenant_id IS NULL"),
+            "the plain tenant table stays tenant-only (per-table, not per-field): {out}"
         );
     }
 

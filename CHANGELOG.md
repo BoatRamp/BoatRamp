@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.16] - 2026-09-16
+
+A per-table tenancy-schema scope (`TenantOrBase`), behind a security review and the CI-hard
+plain-wasm live gate. Plus a release build-cache fix (nightly now warms the OCI images).
+
+### Added
+- **A per-table `TableScope::TenantOrBase`: a table whose `tenant_id IS NULL` rows are shared base,
+  readable under any own/target read.** For a table declared `{"kind": "tenant_or_base"}`, a READ
+  confines to `(tenant = <resolved own/target> OR tenant IS NULL)` (AND the public subset on the
+  target axis) on **both** the own and target axes — the shared base is folded in regardless of the
+  *field's* scope, so a mixed-table field can fold the base into only the tables that declare it
+  (unlike the field-level `own_or_null`/`target_or_null`, which widen every table the field reads).
+  A WRITE stamps the resolved tenant exactly like `Tenant` — a guest can never create or update a
+  `NULL`-tenant base row (base rows are operator-seeded via a privileged path). This is the
+  per-table analog of the field-level NULL-base modes and the base-partition sibling of
+  `TenantOrSession` (whose NULL partition is anonymous-session rows). Unlike `Unscoped`, the
+  per-tenant (non-`NULL`) rows keep the `tenant = <resolved>` boundary, so a tenant can never read
+  another tenant's owned rows. Threaded through the ORM (`read_pred`/`tenant_pred`) and the raw-SQL
+  target rewriter identically; `promote`/`attach_reference`/the SQL-GDC path refuse it fail-closed.
+
+### Fixed
+- **The release GHCR job no longer recompiles the whole musl workspace.** After the v0.4.15
+  crane-split, the release container job's `.#container` derivation resolved its embedded binary to a
+  different store path than the cached `.#boatramp-static` output, so it missed the cache and rebuilt
+  everything (~36 min). The nightly now builds and caches `.#container`/`.#container-cloudflare`
+  themselves (not just `.#boatramp-static`), so the release GHCR job substitutes the exact image
+  closure it consumes.
+
 ## [0.4.15] - 2026-09-16
 
 A target-write shape addition (own↔target parity), behind a security review and the CI-hard

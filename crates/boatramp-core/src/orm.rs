@@ -585,10 +585,18 @@ impl Scope {
     /// require a resolved own-tenant value and **fail closed** ([`OrmError::TenancyNoPrincipal`]) when
     /// there is none (a purely anonymous actor reading a plain tenant table). Never binds to another
     /// table's same-named column — it is qualified by `qual`.
+    ///
+    /// `base_inclusive` folds the shared `column IS NULL` base into the `Own` arm (`Or([col = v, col
+    /// IS NULL])`) — the per-table [`ResolvedScope::TenantOrBase`] read, which reads a table's
+    /// tenant-`NULL` base rows on *any* own/target read regardless of the field mode. It is a no-op for
+    /// `OwnOrNull` (already OR-null), `NullOnly` (base only), and `All` (cross-tenant). It affects only
+    /// the READ predicate; the write stamp is unchanged (a base-inclusive table stamps `tenant = v`,
+    /// never `NULL`).
     fn tenant_pred(
         &self,
         column: &str,
         qualifier: Option<&str>,
+        base_inclusive: bool,
     ) -> Result<Option<Predicate>, OrmError> {
         let is_null = Predicate::Null {
             expr: Self::col_expr(column, qualifier),
@@ -604,7 +612,11 @@ impl Scope {
             ScopeMode::NullOnly => Some(is_null),
             ScopeMode::Own => {
                 let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
-                Some(eq(v))
+                Some(if base_inclusive {
+                    Predicate::Or(vec![eq(v), is_null])
+                } else {
+                    eq(v)
+                })
             }
             ScopeMode::OwnOrNull => {
                 let v = self.value.clone().ok_or(OrmError::TenancyNoPrincipal)?;
@@ -660,13 +672,19 @@ impl Scope {
         let tenant = match self.resolve_table(table)? {
             ResolvedScope::Column(col) => {
                 ident(&col)?;
-                self.tenant_pred(&col, qualifier)?
+                self.tenant_pred(&col, qualifier, false)?
             }
             ResolvedScope::Unscoped => None,
             ResolvedScope::TenantOrSession { tenant, session } => {
                 ident(&tenant)?;
                 ident(&session)?;
                 self.disjunct_pred(&tenant, &session, qualifier)?
+            }
+            // Base-inclusive: fold the shared `tenant IS NULL` base into the read on any own/target
+            // read (base_inclusive = true forces the OR-null form even under a plain `Own` mode).
+            ResolvedScope::TenantOrBase { tenant } => {
+                ident(&tenant)?;
+                self.tenant_pred(&tenant, qualifier, true)?
             }
         };
         // R4/D8: under a TARGET read, additionally confine to the table's host-held PUBLIC subset
@@ -704,6 +722,11 @@ impl Scope {
         };
         match self.resolve_table(table)? {
             ResolvedScope::Column(col) => Ok(tenant_stamp()?.map(|v| (col, v))),
+            // A base-inclusive table WRITES exactly like a plain tenant `Column` table: stamp the
+            // resolved tenant (never `NULL`). The base⊕own fold is read-only — a guest write can
+            // neither create nor update a `NULL`-base row (base rows are operator-seeded via a
+            // privileged `NullOnly`/`All` path, unreachable from a guest's `Own`-mode write).
+            ResolvedScope::TenantOrBase { tenant } => Ok(tenant_stamp()?.map(|v| (tenant, v))),
             ResolvedScope::Unscoped => Err(OrmError::UnscopedWrite(table.to_string())),
             ResolvedScope::TenantOrSession { tenant, session } => {
                 if matches!(self.mode, ScopeMode::All) {
@@ -769,6 +792,9 @@ impl Scope {
         match &self.keys {
             TableKeys::PerTableTarget { keys, .. } => match keys.get(table) {
                 Some(ResolvedScope::Column(c)) => Some(c.clone()),
+                // A base-inclusive table has a plain tenant column too (its NULL rows are shared
+                // base); a target upsert on it keys+guards on that column exactly like a Column table.
+                Some(ResolvedScope::TenantOrBase { tenant }) => Some(tenant.clone()),
                 _ => None,
             },
             _ => None,
@@ -877,6 +903,9 @@ impl Scope {
             let tenant_cols: &[&str] = match rs {
                 ResolvedScope::Column(c) => &[c],
                 ResolvedScope::TenantOrSession { tenant, session } => &[tenant, session],
+                // The tenant column is off-limits to a guest SET; its NULL base rows are never
+                // guest-writable, so a base-inclusive table protects the same one column.
+                ResolvedScope::TenantOrBase { tenant } => &[tenant],
                 ResolvedScope::Unscoped => &[],
             };
             if tenant_cols.iter().any(|t| same_col(t, column)) {
@@ -4493,6 +4522,75 @@ mod tests {
         assert!(
             !sql.contains("published") && !sql.contains("IS NULL"),
             "own read must carry no public confinement: {sql}"
+        );
+    }
+
+    #[test]
+    fn tenant_or_base_folds_the_null_base_on_reads_but_not_writes() {
+        // v0.4.16: `pack` is base-inclusive (its tenant-NULL rows are shared base); `product` is a
+        // plain tenant table. On the OWN axis a read of `pack` folds `(tenant = A OR tenant IS NULL)`
+        // — A's rows ⊕ the shared base — while `product` stays `tenant = A` alone. The fold is per
+        // TABLE, so a query touching both confines each correctly (no field-level widening).
+        use std::collections::BTreeMap;
+        let scope = Scope {
+            column: "tenant_id".into(),
+            value: Some(t("A")),
+            session: None,
+            mode: ScopeMode::Own,
+            keys: TableKeys::PerTable(BTreeMap::from([
+                (
+                    "pack".to_string(),
+                    ResolvedScope::TenantOrBase {
+                        tenant: "tenant_id".into(),
+                    },
+                ),
+                (
+                    "product".to_string(),
+                    ResolvedScope::Column("tenant_id".into()),
+                ),
+            ])),
+        };
+        // Base-inclusive read: (tenant = A OR tenant IS NULL).
+        let mut pack = Select::from("pack");
+        pack.force_scope(&scope).unwrap();
+        let (psql, _p) = pack.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            psql.contains("tenant_id = ?")
+                && psql.contains("tenant_id IS NULL")
+                && psql.contains(" OR "),
+            "base-inclusive read folds the NULL base: {psql}"
+        );
+        // Plain tenant read: tenant = A alone (no base fold — the fold is per-table, not per-field).
+        let mut prod = Select::from("product");
+        prod.force_scope(&scope).unwrap();
+        let (dsql, _p) = prod.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            dsql.contains("tenant_id = ?") && !dsql.contains("IS NULL"),
+            "a plain tenant table alongside a base-inclusive one stays tenant-only: {dsql}"
+        );
+        // WRITE stamps the resolved tenant (never NULL) — a guest can't create a base row.
+        let mut ins = Insert {
+            table: "pack".into(),
+            rows: vec![RowValues {
+                cells: vec![Assignment {
+                    column: "name".into(),
+                    value: Expr::val(t("p")),
+                }],
+            }],
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        };
+        ins.force_scope(Some(&scope), Some(&scope)).unwrap();
+        let (isql, iparams) = ins.compile(Dialect::Sqlite).unwrap();
+        assert!(
+            isql.contains("tenant_id"),
+            "write stamps the tenant column: {isql}"
+        );
+        assert!(
+            iparams.contains(&t("A")) && !iparams.contains(&SqlValue::Null),
+            "write stamps tenant = A, never a NULL base row: {iparams:?}"
         );
     }
 

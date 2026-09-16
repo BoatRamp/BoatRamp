@@ -121,14 +121,26 @@ jobs:
       - name: Flake check
         run: nix flake check --print-build-logs --max-jobs 1 --cores 2
 
-      # Build the exact Linux release artifact — the fully-static musl + jemalloc
-      # binary the release ships. The per-push CI compiles glibc only, so a
-      # musl-only breakage (e.g. a dependency that constructs `cmsghdr`/`msghdr`
-      # with struct literals that omit musl's private fields) sails through every
-      # green gate and only surfaces at release time. Building it here — before the
-      # release tag — closes that gap. Cached via the shared closure above.
-      - name: Build static musl release artifact
-        run: nix build .#boatramp-static --print-build-logs --max-jobs 1 --cores 2
+      # Build the exact Linux release artifacts — the fully-static musl + jemalloc
+      # binary AND the two OCI images the release ships. The per-push CI compiles
+      # glibc only, so a musl-only breakage (e.g. a dependency that constructs
+      # `cmsghdr`/`msghdr` with struct literals that omit musl's private fields)
+      # sails through every green gate and only surfaces at release time. Building
+      # them here — before the release tag — closes that gap.
+      #
+      # Crucially, we build `.#container` / `.#container-cloudflare` too (not just
+      # `.#boatramp-static`): the release GHCR job builds THOSE derivations. In v0.4.15
+      # the GHCR job's `.#container` resolved its embedded binary to a DIFFERENT store
+      # path than the cached `.#boatramp-static` output (observed: static = cavx8…,
+      # container = 6vqi…, same tag), so caching only the bare binary left the GHCR job
+      # cold — it recompiled the whole musl workspace (~36 min). Building the exact
+      # container closure the release consumes here (and pushing it to cachix via the
+      # cachix-action post-step) lets the release GHCR job substitute it in seconds,
+      # regardless of why `.#container`'s binary diverges from `.#boatramp-static`.
+      - name: Build static musl release artifacts + OCI images (warm the release cache)
+        run: |
+          nix build .#boatramp-static .#container .#container-cloudflare \
+            --print-build-logs --max-jobs 1 --cores 2
 
   k8s-e2e:
     name: operator e2e (kind)
