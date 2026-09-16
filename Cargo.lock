@@ -1772,16 +1772,20 @@ dependencies = [
  "http 1.4.2",
  "http-body-util",
  "hyper 1.10.1",
+ "hyper-util",
  "lettre",
  "lru 0.16.4",
+ "rustls 0.23.40",
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wasmtime-wasi-io",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
