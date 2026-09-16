@@ -341,9 +341,10 @@ jobs:
               --print-build-logs --out-link "image-${variant}.tar.gz"
             nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:${tag}"
             nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:latest"
-            # Record the pushed image by digest (immutable ref cosign/SBOM pin to).
+            # Record the pushed image by digest (immutable ref cosign/SBOM pin to) PLUS the local
+            # archive path, so the sign step can SBOM the on-disk image instead of re-pulling it.
             digest="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${tag}")"
-            echo "${repo}@${digest}" >> image-refs.txt
+            echo "${repo}@${digest} image-${variant}.tar.gz" >> image-refs.txt
           done
           cat image-refs.txt
 
@@ -355,13 +356,18 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
         run: |
           set -euo pipefail
-          while read -r ref; do
-            [ -n "$ref" ] || continue
-            nix run nixpkgs#cosign -- sign --yes "$ref"
-            nix run nixpkgs#syft -- "$ref" -o cyclonedx-json > sbom.json
-            nix run nixpkgs#cosign -- attest --yes --predicate sbom.json \
-              --type cyclonedx "$ref"
-          done < image-refs.txt
+          # Resolve cosign + syft ONCE for the whole loop — a per-op `nix run nixpkgs#…`
+          # re-evaluates nixpkgs each time. And SBOM the LOCAL image archive built above
+          # (`docker-archive:…`) rather than re-pulling the just-pushed image over the network:
+          # syft's remote pull dominated the old ~7.6 min. Same SBOM content, no round-trip.
+          nix shell nixpkgs#cosign nixpkgs#syft -c bash -euo pipefail -c '
+            while read -r ref tar; do
+              [ -n "$ref" ] || continue
+              cosign sign --yes "$ref"
+              syft "docker-archive:$tar" -o cyclonedx-json > sbom.json
+              cosign attest --yes --predicate sbom.json --type cyclonedx "$ref"
+            done < image-refs.txt
+          '
 
       # Publish the operator Helm chart as an OCI artifact alongside the images.
       - name: Package + push the Helm chart
