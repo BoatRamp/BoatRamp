@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Multi-tenant default blob-upload cap (100 MiB).
 const MT_MAX_UPLOAD: u64 = 100 * 1024 * 1024;
@@ -200,7 +200,10 @@ impl SecurityProfile {
 /// [`SecurityConfig::overrides`] and as each custom [`SecurityConfig::profiles`]
 /// entry (applied over the strict `multi-tenant` baseline). Byte caps: `0` =
 /// unlimited.
-#[derive(Debug, Clone, Default, Deserialize)]
+// `Serialize` (alongside `Deserialize`) lets a test enumerate every field name to assert each has a
+// `BOATRAMP_SECURITY_*` env mapping — the guard against silently forgetting an env knob (the exact
+// gap v0.4.18 closed). Serializing is otherwise unused; `None` fields render as null.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PostureOverrides {
     /// Permit binding a non-loopback address with control-plane auth disabled.

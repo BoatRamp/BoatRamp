@@ -2471,14 +2471,12 @@ mod tests {
     }
 
     #[test]
-    fn every_posture_override_bool_has_an_env_mapping() {
-        // Guard against the exact class of gap this release closes: a `PostureOverrides` bool that
-        // a 12-factor fleet can set in `[security.overrides]` but NOT via env. For each guest-feature
-        // env var we add, flipping it must move the resolved posture off the multi-tenant default —
-        // a knob whose env var is unregistered in `SECURITY_ENV_VARS` would not even materialise the
-        // section, and a missing `config.rs` arm would leave the override `None` (this test would
-        // then see the default and fail). Mirrors the safety intent of the CLI `handler_validate`
-        // exhaustiveness test.
+    fn each_guest_feature_env_var_moves_its_own_posture_field() {
+        // Cross-wiring guard: set each of the six guest-feature vars ALONE over the multi-tenant
+        // default and assert THAT var's own resolved field flips — so a copy-paste arm mapping a var
+        // to the wrong field (or an unregistered var that never materialises the section) fails here.
+        // Complements `every_posture_override_field_has_an_env_mapping` below (which proves coverage
+        // by field name but not that each arm targets the right field).
         for (var, check) in [
             (
                 "BOATRAMP_SECURITY_ALLOW_GUEST_EMAIL",
@@ -2513,6 +2511,30 @@ mod tests {
                 .resolve()
                 .expect("resolves");
             assert!(check(&posture), "{var} did not flip the resolved posture");
+        }
+    }
+
+    #[test]
+    fn every_posture_override_field_has_an_env_mapping() {
+        // Exhaustive guard against the EXACT class of gap v0.4.18 closes — a `PostureOverrides`
+        // field a 12-factor fleet can set in `[security.overrides]` but NOT via env — for EVERY
+        // field, now and in the future. Enumerate the struct's fields structurally (serialize a
+        // default instance; every field renders as a key) and assert each maps to a registered
+        // `BOATRAMP_SECURITY_<UPPER(field)>` in `SECURITY_ENV_VARS`. A new override field added
+        // without an env var (or a var left out of the registry) fails here — so the omission that
+        // regressed `allow_guest_email` can't silently recur. The registry entry is load-bearing:
+        // `apply_env_overrides` only materialises the section when `source.any(SECURITY_ENV_VARS)`.
+        let all = serde_json::to_value(boatramp_core::security::PostureOverrides::default())
+            .expect("PostureOverrides serializes");
+        let fields = all.as_object().expect("a struct is a JSON object");
+        assert!(!fields.is_empty(), "expected some override fields");
+        for field in fields.keys() {
+            let var = format!("BOATRAMP_SECURITY_{}", field.to_uppercase());
+            assert!(
+                SECURITY_ENV_VARS.contains(&var.as_str()),
+                "PostureOverrides field `{field}` has no env mapping — add `{var}` to \
+                 SECURITY_ENV_VARS + an arm in apply_env_overrides (the v0.4.18 forgot-a-knob guard)"
+            );
         }
     }
 
