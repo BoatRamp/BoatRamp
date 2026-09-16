@@ -356,15 +356,24 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
         run: |
           set -euo pipefail
+          # syft's `docker-archive:` reader needs an UNCOMPRESSED tar. The nix `.#container`
+          # out-link is a GZIPPED docker-archive: skopeo auto-decompresses it on push (the build
+          # step above works), but syft reads the gzip magic as a tar header and dies
+          # (`archive/tar: invalid tar header`). Decompress each archive once here — the runner has
+          # gzip; the cosign/syft nix shell does not — then SBOM the plain tar. Still the LOCAL
+          # archive (no network re-pull, which dominated the old ~7.6 min); `zcat -f` passes a
+          # non-gzip archive through unchanged, so this is robust to a future uncompressed output.
+          while read -r ref tar; do
+            [ -n "$ref" ] || continue
+            zcat -f "$tar" > "$tar.plain"
+          done < image-refs.txt
           # Resolve cosign + syft ONCE for the whole loop — a per-op `nix run nixpkgs#…`
-          # re-evaluates nixpkgs each time. And SBOM the LOCAL image archive built above
-          # (`docker-archive:…`) rather than re-pulling the just-pushed image over the network:
-          # syft's remote pull dominated the old ~7.6 min. Same SBOM content, no round-trip.
+          # re-evaluates nixpkgs each time.
           nix shell nixpkgs#cosign nixpkgs#syft -c bash -euo pipefail -c '
             while read -r ref tar; do
               [ -n "$ref" ] || continue
               cosign sign --yes "$ref"
-              syft "docker-archive:$tar" -o cyclonedx-json > sbom.json
+              syft "docker-archive:$tar.plain" -o cyclonedx-json > sbom.json
               cosign attest --yes --predicate sbom.json --type cyclonedx "$ref"
             done < image-refs.txt
           '
