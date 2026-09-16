@@ -13,16 +13,26 @@
 # Why cargo-zigbuild: the batteries-included set pulls C deps that build their own
 # vendored C (aws-lc-sys via cmake, ring, bundled sqlite). The stock cross-cc setup
 # can't target musl for those, but `zig cc` (via cargo-zigbuild) can — it supplies
-# the musl C cross-toolchain transparently. buildRustPackage still vendors the Rust
-# deps and writes the offline cargo config, so only the compile/link is overridden;
-# the build stays hermetic and offline.
+# the musl C cross-toolchain transparently.
+#
+# Build shape (crane, dependency-split — mirrors ./nix/check-musl.nix):
+#   * `buildDepsOnly` compiles boatramp's third-party closure for musl+jemalloc ONCE,
+#     keyed on `Cargo.lock`'s dependency graph (crane dummifies the workspace sources,
+#     stubbing every workspace `build.rs`), so a boatramp code/version bump substitutes
+#     it from cachix instead of recompiling wasmtime/cranelift/cedar every night.
+#   * the binary stage reuses that `cargoArtifacts` and recompiles only boatramp's own
+#     crates (+ runs the real workspace build scripts — the console dist, the firecracker
+#     `vminit` cross-compile). The dep layer and the binary stage pass identical
+#     `--release --features jemalloc -p boatramp` flags so the cached artifacts match.
 #
 # `consoleDist` + `rustToolchain` mirror ./nix/package.nix (which builds the glibc
 # binary used for `packages.default` / the bare-host release binaries).
 {
   lib,
   stdenv,
-  rustPlatform,
+  craneLib,
+  # The cleaned whole-workspace source (from flake.nix `workspaceSrc`).
+  src,
   rustToolchain,
   cargo-zigbuild,
   zig,
@@ -36,69 +46,90 @@ let
   # Follow the host arch: x86_64 on an x86_64 builder, aarch64 on aarch64 (Graviton/
   # Ampere). The OCI images build on x86_64, so their binary is unchanged.
   target = "${stdenv.hostPlatform.parsed.cpu.name}-unknown-linux-musl";
-in
-rustPlatform.buildRustPackage {
-  pname = "boatramp";
-  version = "0.1.0";
-  src = lib.cleanSource ../.;
-  cargoLock.lockFile = ../Cargo.lock;
 
-  # Stage the prebuilt console SPA where `boatramp-server/build.rs` looks for it
-  # (see ./nix/package.nix for the rationale).
+  # Stage the prebuilt console SPA where `boatramp-server/build.rs` looks for it (see
+  # ./nix/package.nix). Only the REAL binary stage needs it — `buildDepsOnly` stubs
+  # every workspace `build.rs`, so the dep layer never reads the dist.
   postPatch = lib.optionalString (consoleDist != null) ''
     rm -rf crates/boatramp-console/dist
     mkdir -p crates/boatramp-console/dist
     cp -r ${consoleDist}/. crates/boatramp-console/dist/
   '';
 
-  doCheck = false;
+  commonArgs = {
+    inherit src;
+    pname = "boatramp";
+    version = "0.1.0";
+    doCheck = false;
 
-  # nixpkgs' `buildRustPackage` embeds a cargo-auditable dependency section by
-  # pinning it with `-Wl,--undefined=AUDITABLE_VERSION_INFO`. zig's linker (used via
-  # cargo-zigbuild) rejects `--undefined=…` (GNU ld accepts it — hence the glibc
-  # image builds fine), so disable auditable for the musl image.
-  auditable = false;
-
-  nativeBuildInputs = [
-    pkg-config
-    cmake
-    cargo-zigbuild
-    zig
-    removeReferencesTo
-  ];
-  LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages.libclang.lib ];
-
-  # Replace buildRustPackage's compile with cargo-zigbuild targeting musl. The
-  # default `console` etc. features are kept; `jemalloc` is layered on. zig needs a
-  # writable cache, so point HOME/XDG_CACHE_HOME at the sandbox build dir.
-  buildPhase = ''
-    runHook preBuild
-    export HOME="$TMPDIR"
-    export XDG_CACHE_HOME="$TMPDIR/.cache"
-    mkdir -p "$XDG_CACHE_HOME"
-    cargo zigbuild --release --offline \
-      --target ${target} \
-      --features jemalloc \
-      -p boatramp
-    runHook postBuild
-  '';
-
-  installPhase = ''
-    runHook preInstall
-    install -Dm755 target/${target}/release/boatramp "$out/bin/boatramp"
-    # Scrub the dead toolchain store-path string the binary retains after strip, so
-    # nix doesn't pin the ~1.6 GiB toolchain closure into the image (see package.nix).
-    remove-references-to -t ${rustToolchain} "$out/bin/boatramp"
-    runHook postInstall
-  '';
-
-  meta = {
-    description = "Self-hosted, streaming-first static site publishing platform (static musl + jemalloc)";
-    homepage = "https://github.com/BoatRamp/BoatRamp";
-    license = with lib.licenses; [
-      mit
-      asl20
+    nativeBuildInputs = [
+      pkg-config
+      cmake
+      cargo-zigbuild
+      zig
+      removeReferencesTo
     ];
-    mainProgram = "boatramp";
+    LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages.libclang.lib ];
+
+    # cargo-zigbuild reads the target from `--target`; export it too so crane's
+    # artifact plumbing carries the right `target/<triple>` dir between layers.
+    CARGO_BUILD_TARGET = target;
+
+    # zig needs a writable global cache; the sandbox $HOME is not writable by default.
+    preBuild = ''
+      export HOME="$TMPDIR"
+      export XDG_CACHE_HOME="$TMPDIR/.cache"
+      mkdir -p "$XDG_CACHE_HOME"
+    '';
   };
-}
+
+  # Layer 1 — boatramp's third-party dependency closure for musl+jemalloc, compiled
+  # once and cached. No `postPatch` here: the workspace build scripts are stubbed in
+  # the dummy sources, so the console dist is not needed to build the deps.
+  cargoArtifacts = craneLib.buildDepsOnly (
+    commonArgs
+    // {
+      buildPhaseCargoCommand = ''
+        echo "=== cargo-zigbuild build DEPS (jemalloc, release) for ${target} ==="
+        cargo zigbuild --release --offline \
+          --target ${target} \
+          --features jemalloc \
+          -p boatramp
+      '';
+    }
+  );
+in
+# Layer 2 — the static binary, reusing the cached deps. Only boatramp's own crates
+# recompile here; the real workspace build scripts run (staged console dist via
+# postPatch, firecracker vminit cross-compile via zig).
+craneLib.mkCargoDerivation (
+  commonArgs
+  // {
+    inherit cargoArtifacts postPatch;
+    # We install a single binary by hand below, not crane's build-log installer, and
+    # we do not need to re-export the (large) target dir from this stage.
+    doInstallCargoArtifacts = false;
+    buildPhaseCargoCommand = ''
+      cargo zigbuild --release --offline \
+        --target ${target} \
+        --features jemalloc \
+        -p boatramp
+    '';
+    installPhaseCommand = ''
+      install -Dm755 target/${target}/release/boatramp "$out/bin/boatramp"
+      # Scrub the dead toolchain store-path string the binary retains after strip, so
+      # nix doesn't pin the ~1.6 GiB toolchain closure into the image (see package.nix).
+      remove-references-to -t ${rustToolchain} "$out/bin/boatramp"
+    '';
+    meta = {
+      description = "Self-hosted, streaming-first static site publishing platform (static musl + jemalloc)";
+      homepage = "https://github.com/BoatRamp/BoatRamp";
+      license = with lib.licenses; [
+        mit
+        asl20
+      ];
+      mainProgram = "boatramp";
+      platforms = lib.platforms.linux;
+    };
+  }
+)

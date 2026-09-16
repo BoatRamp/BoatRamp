@@ -159,27 +159,30 @@
           # deps like `argon2` fail to resolve (`offline mode … no matching
           # package`). Default features here (matching what the hook covered);
           # `--all-features` clippy stays an explicit CI step.
+          # The whole-workspace source, shared by the glibc clippy check and the
+          # crane-built musl derivations (clippy + static binary). Keep every
+          # workspace file (build scripts read .sql/.ron/templates), but drop the
+          # local `target/` and any `nix build` `result*` symlinks so a stray dev
+          # build dir never bloats the store copy or leaks read-only artifacts into
+          # the sandbox's cargo target dir.
+          workspaceSrc = lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              let
+                base = baseNameOf path;
+              in
+              (lib.cleanSourceFilter path type)
+              && base != "target"
+              && base != "result"
+              && !(lib.hasPrefix "result-" base);
+          };
           clippyArgs = {
             # The root Cargo.toml is a virtual workspace (no `[package]`), so name
             # the derivation explicitly (crane can't infer it).
             pname = "boatramp-workspace";
             version = "0.1.0";
-            # Keep every workspace file (build scripts read .sql/.ron/templates),
-            # but drop the local `target/` and any `nix build` `result*` symlinks
-            # so a stray dev build dir never bloats the store copy or leaks
-            # read-only artifacts into the sandbox's cargo target dir.
-            src = lib.cleanSourceWith {
-              src = ./.;
-              filter =
-                path: type:
-                let
-                  base = baseNameOf path;
-                in
-                (lib.cleanSourceFilter path type)
-                && base != "target"
-                && base != "result"
-                && !(lib.hasPrefix "result-" base);
-            };
+            src = workspaceSrc;
             strictDeps = true;
             cargoExtraArgs = "--workspace";
             inherit nativeBuildInputs buildInputs;
@@ -239,18 +242,23 @@
           # The fully-static musl + jemalloc build that backs the OCI images (see
           # ./nix/package-musl.nix). Lazily evaluated — only the Linux-only
           # `container*` packages force it, so it never builds on macOS. Built with
-          # cargo-zigbuild, so `pkgs.cargo-zigbuild` + `pkgs.zig` are passed in.
+          # crane (dependency-split, cached in cachix) + cargo-zigbuild, so `craneLib`
+          # and the cleaned `workspaceSrc` are threaded in alongside the zig toolchain.
           boatrampMuslBin = pkgs.callPackage ./nix/package-musl.nix {
-            inherit rustPlatform rustToolchain;
+            inherit craneLib rustToolchain;
+            src = workspaceSrc;
             consoleDist = consolePackage;
           };
 
           # All-features workspace clippy for the shipped musl target (see
           # ./nix/check-musl.nix). Wired into `checks` below so `nix flake check` runs it
           # and cachix caches the compiled closure — the per-push CI can't afford this
-          # (~2.5h cross-compile, GitHub-cache-evicted), but cachix amortizes it.
+          # (~2.5h cross-compile, GitHub-cache-evicted), but cachix amortizes it. Crane's
+          # dep layer means a version bump reuses the cached third-party closure instead
+          # of recompiling wasmtime/cranelift/cedar from scratch every nightly.
           boatrampMuslClippy = pkgs.callPackage ./nix/check-musl.nix {
-            inherit rustPlatform rustToolchain;
+            inherit craneLib;
+            src = workspaceSrc;
           };
 
           # Shared builder for the reproducible, Nix-first OCI images. Both targets
