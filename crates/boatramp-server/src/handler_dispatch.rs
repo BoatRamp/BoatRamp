@@ -1242,7 +1242,6 @@ pub(super) fn granted_sql_databases(imports: &[String], allow_imports: &[String]
 }
 
 #[cfg(feature = "handlers")]
-#[allow(clippy::too_many_arguments)]
 /// Why [`build_bindings`] / [`build_function_bindings`](super::function_runtime::build_function_bindings)
 /// could not produce bindings for an invocation.
 #[derive(Debug)]
@@ -1319,6 +1318,7 @@ pub(super) async fn open_bindings_sql(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // host-trusted inputs threaded from dispatch; a params struct would only obscure the plumbing
 pub(super) async fn build_bindings(
     inner: &HandlerRuntimeInner,
     project: boatramp_core::project::ProjectRef<'_>,
