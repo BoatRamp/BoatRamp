@@ -603,6 +603,11 @@ jobs:
             || { echo "::error::RLS tenant GUC gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
           grep -q 'RLS TENANT GUC OK \[postgres\]' rls-guc.log \
             || { echo "::error::RLS tenant GUC never reached its marker (the GUC didn't drive RLS, a forged-tenant write slipped through, or an all-write couldn't provision)" >&2; exit 1; }
+          # v0.4.21: an `all` READ writes a reserved marker to the tenant GUC so a table that opts in
+          # (`USING … OR guc = marker`) opens cross-tenant, while a strict table + every write + an
+          # unset GUC stay fail-closed. A leak (marker over-opening) fails the assertion.
+          grep -q 'RLS ALL-READ MARKER OK \[postgres\]' rls-guc.log \
+            || { echo "::error::RLS all-read marker never reached its marker (the marker didn't open an opted-in all-read, or it leaked to a non-opted table / a write)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in

@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.21] - 2026-09-18
+
+The read-side completion of v0.4.20's RLS session GUC: an `all`-scoped READ now drives the tenant
+GUC too, so an app's cross-tenant reads (login memberships, a payments webhook, SSO config) work
+under row-level security instead of failing closed. Opt-in, Postgres-only. Behind a security review
+(converged to ship after one hardening pass) and the CI-hard live gate extended on a real
+non-superuser FORCE-RLS role.
+
+### Added
+- **All-scope read marker (`tenant_all_marker`).** v0.4.20 set the RLS tenant GUC for `own`/`target`
+  reads and `all` writes, but an `all`-scoped READ left it unset — so RLS keyed on it returned zero
+  rows, breaking the legitimate cross-tenant reads the audited `all` twins perform (some pre-auth).
+  Now, when an operator configures a reserved marker (e.g. `app.tenant_id` = `*`), an `all` read sets
+  the tenant GUC to that marker so a table that opts in with
+  `USING (tenant_id = current_setting(name,true) OR current_setting(name,true) = '<marker>')` opens
+  cross-tenant — while every other table, and every write, stays strict.
+  - **The marker can never be in effect for a write.** It is set only for an explicit `all` READ
+    (never as a fallback for an unresolved `own` read — that stays fail-closed), and every write path
+    force-resets the GUC off the marker (to the resolved tenant, or an empty deny value) *before* the
+    write executes — so an operator's `WITH CHECK (… OR guc = marker)` can never become always-true.
+    The reset propagates its error (an aborted transaction ⇒ the write fails closed), so the guarantee
+    does not rely on best-effort cleanup or backend transaction semantics.
+  - **Per-table opt-in, fail-closed.** Only a table whose policy adds the `OR … = marker` disjunct
+    opens; a strict table, and an unset GUC (a dropped host resolution), open nothing. The guest can
+    never set the marker — the tenant GUC namespace is already reserved against guest writes.
+  - Configured on `ExternalDatabaseConfig` (`tenant_all_marker`, empty/whitespace ⇒ off) and via the
+    matching `…_TENANT_ALL_MARKER` env knob. Postgres-only, and only when a `tenant_guc` is set.
+
 ## [0.4.20] - 2026-09-17
 
 The host-resolved tenant is now exposed to an app's Postgres row-level security as a session GUC, so

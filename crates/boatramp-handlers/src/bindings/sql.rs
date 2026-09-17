@@ -62,6 +62,12 @@ pub struct SqlSession {
     /// The host-resolved in-site tenancy applied to **both** this `sql` binding and the sibling
     /// `orm` binding (they share the session). `None` ⇒ plain queries (no row scoping).
     tenancy: Option<crate::tenant::HostTenancy>,
+    /// Transaction keys `(name, read_only)` whose tenant GUC currently holds the v0.4.21 `all`-read
+    /// marker. Load-bearing for the no-write-under-marker invariant: before any WRITE on a
+    /// `(name,false)` transaction, [`defend_write_marker`](Self::defend_write_marker) force-resets
+    /// the GUC off the marker (error-propagating) — so a marker set by a prior `all` read can NEVER
+    /// be in effect for a write, independent of backend transaction-abort semantics.
+    marker_live: std::collections::HashSet<(String, bool)>,
 }
 
 impl SqlSession {
@@ -71,6 +77,7 @@ impl SqlSession {
             backends,
             txns: HashMap::new(),
             tenancy: None,
+            marker_live: std::collections::HashSet::new(),
         }
     }
 
@@ -168,11 +175,87 @@ impl SqlSession {
         name: &str,
         value: &SqlValue,
     ) -> Result<(), SqlError> {
+        // A write always uses the read-write transaction (`read_only = false`).
+        self.set_rls_tenant_on(name, false, value).await
+    }
+
+    /// Set the tenant GUC on the `(name, read_only)` transaction — the general form of
+    /// [`set_rls_tenant`](Self::set_rls_tenant) so the `all`-read marker can be written to the same
+    /// transaction the read runs on (which may be a read-only one). No-op without an RLS GUC.
+    async fn set_rls_tenant_on(
+        &mut self,
+        name: &str,
+        read_only: bool,
+        value: &SqlValue,
+    ) -> Result<(), SqlError> {
         if let Some(guc) = self.rls_guc(name) {
             let (sql, params) = boatramp_core::sql::render_set_local_guc(&guc.tenant, value);
-            let tx = self.txn(name, false).await?;
+            let tx = self.txn(name, read_only).await?;
             tx.execute(&sql, &params).await?;
         }
+        Ok(())
+    }
+
+    /// v0.4.21 all-read backstop: for an `all`-scoped **READ** against a Postgres RLS binding with a
+    /// configured all-marker, write the marker to the tenant GUC on the transaction the read will use
+    /// (`read_only`), so a table that opts in with `USING (… OR current_setting(name,true) = marker)`
+    /// opens cross-tenant. The marker stays set on that transaction (every read of an `all` component
+    /// wants it) until either the invocation finalizes (the `SET LOCAL` GUC is discarded at COMMIT/
+    /// ROLLBACK) or a WRITE on the `(name,false)` transaction force-resets it via
+    /// [`defend_write_marker`](Self::defend_write_marker) — so it can NEVER be in effect for a write
+    /// (where an active marker in a `WITH CHECK (… OR guc = marker)` would be always-true → a
+    /// cross-tenant write leak). No-op for a write axis, a non-`all` read, or no marker. Marking a
+    /// write transaction (`read_only == false`) records the key so a subsequent write defends first.
+    /// `pub(super)` for the sibling `orm` binding.
+    pub(super) async fn set_all_read_marker(
+        &mut self,
+        name: &str,
+        read_only: bool,
+        axis: crate::tenant::Axis,
+    ) -> Result<(), SqlError> {
+        if !matches!(axis, crate::tenant::Axis::Read) {
+            return Ok(());
+        }
+        let Some(marker) = self.rls_guc(name).and_then(|g| g.all_marker) else {
+            return Ok(());
+        };
+        if !self
+            .tenancy
+            .as_ref()
+            .is_some_and(crate::tenant::HostTenancy::read_is_all)
+        {
+            return Ok(());
+        }
+        self.set_rls_tenant_on(name, read_only, &SqlValue::Text(marker))
+            .await?;
+        self.marker_live.insert((name.to_string(), read_only));
+        Ok(())
+    }
+
+    /// Before a WRITE on the `(name,false)` transaction: if a prior `all` read left the all-marker on
+    /// it (tracked in `marker_live`), force-reset the tenant GUC off the marker — to the resolved
+    /// principal, or an empty string (⇒ the DB's `WITH CHECK`/`USING` denies) — and drop the flag.
+    /// This is the load-bearing half of the no-write-under-marker invariant: it runs before every
+    /// write path (both bindings) and PROPAGATES its error (an aborted transaction ⇒ the write fails
+    /// closed), so the guarantee never depends on best-effort cleanup or backend abort semantics.
+    /// No-op when no marker is live on the write transaction. Only the read-write key `(name,false)`
+    /// is defended: a write only ever runs there. A write-axis statement issued on a read-only handle
+    /// runs on `(name,true)`, whose transaction is opened `BEGIN READ ONLY` — the DB rejects the write
+    /// (SQLSTATE 25006) before RLS `WITH CHECK` is evaluated, so a marker lingering on a read-only
+    /// transaction can never open a write. That is a deliberate reliance on the backend's read-only
+    /// enforcement (the same enforcement that makes a read-only handle read-only at all).
+    pub(super) async fn defend_write_marker(&mut self, name: &str) -> Result<(), SqlError> {
+        let key = (name.to_string(), false);
+        if !self.marker_live.contains(&key) {
+            return Ok(());
+        }
+        let restore = self
+            .tenancy
+            .as_ref()
+            .and_then(|t| t.rls_tenant_value().cloned())
+            .unwrap_or_else(|| SqlValue::Text(String::new()));
+        self.set_rls_tenant_on(name, false, &restore).await?;
+        self.marker_live.remove(&key);
         Ok(())
     }
 
@@ -191,6 +274,9 @@ impl SqlSession {
         if !matches!(axis, crate::tenant::Axis::Write) || self.rls_guc(name).is_none() {
             return Ok(());
         }
+        // v0.4.21: this is a write — first force any `all`-read marker off the write transaction, so
+        // the marker can never be in effect for the `WITH CHECK` below (error-propagating).
+        self.defend_write_marker(name).await?;
         let dialect = self.dialect(name);
         let val = self
             .tenancy
@@ -339,6 +425,14 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .apply_all_write_rls(&name, &statement, axis)
             .await
             .map_err(to_wit_error)?;
+        // v0.4.21: for an `all` READ, set the reserved all-marker on the read's transaction so it
+        // opens the operator's `USING (… OR guc = marker)` cross-tenant. It is force-reset off any
+        // write transaction by `defend_write_marker` before a write runs, so it can never defeat a
+        // `WITH CHECK`. No-op for a non-`all` read / write axis / no marker.
+        self.session
+            .set_all_read_marker(&name, read_only, axis)
+            .await
+            .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)
@@ -396,6 +490,13 @@ impl sql_query::HostDatabase for SqlHost<'_> {
         // mismatch. Unextractable ⇒ GUC unset ⇒ the DB denies (fail-closed).
         self.session
             .apply_all_write_rls(&name, &statement, axis)
+            .await
+            .map_err(to_wit_error)?;
+        // v0.4.21: a read-axis statement reached via `execute()` gets the same all-marker treatment
+        // (no-op unless it is an `all` read with a configured marker). The marker is force-reset off
+        // the write transaction by `defend_write_marker` (via `apply_all_write_rls`) before any write.
+        self.session
+            .set_all_read_marker(&name, read_only, axis)
             .await
             .map_err(to_wit_error)?;
         let txn = self
@@ -802,11 +903,19 @@ mod tests {
     struct RlsBackend {
         injects: bool,
         log: Log,
+        dialect: boatramp_core::sql::Dialect,
+        rls: Option<boatramp_core::sql::RlsGuc>,
     }
     #[async_trait]
     impl SqlBackend for RlsBackend {
         fn injects_session_context(&self) -> bool {
             self.injects
+        }
+        fn dialect(&self) -> boatramp_core::sql::Dialect {
+            self.dialect
+        }
+        fn rls_guc(&self) -> Option<&boatramp_core::sql::RlsGuc> {
+            self.rls.as_ref()
         }
         async fn begin(&self) -> Result<Box<dyn SqlTransaction>, SqlError> {
             Ok(Box::new(FakeTxn {
@@ -824,8 +933,114 @@ mod tests {
 
     fn rls_session(injects: bool, log: Log) -> SqlSession {
         let mut map: HashMap<String, Arc<dyn SqlBackend>> = HashMap::new();
-        map.insert(String::new(), Arc::new(RlsBackend { injects, log }));
+        map.insert(
+            String::new(),
+            Arc::new(RlsBackend {
+                injects,
+                log,
+                dialect: boatramp_core::sql::Dialect::Sqlite,
+                rls: None,
+            }),
+        );
         SqlSession::for_backends(map)
+    }
+
+    /// A Postgres RLS session with a configured all-marker and the given axis modes — for testing the
+    /// v0.4.21 marker set + `defend_write_marker` invariant directly on `SqlSession`.
+    fn pg_marker_session(
+        marker: &str,
+        read: boatramp_core::tenancy::AccessMode,
+        write: boatramp_core::tenancy::AccessMode,
+        log: Log,
+    ) -> SqlSession {
+        let mut map: HashMap<String, Arc<dyn SqlBackend>> = HashMap::new();
+        map.insert(
+            String::new(),
+            Arc::new(RlsBackend {
+                injects: true,
+                log,
+                dialect: boatramp_core::sql::Dialect::Postgres,
+                rls: Some(boatramp_core::sql::RlsGuc {
+                    tenant: "app.tenant_id".into(),
+                    session: None,
+                    all_marker: Some(marker.to_string()),
+                }),
+            }),
+        );
+        SqlSession::for_backends(map).with_tenancy(Some(crate::tenant::HostTenancy::new(
+            "tenant_id",
+            Some(SqlValue::Text("ten_1".into())),
+            read,
+            write,
+        )))
+    }
+
+    /// The core no-write-under-marker invariant, at the `SqlSession` level: an `all` read sets the
+    /// marker on the write transaction, and a subsequent write force-resets the GUC off the marker to
+    /// the resolved tenant BEFORE it runs — so a `WITH CHECK (… OR guc = marker)` is never opened.
+    #[tokio::test]
+    async fn all_read_marker_is_set_then_defended_off_the_write_txn() {
+        use boatramp_core::tenancy::AccessMode;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // read=All + write=Own (ten_1) — the combo where the write path does NOT re-derive the GUC,
+        // so the defend is the only thing that can stop a stale marker riding into the write.
+        let mut session = pg_marker_session("*", AccessMode::All, AccessMode::Own, log.clone());
+
+        // An `all` read sets the marker on the (name, false) write transaction.
+        session
+            .set_all_read_marker("", false, crate::tenant::Axis::Read)
+            .await
+            .unwrap();
+        // A write then defends: force-reset the GUC to the resolved tenant before the write runs.
+        session.defend_write_marker("").await.unwrap();
+
+        let log = log.lock().unwrap();
+        let sets: Vec<&String> = log.iter().filter(|l| l.contains("set_config")).collect();
+        // The `all` read DID set the marker (so an opted-in table opens cross-tenant)…
+        assert!(
+            sets.iter().any(|s| s.contains("\"*\"")),
+            "the all-read set the all-marker, got {sets:?}"
+        );
+        // …but the LAST GUC set before the write is the resolved tenant, NOT the marker — the defend
+        // won, so a `WITH CHECK (… OR guc = marker)` can never be always-true for the write.
+        let last = sets.last().expect("at least one GUC set");
+        assert!(
+            last.contains("ten_1") && !last.contains("\"*\""),
+            "the write defended off the marker to the resolved tenant, got {sets:?}"
+        );
+    }
+
+    /// The marker is NEVER set for a write axis or a non-`all` read (fail-closed gating).
+    #[tokio::test]
+    async fn all_read_marker_not_set_for_writes_or_non_all_reads() {
+        use boatramp_core::tenancy::AccessMode;
+        // A WRITE axis: no marker even though read is All.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut s = pg_marker_session("*", AccessMode::All, AccessMode::All, log.clone());
+        s.set_all_read_marker("", false, crate::tenant::Axis::Write)
+            .await
+            .unwrap();
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .all(|l| !l.contains("set_config")),
+            "a write axis must not set the all-marker"
+        );
+        // An `own` READ (read != All): no marker — an unresolved own read must stay GUC-unset (deny),
+        // never fall back to the marker.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut s = pg_marker_session("*", AccessMode::Own, AccessMode::Own, log.clone());
+        s.set_all_read_marker("", false, crate::tenant::Axis::Read)
+            .await
+            .unwrap();
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .all(|l| !l.contains("set_config")),
+            "a non-`all` read must not set the all-marker"
+        );
     }
 
     /// With rls_session on, a guest `query`/`execute` that sets a reserved
