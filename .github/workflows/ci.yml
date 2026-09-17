@@ -474,6 +474,23 @@ jobs:
             || { echo "::error::consumer signed-context dispatch gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'CONSUMER SIGNED-CONTEXT DISPATCH OK' consumer-sctx.log \
             || { echo "::error::consumer signed-context dispatch never reached its marker (a dropped per-message resolve, a cross-tenant leak, or a fail-open on an unsealed/forged message)" >&2; exit 1; }
+      - name: Managed-dependency readiness gate (v0.4.19)
+        run: |
+          set -eo pipefail
+          # v0.4.19: a component whose required host-MANAGED database is still starting must gate
+          # with a retryable 503 + Retry-After (fail-closed, guest never runs), NOT run into a
+          # confusing "not granted". Driven through the real `build_bindings` with a fake provider:
+          # managed-not-ready (SqlError::Unavailable) -> BindingsError::NotReady; a transient blip is
+          # caught by the bounded readiness retry; an external/local DB outage is skipped (per-DB
+          # resilience, NOT gated); the gate response is a 503 with Retry-After. A fail-open
+          # regression (a not-ready managed DB NOT gating) fails the assertion.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            managed_dependency_not_ready_gates_with_a_retryable_503 \
+            -- --nocapture 2>&1 | tee readiness-gate.log
+          grep -qE 'test result: ok\. 1 passed' readiness-gate.log \
+            || { echo "::error::managed-dependency readiness gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'MANAGED-DEP READINESS GATE OK' readiness-gate.log \
+            || { echo "::error::managed-dependency readiness never reached its marker (a fail-open on a not-ready managed DB, a lost retry, or a gated non-managed outage)" >&2; exit 1; }
       - name: Live guest-egress extra-CA TLS trust on a real loopback handshake (v0.4.17)
         run: |
           set -eo pipefail

@@ -570,10 +570,20 @@ pub(super) async fn execute_function(
     .await
     {
         Ok(bindings) => bindings,
+        // A required managed database is still starting — gate with a retryable 503 + Retry-After
+        // so a caller / migration probe waits, instead of running the function into a confusing
+        // "not granted" (the managed-dependency readiness gate). Fail-closed.
+        Err(super::handler_dispatch::BindingsError::NotReady {
+            detail,
+            retry_after_secs,
+        }) => {
+            tracing::info!(function = %function.name, %detail, "function not ready: managed database starting");
+            return (sql_starting_response(retry_after_secs), 0);
+        }
         // A refused secret ref (a host-env ref under the multi-tenant posture, or
-        // an unsupported scheme) fails the invocation closed — the function never
-        // runs with a leaked or missing value.
-        Err(err) => {
+        // an unsupported scheme) / a tenancy misconfiguration fails the invocation closed — the
+        // function never runs with a leaked or missing value.
+        Err(super::handler_dispatch::BindingsError::Refused(err)) => {
             tracing::warn!(function = %function.name, %err, "function bindings refused");
             return (handler_unavailable(), 0);
         }
@@ -642,7 +652,8 @@ pub(super) async fn build_function_bindings(
     tenant: &FnTenant,
     bearer: Option<&str>,
     domain_context: Option<&str>,
-) -> Result<boatramp_handlers::Bindings, String> {
+) -> Result<boatramp_handlers::Bindings, super::handler_dispatch::BindingsError> {
+    use super::handler_dispatch::BindingsError;
     let granted = |name: &str| config.imports.iter().any(|i| i == name);
     let mut bindings = boatramp_handlers::Bindings::new(scope);
     if granted("wasi:keyvalue") {
@@ -675,8 +686,30 @@ pub(super) async fn build_function_bindings(
             }
         }
         for name in names {
-            match provider.database(project.as_str(), sql_site, name).await {
+            // Same managed-dependency readiness handling as the site-handler path
+            // (`build_bindings`): a MANAGED database still starting (`Unavailable`, after a short
+            // readiness retry) gates the whole invocation with a retryable 503; any other error
+            // (external/local DB down) is logged + skipped (per-DB resilience).
+            match super::handler_dispatch::open_bindings_sql(
+                provider.as_ref(),
+                project.as_str(),
+                sql_site,
+                name,
+                None,
+            )
+            .await
+            {
                 Ok(backend) => bindings = bindings.with_sql(name, backend),
+                Err(err) if err.is_unavailable() => {
+                    tracing::info!(
+                        scope, database = name, %err,
+                        "required managed database not ready — gating the function with a retryable 503"
+                    );
+                    return Err(BindingsError::NotReady {
+                        detail: format!("database `{name}`: {err}"),
+                        retry_after_secs: super::handler_dispatch::SQL_NOT_READY_RETRY_AFTER_SECS,
+                    });
+                }
                 Err(err) => {
                     tracing::warn!(scope, database = name, %err, "opening function SQL database failed");
                 }
@@ -725,7 +758,7 @@ pub(super) async fn build_function_bindings(
                     },
                 )
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| BindingsError::Refused(e.to_string()))?,
                 false,
             ),
             FnTenant::Inherited(value) => (
@@ -735,7 +768,7 @@ pub(super) async fn build_function_bindings(
                     posture,
                     value.clone(),
                 )
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| BindingsError::Refused(e.to_string()))?,
                 false,
             ),
             // The durable async lane: a `signed_context` source resolves the producer's stamped
@@ -753,7 +786,7 @@ pub(super) async fn build_function_bindings(
                     },
                 )
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| BindingsError::Refused(e.to_string()))?,
                 false,
             ),
             FnTenant::Background => (
@@ -764,7 +797,7 @@ pub(super) async fn build_function_bindings(
                     crate::tenant_resolve::TenantSourceInputs::default(),
                 )
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| BindingsError::Refused(e.to_string()))?,
                 false,
             ),
         };

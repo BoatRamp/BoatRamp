@@ -411,10 +411,20 @@ pub(super) async fn dispatch_handler(
     .await
     {
         Ok(bindings) => bindings,
+        // A required managed database is still starting — gate this route with a retryable 503 +
+        // Retry-After so the client / a migration probe waits, instead of running the guest into a
+        // confusing "not granted" (the managed-dependency readiness gate). Fail-closed.
+        Err(BindingsError::NotReady {
+            detail,
+            retry_after_secs,
+        }) => {
+            tracing::info!(site, route = %handler.route, %detail, "handler not ready: managed database starting");
+            return sql_starting_response(retry_after_secs);
+        }
         // A refused secret ref (host-env ref under the multi-tenant posture, or an
-        // unsupported scheme) fails the handler closed rather than instantiating it
-        // with a leaked or missing value.
-        Err(err) => {
+        // unsupported scheme) / a tenancy misconfiguration fails the handler closed rather than
+        // instantiating it with a leaked or missing value.
+        Err(BindingsError::Refused(err)) => {
             tracing::warn!(site, route = %handler.route, %err, "handler bindings refused");
             return handler_unavailable();
         }
@@ -1233,6 +1243,82 @@ pub(super) fn granted_sql_databases(imports: &[String], allow_imports: &[String]
 
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
+/// Why [`build_bindings`] / [`build_function_bindings`](super::function_runtime::build_function_bindings)
+/// could not produce bindings for an invocation.
+#[derive(Debug)]
+pub(super) enum BindingsError {
+    /// A **permanent** refusal — a disallowed `secrets` ref (host-env ref under multi-tenant, an
+    /// unsupported scheme), a tenancy misconfiguration, etc. The component cannot run as configured;
+    /// rendered as a plain `503 handler unavailable`.
+    Refused(String),
+    /// A **required host-managed database is not ready yet** (still starting / recovering / no
+    /// healthy replica) — [`SqlError::Unavailable`](boatramp_core::sql::SqlError::Unavailable) after
+    /// the short readiness retry. Transient: rendered as a retryable `503` + `Retry-After` (the
+    /// managed-dependency readiness gate), so a migration/health probe waits instead of the guest
+    /// hitting a confusing "not granted". Fail-closed: the guest never runs without its DB.
+    NotReady {
+        detail: String,
+        retry_after_secs: u32,
+    },
+}
+
+impl std::fmt::Display for BindingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(m) => f.write_str(m),
+            Self::NotReady { detail, .. } => write!(f, "managed database not ready: {detail}"),
+        }
+    }
+}
+impl std::error::Error for BindingsError {}
+
+// A bare `String` error (e.g. secret-ref resolution) is a permanent refusal — let `?` lift it.
+impl From<String> for BindingsError {
+    fn from(s: String) -> Self {
+        Self::Refused(s)
+    }
+}
+
+/// `Retry-After` (seconds) advertised on the readiness-gate `503` — how soon a client / migration
+/// probe should re-poll while a managed database finishes starting. Small: startup is usually a
+/// handful of seconds and the probe is cheap.
+pub(super) const SQL_NOT_READY_RETRY_AFTER_SECS: u32 = 2;
+
+/// Open a granted SQL database for an invocation's bindings, applying a **short bounded readiness
+/// retry**. A host-managed database that is still starting returns
+/// [`SqlError::Unavailable`](boatramp_core::sql::SqlError::Unavailable); a DB that is only a moment
+/// from ready is caught by one quick re-attempt, so a brief startup blip does not 503. If it is
+/// still not ready, the `Unavailable` error is returned for the caller to turn into the readiness
+/// gate (a retryable `503`). Any other error (an external/local DB down or misconfigured) is
+/// returned as-is — the caller logs + skips it, preserving per-DB resilience (no gate).
+#[cfg(feature = "handlers")]
+pub(super) async fn open_bindings_sql(
+    provider: &dyn boatramp_core::sql::SqlBackends,
+    project: &str,
+    site: &str,
+    name: &str,
+    preview: Option<&str>,
+) -> Result<std::sync::Arc<dyn boatramp_core::sql::SqlBackend>, boatramp_core::sql::SqlError> {
+    // One extra quick attempt (~250 ms) — enough for a DB moments from ready, short enough not to
+    // tie up the handler pool. A DB further out is handled by the client-side `Retry-After` retry.
+    const READINESS_RETRIES: usize = 1;
+    const READINESS_BACKOFF: Duration = Duration::from_millis(250);
+    let mut attempt = 0usize;
+    loop {
+        let opened = match preview {
+            Some(id) => provider.preview_database(project, site, name, id).await,
+            None => provider.database(project, site, name).await,
+        };
+        match opened {
+            Err(ref e) if e.is_unavailable() && attempt < READINESS_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(READINESS_BACKOFF).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 pub(super) async fn build_bindings(
     inner: &HandlerRuntimeInner,
     project: boatramp_core::project::ProjectRef<'_>,
@@ -1269,7 +1355,7 @@ pub(super) async fn build_bindings(
     // (host-verified against the fleet anchor, guest-blind). `None` on every synchronous request/
     // handler path (that lane carries no envelope) — passed per-message by the consumer dispatch.
     signed_context: Option<&str>,
-) -> Result<boatramp_handlers::Bindings, String> {
+) -> Result<boatramp_handlers::Bindings, BindingsError> {
     let granted = |name: &str| {
         imports.iter().any(|i| i == name) && site_handlers.allow_imports.iter().any(|a| a == name)
     };
@@ -1284,22 +1370,27 @@ pub(super) async fn build_bindings(
     if let Some(provider) = &inner.sql {
         // The SQL provider validates + qualifies `project`/`site` internally (it rejects a
         // `/`-bearing composite `site`), so pass the *raw* project + bare site here — never the
-        // already-qualified `scope`. Each granted database is opened independently; a provider
-        // error is logged and that binding left ungranted (the guest sees `access denied` for
-        // that name, not a 500 for the whole request), so one broken database can't fail the
-        // others. A preview routes through `preview_database` so a named external DB honors its
-        // `allow_preview`.
+        // already-qualified `scope`. A preview routes through `preview_database` so a named external
+        // DB honors its `allow_preview`. Two failure classes (WS1/WS2 of the managed-dependency
+        // readiness plan): a MANAGED database still starting (`Unavailable`, after a short readiness
+        // retry) gates the whole invocation with a retryable 503 — a migration/health probe waits
+        // instead of the guest hitting a confusing "not granted". Any OTHER error (external/local DB
+        // down or misconfigured) is logged and that binding left ungranted, so one broken secondary
+        // can't fail an unrelated request (per-DB resilience is preserved, unchanged).
         for name in granted_sql_databases(imports, &site_handlers.allow_imports) {
-            let opened = match preview {
-                Some(id) => {
-                    provider
-                        .preview_database(project.as_str(), site, &name, id)
-                        .await
-                }
-                None => provider.database(project.as_str(), site, &name).await,
-            };
-            match opened {
+            match open_bindings_sql(provider.as_ref(), project.as_str(), site, &name, preview).await
+            {
                 Ok(backend) => bindings = bindings.with_sql(name.clone(), backend),
+                Err(err) if err.is_unavailable() => {
+                    tracing::info!(
+                        site, database = %name, %err,
+                        "required managed database not ready — gating with a retryable 503"
+                    );
+                    return Err(BindingsError::NotReady {
+                        detail: format!("database `{name}`: {err}"),
+                        retry_after_secs: SQL_NOT_READY_RETRY_AFTER_SECS,
+                    });
+                }
                 Err(err) => {
                     tracing::warn!(site, database = %name, %err, "opening SQL database failed");
                 }
@@ -1347,11 +1438,11 @@ pub(super) async fn build_bindings(
             Some(h) => {
                 if let Some(ceiling) = site_handlers.tenancy.as_ref() {
                     if !h.narrows_within(ceiling) {
-                        return Err(format!(
+                        return Err(BindingsError::Refused(format!(
                             "tenancy: a handler on site `{site}` declares a tenancy that widens the \
                              site ceiling (a per-handler decision may narrow within the site's \
                              `tenancy`, never widen it)"
-                        ));
+                        )));
                     }
                 }
                 Some(h)
@@ -1375,10 +1466,10 @@ pub(super) async fn build_bindings(
                     .as_ref()
                     .is_some_and(|s| s.target_field_eligible(site))
                 {
-                    return Err(format!(
+                    return Err(BindingsError::Refused(format!(
                         "tenancy: site `{site}` is not an operator-permitted target-tenant route \
                          (add it to the project's target_eligible_fields)"
-                    ));
+                    )));
                 }
                 // Ruling A (5c): the visibility `public_subset` is mandatory only for an ANONYMOUS
                 // source (`domain`/`handle`) — for an unauthenticated actor the visibility predicate
@@ -1409,10 +1500,10 @@ pub(super) async fn build_bindings(
                         .and_then(|s| s.public_subset(public))
                         .is_none()
                 {
-                    return Err(format!(
+                    return Err(BindingsError::Refused(format!(
                         "tenancy: target route `{site}` names public subset `{public}` which the \
                          project schema does not declare (deny-by-default)"
-                    ));
+                    )));
                 }
                 // G3 (schema-admission fact): the `handle` source is admissible ONLY on a
                 // `world_public` subset — regardless of the via list. A route that lists `handle` on
@@ -1423,11 +1514,11 @@ pub(super) async fn build_bindings(
                         .as_ref()
                         .is_some_and(|s| s.subset_is_world_public(public))
                 {
-                    return Err(format!(
+                    return Err(BindingsError::Refused(format!(
                         "tenancy: target route `{site}` lists the `handle` source but its public \
                          subset `{public}` is not `world_public` (deny-by-default; a public handle \
                          may only reach world-public data)"
-                    ));
+                    )));
                 }
                 // R4/D8 5c: resolve `B` from the first applicable `via` source (first-resolves-wins).
                 // `domain` = the host-stamped routed-domain context tag; `capability` = the request
@@ -1477,11 +1568,11 @@ pub(super) async fn build_bindings(
                     // No `via` source resolved ⇒ refuse (a target route must never fall back to an
                     // own/plain — that would read the caller's own or every tenant's rows).
                     _ => {
-                        return Err(
+                        return Err(BindingsError::Refused(
                             "tenancy: this target route could not resolve a target tenant \
                                     (no routed domain, no valid capability, and no resolvable handle)"
                                 .to_string(),
-                        )
+                        ))
                     }
                 }
             }
@@ -1508,7 +1599,7 @@ pub(super) async fn build_bindings(
                 };
                 crate::tenant_resolve::resolve_host_tenancy(other, imports_db, posture, inputs)
                     .await
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| BindingsError::Refused(e.to_string()))?
                     .map(|h| h.with_schema(schema.as_ref()))
             }
         };
@@ -1960,6 +2051,10 @@ impl ConsumerRebuild<'_> {
             signed_context,
         )
         .await
+        // The async lane has no HTTP response to 503 — a consumer nacks on any bindings failure
+        // (a not-ready managed DB included), so the message redelivers and is retried once the DB
+        // is up. Flatten to a string for the nack log.
+        .map_err(|e| e.to_string())
     }
 }
 

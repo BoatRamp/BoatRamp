@@ -681,6 +681,24 @@ pub(super) fn handler_unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "handler unavailable\n").into_response()
 }
 
+/// A **retryable** `503` for a component whose required host-managed database is still starting —
+/// the managed-dependency readiness gate. Carries `Retry-After` so a client / a migration or health
+/// probe re-polls instead of the guest running into a confusing "not granted"; the guest never runs.
+#[cfg(feature = "handlers")]
+pub(super) fn sql_starting_response(retry_after_secs: u32) -> Response {
+    let mut headers = axum::http::HeaderMap::new();
+    let secs = retry_after_secs.clamp(1, 3600);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+        headers.insert(axum::http::header::RETRY_AFTER, v);
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        "database starting; retry shortly\n",
+    )
+        .into_response()
+}
+
 /// The per-invocation limits for a handler: the site's caps and any per-handler
 /// caps (the lower of the two for each dimension). Left at the engine default
 /// where neither is set; the engine then clamps to its own ceiling.
