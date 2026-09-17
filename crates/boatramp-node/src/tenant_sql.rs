@@ -1235,6 +1235,16 @@ impl NodeTenantSqlResolver {
                 (SESSION_KEY_PROJECT, project.to_string()),
                 (SESSION_KEY_SITE, site.to_string()),
             ]);
+            // v0.4.20: also expose the host-resolved TENANT (and anonymous session) as the
+            // operator's RLS GUCs, so an app's Postgres RLS mirrors boatramp's injected predicate.
+            // The NAMES are per-binding config; the handler binding sets the per-request/per-write
+            // VALUE. Only when a tenant GUC name is configured (else today's project/site-only).
+            if let Some(tenant) = self.binding.tenant_guc.clone().filter(|s| !s.is_empty()) {
+                backend = backend.with_rls_guc(Some(boatramp_core::sql::RlsGuc {
+                    tenant,
+                    session: self.binding.session_guc.clone().filter(|s| !s.is_empty()),
+                }));
+            }
         }
         Ok(Arc::new(backend))
     }

@@ -277,6 +277,48 @@ impl HostTenancy {
         self.tenant_value()
     }
 
+    /// The resolved tenant value for the **RLS session GUC** (v0.4.20): the own [`ScopeAxis::Tenant`]
+    /// fact, or the [`ScopeAxis::TargetTenant`] fact under a target read/write (own and target never
+    /// co-occur). `None` for an anonymous / `all` / null-only principal — the per-transaction GUC is
+    /// then left unset (an `all` write sets it per-statement from the row instead).
+    pub fn rls_tenant_value(&self) -> Option<&SqlValue> {
+        self.tenant_value()
+            .or_else(|| self.fact(ScopeAxis::TargetTenant))
+    }
+
+    /// The resolved anonymous-session value for the RLS **session** GUC (the `TenantOrSession` arm).
+    pub fn rls_session_value(&self) -> Option<&SqlValue> {
+        self.session_value()
+    }
+
+    /// Whether the WRITE axis is the posture-vetted cross-tenant [`AccessMode::All`] — the mode with
+    /// no injected tenant stamp, where the RLS tenant GUC is derived per-statement from the row being
+    /// written ([`Insert::uniform_scope_value`](boatramp_core::orm::Insert::uniform_scope_value) /
+    /// the raw-write extractor) rather than from a resolved principal.
+    pub fn write_is_all(&self) -> bool {
+        self.write == AccessMode::All
+    }
+
+    /// The tenant/scope COLUMN for `table` (the one an RLS policy keys on): the per-table key under a
+    /// project schema (the identity table on its own PK; a `TenantOrSession`/`TenantOrBase` table on
+    /// its tenant column), else the default column (legacy `Uniform`). `None` for an `Unscoped` or
+    /// undeclared table (no per-tenant column ⇒ no GUC to derive for an `all` write there).
+    pub fn tenant_column_for(&self, table: &str) -> Option<String> {
+        use boatramp_core::orm::TableKeys;
+        use boatramp_core::tenancy::ResolvedScope;
+        match &self.keys {
+            TableKeys::Uniform => Some(self.column.clone()),
+            TableKeys::PerTable(m) | TableKeys::PerTableTarget { keys: m, .. } => {
+                match m.get(table) {
+                    Some(ResolvedScope::Column(c)) => Some(c.clone()),
+                    Some(ResolvedScope::TenantOrSession { tenant, .. })
+                    | Some(ResolvedScope::TenantOrBase { tenant }) => Some(tenant.clone()),
+                    Some(ResolvedScope::Unscoped) | None => None,
+                }
+            }
+        }
+    }
+
     fn mode(&self, axis: Axis) -> AccessMode {
         match axis {
             Axis::Read => self.read,

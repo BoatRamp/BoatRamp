@@ -526,6 +526,12 @@ impl ServerConfig {
                 if let Some(v) = source.parse_bool(&format!("{prefix}RLS_SESSION"))? {
                     db.rls_session = v;
                 }
+                if let Some(v) = source.get(&format!("{prefix}TENANT_GUC")) {
+                    db.tenant_guc = Some(v);
+                }
+                if let Some(v) = source.get(&format!("{prefix}SESSION_GUC")) {
+                    db.session_guc = Some(v);
+                }
             }
         }
 
@@ -707,6 +713,9 @@ const SQL_DB_ENV_PREFIX: &str = "BOATRAMP_HANDLERS_SQL_DB_";
 const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_STARTUP_GRACE_SECS",
     "_CONNECT_TIMEOUT_SECS",
+    // `_SESSION_GUC` / `_TENANT_GUC` before `_TENANT`/`_TENANT_SCOPE` (longest-first name isolation).
+    "_SESSION_GUC",
+    "_TENANT_GUC",
     "_VOLUME_SIZE_MIB",
     "_READ_URL_ENV",
     "_PASSWORD_ENV",
@@ -1397,6 +1406,17 @@ pub struct ExternalDatabaseConfig {
     ///   connector's row-level policy), which derives the tenant from the verified
     ///   request, not from anything the handler's SQL can influence.
     pub rls_session: bool,
+    /// The Postgres session GUC name an app's RLS policies read for the host-resolved **tenant**
+    /// (e.g. `app.tenant_id`), set per request/write on the `rls_session` path so RLS mirrors
+    /// boatramp's injected predicate as a defense-in-depth backstop (v0.4.20). Only honored when
+    /// `rls_session` is on and the backend is Postgres. `None` ⇒ not exposed (today's behavior).
+    /// The guest can never set this GUC itself (its namespace becomes reserved).
+    #[serde(default)]
+    pub tenant_guc: Option<String>,
+    /// The session GUC name for the anonymous **session** axis (e.g. `app.session_id`), the
+    /// disjoint-column sibling of `tenant_guc` for `TenantOrSession` tables. `None` ⇒ not exposed.
+    #[serde(default)]
+    pub session_guc: Option<String>,
 }
 
 /// How a managed compute-backed database is physically isolated per tenant (2×2 axis

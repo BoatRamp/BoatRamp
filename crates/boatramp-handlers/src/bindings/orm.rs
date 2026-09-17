@@ -120,6 +120,27 @@ impl wit::HostDatabase for OrmHost<'_> {
                 .map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
+        // v0.4.20 RLS backstop for a typed `all` INSERT: an `own`/`target` write already set the
+        // tenant GUC per transaction; a posture-vetted `all` write has no resolved principal, so set
+        // the GUC to the tenant the row(s) declare (the uniform literal of the table's tenant/key
+        // column) — RLS `WITH CHECK` then passes for that tenant and rejects any other. Multi-row-
+        // differing / non-literal / undeclared-column ⇒ unset ⇒ the DB denies (fail-closed).
+        if self.session.rls_guc(&name).is_some() {
+            let val = self
+                .session
+                .tenancy()
+                .filter(|t| t.write_is_all())
+                .and_then(|t| {
+                    t.tenant_column_for(&core.table)
+                        .and_then(|c| core.uniform_scope_value(&c))
+                });
+            if let Some(val) = val {
+                self.session
+                    .set_rls_tenant(&name, &val)
+                    .await
+                    .map_err(backend_err)?;
+            }
+        }
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }
@@ -137,6 +158,25 @@ impl wit::HostDatabase for OrmHost<'_> {
             core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
+        // v0.4.20 RLS backstop for a typed `all` UPDATE: set the tenant GUC to the single tenant the
+        // WHERE pins `col` to (else unset ⇒ the DB's `USING` matches no row ⇒ the UPDATE is a no-op,
+        // so a genuinely cross-tenant `all` UPDATE can't silently touch one tenant — it must pin one).
+        if self.session.rls_guc(&name).is_some() {
+            let val = self
+                .session
+                .tenancy()
+                .filter(|t| t.write_is_all())
+                .and_then(|t| {
+                    t.tenant_column_for(&core.table)
+                        .and_then(|c| core.pinned_scope_value(&c))
+                });
+            if let Some(val) = val {
+                self.session
+                    .set_rls_tenant(&name, &val)
+                    .await
+                    .map_err(backend_err)?;
+            }
+        }
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
         txn.execute(&sql, &params).await.map_err(backend_err)
     }

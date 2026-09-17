@@ -114,6 +114,101 @@ impl SqlSession {
             .unwrap_or_default()
     }
 
+    /// The operator RLS session-GUC names for `name`'s backend, **iff** configured AND the backend
+    /// is Postgres (the only dialect with the `current_setting(...)` RLS backstop). `None` otherwise.
+    /// (v0.4.20 — the host-set tenant GUC that mirrors the injected predicate.)
+    pub(super) fn rls_guc(&self, name: &str) -> Option<boatramp_core::sql::RlsGuc> {
+        let b = self.backends.get(name)?;
+        if b.dialect() != boatramp_core::sql::Dialect::Postgres {
+            return None;
+        }
+        b.rls_guc().cloned()
+    }
+
+    /// The reserved GUC namespaces a guest must not set for `name`'s backend — the leading segment
+    /// of each configured RLS GUC (e.g. `app` for `app.tenant_id`), so a guest can't forge the
+    /// backstop. Empty when the backend has no RLS GUC. Fed to `reject_reserved_session_writes`.
+    pub(super) fn reserved_guc_namespaces(&self, name: &str) -> Vec<String> {
+        self.rls_guc(name)
+            .map(|g| {
+                g.reserved_names()
+                    .iter()
+                    .filter_map(|n| n.split('.').next().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The per-**transaction** RLS GUC set statements (own/target/session): the host-resolved
+    /// principal value bound to the operator's configured GUC name(s). Empty for an `all` write (no
+    /// resolved principal — the value is set per statement from the row) or when no RLS GUC / not
+    /// Postgres. Computed from `&self` so it can be emitted on a freshly-begun tx without a borrow
+    /// clash. Each entry is `(sql, params)` for one `SELECT set_config(?, ?, true)`.
+    fn rls_tx_sets(&self, name: &str) -> Vec<(String, Vec<SqlValue>)> {
+        let (Some(guc), Some(tenancy)) = (self.rls_guc(name), self.tenancy.as_ref()) else {
+            return Vec::new();
+        };
+        let mut sets = Vec::new();
+        if let Some(tv) = tenancy.rls_tenant_value() {
+            sets.push(boatramp_core::sql::render_set_local_guc(&guc.tenant, tv));
+        }
+        if let (Some(sname), Some(sv)) = (&guc.session, tenancy.rls_session_value()) {
+            sets.push(boatramp_core::sql::render_set_local_guc(sname, sv));
+        }
+        sets
+    }
+
+    /// Set the RLS tenant GUC on the (write) transaction for `name` to an EXPLICIT value — the path
+    /// for an `all` write, where the value is the tenant the row/statement declares (not a resolved
+    /// principal). `SET LOCAL`-scoped, so it holds for the immediately-following write and is
+    /// re-set before each `all` write in the batch. No-op when the backend has no RLS GUC (or isn't
+    /// Postgres). `pub(super)` for the sibling `orm` binding + the raw `sql` path.
+    pub(super) async fn set_rls_tenant(
+        &mut self,
+        name: &str,
+        value: &SqlValue,
+    ) -> Result<(), SqlError> {
+        if let Some(guc) = self.rls_guc(name) {
+            let (sql, params) = boatramp_core::sql::render_set_local_guc(&guc.tenant, value);
+            let tx = self.txn(name, false).await?;
+            tx.execute(&sql, &params).await?;
+        }
+        Ok(())
+    }
+
+    /// v0.4.20 RLS backstop for a **raw** `all` WRITE: if `name`'s backend has an RLS GUC, the axis
+    /// is a write, and the invocation's write mode is `all`, parse the (scope-marked) `statement`
+    /// for the single tenant it declares (INSERT VALUES / UPDATE WHERE) and set the tenant GUC to it
+    /// so the DB's `WITH CHECK`/`USING` passes for that tenant and rejects a mismatch. Unextractable
+    /// (multi-tenant / opaque) ⇒ GUC left unset ⇒ the DB denies (fail-closed). No-op otherwise.
+    /// `pub(super)` for the sibling `orm` binding, which computes the value from the typed AST.
+    pub(super) async fn apply_all_write_rls(
+        &mut self,
+        name: &str,
+        statement: &str,
+        axis: crate::tenant::Axis,
+    ) -> Result<(), SqlError> {
+        if !matches!(axis, crate::tenant::Axis::Write) || self.rls_guc(name).is_none() {
+            return Ok(());
+        }
+        let dialect = self.dialect(name);
+        let val = self
+            .tenancy
+            .as_ref()
+            .filter(|t| t.write_is_all())
+            .and_then(|t| {
+                boatramp_core::target_sql::extract_raw_write_scope_value(
+                    statement,
+                    dialect,
+                    |tbl| t.tenant_column_for(tbl),
+                )
+            });
+        if let Some(val) = val {
+            self.set_rls_tenant(name, &val).await?;
+        }
+        Ok(())
+    }
+
     /// The open transaction for `(name, read_only)`, beginning one on first use.
     /// A read-only transaction is begun via [`SqlBackend::begin_read_only`], so a
     /// replica-configured backend can route it to the replica. Returns the **core**
@@ -132,11 +227,18 @@ impl SqlSession {
                 .get(name)
                 .ok_or_else(|| SqlError::Other(format!("sql database {name:?} not granted")))?
                 .clone();
-            let txn = if read_only {
+            let mut txn = if read_only {
                 backend.begin_read_only().await
             } else {
                 backend.begin().await
             }?;
+            // v0.4.20: set the per-transaction RLS tenant GUC (own/target/session) right after the
+            // tx opens — right after the backend's own `boatramp.project`/`site` context — so an
+            // app's Postgres RLS mirrors the injected predicate. `all` writes add nothing here (no
+            // resolved principal); they set the GUC per statement from the row. `SET LOCAL`, bound.
+            for (sql, params) in self.rls_tx_sets(name) {
+                txn.execute(&sql, &params).await?;
+            }
             self.txns.insert(key.clone(), txn);
         }
         Ok(self.txns.get_mut(&key).expect("inserted above").as_mut())
@@ -208,23 +310,35 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
         // H1: if this database injects the reserved boatramp session context
-        // (rls_session), the guest must not overwrite those keys and spoof its tenant.
+        // (rls_session), the guest must not overwrite those keys and spoof its tenant — boatramp's
+        // own namespace AND the operator's configured RLS GUC namespace (v0.4.20).
         if self.session.injects_session_context(&name) {
-            reject_reserved_session_writes(&statement).map_err(to_wit_error)?;
+            reject_reserved_session_writes(
+                &statement,
+                &self.session.reserved_guc_namespaces(&name),
+            )
+            .map_err(to_wit_error)?;
         }
         let mut params = to_values(params);
         // Stage 0: fill the `{scope}` marker with the host predicate for the axis the STATEMENT
         // exercises (a `DELETE` via `query()` is a write, not a read). Fail-closed: an unmarked
         // scoped statement, or one the axis grant denies, is refused before the backend. Under a
         // target read the whole statement is AST-rewritten instead (dialect selects the parser).
+        let axis = stmt_axis(&statement);
         let statement = apply_scope_marker(
             self.session.tenancy(),
-            stmt_axis(&statement),
+            axis,
             statement,
             &mut params,
             self.session.dialect(&name),
         )
         .map_err(to_wit_error)?;
+        // v0.4.20: an `all` WRITE reached via `query()` (e.g. `… RETURNING`) sets its tenant GUC
+        // from the statement too (raw-write backstop), same as `execute()`.
+        self.session
+            .apply_all_write_rls(&name, &statement, axis)
+            .await
+            .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)
@@ -254,22 +368,36 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .get(&db)
             .map_err(|e| sql_types::Error::Other(e.to_string()))?;
         let (name, read_only) = (handle.name.clone(), handle.read_only);
-        // H1: see `query` — refuse guest overwrites of the reserved session keys.
+        // H1: see `query` — refuse guest overwrites of the reserved session keys (boatramp's own +
+        // the operator's configured RLS GUC namespaces, so a guest can't forge the tenant backstop).
         if self.session.injects_session_context(&name) {
-            reject_reserved_session_writes(&statement).map_err(to_wit_error)?;
+            reject_reserved_session_writes(
+                &statement,
+                &self.session.reserved_guc_namespaces(&name),
+            )
+            .map_err(to_wit_error)?;
         }
         let mut params = to_values(params);
+        let axis = stmt_axis(&statement);
         // Stage 0: fill the `{scope}` marker with the host predicate for the axis the STATEMENT
         // exercises (a bare `SELECT` via `execute()` is still a read). Fail-closed on a missing
         // marker or a denied axis. Under a target read the whole statement is AST-rewritten instead.
         let statement = apply_scope_marker(
             self.session.tenancy(),
-            stmt_axis(&statement),
+            axis,
             statement,
             &mut params,
             self.session.dialect(&name),
         )
         .map_err(to_wit_error)?;
+        // v0.4.20 RLS backstop: for an `all` WRITE against a Postgres RLS binding, set the tenant
+        // GUC to the tenant the statement itself declares (parsed from the INSERT VALUES / UPDATE
+        // WHERE) so the app's `WITH CHECK`/`USING` passes for exactly that tenant and rejects a
+        // mismatch. Unextractable ⇒ GUC unset ⇒ the DB denies (fail-closed).
+        self.session
+            .apply_all_write_rls(&name, &statement, axis)
+            .await
+            .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)

@@ -136,6 +136,12 @@ pub struct ComputeResolvedSqlBackend {
     // ⇒ no injection (the common case). The value is always **bound**, never
     // interpolated into the SQL text.
     session_context: Vec<(&'static str, String)>,
+    // Opt-in RLS **tenant** GUC names (`rls_session` + `tenant_guc`/`session_guc`): the operator's
+    // `current_setting(...)` keys carrying the host-resolved tenant (and anonymous session) so an
+    // app's Postgres RLS mirrors boatramp's injected predicate. The NAMES live here (per-binding);
+    // the VALUE is set per-request/per-write by the handler binding via `render_set_local_guc`.
+    // `None` ⇒ not configured. Exposed via `SqlBackend::rls_guc`.
+    rls: Option<boatramp_core::sql::RlsGuc>,
     // (resolved-url, pool). Rebuilt when the resolved URL changes. The guard is
     // never held across an `.await` (the URL is resolved before locking, and
     // `connect` is synchronous), so a plain `std::sync::Mutex` is correct.
@@ -168,8 +174,16 @@ impl ComputeResolvedSqlBackend {
             read_only,
             connect_timeout,
             session_context: Vec::new(),
+            rls: None,
             cached: Mutex::new(None),
         }
+    }
+
+    /// Attach the opt-in RLS **tenant GUC** names (`tenant_guc`/`session_guc`) the handler binding
+    /// sets per-request/per-write (Postgres only). Builder-style; `None` is a no-op.
+    pub fn with_rls_guc(mut self, rls: Option<boatramp_core::sql::RlsGuc>) -> Self {
+        self.rls = rls;
+        self
     }
 
     /// Attach the opt-in RLS **session context** applied at every transaction start
@@ -467,6 +481,10 @@ impl SqlBackend for ComputeResolvedSqlBackend {
             ExternalSqlKind::Postgres => boatramp_core::sql::Dialect::Postgres,
             ExternalSqlKind::Mysql => boatramp_core::sql::Dialect::Mysql,
         }
+    }
+
+    fn rls_guc(&self) -> Option<&boatramp_core::sql::RlsGuc> {
+        self.rls.as_ref()
     }
 
     /// This backend injects the reserved `boatramp.*` / `@boatramp_*` session context
