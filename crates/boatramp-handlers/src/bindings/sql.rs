@@ -168,12 +168,70 @@ impl SqlSession {
         name: &str,
         value: &SqlValue,
     ) -> Result<(), SqlError> {
+        // A write always uses the read-write transaction (`read_only = false`).
+        self.set_rls_tenant_on(name, false, value).await
+    }
+
+    /// Set the tenant GUC on the `(name, read_only)` transaction — the general form of
+    /// [`set_rls_tenant`](Self::set_rls_tenant) so the `all`-read marker can be written to the same
+    /// transaction the read runs on (which may be a read-only one). No-op without an RLS GUC.
+    async fn set_rls_tenant_on(
+        &mut self,
+        name: &str,
+        read_only: bool,
+        value: &SqlValue,
+    ) -> Result<(), SqlError> {
         if let Some(guc) = self.rls_guc(name) {
             let (sql, params) = boatramp_core::sql::render_set_local_guc(&guc.tenant, value);
-            let tx = self.txn(name, false).await?;
+            let tx = self.txn(name, read_only).await?;
             tx.execute(&sql, &params).await?;
         }
         Ok(())
+    }
+
+    /// v0.4.21 all-read backstop: for an `all`-scoped **READ** against a Postgres RLS binding with a
+    /// configured all-marker, write the marker to the tenant GUC on the transaction the read will use
+    /// (`read_only`), so a table that opts in with `USING (… OR current_setting(name,true) = marker)`
+    /// opens cross-tenant. Returns whether the marker was set — the caller MUST then call
+    /// [`clear_all_read_marker`](Self::clear_all_read_marker) after the read so the marker is live
+    /// ONLY for that one read and can never be in effect for a later write (where an active marker in
+    /// a `WITH CHECK (… OR guc = marker)` would be always-true → a cross-tenant write leak). No-op
+    /// (returns `false`) for a write axis, a non-`all` read, or no marker. `pub(super)` for `orm`.
+    pub(super) async fn set_all_read_marker(
+        &mut self,
+        name: &str,
+        read_only: bool,
+        axis: crate::tenant::Axis,
+    ) -> Result<bool, SqlError> {
+        if !matches!(axis, crate::tenant::Axis::Read) {
+            return Ok(false);
+        }
+        let Some(marker) = self.rls_guc(name).and_then(|g| g.all_marker) else {
+            return Ok(false);
+        };
+        if !self.tenancy.as_ref().is_some_and(|t| t.read_is_all()) {
+            return Ok(false);
+        }
+        self.set_rls_tenant_on(name, read_only, &SqlValue::Text(marker))
+            .await?;
+        Ok(true)
+    }
+
+    /// Restore the tenant GUC after an `all`-read marker (see
+    /// [`set_all_read_marker`](Self::set_all_read_marker)): re-establish the resolved principal value,
+    /// or an empty string (⇒ the DB denies), so the marker is NOT left in effect for any later
+    /// statement on the same transaction. Best-effort — call it regardless of the read's outcome.
+    pub(super) async fn clear_all_read_marker(
+        &mut self,
+        name: &str,
+        read_only: bool,
+    ) -> Result<(), SqlError> {
+        let restore = self
+            .tenancy
+            .as_ref()
+            .and_then(|t| t.rls_tenant_value().cloned())
+            .unwrap_or_else(|| SqlValue::Text(String::new()));
+        self.set_rls_tenant_on(name, read_only, &restore).await
     }
 
     /// v0.4.20 RLS backstop for a **raw** `all` WRITE: if `name`'s backend has an RLS GUC, the axis
@@ -339,12 +397,24 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .apply_all_write_rls(&name, &statement, axis)
             .await
             .map_err(to_wit_error)?;
+        // v0.4.21: for an `all` READ, set the reserved all-marker for the duration of THIS read
+        // only, then restore — so it opens the operator's `USING (… OR guc = marker)` cross-tenant
+        // yet is never in effect for a write (where it would defeat `WITH CHECK`). No-op otherwise.
+        let marked = self
+            .session
+            .set_all_read_marker(&name, read_only, axis)
+            .await
+            .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)
             .await
             .map_err(to_wit_error)?;
-        let rows = txn.query(&statement, &params).await.map_err(to_wit_error)?;
+        let result = txn.query(&statement, &params).await;
+        if marked {
+            let _ = self.session.clear_all_read_marker(&name, read_only).await;
+        }
+        let rows = result.map_err(to_wit_error)?;
         Ok(sql_types::QueryResult {
             columns: rows.columns,
             rows: rows
@@ -398,12 +468,23 @@ impl sql_query::HostDatabase for SqlHost<'_> {
             .apply_all_write_rls(&name, &statement, axis)
             .await
             .map_err(to_wit_error)?;
+        // v0.4.21: a read-axis statement reached via `execute()` gets the same bracketed all-marker
+        // treatment (no-op unless it is an `all` read with a configured marker).
+        let marked = self
+            .session
+            .set_all_read_marker(&name, read_only, axis)
+            .await
+            .map_err(to_wit_error)?;
         let txn = self
             .session
             .txn(&name, read_only)
             .await
             .map_err(to_wit_error)?;
-        txn.execute(&statement, &params).await.map_err(to_wit_error)
+        let result = txn.execute(&statement, &params).await;
+        if marked {
+            let _ = self.session.clear_all_read_marker(&name, read_only).await;
+        }
+        result.map_err(to_wit_error)
     }
 
     fn drop(&mut self, db: Resource<SqlDatabase>) -> wasmtime::Result<()> {

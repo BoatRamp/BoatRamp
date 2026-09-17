@@ -532,6 +532,9 @@ impl ServerConfig {
                 if let Some(v) = source.get(&format!("{prefix}SESSION_GUC")) {
                     db.session_guc = Some(v);
                 }
+                if let Some(v) = source.get(&format!("{prefix}TENANT_ALL_MARKER")) {
+                    db.tenant_all_marker = Some(v);
+                }
             }
         }
 
@@ -713,8 +716,10 @@ const SQL_DB_ENV_PREFIX: &str = "BOATRAMP_HANDLERS_SQL_DB_";
 const SQL_DB_FIELD_SUFFIXES: &[&str] = &[
     "_STARTUP_GRACE_SECS",
     "_CONNECT_TIMEOUT_SECS",
-    // `_SESSION_GUC` / `_TENANT_GUC` before `_TENANT`/`_TENANT_SCOPE` (longest-first name isolation).
+    // `_SESSION_GUC` / `_TENANT_GUC` / `_TENANT_ALL_MARKER` before `_TENANT`/`_TENANT_SCOPE`
+    // (longest-first name isolation).
     "_SESSION_GUC",
+    "_TENANT_ALL_MARKER",
     "_TENANT_GUC",
     "_VOLUME_SIZE_MIB",
     "_READ_URL_ENV",
@@ -1417,6 +1422,14 @@ pub struct ExternalDatabaseConfig {
     /// disjoint-column sibling of `tenant_guc` for `TenantOrSession` tables. `None` ⇒ not exposed.
     #[serde(default)]
     pub session_guc: Option<String>,
+    /// A reserved sentinel value written to `tenant_guc` on an **`all`-scoped READ** (v0.4.21), so a
+    /// table that opts in with `USING (… OR current_setting(tenant_guc, true) = '<marker>')` opens
+    /// cross-tenant for the audited `all` twins. Pick a value that can **never** be a real tenant id
+    /// (e.g. `*` or `__all__`). Only honored with `tenant_guc` set + `rls_session` on + Postgres.
+    /// `None`/empty ⇒ `all` reads leave the GUC untouched (v0.4.20 fail-closed behavior). The guest
+    /// can never set it — the `tenant_guc` namespace is already reserved against guest writes.
+    #[serde(default)]
+    pub tenant_all_marker: Option<String>,
 }
 
 /// How a managed compute-backed database is physically isolated per tenant (2×2 axis
@@ -2125,6 +2138,32 @@ mod tests {
         .expect("valid env overrides apply");
         let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases[""];
         assert_eq!(db.startup_grace_secs, Some(90));
+    }
+
+    #[test]
+    fn env_sets_rls_gucs_and_all_marker_without_suffix_collision() {
+        // The RLS GUC names + the v0.4.21 all-read marker are env-settable. `_TENANT_ALL_MARKER`
+        // and `_TENANT_GUC` must NOT be shadowed by the shorter `_TENANT` suffix (longest-first
+        // isolation) — a `_TENANT` value would otherwise swallow the DB-name split.
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env_overrides(&env(&[
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_KIND", "postgres"),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_DATABASE", "appdb"),
+            (
+                "BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT_GUC",
+                "app.tenant_id",
+            ),
+            (
+                "BOATRAMP_HANDLERS_SQL_DB_DEFAULT_SESSION_GUC",
+                "app.session_id",
+            ),
+            ("BOATRAMP_HANDLERS_SQL_DB_DEFAULT_TENANT_ALL_MARKER", "*"),
+        ]))
+        .expect("valid env overrides apply");
+        let db = &cfg.handlers.unwrap().bindings.sql.unwrap().databases[""];
+        assert_eq!(db.tenant_guc.as_deref(), Some("app.tenant_id"));
+        assert_eq!(db.session_guc.as_deref(), Some("app.session_id"));
+        assert_eq!(db.tenant_all_marker.as_deref(), Some("*"));
     }
 
     #[test]

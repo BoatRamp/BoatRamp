@@ -299,6 +299,15 @@ impl HostTenancy {
         self.write == AccessMode::All
     }
 
+    /// Whether the READ axis is the posture-vetted cross-tenant [`AccessMode::All`] — a read with no
+    /// injected tenant predicate, which the audited twins (identity/idp/payments) use to read across
+    /// tenants (some of it pre-auth). Under this mode the RLS tenant GUC is set to the reserved
+    /// all-marker for the duration of the read (v0.4.21), so a table that opts in with `OR guc =
+    /// marker` opens cross-tenant while every other table — and every write — stays strict.
+    pub fn read_is_all(&self) -> bool {
+        self.read == AccessMode::All
+    }
+
     /// The tenant/scope COLUMN for `table` (the one an RLS policy keys on): the per-table key under a
     /// project schema (the identity table on its own PK; a `TenantOrSession`/`TenantOrBase` table on
     /// its tenant column), else the default column (legacy `Uniform`). `None` for an `Unscoped` or
