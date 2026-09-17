@@ -390,7 +390,10 @@ async fn guest_entry_point_execute(
 ) -> Result<(), SqlError> {
     // === The exact guard gate the real SqlHost applies (H1). ===
     if backend.injects_session_context() {
-        reject_reserved_session_writes(statement)?;
+        // No RLS GUC is configured on this backend, so no extra reserved namespaces (mirrors the
+        // real `SqlHost` path, which passes `reserved_guc_namespaces` — empty when `tenant_guc` is
+        // unset).
+        reject_reserved_session_writes(statement, &[])?;
     }
     tx.execute(statement, &[]).await.map(|_| ())
 }
