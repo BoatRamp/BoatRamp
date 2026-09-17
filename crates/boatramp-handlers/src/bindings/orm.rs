@@ -88,20 +88,16 @@ impl wit::HostDatabase for OrmHost<'_> {
             core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
-        // v0.4.21: an `all`-scoped SELECT sets the reserved all-marker for the duration of THIS read
-        // only, then restores it (see `set_all_read_marker`) — so a table opting in with `OR guc =
-        // marker` opens cross-tenant, yet the marker is never in effect for a write. No-op otherwise.
-        let marked = self
-            .session
+        // v0.4.21: an `all`-scoped SELECT sets the reserved all-marker so a table opting in with `OR
+        // guc = marker` opens cross-tenant. The marker is force-reset off the (shared) write
+        // transaction by `defend_write_marker` before any write runs, so it never defeats a
+        // `WITH CHECK`. No-op for a non-`all` read / no marker.
+        self.session
             .set_all_read_marker(&name, false, crate::tenant::Axis::Read)
             .await
             .map_err(backend_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
-        let result = txn.query(&sql, &params).await;
-        if marked {
-            let _ = self.session.clear_all_read_marker(&name, false).await;
-        }
-        let rows = result.map_err(backend_err)?;
+        let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
         Ok(wit::QueryResult {
             columns: rows.columns,
             rows: rows
@@ -120,6 +116,12 @@ impl wit::HostDatabase for OrmHost<'_> {
         q: wit::InsertQuery,
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
+        // v0.4.21: force any `all`-read marker off the write transaction before this write (see
+        // `defend_write_marker`) — never a write under the marker.
+        self.session
+            .defend_write_marker(&name)
+            .await
+            .map_err(backend_err)?;
         let dialect = self.session.dialect(&name);
         // Write-scope the stamp; read-scope an INSERT…SELECT source (its rows are a read).
         let write = self.scope_for(crate::tenant::Axis::Write)?;
@@ -163,6 +165,11 @@ impl wit::HostDatabase for OrmHost<'_> {
         q: wit::UpdateQuery,
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
+        // v0.4.21: force any `all`-read marker off the write transaction before this write.
+        self.session
+            .defend_write_marker(&name)
+            .await
+            .map_err(backend_err)?;
         let dialect = self.session.dialect(&name);
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_update(&q)?;
@@ -199,6 +206,11 @@ impl wit::HostDatabase for OrmHost<'_> {
         q: wit::DeleteQuery,
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
+        // v0.4.21: force any `all`-read marker off the write transaction before this write.
+        self.session
+            .defend_write_marker(&name)
+            .await
+            .map_err(backend_err)?;
         let dialect = self.session.dialect(&name);
         let write = self.scope_for(crate::tenant::Axis::Write)?;
         let mut core = to_core_delete(&q)?;
@@ -216,6 +228,11 @@ impl wit::HostDatabase for OrmHost<'_> {
         q: wit::DeleteQuery,
     ) -> Result<wit::QueryResult, wit::Error> {
         let name = self.name_of(&db)?;
+        // v0.4.21: force any `all`-read marker off the write transaction before this write.
+        self.session
+            .defend_write_marker(&name)
+            .await
+            .map_err(backend_err)?;
         let dialect = self.session.dialect(&name);
         // The unbounded-delete guard + RETURNING render live in the core compiler; here we run it
         // through the query path so the deleted rows come back (consume-and-read). A delete is a
@@ -246,6 +263,11 @@ impl wit::HostDatabase for OrmHost<'_> {
         table: String,
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
+        // v0.4.21: force any `all`-read marker off the write transaction before this write.
+        self.session
+            .defend_write_marker(&name)
+            .await
+            .map_err(backend_err)?;
         let dialect = self.session.dialect(&name);
         // Promotion (D7) needs the resolved principal carrying BOTH a tenant fact and a session
         // fact — the write axis carries both. No in-site tenancy (or an `all`/no-scope axis) ⇒
@@ -265,6 +287,11 @@ impl wit::HostDatabase for OrmHost<'_> {
         q: wit::AttachReferenceQuery,
     ) -> Result<u64, wit::Error> {
         let name = self.name_of(&db)?;
+        // v0.4.21: force any `all`-read marker off the write transaction before this write.
+        self.session
+            .defend_write_marker(&name)
+            .await
+            .map_err(backend_err)?;
         let dialect = self.session.dialect(&name);
         // attach_reference is a host-mediated WRITE (5d): the caller's write axis must grant a write.
         // A read-only route (no in-site tenancy, an `all`/no-scope axis, or a `handle`-resolved target
