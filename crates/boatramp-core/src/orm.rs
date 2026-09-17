@@ -1020,8 +1020,10 @@ impl Insert {
     /// declare — or `None` when it isn't one well-defined literal (an `INSERT … SELECT` source, a
     /// row missing `col` or giving it a non-literal, or rows that disagree). Used ONLY to set the
     /// RLS tenant GUC to what the write targets (an `all` guest may write any one tenant, GUC-
-    /// consistent); a `None` leaves the GUC unset so the DB's `WITH CHECK` denies (fail-closed). The
-    /// DB is the final arbiter — a wrong value is rejected there.
+    /// consistent); a `None` simply doesn't re-set the GUC, leaving it at whatever the per-transaction
+    /// own/session set established (or unset if none) — under `all` that only over-restricts the write
+    /// (the DB's `WITH CHECK` still confines it), never widens it. The DB is the final arbiter — a
+    /// wrong value is rejected there.
     pub fn uniform_scope_value(&self, col: &str) -> Option<SqlValue> {
         if self.from_select.is_some() || self.rows.is_empty() {
             return None;
@@ -1047,9 +1049,10 @@ impl Update {
     /// For a posture-vetted cross-tenant (`all`) UPDATE: the single tenant value the WHERE pins scope
     /// column `col` to — a top-level `col = <literal>` conjunct (optionally nested in `AND`s) — or
     /// `None` when the filter doesn't pin exactly one tenant (an `OR`/`IN`/range/no-op, or conjuncts
-    /// pinning different values). Used ONLY to set the RLS GUC; `None` fails closed (the DB's `USING`
-    /// then matches no row and the UPDATE affects nothing). An UPDATE that legitimately spans tenants
-    /// under `all` therefore does not silently touch one tenant — it must pin a single tenant to run.
+    /// pinning different values). Used ONLY to set the RLS GUC; a `None` doesn't re-set it, leaving the
+    /// prior per-transaction value (or unset), which only over-restricts — under `all` the DB's `USING`
+    /// then matches no row outside that tenant, so a genuinely multi-tenant UPDATE affects nothing. It
+    /// must pin a single tenant to run; it never silently touches one tenant of a spanning filter.
     pub fn pinned_scope_value(&self, col: &str) -> Option<SqlValue> {
         fn find(pred: &Predicate, col: &str) -> Option<SqlValue> {
             match pred {

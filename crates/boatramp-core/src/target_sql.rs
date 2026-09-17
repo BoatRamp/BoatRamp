@@ -222,10 +222,11 @@ pub fn rewrite_target_select(
 /// on (the caller resolves it from the project schema — the identity table on its own PK, a data
 /// table on `tenant_id`, an `Unscoped`/undeclared table to `None`). Returning `None` there ⇒ no GUC.
 ///
-/// `None` fails **closed**: the GUC stays unset and the DB's RLS (`WITH CHECK`/`USING`) denies. The
-/// DB is the final arbiter, so a conservative (over-`None`) extractor is safe — it can only make a
-/// legitimate write fail, never permit a cross-tenant one. Guest input never reaches a predicate or
-/// the GUC name; only the *value* the write already carries is read back to set the GUC.
+/// `None` fails **closed**: the GUC isn't re-set, so it keeps the prior per-transaction value (or
+/// stays unset if none) — either way the DB's RLS (`WITH CHECK`/`USING`) can only *over*-restrict the
+/// write, never widen it. The DB is the final arbiter, so a conservative (over-`None`) extractor is
+/// safe — it can only make a legitimate write fail, never permit a cross-tenant one. Guest input never
+/// reaches a predicate or the GUC name; only the *value* the write already carries sets the GUC.
 pub fn extract_raw_write_scope_value(
     statement: &str,
     dialect: Dialect,
