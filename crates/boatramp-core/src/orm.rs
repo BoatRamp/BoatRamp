@@ -1014,6 +1014,81 @@ pub struct Delete {
     pub returning: Vec<SelectItem>,
 }
 
+impl Insert {
+    /// For a posture-vetted cross-tenant (`all`) INSERT with no host-injected stamp: the single,
+    /// uniform LITERAL value of scope column `col` across every inserted row — the tenant the row(s)
+    /// declare — or `None` when it isn't one well-defined literal (an `INSERT … SELECT` source, a
+    /// row missing `col` or giving it a non-literal, or rows that disagree). Used ONLY to set the
+    /// RLS tenant GUC to what the write targets (an `all` guest may write any one tenant, GUC-
+    /// consistent); a `None` simply doesn't re-set the GUC, leaving it at whatever the per-transaction
+    /// own/session set established (or unset if none) — under `all` that only over-restricts the write
+    /// (the DB's `WITH CHECK` still confines it), never widens it. The DB is the final arbiter — a
+    /// wrong value is rejected there.
+    pub fn uniform_scope_value(&self, col: &str) -> Option<SqlValue> {
+        if self.from_select.is_some() || self.rows.is_empty() {
+            return None;
+        }
+        let mut found: Option<SqlValue> = None;
+        for row in &self.rows {
+            let cell = row.cells.iter().find(|a| same_col(&a.column, col))?;
+            let v = match &cell.value {
+                Expr::Value(v) => v.clone(),
+                _ => return None, // a non-literal (expression/column) → not a single known tenant
+            };
+            match &found {
+                None => found = Some(v),
+                Some(prev) if *prev == v => {}
+                Some(_) => return None, // rows declare different tenants → not a single value
+            }
+        }
+        found
+    }
+}
+
+impl Update {
+    /// For a posture-vetted cross-tenant (`all`) UPDATE: the single tenant value the WHERE pins scope
+    /// column `col` to — a top-level `col = <literal>` conjunct (optionally nested in `AND`s) — or
+    /// `None` when the filter doesn't pin exactly one tenant (an `OR`/`IN`/range/no-op, or conjuncts
+    /// pinning different values). Used ONLY to set the RLS GUC; a `None` doesn't re-set it, leaving the
+    /// prior per-transaction value (or unset), which only over-restricts — under `all` the DB's `USING`
+    /// then matches no row outside that tenant, so a genuinely multi-tenant UPDATE affects nothing. It
+    /// must pin a single tenant to run; it never silently touches one tenant of a spanning filter.
+    pub fn pinned_scope_value(&self, col: &str) -> Option<SqlValue> {
+        fn find(pred: &Predicate, col: &str) -> Option<SqlValue> {
+            match pred {
+                Predicate::Cmp {
+                    left,
+                    op: CmpOp::Eq,
+                    right,
+                } => match (left, right) {
+                    (Expr::Column(c), Expr::Value(v)) | (Expr::Value(v), Expr::Column(c))
+                        if same_col(c, col) =>
+                    {
+                        Some(v.clone())
+                    }
+                    _ => None,
+                },
+                Predicate::And(children) => {
+                    let mut found: Option<SqlValue> = None;
+                    for ch in children {
+                        if let Some(v) = find(ch, col) {
+                            match &found {
+                                None => found = Some(v),
+                                Some(prev) if *prev == v => {}
+                                Some(_) => return None, // contradictory pins → not a single tenant
+                            }
+                        }
+                    }
+                    found
+                }
+                // OR / NOT / IN / BETWEEN / LIKE / NULL / subquery don't pin exactly one tenant.
+                _ => None,
+            }
+        }
+        find(&self.filter, col)
+    }
+}
+
 impl Select {
     /// Force a host-resolved `scope` onto this `SELECT` **and every nested read node** — its
     /// `UNION` branch — so a tenant scope reaches every row source (a union branch left unscoped
@@ -2672,6 +2747,140 @@ pub fn compile_attach_reference(
         from_select: Some((columns, Box::new(source))),
     };
     insert.compile(dialect)
+}
+
+#[cfg(test)]
+mod rls_scope_value_tests {
+    use super::*;
+
+    fn v(s: &str) -> SqlValue {
+        SqlValue::Text(s.to_string())
+    }
+    fn cell(col: &str, val: SqlValue) -> Assignment {
+        Assignment {
+            column: col.into(),
+            value: Expr::Value(val),
+        }
+    }
+    fn insert(rows: Vec<Vec<Assignment>>) -> Insert {
+        Insert {
+            table: "t".into(),
+            rows: rows.into_iter().map(|cells| RowValues { cells }).collect(),
+            conflict: None,
+            scope: None,
+            returning: vec![],
+            from_select: None,
+        }
+    }
+
+    #[test]
+    fn insert_uniform_scope_value_extracts_only_a_single_declared_tenant() {
+        // Single row → the literal.
+        assert_eq!(
+            insert(vec![vec![cell("tenant_id", v("A")), cell("body", v("x"))]])
+                .uniform_scope_value("tenant_id"),
+            Some(v("A"))
+        );
+        // Multi-row agreeing → the shared literal.
+        assert_eq!(
+            insert(vec![
+                vec![cell("tenant_id", v("A")), cell("body", v("x"))],
+                vec![cell("tenant_id", v("A")), cell("body", v("y"))],
+            ])
+            .uniform_scope_value("tenant_id"),
+            Some(v("A"))
+        );
+        // Rows disagree → None (fail-closed).
+        assert_eq!(
+            insert(vec![
+                vec![cell("tenant_id", v("A"))],
+                vec![cell("tenant_id", v("B"))],
+            ])
+            .uniform_scope_value("tenant_id"),
+            None
+        );
+        // Missing column / non-literal → None.
+        assert_eq!(
+            insert(vec![vec![cell("body", v("x"))]]).uniform_scope_value("tenant_id"),
+            None
+        );
+        assert_eq!(
+            insert(vec![vec![cell("tenant_id", v("A")), cell("body", v("x"))]])
+                .uniform_scope_value("id"),
+            None
+        );
+        // Non-literal value → None.
+        let non_lit = insert(vec![vec![Assignment {
+            column: "tenant_id".into(),
+            value: Expr::col("other"),
+        }]]);
+        assert_eq!(non_lit.uniform_scope_value("tenant_id"), None);
+    }
+
+    #[test]
+    fn update_pinned_scope_value_extracts_only_a_pinned_single_tenant() {
+        let upd = |filter: Predicate| Update {
+            table: "t".into(),
+            set: vec![cell("body", v("x"))],
+            filter,
+            scope: None,
+            returning: vec![],
+        };
+        // `col = 'A'` → A.
+        assert_eq!(
+            upd(Predicate::Cmp {
+                left: Expr::col("tenant_id"),
+                op: CmpOp::Eq,
+                right: Expr::Value(v("A")),
+            })
+            .pinned_scope_value("tenant_id"),
+            Some(v("A"))
+        );
+        // AND with an unrelated conjunct still pins.
+        assert_eq!(
+            upd(Predicate::And(vec![
+                Predicate::Cmp {
+                    left: Expr::col("tenant_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::Value(v("A")),
+                },
+                Predicate::Cmp {
+                    left: Expr::col("active"),
+                    op: CmpOp::Eq,
+                    right: Expr::Value(SqlValue::Boolean(true)),
+                },
+            ]))
+            .pinned_scope_value("tenant_id"),
+            Some(v("A"))
+        );
+        // OR does not pin → None (fail-closed).
+        assert_eq!(
+            upd(Predicate::Or(vec![
+                Predicate::Cmp {
+                    left: Expr::col("tenant_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::Value(v("A")),
+                },
+                Predicate::Cmp {
+                    left: Expr::col("tenant_id"),
+                    op: CmpOp::Eq,
+                    right: Expr::Value(v("B")),
+                },
+            ]))
+            .pinned_scope_value("tenant_id"),
+            None
+        );
+        // No equality on the column → None.
+        assert_eq!(
+            upd(Predicate::Cmp {
+                left: Expr::col("active"),
+                op: CmpOp::Eq,
+                right: Expr::Value(SqlValue::Boolean(true)),
+            })
+            .pinned_scope_value("tenant_id"),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

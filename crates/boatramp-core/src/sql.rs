@@ -105,6 +105,57 @@ impl SqlError {
     }
 }
 
+/// Operator-configured SQL session-context GUC names carrying the host-resolved tenant (and the
+/// anonymous session) to an app's **Postgres RLS**, so its policies (`current_setting(name, true)`)
+/// mirror boatramp's injected tenancy predicate as a defense-in-depth backstop. Set on a managed /
+/// external SQL binding (the `rls_session` flag + these names, e.g. `app.tenant_id`). **Postgres
+/// only** — the backstop is the `current_setting` RLS pattern; a libsql/MySQL backend leaves these
+/// unset. The guest can NEVER set them itself (the reserved-write guard blocks the configured names,
+/// [`reject_reserved_session_writes`]); the host derives the value from the SAME resolution the
+/// injected predicate uses (own / target / session) or, for a posture-vetted `all` write, from the
+/// row/statement being written — the DB's `WITH CHECK` / `USING` is the final arbiter of a mismatch.
+#[derive(Debug, Clone)]
+pub struct RlsGuc {
+    /// The GUC carrying the resolved TENANT (e.g. `app.tenant_id`).
+    pub tenant: String,
+    /// The GUC carrying the anonymous SESSION id (e.g. `app.session_id`), if the operator uses one.
+    pub session: Option<String>,
+}
+
+impl RlsGuc {
+    /// The configured GUC names, lowercased — the EXTRA reserved keys a guest may not set (on top of
+    /// the always-reserved `boatramp.*` / `@boatramp_*`), so a guest can't forge the RLS backstop.
+    pub fn reserved_names(&self) -> Vec<String> {
+        let mut v = vec![self.tenant.to_ascii_lowercase()];
+        if let Some(s) = &self.session {
+            v.push(s.to_ascii_lowercase());
+        }
+        v
+    }
+}
+
+/// Render a **transaction-local Postgres** GUC set (`SELECT set_config($1, $2, true)`). Both the
+/// setting NAME and the VALUE are BOUND parameters (never interpolated), so a dotted operator name
+/// like `app.tenant_id` and any value are injection-safe; the `true` scopes the setting to the
+/// current transaction (auto-cleared at COMMIT/ROLLBACK, like the `boatramp.project`/`site` context).
+/// The value is bound as TEXT (`set_config`'s argument type); the operator's RLS policy casts if its
+/// key column isn't text. Postgres only — callers gate on [`Dialect::Postgres`].
+pub fn render_set_local_guc(name: &str, value: &SqlValue) -> (String, Vec<SqlValue>) {
+    let text = match value {
+        SqlValue::Text(s) => s.clone(),
+        SqlValue::Integer(i) => i.to_string(),
+        SqlValue::Boolean(b) => b.to_string(),
+        SqlValue::Real(r) => r.to_string(),
+        // A tenant/session key is realistically text or an integer; anything else (blob/json/null)
+        // has no meaningful GUC text — bind empty so RLS `= current_setting(...)` denies (fail-safe).
+        SqlValue::Blob(_) | SqlValue::Null | SqlValue::Json(_) => String::new(),
+    };
+    (
+        "SELECT set_config(?1, ?2, true)".to_string(),
+        vec![SqlValue::Text(name.to_string()), SqlValue::Text(text)],
+    )
+}
+
 /// The SQL dialect a backend speaks. The `orm` compiler is `?N`-portable for almost
 /// everything (the backend rewrites the placeholders), and only consults this for the
 /// handful of constructs whose *syntax* genuinely differs across engines — currently JSON
@@ -132,6 +183,16 @@ pub trait SqlBackend: Send + Sync {
     /// (libsql); the Postgres/MySQL backends override it.
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
+    }
+
+    /// The operator-configured RLS session-GUC names ([`RlsGuc`]) this backend carries, or `None`
+    /// (the common case). When `Some` **and** [`dialect`](Self::dialect) is
+    /// [`Postgres`](Dialect::Postgres), the handler `sql`/`orm` binding sets the host-resolved tenant
+    /// (own/target/session) per transaction, and the row's tenant per `all` write, via
+    /// [`render_set_local_guc`], so an app's RLS mirrors the injected predicate. The guest can never
+    /// set these itself ([`reject_reserved_session_writes`] blocks the configured names).
+    fn rls_guc(&self) -> Option<&RlsGuc> {
+        None
     }
 
     /// Open a new read-write transaction. Backends are free to draw the
@@ -233,8 +294,16 @@ pub trait SqlBackend: Send + Sync {
 /// guest statement the guard cannot understand must not slip through while a session
 /// context is injected.
 ///
+/// `extra_namespaces` are additional reserved GUC namespaces (lowercased leading segments, e.g.
+/// `app` for a configured `app.tenant_id`/`app.session_id` RLS GUC) — a guest must not set the
+/// operator's RLS session keys either, or it could forge the defense-in-depth backstop. Reserving
+/// the whole namespace (like `boatramp`) is the safe, simple superset.
+///
 /// Returns [`SqlError::Other`] with a clear message on a match, else `Ok(())`.
-pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
+pub fn reject_reserved_session_writes(
+    sql: &str,
+    extra_namespaces: &[String],
+) -> Result<(), SqlError> {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::tokenizer::{Token, Tokenizer, Word};
 
@@ -243,11 +312,14 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
     /// The reserved MySQL user-var prefix, lowercased (an `@`-prefixed identifier).
     const MYSQL_VAR_PREFIX: &str = "@boatramp_";
 
+    // A reserved GUC namespace (leading dotted segment): boatramp's own, or an operator RLS one.
+    let is_reserved_ns = |w: &str| w == GUC_NAMESPACE || extra_namespaces.iter().any(|n| n == w);
+
     let refused = || {
         Err(SqlError::Other(
-            "setting a boatramp-reserved session key (boatramp.* / @boatramp_*) is not \
-             permitted from a handler: it is managed by rls_session and reserved for \
-             per-request tenant isolation"
+            "setting a reserved session key (boatramp.* / @boatramp_*, or the operator's \
+             rls_session tenant GUC) is not permitted from a handler: it is managed by \
+             rls_session and reserved for per-request tenant isolation"
                 .to_string(),
         ))
     };
@@ -324,7 +396,7 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
         let has_word = |w: &str| toks.iter().any(|t| word_lc(t).as_deref() == Some(w));
         let names_reserved = || {
             toks.iter()
-                .any(|t| word_lc(t).is_some_and(|w| w == GUC_NAMESPACE || is_reserved_var(&w)))
+                .any(|t| word_lc(t).is_some_and(|w| is_reserved_ns(&w) || is_reserved_var(&w)))
         };
         match leading.as_deref() {
             // Anonymous code block / procedure call / prepared-statement indirection:
@@ -364,7 +436,7 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
                 // `RESET boatramp.project` (target segment == namespace) or `RESET ALL`
                 // (clears custom GUCs too).
                 if let Some(target) = toks.get(1).and_then(|t| word_lc(t)) {
-                    if target == "all" || target == GUC_NAMESPACE || is_reserved_var(&target) {
+                    if target == "all" || is_reserved_ns(&target) || is_reserved_var(&target) {
                         return refused();
                     }
                 }
@@ -381,7 +453,7 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
                 if let Some(target) = toks.get(idx).and_then(|t| word_lc(t)) {
                     // A GUC is `boatramp` `.` `project` (dotted); the MySQL var is the
                     // single `@boatramp_*` word. Either way the first identifier decides.
-                    if target == GUC_NAMESPACE || is_reserved_var(&target) {
+                    if is_reserved_ns(&target) || is_reserved_var(&target) {
                         return refused();
                     }
                 }
@@ -415,8 +487,10 @@ pub fn reject_reserved_session_writes(sql: &str) -> Result<(), SqlError> {
             // a non-idiomatic double-quoted first arg is refused, which is fine.
             (Some(Token::SingleQuotedString(s)), Some(Token::Comma | Token::RParen)) => {
                 let name = s.to_ascii_lowercase();
-                // `boatramp` itself or `boatramp.<anything>` (`.` as the namespace boundary).
-                if name == GUC_NAMESPACE || name.starts_with(&format!("{GUC_NAMESPACE}.")) {
+                // A reserved namespace itself, or `<ns>.<anything>` (`.` as the boundary) — for
+                // boatramp's own namespace AND any operator RLS namespace (e.g. `app.tenant_id`).
+                let ns_of = name.split('.').next().unwrap_or(&name);
+                if is_reserved_ns(ns_of) {
                     return refused();
                 }
             }
@@ -583,7 +657,30 @@ mod reserved_session_writes_tests {
     use super::reject_reserved_session_writes as check;
 
     fn rejected(sql: &str) -> bool {
-        check(sql).is_err()
+        check(sql, &[]).is_err()
+    }
+
+    /// Rejected when the operator's RLS GUC namespace (`app`) is reserved.
+    fn rejected_with_app(sql: &str) -> bool {
+        check(sql, &["app".to_string()]).is_err()
+    }
+
+    #[test]
+    fn operator_rls_guc_is_rejected_only_when_its_namespace_is_reserved() {
+        // With `app` reserved (a configured `app.tenant_id` RLS GUC), a guest cannot forge it
+        // via any form — direct SET, set_config, or a RESET of the namespace.
+        assert!(rejected_with_app("SET app.tenant_id = 'victim'"));
+        assert!(rejected_with_app("set local app.tenant_id = 'victim'"));
+        assert!(rejected_with_app(
+            "SELECT set_config('app.tenant_id','victim',false)"
+        ));
+        assert!(rejected_with_app("RESET app.tenant_id"));
+        // Without the reservation, an ordinary `app.*` set is NOT the guard's business (only
+        // boatramp's own namespace is always reserved).
+        assert!(!rejected("SET app.tenant_id = 'x'"));
+        assert!(!rejected("SELECT set_config('app.tenant_id','x',true)"));
+        // The always-reserved boatramp namespace is still blocked regardless of extras.
+        assert!(rejected_with_app("SET boatramp.project = 'x'"));
     }
 
     // ---- hostile statements that spoof the injected tenant MUST be rejected ----

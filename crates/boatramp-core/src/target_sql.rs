@@ -208,6 +208,142 @@ pub fn rewrite_target_select(
     Ok(statements[0].to_string())
 }
 
+/// Best-effort extraction of the single tenant value a **raw-SQL `all` write** declares, so the host
+/// can set the RLS tenant GUC to it (v0.4.20 — the raw-path analog of
+/// [`Insert::uniform_scope_value`](crate::orm::Insert::uniform_scope_value) /
+/// [`Update::pinned_scope_value`](crate::orm::Update::pinned_scope_value)). Parses `statement` and:
+/// - **INSERT** → the uniform literal value of column `col` across all `VALUES` rows (`None` if `col`
+///   is missing, a non-literal, rows disagree, an `INSERT … SELECT`, or not a single INSERT);
+/// - **UPDATE** → the literal the WHERE pins `col` to at top level or within `AND`s (`None` for an
+///   `OR`/`IN`/range/unpinned filter, or contradictory pins);
+/// - anything else → `None`.
+///
+/// `col_for_table` maps the statement's target table to the tenant/scope column an RLS policy keys
+/// on (the caller resolves it from the project schema — the identity table on its own PK, a data
+/// table on `tenant_id`, an `Unscoped`/undeclared table to `None`). Returning `None` there ⇒ no GUC.
+///
+/// `None` fails **closed**: the GUC isn't re-set, so it keeps the prior per-transaction value (or
+/// stays unset if none) — either way the DB's RLS (`WITH CHECK`/`USING`) can only *over*-restrict the
+/// write, never widen it. The DB is the final arbiter, so a conservative (over-`None`) extractor is
+/// safe — it can only make a legitimate write fail, never permit a cross-tenant one. Guest input never
+/// reaches a predicate or the GUC name; only the *value* the write already carries sets the GUC.
+pub fn extract_raw_write_scope_value(
+    statement: &str,
+    dialect: Dialect,
+    col_for_table: impl Fn(&str) -> Option<String>,
+) -> Option<SqlValue> {
+    use sqlparser::ast::{BinaryOperator, Expr as E, SetExpr, Statement, TableFactor, Value as V};
+
+    fn lit(v: &V) -> Option<SqlValue> {
+        match v {
+            V::SingleQuotedString(s) | V::DoubleQuotedString(s) => Some(SqlValue::Text(s.clone())),
+            V::Number(n, _) => Some(
+                n.parse::<i64>()
+                    .map(SqlValue::Integer)
+                    .unwrap_or_else(|_| SqlValue::Text(n.clone())),
+            ),
+            V::Boolean(b) => Some(SqlValue::Boolean(*b)),
+            _ => None,
+        }
+    }
+    fn col_name(e: &E) -> Option<String> {
+        match e {
+            E::Identifier(id) => Some(id.value.clone()),
+            E::CompoundIdentifier(ids) => ids.last().map(|i| i.value.clone()),
+            _ => None,
+        }
+    }
+    // The literal `col = <lit>` pinned by a WHERE `Expr` at top level or within `AND`s.
+    fn pinned(e: &E, col: &str) -> Option<SqlValue> {
+        match e {
+            E::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                if col_name(left).is_some_and(|c| c.eq_ignore_ascii_case(col)) {
+                    if let E::Value(v) = right.as_ref() {
+                        return lit(v);
+                    }
+                }
+                if col_name(right).is_some_and(|c| c.eq_ignore_ascii_case(col)) {
+                    if let E::Value(v) = left.as_ref() {
+                        return lit(v);
+                    }
+                }
+                None
+            }
+            E::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => match (pinned(left, col), pinned(right, col)) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                _ => None, // both sides pin different tenants (contradiction) → fail closed
+            },
+            E::Nested(inner) => pinned(inner, col),
+            _ => None,
+        }
+    }
+
+    let sp: Box<dyn SpDialect> = match dialect {
+        Dialect::Sqlite => Box::new(SQLiteDialect {}),
+        Dialect::Postgres => Box::new(PostgreSqlDialect {}),
+        Dialect::Mysql => Box::new(MySqlDialect {}),
+    };
+    let stmts = Parser::parse_sql(&*sp, statement).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    // The last identifier of an `ObjectName` (`schema.table` → `table`), lowercased for lookup.
+    let table_of = |name: &sqlparser::ast::ObjectName| -> Option<String> {
+        name.0.last().map(|i| i.value.clone())
+    };
+    match &stmts[0] {
+        Statement::Insert(ins) => {
+            let col = col_for_table(&table_of(&ins.table_name)?)?;
+            let idx = ins
+                .columns
+                .iter()
+                .position(|c| c.value.eq_ignore_ascii_case(&col))?;
+            let rows = match ins.source.as_ref()?.body.as_ref() {
+                SetExpr::Values(vals) => &vals.rows,
+                _ => return None, // INSERT … SELECT (or other) — no literal row values
+            };
+            if rows.is_empty() {
+                return None;
+            }
+            let mut found: Option<SqlValue> = None;
+            for row in rows {
+                let v = match row.get(idx)? {
+                    E::Value(v) => lit(v)?,
+                    _ => return None,
+                };
+                match &found {
+                    None => found = Some(v),
+                    Some(prev) if *prev == v => {}
+                    Some(_) => return None,
+                }
+            }
+            found
+        }
+        Statement::Update {
+            table,
+            selection: Some(where_),
+            ..
+        } => {
+            let name = match &table.relation {
+                TableFactor::Table { name, .. } => name,
+                _ => return None,
+            };
+            let col = col_for_table(&table_of(name)?)?;
+            pinned(where_, &col)
+        }
+        _ => None,
+    }
+}
+
 /// The mutating visitor that injects the per-table confinement. `WITH`/CTEs are refused up front
 /// (see [`TargetRewriteError::CteNotAllowed`]), so — because derived tables are `TableFactor::Derived`
 /// and subqueries are their own `Query` nodes — a `TableFactor::Table` bare name is ALWAYS a base
@@ -635,6 +771,79 @@ fn join_operator_kind(op: &JoinOperator) -> &'static str {
         JoinOperator::AsOf { .. } => "ASOF",
         // INNER + CROSS are handled; LEFT-`ON` is handled. Anything else is an unsupported outer join.
         JoinOperator::Inner(_) | JoinOperator::CrossJoin => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod raw_write_scope_value_tests {
+    use super::*;
+
+    // Resolve the tenant column: `tenant`'s identity PK is `id`, everything else `tenant_id`;
+    // an `unscoped` table has none.
+    fn col_for(t: &str) -> Option<String> {
+        match t {
+            "tenant" => Some("id".into()),
+            "unscoped" => None,
+            _ => Some("tenant_id".into()),
+        }
+    }
+    fn extract(sql: &str) -> Option<SqlValue> {
+        extract_raw_write_scope_value(sql, Dialect::Postgres, col_for)
+    }
+    fn text(s: &str) -> SqlValue {
+        SqlValue::Text(s.to_string())
+    }
+
+    #[test]
+    fn insert_and_update_extract_a_single_declared_tenant_else_none() {
+        // INSERT single row → the row's tenant.
+        assert_eq!(
+            extract("INSERT INTO audit_event (tenant_id, kind) VALUES ('A','x')"),
+            Some(text("A"))
+        );
+        // A TenantKeyed identity table resolves its PK column.
+        assert_eq!(
+            extract("INSERT INTO tenant (id, name) VALUES ('A','Acme')"),
+            Some(text("A"))
+        );
+        // Multi-row agreeing → the shared value; disagreeing → None.
+        assert_eq!(
+            extract("INSERT INTO audit_event (tenant_id, kind) VALUES ('A','x'),('A','y')"),
+            Some(text("A"))
+        );
+        assert_eq!(
+            extract("INSERT INTO audit_event (tenant_id, kind) VALUES ('A','x'),('B','y')"),
+            None
+        );
+        // UPDATE pinned by the WHERE → the tenant; unpinned / OR → None.
+        assert_eq!(
+            extract("UPDATE audit_event SET kind='x' WHERE tenant_id = 'A'"),
+            Some(text("A"))
+        );
+        assert_eq!(
+            extract("UPDATE audit_event SET kind='x' WHERE tenant_id='A' AND kind='k'"),
+            Some(text("A"))
+        );
+        assert_eq!(
+            extract("UPDATE audit_event SET kind='x' WHERE tenant_id='A' OR tenant_id='B'"),
+            None
+        );
+        assert_eq!(
+            extract("UPDATE audit_event SET kind='x' WHERE kind='k'"),
+            None
+        );
+        // No per-tenant column (unscoped table) → None.
+        assert_eq!(
+            extract("INSERT INTO unscoped (tenant_id) VALUES ('A')"),
+            None
+        );
+        // INSERT … SELECT, a read, or garbage → None (fail-closed).
+        assert_eq!(
+            extract("INSERT INTO audit_event (tenant_id) SELECT tenant_id FROM other"),
+            None
+        );
+        assert_eq!(extract("SELECT 1"), None);
+        assert_eq!(extract("not sql at all ;;"), None);
     }
 }
 

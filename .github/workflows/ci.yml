@@ -585,6 +585,24 @@ jobs:
           # so the ambiguity — and thus this regression — is only observable on a real Postgres.
           grep -q 'ORM UPSERT GUARD OK \[postgres\]' orm-sqlx.log \
             || { echo "::error::Postgres scoped-upsert guard never reached its marker (a DO-UPDATE ambiguity regression or a cross-tenant upsert clobber, or a skip)" >&2; exit 1; }
+      - name: RLS tenant session GUC backstop on a real non-superuser Postgres role (v0.4.20)
+        env:
+          BOATRAMP_TEST_PG_URL: postgres://boatramp:boatramp@localhost:5432/boatramp
+        run: |
+          set -eo pipefail
+          # v0.4.20: the host-resolved tenant is exposed as an RLS session GUC so an app's Postgres
+          # RLS mirrors boatramp's injected predicate (defense-in-depth). On a real PG as a
+          # NON-superuser role (the itests use the superuser, which BYPASSES RLS) against a
+          # FORCE-RLS table: own reads/writes see + admit only the resolved tenant and reject a
+          # forged one; an `all` provisioning write derives the GUC from the row the statement
+          # declares (typed + raw extractors) so creating tenant B succeeds yet cannot touch A. A
+          # missing GUC / a cross-tenant leak fails the assertion.
+          cargo test -p boatramp-storage --features sql-postgres \
+            --test rls_guc_sqlx_live -- --nocapture --test-threads=1 2>&1 | tee rls-guc.log
+          grep -qE 'test result: ok\. 1 passed' rls-guc.log \
+            || { echo "::error::RLS tenant GUC gate did not run (a silent skip — BOATRAMP_TEST_PG_URL unset — or a failure)" >&2; exit 1; }
+          grep -q 'RLS TENANT GUC OK \[postgres\]' rls-guc.log \
+            || { echo "::error::RLS tenant GUC never reached its marker (the GUC didn't drive RLS, a forged-tenant write slipped through, or an all-write couldn't provision)" >&2; exit 1; }
 
   # The embedded-Raft cluster tests (consensus, leader-loss failover, mesh admit,
   # cron single-firing) live behind the `raft`/`http` features and so ran ONLY in

@@ -5,6 +5,35 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.20] - 2026-09-17
+
+The host-resolved tenant is now exposed to an app's Postgres row-level security as a session GUC, so
+RLS becomes a faithful defense-in-depth backstop that mirrors boatramp's injected tenancy predicate.
+Opt-in, Postgres-only, off by default. Behind a security review (ship — no findings above
+informational) and a CI-hard live gate on a real non-superuser FORCE-RLS role.
+
+### Added
+- **RLS session GUC (`tenant_guc` / `session_guc`).** When an operator names a GUC on an external
+  Postgres binding (e.g. `app.tenant_id`), boatramp sets it transaction-locally to the same tenant it
+  injects into the query predicate — via `SELECT set_config(?1, ?2, true)` with **both the name and
+  the value bound** (never string-interpolated). An app's RLS policy that reads
+  `current_setting('app.tenant_id', true)` then confines exactly what boatramp already confines, so a
+  policy bug in either layer is caught by the other. The optional `session_guc` carries the anonymous
+  session identity for the `tenant-or-session` scope.
+  - **The value is host-resolved, never guest-set.** For `own`/`own_or_null`/`target`/`target_or_null`
+    and `tenant-or-session` reads/writes the GUC is the resolved principal. For a posture-vetted
+    cross-tenant (`all`) write — the provisioning path (e.g. `verifyEmail`) — the GUC is derived from
+    the single tenant the statement itself declares: the typed `Insert`/`Update` AST
+    (`uniform_scope_value`/`pinned_scope_value`) or, for a raw-SQL write, a parse of the statement
+    (`extract_raw_write_scope_value`). A write that doesn't resolve to exactly one tenant leaves the
+    GUC at its prior transaction value, which can only over-restrict — the DB's `WITH CHECK`/`USING`
+    remains the final arbiter, so a mismatch is rejected there, never leaked.
+  - **The guest can never set the GUC.** The reserved-write guard (`reject_reserved_session_writes`)
+    now also blocks a guest `SET`/`set_config` of the operator-configured GUC namespace, alongside the
+    existing `boatramp.*` / `@boatramp_*` reservations.
+  - Configured on `ExternalDatabaseConfig` (`tenant_guc`, `session_guc`) and via the matching
+    `…_TENANT_GUC` / `…_SESSION_GUC` env knobs. Non-Postgres backends ignore it (no session GUCs).
+
 ## [0.4.19] - 2026-09-17
 
 A managed-dependency readiness gate — a component whose host-managed database is still starting now
