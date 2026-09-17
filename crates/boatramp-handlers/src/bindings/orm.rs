@@ -88,8 +88,20 @@ impl wit::HostDatabase for OrmHost<'_> {
             core.force_scope(s).map_err(compile_err)?;
         }
         let (sql, params) = core.compile(dialect).map_err(compile_err)?;
+        // v0.4.21: an `all`-scoped SELECT sets the reserved all-marker for the duration of THIS read
+        // only, then restores it (see `set_all_read_marker`) — so a table opting in with `OR guc =
+        // marker` opens cross-tenant, yet the marker is never in effect for a write. No-op otherwise.
+        let marked = self
+            .session
+            .set_all_read_marker(&name, false, crate::tenant::Axis::Read)
+            .await
+            .map_err(backend_err)?;
         let txn = self.session.txn(&name, false).await.map_err(backend_err)?;
-        let rows = txn.query(&sql, &params).await.map_err(backend_err)?;
+        let result = txn.query(&sql, &params).await;
+        if marked {
+            let _ = self.session.clear_all_read_marker(&name, false).await;
+        }
+        let rows = result.map_err(backend_err)?;
         Ok(wit::QueryResult {
             columns: rows.columns,
             rows: rows

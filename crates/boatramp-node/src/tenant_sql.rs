@@ -1243,6 +1243,13 @@ impl NodeTenantSqlResolver {
                 backend = backend.with_rls_guc(Some(boatramp_core::sql::RlsGuc {
                     tenant,
                     session: self.binding.session_guc.clone().filter(|s| !s.is_empty()),
+                    // v0.4.21: the reserved all-read marker (empty ⇒ None ⇒ `all` reads stay
+                    // fail-closed, v0.4.20 behavior).
+                    all_marker: self
+                        .binding
+                        .tenant_all_marker
+                        .clone()
+                        .filter(|s| !s.is_empty()),
                 }));
             }
         }

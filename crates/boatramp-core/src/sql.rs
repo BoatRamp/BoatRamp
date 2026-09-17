@@ -120,6 +120,13 @@ pub struct RlsGuc {
     pub tenant: String,
     /// The GUC carrying the anonymous SESSION id (e.g. `app.session_id`), if the operator uses one.
     pub session: Option<String>,
+    /// A reserved, host-controlled sentinel written to [`Self::tenant`] on an **`all`-scoped READ**
+    /// (v0.4.21) — a value the operator guarantees can never be a real tenant id, so a table that
+    /// opts in with `USING (tenant_id = current_setting(name, true) OR current_setting(name, true) =
+    /// '<marker>')` opens cross-tenant for the audited `all` twins while every other table (and every
+    /// write) stays strict. `None` ⇒ `all` reads leave the GUC untouched (v0.4.20 behavior:
+    /// fail-closed). The guest can never set it — the whole [`Self::tenant`] namespace is reserved.
+    pub all_marker: Option<String>,
 }
 
 impl RlsGuc {
