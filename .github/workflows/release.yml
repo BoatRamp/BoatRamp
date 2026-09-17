@@ -334,17 +334,27 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           base="ghcr.io/${GITHUB_REPOSITORY,,}"
           : > image-refs.txt
+          # Realize BOTH image closures in ONE `nix build`, so the daemon substitutes their
+          # (nightly-cached) ~230 MiB tarballs from cachix CONCURRENTLY. The old per-variant loop
+          # downloaded them serially — the GHCR long pole (measured ~5 min + ~15 min of cachix
+          # egress on the two blobs). Substitution is NOT gated by `--max-jobs`, so `--max-jobs 1`
+          # stays as the OOM guard for the rare cache-miss recompile; only the download parallelises.
+          # `--print-out-paths` lists the store paths in installable order (container first), which
+          # is more robust than numbered `--out-link` symlinks.
+          mapfile -t IMG < <(nix build ".#container" ".#container-cloudflare" \
+            --max-jobs 1 --cores 2 --no-link --print-build-logs --print-out-paths)
+          i=0
           for variant in container container-cloudflare; do
             repo="$base"
             [ "$variant" = "container-cloudflare" ] && repo="${base}-cloudflare"
-            nix build ".#${variant}" --max-jobs 1 --cores 2 \
-              --print-build-logs --out-link "image-${variant}.tar.gz"
-            nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:${tag}"
-            nix run nixpkgs#skopeo -- copy "docker-archive:image-${variant}.tar.gz" "docker://${repo}:latest"
-            # Record the pushed image by digest (immutable ref cosign/SBOM pin to) PLUS the local
-            # archive path, so the sign step can SBOM the on-disk image instead of re-pulling it.
+            tar="${IMG[$i]}"
+            i=$((i + 1))
+            nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:${tag}"
+            nix run nixpkgs#skopeo -- copy "docker-archive:${tar}" "docker://${repo}:latest"
+            # Record the pushed image by digest (the immutable ref cosign/SBOM pin to) PLUS the
+            # on-disk archive path, so the sign step SBOMs the local image instead of re-pulling it.
             digest="$(nix run nixpkgs#skopeo -- inspect --format '{{.Digest}}' "docker://${repo}:${tag}")"
-            echo "${repo}@${digest} image-${variant}.tar.gz" >> image-refs.txt
+            echo "${repo}@${digest} ${tar}" >> image-refs.txt
           done
           cat image-refs.txt
 
@@ -356,24 +366,29 @@ jobs:
           COSIGN_EXPERIMENTAL: "1"
         run: |
           set -euo pipefail
-          # syft's `docker-archive:` reader needs an UNCOMPRESSED tar. The nix `.#container`
-          # out-link is a GZIPPED docker-archive: skopeo auto-decompresses it on push (the build
-          # step above works), but syft reads the gzip magic as a tar header and dies
-          # (`archive/tar: invalid tar header`). Decompress each archive once here — the runner has
-          # gzip; the cosign/syft nix shell does not — then SBOM the plain tar. Still the LOCAL
-          # archive (no network re-pull, which dominated the old ~7.6 min); `zcat -f` passes a
-          # non-gzip archive through unchanged, so this is robust to a future uncompressed output.
+          # syft's `docker-archive:` reader needs an UNCOMPRESSED tar. The nix image output is a
+          # GZIPPED docker-archive: skopeo auto-decompresses it on push (the build step above works),
+          # but syft reads the gzip magic as a tar header and dies (`archive/tar: invalid tar
+          # header`). Decompress each archive once here into a WRITABLE workdir file — the `$tar`
+          # paths are now read-only `/nix/store` paths, and the nix store can't be written to; the
+          # runner has gzip, the cosign/syft nix shell does not. Keyed by a counter so both loops
+          # agree on the name. Still the LOCAL archive (no network re-pull, which dominated the old
+          # ~7.6 min); `zcat -f` passes a non-gzip archive through unchanged.
+          n=0
           while read -r ref tar; do
             [ -n "$ref" ] || continue
-            zcat -f "$tar" > "$tar.plain"
+            n=$((n + 1))
+            zcat -f "$tar" > "sbom-src-${n}.tar"
           done < image-refs.txt
           # Resolve cosign + syft ONCE for the whole loop — a per-op `nix run nixpkgs#…`
           # re-evaluates nixpkgs each time.
           nix shell nixpkgs#cosign nixpkgs#syft -c bash -euo pipefail -c '
+            n=0
             while read -r ref tar; do
               [ -n "$ref" ] || continue
+              n=$((n + 1))
               cosign sign --yes "$ref"
-              syft "docker-archive:$tar.plain" -o cyclonedx-json > sbom.json
+              syft "docker-archive:sbom-src-${n}.tar" -o cyclonedx-json > sbom.json
               cosign attest --yes --predicate sbom.json --type cyclonedx "$ref"
             done < image-refs.txt
           '

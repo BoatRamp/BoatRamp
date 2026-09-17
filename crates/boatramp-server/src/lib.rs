@@ -213,7 +213,8 @@ mod srvmetrics;
 use scheduler::run_scheduler_tick;
 #[cfg(feature = "handlers")]
 pub(crate) use scheduler::{
-    acquire_site_permit, effective_limits, handler_error_response, handler_unavailable, CronNow,
+    acquire_site_permit, effective_limits, handler_error_response, handler_unavailable,
+    sql_starting_response, CronNow,
 };
 #[cfg(feature = "handlers")]
 use scheduler::{CONSUMER_BATCH, CONSUMER_LEASE, CONSUMER_MAX_ATTEMPTS};
@@ -4891,6 +4892,173 @@ mod tests {
         assert_eq!(build(&["sql:product"]).await, vec!["product"]);
 
         let _ = std::fs::remove_dir_all(&sql_dir);
+    }
+
+    /// **Managed-dependency readiness gate (v0.4.19).** A component whose required host-managed
+    /// database is still starting must NOT run into a confusing `orm: sql database "" not granted`
+    /// (the post-mortem). Driven through the real `build_bindings` with a fake `SqlBackends`:
+    ///   * a MANAGED db that is not ready (`SqlError::Unavailable`) → `BindingsError::NotReady` (the
+    ///     caller renders a retryable 503 + `Retry-After`), fail-closed — the guest never runs;
+    ///   * a db that is only a moment from ready (Unavailable then Ok) → the short readiness retry
+    ///     catches it → the binding is granted (no 503);
+    ///   * an external/local db down (`SqlError::Other`) → logged + SKIPPED, the request still runs
+    ///     (per-DB resilience preserved — NOT gated);
+    ///   * `sql_starting_response` is a 503 carrying `Retry-After`.
+    #[tokio::test]
+    async fn managed_dependency_not_ready_gates_with_a_retryable_503() {
+        use crate::handler_dispatch::{build_bindings, BindingsError};
+        use boatramp_core::config::HandlersSiteConfig;
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::{SqlBackend, SqlBackends, SqlError};
+        use boatramp_handlers::{HandlerEngine, Limits};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // What the fake provider's `database()` yields (per call, in order for the retry case).
+        enum Outcome {
+            Unavailable,       // managed DB still starting → gate
+            Other,             // external/local DB down → skip (resilience)
+            Ready,             // opens fine
+            UnavailableThenOk, // transient: not-ready once, then ready (exercises the retry)
+        }
+        struct FakeSql {
+            outcome: Outcome,
+            calls: AtomicUsize,
+            real: Arc<dyn SqlBackend>,
+        }
+        #[async_trait::async_trait]
+        impl SqlBackends for FakeSql {
+            async fn database(
+                &self,
+                _project: &str,
+                _site: &str,
+                _name: &str,
+            ) -> Result<Arc<dyn SqlBackend>, SqlError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                match self.outcome {
+                    Outcome::Unavailable => {
+                        Err(SqlError::unavailable("workload has no replica yet"))
+                    }
+                    Outcome::Other => Err(SqlError::other("external db connection refused")),
+                    Outcome::Ready => Ok(Arc::clone(&self.real)),
+                    Outcome::UnavailableThenOk if n == 0 => {
+                        Err(SqlError::unavailable("still initializing"))
+                    }
+                    Outcome::UnavailableThenOk => Ok(Arc::clone(&self.real)),
+                }
+            }
+        }
+
+        // A real libsql backend to hand back for the "ready" cases (never queried here).
+        let sql_dir =
+            std::env::temp_dir().join(format!("boatramp-readiness-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let real = boatramp_storage::LibsqlSqlBackends::local(&sql_dir)
+            .database("default", "shop", "")
+            .await
+            .unwrap();
+
+        // Build bindings for a handler granting the default `sql` database, tenancy Disabled (this
+        // test is about the readiness gate, not tenancy), against a provider with `outcome`.
+        async fn build_with(
+            outcome: Outcome,
+            real: &Arc<dyn SqlBackend>,
+        ) -> (Result<boatramp_handlers::Bindings, BindingsError>, usize) {
+            let kv: Arc<dyn boatramp_core::kv::KvStore> =
+                Arc::new(boatramp_core::kv::MemoryKv::new());
+            let storage: Arc<dyn boatramp_core::Storage> = Arc::new(MemStorage::default());
+            let fake = Arc::new(FakeSql {
+                outcome,
+                calls: AtomicUsize::new(0),
+                real: Arc::clone(real),
+            });
+            let sql: Arc<dyn SqlBackends> = fake.clone();
+            let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+            let rt = HandlerRuntime::new(engine, kv, storage, Some(sql), None);
+            let inner = rt.inner.as_ref().unwrap();
+            let site = HandlersSiteConfig {
+                enabled: true,
+                allow_imports: vec!["sql".into()],
+                tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
+                ..Default::default()
+            };
+            let imports = vec!["sql".to_string()];
+            let env = std::collections::BTreeMap::new();
+            let r = build_bindings(
+                inner,
+                ProjectRef::new("default"),
+                "shop",
+                "shop",
+                None,
+                &imports,
+                &site,
+                &env,
+                &[],
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            (r, fake.calls.load(Ordering::SeqCst))
+        }
+
+        // (1) Managed not-ready → NotReady (retryable 503 + Retry-After). Fail-closed.
+        let (r, _) = build_with(Outcome::Unavailable, &real).await;
+        match r {
+            Err(BindingsError::NotReady {
+                retry_after_secs, ..
+            }) => {
+                assert!(retry_after_secs >= 1, "advertises a Retry-After");
+            }
+            Err(BindingsError::Refused(m)) => {
+                panic!("a not-ready managed DB must gate with NotReady, got Refused({m})")
+            }
+            Ok(_) => panic!("a not-ready managed DB must gate, but bindings were built"),
+        }
+
+        // (2) External/local down → skipped, request still builds (per-DB resilience, NOT gated).
+        let (r, _) = build_with(Outcome::Other, &real).await;
+        let bindings = r.expect("a non-managed DB outage must NOT gate the whole request");
+        assert!(
+            !bindings.sql_database_names().contains(&String::new()),
+            "the broken default DB is left ungranted (skipped), not gated"
+        );
+
+        // (3) Ready → the binding is granted.
+        let (r, _) = build_with(Outcome::Ready, &real).await;
+        let bindings = r.expect("a ready DB builds");
+        assert!(bindings.sql_database_names().contains(&String::new()));
+
+        // (4) Transient (not-ready then ready) → the short readiness retry catches it: granted, and
+        // the provider was called twice (one retry).
+        let (r, calls) = build_with(Outcome::UnavailableThenOk, &real).await;
+        let bindings = r.expect("the readiness retry catches a DB a moment from ready");
+        assert!(bindings.sql_database_names().contains(&String::new()));
+        assert_eq!(calls, 2, "one bounded retry on Unavailable");
+
+        // (5) The gate response is a 503 carrying Retry-After.
+        let resp = crate::sql_starting_response(2);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2"),
+            "the readiness 503 advertises Retry-After"
+        );
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!(
+            "MANAGED-DEP READINESS GATE OK: a required managed database that is still starting gates \
+             the invocation with a retryable 503 + Retry-After (fail-closed, guest never runs); a \
+             brief startup blip is caught by the bounded readiness retry; an external/local DB \
+             outage is skipped (per-DB resilience), never gating the whole request."
+        );
     }
 
     /// **Consumer signed-context dispatch live gate (v0.4.17).** The site-`consumers` async lane

@@ -76,12 +76,32 @@ pub enum SqlError {
     /// Any other backend/transport error (I/O, connection, ...).
     #[error("sql error: {0}")]
     Other(String),
+    /// The backend is **not ready yet** — a host-MANAGED database that is still starting,
+    /// recovering, or has no healthy replica (distinct from a permanent config/transport error).
+    /// This is **transient**: the caller should retry, or return a retryable `503` — never treat it
+    /// as a permanent "not configured"/"not granted" failure. Emitted only by the managed-compute
+    /// resolver; an external/local backend's outages stay [`Other`](SqlError::Other) (per-DB
+    /// resilience, no readiness gate).
+    #[error("sql backend not ready: {0}")]
+    Unavailable(String),
 }
 
 impl SqlError {
     /// Wrap any displayable error as [`SqlError::Other`].
     pub fn other<E: std::fmt::Display>(err: E) -> Self {
         Self::Other(err.to_string())
+    }
+
+    /// Wrap a displayable error as [`SqlError::Unavailable`] — a transient "managed backend not
+    /// ready yet" condition (still starting / recovering / no healthy replica).
+    pub fn unavailable<E: std::fmt::Display>(err: E) -> Self {
+        Self::Unavailable(err.to_string())
+    }
+
+    /// Whether this is the transient [`Unavailable`](SqlError::Unavailable) not-ready condition
+    /// (the caller may retry or gate with a retryable `503`).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
     }
 }
 

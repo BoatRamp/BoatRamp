@@ -5,6 +5,34 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.19] - 2026-09-17
+
+A managed-dependency readiness gate — a component whose host-managed database is still starting now
+gets a clear retryable `503`, not a confusing "not granted". Behind a security review (clean, ship)
+and a CI-hard live gate. Plus a release-pipeline speed-up.
+
+### Fixed
+- **A component whose required host-managed database is still starting no longer runs into
+  `sql database "" not granted`.** When a managed Postgres was mid-startup, the host logged and
+  skipped the failed open, so the guest ran and hit the same error as a genuine missing grant — two
+  very different causes ("wait" vs "fix your config") with one misleading message. Now a
+  still-starting managed database is classified distinctly (`SqlError::Unavailable` — transient, vs
+  a permanent `Other`) and the invocation is **gated with a retryable `503` + `Retry-After`** across
+  the handler, function, and session serve lanes: the guest never runs without its database, and a
+  migration / health probe waits instead of hitting a confusing error. A brief startup blip is
+  absorbed by a short bounded readiness retry. An **external or local** database outage still logs +
+  skips that one binding (per-DB resilience is unchanged — one broken secondary never gates an
+  unrelated request), and the async-lane consumers redeliver until the database is up. A guest that
+  does reach the condition (a backend that went unready mid-request) sees the "not ready" message,
+  not "not granted". (A typed guest error variant is a follow-up — it needs a coordinated shim rev.)
+
+### Changed
+- **The release GHCR job substitutes both image tarballs concurrently.** Forensics on a slow run
+  showed the "build + push" step was not recompiling (the images substituted from cache) but
+  downloading two ~230 MiB image tarballs from the binary cache **serially** (~5 min + ~15 min). Both
+  image closures are now realized in one `nix build` so the daemon fetches them concurrently;
+  `--max-jobs 1` is kept as the cache-miss recompile guard (substitution isn't gated by it).
+
 ## [0.4.18] - 2026-09-17
 
 Env-var parity for the guest-feature posture knobs, behind a security review (clean, ship) and

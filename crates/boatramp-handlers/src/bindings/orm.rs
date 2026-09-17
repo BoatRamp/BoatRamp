@@ -831,7 +831,12 @@ fn backend_err(err: boatramp_core::sql::SqlError) -> wit::Error {
     match err {
         SqlError::Syntax(m) => wit::Error::Syntax(m),
         SqlError::Constraint(m) => wit::Error::Constraint(m),
-        SqlError::Other(m) => wit::Error::Other(m),
+        // No dedicated guest variant yet (a typed `unavailable` is the deferred WS1-1b, needs a
+        // coordinated shim rev) — map to `other` with the "not ready" message intact, so a guest
+        // that does reach it sees the real cause rather than a generic error. The host gates a
+        // managed not-ready DB with a retryable 503 before the guest runs, so this is the rare
+        // fallback (e.g. a backend that went unready mid-request).
+        SqlError::Other(m) | SqlError::Unavailable(m) => wit::Error::Other(m),
     }
 }
 

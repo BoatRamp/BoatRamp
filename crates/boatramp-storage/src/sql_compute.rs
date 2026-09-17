@@ -290,7 +290,9 @@ impl ComputeResolvedSqlBackend {
     async fn no_endpoint_error(&self) -> SqlError {
         let diags = self.resolver.replica_diagnostics(&self.workload).await;
         if diags.is_empty() {
-            return SqlError::other(format!(
+            // Transient: the managed workload has no running replica yet (still launching). The
+            // host gates the guest with a retryable 503 rather than a confusing "not granted".
+            return SqlError::unavailable(format!(
                 "managed sql `{}` has no replica to connect to: the workload has no running \
                  replica (it may not be launched yet)",
                 self.workload
@@ -302,7 +304,9 @@ impl ComputeResolvedSqlBackend {
             .first()
             .map(|d| d.endpoint.as_str())
             .unwrap_or("unknown");
-        SqlError::other(format!(
+        // Transient not-ready: replicas are running but none has passed the readiness probe yet
+        // (still initializing / a reachability blip) — retryable, so the host gates with a 503.
+        SqlError::unavailable(format!(
             "managed sql `{}`: {} replica(s) exist ({} running) but none is healthy — no replica \
              passed the readiness probe, so this is a reachability/health problem, not a missing \
              workload (last probe target `{}`; see the `compute health` / `compute-net-debug:` logs \
@@ -369,8 +373,9 @@ impl ComputeResolvedSqlBackend {
                 self.workload
             )))),
             // The probe did not return within the timeout — the DB is listening but not
-            // answering queries (recovery / initializing / overloaded): not ready.
-            Err(_) => Err(SqlError::other(format!(
+            // answering queries (recovery / initializing / overloaded): transient not-ready, so
+            // the host gates with a retryable 503 (never a permanent "not granted").
+            Err(_) => Err(SqlError::unavailable(format!(
                 "managed sql `{}` is not ready: its readiness probe (`SELECT 1`) did not \
                  complete within {}s — the database is listening but not answering queries \
                  (still initializing, in recovery, or overloaded)",
@@ -607,7 +612,14 @@ mod tests {
             false,
             None,
         );
-        let msg = be.resolve_url().await.unwrap_err().to_string();
+        let err = be.resolve_url().await.unwrap_err();
+        // A not-yet-launched managed workload is TRANSIENT (v0.4.19): classified `Unavailable` so
+        // the server gates with a retryable 503, never a permanent "not granted".
+        assert!(
+            err.is_unavailable(),
+            "a missing managed replica is transient-not-ready: {err:?}"
+        );
+        let msg = err.to_string();
         assert!(
             msg.contains("managed sql `pg`"),
             "names the workload: {msg}"
@@ -639,7 +651,14 @@ mod tests {
             false,
             None,
         );
-        let msg = be.resolve_url().await.unwrap_err().to_string();
+        let err = be.resolve_url().await.unwrap_err();
+        // Running-but-unhealthy is TRANSIENT (still initializing / a reachability blip) → classified
+        // `Unavailable` so the server gates with a retryable 503 (v0.4.19).
+        assert!(
+            err.is_unavailable(),
+            "unhealthy-but-running replicas are transient-not-ready: {err:?}"
+        );
+        let msg = err.to_string();
         assert!(
             msg.contains("managed sql `pg-construens`"),
             "names the workload: {msg}"

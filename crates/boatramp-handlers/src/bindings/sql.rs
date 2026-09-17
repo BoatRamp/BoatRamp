@@ -409,7 +409,10 @@ fn to_wit_error(err: SqlError) -> sql_types::Error {
     match err {
         SqlError::Syntax(m) => sql_types::Error::Syntax(m),
         SqlError::Constraint(m) => sql_types::Error::Constraint(m),
-        SqlError::Other(m) => sql_types::Error::Other(m),
+        // No dedicated guest `unavailable` variant yet (deferred WS1-1b, needs a shim rev); map to
+        // `other` keeping the "not ready" message. The host gates a managed not-ready DB with a
+        // retryable 503 before the guest runs, so this is the rare mid-request fallback.
+        SqlError::Other(m) | SqlError::Unavailable(m) => sql_types::Error::Other(m),
     }
 }
 
