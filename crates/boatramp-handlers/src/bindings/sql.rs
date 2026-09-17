@@ -238,8 +238,12 @@ impl SqlSession {
     /// This is the load-bearing half of the no-write-under-marker invariant: it runs before every
     /// write path (both bindings) and PROPAGATES its error (an aborted transaction ⇒ the write fails
     /// closed), so the guarantee never depends on best-effort cleanup or backend abort semantics.
-    /// No-op when no marker is live on the write transaction. (A marker on a read-only transaction is
-    /// harmless — no write ever runs there — so only `(name,false)` is defended.)
+    /// No-op when no marker is live on the write transaction. Only the read-write key `(name,false)`
+    /// is defended: a write only ever runs there. A write-axis statement issued on a read-only handle
+    /// runs on `(name,true)`, whose transaction is opened `BEGIN READ ONLY` — the DB rejects the write
+    /// (SQLSTATE 25006) before RLS `WITH CHECK` is evaluated, so a marker lingering on a read-only
+    /// transaction can never open a write. That is a deliberate reliance on the backend's read-only
+    /// enforcement (the same enforcement that makes a read-only handle read-only at all).
     pub(super) async fn defend_write_marker(&mut self, name: &str) -> Result<(), SqlError> {
         let key = (name.to_string(), false);
         if !self.marker_live.contains(&key) {
