@@ -596,7 +596,17 @@ pub(super) async fn dispatch_session_post(
             project,
             &id,
         )),
-        Err(err) => {
+        // A required managed database still starting → the same retryable 503 + Retry-After as the
+        // handler/function lanes, so a reconnecting session client waits instead of the guest
+        // hitting a confusing "not granted" (uniform managed-dependency readiness gate).
+        Err(crate::handler_dispatch::BindingsError::NotReady {
+            detail,
+            retry_after_secs,
+        }) => {
+            tracing::info!(site, route = %session.route, %detail, "session not ready: managed database starting");
+            return sql_starting_response(retry_after_secs);
+        }
+        Err(crate::handler_dispatch::BindingsError::Refused(err)) => {
             tracing::warn!(site, route = %session.route, %err, "session bindings refused");
             return handler_unavailable();
         }
