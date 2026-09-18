@@ -563,6 +563,37 @@ impl HandlerRuntime {
         Ok(())
     }
 
+    /// Acquire a compile permit (deploy-resilience #2/#1a), held by the caller across a blob read +
+    /// [`precompile_component_holding_permit`](Self::precompile_component_holding_permit) so an
+    /// upload burst holds at most `compile_concurrency` full blobs resident at once. `None` when
+    /// this node has no engine — the caller then skips warming entirely (nothing to compile).
+    #[cfg(feature = "handlers")]
+    pub(crate) async fn acquire_compile_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match self.inner.as_ref() {
+            Some(inner) => Some(inner.engine.acquire_compile_permit().await),
+            None => None,
+        }
+    }
+
+    /// Precompile a component the caller has already gated by holding a permit from
+    /// [`acquire_compile_permit`](Self::acquire_compile_permit) — so it does NOT re-acquire the
+    /// compile gate (which would deadlock at concurrency 1). Runs no guest code; best-effort.
+    #[cfg(feature = "handlers")]
+    pub(crate) async fn precompile_component_holding_permit(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<(), String> {
+        match self.inner.as_ref() {
+            Some(inner) => inner
+                .engine
+                .precompile_off_runtime(hash, wasm)
+                .await
+                .map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
     /// The function invoker, if wired (set at serve startup). Lets the control plane run a
     /// deployed function in-process — e.g. to introspect a function subgraph's SDL via its
     /// federation `_service { sdl }` field when registering it.
