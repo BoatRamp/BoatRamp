@@ -7,7 +7,7 @@
 
 use crate::graphql_federation::{compose, CompositionError, Supergraph};
 use boatramp_core::config::HandlerGraphqlDataConfig;
-use boatramp_core::kv::KvStore;
+use boatramp_core::kv::{KvStore, WriteOp};
 use std::collections::BTreeMap;
 
 /// The kv prefix under which a project's subgraph SDLs live.
@@ -183,12 +183,21 @@ pub(crate) async fn publish(
     subgraphs.retain(|(n, _)| n != name);
     subgraphs.push((name.to_string(), sdl.to_string()));
     let sg = compose(&subgraphs).map_err(PublishError::Composition)?;
-    kv.put(&subgraph_key(project, name), sdl.as_bytes().to_vec())
-        .await
-        .map_err(|e| PublishError::Store(e.to_string()))?;
-    bump_version(kv, project)
-        .await
-        .map_err(PublishError::Store)?;
+    // Persist the SDL, bump the version, and CLEAR the #4 component-hash sidecar — all in one
+    // atomic batch. This publish's SDL did not necessarily come from a function-introspected
+    // component (this is also the manual and SQL registration path), so any previously-recorded
+    // component hash is now stale: leaving it would let a later function redeploy of that exact
+    // hash falsely skip re-introspection (#4) and keep serving *this* override's SDL. Clearing it
+    // forces the next function deploy to re-introspect; the function-deploy path re-sets the hash
+    // itself right after its own `publish`, so it costs that path nothing.
+    let next = composition_version(kv, project).await.wrapping_add(1);
+    kv.write_batch(vec![
+        WriteOp::Put(subgraph_key(project, name), sdl.as_bytes().to_vec()),
+        WriteOp::Delete(subgraph_hash_key(project, name)),
+        WriteOp::Put(version_key(project), next.to_be_bytes().to_vec()),
+    ])
+    .await
+    .map_err(|e| PublishError::Store(e.to_string()))?;
     Ok(sg)
 }
 
@@ -265,22 +274,35 @@ pub(crate) async fn compose_batch(
     }
     let subgraphs: Vec<(String, String)> = set.into_iter().collect();
     let sg = compose(&subgraphs).map_err(PublishError::Composition)?;
-    // Composed OK → promote each pending to live (+ hash), then a single version bump. A mid-promote
-    // store failure returns without bumping, so the (still-current) version keeps serving the old
-    // composed set rather than a half-promoted one.
+    // Composed OK → promote every pending SDL to live (+ its #4 hash sidecar), clear the pending
+    // area, and bump the version — all in ONE atomic `write_batch` so serving never observes a
+    // half-promoted set. A single-key-at-a-time loop could fail mid-promote and leave the live
+    // supergraph non-composing (some subgraphs promoted, others not) with the version either
+    // bumped-onto-a-broken-set or not; the atomic batch makes it all-or-nothing — either the whole
+    // validated set becomes live (with the bump) or the previously-composed set keeps serving.
+    let next = composition_version(kv, project).await.wrapping_add(1);
+    let mut ops: Vec<WriteOp> = Vec::with_capacity(pending.len() * 4 + 1);
     for (name, sdl, hash) in &pending {
-        kv.put(&subgraph_key(project, name), sdl.as_bytes().to_vec())
-            .await
-            .map_err(|e| PublishError::Store(e.to_string()))?;
+        ops.push(WriteOp::Put(
+            subgraph_key(project, name),
+            sdl.as_bytes().to_vec(),
+        ));
         if !hash.is_empty() {
-            let _ = put_subgraph_hash(kv, project, name, hash).await;
+            ops.push(WriteOp::Put(
+                subgraph_hash_key(project, name),
+                hash.as_bytes().to_vec(),
+            ));
         }
-        let _ = kv.delete(&pending_key(project, name)).await;
-        let _ = kv.delete(&pending_hash_key(project, name)).await;
+        ops.push(WriteOp::Delete(pending_key(project, name)));
+        ops.push(WriteOp::Delete(pending_hash_key(project, name)));
     }
-    bump_version(kv, project)
+    ops.push(WriteOp::Put(
+        version_key(project),
+        next.to_be_bytes().to_vec(),
+    ));
+    kv.write_batch(ops)
         .await
-        .map_err(PublishError::Store)?;
+        .map_err(|e| PublishError::Store(e.to_string()))?;
     Ok(sg)
 }
 
@@ -482,5 +504,90 @@ extend schema @link(
         assert!(subgraph_names(&kv, "acme").await.is_empty());
         // Idempotent: unpublishing a gone subgraph is not an error.
         unpublish(&kv, "acme", "accounts").await.unwrap();
+    }
+
+    // MEDIUM-1: `compose_batch` promotes the whole validated set atomically — every pending SDL
+    // goes live (+ its #4 hash), the pending area clears, and the composition version bumps
+    // exactly ONCE for the batch.
+    #[tokio::test]
+    async fn compose_batch_promotes_all_pending_atomically_with_one_version_bump() {
+        let kv = MemoryKv::new();
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        let v_before = composition_version(&kv, "acme").await;
+        // Staging touches neither the live set nor the version.
+        stage_subgraph(&kv, "acme", "reviews", REVIEWS, "hashR")
+            .await
+            .unwrap();
+        assert_eq!(composition_version(&kv, "acme").await, v_before);
+        assert_eq!(
+            subgraph_names(&kv, "acme").await,
+            vec!["accounts".to_string()]
+        );
+        // Compose the batch: reviews promotes to live, its hash is recorded, pending clears, +1 bump.
+        let sg = compose_batch(&kv, "acme").await.unwrap();
+        assert!(sg.entities.contains_key("User"));
+        assert_eq!(
+            subgraph_names(&kv, "acme").await,
+            vec!["accounts".to_string(), "reviews".to_string()]
+        );
+        assert_eq!(
+            subgraph_hash(&kv, "acme", "reviews").await.as_deref(),
+            Some("hashR")
+        );
+        assert_eq!(composition_version(&kv, "acme").await, v_before + 1);
+        assert!(kv
+            .list_prefix(&pending_prefix("acme"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // MEDIUM-1 (the fail-closed half): a batch that does not compose promotes NOTHING and leaves
+    // the previously-composed live set + version untouched (invariant #2).
+    #[tokio::test]
+    async fn compose_batch_promotes_nothing_when_the_batch_does_not_compose() {
+        let kv = MemoryKv::new();
+        publish(&kv, "acme", "a", "type Query { x: Int } type T { f: Int }")
+            .await
+            .unwrap();
+        let v_before = composition_version(&kv, "acme").await;
+        // `b` re-defines `T.f` without @shareable — the batch cannot compose.
+        stage_subgraph(&kv, "acme", "b", "type T { f: Int }", "hashB")
+            .await
+            .unwrap();
+        assert!(matches!(
+            compose_batch(&kv, "acme").await,
+            Err(PublishError::Composition(_))
+        ));
+        // Live set, hash sidecars, and version are all untouched; the (fixable) pending stays staged.
+        assert_eq!(subgraph_names(&kv, "acme").await, vec!["a".to_string()]);
+        assert_eq!(composition_version(&kv, "acme").await, v_before);
+        assert!(subgraph_hash(&kv, "acme", "b").await.is_none());
+        assert!(!kv
+            .list_prefix(&pending_prefix("acme"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // MEDIUM-2: a manual/SQL `publish` clears the #4 component-hash sidecar, so a later function
+    // redeploy of that same hash re-introspects instead of falsely skipping and serving the
+    // override's SDL.
+    #[tokio::test]
+    async fn publish_clears_the_component_hash_sidecar() {
+        let kv = MemoryKv::new();
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        // A prior function deploy recorded its component hash for the #4 skip.
+        put_subgraph_hash(&kv, "acme", "accounts", "hash1")
+            .await
+            .unwrap();
+        assert_eq!(
+            subgraph_hash(&kv, "acme", "accounts").await.as_deref(),
+            Some("hash1")
+        );
+        // A manual publish overwrites the live SDL from a non-function source → the hash is now
+        // stale and MUST be cleared (else the next same-hash function deploy would falsely skip).
+        publish(&kv, "acme", "accounts", ACCOUNTS).await.unwrap();
+        assert!(subgraph_hash(&kv, "acme", "accounts").await.is_none());
     }
 }

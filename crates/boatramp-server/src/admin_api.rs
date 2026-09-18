@@ -119,19 +119,30 @@ pub(super) async fn put_blob(
             // #1a (deploy-resilience): warm the compiled-module cache off the critical path, so a
             // later deploy-time introspection / first request is a cache hit instead of a cold
             // compile that can blow the client/proxy timeout. Best-effort + concurrency-gated (#2):
-            // read the just-stored blob back, and only if it's a wasm **component** (magic bytes),
-            // precompile it (no guest code runs). A non-component asset, a compile failure, or a
-            // node without an engine is silently skipped — the deploy remains the activation
-            // authority. Spawned so the upload responds immediately.
+            // acquire a compile permit FIRST, then read the just-stored blob back — so under an
+            // upload burst at most `compile_concurrency` full blobs are resident at once, not one
+            // per concurrent upload (bounds peak RSS on the small hosts this release targets). Only
+            // if it's a wasm **component** (magic bytes) is it precompiled (no guest code runs). A
+            // non-component asset, a compile failure, or a node without an engine is silently
+            // skipped — the deploy remains the activation authority. Spawned so the upload responds
+            // immediately.
             #[cfg(feature = "handlers")]
             {
                 let handlers = handlers.clone();
                 let deploy = deploy.clone();
                 let hash = hash.clone();
                 tokio::spawn(async move {
+                    // No engine on this node ⇒ nothing to warm; don't even read the blob back.
+                    let Some(_permit) = handlers.acquire_compile_permit().await else {
+                        return;
+                    };
                     match crate::handler_dispatch::read_blob_bytes(&deploy, &hash).await {
                         Ok(wasm) if is_wasm_component(&wasm) => {
-                            if let Err(e) = handlers.precompile_component(&hash, &wasm).await {
+                            // Already holding the permit — use the non-re-gating precompile.
+                            if let Err(e) = handlers
+                                .precompile_component_holding_permit(&hash, &wasm)
+                                .await
+                            {
                                 tracing::debug!(hash = %hash, "precompile-at-upload skipped: {e}");
                             }
                         }

@@ -641,19 +641,24 @@ async fn run_async_deploy(
 ) -> DeployStatus {
     use boatramp_core::function::{Function, Owner};
     let project = boatramp_core::project::ProjectRef::new(project_id);
+    // The persisted `reason` is a COARSE category only — the polling client (unauthenticated to the
+    // deploy's internals) never needs the raw compile/store/introspection error, which can carry
+    // internal paths, SQL, or schema detail. The full error is logged server-side for the operator.
     // 1) Compile-validate: a component that does not compile must never become active.
     match crate::handler_dispatch::read_blob_bytes(&deploy, component).await {
         Ok(wasm) => {
             if let Err(e) = handlers.precompile_component(component, &wasm).await {
+                tracing::warn!(%project_id, %name, %component, error = %e, "async deploy: component failed to compile");
                 return DeployStatus::Failed {
-                    reason: format!("compile: {e}"),
+                    reason: "component failed to compile".to_string(),
                 };
             }
         }
         Err(e) => {
+            tracing::warn!(%project_id, %name, %component, error = %e, "async deploy: could not read component blob");
             return DeployStatus::Failed {
-                reason: format!("read component: {e}"),
-            }
+                reason: "could not read component blob".to_string(),
+            };
         }
     }
     // 2) The target function (live + the new pending version, or brand-new) — needed both to
@@ -673,9 +678,10 @@ async fn run_async_deploy(
             now,
         ),
         Err(e) => {
+            tracing::warn!(%project_id, %name, error = %e, "async deploy: could not load function");
             return DeployStatus::Failed {
-                reason: format!("load function: {e}"),
-            }
+                reason: "could not load function".to_string(),
+            };
         }
     };
     // 3) The same subgraph validation the sync path runs (introspect + compose/stage). A
@@ -685,15 +691,19 @@ async fn run_async_deploy(
     )
     .await
     {
-        return DeployStatus::Failed { reason: msg };
+        tracing::warn!(%project_id, %name, detail = %msg.trim(), "async deploy: subgraph schema did not validate");
+        return DeployStatus::Failed {
+            reason: "subgraph schema did not validate".to_string(),
+        };
     }
     // 4) Promote: flip `active` to the now-validated version (a brand-new function is already active
     //    on it) and persist — the SINGLE point where the served version changes, reached only after
     //    every validation above passed.
     let _ = f.rollback(component);
     if let Err(e) = deploy.put_function(project, &f).await {
+        tracing::warn!(%project_id, %name, %component, error = %e, "async deploy: could not persist activation");
         return DeployStatus::Failed {
-            reason: format!("persist: {e}"),
+            reason: "could not persist activation".to_string(),
         };
     }
     DeployStatus::Active
