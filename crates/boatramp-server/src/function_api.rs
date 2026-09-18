@@ -605,9 +605,9 @@ pub(super) async fn deploy_function(
 
 /// The status of an async (`?wait=false`) deploy (#1b), polled via
 /// `GET /api/functions/{name}/deploys/{version}`.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(tag = "status", rename_all = "lowercase")]
-pub(super) enum DeployStatus {
+pub(crate) enum DeployStatus {
     /// Compiling + composing in the background; `active` is unchanged (the old version still serves).
     Validating,
     /// Validated + promoted — this version is now the served `active`.
@@ -617,7 +617,7 @@ pub(super) enum DeployStatus {
 }
 
 /// KV key for an async deploy's status record.
-fn deploy_status_key(project: &str, name: &str, version: &str) -> String {
+pub(crate) fn deploy_status_key(project: &str, name: &str, version: &str) -> String {
     format!("functions/{project}/{name}/deploys/{version}")
 }
 
@@ -627,7 +627,7 @@ fn deploy_status_key(project: &str, name: &str, version: &str) -> String {
 /// entirely untouched, so an unvalidated component can never serve (the load-bearing invariant).
 #[cfg(feature = "handlers")]
 #[allow(clippy::too_many_arguments)]
-async fn run_async_deploy(
+pub(crate) async fn run_async_deploy(
     deploy: DeployStore,
     handlers: Arc<HandlerRuntime>,
     project_id: &str,
