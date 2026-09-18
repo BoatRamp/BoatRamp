@@ -4219,6 +4219,334 @@ mod tests {
         );
     }
 
+    /// deploy-resilience #1b/#3 live gate (v0.4.22): the accept-then-validate async deploy path,
+    /// exercised over the REAL wasm engine + REAL libsql, proves the load-bearing invariant that a
+    /// component which does not fully validate NEVER becomes the served `active` and NEVER serves —
+    /// and that the batch compose validates-before-promoting. Concretely:
+    ///   A. an async deploy of a component that fails to compile returns `Failed`, leaves the live
+    ///      function's `active` pointer untouched, and the previously-active version keeps serving
+    ///      real traffic through the gateway; the supergraph still composes.
+    ///   B. a valid async deploy reaches `Active` and only THEN is `active` flipped to it.
+    ///   C. a batch compose of N staged subgraphs promotes them with exactly ONE version bump; a
+    ///      batch that does not compose promotes NOTHING and leaves the live set + version intact.
+    /// `#[ignore]`d (real libsql segfaults under the static-musl test binary); the CI
+    /// deploy-resilience gate runs it on the host toolchain and greps the success marker, so a
+    /// silent skip fails the job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run on the host toolchain (real libsql static-musl segfault); wired in the CI deploy-resilience gate"]
+    async fn async_deploy_never_activates_or_serves_an_unvalidated_component() {
+        use crate::function_api::{run_async_deploy, DeployStatus};
+        use boatramp_core::deploy::{sha256_hex, DeployStore};
+        use boatramp_core::function::{
+            Function, FunctionConfig, FunctionVersion, Lifecycle, Owner,
+        };
+        use boatramp_core::project::ProjectRef;
+        use boatramp_core::sql::{SqlBackends, SqlValue};
+        use boatramp_core::tenancy::{AccessMode, ScopeAxis, Tenancy, TenantSource};
+        use boatramp_handlers::{GraphqlRequest, HandlerEngine, Limits, ScopeFact};
+
+        // The compiled subgraph probe: `items` runs `SELECT id FROM items WHERE {scope}`, so it both
+        // answers `_service { sdl }` (a real subgraph) and, invoked, reveals it actually served.
+        const PROBE: &[u8] = include_bytes!("../tests/fixtures/graphql-scope-probe.wasm");
+        const SVC_SDL: &str =
+            "type Query { items: [Item!]! }\ntype Item @key(fields: \"id\") { id: ID! }";
+
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let deploy = DeployStore::new(storage.clone(), kv.clone());
+
+        // Real per-site libsql; seed the svc function's OWN DB (`fn/svc`) with tenant B rows.
+        let sql_dir = std::env::temp_dir().join(format!("br-deployres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&sql_dir);
+        let db = backends.database("default", "fn/svc", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE items (id TEXT PRIMARY KEY, tenant_id TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant) in [("b1", "tenant_B"), ("b2", "tenant_B")] {
+                tx.execute(
+                    "INSERT INTO items (id, tenant_id) VALUES (?1, ?2)",
+                    &[SqlValue::Text(id.into()), SqlValue::Text(tenant.into())],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let sql: Arc<dyn SqlBackends> = Arc::new(backends);
+
+        // Deploy the probe as function "svc", active version id "v1" (component = the probe hash).
+        let hash = sha256_hex(PROBE);
+        let stream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from_static(PROBE)) }).boxed();
+        deploy.put_blob(&hash, stream).await.unwrap();
+        let svc_config = || FunctionConfig {
+            imports: vec!["sql".into()],
+            tenancy: Some(Tenancy::Scoped {
+                column: "tenant_id".into(),
+                sources: vec![TenantSource::None],
+                read: AccessMode::Own,
+                write: AccessMode::None,
+            }),
+            ..Default::default()
+        };
+        let function = Function {
+            name: "svc".into(),
+            owner: Owner::Project("default".into()),
+            versions: vec![FunctionVersion {
+                id: "v1".into(),
+                component: hash.clone(),
+                created: 0,
+                lifecycle: Lifecycle::Independent,
+            }],
+            active: "v1".into(),
+            aliases: Default::default(),
+            config: svc_config(),
+        };
+        deploy
+            .put_function(ProjectRef::DEFAULT, &function)
+            .await
+            .unwrap();
+
+        // Register it as a subgraph + safelist the gateway op, so we can prove it actually SERVES.
+        crate::graphql_registry::publish(kv.as_ref(), "default", "svc", SVC_SDL)
+            .await
+            .unwrap();
+        let query = "{ items { id } }";
+        let op_hash = crate::graphql_apq::sha256_hex(query);
+        kv.put(
+            &format!("hapq/default/{op_hash}"),
+            query.as_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let rt = Arc::new(HandlerRuntime::new(
+            engine,
+            kv.clone(),
+            storage,
+            Some(sql),
+            None,
+        ));
+        rt.set_invoker(deploy.clone());
+        let fed = rt
+            .inner
+            .as_ref()
+            .unwrap()
+            .federation_runner
+            .get()
+            .unwrap()
+            .clone();
+        let serve_svc = || {
+            let fed = fed.clone();
+            async move {
+                let runner = fed.scoped(
+                    ProjectRef::new("default"),
+                    vec![ScopeFact {
+                        axis: ScopeAxis::Tenant,
+                        value: SqlValue::Text("tenant_B".into()),
+                    }],
+                );
+                let req = GraphqlRequest {
+                    query: Some(query.to_string()),
+                    persisted_hash: None,
+                    variables: "{}".to_string(),
+                    operation_name: None,
+                    authorization: None,
+                };
+                String::from_utf8_lossy(&runner.run(req, 0).await.unwrap()).into_owned()
+            }
+        };
+
+        // Good baseline: the active v1 serves tenant B's rows through the real gateway.
+        let before = serve_svc().await;
+        assert!(
+            before.contains("\"b1\"") && before.contains("\"b2\""),
+            "baseline: the active version serves through the gateway: {before}"
+        );
+        let version_good =
+            crate::graphql_registry::composition_version(kv.as_ref(), "default").await;
+        assert!(
+            crate::graphql_registry::supergraph(kv.as_ref(), "default")
+                .await
+                .is_ok(),
+            "baseline supergraph composes"
+        );
+
+        // (A) A component that FAILS TO COMPILE must never activate nor serve. Store a blob with the
+        // wasm-component preamble but junk body, then async-deploy it as a new version of "svc".
+        let garbage: Vec<u8> = vec![
+            0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0xff, 0xff, 0xde, 0xad,
+        ];
+        let garbage_hash = sha256_hex(&garbage);
+        let g = garbage.clone();
+        let gstream: ByteStream =
+            futures::stream::once(async move { Ok(bytes::Bytes::from(g)) }).boxed();
+        deploy.put_blob(&garbage_hash, gstream).await.unwrap();
+        let status = run_async_deploy(
+            deploy.clone(),
+            rt.clone(),
+            "default",
+            "svc",
+            &garbage_hash,
+            svc_config(),
+            Lifecycle::Independent,
+            Some(false),
+            false,
+            0,
+        )
+        .await;
+        assert!(
+            matches!(status, DeployStatus::Failed { .. }),
+            "an uncompilable component must fail validation, got {status:?}"
+        );
+        // active pointer untouched...
+        let f = deploy
+            .get_function(ProjectRef::DEFAULT, "svc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.active, "v1",
+            "the failed deploy must NOT flip `active` (still the validated v1), got {}",
+            f.active
+        );
+        assert!(
+            !f.versions.iter().any(|v| v.id == garbage_hash),
+            "the failed component must not even be persisted as a version"
+        );
+        // ...the old version still serves real traffic...
+        let after = serve_svc().await;
+        assert!(
+            after.contains("\"b1\"") && after.contains("\"b2\""),
+            "the previously-active version must keep serving after a failed deploy: {after}"
+        );
+        // ...and the supergraph still composes, at the unchanged version.
+        assert!(
+            crate::graphql_registry::supergraph(kv.as_ref(), "default")
+                .await
+                .is_ok(),
+            "the live supergraph must still compose after a failed deploy"
+        );
+        assert_eq!(
+            crate::graphql_registry::composition_version(kv.as_ref(), "default").await,
+            version_good,
+            "a failed deploy must not touch the composition version"
+        );
+
+        // (B) A VALID async deploy reaches Active and only THEN flips `active` to the validated
+        // version (id == component hash). register=false keeps the already-registered subgraph.
+        let status = run_async_deploy(
+            deploy.clone(),
+            rt.clone(),
+            "default",
+            "svc",
+            &hash,
+            svc_config(),
+            Lifecycle::Independent,
+            Some(false),
+            false,
+            0,
+        )
+        .await;
+        assert!(
+            matches!(status, DeployStatus::Active),
+            "a valid component must validate to Active, got {status:?}"
+        );
+        let f = deploy
+            .get_function(ProjectRef::DEFAULT, "svc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.active, hash,
+            "a valid deploy flips `active` to the validated version only after Active"
+        );
+
+        // (C) Batch compose (#3) validate-before-promote, on a fresh project.
+        const ACCOUNTS: &str =
+            "type Query { me: User }\ntype User @key(fields: \"id\") { id: ID! name: String }";
+        const REVIEWS: &str = "type Query { topReviews: [Review] }\ntype Review { id: ID! body: String author: User }\nextend type User @key(fields: \"id\") { id: ID! @external reviews: [Review] }";
+        assert_eq!(
+            crate::graphql_registry::composition_version(kv.as_ref(), "batchproj").await,
+            0
+        );
+        crate::graphql_registry::stage_subgraph(
+            kv.as_ref(),
+            "batchproj",
+            "accounts",
+            ACCOUNTS,
+            "h1",
+        )
+        .await
+        .unwrap();
+        crate::graphql_registry::stage_subgraph(kv.as_ref(), "batchproj", "reviews", REVIEWS, "h2")
+            .await
+            .unwrap();
+        // Staging alone promotes nothing.
+        assert!(
+            crate::graphql_registry::subgraph_names(kv.as_ref(), "batchproj")
+                .await
+                .is_empty()
+        );
+        let sg = crate::graphql_registry::compose_batch(kv.as_ref(), "batchproj")
+            .await
+            .unwrap();
+        assert!(
+            sg.entities.contains_key("User"),
+            "the batch composed as a whole"
+        );
+        assert_eq!(
+            crate::graphql_registry::subgraph_names(kv.as_ref(), "batchproj").await,
+            vec!["accounts".to_string(), "reviews".to_string()]
+        );
+        assert_eq!(
+            crate::graphql_registry::composition_version(kv.as_ref(), "batchproj").await,
+            1,
+            "a batch of N subgraphs bumps the composition version exactly ONCE"
+        );
+        // A non-composing batch promotes nothing and leaves the live set + version intact.
+        crate::graphql_registry::stage_subgraph(
+            kv.as_ref(),
+            "batchproj",
+            "clash",
+            "type Review { id: ID! body: String }",
+            "h3",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            crate::graphql_registry::compose_batch(kv.as_ref(), "batchproj").await,
+            Err(crate::graphql_registry::PublishError::Composition(_))
+        ));
+        assert_eq!(
+            crate::graphql_registry::subgraph_names(kv.as_ref(), "batchproj").await,
+            vec!["accounts".to_string(), "reviews".to_string()],
+            "a non-composing batch must promote NOTHING"
+        );
+        assert_eq!(
+            crate::graphql_registry::composition_version(kv.as_ref(), "batchproj").await,
+            1,
+            "a non-composing batch must not bump the version"
+        );
+
+        let _ = std::fs::remove_dir_all(&sql_dir);
+        println!(
+            "DEPLOY-RESILIENCE ASYNC/BATCH OK: over a real wasm engine + real libsql, an async \
+             deploy of an uncompilable component returned Failed WITHOUT flipping `active` (the \
+             validated v1 kept serving tenant B's rows through the gateway and the supergraph still \
+             composed); a valid async deploy reached Active and only then flipped `active`; and a \
+             batch compose promoted N staged subgraphs with exactly ONE version bump while a \
+             non-composing batch promoted nothing and left the live set + version intact"
+        );
+    }
+
     /// Tenant isolation (Step 7a): the background scheduler fans out over every
     /// project, so a **non-default** project's queued async invocation is drained
     /// and metered **within that project** — never leaking into `default`. Before
