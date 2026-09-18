@@ -137,7 +137,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Typos
-        uses: crate-ci/typos@master
+        # Pinned to a release tag (the repo's `master` branch was renamed to `main`, so `@master`
+        # no longer resolves) — and to the SAME version the local pre-commit hook uses, so a commit
+        # that passes the hook passes CI.
+        uses: crate-ci/typos@v1.47.0
 
   clippy:
     name: clippy (default features)
