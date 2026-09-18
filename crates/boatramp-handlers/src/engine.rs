@@ -575,6 +575,15 @@ pub struct HandlerEngine {
     /// A **separate** concurrency gate for the streaming lane, so a burst of
     /// long-lived streams can't exhaust the sync request pool or the async drain.
     streaming_semaphore: Semaphore,
+    /// Concurrency cap on **compilation** (deploy-resilience #2): bounds how many cranelift
+    /// compiles run at once, so a bulk precompile (e.g. an apply uploading many components, each
+    /// warming the cache via [`precompile_gated`](Self::precompile_gated)) can't spike RSS on a
+    /// small host. Acquired only on the gated precompile path; the on-demand serve-path
+    /// [`proxy_pre`](Self::proxy_pre) is unchanged (traffic-serialized + cached). Default 1
+    /// (fully serialize); raise via [`with_compile_concurrency`](Self::with_compile_concurrency).
+    /// `Arc` so a caller can hold an OWNED permit across an expensive blob read + compile (the
+    /// precompile-at-upload path bounds resident blobs to this concurrency, #1a).
+    compile_gate: Arc<Semaphore>,
     /// Optional ceiling on a guest's **outbound** `wasi:http` call (connect +
     /// time-to-first-byte), independent of the invocation's own timeout, so a
     /// hung upstream is bounded on its own terms. `None` keeps wasmtime's default.
@@ -655,6 +664,9 @@ impl HandlerEngine {
             async_limits: limits,
             streaming_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             streaming_limits: limits,
+            // Serialize bulk precompiles by default (safest for a memory-bound host); operators with
+            // headroom raise it via `with_compile_concurrency`.
+            compile_gate: Arc::new(Semaphore::new(1)),
             outbound_timeout: None,
             allow_private_egress: false,
             self_egress_addrs: Arc::from([] as [SocketAddr; 0]),
@@ -784,6 +796,81 @@ impl HandlerEngine {
     /// warms the compilation cache so the first real request is fast.
     pub fn precompile(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
         self.proxy_pre(hash, wasm).map(|_| ())
+    }
+
+    /// Raise the compilation-concurrency cap (deploy-resilience #2). Default 1 (fully serialize);
+    /// an operator with memory headroom can allow more parallel compiles. Called once at build.
+    #[must_use]
+    pub fn with_compile_concurrency(mut self, n: usize) -> Self {
+        self.compile_gate = Arc::new(Semaphore::new(n.max(1)));
+        self
+    }
+
+    /// Acquire an OWNED permit on the compile-concurrency gate (#2), to be held across an expensive
+    /// blob read **and** the subsequent [`precompile_off_runtime`](Self::precompile_off_runtime) —
+    /// so the precompile-at-upload path reads a blob back into RAM only when it is this component's
+    /// turn to compile, bounding simultaneously-resident upload blobs to the compile-concurrency
+    /// (not the upload-concurrency). The gate is never closed, so acquisition always succeeds.
+    pub async fn acquire_compile_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.compile_gate)
+            .acquire_owned()
+            .await
+            .expect("compile gate is never closed")
+    }
+
+    /// [`precompile`](Self::precompile) off the async runtime but WITHOUT acquiring the compile gate
+    /// — for a caller that already holds a permit from
+    /// [`acquire_compile_permit`](Self::acquire_compile_permit). (Re-acquiring the gate here would
+    /// deadlock at concurrency 1, since the same task already holds the only permit.)
+    pub async fn precompile_off_runtime(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<(), HandlerError> {
+        Self::run_compile_off_runtime(|| self.precompile(hash, wasm))
+    }
+
+    /// Run a synchronous cranelift compile without starving the async runtime. On the multi-thread
+    /// runtime (the server's) `block_in_place` moves the OTHER tasks off this worker for the
+    /// compile's duration, so a several-hundred-ms compile can't stall unrelated futures sharing the
+    /// worker. On a current-thread runtime (some unit tests) `block_in_place` would panic, so we run
+    /// the closure inline there — harmless, as those callers serve no live traffic.
+    fn run_compile_off_runtime<T>(f: impl FnOnce() -> T) -> T {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+            _ => f(),
+        }
+    }
+
+    /// [`precompile`](Self::precompile) behind the compile-concurrency gate (#2): `await`s a permit
+    /// (yielding the worker while others hold it), then runs the cranelift compile via
+    /// [`block_in_place`](tokio::task::block_in_place) so the sync compile doesn't block the async
+    /// worker it runs on. Used by the bulk-precompile paths (blob upload, activation precheck) so a
+    /// many-component apply warms the cache without a simultaneous compile spike. Best-effort at the
+    /// call site — a compile failure here is surfaced by the eventual deploy, never silently served.
+    pub async fn precompile_gated(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
+        let _permit = self
+            .compile_gate
+            .acquire()
+            .await
+            .expect("compile gate is never closed");
+        Self::run_compile_off_runtime(|| self.precompile(hash, wasm))
+    }
+
+    /// [`precompile_consumer`](Self::precompile_consumer) behind the same compile gate (#2), with the
+    /// same off-runtime compile as [`precompile_gated`](Self::precompile_gated).
+    #[cfg(feature = "messaging")]
+    pub async fn precompile_consumer_gated(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<(), HandlerError> {
+        let _permit = self
+            .compile_gate
+            .acquire()
+            .await
+            .expect("compile gate is never closed");
+        Self::run_compile_off_runtime(|| self.precompile_consumer(hash, wasm))
     }
 
     /// Precompile + validate a component as a **`wasi:messaging` consumer** (it

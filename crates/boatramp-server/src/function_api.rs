@@ -100,6 +100,20 @@ pub(super) struct DeployFunctionQuery {
     /// escape hatch for a coordinated multi-subgraph migration.
     #[serde(default)]
     register_subgraph: Option<bool>,
+    /// `?compose=defer` (deploy-resilience #3): for a subgraph function, introspect + **stage** the
+    /// new SDL without recomposing the supergraph — an apply deploying many subgraphs stages each
+    /// (O(1) per deploy), then calls `POST /api/graphql/compose` **once** to validate + promote the
+    /// whole set (O(N) total instead of O(N²)). Absent ⇒ compose immediately (per-deploy, default).
+    #[serde(default)]
+    compose: Option<String>,
+    /// `?wait=false` (deploy-resilience #1b): **accept-then-validate**. Return `202` immediately
+    /// and run the slow validation (compile + subgraph introspect/compose) in the background,
+    /// flipping the served `active` version ONLY after it fully validates — so a slow-but-valid
+    /// deploy never blocks the client/proxy into a `502`, and a component that fails to
+    /// compile/compose NEVER serves. Poll `GET /api/functions/{name}/deploys/{version}` for the
+    /// outcome. Absent/`true` ⇒ synchronous (back-compat; now fast thanks to #1a/#2/#3/#4).
+    #[serde(default)]
+    wait: Option<bool>,
 }
 
 /// Invoke `f` with the bytes of every `boatramp:function-manifest` custom section in a
@@ -328,6 +342,7 @@ pub fn unmet_requires(component: &[u8]) -> Vec<String> {
 /// (no registry entry, no marker) is untouched, `?register_subgraph=false` opts out, and a node
 /// with no engine degrades to a skip. `Ok(())` ⇒ proceed with the deploy.
 #[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
 async fn maybe_register_subgraph(
     deploy: &DeployStore,
     handlers: &HandlerRuntime,
@@ -336,7 +351,8 @@ async fn maybe_register_subgraph(
     function: &boatramp_core::function::Function,
     component: &str,
     register: Option<bool>,
-) -> Result<(), Response> {
+    defer: bool,
+) -> Result<(), (StatusCode, String)> {
     if register == Some(false) {
         return Ok(()); // explicit opt-out (the coordinated-migration escape hatch)
     }
@@ -348,6 +364,18 @@ async fn maybe_register_subgraph(
             Ok(blob) if component_declares_subgraph(&blob) => {}
             _ => return Ok(()),
         }
+    }
+    // #4 (deploy-resilience): skip the expensive introspection + recompose when this exact
+    // component hash's SDL is already published — a redeploy of an unchanged component (e.g. an
+    // idempotent re-run of an apply, or a function whose hash a shim bump did NOT change) is a
+    // no-op for the registry. The hash sidecar is only written by this path (below), so a match
+    // means the currently-published SDL came from exactly this component — never a false skip.
+    if crate::graphql_registry::subgraph_hash(kv, project.as_str(), name)
+        .await
+        .as_deref()
+        == Some(component)
+    {
+        return Ok(());
     }
     let sdl = match handlers
         .introspect_subgraph_sdl(deploy, project, function, component)
@@ -363,32 +391,54 @@ async fn maybe_register_subgraph(
                     "subgraph `{name}` does not answer `{{ _service {{ sdl }} }}`; deploy with \
                      `?register_subgraph=false` to skip subgraph registration\n"
                 ),
-            )
-                .into_response())
+            ))
         }
         Err(crate::function_runtime::SubgraphSdlError::InvokeFailed(msg)) => {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("could not introspect subgraph `{name}`: {msg}\n"),
-            )
-                .into_response())
+            ))
         }
     };
+    // #3: with `?compose=defer`, stage the SDL for a batched compose instead of recomposing now.
+    // The whole apply's subgraphs are validated + promoted together by `POST /api/graphql/compose`.
+    if defer {
+        return crate::graphql_registry::stage_subgraph(
+            kv,
+            project.as_str(),
+            name,
+            &sdl,
+            component,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("registry stage error: {e}\n"),
+            )
+        });
+    }
     match crate::graphql_registry::publish(kv, project.as_str(), name, &sdl).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // Record the component hash whose SDL is now published, so an unchanged redeploy skips
+            // the introspection + recompose above (best-effort — a write failure only costs a
+            // redundant re-introspect next time, never correctness).
+            let _ =
+                crate::graphql_registry::put_subgraph_hash(kv, project.as_str(), name, component)
+                    .await;
+            Ok(())
+        }
         Err(crate::graphql_registry::PublishError::Composition(e)) => Err((
             StatusCode::BAD_REQUEST,
             format!(
                 "subgraph `{name}` does not compose: {e}\n(deploy with `?register_subgraph=false` \
                  to skip, or unregister a conflicting subgraph first)\n"
             ),
-        )
-            .into_response()),
+        )),
         Err(crate::graphql_registry::PublishError::Store(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("registry store error: {e}\n"),
-        )
-            .into_response()),
+        )),
     }
 }
 
@@ -402,7 +452,8 @@ async fn maybe_register_subgraph(
     _function: &boatramp_core::function::Function,
     _component: &str,
     _register: Option<bool>,
-) -> Result<(), Response> {
+    _defer: bool,
+) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
@@ -452,6 +503,65 @@ pub(super) async fn deploy_function(
         Err(err) => return deploy_error_response(err),
     }
     let now = now_unix();
+    // #1b: `?wait=false` accepts the deploy and validates it in the background, flipping `active`
+    // only on success — so a slow-but-valid compile/compose never 502s and an invalid one never
+    // serves. The live function is left entirely untouched until validation promotes the new
+    // version. Needs the engine; without it, fall through to the synchronous path.
+    #[cfg(feature = "handlers")]
+    if matches!(q.wait, Some(false)) {
+        let version = body.component.clone();
+        let status_key = deploy_status_key(project.as_ref().as_str(), &name, &version);
+        // Record "validating" up front so a poll right after the 202 sees it.
+        let _ = deploy
+            .kv()
+            .put(
+                &status_key,
+                serde_json::to_vec(&DeployStatus::Validating).unwrap_or_default(),
+            )
+            .await;
+        let (deploy2, handlers2, project_id, name2, component2, config2, lifecycle) = (
+            deploy.clone(),
+            handlers.clone(),
+            project.as_ref().as_str().to_string(),
+            name.clone(),
+            version.clone(),
+            body.config.clone(),
+            body.lifecycle,
+        );
+        let (register, defer) = (
+            q.register_subgraph,
+            matches!(q.compose.as_deref(), Some("defer")),
+        );
+        tokio::spawn(async move {
+            let status = run_async_deploy(
+                deploy2.clone(),
+                handlers2,
+                &project_id,
+                &name2,
+                &component2,
+                config2,
+                lifecycle,
+                register,
+                defer,
+                now,
+            )
+            .await;
+            let key = deploy_status_key(&project_id, &name2, &component2);
+            let _ = deploy2
+                .kv()
+                .put(&key, serde_json::to_vec(&status).unwrap_or_default())
+                .await;
+        });
+        return (
+            StatusCode::ACCEPTED,
+            [(
+                axum::http::header::LOCATION,
+                format!("/api/functions/{name}/deploys/{version}"),
+            )],
+            Json(DeployStatus::Validating),
+        )
+            .into_response();
+    }
     let f = match deploy.get_function(project.as_ref(), &name).await {
         Ok(Some(mut existing)) => {
             existing.config = body.config;
@@ -481,15 +591,145 @@ pub(super) async fn deploy_function(
         &f,
         &body.component,
         q.register_subgraph,
+        matches!(q.compose.as_deref(), Some("defer")),
     )
     .await
     {
-        return resp;
+        return resp.into_response();
     }
     if let Err(err) = deploy.put_function(project.as_ref(), &f).await {
         return deploy_error_response(err);
     }
     Json(f).into_response()
+}
+
+/// The status of an async (`?wait=false`) deploy (#1b), polled via
+/// `GET /api/functions/{name}/deploys/{version}`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub(crate) enum DeployStatus {
+    /// Compiling + composing in the background; `active` is unchanged (the old version still serves).
+    Validating,
+    /// Validated + promoted — this version is now the served `active`.
+    Active,
+    /// Validation failed; `active` is unchanged (the old version still serves).
+    Failed { reason: String },
+}
+
+/// KV key for an async deploy's status record.
+pub(crate) fn deploy_status_key(project: &str, name: &str, version: &str) -> String {
+    format!("functions/{project}/{name}/deploys/{version}")
+}
+
+/// Background validation for an async deploy (#1b): compile the component, run the **same** subgraph
+/// register/compose the synchronous path does, and ONLY on full success promote the new version to
+/// the served `active` (atomically with the new config). Any failure leaves the live function
+/// entirely untouched, so an unvalidated component can never serve (the load-bearing invariant).
+#[cfg(feature = "handlers")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_async_deploy(
+    deploy: DeployStore,
+    handlers: Arc<HandlerRuntime>,
+    project_id: &str,
+    name: &str,
+    component: &str,
+    config: boatramp_core::function::FunctionConfig,
+    lifecycle: boatramp_core::function::Lifecycle,
+    register: Option<bool>,
+    defer: bool,
+    now: u64,
+) -> DeployStatus {
+    use boatramp_core::function::{Function, Owner};
+    let project = boatramp_core::project::ProjectRef::new(project_id);
+    // The persisted `reason` is a COARSE category only — the polling client (unauthenticated to the
+    // deploy's internals) never needs the raw compile/store/introspection error, which can carry
+    // internal paths, SQL, or schema detail. The full error is logged server-side for the operator.
+    // 1) Compile-validate: a component that does not compile must never become active.
+    match crate::handler_dispatch::read_blob_bytes(&deploy, component).await {
+        Ok(wasm) => {
+            if let Err(e) = handlers.precompile_component(component, &wasm).await {
+                tracing::warn!(%project_id, %name, %component, error = %e, "async deploy: component failed to compile");
+                return DeployStatus::Failed {
+                    reason: "component failed to compile".to_string(),
+                };
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%project_id, %name, %component, error = %e, "async deploy: could not read component blob");
+            return DeployStatus::Failed {
+                reason: "could not read component blob".to_string(),
+            };
+        }
+    }
+    // 2) The target function (live + the new pending version, or brand-new) — needed both to
+    //    introspect its subgraph SDL and to activate on success. `active` is NOT flipped here.
+    let mut f = match deploy.get_function(project, name).await {
+        Ok(Some(mut existing)) => {
+            existing.config = config;
+            existing.add_version(component, lifecycle, now);
+            existing
+        }
+        Ok(None) => Function::new(
+            name.to_string(),
+            Owner::Project("default".to_string()),
+            component,
+            config,
+            lifecycle,
+            now,
+        ),
+        Err(e) => {
+            tracing::warn!(%project_id, %name, error = %e, "async deploy: could not load function");
+            return DeployStatus::Failed {
+                reason: "could not load function".to_string(),
+            };
+        }
+    };
+    // 3) The same subgraph validation the sync path runs (introspect + compose/stage). A
+    //    non-composing schema fails here — before any activation.
+    if let Err((_, msg)) = maybe_register_subgraph(
+        &deploy, &handlers, project, name, &f, component, register, defer,
+    )
+    .await
+    {
+        tracing::warn!(%project_id, %name, detail = %msg.trim(), "async deploy: subgraph schema did not validate");
+        return DeployStatus::Failed {
+            reason: "subgraph schema did not validate".to_string(),
+        };
+    }
+    // 4) Promote: flip `active` to the now-validated version (a brand-new function is already active
+    //    on it) and persist — the SINGLE point where the served version changes, reached only after
+    //    every validation above passed.
+    let _ = f.rollback(component);
+    if let Err(e) = deploy.put_function(project, &f).await {
+        tracing::warn!(%project_id, %name, %component, error = %e, "async deploy: could not persist activation");
+        return DeployStatus::Failed {
+            reason: "could not persist activation".to_string(),
+        };
+    }
+    DeployStatus::Active
+}
+
+/// `GET /api/functions/{name}/deploys/{version}` (#1b) — poll an async deploy's outcome.
+pub(super) async fn get_deploy_status(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+    Path((name, version)): Path<(String, String)>,
+) -> Response {
+    let key = deploy_status_key(project.as_ref().as_str(), &name, &version);
+    match deploy.kv().get(&key).await {
+        Ok(Some(bytes)) => match serde_json::from_slice::<DeployStatus>(&bytes) {
+            Ok(status) => Json(status).into_response(),
+            Err(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "corrupt deploy status\n").into_response()
+            }
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "no such deploy\n").into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("deploy status read failed: {err}\n"),
+        )
+            .into_response(),
+    }
 }
 
 /// Body of `POST /api/functions/:name/rollback`.
@@ -691,6 +931,7 @@ mod tests {
             &f,
             "component-hash",
             None,
+            false,
         )
         .await
         .expect("an unregistered function deploys freely");
@@ -720,6 +961,7 @@ mod tests {
             &f,
             "component-hash",
             Some(false),
+            false,
         )
         .await
         .expect("opt-out never blocks");
@@ -734,6 +976,7 @@ mod tests {
             &f,
             "component-hash",
             None,
+            false,
         )
         .await
         .expect("a node with no engine skips the refresh, it does not block");
