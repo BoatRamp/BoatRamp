@@ -112,7 +112,10 @@ pub(super) struct DeployFunctionQuery {
     /// deploy never blocks the client/proxy into a `502`, and a component that fails to
     /// compile/compose NEVER serves. Poll `GET /api/functions/{name}/deploys/{version}` for the
     /// outcome. Absent/`true` ⇒ synchronous (back-compat; now fast thanks to #1a/#2/#3/#4).
+    /// Acted on only under the `handlers` feature (the async validate/serve path); still always
+    /// deserialized so the query shape is uniform, hence the no-engine-build dead-code allowance.
     #[serde(default)]
+    #[cfg_attr(not(feature = "handlers"), allow(dead_code))]
     wait: Option<bool>,
 }
 
@@ -444,6 +447,7 @@ async fn maybe_register_subgraph(
 
 /// No wasm engine in this build → no subgraph registry to maintain; the deploy proceeds unchanged.
 #[cfg(not(feature = "handlers"))]
+#[allow(clippy::too_many_arguments)]
 async fn maybe_register_subgraph(
     _deploy: &DeployStore,
     _handlers: &HandlerRuntime,
