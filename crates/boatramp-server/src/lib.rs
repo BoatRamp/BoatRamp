@@ -52,8 +52,8 @@ pub(crate) use admin_api::{
 #[cfg(feature = "handlers")]
 pub(crate) use admin_api::{
     delete_graphql_safelist, delete_graphql_subgraph, get_graphql_supergraph,
-    list_graphql_safelist, put_graphql_function_subgraph, put_graphql_sql_subgraph,
-    put_graphql_subgraph, register_graphql_safelist,
+    list_graphql_safelist, post_graphql_compose, put_graphql_function_subgraph,
+    put_graphql_sql_subgraph, put_graphql_subgraph, register_graphql_safelist,
 };
 /// The server-side controller backing the guest `admin` capability (project self-config).
 #[cfg(feature = "admin")]
@@ -129,7 +129,8 @@ pub(crate) use handler_dispatch::{
 use handler_dispatch::{resolve_env, set_forwarded_headers};
 mod function_api;
 pub(crate) use function_api::{
-    alias_function, deploy_function, list_functions, remove_function, rollback_function,
+    alias_function, deploy_function, get_deploy_status, list_functions, remove_function,
+    rollback_function,
 };
 /// The capability **features** this host build implements — the registry a guest's manifest
 /// `requires` is admission-checked against, re-exported so `boatramp capabilities` reports the
@@ -541,6 +542,25 @@ impl HandlerRuntime {
     #[cfg(feature = "handlers")]
     pub(crate) fn sql_provider(&self) -> Option<Arc<dyn boatramp_core::sql::SqlBackends>> {
         self.inner.as_ref().and_then(|inner| inner.sql.clone())
+    }
+
+    /// Precompile an uploaded **component** blob to warm the compiled-module cache
+    /// (deploy-resilience #1a), so a later deploy-time introspection / first request finds a cache
+    /// hit instead of paying a cold cranelift compile on the critical path. Runs **no guest code**
+    /// (compile + pre-instantiate only) and is best-effort + concurrency-gated (#2). Always
+    /// callable; a no-op when this node has no wasm engine. A component that fails to compile is
+    /// simply not warmed — the deploy that later activates it is the authority that rejects it.
+    pub async fn precompile_component(&self, hash: &str, wasm: &[u8]) -> Result<(), String> {
+        #[cfg(feature = "handlers")]
+        if let Some(inner) = self.inner.as_ref() {
+            return inner
+                .engine
+                .precompile_gated(hash, wasm)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        let _ = (hash, wasm);
+        Ok(())
     }
 
     /// The function invoker, if wired (set at serve startup). Lets the control plane run a

@@ -959,10 +959,12 @@ pub(super) async fn precheck_component(
     // the bug that let a non-consumer pass the gate and then under-deliver
     // silently. `handlers` always compiles in `boatramp-handlers/messaging`, so
     // `precompile_consumer` is always available here.
+    // Through the compile-concurrency gate (#2) so a many-component activation doesn't spike RSS.
     if is_consumer {
         inner
             .engine
-            .precompile_consumer(&entry.hash, &wasm)
+            .precompile_consumer_gated(&entry.hash, &wasm)
+            .await
             .map_err(|err| {
                 let e = err.to_string();
                 translate_link_error(label, &e).unwrap_or_else(|| {
@@ -970,11 +972,15 @@ pub(super) async fn precheck_component(
                 })
             })?;
     } else {
-        inner.engine.precompile(&entry.hash, &wasm).map_err(|err| {
-            let e = err.to_string();
-            translate_link_error(label, &e)
-                .unwrap_or_else(|| format!("{label} failed to compile: {e}"))
-        })?;
+        inner
+            .engine
+            .precompile_gated(&entry.hash, &wasm)
+            .await
+            .map_err(|err| {
+                let e = err.to_string();
+                translate_link_error(label, &e)
+                    .unwrap_or_else(|| format!("{label} failed to compile: {e}"))
+            })?;
     }
     Ok(())
 }
