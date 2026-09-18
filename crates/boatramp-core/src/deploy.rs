@@ -889,7 +889,47 @@ impl DeployStore {
         config: &SiteConfig,
     ) -> Result<(), DeployError> {
         let _claim = self.domain_claim_lock.lock().await;
-        self.set_site_config_locked(project, site, config).await
+        self.set_site_config_locked(project, site, config, false)
+            .await
+    }
+
+    /// [`set_site_config`](Self::set_site_config), but **cooperative** for the runtime-managed
+    /// domain sub-fields (apply-merge-contexts): a whole-config PUT — `apply`, the operator API, or
+    /// the guest `admin` `site-config-put` — preserves imperatively-written `domains.contexts` /
+    /// `domains.aliases` it doesn't mention (union with the stored values; incoming wins on a
+    /// context-key conflict). Everything else is replaced (manifest-authoritative). Removal of a
+    /// context/alias stays explicit via `domain rm` (the non-cooperative [`set_site_config`]).
+    pub async fn set_site_config_cooperative(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        config: &SiteConfig,
+    ) -> Result<(), DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
+        self.set_site_config_locked(project, site, config, true)
+            .await
+    }
+
+    /// Merge the **runtime-managed** domain sub-fields of `old` into `incoming` (apply-merge-
+    /// contexts): `domains.contexts` and `domains.aliases` are merged by union (an incoming context
+    /// key wins on conflict; a stored key/alias the incoming config omits is preserved), while every
+    /// other field of `incoming` — `primary`/`wildcards`/`canonical_redirect` and all non-domain
+    /// config — is kept as-is (manifest-authoritative). Returns the effective config to persist.
+    fn merge_domain_runtime(incoming: &SiteConfig, old: &SiteConfig) -> SiteConfig {
+        let mut merged = incoming.clone();
+        for (host, tag) in &old.domains.contexts {
+            merged
+                .domains
+                .contexts
+                .entry(host.clone())
+                .or_insert_with(|| tag.clone());
+        }
+        for alias in &old.domains.aliases {
+            if !merged.domains.aliases.contains(alias) {
+                merged.domains.aliases.push(alias.clone());
+            }
+        }
+        merged
     }
 
     /// [`set_site_config`](Self::set_site_config) assuming the domain-claim lock
@@ -901,8 +941,24 @@ impl DeployStore {
         project: ProjectRef<'_>,
         site: &str,
         config: &SiteConfig,
+        cooperative: bool,
     ) -> Result<(), DeployError> {
         let owner = DomainOwner::new(project.as_str(), site);
+        // Fetch the current config ONCE — reused for both the cooperative merge and the
+        // stale-domain-key deletes below.
+        let old = self.get_site_config(project, site).await?;
+        // Cooperative merge (apply-merge-contexts): a whole-config PUT — `apply`, the operator
+        // API, or the guest `admin` `site-config-put` — must NOT clobber imperatively-written
+        // runtime domain state it doesn't mention. Union `domains.contexts`/`domains.aliases` with
+        // the stored config (incoming wins on a context-key conflict; entries absent from the
+        // incoming config are preserved). Removal stays explicit via `domain rm`, which writes
+        // through the raw non-cooperative path. Everything else stays manifest-authoritative
+        // (replace). Entry-level writers (domain add/rm, attach) pass `cooperative = false`.
+        let effective: SiteConfig = match (&old, cooperative) {
+            (Some(o), true) => Self::merge_domain_runtime(config, o),
+            _ => config.clone(),
+        };
+        let config = &effective;
         // Refuse any host/wildcard already claimed by another (project, site) before
         // writing anything (the hijack guard). A host this site already owns, or one
         // that is unclaimed, passes.
@@ -921,7 +977,7 @@ impl DeployStore {
         let hash = sha256_hex(&body);
 
         let mut ops = Vec::new();
-        if let Some(old) = self.get_site_config(project, site).await? {
+        if let Some(old) = &old {
             for host in old.domains.exact_hosts() {
                 ops.push(WriteOp::Delete(keys::domain(host)));
             }
@@ -2021,7 +2077,10 @@ impl DeployStore {
                 domains.aliases.push(host);
             }
         }
-        self.set_site_config_locked(project, site.as_str(), &config)
+        // Entry-level write (attach a verified domain): non-cooperative — this path already
+        // read-modified-write the full config, so a merge would be redundant, and it must be able
+        // to reflect the exact `config` it computed.
+        self.set_site_config_locked(project, site.as_str(), &config, false)
             .await?;
         Ok(config)
     }
@@ -3433,6 +3492,72 @@ mod tests {
     use super::*;
     use crate::config::DeployConfig;
     use crate::ObjectMeta;
+
+    #[test]
+    fn merge_domain_runtime_unions_contexts_and_aliases_and_replaces_the_rest() {
+        // apply-merge-contexts: a whole-config PUT preserves runtime `contexts`/`aliases` it omits,
+        // incoming wins on a context-key conflict, and everything else is manifest-authoritative.
+        let mut old = SiteConfig::default();
+        old.domains
+            .contexts
+            .insert("shop.example.com".into(), "ten_A".into());
+        old.domains
+            .contexts
+            .insert("admin.example.com".into(), "ten_B".into());
+        old.domains.aliases.push("www.example.com".into());
+        old.domains.aliases.push("legacy.example.com".into());
+        old.domains.wildcards.push("*.old.example.com".into());
+        old.domains.primary = Some("old-primary.example.com".into());
+
+        let mut incoming = SiteConfig::default();
+        // A conflicting context (incoming must win) + a manifest-declared wildcard/primary/alias.
+        incoming
+            .domains
+            .contexts
+            .insert("shop.example.com".into(), "ten_NEW".into());
+        incoming.domains.aliases.push("www.example.com".into()); // dup → no double
+        incoming.domains.wildcards.push("*.new.example.com".into());
+        incoming.domains.primary = Some("new-primary.example.com".into());
+
+        let merged = DeployStore::merge_domain_runtime(&incoming, &old);
+
+        // contexts: union; incoming wins on `shop`; old-only `admin` preserved.
+        assert_eq!(
+            merged.domains.contexts.get("shop.example.com").unwrap(),
+            "ten_NEW"
+        );
+        assert_eq!(
+            merged.domains.contexts.get("admin.example.com").unwrap(),
+            "ten_B"
+        );
+        // aliases: union, no duplicate `www`, old-only `legacy` preserved.
+        assert!(merged
+            .domains
+            .aliases
+            .contains(&"www.example.com".to_string()));
+        assert!(merged
+            .domains
+            .aliases
+            .contains(&"legacy.example.com".to_string()));
+        assert_eq!(
+            merged
+                .domains
+                .aliases
+                .iter()
+                .filter(|a| *a == "www.example.com")
+                .count(),
+            1
+        );
+        // wildcards + primary: REPLACED by the incoming (manifest-authoritative) — old NOT kept.
+        assert_eq!(
+            merged.domains.wildcards,
+            vec!["*.new.example.com".to_string()]
+        );
+        assert_eq!(
+            merged.domains.primary.as_deref(),
+            Some("new-primary.example.com")
+        );
+    }
 
     fn entry(hash: &str) -> FileEntry {
         FileEntry {

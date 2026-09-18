@@ -367,8 +367,11 @@ impl AdminController for ServerAdminController {
             DomainGuard::Ok => {}
             DomainGuard::Unverified(reason) => return Err(AdminError::NotVerified(reason)),
         }
+        // Cooperative (apply-merge-contexts): preserve `domains.contexts`/`aliases` this PUT
+        // doesn't mention, so a partial guest config write (or an `apply`) can't wipe another
+        // invocation's per-host tenant tags. Removal stays explicit via `domain rm`.
         self.deploy
-            .set_site_config(self.project(), site, &next)
+            .set_site_config_cooperative(self.project(), site, &next)
             .await
             .map_err(deploy_err)?;
         self.audit("site", "config-put", site, "ok");

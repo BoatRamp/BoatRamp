@@ -122,6 +122,11 @@ pub fn router_with_fast(
             put(deploy_function).delete(remove_function),
         )
         .route("/api/functions/{name}/rollback", post(rollback_function))
+        // Poll an async (`?wait=false`) deploy's outcome (deploy-resilience #1b).
+        .route(
+            "/api/functions/{name}/deploys/{version}",
+            get(get_deploy_status),
+        )
         .route("/api/functions/{name}/aliases/{label}", put(alias_function))
         .route(
             "/api/sites/{site}/deployments",
@@ -379,6 +384,9 @@ pub fn router_with_fast(
             "/api/graphql/subgraphs/{name}",
             put(put_graphql_subgraph).delete(delete_graphql_subgraph),
         )
+        // Batch-compose the staged subgraphs (deploy-resilience #3): an apply that deployed with
+        // `?compose=defer` calls this once to validate + promote the whole set in one version bump.
+        .route("/api/graphql/compose", post(post_graphql_compose))
         // Register a SQL-backed federation subgraph: introspect the named site's database,
         // generate its `@key` SDL, and record the SQL backend.
         .route(

@@ -5,7 +5,55 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
-## [0.4.21] - 2026-09-18
+## [0.4.22] - 2026-09-18
+
+Two changes. **Deploy resilience:** a many-function `apply` (e.g. one triggered by a shim bump that
+changes every component hash) no longer times out at the edge — the compile storm, the redundant
+re-introspect/recompose, and the O(N²) supergraph composition are all removed from the deploy hot
+path, and an optional accept-then-validate mode lets a slow-but-valid deploy return immediately —
+**without ever letting an unvalidated component serve**. **Cooperative apply (construens):** a
+declarative `apply` no longer wipes imperatively-written per-host `domains.contexts` / `domains.aliases`.
+Behind a security-review loop (converged to ship after two Medium fixes — an atomic batch promote and a
+stale-hash-skip clear — plus a Cloudflare-KV atomicity follow-up) and a new CI-hard live gate proving,
+over a real engine, that a failed/non-composing deploy never activates nor serves.
+
+### Added
+- **Accept-then-validate async deploy (`?wait=false`).** `deploy_function` can now accept a deploy,
+  append the new version **without** flipping the served `active`, return `202` with a status handle
+  (`GET /api/functions/{name}/deploys/{version}`), and validate (compile → introspect → compose) in the
+  background — flipping `active` **only** on full success (else recording `failed`). The default stays
+  synchronous. A slow-but-valid deploy never trips the edge timeout; an invalid one never serves.
+- **Batch supergraph compose (`?compose=defer` + `POST /api/graphql/compose`).** A deploy can **stage** a
+  subgraph's introspected SDL without composing; a final `compose` validates the whole apply's subgraphs
+  **once** and promotes them atomically with a single version bump — O(N) instead of `publish`'s
+  per-deploy O(N²) recompose. Validate-before-promote: a batch that doesn't compose promotes nothing.
+- **Precompile-at-upload + compile-concurrency cap.** A blob upload best-effort precompiles a wasm
+  **component** off the critical path (no guest code runs), so the deploy-time compile is a cache hit;
+  a new `[handlers] compile_concurrency` knob (default 1) bounds simultaneous cranelift compiles so a
+  bulk apply can't spike RSS on a small host.
+- **Skip re-introspect/compose on an unchanged component hash.** A redeploy of a component whose hash is
+  already the published subgraph SDL skips the `{ _service { sdl } }` introspection + recompose entirely
+  (a re-run of an already-applied deploy is a no-op for the registry).
+
+### Changed
+- **Cooperative `apply` for runtime-managed domain sub-fields.** `put_site_config` (used by `apply`, the
+  operator API, and the guest `admin` `site-config-put`) now **merges** `domains.contexts` (union;
+  incoming wins per host; omitted hosts preserved) and `domains.aliases` (union) with the stored config,
+  while `domains.primary`/`wildcards`/`canonical_redirect` and all non-domain config stay
+  manifest-authoritative (replace). So a declarative `apply` that doesn't mention a host's context/alias
+  leaves it intact; removal stays explicit (`domain rm`). `domain add`/`rm`/attach remain authoritative
+  writers. Resolves the construens `apply`-clobbers-contexts gap (the `domain-source` funnel rollout
+  blocker). No config-format change.
+
+### Fixed
+- **Deploy-time edge timeouts (502s) on a multi-function apply.** Registering N subgraphs in one apply
+  previously did a cold compile + instantiate-and-introspect + whole-supergraph recompose per function,
+  building RSS and slowing each successive one until an edge proxy timed out. The four changes above
+  remove that from the hot path; the server-completes-so-reruns-advance behavior is no longer needed.
+- **Atomic batch promote on every KV backend.** `compose_batch`/`publish` now issue their live-key
+  writes, hash-sidecar update, and version bump as one `write_batch`; the Cloudflare KV backend gained a
+  bulk-endpoint `write_batch` override (it had silently inherited the non-atomic default loop) so a
+  partial write can't leave the live supergraph half-promoted.
 
 The read-side completion of v0.4.20's RLS session GUC: an `all`-scoped READ now drives the tenant
 GUC too, so an app's cross-tenant reads (login memberships, a payments webhook, SSO config) work

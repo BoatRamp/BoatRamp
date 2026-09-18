@@ -505,6 +505,24 @@ jobs:
             || { echo "::error::guest-egress extra-CA gate did not pass (silent skip or failure?)" >&2; exit 1; }
           grep -q 'GUEST-EGRESS EXTRA-CA OK' egress-ca.log \
             || { echo "::error::guest-egress extra-CA never reached its marker (a verification bypass, trust not actually widened, or a skipped test)" >&2; exit 1; }
+      - name: Live deploy-resilience async-deploy + batch-compose invariant on a real libsql engine (v0.4.22)
+        run: |
+          set -eo pipefail
+          # v0.4.22 deploy-resilience #1b/#3: the accept-then-validate async deploy must NEVER flip the
+          # served `active` to a component that failed validation, and the batch compose must
+          # validate-before-promote. Over the REAL wasm engine + REAL libsql: an async deploy of an
+          # uncompilable component returns Failed WITHOUT flipping `active` (the validated version keeps
+          # serving real gateway traffic and the supergraph still composes); a valid async deploy reaches
+          # Active and only THEN flips `active`; a batch of N staged subgraphs composes with exactly ONE
+          # version bump while a non-composing batch promotes nothing. A regression (an unvalidated
+          # component becoming active/serving, or a half-promoted batch) fails the assertion.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            async_deploy_never_activates_or_serves_an_unvalidated_component \
+            -- --ignored --nocapture 2>&1 | tee deployres.log
+          grep -qE 'test result: ok\. 1 passed' deployres.log \
+            || { echo "::error::deploy-resilience async/batch gate did not pass (silent skip or failure?)" >&2; exit 1; }
+          grep -q 'DEPLOY-RESILIENCE ASYNC/BATCH OK' deployres.log \
+            || { echo "::error::deploy-resilience async/batch invariant never reached its marker (an unvalidated component activated or served, a lost old version, or a half-promoted/over-bumped batch)" >&2; exit 1; }
 
   # The SAME Stage 0 tenant-isolation invariant, but on REAL Postgres and MySQL. The ORM emits
   # portable `?N` SQL that the external-SQL backend rewrites to each engine's native placeholder
