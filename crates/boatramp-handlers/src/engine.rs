@@ -575,6 +575,13 @@ pub struct HandlerEngine {
     /// A **separate** concurrency gate for the streaming lane, so a burst of
     /// long-lived streams can't exhaust the sync request pool or the async drain.
     streaming_semaphore: Semaphore,
+    /// Concurrency cap on **compilation** (deploy-resilience #2): bounds how many cranelift
+    /// compiles run at once, so a bulk precompile (e.g. an apply uploading many components, each
+    /// warming the cache via [`precompile_gated`](Self::precompile_gated)) can't spike RSS on a
+    /// small host. Acquired only on the gated precompile path; the on-demand serve-path
+    /// [`proxy_pre`](Self::proxy_pre) is unchanged (traffic-serialized + cached). Default 1
+    /// (fully serialize); raise via [`with_compile_concurrency`](Self::with_compile_concurrency).
+    compile_gate: Semaphore,
     /// Optional ceiling on a guest's **outbound** `wasi:http` call (connect +
     /// time-to-first-byte), independent of the invocation's own timeout, so a
     /// hung upstream is bounded on its own terms. `None` keeps wasmtime's default.
@@ -655,6 +662,9 @@ impl HandlerEngine {
             async_limits: limits,
             streaming_semaphore: Semaphore::new(limits.max_concurrency.max(1)),
             streaming_limits: limits,
+            // Serialize bulk precompiles by default (safest for a memory-bound host); operators with
+            // headroom raise it via `with_compile_concurrency`.
+            compile_gate: Semaphore::new(1),
             outbound_timeout: None,
             allow_private_egress: false,
             self_egress_addrs: Arc::from([] as [SocketAddr; 0]),
@@ -784,6 +794,43 @@ impl HandlerEngine {
     /// warms the compilation cache so the first real request is fast.
     pub fn precompile(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
         self.proxy_pre(hash, wasm).map(|_| ())
+    }
+
+    /// Raise the compilation-concurrency cap (deploy-resilience #2). Default 1 (fully serialize);
+    /// an operator with memory headroom can allow more parallel compiles. Called once at build.
+    #[must_use]
+    pub fn with_compile_concurrency(mut self, n: usize) -> Self {
+        self.compile_gate = Semaphore::new(n.max(1));
+        self
+    }
+
+    /// [`precompile`](Self::precompile) behind the compile-concurrency gate (#2): `await`s a permit
+    /// (yielding the worker while others compile — never blocking the runtime), then runs the
+    /// cranelift compile. Used by the bulk-precompile paths (blob upload, activation precheck) so a
+    /// many-component apply warms the cache without a simultaneous compile spike. Best-effort at the
+    /// call site — a compile failure here is surfaced by the eventual deploy, never silently served.
+    pub async fn precompile_gated(&self, hash: &str, wasm: &[u8]) -> Result<(), HandlerError> {
+        let _permit = self
+            .compile_gate
+            .acquire()
+            .await
+            .expect("compile gate is never closed");
+        self.precompile(hash, wasm)
+    }
+
+    /// [`precompile_consumer`](Self::precompile_consumer) behind the same compile gate (#2).
+    #[cfg(feature = "messaging")]
+    pub async fn precompile_consumer_gated(
+        &self,
+        hash: &str,
+        wasm: &[u8],
+    ) -> Result<(), HandlerError> {
+        let _permit = self
+            .compile_gate
+            .acquire()
+            .await
+            .expect("compile gate is never closed");
+        self.precompile_consumer(hash, wasm)
     }
 
     /// Precompile + validate a component as a **`wasi:messaging` consumer** (it

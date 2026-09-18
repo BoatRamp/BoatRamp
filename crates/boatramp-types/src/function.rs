@@ -410,6 +410,28 @@ impl Function {
         hash
     }
 
+    /// Append a version for `component_hash` WITHOUT activating it (deploy-resilience #1b async
+    /// deploy): the version is stored but `active` (the served pointer) is unchanged, so it cannot
+    /// serve until background validation promotes it with [`rollback`](Self::rollback). Idempotent
+    /// on the version id. Returns the version id.
+    pub fn add_version(
+        &mut self,
+        component_hash: impl Into<String>,
+        lifecycle: Lifecycle,
+        created: u64,
+    ) -> String {
+        let hash = component_hash.into();
+        if !self.versions.iter().any(|v| v.id == hash) {
+            self.versions.push(FunctionVersion {
+                id: hash.clone(),
+                component: hash.clone(),
+                created,
+                lifecycle,
+            });
+        }
+        hash
+    }
+
     /// Point `active` at an existing version id. `Err` if the version is unknown.
     pub fn rollback(&mut self, to: &str) -> Result<(), UnknownVersion> {
         if self.versions.iter().any(|v| v.id == to) {

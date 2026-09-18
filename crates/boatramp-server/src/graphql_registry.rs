@@ -93,6 +93,39 @@ fn backend_key(project: &str, name: &str) -> String {
     format!("{}{name}", backend_prefix(project))
 }
 
+/// The key holding the **component hash** whose introspected SDL is currently published for
+/// subgraph `name` (v0.4.x deploy-resilience #4). Lets a function redeploy of an UNCHANGED
+/// component skip the expensive `{ _service { sdl } }` introspection + recompose — the published
+/// SDL is already current for that hash. Only written by the function-deploy path (a manual/SQL
+/// publish leaves it absent, so the next function deploy re-introspects — never a false skip).
+fn subgraph_hash_key(project: &str, name: &str) -> String {
+    format!("graphql/{project}/subgraph-hash/{name}")
+}
+
+/// The component hash whose SDL is currently published for subgraph `name` (`None` if unknown —
+/// never published from a function deploy, or published from a manual/SQL source). A deploy whose
+/// component hash equals this can skip re-introspection.
+pub(crate) async fn subgraph_hash(kv: &dyn KvStore, project: &str, name: &str) -> Option<String> {
+    match kv.get(&subgraph_hash_key(project, name)).await {
+        Ok(Some(bytes)) => String::from_utf8(bytes).ok(),
+        _ => None,
+    }
+}
+
+/// Record that subgraph `name`'s currently-published SDL was introspected from component `hash`.
+/// Best-effort accounting for the skip-if-unchanged optimization; a write failure just means the
+/// next deploy re-introspects (correct, only slower), so the caller can ignore the error.
+pub(crate) async fn put_subgraph_hash(
+    kv: &dyn KvStore,
+    project: &str,
+    name: &str,
+    hash: &str,
+) -> Result<(), String> {
+    kv.put(&subgraph_hash_key(project, name), hash.as_bytes().to_vec())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The SQL-backed subgraphs of `project`: `name → (site, data config)`. Function subgraphs
 /// (the default) are not included — the gateway routes those to the invoker.
 pub(crate) async fn sql_subgraphs(
@@ -159,6 +192,98 @@ pub(crate) async fn publish(
     Ok(sg)
 }
 
+/// The kv prefix for **staged** (pending) subgraph SDLs — the batch-compose area
+/// (deploy-resilience #3). A deploy with `?compose=defer` writes here WITHOUT composing; a later
+/// `compose_batch` validates the whole set once and promotes them to live in a single version bump.
+fn pending_prefix(project: &str) -> String {
+    format!("graphql/{project}/pending/")
+}
+
+fn pending_key(project: &str, name: &str) -> String {
+    format!("{}{name}", pending_prefix(project))
+}
+
+fn pending_hash_key(project: &str, name: &str) -> String {
+    format!("graphql/{project}/pending-hash/{name}")
+}
+
+/// Stage subgraph `name`'s SDL (introspected from component `hash`) for a batched compose WITHOUT
+/// composing or bumping the version (#3). The live supergraph is untouched until `compose_batch`.
+pub(crate) async fn stage_subgraph(
+    kv: &dyn KvStore,
+    project: &str,
+    name: &str,
+    sdl: &str,
+    hash: &str,
+) -> Result<(), String> {
+    kv.put(&pending_key(project, name), sdl.as_bytes().to_vec())
+        .await
+        .map_err(|e| e.to_string())?;
+    kv.put(&pending_hash_key(project, name), hash.as_bytes().to_vec())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Load the staged (pending) subgraphs as `(name, sdl, hash)`.
+async fn load_pending(kv: &dyn KvStore, project: &str) -> Vec<(String, String, String)> {
+    let prefix = pending_prefix(project);
+    let mut out = Vec::new();
+    for key in kv.list_prefix(&prefix).await.unwrap_or_default() {
+        let name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+        if let Ok(Some(bytes)) = kv.get(&key).await {
+            if let Ok(sdl) = String::from_utf8(bytes) {
+                let hash = match kv.get(&pending_hash_key(project, &name)).await {
+                    Ok(Some(h)) => String::from_utf8(h).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                out.push((name, sdl, hash));
+            }
+        }
+    }
+    out
+}
+
+/// Compose the whole set ONCE — live subgraphs overlaid with everything staged (#3) — validate it,
+/// and only on success **promote** each pending SDL to live (+ its hash sidecar for #4), clear the
+/// pending area, and bump the version a **single** time. On a composition failure NOTHING is
+/// promoted and the live supergraph is untouched (invariant #2). The batch analog of `publish`.
+pub(crate) async fn compose_batch(
+    kv: &dyn KvStore,
+    project: &str,
+) -> Result<Supergraph, PublishError> {
+    let pending = load_pending(kv, project).await;
+    if pending.is_empty() {
+        // Nothing staged — recompose the live set so the caller still gets a validated supergraph.
+        return supergraph(kv, project)
+            .await
+            .map_err(PublishError::Composition);
+    }
+    // Live set with pending overlaid (pending wins on name collision), composed once.
+    let mut set: BTreeMap<String, String> = load_subgraphs(kv, project).await.into_iter().collect();
+    for (name, sdl, _) in &pending {
+        set.insert(name.clone(), sdl.clone());
+    }
+    let subgraphs: Vec<(String, String)> = set.into_iter().collect();
+    let sg = compose(&subgraphs).map_err(PublishError::Composition)?;
+    // Composed OK → promote each pending to live (+ hash), then a single version bump. A mid-promote
+    // store failure returns without bumping, so the (still-current) version keeps serving the old
+    // composed set rather than a half-promoted one.
+    for (name, sdl, hash) in &pending {
+        kv.put(&subgraph_key(project, name), sdl.as_bytes().to_vec())
+            .await
+            .map_err(|e| PublishError::Store(e.to_string()))?;
+        if !hash.is_empty() {
+            let _ = put_subgraph_hash(kv, project, name, hash).await;
+        }
+        let _ = kv.delete(&pending_key(project, name)).await;
+        let _ = kv.delete(&pending_hash_key(project, name)).await;
+    }
+    bump_version(kv, project)
+        .await
+        .map_err(PublishError::Store)?;
+    Ok(sg)
+}
+
 /// The current composed supergraph for `project` (recomposed from the stored subgraphs).
 pub(crate) async fn supergraph(
     kv: &dyn KvStore,
@@ -183,6 +308,11 @@ pub(crate) async fn unpublish(kv: &dyn KvStore, project: &str, name: &str) -> Re
         .await
         .map_err(|e| e.to_string())?;
     kv.delete(&backend_key(project, name))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Clear the deploy-resilience hash sidecar too, so re-registering this subgraph (a function
+    // redeploy of the same component hash) does NOT falsely skip introspection (#4).
+    kv.delete(&subgraph_hash_key(project, name))
         .await
         .map_err(|e| e.to_string())?;
     bump_version(kv, project).await

@@ -79,6 +79,7 @@ pub(super) async fn create_deployment(
 pub(super) async fn put_blob(
     State(deploy): State<DeployStore>,
     Extension(guard): Extension<Arc<UploadGuard>>,
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
     Path(hash): Path<String>,
     headers: HeaderMap,
     body: Body,
@@ -114,9 +115,44 @@ pub(super) async fn put_blob(
     let stream = guard.limit_body(stream);
 
     match deploy.put_blob(&hash, stream).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // #1a (deploy-resilience): warm the compiled-module cache off the critical path, so a
+            // later deploy-time introspection / first request is a cache hit instead of a cold
+            // compile that can blow the client/proxy timeout. Best-effort + concurrency-gated (#2):
+            // read the just-stored blob back, and only if it's a wasm **component** (magic bytes),
+            // precompile it (no guest code runs). A non-component asset, a compile failure, or a
+            // node without an engine is silently skipped — the deploy remains the activation
+            // authority. Spawned so the upload responds immediately.
+            #[cfg(feature = "handlers")]
+            {
+                let handlers = handlers.clone();
+                let deploy = deploy.clone();
+                let hash = hash.clone();
+                tokio::spawn(async move {
+                    match crate::handler_dispatch::read_blob_bytes(&deploy, &hash).await {
+                        Ok(wasm) if is_wasm_component(&wasm) => {
+                            if let Err(e) = handlers.precompile_component(&hash, &wasm).await {
+                                tracing::debug!(hash = %hash, "precompile-at-upload skipped: {e}");
+                            }
+                        }
+                        _ => {} // not a component (or unreadable) — nothing to warm
+                    }
+                });
+            }
+            #[cfg(not(feature = "handlers"))]
+            let _ = &handlers;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => deploy_error_response(err),
     }
+}
+
+/// Whether `bytes` begins with the wasm **component** preamble (`\0asm` + layer byte `0x01`) — a
+/// core module has layer `0x00`, so this precompiles only components (what handlers deploy), never
+/// an uploaded static asset. (deploy-resilience #1a)
+#[cfg(feature = "handlers")]
+fn is_wasm_component(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && bytes[0..4] == [0x00, 0x61, 0x73, 0x6d] && bytes[6] == 0x01
 }
 
 pub(super) async fn activate_deployment(
@@ -331,8 +367,11 @@ pub(super) async fn put_site_config(
         }
         Err(err) => return deploy_error_response(err),
     }
+    // Cooperative (apply-merge-contexts): a whole-config PUT preserves imperatively-written
+    // `domains.contexts`/`aliases` the incoming config doesn't mention — so a declarative `apply`
+    // (which calls this) can't wipe a tenant's runtime host routing. Removal stays via `domain rm`.
     match deploy
-        .set_site_config(project.as_ref(), &site, &config)
+        .set_site_config_cooperative(project.as_ref(), &site, &config)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -423,6 +462,35 @@ pub(super) struct SqlSubgraphRequest {
     site: String,
     #[serde(default)]
     config: boatramp_core::config::HandlerGraphqlDataConfig,
+}
+
+/// `POST /api/projects/{proj}/graphql/compose` — validate + promote the **staged** subgraphs
+/// (deploy-resilience #3) in one composition. An apply that deployed many subgraphs with
+/// `?compose=defer` calls this once at the end: the whole set is composed together, and on success
+/// every staged SDL is promoted to live with a single version bump; on a composition failure
+/// nothing is promoted and the live supergraph is untouched. `System·Admin`.
+#[cfg(feature = "handlers")]
+pub(super) async fn post_graphql_compose(
+    State(deploy): State<DeployStore>,
+    Extension(project): axum::extract::Extension<ProjectContext>,
+) -> Response {
+    let kv = deploy.kv().as_ref();
+    match crate::graphql_registry::compose_batch(kv, &project.0).await {
+        Ok(sg) => {
+            let names = crate::graphql_registry::subgraph_names(kv, &project.0).await;
+            axum::Json(crate::graphql_registry::summary_json(&sg, &names)).into_response()
+        }
+        Err(crate::graphql_registry::PublishError::Composition(e)) => (
+            StatusCode::BAD_REQUEST,
+            format!("staged supergraph does not compose: {e}\n"),
+        )
+            .into_response(),
+        Err(crate::graphql_registry::PublishError::Store(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("registry store error: {e}\n"),
+        )
+            .into_response(),
+    }
 }
 
 /// `PUT /api/projects/{proj}/graphql/subgraphs/{name}/sql` — register a **SQL-backed**
@@ -1864,6 +1932,20 @@ pub(super) struct InvalidateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "handlers")]
+    #[test]
+    fn is_wasm_component_matches_component_not_module_or_asset() {
+        // A component (layer byte 0x01) is precompiled; a core module (layer 0x00) and a non-wasm
+        // asset are skipped, so precompile-at-upload (#1a) never wastes a compile on a static asset.
+        let component = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+        let core_module = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        assert!(is_wasm_component(&component));
+        assert!(!is_wasm_component(&core_module));
+        assert!(!is_wasm_component(b"<!DOCTYPE html>")); // an SPA asset
+        assert!(!is_wasm_component(&[0x00, 0x61, 0x73])); // too short
+        assert!(!is_wasm_component(&[])); // empty
+    }
 
     #[test]
     fn deploy_meta_query_parses_tag_and_tags_json() {
