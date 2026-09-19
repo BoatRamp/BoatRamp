@@ -378,6 +378,11 @@ interface messaging-producer {
   /// the host's limit is rejected whole with `other`. Prefer this over a loop of
   /// `publish` when emitting a burst — it is how a guest reaches high throughput.
   publish-batch: func(messages: list<outgoing>) -> result<_, error>;
+
+  /// Publish `data` to `topic` with a visibility DELAY: durably enqueued now, but
+  /// not deliverable to a consumer until `delay-ms` elapses (scheduled/delayed
+  /// work; delayed retries). `delay-ms == 0` is identical to `publish`.
+  publish-delayed: func(topic: string, data: list<u8>, delay-ms: u64) -> result<_, error>;
 }
 
 /// The consumer half: the host calls `handle` once per delivered message. A
