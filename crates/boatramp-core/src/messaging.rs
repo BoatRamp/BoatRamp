@@ -2453,6 +2453,60 @@ mod tests {
         );
     }
 
+    // A2 fail-all: when the group's durable commit fails, EVERY member publish fails — no partial
+    // success (a publisher never believes it succeeded when its message wasn't committed).
+    #[tokio::test]
+    async fn group_commit_fails_all_members_when_the_commit_fails() {
+        // A KvStore whose commit always fails (the durable-write boundary) — enough to drive
+        // `publish` → `group_commit` → `write_batch` → error.
+        struct FailingKv;
+        #[async_trait]
+        impl KvStore for FailingKv {
+            async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+                Ok(None)
+            }
+            async fn put(&self, _: &str, _: Vec<u8>) -> Result<(), crate::kv::KvError> {
+                Err(crate::kv::KvError::backend("commit failed"))
+            }
+            async fn delete(&self, _: &str) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn list_prefix(&self, _: &str) -> Result<Vec<String>, crate::kv::KvError> {
+                Ok(Vec::new())
+            }
+            async fn write_batch(
+                &self,
+                _: Vec<crate::kv::WriteOp>,
+            ) -> Result<(), crate::kv::KvError> {
+                Err(crate::kv::KvError::backend("commit failed"))
+            }
+        }
+
+        let mq = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            Arc::new(FailingKv),
+        ));
+        // A single publish surfaces the group-commit failure.
+        assert!(
+            mq.publish("t", b"x").await.is_err(),
+            "a failed group commit fails the publish"
+        );
+        // Concurrent publishes ALL fail — fail-all, no partial success.
+        let mut handles = Vec::new();
+        for i in 0..16u32 {
+            let mq = mq.clone();
+            handles.push(tokio::spawn(async move {
+                mq.publish("t", format!("m{i}").as_bytes()).await
+            }));
+        }
+        for h in handles {
+            assert!(
+                h.await.unwrap().is_err(),
+                "every member of a failed group commit fails (fail-all)"
+            );
+        }
+    }
+
     // A3 × DLQ: an inlined message that dead-letters keeps its payload in the record, so redrive
     // redelivers it with its body and purge needs no object-store touch.
     #[tokio::test]
