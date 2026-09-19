@@ -29,7 +29,9 @@ use std::time::Duration;
 use boatramp_core::time::now_unix_ms;
 
 use async_trait::async_trait;
-use boatramp_core::messaging::{self, ClaimedMessage, Messaging, MessagingError, StreamHubs};
+use boatramp_core::messaging::{
+    self, ClaimedMessage, DeadLetter, DeadLetterFilter, Messaging, MessagingError, StreamHubs,
+};
 use boatramp_core::{PutMeta, Storage};
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -380,6 +382,55 @@ impl RaftMessaging {
                     .map(|(g, i)| (g.to_string(), i.to_string()))
             })
             .collect()
+    }
+
+    /// Read every dead-letter on `topic` from this node's applied state as [`DeadLetter`] METADATA
+    /// (no payload) across BOTH lanes, id-ordered — the shared read path behind the selective DLQ
+    /// list/redrive/discard (P1). Payloads are loaded lazily by `show_dead_letter`.
+    async fn collect_dead_letters(&self, topic: &str) -> Vec<DeadLetter> {
+        let mut out = Vec::new();
+        let wq_prefix = messaging::dead_prefix(topic);
+        for key in self.state.list_prefix(&wq_prefix).await {
+            if !messaging::is_direct_child(&key, &wq_prefix) {
+                continue;
+            }
+            let Some(raw) = self.state.get(&key).await else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<messaging::Record>(&raw) else {
+                continue;
+            };
+            out.push(DeadLetter {
+                id: key[wq_prefix.len()..].to_string(),
+                group: String::new(),
+                attempts: record.attempts,
+                last_error: record.last_error,
+                signed_context: record.signed_context,
+                payload: None,
+            });
+        }
+        let gprefix = messaging::gdead_topic_prefix(topic);
+        for key in self.state.list_prefix(&gprefix).await {
+            let Some((group, id)) = messaging::split_group_id(&key[gprefix.len()..]) else {
+                continue;
+            };
+            let Some(raw) = self.state.get(&key).await else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<messaging::Record>(&raw) else {
+                continue;
+            };
+            out.push(DeadLetter {
+                id: id.to_string(),
+                group: group.to_string(),
+                attempts: record.attempts,
+                last_error: record.last_error,
+                signed_context: record.signed_context,
+                payload: None,
+            });
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 }
 
@@ -748,6 +799,173 @@ impl Messaging for RaftMessaging {
         }
         self.propose(WriteOp::Batch(ops)).await?;
         Ok(ids.len() + grouped.len())
+    }
+
+    async fn set_last_error(
+        &self,
+        msg: &ClaimedMessage,
+        reason: &str,
+    ) -> Result<(), MessagingError> {
+        // Grouped last_error capture is a follow-up; the work-queue lane records it today. Replicated
+        // via a deterministic read-modify-write op (the reason is sanitized+bounded here, so every
+        // replica applies identical bytes).
+        if !msg.group.is_empty() {
+            return Ok(());
+        }
+        self.propose(WriteOp::MqSetLastError {
+            topic: msg.topic.clone(),
+            id: msg.id.clone(),
+            reason: messaging::sanitize_reason(reason),
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn list_dead_letters(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<Vec<DeadLetter>, MessagingError> {
+        let now = now_unix_ms();
+        let mut matched: Vec<DeadLetter> = self
+            .collect_dead_letters(topic)
+            .await
+            .into_iter()
+            .filter(|dl| filter.matches(dl, now))
+            .collect();
+        if let Some(limit) = filter.limit {
+            matched.truncate(limit);
+        }
+        Ok(matched)
+    }
+
+    async fn show_dead_letter(
+        &self,
+        topic: &str,
+        group: &str,
+        id: &str,
+    ) -> Result<Option<DeadLetter>, MessagingError> {
+        let key = if group.is_empty() {
+            messaging::dead_key(topic, id)
+        } else {
+            messaging::gdead_key(topic, group, id)
+        };
+        let Some(raw) = self.state.get(&key).await else {
+            return Ok(None);
+        };
+        let record: messaging::Record =
+            serde_json::from_slice(&raw).map_err(|e| MessagingError::Backend(e.to_string()))?;
+        // Payload: inlined bodies ride in the record (A3); otherwise the object-store copy (work-queue
+        // `payload_key`, or the shared grouped `gpayload_key` pinned by this dead-letter). A missing
+        // object yields an empty body rather than failing the inspection.
+        let payload = if let Some(inline) = record.inline.clone() {
+            inline
+        } else if group.is_empty() {
+            self.read_payload(topic, id).await.unwrap_or_default()
+        } else {
+            self.read_gpayload(topic, id).await.unwrap_or_default()
+        };
+        Ok(Some(DeadLetter {
+            id: id.to_string(),
+            group: group.to_string(),
+            attempts: record.attempts,
+            last_error: record.last_error,
+            signed_context: record.signed_context,
+            payload: Some(payload),
+        }))
+    }
+
+    async fn redrive_dead_letters_filtered(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let mut matched: Vec<DeadLetter> = self
+            .collect_dead_letters(topic)
+            .await
+            .into_iter()
+            .filter(|dl| filter.matches(dl, now))
+            .collect();
+        if let Some(limit) = filter.limit {
+            matched.truncate(limit);
+        }
+        if matched.is_empty() {
+            return Ok(0);
+        }
+        // Same re-arm semantics as the whole-DLQ redrive, but only for the matching ids: work-queue =
+        // re-arm the idempotent `MqPublish` (carrying the preserved signed-context + inline payload)
+        // + drop the dead record; grouped = `MqRedriveGroupedDead`. One replicated batch.
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(matched.len() * 2);
+        for dl in &matched {
+            if dl.group.is_empty() {
+                let (signed_context, inline) = self
+                    .state
+                    .get(&messaging::dead_key(topic, &dl.id))
+                    .await
+                    .and_then(|raw| serde_json::from_slice::<messaging::Record>(&raw).ok())
+                    .map(|r| (r.signed_context, r.inline))
+                    .unwrap_or((None, None));
+                ops.push(WriteOp::MqPublish {
+                    topic: topic.to_string(),
+                    id: dl.id.clone(),
+                    retain: false,
+                    signed_context,
+                    inline,
+                });
+                ops.push(WriteOp::Delete {
+                    key: messaging::dead_key(topic, &dl.id),
+                });
+            } else {
+                ops.push(WriteOp::MqRedriveGroupedDead {
+                    topic: topic.to_string(),
+                    group: dl.group.clone(),
+                    id: dl.id.clone(),
+                });
+            }
+        }
+        self.propose(WriteOp::Batch(ops)).await?;
+        Ok(matched.len())
+    }
+
+    async fn discard_dead_letters(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let mut matched: Vec<DeadLetter> = self
+            .collect_dead_letters(topic)
+            .await
+            .into_iter()
+            .filter(|dl| filter.matches(dl, now))
+            .collect();
+        if let Some(limit) = filter.limit {
+            matched.truncate(limit);
+        }
+        if matched.is_empty() {
+            return Ok(0);
+        }
+        // Replicate the dead-record deletes in one batch; then drop the work-queue payloads from
+        // shared storage (grouped payloads stay — un-pinned, the sweep reclaims them once no group
+        // needs them).
+        let mut deletes: Vec<WriteOp> = Vec::with_capacity(matched.len());
+        for dl in &matched {
+            let key = if dl.group.is_empty() {
+                messaging::dead_key(topic, &dl.id)
+            } else {
+                messaging::gdead_key(topic, &dl.group, &dl.id)
+            };
+            deletes.push(WriteOp::Delete { key });
+        }
+        self.propose(WriteOp::Batch(deletes)).await?;
+        for dl in matched.iter().filter(|dl| dl.group.is_empty()) {
+            self.storage
+                .delete(&messaging::payload_key(topic, &dl.id))
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        Ok(matched.len())
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -1212,6 +1430,70 @@ mod tests {
         );
         for m in &bexp {
             mq.ack(m).await.unwrap();
+        }
+        assert_eq!(mq.backlog(topic).await.unwrap(), 0);
+
+        // P1 selective DLQ (both backends): capture a sanitized host last_error, then list/show and
+        // redrive-by-id / discard-by-filter. Two poison messages exhaust to the DLQ; one is annotated.
+        mq.publish(topic, b"poison-x").await.unwrap();
+        mq.publish(topic, b"poison-y").await.unwrap();
+        let d1 = mq.claim(topic, Duration::ZERO, 10, 1).await.unwrap();
+        let px = d1
+            .iter()
+            .find(|m| m.payload == b"poison-x")
+            .unwrap()
+            .clone();
+        mq.set_last_error(&px, "guest-trap: boom").await.unwrap();
+        assert!(mq
+            .claim(topic, Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 2);
+        // list + --match finds only the annotated one; show returns its body + reason.
+        let matched = mq
+            .list_dead_letters(
+                topic,
+                &DeadLetterFilter {
+                    match_last_error: Some("guest-trap".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, px.id);
+        let shown = mq
+            .show_dead_letter(topic, "", &px.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.payload.as_deref(), Some(b"poison-x".as_slice()));
+        assert!(shown.last_error.as_deref().unwrap().contains("guest-trap"));
+        // redrive only poison-x (by id) → DLQ down to 1; then discard the remainder.
+        assert_eq!(
+            mq.redrive_dead_letters_filtered(
+                topic,
+                &DeadLetterFilter {
+                    id: Some(px.id.clone()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 1);
+        assert_eq!(
+            mq.discard_dead_letters(topic, &DeadLetterFilter::default())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 0);
+        // Drain the redriven poison-x so the queue ends empty.
+        for m in mq.claim(topic, LEASE, 10, 5).await.unwrap() {
+            mq.ack(&m).await.unwrap();
         }
         assert_eq!(mq.backlog(topic).await.unwrap(), 0);
     }
