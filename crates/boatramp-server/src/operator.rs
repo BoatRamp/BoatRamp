@@ -379,6 +379,134 @@ pub(super) async fn operator_queue_peek(
     }
 }
 
+/// `GET …/_boatramp/queue/groups` query: list the consumer groups on a topic.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueueGroupsQuery {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct GroupEntry {
+    group: String,
+    hwm: String,
+    in_flight: usize,
+    lag: usize,
+}
+
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct QueueGroupsResponse {
+    version: u32,
+    groups: Vec<GroupEntry>,
+}
+
+/// Operator consumer-group LISTING (`GET …/_boatramp/queue/groups`, read). Site-scoped.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_groups(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<QueueGroupsQuery>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    let Some(messaging) = inner.messaging.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response();
+    };
+    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    match messaging.list_groups(&namespaced).await {
+        Ok(groups) => Json(QueueGroupsResponse {
+            version: DLQ_VIEW_VERSION,
+            groups: groups
+                .into_iter()
+                .map(|g| GroupEntry {
+                    group: g.group,
+                    hwm: g.hwm,
+                    in_flight: g.in_flight,
+                    lag: g.lag,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("group list failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// Which group-lifecycle mutation `POST …/_boatramp/queue/group` runs.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GroupAction {
+    /// Reset the group's cursor (re-consume from earliest / skip to latest) + drop in-flight.
+    Reset,
+    /// Delete the group (state + its dead-letters).
+    Delete,
+}
+
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueueGroupRequest {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+    group: String,
+    action: GroupAction,
+    /// For `reset`: `earliest` (re-consume the backlog) or `latest` (skip to the head). Defaults
+    /// `earliest`. Ignored for `delete`.
+    #[serde(default)]
+    start: Option<boatramp_core::messaging::StartPosition>,
+}
+
+/// Operator consumer-group MUTATION (`POST …/_boatramp/queue/group`, write): reset or delete a group.
+/// Site-scoped so an operator only touches their own site's groups.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_group(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    Json(req): Json<QueueGroupRequest>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    let Some(messaging) = inner.messaging.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response();
+    };
+    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    let result = match req.action {
+        GroupAction::Reset => {
+            let start = req
+                .start
+                .unwrap_or(boatramp_core::messaging::StartPosition::Earliest);
+            messaging.reset_group(&namespaced, &req.group, start).await
+        }
+        GroupAction::Delete => messaging.delete_group(&namespaced, &req.group).await,
+    };
+    match result {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("group operation failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Operator dead-letter MUTATION (`POST …/_boatramp/dlq`, write): purge / redrive / discard, whole
 /// or filter-selective, with a `dry_run` preview. Site-scoped so an operator only touches their own
 /// site's queues.

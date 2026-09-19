@@ -383,6 +383,16 @@ pub struct DlqFilter {
     pub limit: Option<usize>,
 }
 
+/// One consumer group returned by `queue groups`.
+#[derive(Debug, Deserialize)]
+pub struct GroupEntry {
+    pub group: String,
+    #[serde(default)]
+    pub hwm: String,
+    pub in_flight: usize,
+    pub lag: usize,
+}
+
 /// One live message returned by `queue peek` (payload base64).
 #[derive(Debug, Deserialize)]
 pub struct QueuePeekEntry {
@@ -981,6 +991,77 @@ impl ControlPlane {
             .json()
             .await?;
         Ok((resp.affected, resp.matched))
+    }
+
+    /// List a topic's consumer groups (`GET …/_boatramp/queue/groups`).
+    pub async fn list_groups(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+    ) -> Result<Vec<GroupEntry>> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        #[derive(Deserialize)]
+        struct GroupsResponse {
+            #[allow(dead_code)]
+            version: u32,
+            groups: Vec<GroupEntry>,
+        }
+        let mut req = client
+            .get(format!("{server}/api/{seg}/{site}/_boatramp/queue/groups"))
+            .query(&[("topic", topic)]);
+        if let Some(alias) = alias {
+            req = req.query(&[("alias", alias)]);
+        }
+        let resp: GroupsResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.groups)
+    }
+
+    /// Reset or delete a consumer group (`POST …/_boatramp/queue/group`). For `reset`, `start` is
+    /// `"earliest"` or `"latest"`.
+    pub async fn group_op(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+        group: &str,
+        action: &str,
+        start: Option<&str>,
+    ) -> Result<()> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            group: &'a str,
+            action: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            start: Option<&'a str>,
+        }
+        client
+            .post(format!("{server}/api/{seg}/{site}/_boatramp/queue/group"))
+            .json(&Request {
+                topic,
+                alias,
+                group,
+                action,
+                start,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// Peek the head of a topic's LIVE work-queue without consuming (`GET …/_boatramp/queue/peek`).
