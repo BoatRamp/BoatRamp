@@ -229,6 +229,64 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// Record a sanitized HOST reason for the most recent failed delivery of `msg`, so it survives
+    /// into the dead-letter record for `dlq ls/show` and `--match` (P1/SEC6). Called by the
+    /// dispatcher on a failed consume (before the message may later dead-letter). `reason` is a host
+    /// classification (never guest bytes); the backend sanitizes + bounds it via
+    /// [`sanitize_reason`]. A no-op on a message that has since been acked/gone. Default no-op
+    /// (backends without a per-message record).
+    async fn set_last_error(
+        &self,
+        _msg: &ClaimedMessage,
+        _reason: &str,
+    ) -> Result<(), MessagingError> {
+        Ok(())
+    }
+
+    /// **List** the dead-letters on `topic` matching `filter` (P1 `dlq ls`) — metadata only
+    /// (`DeadLetter::payload` is `None`; use [`show_dead_letter`](Self::show_dead_letter) for a body).
+    /// Covers BOTH the work-queue and every consumer group's DLQ, ordered by id. Default empty.
+    async fn list_dead_letters(
+        &self,
+        _topic: &str,
+        _filter: &DeadLetterFilter,
+    ) -> Result<Vec<DeadLetter>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **Show** one dead-letter in full, including its payload (P1 `dlq show <topic> <id>`). `group`
+    /// selects the lane (`""` = work-queue). `None` if no such dead-letter. Default `None`.
+    async fn show_dead_letter(
+        &self,
+        _topic: &str,
+        _group: &str,
+        _id: &str,
+    ) -> Result<Option<DeadLetter>, MessagingError> {
+        Ok(None)
+    }
+
+    /// **Redrive** only the dead-letters matching `filter` (P1 `dlq redrive --id|--older-than|--match
+    /// |--limit`). Same re-arm semantics as [`redrive_dead_letters`](Self::redrive_dead_letters) but
+    /// selective. Returns the number redriven. Default no-op (`0`).
+    async fn redrive_dead_letters_filtered(
+        &self,
+        _topic: &str,
+        _filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// **Discard** only the dead-letters matching `filter` (P1 `dlq discard …`) — delete the records
+    /// (+ work-queue payloads), never re-queuing. The selective analog of
+    /// [`purge_dead_letters`](Self::purge_dead_letters). Returns the number discarded. Default `0`.
+    async fn discard_dead_letters(
+        &self,
+        _topic: &str,
+        _filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
     /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
     /// every consumer group has already consumed (a message below every group's
     /// high-water with none holding it in-flight), with an age-based TTL backstop.
@@ -297,6 +355,14 @@ pub struct Record {
     /// when absent so pre-A3 records stay byte-identical (`#[serde(default)]` + `skip_serializing_if`).
     #[serde(default, with = "inline_b64", skip_serializing_if = "Option::is_none")]
     pub inline: Option<Vec<u8>>,
+    /// **Last failure reason** (P1 selective DLQ, SEC6): a sanitized, host-classified reason for the
+    /// most recent failed delivery (e.g. `guest-error`, `guest-trap`, `timeout`) — never guest-supplied
+    /// bytes and never PII, capped at [`LAST_ERROR_MAX`] chars. Set by the dispatcher via
+    /// [`set_last_error`](Messaging::set_last_error) so it survives into the dead-letter record for
+    /// `dlq ls/show` and `--match` filtering. `None` for a message that never failed, or written by an
+    /// older binary. Elided when absent (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// serde codec for [`Record::inline`]: base64 (not a JSON byte-array) so an inlined payload stays
@@ -367,8 +433,106 @@ impl Record {
             lease_until_ms: 0,
             signed_context,
             inline: None,
+            last_error: None,
         }
     }
+}
+
+/// The most bytes a [`Record::last_error`] may hold (SEC6): a bounded, sanitized host reason — long
+/// enough to be useful, short enough that it can never bloat the durable index or a log line.
+pub const LAST_ERROR_MAX: usize = 256;
+
+/// Sanitize a host failure reason for durable storage as [`Record::last_error`] (SEC6): control
+/// characters (newlines, escapes) become spaces so it can never break a JSON field or a log line,
+/// then it is byte-bounded to [`LAST_ERROR_MAX`]. The dispatcher already passes a HOST classification
+/// (never raw guest bytes); this is the defensive floor.
+pub fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::new();
+    for c in reason.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > LAST_ERROR_MAX {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim().to_string()
+}
+
+/// An inspectable dead-letter (P1 `dlq ls`/`show`). Host-side metadata; `payload` is populated only
+/// by [`show_dead_letter`](Messaging::show_dead_letter) (a listing is metadata-only, so `dlq ls`
+/// never loads bodies). `group` is `""` for a work-queue dead-letter, else the consumer group.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// The message's durable id (time-ordered).
+    pub id: String,
+    /// The consumer group (`""` = the competing-consumer work queue).
+    pub group: String,
+    /// Delivery attempts charged before it dead-lettered.
+    pub attempts: u32,
+    /// The sanitized host reason for the last failed delivery (see [`Record::last_error`]).
+    pub last_error: Option<String>,
+    /// The producer's durable signed-context envelope, if any (carried through the DLQ).
+    pub signed_context: Option<String>,
+    /// The message body — `Some` only from `show_dead_letter`; `None` in a metadata listing.
+    pub payload: Option<Vec<u8>>,
+}
+
+/// An AND-composed filter over a topic's dead-letters (P1 selective DLQ). A dead-letter matches iff
+/// it satisfies EVERY set predicate; an all-`None` filter matches everything (the whole-DLQ op). Used
+/// by [`list_dead_letters`](Messaging::list_dead_letters),
+/// [`redrive_dead_letters_filtered`](Messaging::redrive_dead_letters_filtered), and
+/// [`discard_dead_letters`](Messaging::discard_dead_letters).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeadLetterFilter {
+    /// Exact message id.
+    pub id: Option<String>,
+    /// Restrict to a lane: `Some("")` = work-queue only, `Some(group)` = that group, `None` = all.
+    pub group: Option<String>,
+    /// Only messages published more than this many ms ago (age derived from the time-ordered id — no
+    /// dead-letter timestamp is stored). `--older-than`.
+    pub older_than_ms: Option<u64>,
+    /// Case-sensitive substring match on `last_error` (a dead-letter with no `last_error` never
+    /// matches). `--match`, scoped to the host reason only (never the payload).
+    pub match_last_error: Option<String>,
+    /// Cap the number acted on / listed (applied after ordering by id). `--limit`.
+    pub limit: Option<usize>,
+}
+
+impl DeadLetterFilter {
+    /// Does `dl` satisfy every set predicate? `now_ms` anchors the age test.
+    fn matches(&self, dl: &DeadLetter, now_ms: u64) -> bool {
+        if let Some(id) = &self.id {
+            if &dl.id != id {
+                return false;
+            }
+        }
+        if let Some(group) = &self.group {
+            if &dl.group != group {
+                return false;
+            }
+        }
+        if let Some(older) = self.older_than_ms {
+            match id_age_ms(&dl.id, now_ms) {
+                Some(age) if age >= older => {}
+                _ => return false,
+            }
+        }
+        if let Some(needle) = &self.match_last_error {
+            match &dl.last_error {
+                Some(err) if err.contains(needle.as_str()) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// The age in ms of a message from its time-ordered id (the `{:013}` unix-millis prefix), or `None`
+/// if the prefix doesn't parse (a foreign id shape) — a non-parsing id is never matched by an
+/// age filter (fail-closed: `--older-than` can't accidentally sweep it).
+fn id_age_ms(id: &str, now_ms: u64) -> Option<u64> {
+    let millis: u64 = id.split('-').next()?.parse().ok()?;
+    Some(now_ms.saturating_sub(millis))
 }
 
 /// One transition the [`plan_claim`] decision produces for a single message.
@@ -1082,6 +1246,66 @@ impl LogMessaging {
         Ok(keys.iter().filter(|k| is_direct_child(k, prefix)).count())
     }
 
+    /// Read every dead-letter on `topic` as [`DeadLetter`] METADATA (no payload) across BOTH lanes —
+    /// the work-queue (`mqdead/{topic}/{id}`) and every consumer group (`mqgd/{topic}/{group}/{id}`) —
+    /// ordered by id. The shared read path behind `list`/`redrive_filtered`/`discard` (P1 selective
+    /// DLQ). Payloads are loaded lazily by `show_dead_letter`, so a large DLQ lists cheaply.
+    async fn collect_dead_letters(&self, topic: &str) -> Result<Vec<DeadLetter>, MessagingError> {
+        let mut out = Vec::new();
+        // Work-queue lane.
+        let wq_prefix = dead_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&wq_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &wq_prefix) {
+                continue;
+            }
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            out.push(DeadLetter {
+                id: key[wq_prefix.len()..].to_string(),
+                group: String::new(),
+                attempts: record.attempts,
+                last_error: record.last_error,
+                signed_context: record.signed_context,
+                payload: None,
+            });
+        }
+        // Grouped lanes (every group).
+        let gprefix = gdead_topic_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            let Some((group, id)) = split_group_id(&key[gprefix.len()..]) else {
+                continue;
+            };
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            out.push(DeadLetter {
+                id: id.to_string(),
+                group: group.to_string(),
+                attempts: record.attempts,
+                last_error: record.last_error,
+                signed_context: record.signed_context,
+                payload: None,
+            });
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
     /// The per-topic `logmax` gate marker: the id of the last message published
     /// to a grouped topic (`""` if none yet). Both the backlog gate and a
     /// `latest`-start group's initial high-water read this — one O(1) `get`.
@@ -1448,6 +1672,9 @@ impl Messaging for LogMessaging {
                 signed_context,
                 // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
                 inline: None,
+                // Grouped last_error capture needs a per-in-flight reason (GroupState::InFlight) — a
+                // follow-up; work-queue dead-letters carry it today (that's construens' poison path).
+                last_error: None,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -1816,6 +2043,221 @@ impl Messaging for LogMessaging {
             }
         }
         Ok(redriven)
+    }
+
+    async fn set_last_error(
+        &self,
+        msg: &ClaimedMessage,
+        reason: &str,
+    ) -> Result<(), MessagingError> {
+        // Grouped last_error capture (GroupState::InFlight) is a follow-up; today the work-queue lane
+        // records it (construens' poison path). A grouped call is a safe no-op, never an error.
+        if !msg.group.is_empty() {
+            return Ok(());
+        }
+        let key = meta_key(&msg.topic, &msg.id);
+        let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+            return Ok(()); // acked/gone since the failed delivery — nothing to annotate.
+        };
+        let mut record: Record =
+            serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+        record.last_error = Some(sanitize_reason(reason));
+        let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+        self.kv
+            .put(&key, json)
+            .await
+            .map_err(MessagingError::backend)?;
+        Ok(())
+    }
+
+    async fn list_dead_letters(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<Vec<DeadLetter>, MessagingError> {
+        let now = now_unix_ms();
+        let mut matched: Vec<DeadLetter> = self
+            .collect_dead_letters(topic)
+            .await?
+            .into_iter()
+            .filter(|dl| filter.matches(dl, now))
+            .collect();
+        if let Some(limit) = filter.limit {
+            matched.truncate(limit); // collect_dead_letters ordered by id, so this keeps the earliest.
+        }
+        Ok(matched)
+    }
+
+    async fn show_dead_letter(
+        &self,
+        topic: &str,
+        group: &str,
+        id: &str,
+    ) -> Result<Option<DeadLetter>, MessagingError> {
+        let key = if group.is_empty() {
+            dead_key(topic, id)
+        } else {
+            gdead_key(topic, group, id)
+        };
+        let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+            return Ok(None);
+        };
+        let record: Record =
+            serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+        // Payload: an inlined body rides in the record (A3); otherwise it is object-store retained —
+        // the work-queue copy (`payload_key`) or the shared grouped copy (`gpayload_key`, pinned by
+        // this dead-letter). A missing object yields an empty body rather than failing the inspection.
+        let payload = if let Some(inline) = record.inline.clone() {
+            inline
+        } else if group.is_empty() {
+            self.read_payload(topic, id).await.unwrap_or_default()
+        } else {
+            self.read_gpayload(topic, id).await.unwrap_or_default()
+        };
+        Ok(Some(DeadLetter {
+            id: id.to_string(),
+            group: group.to_string(),
+            attempts: record.attempts,
+            last_error: record.last_error,
+            signed_context: record.signed_context,
+            payload: Some(payload),
+        }))
+    }
+
+    async fn redrive_dead_letters_filtered(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let matched: Vec<DeadLetter> = {
+            let mut m: Vec<DeadLetter> = self
+                .collect_dead_letters(topic)
+                .await?
+                .into_iter()
+                .filter(|dl| filter.matches(dl, now))
+                .collect();
+            if let Some(limit) = filter.limit {
+                m.truncate(limit);
+            }
+            m
+        };
+        let mut redriven = 0;
+        // Work-queue matches: re-arm a fresh `mq/` record from the preserved dead record (attempts +
+        // lease reset, signed-context + inline payload kept), then drop the dead record.
+        for dl in matched.iter().filter(|dl| dl.group.is_empty()) {
+            let dead = dead_key(topic, &dl.id);
+            let Some(raw) = self.kv.get(&dead).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let mut record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            record.attempts = 0;
+            record.lease_until_ms = 0;
+            record.last_error = None; // a fresh life — the prior failure reason no longer applies.
+            let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
+            self.kv
+                .put(&meta_key(topic, &dl.id), json)
+                .await
+                .map_err(MessagingError::backend)?;
+            self.kv
+                .delete(&dead)
+                .await
+                .map_err(MessagingError::backend)?;
+            redriven += 1;
+        }
+        // Grouped matches: re-arm each id in its group's in-flight (fresh attempts, claimable now) and
+        // drop the dead record — the retained payload stays pinned until then. One `claim_lock` turn.
+        let grouped: Vec<&DeadLetter> = matched.iter().filter(|dl| !dl.group.is_empty()).collect();
+        if !grouped.is_empty() {
+            let _guard = self.claim_lock.lock().await;
+            for dl in grouped {
+                let dead = gdead_key(topic, &dl.group, &dl.id);
+                if self
+                    .kv
+                    .get(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?
+                    .is_none()
+                {
+                    continue;
+                }
+                let mut state = match self.get_group_state(topic, &dl.group).await? {
+                    Some(state) => state,
+                    None => {
+                        self.mark_grouped(topic);
+                        GroupState::new(self.read_logmax(topic).await?)
+                    }
+                };
+                if !state.in_flight.iter().any(|f| f.id == dl.id) {
+                    state.in_flight.push(InFlight {
+                        id: dl.id.clone(),
+                        attempts: 0,
+                        lease_until_ms: 0,
+                    });
+                }
+                self.put_group_state(topic, &dl.group, &state).await?;
+                self.kv
+                    .delete(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?;
+                redriven += 1;
+            }
+        }
+        Ok(redriven)
+    }
+
+    async fn discard_dead_letters(
+        &self,
+        topic: &str,
+        filter: &DeadLetterFilter,
+    ) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let matched: Vec<DeadLetter> = {
+            let mut m: Vec<DeadLetter> = self
+                .collect_dead_letters(topic)
+                .await?
+                .into_iter()
+                .filter(|dl| filter.matches(dl, now))
+                .collect();
+            if let Some(limit) = filter.limit {
+                m.truncate(limit);
+            }
+            m
+        };
+        let mut discarded = 0;
+        for dl in &matched {
+            if dl.group.is_empty() {
+                // Work-queue: drop the object-store payload (unless inlined) then the record.
+                let dead = dead_key(topic, &dl.id);
+                let inline = self
+                    .kv
+                    .get(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?
+                    .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+                    .is_some_and(|r| r.inline.is_some());
+                if !inline {
+                    self.storage
+                        .delete(&payload_key(topic, &dl.id))
+                        .await
+                        .map_err(MessagingError::backend)?;
+                }
+                self.kv
+                    .delete(&dead)
+                    .await
+                    .map_err(MessagingError::backend)?;
+            } else {
+                // Grouped: drop the dead record; the shared retained payload un-pins and the sweep
+                // reclaims it once no group needs it (another group may still consume this message).
+                self.kv
+                    .delete(&gdead_key(topic, &dl.group, &dl.id))
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
+            discarded += 1;
+        }
+        Ok(discarded)
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -2904,6 +3346,147 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].payload, b"x");
         assert_eq!(again[0].attempts, 1, "fresh attempts after redrive");
+    }
+
+    // P1 selective DLQ: last_error capture (sanitized), list/show, and redrive/discard by an
+    // AND-composed filter (--id / --match / --limit), work-queue lane.
+    #[tokio::test]
+    async fn selective_dlq_list_show_redrive_discard_by_filter() {
+        let mq = mq();
+        for p in [b"aaa".as_slice(), b"bbb", b"ccc"] {
+            mq.publish("t", p).await.unwrap();
+        }
+        // Deliver once (attempt 1, max_attempts=1), annotate "bbb" with a host failure reason that
+        // includes control characters (must be sanitized), then the next claim dead-letters all three.
+        let first = mq.claim("t", Duration::ZERO, 10, 1).await.unwrap();
+        let bbb = first.iter().find(|m| m.payload == b"bbb").unwrap().clone();
+        mq.set_last_error(&bbb, "guest-trap:\n injected\u{7} reason")
+            .await
+            .unwrap();
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 3);
+
+        // list: metadata only (no payloads); "bbb" carries the SANITIZED reason (control chars gone).
+        let all = mq
+            .list_dead_letters("t", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|d| d.payload.is_none()));
+        let bbb_dl = all.iter().find(|d| d.id == bbb.id).unwrap();
+        let err = bbb_dl.last_error.as_deref().unwrap();
+        assert!(err.contains("guest-trap"));
+        assert!(
+            !err.contains('\n') && !err.contains('\u{7}'),
+            "control characters are sanitized out of last_error"
+        );
+
+        // --match (substring on last_error) → only bbb.
+        let matched = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    match_last_error: Some("guest-trap".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, bbb.id);
+
+        // --limit caps the (id-ordered) result.
+        let limited = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 2);
+
+        // show returns the full body + reason.
+        let shown = mq
+            .show_dead_letter("t", "", &bbb.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.payload.as_deref(), Some(b"bbb".as_slice()));
+        assert!(shown.last_error.as_deref().unwrap().contains("guest-trap"));
+
+        // redrive ONLY bbb (by id) → back on the live queue with a fresh life; DLQ now 2.
+        let n = mq
+            .redrive_dead_letters_filtered(
+                "t",
+                &DeadLetterFilter {
+                    id: Some(bbb.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 2);
+        let back = mq.claim("t", LEASE, 10, 5).await.unwrap();
+        let revived = back.iter().find(|m| m.payload == b"bbb").unwrap();
+        assert_eq!(revived.attempts, 1, "redrive resets attempts");
+
+        // discard the remaining two (all-match filter) → DLQ empty.
+        let d = mq
+            .discard_dead_letters("t", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(d, 2);
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 0);
+    }
+
+    // P1 selective DLQ: --older-than filters by the message's own age (derived from its time-ordered
+    // id), and a foreign/unparseable id is never swept by an age filter (fail-closed).
+    #[tokio::test]
+    async fn selective_dlq_older_than_uses_id_age() {
+        let mq = mq();
+        mq.publish("t", b"recent").await.unwrap();
+        assert_eq!(mq.claim("t", Duration::ZERO, 10, 1).await.unwrap().len(), 1);
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+        // The message was published moments ago, so a 1-hour `older_than` matches nothing…
+        let none = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    older_than_ms: Some(3_600_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            none.is_empty(),
+            "a just-published dead-letter isn't 'older than' 1h"
+        );
+        // …but `older_than: 0` matches it (age >= 0).
+        let any = mq
+            .list_dead_letters(
+                "t",
+                &DeadLetterFilter {
+                    older_than_ms: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(any.len(), 1);
     }
 
     /// The "survives restart" guarantee: queue state
