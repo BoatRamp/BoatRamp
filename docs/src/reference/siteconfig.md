@@ -92,6 +92,7 @@ entirely.
 | `graphql` | HandlerGraphqlConfig? | `None` (off) | [GraphQL edge features](#handlersgraphql). |
 | `cookie_auth` | CookieAuthConfig? | `None` (off) | [Browser cookie session auth](#handlerscookie_auth). |
 | `tenancy` | Tenancy? | `None` (undeclared) | Site-level in-site [tenancy decision](#handlerstenancy) for `sql`/`orm` access — the ceiling for this site's handlers. |
+| `allow_ceiling_exceptions` | bool | `false` | Whether a route may deliberately **exceed** this site's `tenancy` ceiling via [`exceed_site_ceiling`](../how-to/tenant-isolation.md#an-unscoped-all-route-under-an-own-site-authorized-exception) (key 1 of the three-key model). While `false`, every route's exception token is inert (a widening still fails closed) — so a site at the default is provably exception-free. Enabling it authorizes nothing by itself: a route must also carry `exceed_site_ceiling: true`, and an `all` grant still needs the operator [`allow_cross_tenant_db`](../how-to/tenant-isolation.md#dimension-2-the-access-mode-per-readwrite-axis) posture. |
 
 A handler that requests an import not in `allow_imports`, or exceeds a cap, is
 rejected at activation — not at request time. See
