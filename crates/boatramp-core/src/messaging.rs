@@ -146,6 +146,21 @@ pub trait Messaging: Send + Sync {
         self.publish_ctx(topic, payload, signed_context).await
     }
 
+    /// Publish with a **TTL** (P2 delivery modes): an un-delivered message is dead-lettered (reason
+    /// `ttl-expired`) once `ttl` elapses, instead of being delivered — for time-sensitive work that
+    /// is worthless if stale. `ttl == 0` ⇒ no expiry (identical to [`publish_ctx`](Self::publish_ctx)).
+    /// The default drops the TTL and delegates; the durable backends honor it via the record's
+    /// `expires_at_ms`, enforced in [`plan_claim`].
+    async fn publish_with_ttl_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _ttl: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, signed_context).await
+    }
+
     /// Atomically claim up to `max_batch` deliverable messages from `topic`,
     /// leasing each for `lease` (after which an un-acked message is redelivered).
     /// A message that has already been delivered `max_attempts` times is moved to
@@ -433,6 +448,17 @@ pub struct Record {
     /// older binary. Elided when absent (`skip_serializing_if`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// **Message expiry** (P2 delivery-mode TTL): absolute unix-ms after which an un-delivered message
+    /// is dead-lettered (reason `ttl-expired`) instead of leased — set from a publish-time TTL. `0` =
+    /// no expiry. Checked in [`plan_claim`] after the lease skip, so a leased message is (re)checked on
+    /// its next claim. Elided when `0` (`skip_serializing_if`) so pre-TTL records stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub expires_at_ms: u64,
+}
+
+/// serde `skip_serializing_if` for a `u64` that is elided when `0` (keeps pre-TTL records byte-identical).
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// serde codec for [`Record::inline`]: base64 (not a JSON byte-array) so an inlined payload stays
@@ -504,6 +530,7 @@ impl Record {
             signed_context,
             inline: None,
             last_error: None,
+            expires_at_ms: 0,
         }
     }
 }
@@ -685,6 +712,14 @@ pub fn plan_claim(
         }
         if record.lease_until_ms > now_ms {
             continue; // still leased to someone else
+        }
+        // TTL (P2 delivery modes): an expired, un-delivered message is dead-lettered (reason
+        // `ttl-expired`) rather than delivered — visible/redrivable like any dead-letter. Checked
+        // after the lease skip, so a currently-leased message is re-checked on its next claim.
+        if record.expires_at_ms != 0 && record.expires_at_ms <= now_ms {
+            record.last_error = Some("ttl-expired".to_string());
+            actions.push(ClaimAction::DeadLetter { id, record });
+            continue;
         }
         if record.attempts >= max_attempts {
             actions.push(ClaimAction::DeadLetter { id, record });
@@ -1218,6 +1253,7 @@ impl LogMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
         not_before_ms: u64,
+        expires_at_ms: u64,
     ) -> Result<(String, Vec<WriteOp>), MessagingError> {
         let id = format!(
             "{:013}-{:016x}",
@@ -1261,6 +1297,8 @@ impl LogMessaging {
         // Delivery-mode delay (P2): a not-before in the future rides the lease field — attempts stay 0,
         // so a claim before then skips it (leased) and after then delivers it as the first attempt.
         record.lease_until_ms = not_before_ms;
+        // Delivery-mode TTL (P2): 0 = no expiry; else the absolute time after which claim dead-letters it.
+        record.expires_at_ms = expires_at_ms;
         if inline {
             record.inline = Some(payload.to_vec());
         }
@@ -1600,7 +1638,7 @@ impl Messaging for LogMessaging {
         // them in one durable group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3-inline / SA1-budget / grouped-retain decisions and coalesces N messages into one commit.
         let (id, ops) = self
-            .build_publish_ops(topic, payload, signed_context, 0)
+            .build_publish_ops(topic, payload, signed_context, 0, 0)
             .await?;
         // Group-commit (A2): concurrent publishes coalesce their index writes into one durable
         // `write_batch`. Returns only after this message's group is durably committed
@@ -1627,10 +1665,32 @@ impl Messaging for LogMessaging {
             now_unix_ms().saturating_add(delay.as_millis() as u64)
         };
         let (id, ops) = self
-            .build_publish_ops(topic, payload, signed_context, not_before_ms)
+            .build_publish_ops(topic, payload, signed_context, not_before_ms, 0)
             .await?;
         self.group_commit(ops).await?;
         // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_with_ttl_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        ttl: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Delivery-mode TTL (P2): expires_at = now + ttl (0 ⇒ no expiry). The message is durably
+        // committed now; a claim after expiry dead-letters it (reason ttl-expired) instead of delivering.
+        let expires_at_ms = if ttl.is_zero() {
+            0
+        } else {
+            now_unix_ms().saturating_add(ttl.as_millis() as u64)
+        };
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms)
+            .await?;
+        self.group_commit(ops).await?;
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -1652,7 +1712,7 @@ impl Messaging for LogMessaging {
         let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
         for (topic, payload) in messages {
             let (id, ops) = self
-                .build_publish_ops(topic, payload, signed_context, 0)
+                .build_publish_ops(topic, payload, signed_context, 0, 0)
                 .await?;
             all_ops.extend(ops);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
@@ -1817,6 +1877,8 @@ impl Messaging for LogMessaging {
                 // Grouped last_error capture needs a per-in-flight reason (GroupState::InFlight) — a
                 // follow-up; work-queue dead-letters carry it today (that's construens' poison path).
                 last_error: None,
+                // A dead-letter is terminal — no further expiry.
+                expires_at_ms: 0,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -3111,6 +3173,37 @@ mod tests {
             "delayed one deferred"
         );
         assert_eq!(ready[0].attempts, 1);
+    }
+
+    // P2 delivery-mode TTL: plan_claim dead-letters an expired (past-`expires_at`) undelivered message
+    // with reason `ttl-expired`, instead of leasing it; a live one leases normally. Pure + deterministic
+    // (plan_claim takes `now_ms`), so no clock/sleep needed.
+    #[test]
+    fn plan_claim_dead_letters_an_expired_message() {
+        let expired = Record {
+            expires_at_ms: 100, // expired at t=100
+            ..Record::fresh(None)
+        };
+        let live = Record::fresh(None); // no expiry
+        let actions = plan_claim(
+            vec![
+                ("0000000000100-a".to_string(), expired),
+                ("0000000000200-b".to_string(), live),
+            ],
+            1_000, // now = 1000 > 100 ⇒ the first is expired
+            30_000,
+            10,
+            5,
+        );
+        assert!(
+            matches!(&actions[0], ClaimAction::DeadLetter { record, .. }
+                if record.last_error.as_deref() == Some("ttl-expired")),
+            "the expired message dead-letters with the ttl-expired reason"
+        );
+        assert!(
+            matches!(&actions[1], ClaimAction::Lease { .. }),
+            "the live message leases normally"
+        );
     }
 
     #[tokio::test]

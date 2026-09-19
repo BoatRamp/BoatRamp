@@ -238,6 +238,7 @@ impl RaftMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
         not_before_ms: u64,
+        expires_at_ms: u64,
     ) -> Result<(String, WriteOp), MessagingError> {
         let id = self.next_id();
         let retain = self.topic_has_groups(topic).await;
@@ -296,6 +297,7 @@ impl RaftMessaging {
                 signed_context: signed_context.map(str::to_owned),
                 inline: inline.then(|| payload.to_vec()),
                 not_before_ms,
+                expires_at_ms,
             },
         ))
     }
@@ -453,7 +455,7 @@ impl Messaging for RaftMessaging {
         // then commit it in one group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3/SA1/retain decisions and coalesces N messages into one Raft entry.
         let (id, op) = self
-            .build_publish_op(topic, payload, signed_context, 0)
+            .build_publish_op(topic, payload, signed_context, 0, 0)
             .await?;
         // Group-commit (A2): coalesce this MqPublish with other concurrent ones into a single
         // WriteOp::Batch proposal (one Raft round-trip per group). Returns only after the group is
@@ -480,7 +482,29 @@ impl Messaging for RaftMessaging {
             now_unix_ms().saturating_add(delay.as_millis() as u64)
         };
         let (id, op) = self
-            .build_publish_op(topic, payload, signed_context, not_before_ms)
+            .build_publish_op(topic, payload, signed_context, not_before_ms, 0)
+            .await?;
+        self.group_commit(vec![op]).await?;
+        self.bus.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_with_ttl_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        ttl: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Delivery-mode TTL (P2): the issuing node stamps the absolute expires-at (deterministic).
+        // 0 ⇒ no expiry. A claim after expiry dead-letters it (ttl-expired) instead of delivering.
+        let expires_at_ms = if ttl.is_zero() {
+            0
+        } else {
+            now_unix_ms().saturating_add(ttl.as_millis() as u64)
+        };
+        let (id, op) = self
+            .build_publish_op(topic, payload, signed_context, 0, expires_at_ms)
             .await?;
         self.group_commit(vec![op]).await?;
         self.bus.broadcast(topic, &id, payload);
@@ -503,7 +527,7 @@ impl Messaging for RaftMessaging {
         let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
         for (topic, payload) in messages {
             let (id, op) = self
-                .build_publish_op(topic, payload, signed_context, 0)
+                .build_publish_op(topic, payload, signed_context, 0, 0)
                 .await?;
             ops.push(op);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
@@ -820,6 +844,7 @@ impl Messaging for RaftMessaging {
                 signed_context,
                 inline,
                 not_before_ms: 0, // redrive re-arms immediately claimable
+                expires_at_ms: 0, // and clears any TTL (an operator redrive is a deliberate retry)
             });
             ops.push(WriteOp::Delete {
                 key: messaging::dead_key(topic, id),
@@ -948,6 +973,7 @@ impl Messaging for RaftMessaging {
                     signed_context,
                     inline,
                     not_before_ms: 0, // redrive re-arms immediately claimable
+                    expires_at_ms: 0, // and clears any TTL (an operator redrive is a deliberate retry)
                 });
                 ops.push(WriteOp::Delete {
                     key: messaging::dead_key(topic, &dl.id),
@@ -1733,6 +1759,50 @@ mod tests {
             "delayed delivery is still the first attempt"
         );
         mq.ack(&soon[0]).await.unwrap();
+
+        // --- P2 delivery modes: TTL (both backends) --------------------------------------------
+        // A short-TTL message not consumed in time is dead-lettered (ttl-expired), not delivered; a
+        // companion with no TTL is delivered normally.
+        mq.publish_with_ttl_ctx(topic, b"perishable", Duration::from_millis(100), None)
+            .await
+            .unwrap();
+        mq.publish_with_ttl_ctx(topic, b"keeps", Duration::ZERO, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let after_ttl = mq.claim(topic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            after_ttl
+                .iter()
+                .map(|m| m.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![b"keeps".to_vec()],
+            "the expired message is not delivered; the no-TTL one is"
+        );
+        mq.ack(&after_ttl[0]).await.unwrap();
+        assert_eq!(
+            mq.dead_letter_count(topic).await.unwrap(),
+            1,
+            "the expired message was dead-lettered"
+        );
+        let dl = mq
+            .list_dead_letters(
+                topic,
+                &boatramp_core::messaging::DeadLetterFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dl.len(), 1);
+        assert_eq!(
+            dl[0].last_error.as_deref(),
+            Some("ttl-expired"),
+            "the dead-letter records why it expired"
+        );
+        assert_eq!(
+            mq.purge_dead_letters(topic).await.unwrap(),
+            1,
+            "purge clears the ttl dead-letter"
+        );
     }
 
     /// Conformance — **single-node** coordinator (`core::messaging::LogMessaging`).
