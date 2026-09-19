@@ -647,6 +647,27 @@ jobs:
           key: test-cluster-musl
       - name: Test (raft + http)
         run: cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-cluster --features raft,http
+      # Phase-1 messaging poison-pill/DLQ matrix HARD GATE. The four conformance batteries cover the
+      # full matrix — work-queue × grouped(fan-out) × single-node × cluster — each publishing a poison
+      # message, exhausting max_attempts, and asserting dead_letters==N with exact redrive/purge. They
+      # run in the lane above, but a silent skip (a rename, an accidental `#[ignore]`) reports `ok`, so
+      # this re-runs the `conformance` subset with `--nocapture` and asserts all four success markers +
+      # the exact pass count — a regression of the grouped-DLQ P0 fix (or a skipped cell) fails the merge.
+      - name: Messaging poison-pill/DLQ matrix markers
+        run: |
+          set -eo pipefail
+          cargo-zigbuild test --target x86_64-unknown-linux-musl -p boatramp-cluster \
+            --features raft,http conformance -- --nocapture 2>&1 | tee messaging-dlq.log
+          grep -qE 'test result: ok\. 4 passed' messaging-dlq.log \
+            || { echo "::error::messaging conformance did not run all 4 DLQ-matrix cells (silent skip or failure?)" >&2; exit 1; }
+          for m in \
+            'MESSAGING WQ DLQ MATRIX OK [single-node]' \
+            'MESSAGING WQ DLQ MATRIX OK [cluster]' \
+            'MESSAGING GROUPED DLQ MATRIX OK [single-node]' \
+            'MESSAGING GROUPED DLQ MATRIX OK [cluster]'; do
+            grep -qF "$m" messaging-dlq.log \
+              || { echo "::error::missing poison-pill/DLQ matrix marker: $m (a DLQ regression or a skipped cell)" >&2; exit 1; }
+          done
 
   deny:
     name: cargo-deny

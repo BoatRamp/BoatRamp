@@ -1223,6 +1223,8 @@ mod tests {
         use boatramp_core::messaging::LogMessaging;
         let mq = LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
         assert_conformance(&mq, "conformance/topic").await;
+        // CI-hard poison-pill/DLQ matrix marker (see ci.yml `test-messaging-dlq`).
+        println!("MESSAGING WQ DLQ MATRIX OK [single-node]");
     }
 
     /// Conformance — **cluster** coordinator (`RaftMessaging`). Run on the leader
@@ -1235,6 +1237,7 @@ mod tests {
         let leader = rafts[&1].metrics().borrow().current_leader.unwrap();
         assert_conformance(mqs[&leader].as_ref(), "conformance/topic").await;
         shutdown(rafts).await;
+        println!("MESSAGING WQ DLQ MATRIX OK [cluster]");
     }
 
     fn payloads(msgs: &[ClaimedMessage]) -> Vec<Vec<u8>> {
@@ -1454,6 +1457,8 @@ mod tests {
         use boatramp_core::messaging::LogMessaging;
         let mq = LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()));
         assert_grouped_conformance(&mq, "bus/grouped").await;
+        // The P0 fix: grouped/fan-out dead-letters are visible/redrivable/purgeable single-node.
+        println!("MESSAGING GROUPED DLQ MATRIX OK [single-node]");
     }
 
     /// Grouped conformance — **cluster** (`RaftMessaging`), on the leader. The
@@ -1466,6 +1471,8 @@ mod tests {
         let leader = rafts[&1].metrics().borrow().current_leader.unwrap();
         assert_grouped_conformance(mqs[&leader].as_ref(), "bus/grouped").await;
         shutdown(rafts).await;
+        // The P0 fix proven at cluster parity (deterministic Raft apply can't touch object storage).
+        println!("MESSAGING GROUPED DLQ MATRIX OK [cluster]");
     }
 
     /// **Grouped no-double-delivery across nodes.** A group registered cluster-wide
