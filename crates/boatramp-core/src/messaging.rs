@@ -344,6 +344,21 @@ pub trait Messaging: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// **Replay** a grouped `topic`'s retained history from `after` (exclusive; `None` = the start),
+    /// up to `limit`, WITHOUT consuming or touching any group's cursor (P2 durable replay). The
+    /// read-from-offset companion to [`subscribe`](Self::subscribe) (live tail) and
+    /// [`reset_group`](Self::reset_group) (a group re-consuming): re-read history for debugging or to
+    /// rebuild state, without disturbing live consumers. Only GROUPED topics retain history — the
+    /// work-queue deletes on ack (use [`peek`](Self::peek) there). Ordered by id. Default empty.
+    async fn replay(
+        &self,
+        _topic: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<PeekedMessage>, MessagingError> {
+        Ok(Vec::new())
+    }
+
     /// **List** the consumer groups registered on a grouped `topic` (P2 `queue groups`) with each
     /// group's cursor + health (hwm, in-flight, lag). Read-only. Default empty (no groups).
     async fn list_groups(&self, _topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
@@ -2549,6 +2564,53 @@ impl Messaging for LogMessaging {
                 attempts: record.attempts,
                 leased: record.lease_until_ms > now,
                 signed_context: record.signed_context,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn replay(
+        &self,
+        topic: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PeekedMessage>, MessagingError> {
+        // Read the retained grouped-fan-out log (existence markers under `mqglog/{topic}/`), not the
+        // work-queue index — a grouped topic keeps its history until the retention sweep, independent
+        // of any group's cursor. Purely non-destructive: no lease, no attempt charge, no cursor touch,
+        // so a live tail (`subscribe`) and every group's drain are undisturbed.
+        let prefix = glog_prefix(topic);
+        let mut ids: Vec<String> = self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| is_direct_child(k, &prefix))
+            .map(|k| k[prefix.len()..].to_string())
+            .collect();
+        ids.sort(); // ids are time-ordered ⇒ publish order.
+        let mut out = Vec::new();
+        for id in ids {
+            // `after` is exclusive — skip everything at or before the caller's last-seen offset.
+            if let Some(after) = after {
+                if id.as_str() <= after {
+                    continue;
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+            // The retained fan-out payload (a missing object yields an empty body rather than failing
+            // the replay); context re-read from the shared index record, best-effort.
+            let payload = self.read_gpayload(topic, &id).await.unwrap_or_default();
+            let signed_context = self.read_ctx(topic, &id).await;
+            out.push(PeekedMessage {
+                id,
+                attempts: 0,   // history entries carry no per-group delivery count.
+                leased: false, // replay never leases.
+                signed_context,
                 payload,
             });
         }

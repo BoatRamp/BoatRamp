@@ -1089,6 +1089,56 @@ impl Messaging for RaftMessaging {
         Ok(out)
     }
 
+    async fn replay(
+        &self,
+        topic: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<boatramp_core::messaging::PeekedMessage>, MessagingError> {
+        // Read the retained grouped-fan-out log from applied state (existence markers under
+        // `mqglog/{topic}/`). Purely non-destructive: no proposal, no lease, no cursor touch — a live
+        // tail and every group's drain are undisturbed. Symmetric to the single-node backend.
+        let prefix = messaging::glog_prefix(topic);
+        let mut ids: Vec<String> = self
+            .state
+            .list_prefix(&prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &prefix))
+            .map(|k| k[prefix.len()..].to_string())
+            .collect();
+        ids.sort(); // ids are time-ordered ⇒ publish order.
+        let mut out = Vec::new();
+        for id in ids {
+            // `after` is exclusive — skip everything at or before the caller's last-seen offset.
+            if let Some(after) = after {
+                if id.as_str() <= after {
+                    continue;
+                }
+            }
+            if out.len() >= limit {
+                break;
+            }
+            // Retained fan-out payload (a missing object yields an empty body rather than failing the
+            // replay); context re-read best-effort from the shared index record.
+            let payload = self.read_gpayload(topic, &id).await.unwrap_or_default();
+            let signed_context = self
+                .state
+                .get(&messaging::meta_key(topic, &id))
+                .await
+                .and_then(|raw| serde_json::from_slice::<messaging::Record>(&raw).ok())
+                .and_then(|r| r.signed_context);
+            out.push(boatramp_core::messaging::PeekedMessage {
+                id,
+                attempts: 0,   // history entries carry no per-group delivery count.
+                leased: false, // replay never leases.
+                signed_context,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
     async fn list_groups(&self, topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
         let gprefix = messaging::gstate_prefix(topic);
         let log_prefix = messaging::glog_prefix(topic);
@@ -2160,6 +2210,61 @@ mod tests {
             2,
             "the retained backlog survived a sibling group's deletion"
         );
+
+        // --- P2 durable replay: read retained grouped history from an offset, non-destructively -----
+        let rp = format!("{base}/replay");
+        // Register a group so the topic retains its fan-out log, then publish a backlog.
+        assert!(mq
+            .claim_grouped(&rp, "reader", StartPosition::Latest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(&rp, b"R1").await.unwrap();
+        mq.publish(&rp, b"R2").await.unwrap();
+        mq.publish(&rp, b"R3").await.unwrap();
+        // Replay the whole retained history in publish order — a pure read (no lease, no attempt).
+        let hist = mq.replay(&rp, None, 10).await.unwrap();
+        assert_eq!(
+            hist.iter().map(|m| m.payload.clone()).collect::<Vec<_>>(),
+            vec![b"R1".to_vec(), b"R2".to_vec(), b"R3".to_vec()],
+            "replay returns the retained history in publish order"
+        );
+        assert!(
+            hist.iter().all(|m| m.attempts == 0 && !m.leased),
+            "replay is a pure read: no lease, no attempt charge"
+        );
+        // `after` is exclusive — replaying past R1 yields only R2, R3.
+        let tail = mq.replay(&rp, Some(&hist[0].id), 10).await.unwrap();
+        assert_eq!(
+            tail.iter().map(|m| m.payload.clone()).collect::<Vec<_>>(),
+            vec![b"R2".to_vec(), b"R3".to_vec()],
+            "replay from an offset is exclusive"
+        );
+        // `limit` is respected.
+        assert_eq!(
+            mq.replay(&rp, None, 2).await.unwrap().len(),
+            2,
+            "replay honours the limit"
+        );
+        // Non-destructive: replay touched no cursor, so it is repeatable AND a fresh `earliest` group
+        // still consumes the whole backlog (nothing was consumed by the reads above).
+        assert_eq!(
+            mq.replay(&rp, None, 10).await.unwrap().len(),
+            3,
+            "replay is repeatable — it consumes nothing"
+        );
+        let consumer = mq
+            .claim_grouped(&rp, "consumer", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            payloads(&consumer),
+            vec![b"R1".to_vec(), b"R2".to_vec(), b"R3".to_vec()],
+            "the retained history survived replay for a live consumer"
+        );
+        for m in &consumer {
+            mq.ack(m).await.unwrap();
+        }
     }
 
     /// Grouped conformance — **single-node** (`LogMessaging`).

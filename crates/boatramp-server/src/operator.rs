@@ -379,6 +379,85 @@ pub(super) async fn operator_queue_peek(
     }
 }
 
+/// `GET …/_boatramp/queue/replay` query: re-read a GROUPED topic's retained history from an offset,
+/// without consuming or touching any group's cursor (P2 durable replay).
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueueReplayQuery {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+    /// Exclusive start offset (a prior message id); omit to replay from the beginning.
+    #[serde(default)]
+    after: Option<String>,
+    /// How many messages to return (publish order). Defaults to 10; hard-capped at `QUEUE_PEEK_MAX`.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct QueueReplayResponse {
+    version: u32,
+    messages: Vec<QueuePeekEntry>,
+    /// The last id returned — the caller passes it back as `after` to page forward (absent = no more).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after: Option<String>,
+}
+
+/// Operator durable REPLAY (`GET …/_boatramp/queue/replay`, read): re-read a grouped topic's retained
+/// history from an offset WITHOUT consuming (no lease, no attempt, no cursor touch). Site-scoped like
+/// the other queue endpoints. Grouped-only — a work-queue deletes on ack (use `queue peek` there).
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_replay(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<QueueReplayQuery>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    let Some(messaging) = inner.messaging.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response();
+    };
+    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    let limit = q.limit.unwrap_or(10).min(QUEUE_PEEK_MAX);
+    match messaging
+        .replay(&namespaced, q.after.as_deref(), limit)
+        .await
+    {
+        Ok(msgs) => {
+            use base64::Engine as _;
+            let next_after = msgs.last().map(|m| m.id.clone());
+            let messages = msgs
+                .into_iter()
+                .map(|m| QueuePeekEntry {
+                    id: m.id,
+                    attempts: m.attempts,
+                    leased: m.leased,
+                    signed_context_present: m.signed_context.is_some(),
+                    payload_b64: base64::engine::general_purpose::STANDARD.encode(m.payload),
+                })
+                .collect();
+            Json(QueueReplayResponse {
+                version: DLQ_VIEW_VERSION,
+                messages,
+                next_after,
+            })
+            .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("queue replay failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET …/_boatramp/queue/groups` query: list the consumer groups on a topic.
 #[cfg(feature = "handlers")]
 #[derive(Deserialize)]
