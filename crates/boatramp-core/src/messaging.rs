@@ -3490,6 +3490,64 @@ mod tests {
         assert_eq!(any.len(), 1);
     }
 
+    // SEC6: sanitize_reason strips control characters (no log/JSON injection) and byte-bounds to
+    // LAST_ERROR_MAX without splitting a multi-byte char (the security review's UTF-8-boundary note).
+    #[test]
+    fn sanitize_reason_strips_control_chars_and_bounds_bytes() {
+        let s = sanitize_reason("guest-trap:\n\t\u{7}boom");
+        assert!(s.contains("guest-trap") && s.contains("boom"));
+        assert!(!s.chars().any(char::is_control), "no control chars survive");
+        // 4-byte chars: 100 emoji = 400 bytes → bounded to <=256, still valid UTF-8 (a String always
+        // is; the point is the boundary check never panics or truncates mid-char).
+        let emoji = sanitize_reason(&"😀".repeat(100));
+        assert!(emoji.len() <= LAST_ERROR_MAX);
+        assert_eq!(
+            emoji.len() % 4,
+            0,
+            "bounded on a whole 4-byte char boundary"
+        );
+        // 3-byte chars.
+        assert!(sanitize_reason(&"€".repeat(200)).len() <= LAST_ERROR_MAX);
+        // All-control input collapses to empty (trimmed).
+        assert_eq!(sanitize_reason("\n\r\t\u{0}"), "");
+    }
+
+    // Site-confinement underpinning (the review's traversal note): a DLQ op is confined to its
+    // namespaced topic — listing/discarding one site's queue never sees or touches another's, because
+    // the KV keyspace is literal-prefixed (no path normalization). Proven at the substrate that the
+    // operator's `{site}/…` namespacing relies on.
+    #[tokio::test]
+    async fn dead_letter_ops_are_confined_to_their_namespaced_topic() {
+        let mq = mq();
+        for t in ["siteA/orders", "siteB/orders"] {
+            mq.publish(t, format!("{t}-poison").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(mq.claim(t, Duration::ZERO, 10, 1).await.unwrap().len(), 1);
+            assert!(mq.claim(t, Duration::ZERO, 10, 1).await.unwrap().is_empty());
+        }
+        // A list on site A sees ONLY A's dead-letter.
+        let a = mq
+            .list_dead_letters("siteA/orders", &DeadLetterFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(!a[0].id.is_empty() && a.iter().all(|d| !d.id.contains("siteB")));
+        // A discard on site A leaves site B's dead-letter untouched.
+        assert_eq!(
+            mq.discard_dead_letters("siteA/orders", &DeadLetterFilter::default())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(mq.dead_letter_count("siteA/orders").await.unwrap(), 0);
+        assert_eq!(
+            mq.dead_letter_count("siteB/orders").await.unwrap(),
+            1,
+            "another site's DLQ is untouched"
+        );
+    }
+
     /// The "survives restart" guarantee: queue state
     /// lives in `Storage`/`KvStore`, so a fresh `LogMessaging` over the same
     /// backends still has the un-acked message (re-claimable) and not the acked
