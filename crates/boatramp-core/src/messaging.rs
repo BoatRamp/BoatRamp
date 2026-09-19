@@ -3738,6 +3738,50 @@ mod tests {
         assert_eq!(any.len(), 1);
     }
 
+    // P2 security: group + pause ops are confined to their namespaced topic — a delete/pause on one
+    // site's namespace never touches another site's group state or pause marker (literal KV keys).
+    #[tokio::test]
+    async fn group_and_pause_ops_are_confined_to_their_namespaced_topic() {
+        let mq = mq();
+        for t in ["siteA/ev", "siteB/ev"] {
+            assert!(mq
+                .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+            mq.publish(t, b"m").await.unwrap();
+        }
+        // Pausing siteA does NOT pause siteB.
+        mq.set_paused("siteA/ev", true).await.unwrap();
+        assert!(mq.is_paused("siteA/ev").await.unwrap());
+        assert!(
+            !mq.is_paused("siteB/ev").await.unwrap(),
+            "pausing one site's topic never pauses another's"
+        );
+        // Deleting siteA's group leaves siteB's group intact.
+        mq.delete_group("siteA/ev", "g").await.unwrap();
+        assert!(mq.list_groups("siteA/ev").await.unwrap().is_empty());
+        assert_eq!(
+            mq.list_groups("siteB/ev").await.unwrap().len(),
+            1,
+            "another site's group is untouched by a delete"
+        );
+        // siteB (unpaused) still delivers; siteA (paused) delivers nothing.
+        assert!(mq
+            .claim_grouped("siteA/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            mq.claim_grouped("siteB/ev", "g", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the other site's grouped delivery is unaffected"
+        );
+    }
+
     // SEC6: sanitize_reason strips control characters (no log/JSON injection) and byte-bounds to
     // LAST_ERROR_MAX without splitting a multi-byte char (the security review's UTF-8-boundary note).
     #[test]
