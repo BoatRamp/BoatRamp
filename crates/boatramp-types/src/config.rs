@@ -602,6 +602,20 @@ pub struct ConsumerConfig {
     /// forwarded bearer). Absent ⇒ the token source can't verify (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_claims: Option<HandlerGraphqlTokenClaims>,
+    /// Per-consumer redelivery **visibility timeout** in ms (≈ JetStream *AckWait*): how long a
+    /// claimed-but-unacked message stays leased before redelivery. `None` ⇒ the server default
+    /// (30 s). A short lease suits fast retry/DLQ; a long one suits big-blob work — one global
+    /// constant can't serve both. (JetStream-per-consumer-config parity, P1.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// Per-consumer **max delivery attempts** before a message is dead-lettered (≈ JetStream
+    /// *MaxDeliver*). `None` ⇒ the server default (5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    /// Per-consumer **max messages claimed per tick** (the pull batch size). `None` ⇒ the server
+    /// default (16). Bounds the consumer's in-flight window per dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch: Option<usize>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
@@ -1189,6 +1203,29 @@ mod tests {
         assert_eq!(config.index, vec!["index.html".to_string()]);
         assert_eq!(config.trailing_slash, TrailingSlash::Preserve);
         assert!(config.redirects.is_empty());
+    }
+
+    #[test]
+    fn consumer_per_consumer_tuning_is_optional_and_round_trips() {
+        // Back-compat: a consumer with no tuning fields leaves them `None` (server defaults apply).
+        let bare: ConsumerConfig =
+            serde_json::from_str(r#"{"topic":"orders","component":"c.wasm"}"#).unwrap();
+        assert_eq!(bare.lease_ms, None);
+        assert_eq!(bare.max_attempts, None);
+        assert_eq!(bare.max_batch, None);
+        // Explicit per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch) round-trip.
+        let tuned: ConsumerConfig = serde_json::from_str(
+            r#"{"topic":"orders","component":"c.wasm","lease_ms":5000,"max_attempts":10,"max_batch":64}"#,
+        )
+        .unwrap();
+        assert_eq!(tuned.lease_ms, Some(5000));
+        assert_eq!(tuned.max_attempts, Some(10));
+        assert_eq!(tuned.max_batch, Some(64));
+        let reparsed: ConsumerConfig =
+            serde_json::from_str(&serde_json::to_string(&tuned).unwrap()).unwrap();
+        assert_eq!(reparsed.lease_ms, Some(5000));
+        assert_eq!(reparsed.max_attempts, Some(10));
+        assert_eq!(reparsed.max_batch, Some(64));
     }
 
     #[test]
