@@ -494,6 +494,44 @@ async fn apply_site<C: ControlPlane>(
             yes_no(site.routing.is_some()),
             yes_no(site.config.is_some()),
         );
+        // #470 legibility: surface any route that deliberately EXCEEDS the site tenancy ceiling, so an
+        // authorized exception is visible at plan time (never hidden behind a function indirection —
+        // the whole point of the inline model). When this apply also carries the site config, flag the
+        // definite misconfig where a route asks for an exception the site does not permit (the server
+        // precheck refuses it at activation; we warn early). Not a hard failure — the site config may
+        // be managed out-of-band, so the server remains the authoritative gate.
+        let site_allows = site
+            .config
+            .as_ref()
+            .and_then(|c| c.handlers.as_ref())
+            .map(|h| h.allow_ceiling_exceptions);
+        if let Some(routing) = &site.routing {
+            for h in &routing.handlers {
+                if matches!(
+                    &h.tenancy,
+                    Some(boatramp_core::tenancy::Tenancy::Scoped {
+                        exceed_site_ceiling: true,
+                        ..
+                    })
+                ) {
+                    let route = &h.route;
+                    let methods = h.methods.join(",");
+                    match site_allows {
+                        Some(false) => eprintln!(
+                            "    ⚠ route {route:?} [{methods}]: declares `exceed_site_ceiling` but \
+                             this apply's site config does NOT set `allow_ceiling_exceptions` — it \
+                             will be REFUSED at activation. Set it, or narrow the route."
+                        ),
+                        _ => eprintln!(
+                            "    ⚠ route {route:?} [{methods}]: exceeds the site tenancy ceiling \
+                             (authorized via `exceed_site_ceiling`; the site must set \
+                             `allow_ceiling_exceptions`, and an `all` grant also needs the operator \
+                             posture `allow_cross_tenant_db`)."
+                        ),
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 

@@ -1370,6 +1370,44 @@ mod tests {
             "null_base survives the bridge"
         );
 
+        // #470: a route's `exceed_site_ceiling: true` round-trips through the bridge from RON and
+        // JSON (the canonical config surface a deployer writes for an authorized ceiling exception),
+        // and an absent flag defaults to false (byte-identical to a pre-#470 config).
+        let exc_ron: W = ron_opts
+            .from_str(
+                r#"(tenancy: (mode: "scoped", column: "tenant_id",
+                    sources: [(kind: "token", claim: "tid")],
+                    read: "all", write: "all", exceed_site_ceiling: true))"#,
+            )
+            .expect("exceed_site_ceiling RON parses via the bridge");
+        let exc_json: W = serde_json::from_str(
+            r#"{"tenancy":{"mode":"scoped","column":"tenant_id",
+                "sources":[{"kind":"token","claim":"tid"}],
+                "read":"all","write":"all","exceed_site_ceiling":true}}"#,
+        )
+        .expect("exceed_site_ceiling JSON parses via the bridge");
+        assert_eq!(exc_ron.tenancy, exc_json.tenancy);
+        assert!(
+            matches!(
+                exc_ron.tenancy,
+                Some(Tenancy::Scoped {
+                    exceed_site_ceiling: true,
+                    ..
+                })
+            ),
+            "exceed_site_ceiling survives the bridge"
+        );
+        assert!(
+            matches!(
+                scoped_json.tenancy,
+                Some(Tenancy::Scoped {
+                    exceed_site_ceiling: false,
+                    ..
+                })
+            ),
+            "an omitted exceed_site_ceiling defaults to false"
+        );
+
         // Disabled + absent.
         let disabled: W = ron_opts
             .from_str(r#"(tenancy: (mode: "disabled"))"#)
