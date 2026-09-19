@@ -80,6 +80,8 @@ impl StreamBus for InProcessStreamBus {
 
 /// Group-commit (A2): the most `MqPublish` ops coalesced into one `WriteOp::Batch` proposal — so a
 /// burst of concurrent publishes costs one Raft round-trip per group, not one per message.
+/// Intentionally independent of the single-node cap (`boatramp_core::messaging`'s `GROUP_COMMIT_MAX`):
+/// the two commit paths bound different resources (one Raft entry vs one `write_batch`).
 const GROUP_COMMIT_MAX: usize = 512;
 
 /// The cluster [`Messaging`]: a durable log whose **index** is the Raft state
@@ -174,6 +176,11 @@ impl RaftMessaging {
                     ops.push(job.op);
                     dones.push(job.done);
                 }
+                // A proposal can fail AFTER the entry actually committed+applied (leader lost, or the
+                // forwarder timed out on the reply). That surfaces here as `Err` for a group that in
+                // fact committed — a false NEGATIVE, which is the at-least-once-safe direction: the
+                // caller may retry and produce a tolerable duplicate. Never invert this into a false
+                // positive (Ok on an uncommitted group).
                 let outcome = self.propose(WriteOp::Batch(ops)).await.map(|_| ());
                 for done in dones {
                     // Clone the shared outcome to every member (fail-all on a failed proposal).
