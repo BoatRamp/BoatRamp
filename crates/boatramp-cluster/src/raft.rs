@@ -156,6 +156,15 @@ pub enum WriteOp {
         topic: String,
         id: String,
     },
+    /// Record a sanitized HOST failure reason on a message's live record (P1 selective DLQ / SEC6),
+    /// so it survives into the dead-letter for `dlq ls/show` + `--match`. `reason` is already
+    /// sanitized+bounded by the caller (deterministic bytes → identical on every replica); the apply
+    /// is a read-modify-write of the meta record, a no-op if the message was acked in the meantime.
+    MqSetLastError {
+        topic: String,
+        id: String,
+        reason: String,
+    },
     /// Atomically claim up to `max_batch` messages for a **consumer group** (the
     /// durable fan-out path). The leader applies the shared offset-log decision
     /// ([`messaging::plan_claim_grouped`]) over the group's compact state — the
@@ -379,6 +388,20 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             if let Some(raw) = target.data.get(&key) {
                 if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
                     record.lease_until_ms = 0; // claimable again now
+                    if let Ok(json) = serde_json::to_vec(&record) {
+                        target.put(key, json);
+                    }
+                }
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqSetLastError { topic, id, reason } => {
+            // Read-modify-write the live record's last_error (already sanitized by the caller). A
+            // no-op if the message was acked/gone since the failed delivery.
+            let key = messaging::meta_key(&topic, &id);
+            if let Some(raw) = target.data.get(&key) {
+                if let Ok(mut record) = serde_json::from_slice::<messaging::Record>(raw) {
+                    record.last_error = Some(reason);
                     if let Ok(json) = serde_json::to_vec(&record) {
                         target.put(key, json);
                     }

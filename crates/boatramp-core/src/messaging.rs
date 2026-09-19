@@ -499,8 +499,9 @@ pub struct DeadLetterFilter {
 }
 
 impl DeadLetterFilter {
-    /// Does `dl` satisfy every set predicate? `now_ms` anchors the age test.
-    fn matches(&self, dl: &DeadLetter, now_ms: u64) -> bool {
+    /// Does `dl` satisfy every set predicate? `now_ms` anchors the age test. Public so a backend in
+    /// another crate (the cluster coordinator) applies the identical AND-composition.
+    pub fn matches(&self, dl: &DeadLetter, now_ms: u64) -> bool {
         if let Some(id) = &self.id {
             if &dl.id != id {
                 return false;
