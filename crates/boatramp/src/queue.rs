@@ -51,6 +51,21 @@ enum QueueCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Replay a GROUPED topic's retained history from an offset, without consuming (no lease, no
+    /// attempt, no group cursor touched). Work-queue topics delete on ack — use `peek` there.
+    Replay {
+        /// Consumer topic (as declared in the deploy config).
+        topic: String,
+        /// Exclusive start offset — a prior message id; omit to replay from the beginning.
+        #[arg(long)]
+        after: Option<String>,
+        /// How many messages to replay (publish order). Server-capped.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
     /// List a topic's consumer groups (cursor, in-flight, lag).
     Groups {
         /// Consumer topic (as declared in the deploy config).
@@ -122,6 +137,17 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
                 .await?;
             print_peek(topic, &msgs);
         }
+        QueueCommand::Replay {
+            topic,
+            after,
+            limit,
+            alias,
+        } => {
+            let (msgs, next_after) = cp
+                .replay_queue(&site, topic, alias.as_deref(), after.as_deref(), *limit)
+                .await?;
+            print_replay(topic, &msgs, next_after.as_deref());
+        }
         QueueCommand::Groups { topic, alias } => {
             let groups = cp.list_groups(&site, topic, alias.as_deref()).await?;
             print_groups(topic, &groups);
@@ -176,9 +202,24 @@ fn print_groups(topic: &str, groups: &[GroupEntry]) {
     println!("{} group(s) on {topic:?}", groups.len());
 }
 
+/// Decode a base64 payload to a short UTF-8 preview (or a binary/undecodable marker).
+fn payload_preview(payload_b64: &str) -> String {
+    use base64::Engine as _;
+    match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(text) if text.chars().count() <= 120 => text.to_string(),
+            Ok(text) => {
+                let head: String = text.chars().take(120).collect();
+                format!("{head}… ({} bytes)", bytes.len())
+            }
+            Err(_) => format!("<{} bytes binary>", bytes.len()),
+        },
+        Err(_) => "<undecodable>".to_string(),
+    }
+}
+
 /// Print the peeked head of the queue, decoding each payload as UTF-8 when possible.
 fn print_peek(topic: &str, msgs: &[QueuePeekEntry]) {
-    use base64::Engine as _;
     if msgs.is_empty() {
         println!("no messages queued on topic {topic:?}");
         return;
@@ -186,18 +227,30 @@ fn print_peek(topic: &str, msgs: &[QueuePeekEntry]) {
     for m in msgs {
         let state = if m.leased { "leased" } else { "claimable" };
         let ctx = if m.signed_context_present { " ctx" } else { "" };
-        let preview = match base64::engine::general_purpose::STANDARD.decode(&m.payload_b64) {
-            Ok(bytes) => match std::str::from_utf8(&bytes) {
-                Ok(text) if text.chars().count() <= 120 => text.to_string(),
-                Ok(text) => {
-                    let head: String = text.chars().take(120).collect();
-                    format!("{head}… ({} bytes)", bytes.len())
-                }
-                Err(_) => format!("<{} bytes binary>", bytes.len()),
-            },
-            Err(_) => "<undecodable>".to_string(),
-        };
+        let preview = payload_preview(&m.payload_b64);
         println!("{}  {state}{ctx}  attempts={}  {preview}", m.id, m.attempts);
     }
     println!("{} message(s) at the head of {topic:?}", msgs.len());
+}
+
+/// Print a replayed slice of a grouped topic's retained history (publish order). Unlike `peek`, these
+/// are history entries — no lease/attempt state — so print just the id, context flag, and payload; a
+/// `next_after` cursor (when present) tells the operator how to page forward.
+fn print_replay(topic: &str, msgs: &[QueuePeekEntry], next_after: Option<&str>) {
+    if msgs.is_empty() {
+        println!("no retained history on topic {topic:?} (grouped-only; empty past the offset)");
+        return;
+    }
+    for m in msgs {
+        let ctx = if m.signed_context_present { " ctx" } else { "" };
+        let preview = payload_preview(&m.payload_b64);
+        println!("{}{ctx}  {preview}", m.id);
+    }
+    match next_after {
+        Some(after) => println!(
+            "{} message(s) from {topic:?}; page on with --after {after}",
+            msgs.len()
+        ),
+        None => println!("{} message(s) from {topic:?}", msgs.len()),
+    }
 }

@@ -1131,6 +1131,47 @@ impl ControlPlane {
         Ok(resp.messages)
     }
 
+    /// Replay a GROUPED topic's retained history from an offset without consuming
+    /// (`GET …/_boatramp/queue/replay`, P2). Returns the messages plus the `next_after` cursor to
+    /// page forward (`None` when the history is exhausted).
+    pub async fn replay_queue(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+        after: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<QueuePeekEntry>, Option<String>)> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        #[derive(Deserialize)]
+        struct QueueReplayResponse {
+            #[allow(dead_code)]
+            version: u32,
+            messages: Vec<QueuePeekEntry>,
+            #[serde(default)]
+            next_after: Option<String>,
+        }
+        let mut req = client
+            .get(format!("{server}/api/{seg}/{site}/_boatramp/queue/replay"))
+            .query(&[("topic", topic)]);
+        if let Some(alias) = alias {
+            req = req.query(&[("alias", alias)]);
+        }
+        if let Some(after) = after {
+            req = req.query(&[("after", after)]);
+        }
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: QueueReplayResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok((resp.messages, resp.next_after))
+    }
+
     /// List (or `show`) a topic's dead-letters (`GET …/_boatramp/dlq`), filter-matching. `show` with
     /// `filter.id` set returns the single dead-letter in full (with `payload_b64`); otherwise a
     /// metadata listing.

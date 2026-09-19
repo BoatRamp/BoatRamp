@@ -344,6 +344,10 @@ pub fn router_with_fast(
             get(operator_queue_peek),
         )
         .route(
+            "/api/sites/{site}/_boatramp/queue/replay",
+            get(operator_queue_replay),
+        )
+        .route(
             "/api/sites/{site}/_boatramp/queue/groups",
             get(operator_queue_groups),
         )

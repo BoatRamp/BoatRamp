@@ -437,7 +437,7 @@ fn site_subpath_action(method: &str, get: bool, sub: &[&str]) -> Option<Action> 
                 None
             }
         }
-        // `_boatramp/handlers`, `_boatramp/logs`, `_boatramp/queue/{peek,groups}` (per-site
+        // `_boatramp/handlers`, `_boatramp/logs`, `_boatramp/queue/{peek,replay,groups}` (per-site
         // observability, read); `_boatramp/dlq` purge/redrive/discard and
         // `_boatramp/queue/group` reset/delete are destructive site-scoped writes.
         Some("_boatramp") => {
