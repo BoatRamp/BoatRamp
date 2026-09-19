@@ -2151,12 +2151,13 @@ pub(super) async fn dispatch_consumer_batch(
                 limits,
             )
             .await;
+        let outcome = metrics::Outcome::from_result(&result);
         metrics.observe(
             site,
             metrics::Trigger::Consumer,
             guest_topic,
             component_hash,
-            metrics::Outcome::from_result(&result),
+            outcome,
             start.elapsed(),
         );
         match result {
@@ -2171,6 +2172,10 @@ pub(super) async fn dispatch_consumer_batch(
                     %err,
                     "consumer failed; redelivering (dead-letters after max attempts)"
                 );
+                // Record the host-classified failure reason (P1/SEC6: never the guest's error text)
+                // so it survives into the dead-letter for `dlq ls/show` + `--match`. Best-effort —
+                // a failure to annotate must never block redelivery.
+                let _ = messaging.set_last_error(&msg, outcome.as_str()).await;
                 let _ = messaging.nack(&msg).await;
             }
         }
