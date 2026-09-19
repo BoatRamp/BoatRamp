@@ -204,6 +204,20 @@ pub enum WriteOp {
         group: String,
         id: String,
     },
+    /// **Reset** a consumer group's cursor (P2 group lifecycle): move its high-water per `start`
+    /// (`Earliest` ⇒ `""` re-consume backlog; `Latest` ⇒ the current logmax, read deterministically
+    /// from applied state at apply time) and drop its in-flight set. A no-op if the group is gone.
+    MqResetGroup {
+        topic: String,
+        group: String,
+        start: messaging::StartPosition,
+    },
+    /// **Delete** a consumer group (P2 group lifecycle): remove its state + its dead-letter records.
+    /// The shared retained log/payloads it pinned are reclaimed by the sweep once no group needs them.
+    MqDeleteGroup {
+        topic: String,
+        group: String,
+    },
     /// **Retention sweep** for a grouped topic: reclaim the replicated log entries
     /// that no group still needs (with an id-age TTL backstop), returning the
     /// reclaimed ids so the caller can delete their `Storage` payloads (which the
@@ -475,6 +489,42 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             put_group_state(target, &topic, &group, &state);
             target.remove(messaging::gdead_key(&topic, &group, &id));
+            WriteResponse::Kv
+        }
+        WriteOp::MqResetGroup {
+            topic,
+            group,
+            start,
+        } => {
+            // Reset only an existing group (no-op if gone — deterministic). hwm from `start`, read
+            // from applied state so every replica computes the identical value. Drops in-flight.
+            if load_group_state(target, &topic, &group).is_some() {
+                let hwm = match start {
+                    messaging::StartPosition::Earliest => String::new(),
+                    messaging::StartPosition::Latest => target
+                        .data
+                        .get(&messaging::logmax_key(&topic))
+                        .map(|v| String::from_utf8_lossy(v).into_owned())
+                        .unwrap_or_default(),
+                };
+                put_group_state(target, &topic, &group, &messaging::GroupState::new(hwm));
+            }
+            WriteResponse::Kv
+        }
+        WriteOp::MqDeleteGroup { topic, group } => {
+            // Remove the group's dead-letter records, then its state. Collect keys first (can't mutate
+            // `target.data` while ranging it). Retained log/payloads reclaim via the sweep.
+            let dprefix = format!("mqgd/{topic}/{group}/");
+            let dead: Vec<String> = target
+                .data
+                .range(dprefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&dprefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in dead {
+                target.remove(key);
+            }
+            target.remove(messaging::gstate_key(&topic, &group));
             WriteResponse::Kv
         }
         WriteOp::MqSweepGrouped { topic, now_ms } => {
