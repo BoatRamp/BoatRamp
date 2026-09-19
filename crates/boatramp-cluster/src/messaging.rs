@@ -78,6 +78,10 @@ impl StreamBus for InProcessStreamBus {
     }
 }
 
+/// Group-commit (A2): the most `MqPublish` ops coalesced into one `WriteOp::Batch` proposal — so a
+/// burst of concurrent publishes costs one Raft round-trip per group, not one per message.
+const GROUP_COMMIT_MAX: usize = 512;
+
 /// The cluster [`Messaging`]: a durable log whose **index** is the Raft state
 /// machine and whose **payloads** live in a shared [`Storage`]. The single-writer
 /// coordinator is the Raft leader (claim/ack/nack/publish are proposals).
@@ -103,6 +107,20 @@ pub struct RaftMessaging {
     /// (only over-counts — the safe direction; a fully cluster-consistent cap would be a deterministic
     /// state-machine counter, a further hardening).
     inline_inflight_bytes: AtomicUsize,
+    /// Group-commit (A2): publishers push their `MqPublish` op here, then take
+    /// [`commit_gate`](Self::commit_gate); whoever holds the gate drains the queue and proposes ONE
+    /// `WriteOp::Batch` — so N concurrent publishes cost one Raft round-trip, not N. Self-bounding
+    /// (every pusher is a gate-waiter).
+    commit_queue: StdMutex<Vec<ClusterPublishJob>>,
+    /// The group-commit gate (A2): the single propose turn (see [`commit_queue`](Self::commit_queue)).
+    commit_gate: futures::lock::Mutex<()>,
+}
+
+/// One publisher's contribution to a cluster group commit (A2): its `MqPublish` op + a one-shot for
+/// the durable (replicated-and-applied) outcome. The gate-holder batches many into one proposal.
+struct ClusterPublishJob {
+    op: WriteOp,
+    done: futures::channel::oneshot::Sender<Result<(), MessagingError>>,
 }
 
 impl RaftMessaging {
@@ -126,7 +144,46 @@ impl RaftMessaging {
             hubs,
             bus,
             inline_inflight_bytes: AtomicUsize::new(0),
+            commit_queue: StdMutex::new(Vec::new()),
+            commit_gate: futures::lock::Mutex::new(()),
         }
+    }
+
+    /// Group-commit a `MqPublish` op (A2): push it, take the gate, and — as the gate-holder — drain
+    /// the queue and propose EVERYONE's ops in one `WriteOp::Batch` (one Raft round-trip), signalling
+    /// each. A publisher flushed by an earlier gate-holder finds its one-shot already resolved.
+    /// Returns only after the group is replicated + applied (at-least-once); a failed proposal fails
+    /// every member. Same self-bounded, no-spawn pattern as `LogMessaging::group_commit`.
+    async fn group_commit(&self, op: WriteOp) -> Result<(), MessagingError> {
+        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        self.commit_queue
+            .lock()
+            .unwrap()
+            .push(ClusterPublishJob { op, done: done_tx });
+        {
+            let _turn = self.commit_gate.lock().await;
+            let batch: Vec<ClusterPublishJob> = {
+                let mut q = self.commit_queue.lock().unwrap();
+                let take = q.len().min(GROUP_COMMIT_MAX);
+                q.drain(..take).collect()
+            };
+            if !batch.is_empty() {
+                let mut ops = Vec::with_capacity(batch.len());
+                let mut dones = Vec::with_capacity(batch.len());
+                for job in batch {
+                    ops.push(job.op);
+                    dones.push(job.done);
+                }
+                let outcome = self.propose(WriteOp::Batch(ops)).await.map(|_| ());
+                for done in dones {
+                    // Clone the shared outcome to every member (fail-all on a failed proposal).
+                    let _ = done.send(outcome.clone());
+                }
+            }
+        }
+        done_rx
+            .await
+            .map_err(|_| MessagingError::Backend("group-commit dropped before durable".into()))?
     }
 
     /// Mint a globally-unique, ≈time-ordered message id. The millis prefix keeps
@@ -289,7 +346,10 @@ impl Messaging for RaftMessaging {
                 .await
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
         }
-        self.propose(WriteOp::MqPublish {
+        // Group-commit (A2): coalesce this MqPublish with other concurrent ones into a single
+        // WriteOp::Batch proposal (one Raft round-trip per group). Returns only after the group is
+        // replicated + applied (at-least-once); a failed proposal fails this publish too.
+        self.group_commit(WriteOp::MqPublish {
             topic: topic.to_string(),
             id: id.clone(),
             retain,

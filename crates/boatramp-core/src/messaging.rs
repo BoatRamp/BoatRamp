@@ -320,6 +320,20 @@ pub const INLINE_MAX: usize = 4096;
 /// (they never inline). A soft, per-node guard (see [`LogMessaging::inline_inflight_bytes`]).
 pub const INLINE_INFLIGHT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+/// Group-commit (A2): the most index writes coalesced into one durable `write_batch`. Concurrent
+/// publishers that pile up during a flush form the next group; this caps a single group so one burst
+/// can't build an unbounded batch (the queue itself is self-bounded — every pusher is a gate-waiter).
+const GROUP_COMMIT_MAX: usize = 512;
+
+/// One publisher's contribution to a group commit (A2): its index ops + a one-shot to signal the
+/// durable outcome. The committer coalesces many of these into ONE `write_batch` then signals each —
+/// a publisher's `publish` returns only AFTER its group's commit is durable (at-least-once), and a
+/// failed group commit fails EVERY member (no partial success on the synchronous path).
+struct PublishJob {
+    ops: Vec<WriteOp>,
+    done: futures::channel::oneshot::Sender<Result<(), MessagingError>>,
+}
+
 impl Record {
     /// A freshly-published record: never delivered, claimable immediately, carrying the optional
     /// host-minted signed-context envelope stamped from the producer's own-tenant.
@@ -757,6 +771,15 @@ pub struct LogMessaging {
     /// only while `inline_inflight_bytes` stays under it, else falls back to object storage. Tunable
     /// via [`with_inline_budget`](Self::with_inline_budget).
     inline_budget_bytes: usize,
+    /// Group-commit (A2), runtime-agnostic (no spawned task — core uses `futures`, not `tokio`):
+    /// a publisher pushes its index ops here, then takes [`commit_gate`](Self::commit_gate); whoever
+    /// holds the gate drains this queue and commits everyone's ops in ONE `write_batch`, signalling
+    /// each. Self-bounding — every pusher is also a gate-waiter, so the queue never holds more than
+    /// the number of concurrent publishers.
+    commit_queue: std::sync::Mutex<Vec<PublishJob>>,
+    /// The group-commit gate (A2): the single durable-flush turn. Held only across the drain +
+    /// `write_batch`, so publishers that pile up during a flush coalesce into the next batch.
+    commit_gate: futures::lock::Mutex<()>,
 }
 
 /// How long a grouped topic retains a message (its log + payload) before the
@@ -787,7 +810,56 @@ impl LogMessaging {
             grouped_topics: std::sync::Mutex::new(None),
             inline_inflight_bytes: std::sync::atomic::AtomicUsize::new(0),
             inline_budget_bytes: INLINE_INFLIGHT_MAX_BYTES,
+            commit_queue: std::sync::Mutex::new(Vec::new()),
+            commit_gate: futures::lock::Mutex::new(()),
         }
+    }
+
+    /// Group-commit a publisher's index ops (A2): push the job, take the gate, and — as whoever holds
+    /// the gate — drain the queue and commit EVERYONE's ops in one `write_batch`, signalling each.
+    /// A publisher that pushed but was flushed by an earlier gate-holder simply finds its one-shot
+    /// already resolved. Returns only after this job's group is durably committed (at-least-once); a
+    /// failed group commit fails every member (no partial success). Runtime-agnostic: no spawned task.
+    async fn group_commit(&self, ops: Vec<WriteOp>) -> Result<(), MessagingError> {
+        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        self.commit_queue
+            .lock()
+            .unwrap()
+            .push(PublishJob { ops, done: done_tx });
+        {
+            // Whoever holds the gate is the committer for this turn.
+            let _turn = self.commit_gate.lock().await;
+            // Take the whole queue (up to the per-group cap; the rest wait for the next turn). If it
+            // is already empty, an earlier committer flushed our job — fall through to await it.
+            let batch: Vec<PublishJob> = {
+                let mut q = self.commit_queue.lock().unwrap();
+                let take = q.len().min(GROUP_COMMIT_MAX);
+                q.drain(..take).collect()
+            };
+            if !batch.is_empty() {
+                let mut all_ops = Vec::new();
+                let mut dones = Vec::with_capacity(batch.len());
+                for job in batch {
+                    let mut job = job;
+                    all_ops.append(&mut job.ops);
+                    dones.push(job.done);
+                }
+                let outcome = self
+                    .kv
+                    .write_batch(all_ops)
+                    .await
+                    .map_err(MessagingError::backend);
+                for done in dones {
+                    // A dropped receiver (cancelled publisher) is harmless — the message is still
+                    // durably committed; at-least-once/redelivery is unaffected.
+                    let _ = done.send(outcome.clone());
+                }
+            }
+        }
+        // Our own outcome: signalled by whichever committer flushed our job (possibly us).
+        done_rx
+            .await
+            .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
     }
 
     /// Set the aggregate-inline byte budget (SA1) — the total inline-payload bytes this node keeps
@@ -1138,10 +1210,11 @@ impl Messaging for LogMessaging {
                 ops.push(WriteOp::Put(logmax_key(topic), id.clone().into_bytes()));
             }
         }
-        self.kv
-            .write_batch(ops)
-            .await
-            .map_err(MessagingError::backend)?;
+        // Group-commit (A2): concurrent publishes coalesce their index writes into one durable
+        // `write_batch`. Returns only after this message's group is durably committed
+        // (at-least-once); a failed group fails this publish too. Payloads (object store) were
+        // already written above (payload-first), so only the index writes are batched here.
+        self.group_commit(ops).await?;
         // Notify live SSE subscribers (best-effort, separate from the durable
         // queue above).
         self.hubs.broadcast(topic, &id, payload);
@@ -2342,6 +2415,41 @@ mod tests {
         assert!(
             more.iter().any(|m| m.payload == b"ddddd" && m.inline),
             "after ack freed budget, the next small publish inlines again"
+        );
+    }
+
+    // A2: many concurrent publishes coalesce through the group-commit gate; each returns Ok ONLY
+    // after its group is durably committed (at-least-once), and every message is claimable.
+    #[tokio::test]
+    async fn group_commit_coalesces_concurrent_publishes() {
+        let mq = Arc::new(mq());
+        let mut handles = Vec::new();
+        for i in 0..64u32 {
+            let mq = mq.clone();
+            handles.push(tokio::spawn(async move {
+                mq.publish("t", format!("m{i}").as_bytes()).await
+            }));
+        }
+        for h in handles {
+            h.await
+                .unwrap()
+                .expect("each publish returns Ok after its durable group commit");
+        }
+        // All 64 are durably enqueued and claimable (nothing lost, no double-count).
+        let mut seen = 0;
+        loop {
+            let batch = mq
+                .claim("t", Duration::from_secs(60), 100, 5)
+                .await
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            seen += batch.len();
+        }
+        assert_eq!(
+            seen, 64,
+            "all concurrent publishes were durably committed and claimable"
         );
     }
 
