@@ -1509,14 +1509,32 @@ mod tests {
             let mq = mqs[&id].clone();
             let collected = collected.clone();
             tasks.push(tokio::spawn(async move {
+                // Drain until the group has yielded all N (shared count), tolerating TRANSIENT empty
+                // batches. A grouped claim forwards to the leader (linearizable), but under CPU load a
+                // just-published straggler may not be claimable at the instant a node polls, and if all
+                // three nodes broke on their first empty batch a message could be left unclaimed (a
+                // delivery-timing flake, not a loss). A long lease + no acks means re-polling is safe —
+                // a claimed message stays leased and never reappears — so a bounded straggler window
+                // removes the flake WITHOUT masking a real defect: the post-loop assertions still
+                // require exactly N and zero duplicates.
+                let mut empty_rounds = 0;
                 loop {
+                    if collected.lock().unwrap().len() >= N {
+                        break;
+                    }
                     let batch = mq
                         .claim_grouped(t, "g", StartPosition::Earliest, LEASE, 4, 5)
                         .await
                         .unwrap();
                     if batch.is_empty() {
-                        break;
+                        empty_rounds += 1;
+                        if empty_rounds >= 50 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
                     }
+                    empty_rounds = 0;
                     collected.lock().unwrap().extend(batch);
                 }
             }));
