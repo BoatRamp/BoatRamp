@@ -298,6 +298,87 @@ pub(super) async fn operator_dlq_list(
     }
 }
 
+/// `GET …/_boatramp/queue/peek` query: inspect the head of a LIVE work-queue without consuming.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueuePeekQuery {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+    /// How many messages to peek (head of the queue, delivery order). Defaults to 10; hard-capped.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// One peeked live message in the operator view (payload base64; signed-context as presence only).
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct QueuePeekEntry {
+    id: String,
+    attempts: u32,
+    leased: bool,
+    signed_context_present: bool,
+    payload_b64: String,
+}
+
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct QueuePeekResponse {
+    version: u32,
+    messages: Vec<QueuePeekEntry>,
+}
+
+/// The most messages one `queue peek` returns — bounds the payload bytes a single read can pull.
+#[cfg(feature = "handlers")]
+const QUEUE_PEEK_MAX: usize = 100;
+
+/// Operator live-queue INSPECTION (`GET …/_boatramp/queue/peek`, read): the head of a topic's
+/// work-queue WITHOUT consuming (no lease, no attempt charge). Site-scoped like the DLQ endpoints.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_peek(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<QueuePeekQuery>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    let Some(messaging) = inner.messaging.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response();
+    };
+    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    let limit = q.limit.unwrap_or(10).min(QUEUE_PEEK_MAX);
+    match messaging.peek(&namespaced, limit).await {
+        Ok(msgs) => {
+            use base64::Engine as _;
+            let messages = msgs
+                .into_iter()
+                .map(|m| QueuePeekEntry {
+                    id: m.id,
+                    attempts: m.attempts,
+                    leased: m.leased,
+                    signed_context_present: m.signed_context.is_some(),
+                    payload_b64: base64::engine::general_purpose::STANDARD.encode(m.payload),
+                })
+                .collect();
+            Json(QueuePeekResponse {
+                version: DLQ_VIEW_VERSION,
+                messages,
+            })
+            .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("queue peek failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Operator dead-letter MUTATION (`POST …/_boatramp/dlq`, write): purge / redrive / discard, whole
 /// or filter-selective, with a `dry_run` preview. Site-scoped so an operator only touches their own
 /// site's queues.
