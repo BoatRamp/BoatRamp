@@ -1979,6 +1979,70 @@ mod tests {
         }
     }
 
+    /// A `KvStore` that delegates to an inner [`MemoryKv`] but BLOCKS the first `write_batch` until
+    /// released — so a test can hold one publisher inside the durable commit (holding the group-commit
+    /// gate) while it stages another publisher behind it. `new()` returns the store plus an `entered`
+    /// receiver (fires when the first commit begins) and a `release` sender (unblocks it). Uses
+    /// `futures::channel::oneshot` (core's runtime-agnostic dep; tokio's `sync` isn't enabled here).
+    struct GateKv {
+        inner: MemoryKv,
+        calls: std::sync::atomic::AtomicUsize,
+        entered_tx: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+        release_rx: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+    impl GateKv {
+        fn new() -> (
+            Arc<Self>,
+            futures::channel::oneshot::Receiver<()>,
+            futures::channel::oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+            let (release_tx, release_rx) = futures::channel::oneshot::channel();
+            let kv = Arc::new(Self {
+                inner: MemoryKv::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entered_tx: std::sync::Mutex::new(Some(entered_tx)),
+                release_rx: std::sync::Mutex::new(Some(release_rx)),
+            });
+            (kv, entered_rx, release_tx)
+        }
+    }
+    #[async_trait]
+    impl KvStore for GateKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        async fn write_batch(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            if self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                // Take the receiver OUT of the lock before awaiting (never hold a std guard across await).
+                let rx = self.release_rx.lock().unwrap().take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+            }
+            self.inner.write_batch(ops).await
+        }
+    }
+
     const LEASE: Duration = Duration::from_secs(30);
 
     fn payloads(msgs: &[ClaimedMessage]) -> Vec<Vec<u8>> {
@@ -2665,6 +2729,108 @@ mod tests {
         assert!(
             mq.publish_batch_ctx(&msgs, None).await.is_err(),
             "a failed commit fails the whole batch"
+        );
+    }
+
+    // A4: publish_batch preserves publish order — claim returns the batch in the order it was handed
+    // in (a durable work-queue must not reorder a producer's own batch). JetStream: stream order.
+    #[tokio::test]
+    async fn publish_batch_preserves_publish_order() {
+        let mq = mq();
+        let msgs: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|i| ("t".to_string(), format!("m{i:02}").into_bytes()))
+            .collect();
+        mq.publish_batch_ctx(&msgs, None).await.unwrap();
+        let got = mq.claim("t", LEASE, 100, 5).await.unwrap();
+        assert_eq!(
+            payloads(&got),
+            msgs.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(),
+            "the batch is claimable in publish order"
+        );
+    }
+
+    // A2/A4 op-bounded drain: a single batch whose op count exceeds GROUP_COMMIT_MAX is still taken
+    // WHOLE and committed in ONE write_batch — proves the drain always makes progress on an oversized
+    // single job (the `n > 0` guard) rather than starving it.
+    #[tokio::test]
+    async fn oversized_single_batch_commits_whole_in_one_write_batch() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        // GROUP_COMMIT_MAX + 100 messages = one PublishJob whose op count exceeds the per-turn budget.
+        let n = GROUP_COMMIT_MAX + 100;
+        let msgs: Vec<(String, Vec<u8>)> =
+            (0..n).map(|i| ("t".to_string(), vec![i as u8])).collect();
+        mq.publish_batch_ctx(&msgs, None).await.unwrap();
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            1,
+            "the oversized single batch committed in exactly one write_batch (drain took it whole)"
+        );
+        let mut seen = 0;
+        loop {
+            let b = mq.claim("t", LEASE, 10_000, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen += b.len();
+        }
+        assert_eq!(
+            seen, n,
+            "every message in the oversized batch is durably enqueued"
+        );
+    }
+
+    // A2 durability edge (JetStream-parity: at-least-once never loses an in-flight write): a publisher
+    // CANCELLED after pushing its group-commit job but before taking the gate is still committed by a
+    // LATER gate-holder. A cancelled publish may thus still deliver (the safe direction) — it must
+    // NEVER silently vanish mid-commit.
+    #[tokio::test]
+    async fn cancelled_publisher_is_still_committed_by_a_later_gate_holder() {
+        let (kv, entered_rx, release_tx) = GateKv::new();
+        let mq = Arc::new(LogMessaging::new(Arc::new(MemStorage::default()), kv));
+
+        // Q: a publish that blocks inside its durable commit → holds the group-commit gate.
+        let q = {
+            let mq = mq.clone();
+            tokio::spawn(async move { mq.publish("t", b"Q").await })
+        };
+        entered_rx.await.unwrap(); // Q is now inside write_batch, holding the gate.
+
+        // P: drive one poll so it builds its ops and PUSHES its job, then blocks on the held gate —
+        // then drop the future (cancel P after it enqueued but before it could commit).
+        {
+            let mut p = Box::pin(mq.publish("t", b"P"));
+            let polled = futures::poll!(p.as_mut());
+            assert!(
+                polled.is_pending(),
+                "P pushed its job and is now blocked on the gate Q holds"
+            );
+        } // P dropped — cancelled after pushing.
+
+        // Release Q: it commits its own job; P's job stays queued (its owner is gone).
+        release_tx.send(()).unwrap();
+        q.await.unwrap().unwrap();
+
+        // R: a later publisher drains the queue — including P's orphaned job — and commits both.
+        mq.publish("t", b"R").await.unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let b = mq.claim("t", LEASE, 100, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen.extend(b.into_iter().map(|m| m.payload));
+        }
+        assert!(seen.contains(&b"Q".to_vec()), "Q committed");
+        assert!(seen.contains(&b"R".to_vec()), "R committed");
+        assert!(
+            seen.contains(&b"P".to_vec()),
+            "the cancelled publisher's message was still durably committed (never silently lost)"
         );
     }
 
