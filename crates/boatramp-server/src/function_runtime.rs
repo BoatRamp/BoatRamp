@@ -2086,6 +2086,14 @@ async fn dispatch_function_queue(
         if delivered {
             let _ = messaging.ack(&msg).await;
         } else {
+            // Record a host-classified failure reason (P1/SEC6: never guest body bytes) so it
+            // survives into the dead-letter for `dlq ls/show` + `--match`.
+            let reason = match status {
+                StatusCode::GATEWAY_TIMEOUT => "timeout",
+                StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+                _ => "error",
+            };
+            let _ = messaging.set_last_error(&msg, reason).await;
             let _ = messaging.nack(&msg).await;
         }
     }
