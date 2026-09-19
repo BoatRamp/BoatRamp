@@ -134,6 +134,12 @@ pub enum WriteOp {
         /// an older node's `MqPublish` applies with the payload in object storage as before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inline: Option<Vec<u8>>,
+        /// **Delivery-mode delay** (P2): the absolute unix-ms not-before time; the applied record's
+        /// lease is set to this, so the message isn't claimable until then. `0`/absent = claimable now.
+        /// The issuing node stamps the absolute time (deterministic across replicas). `#[serde(default)]`
+        /// so an older node's `MqPublish` applies as an immediately-claimable publish.
+        #[serde(default)]
+        not_before_ms: u64,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -354,6 +360,7 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             retain,
             signed_context,
             inline,
+            not_before_ms,
         } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
@@ -362,6 +369,8 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 let mut record = messaging::Record::fresh(signed_context);
                 // A3: a small work-queue payload rides IN the replicated record (no object store).
                 record.inline = inline;
+                // Delivery-mode delay (P2): defer first delivery via the lease field (attempts stay 0).
+                record.lease_until_ms = not_before_ms;
                 let fresh = serde_json::to_vec(&record).expect("record serializes");
                 target.put(key, fresh);
             }

@@ -237,6 +237,7 @@ impl RaftMessaging {
         topic: &str,
         payload: &[u8],
         signed_context: Option<&str>,
+        not_before_ms: u64,
     ) -> Result<(String, WriteOp), MessagingError> {
         let id = self.next_id();
         let retain = self.topic_has_groups(topic).await;
@@ -294,6 +295,7 @@ impl RaftMessaging {
                 retain,
                 signed_context: signed_context.map(str::to_owned),
                 inline: inline.then(|| payload.to_vec()),
+                not_before_ms,
             },
         ))
     }
@@ -451,7 +453,7 @@ impl Messaging for RaftMessaging {
         // then commit it in one group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3/SA1/retain decisions and coalesces N messages into one Raft entry.
         let (id, op) = self
-            .build_publish_op(topic, payload, signed_context)
+            .build_publish_op(topic, payload, signed_context, 0)
             .await?;
         // Group-commit (A2): coalesce this MqPublish with other concurrent ones into a single
         // WriteOp::Batch proposal (one Raft round-trip per group). Returns only after the group is
@@ -459,6 +461,28 @@ impl Messaging for RaftMessaging {
         self.group_commit(vec![op]).await?;
         // Live SSE fan-out across the cluster (best-effort, separate from the
         // durable queue): every node's hubs, including this one's.
+        self.bus.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_delayed_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        delay: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Delivery-mode delay (P2): the issuing node stamps the absolute not-before (deterministic
+        // across replicas — the apply just copies it into the record's lease). 0 ⇒ claimable now.
+        let not_before_ms = if delay.is_zero() {
+            0
+        } else {
+            now_unix_ms().saturating_add(delay.as_millis() as u64)
+        };
+        let (id, op) = self
+            .build_publish_op(topic, payload, signed_context, not_before_ms)
+            .await?;
+        self.group_commit(vec![op]).await?;
         self.bus.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -479,7 +503,7 @@ impl Messaging for RaftMessaging {
         let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
         for (topic, payload) in messages {
             let (id, op) = self
-                .build_publish_op(topic, payload, signed_context)
+                .build_publish_op(topic, payload, signed_context, 0)
                 .await?;
             ops.push(op);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
@@ -795,6 +819,7 @@ impl Messaging for RaftMessaging {
                 retain: false,
                 signed_context,
                 inline,
+                not_before_ms: 0, // redrive re-arms immediately claimable
             });
             ops.push(WriteOp::Delete {
                 key: messaging::dead_key(topic, id),
@@ -922,6 +947,7 @@ impl Messaging for RaftMessaging {
                     retain: false,
                     signed_context,
                     inline,
+                    not_before_ms: 0, // redrive re-arms immediately claimable
                 });
                 ops.push(WriteOp::Delete {
                     key: messaging::dead_key(topic, &dl.id),
@@ -1667,6 +1693,46 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         assert_eq!(mq.backlog(topic).await.unwrap(), 0);
+
+        // --- P2 delivery modes: delayed publish (both backends, deterministic deferral) -----------
+        // A far-future delay defers delivery; a no-delay companion flows immediately. (Delivery AFTER
+        // the delay elapses is the same lease-expiry mechanism already covered by lease_expiry tests.)
+        mq.publish_delayed_ctx(topic, b"later", Duration::from_secs(3600), None)
+            .await
+            .unwrap();
+        mq.publish_delayed_ctx(topic, b"now", Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mq.backlog(topic).await.unwrap(),
+            2,
+            "both are durably enqueued (the delayed one counts as pending)"
+        );
+        let ready = mq.claim(topic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            ready.iter().map(|m| m.payload.clone()).collect::<Vec<_>>(),
+            vec![b"now".to_vec()],
+            "only the non-delayed message is claimable; the delayed one is deferred"
+        );
+        mq.ack(&ready[0]).await.unwrap();
+        // Delivery AFTER a short delay elapses (the not-before expiry path): publish with 100ms delay,
+        // confirm it's deferred, wait past it, then it's delivered as the first attempt.
+        mq.publish_delayed_ctx(topic, b"soon", Duration::from_millis(100), None)
+            .await
+            .unwrap();
+        assert!(
+            mq.claim(topic, LEASE, 10, 5).await.unwrap().is_empty(),
+            "still deferred right after publish"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let soon = mq.claim(topic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(soon.len(), 1, "delivered once the delay elapsed");
+        assert_eq!(soon[0].payload, b"soon");
+        assert_eq!(
+            soon[0].attempts, 1,
+            "delayed delivery is still the first attempt"
+        );
+        mq.ack(&soon[0]).await.unwrap();
     }
 
     /// Conformance — **single-node** coordinator (`core::messaging::LogMessaging`).

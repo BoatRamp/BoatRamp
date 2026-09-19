@@ -129,6 +129,23 @@ pub trait Messaging: Send + Sync {
         Ok(())
     }
 
+    /// Publish with a visibility **delay** (P2 delivery modes): the message is durably enqueued now but
+    /// is not claimable until `delay` elapses — scheduled/delayed delivery, and the basis for
+    /// redelivery backoff. `delay == 0` is identical to [`publish_ctx`](Self::publish_ctx). Reuses the
+    /// lease/visibility mechanism: the message's initial not-before is set to `now + delay`, so a claim
+    /// before then skips it exactly as it skips a leased message, and after then delivers it as
+    /// attempt 1. The default drops the delay and delegates to `publish_ctx`; the durable backends
+    /// honor it.
+    async fn publish_delayed_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _delay: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, signed_context).await
+    }
+
     /// Atomically claim up to `max_batch` deliverable messages from `topic`,
     /// leasing each for `lease` (after which an un-acked message is redelivered).
     /// A message that has already been delivered `max_attempts` times is moved to
@@ -1200,6 +1217,7 @@ impl LogMessaging {
         topic: &str,
         payload: &[u8],
         signed_context: Option<&str>,
+        not_before_ms: u64,
     ) -> Result<(String, Vec<WriteOp>), MessagingError> {
         let id = format!(
             "{:013}-{:016x}",
@@ -1240,6 +1258,9 @@ impl LogMessaging {
         // The durable signed-context (R1) rides on the meta record, deleted with it on ack/dead-letter.
         let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
         let mut record = Record::fresh(signed_context.map(str::to_owned));
+        // Delivery-mode delay (P2): a not-before in the future rides the lease field — attempts stay 0,
+        // so a claim before then skips it (leased) and after then delivers it as the first attempt.
+        record.lease_until_ms = not_before_ms;
         if inline {
             record.inline = Some(payload.to_vec());
         }
@@ -1579,7 +1600,7 @@ impl Messaging for LogMessaging {
         // them in one durable group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3-inline / SA1-budget / grouped-retain decisions and coalesces N messages into one commit.
         let (id, ops) = self
-            .build_publish_ops(topic, payload, signed_context)
+            .build_publish_ops(topic, payload, signed_context, 0)
             .await?;
         // Group-commit (A2): concurrent publishes coalesce their index writes into one durable
         // `write_batch`. Returns only after this message's group is durably committed
@@ -1587,6 +1608,29 @@ impl Messaging for LogMessaging {
         // already written by `build_publish_ops` (payload-first), so only the index writes are here.
         self.group_commit(ops).await?;
         // Notify live SSE subscribers (best-effort, separate from the durable queue above).
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_delayed_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        delay: Duration,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Delivery-mode delay (P2): initial not-before = now + delay (0 ⇒ claimable now). The message
+        // is durably committed immediately; the lease field defers its first delivery.
+        let not_before_ms = if delay.is_zero() {
+            0
+        } else {
+            now_unix_ms().saturating_add(delay.as_millis() as u64)
+        };
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, not_before_ms)
+            .await?;
+        self.group_commit(ops).await?;
+        // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
         self.hubs.broadcast(topic, &id, payload);
         Ok(())
     }
@@ -1608,7 +1652,7 @@ impl Messaging for LogMessaging {
         let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
         for (topic, payload) in messages {
             let (id, ops) = self
-                .build_publish_ops(topic, payload, signed_context)
+                .build_publish_ops(topic, payload, signed_context, 0)
                 .await?;
             all_ops.extend(ops);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
@@ -3044,6 +3088,29 @@ mod tests {
         let second = mq.claim("t", LEASE, 10, 5).await.unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].attempts, 2); // redelivered, attempt charged again
+    }
+
+    // P2 delivery modes: a far-future delay defers delivery; a no-delay companion is claimable now.
+    // (Delivery AFTER the delay elapses is exercised in the cluster crate's conformance, which has a
+    // tokio time driver; the mechanism — an expired not-before on an attempts-0 record — is the same
+    // lease-expiry path as `lease_expiry_redelivers`.)
+    #[tokio::test]
+    async fn delayed_publish_defers_until_its_not_before() {
+        let mq = mq();
+        mq.publish_delayed_ctx("t", b"later", Duration::from_secs(3600), None)
+            .await
+            .unwrap();
+        mq.publish_delayed_ctx("t", b"now", Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 2, "both durably enqueued");
+        let ready = mq.claim("t", LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            payloads(&ready),
+            vec![b"now".to_vec()],
+            "delayed one deferred"
+        );
+        assert_eq!(ready[0].attempts, 1);
     }
 
     #[tokio::test]
