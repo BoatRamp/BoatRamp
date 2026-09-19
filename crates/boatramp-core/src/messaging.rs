@@ -1193,37 +1193,55 @@ impl LogMessaging {
     /// already resolved. Returns only after this job's group is durably committed (at-least-once); a
     /// failed group commit fails every member (no partial success). Runtime-agnostic: no spawned task.
     async fn group_commit(&self, ops: Vec<WriteOp>) -> Result<(), MessagingError> {
-        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        use futures::future::{select, Either};
+        let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
         self.commit_queue
             .lock()
             .unwrap()
             .push(PublishJob { ops, done: done_tx });
-        {
-            // Whoever holds the gate is the committer for this turn.
-            let _turn = self.commit_gate.lock().await;
-            // Drain jobs until the per-commit OP budget is met (a batch job carries many ops, so the
-            // bound must be on ops, not jobs — else one turn could build an unbounded `write_batch`).
-            // Always take at least one job so an oversized single batch (already bounded by the host's
-            // PUBLISH_BATCH_MAX) still makes progress. The rest wait for the next turn. An already-empty
-            // queue means an earlier committer flushed our job — fall through to await it.
-            let batch: Vec<PublishJob> = {
-                let mut q = self.commit_queue.lock().unwrap();
-                let mut n = 0;
-                let mut ops = 0;
-                while n < q.len() {
-                    if n > 0 && ops + q[n].ops.len() > GROUP_COMMIT_MAX {
+        // Become the LEADER only if the commit gate is free; otherwise our just-pushed job is
+        // committed by the current leader's drain loop (which re-checks the queue until empty), so a
+        // waiter does NOT serialize through the gate — it simply awaits its durable ack. THIS is what
+        // lets concurrent publishes coalesce in steady state: while one leader's flush is in flight,
+        // every other publisher's job piles up in the queue and the next drain commits them all in one
+        // `write_batch`. The `select` closes the only stranding race — a publisher either wins the gate
+        // (becoming leader and committing its own job) or its `done` fires first (a leader committed
+        // it); it can never both-miss.
+        let gate = self.commit_gate.lock();
+        futures::pin_mut!(gate);
+        match select(gate, &mut done_rx).await {
+            // The current leader durably committed our job while we waited — done.
+            Either::Right((res, _gate)) => {
+                return res
+                    .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
+            }
+            // We hold the gate: drain + commit in a loop until the queue is empty, so a job pushed
+            // during our flush (even after a prior empty check) is never stranded. Our OWN job is in
+            // the queue (or a prior leader already committed it), so it is durable by the time we
+            // release; we then read our outcome from `done_rx` below.
+            Either::Left((_turn, _done)) => loop {
+                let batch: Vec<PublishJob> = {
+                    let mut q = self.commit_queue.lock().unwrap();
+                    if q.is_empty() {
                         break;
                     }
-                    ops += q[n].ops.len();
-                    n += 1;
-                }
-                q.drain(..n).collect()
-            };
-            if !batch.is_empty() {
+                    // Bound the drain on OPS, not jobs (a batch job carries many ops) — else one turn
+                    // could build an unbounded `write_batch`. Always take ≥1 so an oversized single
+                    // batch (host-bounded by PUBLISH_BATCH_MAX) still makes progress.
+                    let mut n = 0;
+                    let mut op_count = 0;
+                    while n < q.len() {
+                        if n > 0 && op_count + q[n].ops.len() > GROUP_COMMIT_MAX {
+                            break;
+                        }
+                        op_count += q[n].ops.len();
+                        n += 1;
+                    }
+                    q.drain(..n).collect()
+                };
                 let mut all_ops = Vec::new();
                 let mut dones = Vec::with_capacity(batch.len());
-                for job in batch {
-                    let mut job = job;
+                for mut job in batch {
                     all_ops.append(&mut job.ops);
                     dones.push(job.done);
                 }
@@ -1237,9 +1255,10 @@ impl LogMessaging {
                     // durably committed; at-least-once/redelivery is unaffected.
                     let _ = done.send(outcome.clone());
                 }
-            }
+            },
         }
-        // Our own outcome: signalled by whichever committer flushed our job (possibly us).
+        // We were the leader; our own job was committed in the drain loop above (or by a prior leader
+        // before we acquired the gate). Read the outcome our commit recorded.
         done_rx
             .await
             .map_err(|_| MessagingError::backend("group-commit dropped before durable"))?
