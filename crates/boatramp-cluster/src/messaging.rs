@@ -165,35 +165,53 @@ impl RaftMessaging {
     /// failed proposal fails every member. Same self-bounded, no-spawn pattern as
     /// `LogMessaging::group_commit`.
     async fn group_commit(&self, ops: Vec<WriteOp>) -> Result<(), MessagingError> {
-        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        use futures::future::{select, Either};
+        let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
         self.commit_queue
             .lock()
             .unwrap()
             .push(ClusterPublishJob { ops, done: done_tx });
-        {
-            let _turn = self.commit_gate.lock().await;
-            // Drain jobs until the per-commit OP budget is met (a batch job carries many ops, so the
-            // bound is on ops, not jobs — else one turn could build an unbounded Raft entry). Always
-            // take at least one job so an oversized single batch (bounded by the host's
-            // PUBLISH_BATCH_MAX) still makes progress.
-            let batch: Vec<ClusterPublishJob> = {
-                let mut q = self.commit_queue.lock().unwrap();
-                let mut n = 0;
-                let mut count = 0;
-                while n < q.len() {
-                    if n > 0 && count + q[n].ops.len() > GROUP_COMMIT_MAX {
+        // Leader-only gate (mirrors `LogMessaging::group_commit`): a waiter awaits its durable ack
+        // WITHOUT taking the gate, so concurrent publishes pile up during the in-flight Raft propose
+        // and the leader's drain loop coalesces them into ONE `WriteOp::Batch`. A Raft round-trip is
+        // even costlier than a local flush, so steady-state coalescing matters more here. The `select`
+        // closes the only stranding race — a publisher either wins the gate (leader, proposes its own
+        // job) or its `done` fires first (a leader proposed it); it can never both-miss.
+        let gate = self.commit_gate.lock();
+        futures::pin_mut!(gate);
+        match select(gate, &mut done_rx).await {
+            // The current leader replicated our job while we waited — done.
+            Either::Right((res, _gate)) => {
+                return res.map_err(|_| {
+                    MessagingError::Backend("group-commit dropped before durable".into())
+                })?
+            }
+            // We hold the gate: drain + propose in a loop until the queue is empty, so a job pushed
+            // during our propose (even after a prior empty check) is never stranded.
+            Either::Left((_turn, _done)) => loop {
+                // Drain jobs until the per-commit OP budget is met (a batch job carries many ops, so
+                // the bound is on ops, not jobs — else one turn could build an unbounded Raft entry).
+                // Always take at least one so an oversized single batch (host-bounded by
+                // PUBLISH_BATCH_MAX) still makes progress.
+                let batch: Vec<ClusterPublishJob> = {
+                    let mut q = self.commit_queue.lock().unwrap();
+                    if q.is_empty() {
                         break;
                     }
-                    count += q[n].ops.len();
-                    n += 1;
-                }
-                q.drain(..n).collect()
-            };
-            if !batch.is_empty() {
+                    let mut n = 0;
+                    let mut count = 0;
+                    while n < q.len() {
+                        if n > 0 && count + q[n].ops.len() > GROUP_COMMIT_MAX {
+                            break;
+                        }
+                        count += q[n].ops.len();
+                        n += 1;
+                    }
+                    q.drain(..n).collect()
+                };
                 let mut ops = Vec::with_capacity(batch.len());
                 let mut dones = Vec::with_capacity(batch.len());
-                for job in batch {
-                    let mut job = job;
+                for mut job in batch {
                     ops.append(&mut job.ops);
                     dones.push(job.done);
                 }
@@ -207,7 +225,7 @@ impl RaftMessaging {
                     // Clone the shared outcome to every member (fail-all on a failed proposal).
                     let _ = done.send(outcome.clone());
                 }
-            }
+            },
         }
         done_rx
             .await
