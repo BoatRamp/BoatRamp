@@ -17,7 +17,13 @@ mod generated {
         path: "wit",
         world: "boatramp:handlers/messaging-host",
         async: {
-            only_imports: ["publish", "publish-batch", "publish-delayed", "publish-with-ttl"],
+            only_imports: [
+                "publish",
+                "publish-batch",
+                "publish-delayed",
+                "publish-with-ttl",
+                "publish-with-priority",
+            ],
         },
     });
 }
@@ -167,6 +173,24 @@ impl messaging_producer::Host for MessagingHost<'_> {
                 std::time::Duration::from_millis(ttl_ms),
                 signed_context.as_deref(),
             )
+            .await
+            .map_err(|err| messaging_types::Error::Other(err.to_string()))
+    }
+
+    async fn publish_with_priority(
+        &mut self,
+        topic: String,
+        data: Vec<u8>,
+        priority: u8,
+    ) -> Result<(), messaging_types::Error> {
+        let Some(binding) = self.binding else {
+            return Err(messaging_types::Error::AccessDenied);
+        };
+        let namespaced = binding.namespace(&topic);
+        let signed_context = binding.current_context();
+        binding
+            .messaging
+            .publish_with_priority_ctx(&namespaced, &data, priority, signed_context.as_deref())
             .await
             .map_err(|err| messaging_types::Error::Other(err.to_string()))
     }
@@ -483,6 +507,29 @@ mod tests {
         let mut host = MessagingHost::new(None);
         let err = host
             .publish_with_ttl("orders/created".into(), b"x".to_vec(), 1000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, messaging_types::Error::AccessDenied));
+    }
+
+    #[tokio::test]
+    async fn publish_with_priority_namespaces_and_stamps_context() {
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding_with_context(backend.clone(), Some("ctx-p".to_string()));
+        let mut host = MessagingHost::new(Some(&binding));
+        host.publish_with_priority("orders/created".into(), b"urgent".to_vec(), 9)
+            .await
+            .unwrap();
+        let published = backend.published.lock().unwrap();
+        assert_eq!(published[0].0, "blog/production/orders/created");
+        assert_eq!(published[0].2.as_deref(), Some("ctx-p"));
+    }
+
+    #[tokio::test]
+    async fn ungranted_publish_with_priority_is_denied() {
+        let mut host = MessagingHost::new(None);
+        let err = host
+            .publish_with_priority("orders/created".into(), b"x".to_vec(), 5)
             .await
             .unwrap_err();
         assert!(matches!(err, messaging_types::Error::AccessDenied));

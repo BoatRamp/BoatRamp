@@ -388,6 +388,10 @@ interface messaging-producer {
   /// message is dead-lettered (reason `ttl-expired`) instead of delivered — for
   /// time-sensitive work that is worthless if stale. `ttl-ms == 0` = no expiry.
   publish-with-ttl: func(topic: string, data: list<u8>, ttl-ms: u64) -> result<_, error>;
+
+  /// Publish `data` to `topic` with a delivery PRIORITY: higher `priority` is
+  /// delivered before lower, FIFO within a priority. `priority == 0` = normal.
+  publish-with-priority: func(topic: string, data: list<u8>, priority: u8) -> result<_, error>;
 }
 
 /// The consumer half: the host calls `handle` once per delivered message. A

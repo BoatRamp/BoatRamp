@@ -161,6 +161,20 @@ pub trait Messaging: Send + Sync {
         self.publish_ctx(topic, payload, signed_context).await
     }
 
+    /// Publish with a **priority** (P2 delivery modes): higher-priority messages are leased first, with
+    /// FIFO among equal priorities. `priority == 0` is normal (identical to [`publish_ctx`](Self::
+    /// publish_ctx)). Work-queue only. The default drops the priority and delegates; the durable
+    /// backends honor it via the record's `priority`, ordered in [`plan_claim`].
+    async fn publish_with_priority_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        _priority: u8,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        self.publish_ctx(topic, payload, signed_context).await
+    }
+
     /// Atomically claim up to `max_batch` deliverable messages from `topic`,
     /// leasing each for `lease` (after which an un-acked message is redelivered).
     /// A message that has already been delivered `max_attempts` times is moved to
@@ -454,6 +468,17 @@ pub struct Record {
     /// its next claim. Elided when `0` (`skip_serializing_if`) so pre-TTL records stay byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub expires_at_ms: u64,
+    /// **Delivery priority** (P2 delivery modes): higher is delivered first; ties break by id (so it
+    /// is priority-then-FIFO). `0` = normal (the default — every message equal ⇒ pure FIFO, so
+    /// pre-priority behavior is unchanged). Work-queue only (grouped fan-out is append-log-ordered).
+    /// Elided when `0` (`skip_serializing_if`) so pre-priority records stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub priority: u8,
+}
+
+/// serde `skip_serializing_if` for a `u8` elided when `0` (keeps pre-priority records byte-identical).
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 /// serde `skip_serializing_if` for a `u64` that is elided when `0` (keeps pre-TTL records byte-identical).
@@ -531,6 +556,7 @@ impl Record {
             inline: None,
             last_error: None,
             expires_at_ms: 0,
+            priority: 0,
         }
     }
 }
@@ -702,8 +728,10 @@ pub fn plan_claim(
     max_batch: usize,
     max_attempts: u32,
 ) -> Vec<ClaimAction> {
-    // Lexical order on `{millis}-{...}` ids ≈ publish order (best-effort FIFO).
-    records.sort_by(|a, b| a.0.cmp(&b.0));
+    // Priority-then-FIFO: higher `priority` leases first; ties break by id (lexical `{millis}-{...}`
+    // ≈ publish order). All-default priority (0) ⇒ pure best-effort FIFO (unchanged). Deterministic
+    // (a total order), so every replica computes the same lease sequence.
+    records.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
     let mut actions = Vec::new();
     let mut leased = 0;
     for (id, mut record) in records {
@@ -1254,6 +1282,7 @@ impl LogMessaging {
         signed_context: Option<&str>,
         not_before_ms: u64,
         expires_at_ms: u64,
+        priority: u8,
     ) -> Result<(String, Vec<WriteOp>), MessagingError> {
         let id = format!(
             "{:013}-{:016x}",
@@ -1299,6 +1328,8 @@ impl LogMessaging {
         record.lease_until_ms = not_before_ms;
         // Delivery-mode TTL (P2): 0 = no expiry; else the absolute time after which claim dead-letters it.
         record.expires_at_ms = expires_at_ms;
+        // Delivery-mode priority (P2): 0 = normal; higher leases first (ties FIFO by id).
+        record.priority = priority;
         if inline {
             record.inline = Some(payload.to_vec());
         }
@@ -1638,7 +1669,7 @@ impl Messaging for LogMessaging {
         // them in one durable group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3-inline / SA1-budget / grouped-retain decisions and coalesces N messages into one commit.
         let (id, ops) = self
-            .build_publish_ops(topic, payload, signed_context, 0, 0)
+            .build_publish_ops(topic, payload, signed_context, 0, 0, 0)
             .await?;
         // Group-commit (A2): concurrent publishes coalesce their index writes into one durable
         // `write_batch`. Returns only after this message's group is durably committed
@@ -1665,7 +1696,7 @@ impl Messaging for LogMessaging {
             now_unix_ms().saturating_add(delay.as_millis() as u64)
         };
         let (id, ops) = self
-            .build_publish_ops(topic, payload, signed_context, not_before_ms, 0)
+            .build_publish_ops(topic, payload, signed_context, not_before_ms, 0, 0)
             .await?;
         self.group_commit(ops).await?;
         // A delayed message isn't live yet; still notify SSE (best-effort) so a live tail sees it.
@@ -1688,7 +1719,23 @@ impl Messaging for LogMessaging {
             now_unix_ms().saturating_add(ttl.as_millis() as u64)
         };
         let (id, ops) = self
-            .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms)
+            .build_publish_ops(topic, payload, signed_context, 0, expires_at_ms, 0)
+            .await?;
+        self.group_commit(ops).await?;
+        self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_with_priority_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        priority: u8,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Delivery-mode priority (P2): higher leases first (ties FIFO); 0 = normal. Work-queue only.
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context, 0, 0, priority)
             .await?;
         self.group_commit(ops).await?;
         self.hubs.broadcast(topic, &id, payload);
@@ -1712,7 +1759,7 @@ impl Messaging for LogMessaging {
         let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
         for (topic, payload) in messages {
             let (id, ops) = self
-                .build_publish_ops(topic, payload, signed_context, 0, 0)
+                .build_publish_ops(topic, payload, signed_context, 0, 0, 0)
                 .await?;
             all_ops.extend(ops);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
@@ -1879,6 +1926,8 @@ impl Messaging for LogMessaging {
                 last_error: None,
                 // A dead-letter is terminal — no further expiry.
                 expires_at_ms: 0,
+                // Grouped is append-log-ordered; priority is a work-queue concept.
+                priority: 0,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -3208,6 +3257,39 @@ mod tests {
         assert!(
             matches!(&actions[1], ClaimAction::Lease { .. }),
             "the live message leases normally"
+        );
+    }
+
+    // P2 delivery-mode priority: plan_claim leases higher priority first, FIFO within a priority.
+    // Pure + deterministic (a total sort order → same lease sequence on every replica).
+    #[test]
+    fn plan_claim_orders_by_priority_then_fifo() {
+        let hi = Record {
+            priority: 5,
+            ..Record::fresh(None)
+        };
+        let actions = plan_claim(
+            vec![
+                ("0000000000001-a".to_string(), Record::fresh(None)), // id 1, prio 0
+                ("0000000000002-b".to_string(), hi),                  // id 2, prio 5
+                ("0000000000003-c".to_string(), Record::fresh(None)), // id 3, prio 0
+            ],
+            1_000,
+            30_000,
+            10,
+            5,
+        );
+        let leased: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ClaimAction::Lease { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leased,
+            vec!["0000000000002-b", "0000000000001-a", "0000000000003-c"],
+            "high-priority b leases first, then a & c FIFO within the default priority"
         );
     }
 
