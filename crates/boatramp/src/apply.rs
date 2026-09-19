@@ -946,6 +946,7 @@ mod tests {
                 sources,
                 read,
                 write,
+                ..
             } => {
                 assert_eq!(column, "tenant_id");
                 assert_eq!(

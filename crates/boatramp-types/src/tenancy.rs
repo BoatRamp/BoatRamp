@@ -355,6 +355,22 @@ pub enum Tenancy {
         /// Which tenant-set writes may reach (default [`AccessMode::Own`]).
         #[serde(default = "default_own")]
         write: AccessMode,
+        /// **Authorized site-ceiling exception** (task #470, the three-key model). When `true`, this
+        /// route's `read`/`write` may EXCEED (widen beyond) the site's [`tenancy`
+        /// ceiling](crate::config::HandlersSiteConfig::tenancy) — but the exception takes effect ONLY
+        /// when the site has ALSO set
+        /// [`allow_ceiling_exceptions`](crate::config::HandlersSiteConfig::allow_ceiling_exceptions)
+        /// (key 1, the baseline-definer's affirmative permission) AND the operator posture permits
+        /// `all` (key 3, [`allow_cross_tenant_db`], enforced at runtime by `cap()`). It is a SEPARATE
+        /// sub-field from `read`/`write` on purpose: a bare `read: all` WITHOUT this token still fails
+        /// closed, so a config mistake never widens — the widen must be typed deliberately. Being a
+        /// `Scoped`-variant sub-field, it can ONLY ever authorize a `Scoped`→`Scoped` read/write
+        /// widening (same tenant column, up to `all`); it structurally cannot authorize a switch to
+        /// [`Disabled`](Self::Disabled) or an own↔target axis change — those escape the posture
+        /// backstop and stay refused. Elided when `false`, so a pre-#470 config serializes
+        /// byte-identically. Enforced at bind via [`narrows_within_authorized`](Self::narrows_within_authorized).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exceed_site_ceiling: bool,
     },
     /// **Target** (R4/D8): this route/handler reads (and, with a `write` grant, writes) a SECOND
     /// tenant `B`'s PUBLIC subset (never the caller's own). The non-federated (plain-wasm) analog of
@@ -456,6 +472,38 @@ impl Tenancy {
             // Any own-vs-target axis mismatch across the ceiling is a misdeclaration — refuse.
             _ => false,
         }
+    }
+
+    /// The **authorized-exception** form of [`narrows_within`](Self::narrows_within) (task #470,
+    /// three-key model): honors a per-route ceiling exception. A widening that [`narrows_within`]
+    /// would refuse is permitted here ONLY when the ROUTE (`self`) is
+    /// [`Scoped`](Self::Scoped)`{ exceed_site_ceiling: true }` (key 2, the deployer's opt-in) AND the
+    /// SITE has enabled exceptions (`site_allows_exceptions`, key 1) — and even then only a
+    /// `Scoped`→`Scoped` read/write widening on the SAME tenant column. It can never authorize a
+    /// `Scoped`→[`Disabled`](Self::Disabled) widening, an own↔target axis switch, or a tenant-column
+    /// change — those stay refused, so the operator posture (key 3, `cap()`) remains the SOLE
+    /// authority over whether an `all` grant actually crosses tenants at runtime. The tokens relax
+    /// only THIS shape check; they never thread into `cap()`.
+    ///
+    /// With either key absent this is byte-identical to [`narrows_within`](Self::narrows_within) —
+    /// a bare widening still fails closed, a route token under a non-permitting site is inert, and a
+    /// permitting site with no tokened route changes nothing.
+    pub fn narrows_within_authorized(&self, ceiling: &Self, site_allows_exceptions: bool) -> bool {
+        use Tenancy::*;
+        // A genuine narrowing (or equal) needs no exception — always allowed.
+        if self.narrows_within(ceiling) {
+            return true;
+        }
+        // The ONLY widening the exception authorizes: a tokened Scoped route under a Scoped ceiling on
+        // the SAME column, when the site permits exceptions. `read`/`write` may then widen up to `all`
+        // (still posture-gated at runtime). Anything else stayed `false` above.
+        matches!(
+            (self, ceiling),
+            (
+                Scoped { exceed_site_ceiling: true, column: c, .. },
+                Scoped { column: cc, .. },
+            ) if site_allows_exceptions && c == cc
+        )
     }
 }
 
@@ -839,6 +887,7 @@ mod tests {
                 sources: vec![TenantSource::None],
                 read: AccessMode::Own,
                 write: AccessMode::Own,
+                exceed_site_ceiling: false,
             }
         );
         assert!(t.is_scoped());
@@ -919,6 +968,7 @@ mod tests {
             sources: vec![TenantSource::Domain],
             read: AccessMode::OwnOrNull,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         let s = serde_json::to_string(&t).unwrap();
         assert_eq!(t, serde_json::from_str::<Tenancy>(&s).unwrap());
@@ -1062,6 +1112,27 @@ mod tests {
             }],
             read,
             write,
+            exceed_site_ceiling: false,
+        }
+    }
+
+    /// A `Scoped` route that carries the #470 ceiling-exception token (key 2).
+    fn scoped_exceeding(read: AccessMode, write: AccessMode) -> Tenancy {
+        match scoped(read, write) {
+            Tenancy::Scoped {
+                column,
+                sources,
+                read,
+                write,
+                ..
+            } => Tenancy::Scoped {
+                column,
+                sources,
+                read,
+                write,
+                exceed_site_ceiling: true,
+            },
+            _ => unreachable!(),
         }
     }
 
@@ -1081,8 +1152,68 @@ mod tests {
             sources: vec![TenantSource::None],
             read: Own,
             write: Own,
+            exceed_site_ceiling: false,
         }
         .narrows_within(&scoped(All, All)));
+    }
+
+    #[test]
+    fn tenancy_authorized_ceiling_exception() {
+        use AccessMode::*;
+        let ceiling = scoped(Own, Own); // an `own` site ceiling.
+
+        // Key model — a widening (`own` → `all` read/write) needs BOTH deployer keys:
+        // (a) bare widening, no token: refused whether or not the site permits exceptions.
+        assert!(!scoped(All, All).narrows_within_authorized(&ceiling, true));
+        assert!(!scoped(All, All).narrows_within_authorized(&ceiling, false));
+        // (b) tokened route but site does NOT permit exceptions (key 1 absent): inert → refused.
+        assert!(!scoped_exceeding(All, All).narrows_within_authorized(&ceiling, false));
+        // (c) BOTH keys present: the Scoped→Scoped read/write widening is authorized.
+        assert!(scoped_exceeding(All, All).narrows_within_authorized(&ceiling, true));
+        assert!(scoped_exceeding(All, Own).narrows_within_authorized(&ceiling, true));
+
+        // A genuine narrowing never needs the token, and the token is harmless when unused.
+        assert!(scoped(Own, Own).narrows_within_authorized(&ceiling, true));
+        assert!(scoped_exceeding(Own, Own).narrows_within_authorized(&ceiling, true));
+
+        // The exception is confined to the Scoped→Scoped axis on the SAME column:
+        // - a different tenant column stays refused even with both keys.
+        let other_col = match scoped_exceeding(All, All) {
+            Tenancy::Scoped {
+                sources,
+                read,
+                write,
+                exceed_site_ceiling,
+                ..
+            } => Tenancy::Scoped {
+                column: "org_id".into(),
+                sources,
+                read,
+                write,
+                exceed_site_ceiling,
+            },
+            _ => unreachable!(),
+        };
+        assert!(!other_col.narrows_within_authorized(&ceiling, true));
+        // - it cannot authorize removing scoping (Scoped→... via Disabled): a Disabled route carries
+        //   no token at all, and a Disabled ceiling makes everything within regardless.
+        assert!(!Tenancy::Disabled.narrows_within_authorized(&ceiling, true));
+        // - it cannot bridge an own↔target axis mismatch even with the site permitting exceptions.
+        let target = Tenancy::Target {
+            via: vec![TargetSource::Domain],
+            public: "storefront".into(),
+            write: vec![],
+            null_base: false,
+        };
+        assert!(!target.narrows_within_authorized(&ceiling, true));
+        assert!(!scoped_exceeding(All, All).narrows_within_authorized(&target, true));
+
+        // With both keys absent, it is byte-identical to `narrows_within` (a bare widening fails
+        // closed), so the default posture is unchanged.
+        assert_eq!(
+            scoped(All, All).narrows_within_authorized(&ceiling, false),
+            scoped(All, All).narrows_within(&ceiling),
+        );
     }
 
     #[test]
@@ -1115,6 +1246,7 @@ mod tests {
             sources: vec![TenantSource::SignedContext],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         assert!(ctx.declares_signed_context());
         let mixed = Tenancy::Scoped {
@@ -1127,6 +1259,7 @@ mod tests {
             ],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         assert!(mixed.declares_signed_context());
         let no_ctx = Tenancy::Scoped {
@@ -1134,6 +1267,7 @@ mod tests {
             sources: vec![TenantSource::None],
             read: AccessMode::Null,
             write: AccessMode::Null,
+            exceed_site_ceiling: false,
         };
         assert!(!no_ctx.declares_signed_context());
         assert!(!Tenancy::Disabled.declares_signed_context());
@@ -1172,6 +1306,7 @@ mod tests {
                 sources,
                 read,
                 write,
+                ..
             } => {
                 assert_eq!(column, "tenant_id");
                 assert_eq!(
