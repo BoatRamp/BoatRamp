@@ -313,6 +313,13 @@ mod inline_b64 {
 /// index bloat. (SA1 aggregate-cap-with-fallback is a documented pre-release hardening.)
 pub const INLINE_MAX: usize = 4096;
 
+/// Aggregate cap (SA1): total inline-payload bytes a node keeps in-flight before new publishes fall
+/// back to the object-store path — so a stuck consumer + small-message flood can't grow the durable
+/// index (and the replicated Raft log/snapshots) without bound. Sized so the worst-case inline
+/// footprint stays modest (32 MiB ≈ 8k messages at `INLINE_MAX`); large-blob loads are unaffected
+/// (they never inline). A soft, per-node guard (see [`LogMessaging::inline_inflight_bytes`]).
+pub const INLINE_INFLIGHT_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 impl Record {
     /// A freshly-published record: never delivered, claimable immediately, carrying the optional
     /// host-minted signed-context envelope stamped from the producer's own-tenant.
@@ -737,6 +744,19 @@ pub struct LogMessaging {
     /// pays nothing extra). `None` until lazily loaded from the persisted
     /// group-state registry on first use.
     grouped_topics: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
+    /// Approximate count of inline-payload bytes currently in-flight on this node (A3/SA1): the
+    /// aggregate-inline budget. Incremented when a publish inlines, decremented when an inline
+    /// message is acked. Once it reaches [`INLINE_INFLIGHT_MAX_BYTES`] a publish falls back to the
+    /// object-store path — so a stuck consumer + small-message flood can't grow the durable index
+    /// (and the Raft log/snapshots in a cluster) unbounded. Deliberately a soft guard: it only
+    /// **over**-counts (a dead-lettered/purged inline record isn't decremented until acked, and a
+    /// restart resets it to `0` — under-count is bounded to one budget-worth of pre-existing inline),
+    /// and over-counting is the SAFE direction (it just falls back to object storage sooner).
+    inline_inflight_bytes: std::sync::atomic::AtomicUsize,
+    /// The aggregate-inline budget in bytes (default [`INLINE_INFLIGHT_MAX_BYTES`]); a publish inlines
+    /// only while `inline_inflight_bytes` stays under it, else falls back to object storage. Tunable
+    /// via [`with_inline_budget`](Self::with_inline_budget).
+    inline_budget_bytes: usize,
 }
 
 /// How long a grouped topic retains a message (its log + payload) before the
@@ -765,7 +785,18 @@ impl LogMessaging {
             seq: AtomicU64::new(0),
             hubs: StreamHubs::new(),
             grouped_topics: std::sync::Mutex::new(None),
+            inline_inflight_bytes: std::sync::atomic::AtomicUsize::new(0),
+            inline_budget_bytes: INLINE_INFLIGHT_MAX_BYTES,
         }
+    }
+
+    /// Set the aggregate-inline byte budget (SA1) — the total inline-payload bytes this node keeps
+    /// in-flight before publishes fall back to object storage. Defaults to
+    /// [`INLINE_INFLIGHT_MAX_BYTES`]; lower it on a memory-tight node (or in tests).
+    #[must_use]
+    pub fn with_inline_budget(mut self, bytes: usize) -> Self {
+        self.inline_budget_bytes = bytes;
+        self
     }
 
     /// Whether `topic` has ≥1 registered consumer group (so `publish` retains the
@@ -1047,7 +1078,19 @@ impl Messaging for LogMessaging {
         // reads) and only up to `INLINE_MAX` (larger payloads take the object-store path — boatramp's
         // large-blob strength). Otherwise: payload first to object storage, then the index record —
         // so the record never references a missing payload.
-        let inline = !retain && payload.len() <= INLINE_MAX;
+        // SA1: only inline while under the aggregate in-flight budget; past it, fall back to the
+        // object-store path so a stuck consumer can't grow the durable index unbounded.
+        let inline = !retain
+            && payload.len() <= INLINE_MAX
+            && self
+                .inline_inflight_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(payload.len())
+                <= self.inline_budget_bytes;
+        if inline {
+            self.inline_inflight_bytes
+                .fetch_add(payload.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         if !inline {
             let bytes = bytes::Bytes::copy_from_slice(payload);
             let body = futures::stream::once(async move { Ok(bytes) }).boxed();
@@ -1310,8 +1353,17 @@ impl Messaging for LogMessaging {
             .await
             .map_err(MessagingError::backend)?;
         // A3: an inlined payload lived IN the record just deleted — no object-store object exists, so
-        // skip the delete (avoids a wasted object-store round-trip, the whole point of inlining).
-        if !msg.inline {
+        // skip the delete (avoids a wasted object-store round-trip, the whole point of inlining), and
+        // release its bytes from the SA1 aggregate-inline budget.
+        if msg.inline {
+            // Saturating (never wrap on underflow — a post-restart ack of a pre-restart inline
+            // message would otherwise underflow the counter and wedge the budget at "full").
+            let _ = self.inline_inflight_bytes.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| Some(v.saturating_sub(msg.payload.len())),
+            );
+        } else {
             self.storage
                 .delete(&payload_key(&msg.topic, &msg.id))
                 .await
@@ -2255,6 +2307,41 @@ mod tests {
         assert!(
             storage.head(&payload_key("t", &m[0].id)).await.is_ok(),
             "large payload lives in object storage"
+        );
+    }
+
+    // SA1: the aggregate-inline budget bounds inline bytes in-flight — past it, publishes fall back
+    // to the object-store path; acking an inline message frees budget so later publishes inline again.
+    #[tokio::test]
+    async fn inline_budget_falls_back_to_object_store_when_exhausted() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        // Budget = 10 bytes: the first 5-byte payload inlines; the second would exceed it → object store.
+        let mq = LogMessaging::new(storage.clone(), kv).with_inline_budget(10);
+        mq.publish("t", b"aaaaa").await.unwrap(); // 5 bytes inline (5 <= 10)
+        mq.publish("t", b"bbbbb").await.unwrap(); // 5 + 5 = 10 <= 10 → inline
+        mq.publish("t", b"ccccc").await.unwrap(); // 10 + 5 = 15 > 10 → object store
+        let got = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(got.len(), 3);
+        let inline_count = got.iter().filter(|m| m.inline).count();
+        assert_eq!(
+            inline_count, 2,
+            "budget admitted exactly two inline messages"
+        );
+        // The third rode object storage.
+        let obj = got.iter().find(|m| !m.inline).unwrap();
+        assert!(
+            storage.head(&payload_key("t", &obj.id)).await.is_ok(),
+            "the over-budget message fell back to the object store"
+        );
+        // Ack an inline message → frees budget → a new small publish inlines again.
+        let inline_msg = got.iter().find(|m| m.inline).unwrap().clone();
+        mq.ack(&inline_msg).await.unwrap();
+        mq.publish("t", b"ddddd").await.unwrap();
+        let more = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert!(
+            more.iter().any(|m| m.payload == b"ddddd" && m.inline),
+            "after ack freed budget, the next small publish inlines again"
         );
     }
 

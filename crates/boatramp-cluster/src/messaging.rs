@@ -22,7 +22,7 @@
 //! to any node sees events published on any node. Cron single-firing keys off
 //! Raft leadership ([`crate::raft::is_leader`]).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -97,6 +97,12 @@ pub struct RaftMessaging {
     hubs: Arc<StreamHubs>,
     /// Cross-node live-stream delivery (every node's hubs); called on publish.
     bus: Arc<dyn StreamBus>,
+    /// Approximate inline-payload bytes this node has in-flight (A3/SA1 aggregate budget): once it
+    /// reaches [`messaging::INLINE_INFLIGHT_MAX_BYTES`] a publish falls back to object storage, so a
+    /// small-message flood can't grow the replicated Raft log/snapshots unbounded. Soft, per-node
+    /// (only over-counts — the safe direction; a fully cluster-consistent cap would be a deterministic
+    /// state-machine counter, a further hardening).
+    inline_inflight_bytes: AtomicUsize,
 }
 
 impl RaftMessaging {
@@ -119,6 +125,7 @@ impl RaftMessaging {
             seq: AtomicU64::new(0),
             hubs,
             bus,
+            inline_inflight_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -241,7 +248,19 @@ impl Messaging for RaftMessaging {
         // object every group reads) and only up to `INLINE_MAX` (larger ⇒ object store). Otherwise:
         // payload to shared storage FIRST, then the index proposal — the replicated record never
         // references a missing payload.
-        let inline = !retain && payload.len() <= messaging::INLINE_MAX;
+        // SA1: only inline while under the aggregate in-flight budget (past it, object-store path),
+        // so a small-message flood can't grow the replicated log/snapshots unbounded.
+        let inline = !retain
+            && payload.len() <= messaging::INLINE_MAX
+            && self
+                .inline_inflight_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(payload.len())
+                <= messaging::INLINE_INFLIGHT_MAX_BYTES;
+        if inline {
+            self.inline_inflight_bytes
+                .fetch_add(payload.len(), Ordering::Relaxed);
+        }
         if !inline {
             let bytes = bytes::Bytes::copy_from_slice(payload);
             let body = futures::stream::once(async move { Ok(bytes) }).boxed();
@@ -405,7 +424,15 @@ impl Messaging for RaftMessaging {
             id: msg.id.clone(),
         })
         .await?;
-        if !msg.inline {
+        if msg.inline {
+            // Release the inline bytes from the SA1 budget (saturating — never wrap on a post-restart
+            // ack of a pre-restart inline message).
+            let _ = self.inline_inflight_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(msg.payload.len())),
+            );
+        } else {
             self.storage
                 .delete(&messaging::payload_key(&msg.topic, &msg.id))
                 .await
