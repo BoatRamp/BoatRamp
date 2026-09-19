@@ -327,6 +327,19 @@ pub trait Messaging: Send + Sync {
         Ok(())
     }
 
+    /// **Pause / resume** a topic (P2 flow control `queue pause|resume|drain`). While paused, `claim`
+    /// and `claim_grouped` deliver NOTHING (new deliveries suppressed) — publish still durably
+    /// enqueues, and in-flight leases still ack/nack/expire, so "drain" = pause + let outstanding
+    /// finish. An operator backpressure/maintenance control. Default no-op.
+    async fn set_paused(&self, _topic: &str, _paused: bool) -> Result<(), MessagingError> {
+        Ok(())
+    }
+
+    /// Whether `topic` is currently paused (P2 flow control) — for stats/CLI. Default `false`.
+    async fn is_paused(&self, _topic: &str) -> Result<bool, MessagingError> {
+        Ok(false)
+    }
+
     /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
     /// every consumer group has already consumed (a message below every group's
     /// high-water with none holding it in-flight), with an age-based TTL backstop.
@@ -687,6 +700,11 @@ pub fn dead_key(topic: &str, id: &str) -> String {
 /// KV/state prefix for a topic's dead-lettered records.
 pub fn dead_prefix(topic: &str) -> String {
     format!("mqdead/{topic}/")
+}
+/// KV/state key for a topic's **pause** flag (P2 flow control): its existence = paused (new
+/// deliveries suppressed; publish + in-flight ack/nack unaffected). A tiny marker; absent = flowing.
+pub fn pause_key(topic: &str) -> String {
+    format!("mqpause/{topic}")
 }
 
 // --- consumer-group (durable fan-out) keyspace: the offset-log model ---
@@ -1609,6 +1627,10 @@ impl Messaging for LogMessaging {
         max_batch: usize,
         max_attempts: u32,
     ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+        // Flow control (P2): a paused topic delivers nothing (publish + in-flight ack/nack unaffected).
+        if self.is_paused(topic).await? {
+            return Ok(Vec::new());
+        }
         // Single-writer: only one claim runs at a time, so a message is leased
         // to exactly one consumer (the per-process coordinator — a cluster swaps
         // this mutex for the Raft leader applying the same `plan_claim`).
@@ -1698,6 +1720,10 @@ impl Messaging for LogMessaging {
         // The default group is the legacy work-queue (unchanged, released format).
         if group.is_empty() {
             return self.claim(topic, lease, max_batch, max_attempts).await;
+        }
+        // Flow control (P2): a paused topic delivers nothing to any group.
+        if self.is_paused(topic).await? {
+            return Ok(Vec::new());
         }
         let _guard = self.claim_lock.lock().await;
         let now = now_unix_ms();
@@ -2456,6 +2482,31 @@ impl Messaging for LogMessaging {
             .await
             .map_err(MessagingError::backend)?;
         Ok(())
+    }
+
+    async fn set_paused(&self, topic: &str, paused: bool) -> Result<(), MessagingError> {
+        let key = pause_key(topic);
+        if paused {
+            self.kv
+                .put(&key, Vec::new())
+                .await
+                .map_err(MessagingError::backend)?;
+        } else {
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        Ok(())
+    }
+
+    async fn is_paused(&self, topic: &str) -> Result<bool, MessagingError> {
+        Ok(self
+            .kv
+            .get(&pause_key(topic))
+            .await
+            .map_err(MessagingError::backend)?
+            .is_some())
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {

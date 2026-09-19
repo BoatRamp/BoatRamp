@@ -993,6 +993,40 @@ impl ControlPlane {
         Ok((resp.affected, resp.matched))
     }
 
+    /// Pause or resume a topic (`POST …/_boatramp/queue/pause`, P2 flow control).
+    pub async fn pause_queue(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+        paused: bool,
+    ) -> Result<()> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            topic: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alias: Option<&'a str>,
+            paused: bool,
+        }
+        client
+            .post(format!("{server}/api/{seg}/{site}/_boatramp/queue/pause"))
+            .json(&Request {
+                topic,
+                alias,
+                paused,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// List a topic's consumer groups (`GET …/_boatramp/queue/groups`).
     pub async fn list_groups(
         &self,

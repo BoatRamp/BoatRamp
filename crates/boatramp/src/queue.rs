@@ -85,6 +85,22 @@ enum QueueCommand {
         #[arg(long)]
         alias: Option<String>,
     },
+    /// Pause a topic — suppress delivery (publish + in-flight ack/nack keep flowing).
+    Pause {
+        /// Consumer topic.
+        topic: String,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Resume a paused topic.
+    Resume {
+        /// Consumer topic.
+        topic: String,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 /// Entry point for `boatramp queue`.
@@ -131,6 +147,15 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
             cp.group_op(&site, topic, alias.as_deref(), group, "delete", None)
                 .await?;
             println!("deleted group {group:?} on topic {topic:?}");
+        }
+        QueueCommand::Pause { topic, alias } => {
+            cp.pause_queue(&site, topic, alias.as_deref(), true).await?;
+            println!("paused topic {topic:?} (delivery suppressed; publish still flows)");
+        }
+        QueueCommand::Resume { topic, alias } => {
+            cp.pause_queue(&site, topic, alias.as_deref(), false)
+                .await?;
+            println!("resumed topic {topic:?}");
         }
     }
     Ok(())

@@ -351,6 +351,10 @@ pub fn router_with_fast(
             "/api/sites/{site}/_boatramp/queue/group",
             post(operator_queue_group),
         )
+        .route(
+            "/api/sites/{site}/_boatramp/queue/pause",
+            post(operator_queue_pause),
+        )
         // Captured guest logs for a function — symmetric to the per-site logs endpoint,
         // reading the same store under the function's project-qualified scope. Project-
         // owned read (the `/api/functions/*` authz mapping), so a project token reaches
