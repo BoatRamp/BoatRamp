@@ -382,6 +382,23 @@ pub fn logmax_key(topic: &str) -> String {
 pub fn gdead_key(topic: &str, group: &str, id: &str) -> String {
     format!("mqgd/{topic}/{group}/{id}")
 }
+/// KV prefix over ALL of a topic's grouped dead-letters (every group). Entries below it are
+/// `{group}/{id}` (two segments), NOT direct children — iterate with [`split_group_id`].
+pub fn gdead_topic_prefix(topic: &str) -> String {
+    format!("mqgd/{topic}/")
+}
+/// Split a `mqgd/{topic}/` suffix into `(group, id)`. A valid entry is exactly two non-empty
+/// segments (`{group}/{id}`); the id is `{millis}-{hex}` (no `/`) and the group is a validated
+/// single-segment name. Returns `None` for anything else — in particular a **subtopic** bleed
+/// (`{subtopic}/{group}/{id}`, ≥3 segments) is rejected so a topic's ops never touch a subtopic's
+/// grouped dead-letters (the grouped analog of [`is_direct_child`]).
+pub fn split_group_id(suffix: &str) -> Option<(&str, &str)> {
+    let (group, id) = suffix.split_once('/')?;
+    if group.is_empty() || id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some((group, id))
+}
 
 /// One leased-but-unacked message in a consumer group's [`GroupState`]. The set
 /// is bounded by `max_batch` × the lease window, **not** by the backlog.
@@ -891,6 +908,23 @@ impl LogMessaging {
             }
         }
 
+        // A dead-lettered message PINS its retained payload against reclaim (any group's dead-letter
+        // for this topic), so a redrive/purge always has the payload — no separate dead-letter copy
+        // needed, and this is the ONE mechanism that also works cluster-side (the deterministic Raft
+        // apply cannot write to object storage). Gather the dead-lettered ids across all groups once.
+        let gdead_prefix = gdead_topic_prefix(topic);
+        let mut dead_ids = std::collections::HashSet::new();
+        for key in self
+            .kv
+            .list_prefix(&gdead_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if let Some((_, id)) = split_group_id(&key[gdead_prefix.len()..]) {
+                dead_ids.insert(id.to_string());
+            }
+        }
+
         let log_prefix = glog_prefix(topic);
         let log_keys = self
             .kv
@@ -903,9 +937,12 @@ impl LogMessaging {
                 continue;
             }
             let id = &key[log_prefix.len()..];
+            // A dead-lettered message's payload is pinned unconditionally (even past retention age)
+            // until the dead-letter is redriven or purged — so a redrive always has its payload.
+            let pinned = dead_ids.contains(id);
             let needed = grouped_message_needed(&states, id);
             let expired = id_millis(id) + GROUP_RETENTION_MS < now;
-            if !needed || expired {
+            if !pinned && (!needed || expired) {
                 let _ = self.storage.delete(&gpayload_key(topic, id)).await;
                 let _ = self.kv.delete(&glog_key(topic, id)).await;
                 reclaimed += 1;
@@ -1109,15 +1146,18 @@ impl Messaging for LogMessaging {
         // tells us what to deliver and what to dead-letter.
         let plan = plan_claim_grouped(&mut state, now, lease_ms, max_batch, max_attempts, &new_ids);
 
-        // Dead-letter the exhausted ones (preserve the record under the group's DLQ).
+        // Dead-letter the exhausted ones under the group's DLQ, capturing the producer's
+        // signed-context so a redriven message still resolves its tenant. The retained payload
+        // (`mqgp/…`) is left in place and PINNED against the retention sweep by the dead-letter
+        // record (see `gc_grouped`) — so the DLQ is inspectable/redrivable/purgeable without a
+        // separate payload copy (the mechanism that also works cluster-side).
         for (id, attempts) in &plan.dead {
+            let signed_context = self.read_ctx(topic, id).await;
             let record = Record {
                 version: crate::SCHEMA_VERSION,
                 attempts: *attempts,
                 lease_until_ms: 0,
-                // The group's offset log doesn't carry the per-message context; a redriven grouped
-                // dead-letter re-resolves via the message's index record if still present.
-                signed_context: None,
+                signed_context,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -1190,7 +1230,20 @@ impl Messaging for LogMessaging {
     }
 
     async fn dead_letter_count(&self, topic: &str) -> Result<usize, MessagingError> {
-        self.count_direct(&dead_prefix(topic)).await
+        // Work-queue dead-letters (`mqdead/{topic}/{id}`) PLUS every consumer group's dead-letters
+        // (`mqgd/{topic}/{group}/{id}`). Before v0.4.24 only the work-queue keyspace was counted, so
+        // a fan-out consumer's poison messages reported `0` and were invisible to the operator.
+        let wq = self.count_direct(&dead_prefix(topic)).await?;
+        let gprefix = gdead_topic_prefix(topic);
+        let grouped = self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| split_group_id(&k[gprefix.len()..]).is_some())
+            .count();
+        Ok(wq + grouped)
     }
 
     async fn nack(&self, msg: &ClaimedMessage) -> Result<(), MessagingError> {
@@ -1230,20 +1283,20 @@ impl Messaging for LogMessaging {
     }
 
     async fn purge_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
+        let mut purged = 0;
+        // Work-queue dead-letters: drop the preserved payload then the record (payload-then-index,
+        // mirroring `ack`).
         let prefix = dead_prefix(topic);
-        let keys = self
+        for key in self
             .kv
             .list_prefix(&prefix)
             .await
-            .map_err(MessagingError::backend)?;
-        let mut purged = 0;
-        for key in keys {
+            .map_err(MessagingError::backend)?
+        {
             if !is_direct_child(&key, &prefix) {
                 continue; // a subtopic's dead letters aren't this topic's
             }
             let id = &key[prefix.len()..];
-            // Drop the preserved payload (kept at dead-letter time) then the
-            // dead record — order mirrors `ack` (payload, then index).
             self.storage
                 .delete(&payload_key(topic, id))
                 .await
@@ -1254,27 +1307,45 @@ impl Messaging for LogMessaging {
                 .map_err(MessagingError::backend)?;
             purged += 1;
         }
+        // Grouped dead-letters (every group): drop the dead-letter record. That un-pins the shared
+        // retained payload (`mqgp/…`); the retention sweep reclaims it once no group needs it — we
+        // don't delete it here because other groups may still be consuming that message.
+        let gprefix = gdead_topic_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if split_group_id(&key[gprefix.len()..]).is_none() {
+                continue;
+            }
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+            purged += 1;
+        }
         Ok(purged)
     }
 
     async fn redrive_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
+        let mut redriven = 0;
+        // Work-queue: re-arm a fresh, immediately-claimable `mq/` record (the payload is still
+        // present), *then* drop the dead record — a crash in between leaves the message recoverable
+        // (live) rather than orphaning its payload. Carry the preserved signed-context forward so a
+        // redriven message still resolves the producer's tenant on retry.
         let prefix = dead_prefix(topic);
-        let keys = self
+        for key in self
             .kv
             .list_prefix(&prefix)
             .await
-            .map_err(MessagingError::backend)?;
-        let mut redriven = 0;
-        for key in keys {
+            .map_err(MessagingError::backend)?
+        {
             if !is_direct_child(&key, &prefix) {
                 continue;
             }
             let id = &key[prefix.len()..];
-            // Re-arm a fresh, immediately-claimable record (the payload is still
-            // present), *then* drop the dead record — so a crash in between leaves
-            // the message recoverable (live) rather than orphaning its payload.
-            // Carry the preserved signed-context forward so a redriven message still resolves the
-            // producer's tenant on retry (the dead record kept it verbatim).
             let signed_context = self
                 .kv
                 .get(&key)
@@ -1293,6 +1364,48 @@ impl Messaging for LogMessaging {
                 .await
                 .map_err(MessagingError::backend)?;
             redriven += 1;
+        }
+        // Grouped: restore each dead-letter's preserved payload into the shared retained slot, re-arm
+        // the id in its group's in-flight (fresh attempts, claimable now), then drop the dead record
+        // + its preserved payload. Serialized with `claim` — it mutates the compact group state.
+        let gprefix = gdead_topic_prefix(topic);
+        let gkeys = self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        if !gkeys.is_empty() {
+            let _guard = self.claim_lock.lock().await;
+            for key in gkeys {
+                let Some((group, id)) = split_group_id(&key[gprefix.len()..]) else {
+                    continue;
+                };
+                // The retained payload (`mqgp/…`) is still present — it was pinned by this dead-letter
+                // record against the retention sweep — so we only re-arm the id in the group's
+                // in-flight (fresh attempts, claimable now) and drop the dead record. Create the
+                // group at the current head if it was deregistered, so only the redriven id is
+                // in-flight (no backlog replay).
+                let mut state = match self.get_group_state(topic, group).await? {
+                    Some(state) => state,
+                    None => {
+                        self.mark_grouped(topic);
+                        GroupState::new(self.read_logmax(topic).await?)
+                    }
+                };
+                if !state.in_flight.iter().any(|f| f.id == id) {
+                    state.in_flight.push(InFlight {
+                        id: id.to_string(),
+                        attempts: 0,
+                        lease_until_ms: 0,
+                    });
+                }
+                self.put_group_state(topic, group, &state).await?;
+                self.kv
+                    .delete(&key)
+                    .await
+                    .map_err(MessagingError::backend)?;
+                redriven += 1;
+            }
         }
         Ok(redriven)
     }
@@ -1797,6 +1910,68 @@ mod tests {
             "should dead-letter, not deliver a 3rd time"
         );
         assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+    }
+
+    // A **grouped** (fan-out) consumer's poison message must land in an INSPECTABLE dead-letter
+    // store — counted, redrivable (with its payload), purgeable — not silently invisible. Before
+    // the fix, grouped dead-letters went to `mqgd/…` while the operator ops scanned only `mqdead/…`,
+    // so `dead_letters` reported 0 for exactly the construens fan-out case. Mirrors the work-queue
+    // DLQ tests, for a group.
+    #[tokio::test]
+    async fn grouped_dead_letters_are_visible_redrivable_and_purgeable() {
+        let mq = mq();
+        let t = "bus/sync";
+        // Register the group (first claim), publish one poison message.
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(t, b"poison").await.unwrap();
+        // max_attempts = 2: two deliveries (ZERO lease ⇒ immediate re-claim), then the 3rd
+        // dead-letters instead of delivering.
+        for expected in 1..=2 {
+            let m = mq
+                .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap();
+            assert_eq!(m.len(), 1, "grouped attempt {expected}");
+            assert_eq!(m[0].attempts, expected);
+        }
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        // VISIBLE: the grouped poison message is counted (the fix).
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
+
+        // REDRIVABLE: requeues exactly it, and it redelivers with its payload + fresh attempts.
+        assert_eq!(mq.redrive_dead_letters(t).await.unwrap(), 1);
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 0);
+        let again = mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap();
+        assert_eq!(payloads(&again), vec![b"poison".to_vec()]);
+        assert_eq!(again[0].attempts, 1, "redrive reset the attempt count");
+
+        // PURGEABLE: exhaust it again (attempt 2, then dead), then purge removes exactly it.
+        assert_eq!(
+            mq.claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(mq
+            .claim_grouped(t, "worker", StartPosition::Latest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
+        assert_eq!(mq.purge_dead_letters(t).await.unwrap(), 1);
+        assert_eq!(mq.dead_letter_count(t).await.unwrap(), 0);
     }
 
     #[tokio::test]

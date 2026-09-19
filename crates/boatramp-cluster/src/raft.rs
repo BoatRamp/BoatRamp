@@ -179,6 +179,16 @@ pub enum WriteOp {
         group: String,
         id: String,
     },
+    /// **Redrive** a grouped dead-letter: re-arm the id in its group's in-flight (fresh attempts,
+    /// claimable now) and drop the dead-letter record — the operator DLQ redrive for a fan-out
+    /// group. The retained payload/log is still present (a dead-letter pins it against the sweep).
+    /// Deterministic: creates the group at the current log head if it was deregistered, so only the
+    /// redriven id is in-flight (no backlog replay); no clock needed (lease 0 = claimable now).
+    MqRedriveGroupedDead {
+        topic: String,
+        group: String,
+        id: String,
+    },
     /// **Retention sweep** for a grouped topic: reclaim the replicated log entries
     /// that no group still needs (with an id-age TTL backstop), returning the
     /// reclaimed ids so the caller can delete their `Storage` payloads (which the
@@ -411,6 +421,30 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             }
             WriteResponse::Kv
         }
+        WriteOp::MqRedriveGroupedDead { topic, group, id } => {
+            // Re-arm the id in the group's in-flight (fresh attempts, claimable now) and drop the
+            // dead-letter record. Create the group at the current head if it was deregistered, so
+            // only the redriven id is in-flight (no backlog replay). The retained payload/log is
+            // still present — a dead-letter pins it against the sweep (see apply_mq_sweep_grouped).
+            let mut state = load_group_state(target, &topic, &group).unwrap_or_else(|| {
+                let hwm = target
+                    .data
+                    .get(&messaging::logmax_key(&topic))
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .unwrap_or_default();
+                messaging::GroupState::new(hwm)
+            });
+            if !state.in_flight.iter().any(|f| f.id == id) {
+                state.in_flight.push(messaging::InFlight {
+                    id: id.clone(),
+                    attempts: 0,
+                    lease_until_ms: 0,
+                });
+            }
+            put_group_state(target, &topic, &group, &state);
+            target.remove(messaging::gdead_key(&topic, &group, &id));
+            WriteResponse::Kv
+        }
         WriteOp::MqSweepGrouped { topic, now_ms } => {
             WriteResponse::Reclaimed(apply_mq_sweep_grouped(target, &topic, now_ms))
         }
@@ -592,15 +626,20 @@ fn apply_mq_claim_grouped(
         &new_ids,
     );
 
-    // Dead-letter the exhausted ids (preserve the record under the group's DLQ).
+    // Dead-letter the exhausted ids under the group's DLQ, capturing the producer's signed-context
+    // from the shared index record (deterministic applied state) so a redriven grouped dead-letter
+    // still resolves its tenant. The retained payload is pinned against the sweep by this record.
     for (id, attempts) in &plan.dead {
+        let signed_context = target
+            .data
+            .get(&messaging::meta_key(topic, id))
+            .and_then(|raw| serde_json::from_slice::<messaging::Record>(raw).ok())
+            .and_then(|r| r.signed_context);
         let record = messaging::Record {
             version: boatramp_core::SCHEMA_VERSION,
             attempts: *attempts,
             lease_until_ms: 0,
-            // The group offset log doesn't carry per-message context; a redriven grouped
-            // dead-letter re-resolves via the shared index record if still present.
-            signed_context: None,
+            signed_context,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);
@@ -663,11 +702,25 @@ fn apply_mq_sweep_grouped(target: &mut ApplyTarget, topic: &str, now_ms: u64) ->
         }
     }
 
+    // A dead-lettered message (any group) PINS its retained log+payload against reclaim until the
+    // dead-letter is redriven or purged — so a redrive always has the payload. Gather the dead ids.
+    let gdead_prefix = messaging::gdead_topic_prefix(topic);
+    let mut dead_ids = std::collections::HashSet::new();
+    for (key, _) in target.data.range(gdead_prefix.clone()..) {
+        if !key.starts_with(&gdead_prefix) {
+            break;
+        }
+        if let Some((_, id)) = messaging::split_group_id(&key[gdead_prefix.len()..]) {
+            dead_ids.insert(id.to_string());
+        }
+    }
+
     let mut reclaimed = Vec::new();
     for id in ids {
+        let pinned = dead_ids.contains(&id);
         let needed = messaging::grouped_message_needed(&states, &id);
         let expired = messaging::id_millis(&id) + messaging::GROUP_RETENTION_MS < now_ms;
-        if !needed || expired {
+        if !pinned && (!needed || expired) {
             target.remove(messaging::glog_key(topic, &id));
             reclaimed.push(id);
         }
