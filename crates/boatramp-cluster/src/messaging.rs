@@ -1798,11 +1798,23 @@ mod tests {
             Some("ttl-expired"),
             "the dead-letter records why it expired"
         );
+        // Redrive the ttl dead-letter: it must become claimable + deliverable, NOT immediately
+        // re-expire (both backends must clear expires_at on redrive — a deliberate operator retry).
+        assert_eq!(mq.redrive_dead_letters(topic).await.unwrap(), 1);
+        assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 0);
+        let revived = mq.claim(topic, LEASE, 10, 5).await.unwrap();
         assert_eq!(
-            mq.purge_dead_letters(topic).await.unwrap(),
-            1,
-            "purge clears the ttl dead-letter"
+            revived
+                .iter()
+                .map(|m| m.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![b"perishable".to_vec()],
+            "the redriven ttl message is delivered, not re-expired"
         );
+        for m in &revived {
+            mq.ack(m).await.unwrap();
+        }
+        assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 0);
     }
 
     /// Conformance — **single-node** coordinator (`core::messaging::LogMessaging`).
