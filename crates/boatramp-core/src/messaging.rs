@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::kv::KvStore;
+use crate::kv::{KvStore, WriteOp};
 use crate::{PutMeta, Storage};
 
 /// A message claimed for delivery to a consumer.
@@ -977,18 +977,22 @@ impl Messaging for LogMessaging {
             .put(&payload_key(topic, &id), body, PutMeta::default())
             .await
             .map_err(MessagingError::backend)?;
-        // The durable signed-context (R1) rides on the index record, so it is deleted with the
-        // record on ack/dead-letter (no separate keyspace to clean up).
-        let json = serde_json::to_vec(&Record::fresh(signed_context.map(str::to_owned)))
-            .map_err(MessagingError::backend)?;
-        self.kv
-            .put(&meta_key(topic, &id), json)
-            .await
-            .map_err(MessagingError::backend)?;
-        // Grouped (fan-out) topics keep a **retained** copy of the payload + an
-        // append-only log entry, so each group can consume the message on its own
-        // high-water long after the default queue's ack would have deleted it, and
-        // advance the per-topic `logmax` gate marker (so an idle group's claim
+        // Coalesce this publish's INDEX writes into ONE durable `write_batch` (deploy-resilience A1):
+        // the meta record, and — on a grouped topic — the retained-log marker + the `logmax` gate
+        // advance, committed in a single flush instead of 2–4 separate awaited puts (each of which
+        // costs ~one SlateDB flush interval). The payloads stay separate object-store writes that
+        // PRECEDE the batch (the payload-first invariant, so an index entry never dangles).
+        // The durable signed-context (R1) rides on the meta record, so it is deleted with the record
+        // on ack/dead-letter (no separate keyspace to clean up).
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
+        ops.push(WriteOp::Put(
+            meta_key(topic, &id),
+            serde_json::to_vec(&Record::fresh(signed_context.map(str::to_owned)))
+                .map_err(MessagingError::backend)?,
+        ));
+        // Grouped (fan-out) topics keep a **retained** copy of the payload + an append-only log
+        // entry, so each group consumes on its own high-water long after the work-queue ack would
+        // have deleted it, and advance the per-topic `logmax` gate marker (so an idle group's claim
         // early-returns without a scan). Only paid on topics with a registered group.
         if self.topic_has_groups(topic).await {
             let bytes = bytes::Bytes::copy_from_slice(payload);
@@ -997,13 +1001,10 @@ impl Messaging for LogMessaging {
                 .put(&gpayload_key(topic, &id), body, PutMeta::default())
                 .await
                 .map_err(MessagingError::backend)?;
-            self.kv
-                .put(&glog_key(topic, &id), Vec::new())
-                .await
-                .map_err(MessagingError::backend)?;
-            // Advance the gate to the max id seen — never backward, so two
-            // concurrent same-ms publishes can't leave it below a retained id
-            // (which would wrongly close the gate on the higher one).
+            ops.push(WriteOp::Put(glog_key(topic, &id), Vec::new()));
+            // Advance the gate to the max id seen — never backward, so two concurrent same-ms
+            // publishes can't leave it below a retained id (which would wrongly close the gate on
+            // the higher one).
             let cur = self
                 .kv
                 .get(&logmax_key(topic))
@@ -1012,12 +1013,13 @@ impl Messaging for LogMessaging {
                 .map(|v| String::from_utf8_lossy(&v).into_owned())
                 .unwrap_or_default();
             if id.as_str() > cur.as_str() {
-                self.kv
-                    .put(&logmax_key(topic), id.clone().into_bytes())
-                    .await
-                    .map_err(MessagingError::backend)?;
+                ops.push(WriteOp::Put(logmax_key(topic), id.clone().into_bytes()));
             }
         }
+        self.kv
+            .write_batch(ops)
+            .await
+            .map_err(MessagingError::backend)?;
         // Notify live SSE subscribers (best-effort, separate from the durable
         // queue above).
         self.hubs.broadcast(topic, &id, payload);
