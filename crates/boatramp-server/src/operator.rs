@@ -34,6 +34,16 @@ struct ConsumerStat {
     backlog: usize,
     /// Messages parked in the dead-letter store (exhausted retries).
     dead_letters: usize,
+    /// In-flight (leased-but-unacked) messages — a subset of `backlog`. Lets an operator tell
+    /// "queued and draining" from "queued and wedged". (Additive; older clients ignore it.)
+    in_flight: usize,
+    /// Age in ms of the oldest still-pending message (the work-queue frontier), or `null` if empty
+    /// — "how stale is my backlog". (Additive.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_pending_ms: Option<u64>,
+    /// For a fan-out (grouped) consumer: retained messages this group has not yet leased ("who's
+    /// lagging"). `0` for the default work-queue (there `backlog` is the lag). (Additive.)
+    lag: usize,
 }
 
 /// The `/_boatramp/handlers` operator response: per-`(trigger, route)`
@@ -184,6 +194,19 @@ async fn collect_consumer_stats(
                 topic: consumer.topic.clone(),
                 backlog: messaging.backlog(&namespaced).await.unwrap_or(0),
                 dead_letters: messaging.dead_letter_count(&namespaced).await.unwrap_or(0),
+                in_flight: messaging.in_flight_count(&namespaced).await.unwrap_or(0),
+                oldest_pending_ms: messaging
+                    .oldest_pending_ms(&namespaced)
+                    .await
+                    .unwrap_or(None),
+                lag: if consumer.group.is_empty() {
+                    0
+                } else {
+                    messaging
+                        .group_lag(&namespaced, &consumer.group)
+                        .await
+                        .unwrap_or(0)
+                },
             });
         }
     }

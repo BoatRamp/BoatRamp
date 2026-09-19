@@ -57,6 +57,10 @@ pub struct ClaimedMessage {
     /// the consumer's tenant resolver verifies it (signature + expiry) against the fleet anchor and
     /// resolves the `signed_context` source; a forged/absent envelope fails an "own" op closed.
     pub signed_context: Option<String>,
+    /// Whether this message's payload was **inlined** in its index record (A3) rather than stored
+    /// as a separate object — so `ack` can skip the object-store delete (there is no object to
+    /// delete). Set by the claim path from the record; internal bookkeeping, not guest-visible.
+    pub inline: bool,
 }
 
 // A new consumer group's start position — defined in `boatramp-types` (so the
@@ -164,6 +168,30 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// Age in ms of the OLDEST still-pending message on `topic` (the earliest live id, claimable or
+    /// leased), or `None` if empty — the "how stale is my backlog" signal (≈ JetStream's
+    /// oldest-unacked age). Ids are time-ordered, so it's the age of the earliest live id. Scoped to
+    /// the work-queue index (grouped topics track a per-group frontier — use group lag). Default
+    /// `None` for backends without introspection.
+    async fn oldest_pending_ms(&self, _topic: &str) -> Result<Option<u64>, MessagingError> {
+        Ok(None)
+    }
+
+    /// Number of IN-FLIGHT (leased-but-unacked) messages on `topic` — distinct from `backlog`
+    /// (claimable *plus* leased), so an operator can tell "queued and draining" from "queued and
+    /// wedged" (≈ JetStream's ack-pending). Counts the work-queue's leased records and every
+    /// consumer group's in-flight set. Default `0`.
+    async fn in_flight_count(&self, _topic: &str) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
+    /// Consumer-group **lag** on a grouped `topic`: retained messages `group` has not yet leased
+    /// (log ids strictly beyond its high-water). The fan-out analog of `backlog` — the "who's
+    /// lagging" signal. `0` for the work-queue (empty group) or an unknown group. Default `0`.
+    async fn group_lag(&self, _topic: &str, _group: &str) -> Result<usize, MessagingError> {
+        Ok(0)
+    }
+
     /// **Purge** every dead-lettered message on `topic` — delete the preserved
     /// records *and* their payloads, reclaiming the space. Returns the number
     /// purged. The one operator action that clears the otherwise
@@ -241,7 +269,49 @@ pub struct Record {
     /// (`skip_serializing_if`). Verified — never trusted — at consume time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_context: Option<String>,
+    /// **Inlined payload** (A3): for a small work-queue message (`<= INLINE_MAX`, no consumer
+    /// groups) the body rides IN this index record instead of a separate object-store object — so
+    /// publish is one local durable write (no object-store round-trip) and claim needs no fetch. It
+    /// travels with the record through lease/dead-letter/redrive transparently. `None` ⇒ the payload
+    /// lives in [`Storage`] at [`payload_key`] (grouped topics + payloads over `INLINE_MAX`). Elided
+    /// when absent so pre-A3 records stay byte-identical (`#[serde(default)]` + `skip_serializing_if`).
+    #[serde(default, with = "inline_b64", skip_serializing_if = "Option::is_none")]
+    pub inline: Option<Vec<u8>>,
 }
+
+/// serde codec for [`Record::inline`]: base64 (not a JSON byte-array) so an inlined payload stays
+/// compact in the record's JSON — the whole point of inlining is to avoid a fat encoding on the
+/// hot durable-write path (and in the Raft log for a cluster).
+mod inline_b64 {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => {
+                s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        match opt {
+            Some(text) => base64::engine::general_purpose::STANDARD
+                .decode(text.as_bytes())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Max payload size (bytes) inlined into the index record (A3). Above this, the payload takes the
+/// object-store path (boatramp's large-blob strength). Conservative on purpose: inlined payloads
+/// ride the durable index (and the Raft log/snapshots in a cluster), so this bounds per-message
+/// index bloat. (SA1 aggregate-cap-with-fallback is a documented pre-release hardening.)
+pub const INLINE_MAX: usize = 4096;
 
 impl Record {
     /// A freshly-published record: never delivered, claimable immediately, carrying the optional
@@ -252,6 +322,7 @@ impl Record {
             attempts: 0,
             lease_until_ms: 0,
             signed_context,
+            inline: None,
         }
     }
 }
@@ -969,32 +1040,40 @@ impl Messaging for LogMessaging {
             now_unix_ms(),
             self.seq.fetch_add(1, Ordering::Relaxed)
         );
-        // Payload first, then the index record — so the record never references
-        // a missing payload.
-        let bytes = bytes::Bytes::copy_from_slice(payload);
-        let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-        self.storage
-            .put(&payload_key(topic, &id), body, PutMeta::default())
-            .await
-            .map_err(MessagingError::backend)?;
-        // Coalesce this publish's INDEX writes into ONE durable `write_batch` (deploy-resilience A1):
-        // the meta record, and — on a grouped topic — the retained-log marker + the `logmax` gate
-        // advance, committed in a single flush instead of 2–4 separate awaited puts (each of which
-        // costs ~one SlateDB flush interval). The payloads stay separate object-store writes that
-        // PRECEDE the batch (the payload-first invariant, so an index entry never dangles).
-        // The durable signed-context (R1) rides on the meta record, so it is deleted with the record
-        // on ack/dead-letter (no separate keyspace to clean up).
+        let retain = self.topic_has_groups(topic).await;
+        // A3 — inline a small work-queue payload IN the index record: it is then written in the one
+        // batch below (no object-store round-trip) and read straight off the record at claim. Only
+        // for the work-queue (a retained/grouped topic keeps the shared object-store copy every group
+        // reads) and only up to `INLINE_MAX` (larger payloads take the object-store path — boatramp's
+        // large-blob strength). Otherwise: payload first to object storage, then the index record —
+        // so the record never references a missing payload.
+        let inline = !retain && payload.len() <= INLINE_MAX;
+        if !inline {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(&payload_key(topic, &id), body, PutMeta::default())
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        // Coalesce this publish's INDEX writes into ONE durable `write_batch` (A1): the meta record
+        // (carrying an inlined payload when A3 applies), and — on a grouped topic — the retained-log
+        // marker + the `logmax` gate advance, in a single flush instead of 2–4 separate awaited puts.
+        // The durable signed-context (R1) rides on the meta record, deleted with it on ack/dead-letter.
         let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
+        let mut record = Record::fresh(signed_context.map(str::to_owned));
+        if inline {
+            record.inline = Some(payload.to_vec());
+        }
         ops.push(WriteOp::Put(
             meta_key(topic, &id),
-            serde_json::to_vec(&Record::fresh(signed_context.map(str::to_owned)))
-                .map_err(MessagingError::backend)?,
+            serde_json::to_vec(&record).map_err(MessagingError::backend)?,
         ));
         // Grouped (fan-out) topics keep a **retained** copy of the payload + an append-only log
         // entry, so each group consumes on its own high-water long after the work-queue ack would
         // have deleted it, and advance the per-topic `logmax` gate marker (so an idle group's claim
         // early-returns without a scan). Only paid on topics with a registered group.
-        if self.topic_has_groups(topic).await {
+        if retain {
             let bytes = bytes::Bytes::copy_from_slice(payload);
             let body = futures::stream::once(async move { Ok(bytes) }).boxed();
             self.storage
@@ -1076,7 +1155,12 @@ impl Messaging for LogMessaging {
                         .put(&meta_key(topic, &id), json)
                         .await
                         .map_err(MessagingError::backend)?;
-                    let payload = self.read_payload(topic, &id).await?;
+                    // A3: an inlined payload rides the record — no object-store fetch.
+                    let inline = record.inline.is_some();
+                    let payload = match record.inline {
+                        Some(bytes) => bytes,
+                        None => self.read_payload(topic, &id).await?,
+                    };
                     claimed.push(ClaimedMessage {
                         id,
                         topic: topic.to_string(),
@@ -1084,6 +1168,7 @@ impl Messaging for LogMessaging {
                         attempts: record.attempts,
                         group: String::new(),
                         signed_context: record.signed_context,
+                        inline,
                     });
                 }
                 ClaimAction::DeadLetter { id, record } => {
@@ -1160,6 +1245,8 @@ impl Messaging for LogMessaging {
                 attempts: *attempts,
                 lease_until_ms: 0,
                 signed_context,
+                // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
+                inline: None,
             };
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
@@ -1187,6 +1274,8 @@ impl Messaging for LogMessaging {
                         attempts,
                         group: group.to_string(),
                         signed_context,
+                        // Grouped/fan-out payloads are always object-store retained, never inlined.
+                        inline: false,
                     });
                 }
                 Err(_) => continue,
@@ -1220,15 +1309,107 @@ impl Messaging for LogMessaging {
             .delete(&meta_key(&msg.topic, &msg.id))
             .await
             .map_err(MessagingError::backend)?;
-        self.storage
-            .delete(&payload_key(&msg.topic, &msg.id))
-            .await
-            .map_err(MessagingError::backend)?;
+        // A3: an inlined payload lived IN the record just deleted — no object-store object exists, so
+        // skip the delete (avoids a wasted object-store round-trip, the whole point of inlining).
+        if !msg.inline {
+            self.storage
+                .delete(&payload_key(&msg.topic, &msg.id))
+                .await
+                .map_err(MessagingError::backend)?;
+        }
         Ok(())
     }
 
     async fn backlog(&self, topic: &str) -> Result<usize, MessagingError> {
         self.count_direct(&meta_prefix(topic)).await
+    }
+
+    async fn oldest_pending_ms(&self, topic: &str) -> Result<Option<u64>, MessagingError> {
+        // The earliest live work-queue id (ids are time-ordered; `list_prefix` is sorted, so the
+        // first direct child is the oldest). Age = now − its embedded publish time.
+        let prefix = meta_prefix(topic);
+        let mut oldest: Option<u64> = None;
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            let ms = id_millis(&key[prefix.len()..]);
+            oldest = Some(oldest.map_or(ms, |o| o.min(ms)));
+        }
+        Ok(oldest.map(|ms| now_unix_ms().saturating_sub(ms)))
+    }
+
+    async fn in_flight_count(&self, topic: &str) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        // Work-queue: records currently leased (lease_until_ms in the future).
+        let prefix = meta_prefix(topic);
+        let mut count = 0;
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            if let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? {
+                if let Ok(rec) = serde_json::from_slice::<Record>(&raw) {
+                    if rec.lease_until_ms > now {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        // Grouped: every registered group's currently-leased in-flight entries.
+        let gprefix = gstate_prefix(topic);
+        for key in self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &gprefix) {
+                continue;
+            }
+            let group = &key[gprefix.len()..];
+            if let Some(state) = self.get_group_state(topic, group).await? {
+                count += state
+                    .in_flight
+                    .iter()
+                    .filter(|f| f.lease_until_ms > now)
+                    .count();
+            }
+        }
+        Ok(count)
+    }
+
+    async fn group_lag(&self, topic: &str, group: &str) -> Result<usize, MessagingError> {
+        let Some(state) = self.get_group_state(topic, group).await? else {
+            return Ok(0);
+        };
+        // Retained log ids strictly beyond the group's high-water = not-yet-leased for this group.
+        let prefix = glog_prefix(topic);
+        let mut lag = 0;
+        for key in self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            if !is_direct_child(&key, &prefix) {
+                continue;
+            }
+            if key[prefix.len()..] > *state.hwm {
+                lag += 1;
+            }
+        }
+        Ok(lag)
     }
 
     async fn dead_letter_count(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -1299,10 +1480,21 @@ impl Messaging for LogMessaging {
                 continue; // a subtopic's dead letters aren't this topic's
             }
             let id = &key[prefix.len()..];
-            self.storage
-                .delete(&payload_key(topic, id))
+            // Only delete an object-store payload for a NON-inlined dead record; an inlined one's
+            // payload lived in the record we're about to delete (no object exists to free).
+            let inline = self
+                .kv
+                .get(&key)
                 .await
-                .map_err(MessagingError::backend)?;
+                .map_err(MessagingError::backend)?
+                .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
+                .is_some_and(|r| r.inline.is_some());
+            if !inline {
+                self.storage
+                    .delete(&payload_key(topic, id))
+                    .await
+                    .map_err(MessagingError::backend)?;
+            }
             self.kv
                 .delete(&key)
                 .await
@@ -1348,15 +1540,19 @@ impl Messaging for LogMessaging {
                 continue;
             }
             let id = &key[prefix.len()..];
-            let signed_context = self
+            // Re-arm from the preserved dead record: reset attempts + lease (claimable now) but KEEP
+            // its signed-context AND its inlined payload (A3) — so a redriven inline message still
+            // carries its body without any object-store object.
+            let mut record = self
                 .kv
                 .get(&key)
                 .await
                 .map_err(MessagingError::backend)?
                 .and_then(|raw| serde_json::from_slice::<Record>(&raw).ok())
-                .and_then(|r| r.signed_context);
-            let json = serde_json::to_vec(&Record::fresh(signed_context))
-                .map_err(MessagingError::backend)?;
+                .unwrap_or_else(|| Record::fresh(None));
+            record.attempts = 0;
+            record.lease_until_ms = 0;
+            let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, id), json)
                 .await
@@ -1974,6 +2170,114 @@ mod tests {
         assert_eq!(mq.dead_letter_count(t).await.unwrap(), 1);
         assert_eq!(mq.purge_dead_letters(t).await.unwrap(), 1);
         assert_eq!(mq.dead_letter_count(t).await.unwrap(), 0);
+    }
+
+    // P1 inspection stats: in-flight (leased-but-unacked) is a subset of backlog, and
+    // oldest_pending_ms exposes the backlog frontier — so an operator can tell "draining" from
+    // "wedged" and "how stale". Read-only; never mutate the queue.
+    #[tokio::test]
+    async fn stats_expose_in_flight_and_oldest_pending() {
+        let mq = mq();
+        // Empty topic: nothing pending, nothing in-flight.
+        assert_eq!(mq.oldest_pending_ms("t").await.unwrap(), None);
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 0);
+        // Published but unclaimed: pending (an age exists — the id carries the publish time), but
+        // nothing is leased yet.
+        mq.publish("t", b"a").await.unwrap();
+        mq.publish("t", b"b").await.unwrap();
+        assert!(mq.oldest_pending_ms("t").await.unwrap().is_some());
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 0);
+        // Claim both with a long lease → in-flight == 2 (backlog also 2, still pending).
+        let claimed = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 2);
+        assert_eq!(mq.backlog("t").await.unwrap(), 2);
+        // Ack one → in-flight drops to 1 and backlog to 1.
+        mq.ack(&claimed[0]).await.unwrap();
+        assert_eq!(mq.in_flight_count("t").await.unwrap(), 1);
+        assert_eq!(mq.backlog("t").await.unwrap(), 1);
+
+        // Group lag: a group registered `earliest` then two messages published → lag 2; after it
+        // leases them, lag 0 (they're beyond nothing / at its high-water).
+        let g = "bus/lag";
+        assert!(mq
+            .claim_grouped(g, "w", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap()
+            .is_empty());
+        mq.publish(g, b"x").await.unwrap();
+        mq.publish(g, b"y").await.unwrap();
+        assert_eq!(
+            mq.group_lag(g, "w").await.unwrap(),
+            2,
+            "two retained, none leased yet"
+        );
+        let got = mq
+            .claim_grouped(g, "w", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            mq.group_lag(g, "w").await.unwrap(),
+            0,
+            "caught up to the high-water"
+        );
+    }
+
+    // A3: a small work-queue payload rides IN the index record (no object-store object), so publish
+    // is one local durable write and claim needs no fetch; a large payload keeps the object path.
+    #[tokio::test]
+    async fn small_work_queue_payload_is_inlined_large_takes_object_store() {
+        let storage: Arc<dyn Storage> = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage.clone(), kv);
+
+        // Small → inlined.
+        mq.publish("t", b"small").await.unwrap();
+        let m = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].payload, b"small");
+        assert!(m[0].inline, "small payload inlined into the record");
+        assert!(
+            storage.head(&payload_key("t", &m[0].id)).await.is_err(),
+            "inlined ⇒ no object-store object written"
+        );
+        // Ack cleans up (no object-store object to free); nothing left.
+        mq.ack(&m[0]).await.unwrap();
+        assert_eq!(mq.backlog("t").await.unwrap(), 0);
+
+        // Larger than INLINE_MAX → object-store path (boatramp's large-blob strength).
+        let big = vec![7u8; INLINE_MAX + 1];
+        mq.publish("t", &big).await.unwrap();
+        let m = mq.claim("t", Duration::from_secs(60), 10, 5).await.unwrap();
+        assert_eq!(m[0].payload, big);
+        assert!(!m[0].inline, "large payload not inlined");
+        assert!(
+            storage.head(&payload_key("t", &m[0].id)).await.is_ok(),
+            "large payload lives in object storage"
+        );
+    }
+
+    // A3 × DLQ: an inlined message that dead-letters keeps its payload in the record, so redrive
+    // redelivers it with its body and purge needs no object-store touch.
+    #[tokio::test]
+    async fn inlined_message_dead_letters_and_redrives_with_its_payload() {
+        let mq = mq();
+        mq.publish("t", b"poison").await.unwrap();
+        // max_attempts=1: one delivery, next claim dead-letters.
+        let m = mq.claim("t", Duration::ZERO, 10, 1).await.unwrap();
+        assert!(m[0].inline);
+        assert!(mq
+            .claim("t", Duration::ZERO, 10, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count("t").await.unwrap(), 1);
+        // Redrive → redelivers with the inlined payload intact.
+        assert_eq!(mq.redrive_dead_letters("t").await.unwrap(), 1);
+        let back = mq.claim("t", Duration::from_secs(60), 10, 1).await.unwrap();
+        assert_eq!(back[0].payload, b"poison");
+        assert!(back[0].inline);
     }
 
     #[tokio::test]
