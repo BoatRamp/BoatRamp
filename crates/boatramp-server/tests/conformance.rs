@@ -3550,6 +3550,9 @@ async fn activation_refuses_a_non_consumer_component() {
                 imports: Vec::new(),
                 group: String::new(),
                 start: Default::default(),
+                lease_ms: None,
+                max_attempts: None,
+                max_batch: None,
             }],
             ..Default::default()
         },
@@ -4642,6 +4645,9 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 imports: vec!["wasi:keyvalue".to_string()],
                 group: String::new(),
                 start: Default::default(),
+                lease_ms: None,
+                max_attempts: None,
+                max_batch: None,
             }],
             ..Default::default()
         },
