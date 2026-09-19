@@ -454,9 +454,14 @@ pub(super) async fn run_scheduler_tick(
                             &bindings,
                             rebuild.as_ref(),
                             site_limits(site_handlers),
-                            CONSUMER_LEASE,
-                            CONSUMER_MAX_ATTEMPTS,
-                            CONSUMER_BATCH,
+                            // Per-consumer overrides (≈ JetStream AckWait/MaxDeliver/batch), each
+                            // falling back to the server default when unset (back-compat).
+                            consumer
+                                .lease_ms
+                                .map(Duration::from_millis)
+                                .unwrap_or(CONSUMER_LEASE),
+                            consumer.max_attempts.unwrap_or(CONSUMER_MAX_ATTEMPTS),
+                            consumer.max_batch.unwrap_or(CONSUMER_BATCH),
                         )
                         .await;
                         // A grouped (fan-out) topic keeps a retained log; reclaim

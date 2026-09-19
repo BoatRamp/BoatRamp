@@ -3333,6 +3333,9 @@ mod tests {
                     imports: vec!["wasi:keyvalue".into()],
                     group: String::new(),
                     start: Default::default(),
+                    lease_ms: None,
+                    max_attempts: None,
+                    max_batch: None,
                 }],
                 ..Default::default()
             },
