@@ -30,11 +30,17 @@ use generated::boatramp::handlers::{messaging_producer, messaging_types};
 /// producer and a consumer in *different* components can meet on one topic.
 pub const BUS_TOPIC_SELECTOR: &str = "bus:";
 
-/// The most messages a single `publish-batch` may carry. A batch is committed in one durable write
-/// and its payloads are buffered host-side before the commit, so this bounds both the coalesced
-/// commit size and the transient host memory a guest can pin with one call — a larger batch is
-/// rejected whole (never partially published). Comfortably above a realistic pipeline chunk.
+/// The most messages a single `publish-batch` may carry. A batch is committed in one durable write,
+/// so this bounds the coalesced commit's op count — a larger batch is rejected whole (never partially
+/// published). Comfortably above a realistic pipeline chunk.
 pub const PUBLISH_BATCH_MAX: usize = 1024;
+
+/// The most total payload bytes a single `publish-batch` may carry. A batch's payloads are copied
+/// host-side (into the index record when inlined, or into the object store) before the commit, so
+/// this bounds the transient host memory one call can pin — the message COUNT cap alone doesn't (a
+/// guest could send few but huge payloads). A batch over this is rejected whole. Sized well above a
+/// realistic high-throughput chunk so it never throttles legitimate pipelining.
+pub const PUBLISH_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// A per-site messaging grant: the backend plus the topic-namespace prefixes the
 /// host prepends. A plain `orders/created` is namespaced under the
@@ -126,12 +132,20 @@ impl messaging_producer::Host for MessagingHost<'_> {
         let Some(binding) = self.binding else {
             return Err(messaging_types::Error::AccessDenied);
         };
-        // Reject an oversized batch WHOLE (never publish a prefix) — bounds the coalesced commit and
-        // the host memory one call can pin. An empty batch is a no-op success.
+        // Reject an oversized batch WHOLE (never publish a prefix), on BOTH axes — the message count
+        // (bounds the coalesced commit's op count) and the total payload bytes (bounds the transient
+        // host memory one call can pin; the count cap alone doesn't, since payloads are unbounded per
+        // message). Checked before any per-message work/allocation. An empty batch is a no-op success.
         if messages.len() > PUBLISH_BATCH_MAX {
             return Err(messaging_types::Error::Other(format!(
                 "publish-batch exceeds the {PUBLISH_BATCH_MAX}-message limit ({} given)",
                 messages.len()
+            )));
+        }
+        let total_bytes: usize = messages.iter().map(|m| m.data.len()).sum();
+        if total_bytes > PUBLISH_BATCH_MAX_BYTES {
+            return Err(messaging_types::Error::Other(format!(
+                "publish-batch exceeds the {PUBLISH_BATCH_MAX_BYTES}-byte limit ({total_bytes} given)"
             )));
         }
         if messages.is_empty() {
@@ -348,6 +362,27 @@ mod tests {
         assert!(matches!(err, messaging_types::Error::Other(_)));
         // Rejected whole — not a single message was published.
         assert_eq!(backend.published.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_batch_over_byte_limit_is_rejected_whole() {
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding(backend.clone());
+        let mut host = MessagingHost::new(Some(&binding));
+        // Two messages, each just over half the byte cap → total exceeds it. Well under the COUNT cap,
+        // so this exercises the byte axis specifically.
+        let half = PUBLISH_BATCH_MAX_BYTES / 2 + 1;
+        let big = vec![0u8; half];
+        let err = host
+            .publish_batch(vec![outgoing("t", &big), outgoing("t", &big)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, messaging_types::Error::Other(_)));
+        assert_eq!(
+            backend.published.lock().unwrap().len(),
+            0,
+            "rejected whole on the byte axis — nothing published"
+        );
     }
 
     #[tokio::test]
