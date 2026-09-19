@@ -17,7 +17,7 @@ mod generated {
         path: "wit",
         world: "boatramp:handlers/messaging-host",
         async: {
-            only_imports: ["publish"],
+            only_imports: ["publish", "publish-batch"],
         },
     });
 }
@@ -29,6 +29,12 @@ use generated::boatramp::handlers::{messaging_producer, messaging_types};
 /// project-wide bus instead of its own component-private namespace, so a
 /// producer and a consumer in *different* components can meet on one topic.
 pub const BUS_TOPIC_SELECTOR: &str = "bus:";
+
+/// The most messages a single `publish-batch` may carry. A batch is committed in one durable write
+/// and its payloads are buffered host-side before the commit, so this bounds both the coalesced
+/// commit size and the transient host memory a guest can pin with one call — a larger batch is
+/// rejected whole (never partially published). Comfortably above a realistic pipeline chunk.
+pub const PUBLISH_BATCH_MAX: usize = 1024;
 
 /// A per-site messaging grant: the backend plus the topic-namespace prefixes the
 /// host prepends. A plain `orders/created` is namespaced under the
@@ -70,6 +76,28 @@ impl<'a> MessagingHost<'a> {
     }
 }
 
+impl MessagingBinding {
+    /// Host-namespace a guest-relative topic: a `bus:<topic>` targets the shared project bus
+    /// ([`bus_prefix`](Self::bus_prefix)); anything else stays in the component-private
+    /// [`prefix`](Self::prefix). A guest can only ever name topics within its own namespace.
+    fn namespace(&self, topic: &str) -> String {
+        match topic.strip_prefix(BUS_TOPIC_SELECTOR) {
+            Some(bus_topic) => format!("{}{bus_topic}", self.bus_prefix),
+            None => format!("{}{topic}", self.prefix),
+        }
+    }
+
+    /// Read the current host-sealed producer-context envelope (R1/Gap 3) fresh from the shared cell —
+    /// so a `tenancy::present-token` earlier in this invocation is reflected. `None` ⇒ an unscoped
+    /// producer. The lock is released immediately (a quick clone).
+    fn current_context(&self) -> Option<String> {
+        self.signed_context
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+}
+
 impl messaging_producer::Host for MessagingHost<'_> {
     async fn publish(
         &mut self,
@@ -79,25 +107,47 @@ impl messaging_producer::Host for MessagingHost<'_> {
         let Some(binding) = self.binding else {
             return Err(messaging_types::Error::AccessDenied);
         };
-        // A `bus:<topic>` publish targets the shared project bus; anything else
-        // stays in the component-private namespace (back-compat).
-        let namespaced = match topic.strip_prefix(BUS_TOPIC_SELECTOR) {
-            Some(bus_topic) => format!("{}{bus_topic}", binding.bus_prefix),
-            None => format!("{}{topic}", binding.prefix),
-        };
+        let namespaced = binding.namespace(&topic);
         // The guest names no tenant; the host stamps the producer's own-tenant signed context onto
-        // the message so a declaring consumer resolves it on the async lane. Read FRESH from the
-        // shared cell so a `tenancy::present-token` earlier in this invocation (Gap 3) is reflected.
-        // `None` ⇒ an unscoped producer, identical to a plain publish. The lock is released before
-        // the await (a quick clone).
-        let signed_context = binding
-            .signed_context
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+        // the message so a declaring consumer resolves it on the async lane. `None` ⇒ an unscoped
+        // producer, identical to a plain publish.
+        let signed_context = binding.current_context();
         binding
             .messaging
             .publish_ctx(&namespaced, &data, signed_context.as_deref())
+            .await
+            .map_err(|err| messaging_types::Error::Other(err.to_string()))
+    }
+
+    async fn publish_batch(
+        &mut self,
+        messages: Vec<messaging_types::Outgoing>,
+    ) -> Result<(), messaging_types::Error> {
+        let Some(binding) = self.binding else {
+            return Err(messaging_types::Error::AccessDenied);
+        };
+        // Reject an oversized batch WHOLE (never publish a prefix) — bounds the coalesced commit and
+        // the host memory one call can pin. An empty batch is a no-op success.
+        if messages.len() > PUBLISH_BATCH_MAX {
+            return Err(messaging_types::Error::Other(format!(
+                "publish-batch exceeds the {PUBLISH_BATCH_MAX}-message limit ({} given)",
+                messages.len()
+            )));
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+        // Every message in one batch comes from THIS single invocation, so they all share the one
+        // host-sealed producer context (read once, fresh) — there is exactly one producer principal
+        // per batch and no cross-tenant mixing. The guest still names no tenant.
+        let signed_context = binding.current_context();
+        let namespaced: Vec<(String, Vec<u8>)> = messages
+            .into_iter()
+            .map(|m| (binding.namespace(&m.topic), m.data))
+            .collect();
+        binding
+            .messaging
+            .publish_batch_ctx(&namespaced, signed_context.as_deref())
             .await
             .map_err(|err| messaging_types::Error::Other(err.to_string()))
     }
@@ -249,6 +299,71 @@ mod tests {
         let mut host = MessagingHost::new(None);
         let err = host
             .publish("orders/created".into(), b"x".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, messaging_types::Error::AccessDenied));
+    }
+
+    fn outgoing(topic: &str, data: &[u8]) -> messaging_types::Outgoing {
+        messaging_types::Outgoing {
+            topic: topic.to_string(),
+            data: data.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_batch_namespaces_each_message_and_stamps_shared_context() {
+        // A4: one batch, mixed private + bus topics. Every message is namespaced independently and
+        // all carry the single host-sealed producer context (one producer principal per batch).
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding_with_context(backend.clone(), Some("ctx-abc".to_string()));
+        let mut host = MessagingHost::new(Some(&binding));
+        host.publish_batch(vec![
+            outgoing("orders/created", b"a"),
+            outgoing("bus:concept.generate", b"b"),
+            outgoing("orders/created", b"c"),
+        ])
+        .await
+        .unwrap();
+        let published = backend.published.lock().unwrap();
+        assert_eq!(published.len(), 3);
+        assert_eq!(published[0].0, "blog/production/orders/created");
+        assert_eq!(published[1].0, "acme/bus/concept.generate");
+        assert_eq!(published[2].0, "blog/production/orders/created");
+        assert_eq!(published[0].1, b"a");
+        assert_eq!(published[1].1, b"b");
+        // Every message carries the same host-minted context — no per-message tenant from the guest.
+        assert!(published.iter().all(|p| p.2.as_deref() == Some("ctx-abc")));
+    }
+
+    #[tokio::test]
+    async fn publish_batch_over_limit_is_rejected_whole() {
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding(backend.clone());
+        let mut host = MessagingHost::new(Some(&binding));
+        let too_many: Vec<_> = (0..=PUBLISH_BATCH_MAX)
+            .map(|_| outgoing("orders/created", b"x"))
+            .collect();
+        let err = host.publish_batch(too_many).await.unwrap_err();
+        assert!(matches!(err, messaging_types::Error::Other(_)));
+        // Rejected whole — not a single message was published.
+        assert_eq!(backend.published.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_publish_batch_is_a_noop_success() {
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding(backend.clone());
+        let mut host = MessagingHost::new(Some(&binding));
+        host.publish_batch(Vec::new()).await.unwrap();
+        assert_eq!(backend.published.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ungranted_publish_batch_is_denied() {
+        let mut host = MessagingHost::new(None);
+        let err = host
+            .publish_batch(vec![outgoing("orders/created", b"x")])
             .await
             .unwrap_err();
         assert!(matches!(err, messaging_types::Error::AccessDenied));
