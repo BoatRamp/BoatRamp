@@ -383,6 +383,11 @@ interface messaging-producer {
   /// not deliverable to a consumer until `delay-ms` elapses (scheduled/delayed
   /// work; delayed retries). `delay-ms == 0` is identical to `publish`.
   publish-delayed: func(topic: string, data: list<u8>, delay-ms: u64) -> result<_, error>;
+
+  /// Publish `data` to `topic` with a TTL: if not consumed within `ttl-ms`, the
+  /// message is dead-lettered (reason `ttl-expired`) instead of delivered — for
+  /// time-sensitive work that is worthless if stale. `ttl-ms == 0` = no expiry.
+  publish-with-ttl: func(topic: string, data: list<u8>, ttl-ms: u64) -> result<_, error>;
 }
 
 /// The consumer half: the host calls `handle` once per delivered message. A
