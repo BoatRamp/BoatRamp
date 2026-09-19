@@ -367,6 +367,36 @@ pub struct CreateDeploymentResponse {
     pub missing: Vec<String>,
 }
 
+/// An AND-composed dead-letter filter for the `dlq` commands (mirrors the server's wire filter).
+/// Serializes `match_last_error` as `match`. All-`None` = the whole DLQ.
+#[derive(Debug, Default, Serialize)]
+pub struct DlqFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub older_than_ms: Option<u64>,
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// One dead-letter as returned by the `dlq` list/show/dry-run views.
+#[derive(Debug, Deserialize)]
+pub struct DlqEntry {
+    pub id: String,
+    pub group: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub signed_context_present: bool,
+    /// Present only from a `show` (base64 payload).
+    #[serde(default)]
+    pub payload_b64: Option<String>,
+}
+
 /// An authenticated control-plane connection: an [`ApiClient`] bound to a
 /// resolved server base URL. The request methods key off it, so the client and
 /// server base are threaded once (at construction) instead of by hand at every
@@ -890,16 +920,19 @@ impl ControlPlane {
             .await?)
     }
 
-    /// Run a dead-letter operation (`purge` or `redrive`) on a consumer `topic`
-    /// (scope-relative; `alias` for a background-alias consumer). Returns the number
-    /// of dead-lettered messages affected (`POST …/_boatramp/dlq`).
+    /// Run a dead-letter mutation (`purge` / `redrive` / `discard`) on a consumer `topic`
+    /// (scope-relative; `alias` for a background-alias consumer), optionally filter-selective and/or
+    /// `dry_run`. Returns the number affected plus (for a dry-run) the matching preview
+    /// (`POST …/_boatramp/dlq`).
     pub async fn operate_dlq(
         &self,
         site: &str,
         topic: &str,
         alias: Option<&str>,
         action: &str,
-    ) -> Result<usize> {
+        filter: &DlqFilter,
+        dry_run: bool,
+    ) -> Result<(usize, Vec<DlqEntry>)> {
         let seg = self.sites_seg();
         let Self {
             http: client,
@@ -912,10 +945,14 @@ impl ControlPlane {
             #[serde(skip_serializing_if = "Option::is_none")]
             alias: Option<&'a str>,
             action: &'a str,
+            filter: &'a DlqFilter,
+            dry_run: bool,
         }
         #[derive(Deserialize)]
         struct DlqResponse {
             affected: usize,
+            #[serde(default)]
+            matched: Vec<DlqEntry>,
         }
         let resp: DlqResponse = client
             .post(format!("{server}/api/{seg}/{site}/_boatramp/dlq"))
@@ -923,13 +960,66 @@ impl ControlPlane {
                 topic,
                 alias,
                 action,
+                filter,
+                dry_run,
             })
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
-        Ok(resp.affected)
+        Ok((resp.affected, resp.matched))
+    }
+
+    /// List (or `show`) a topic's dead-letters (`GET …/_boatramp/dlq`), filter-matching. `show` with
+    /// `filter.id` set returns the single dead-letter in full (with `payload_b64`); otherwise a
+    /// metadata listing.
+    pub async fn list_dlq(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+        show: bool,
+        filter: &DlqFilter,
+    ) -> Result<Vec<DlqEntry>> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        #[derive(Deserialize)]
+        struct DlqListResponse {
+            #[allow(dead_code)]
+            version: u32,
+            dead_letters: Vec<DlqEntry>,
+        }
+        let mut req = client
+            .get(format!("{server}/api/{seg}/{site}/_boatramp/dlq"))
+            .query(&[("topic", topic)]);
+        if let Some(alias) = alias {
+            req = req.query(&[("alias", alias)]);
+        }
+        if show {
+            req = req.query(&[("show", "true")]);
+        }
+        if let Some(id) = &filter.id {
+            req = req.query(&[("id", id)]);
+        }
+        if let Some(group) = &filter.group {
+            req = req.query(&[("group", group)]);
+        }
+        if let Some(older) = filter.older_than_ms {
+            req = req.query(&[("older_than_ms", older.to_string())]);
+        }
+        if let Some(m) = &filter.match_last_error {
+            req = req.query(&[("match", m)]);
+        }
+        if let Some(limit) = filter.limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: DlqListResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.dead_letters)
     }
 
     /// Upload a file as a content-addressed blob (`PUT /api/blobs/<hash>`, streamed).

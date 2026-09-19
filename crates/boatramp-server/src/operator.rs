@@ -86,7 +86,13 @@ pub(super) async fn operator_handler_stats(
     .into_response()
 }
 
-/// Which dead-letter operation `POST …/_boatramp/dlq` should run.
+/// The versioned DLQ view schema (UX5): bumped only on a breaking shape change, so a client can
+/// detect an incompatible server.
+#[cfg(feature = "handlers")]
+const DLQ_VIEW_VERSION: u32 = 1;
+
+/// Which dead-letter operation `POST …/_boatramp/dlq` should run (all mutating → operator-auth,
+/// site-scoped). Reads (`ls`/`show`) go through the GET endpoint.
 #[cfg(feature = "handlers")]
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +101,51 @@ enum DlqAction {
     Purge,
     /// Requeue them onto the live topic with a fresh attempt count.
     Redrive,
+    /// Selectively drop only the filter-matching dead-letters (never re-queued).
+    Discard,
+}
+
+/// An AND-composed dead-letter filter as sent over the wire (mirrors
+/// [`boatramp_core::messaging::DeadLetterFilter`], flattened into the request/query).
+#[cfg(feature = "handlers")]
+#[derive(Deserialize, Default)]
+pub(super) struct DlqFilterWire {
+    /// Exact message id.
+    #[serde(default)]
+    id: Option<String>,
+    /// Lane: `""` = work-queue, else a group; omitted = all lanes.
+    #[serde(default)]
+    group: Option<String>,
+    /// Only messages older than this many ms (age from the time-ordered id).
+    #[serde(default)]
+    older_than_ms: Option<u64>,
+    /// Substring match on the host `last_error`.
+    #[serde(default, rename = "match")]
+    match_last_error: Option<String>,
+    /// Cap the number listed/acted on.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[cfg(feature = "handlers")]
+impl DlqFilterWire {
+    fn into_core(self) -> boatramp_core::messaging::DeadLetterFilter {
+        boatramp_core::messaging::DeadLetterFilter {
+            id: self.id,
+            group: self.group,
+            older_than_ms: self.older_than_ms,
+            match_last_error: self.match_last_error,
+            limit: self.limit,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.id.is_none()
+            && self.group.is_none()
+            && self.older_than_ms.is_none()
+            && self.match_last_error.is_none()
+            && self.limit.is_none()
+    }
 }
 
 /// `POST …/_boatramp/dlq` request: which consumer topic, and what to do.
@@ -106,21 +157,150 @@ pub(super) struct DlqRequest {
     /// Background-alias scope (`{site}/{alias}`); omitted = the live site.
     #[serde(default)]
     alias: Option<String>,
-    /// `purge` or `redrive`.
+    /// `purge`, `redrive`, or `discard`.
     action: DlqAction,
+    /// The selective filter (P1). Absent/empty ⇒ the WHOLE-DLQ op (back-compat): `purge`/`redrive`
+    /// over everything. A `discard` with an empty filter still acts on all (explicit intent).
+    #[serde(default)]
+    filter: DlqFilterWire,
+    /// Preview only: return the matching set WITHOUT acting (`--dry-run`). No mutation is proposed.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// One dead-letter in an operator DLQ view. `payload_b64` is present only in a `show`; the
+/// producer's signed-context is exposed as PRESENCE only (never the tenant-bearing envelope value).
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct DlqEntry {
+    id: String,
+    group: String,
+    attempts: u32,
+    last_error: Option<String>,
+    signed_context_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_b64: Option<String>,
+}
+
+#[cfg(feature = "handlers")]
+impl DlqEntry {
+    fn from_dead(dl: boatramp_core::messaging::DeadLetter) -> Self {
+        use base64::Engine as _;
+        Self {
+            id: dl.id,
+            group: dl.group,
+            attempts: dl.attempts,
+            last_error: dl.last_error,
+            signed_context_present: dl.signed_context.is_some(),
+            payload_b64: dl
+                .payload
+                .map(|p| base64::engine::general_purpose::STANDARD.encode(p)),
+        }
+    }
 }
 
 #[cfg(feature = "handlers")]
 #[derive(Serialize)]
 struct DlqResponse {
-    /// Number of dead-lettered messages affected.
+    /// Number of dead-lettered messages affected (or that WOULD be, for `dry_run`).
     affected: usize,
+    /// The matching dead-letters — metadata only, populated for a `dry_run` (a preview) so an
+    /// operator can see exactly what a `redrive`/`discard` would touch before confirming.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    matched: Vec<DlqEntry>,
 }
 
-/// Operator dead-letter management (`POST …/_boatramp/dlq`, site·write): purge or
-/// redrive a consumer topic's dead-letter queue. The topic is
-/// namespaced to the site (or a background alias) exactly as the dispatcher does,
-/// so an operator can only touch their own site's queues.
+#[cfg(feature = "handlers")]
+#[derive(Serialize)]
+struct DlqListResponse {
+    /// The DLQ view schema version (UX5).
+    version: u32,
+    dead_letters: Vec<DlqEntry>,
+}
+
+/// `GET …/_boatramp/dlq` query: list (metadata) or show one (with payload). Site-scoped, read-only.
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct DlqListQuery {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+    /// Return one dead-letter IN FULL (with payload) instead of a list — requires `id`.
+    #[serde(default)]
+    show: bool,
+    #[serde(flatten)]
+    filter: DlqFilterWire,
+}
+
+/// Namespace a scope-relative topic exactly as the dispatcher does: `{site}/{topic}`, or
+/// `{site}/{alias}/{topic}` for a background-alias consumer — so an operator only touches their own
+/// site's queues.
+#[cfg(feature = "handlers")]
+fn dlq_namespace(site: &str, alias: &Option<String>, topic: &str) -> String {
+    match alias {
+        Some(alias) => format!("{site}/{alias}/{topic}"),
+        None => format!("{site}/{topic}"),
+    }
+}
+
+/// Operator dead-letter INSPECTION (`GET …/_boatramp/dlq`, read): `ls` (filter-matching metadata) or
+/// `show` (one dead-letter in full, incl. payload). Site-scoped like the mutating POST.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_dlq_list(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DlqListQuery>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    let Some(messaging) = inner.messaging.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response();
+    };
+    let namespaced = dlq_namespace(&site, &q.alias, &q.topic);
+    if q.show {
+        let Some(id) = q.filter.id.clone() else {
+            return (StatusCode::BAD_REQUEST, "show requires ?id=<id>\n").into_response();
+        };
+        let group = q.filter.group.clone().unwrap_or_default();
+        return match messaging.show_dead_letter(&namespaced, &group, &id).await {
+            Ok(Some(dl)) => Json(DlqListResponse {
+                version: DLQ_VIEW_VERSION,
+                dead_letters: vec![DlqEntry::from_dead(dl)],
+            })
+            .into_response(),
+            Ok(None) => not_found(),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dead-letter show failed: {err}\n"),
+            )
+                .into_response(),
+        };
+    }
+    match messaging
+        .list_dead_letters(&namespaced, &q.filter.into_core())
+        .await
+    {
+        Ok(list) => Json(DlqListResponse {
+            version: DLQ_VIEW_VERSION,
+            dead_letters: list.into_iter().map(DlqEntry::from_dead).collect(),
+        })
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("dead-letter list failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// Operator dead-letter MUTATION (`POST …/_boatramp/dlq`, write): purge / redrive / discard, whole
+/// or filter-selective, with a `dry_run` preview. Site-scoped so an operator only touches their own
+/// site's queues.
 #[cfg(feature = "handlers")]
 pub(super) async fn operator_dlq(
     Extension(handlers): Extension<Arc<HandlerRuntime>>,
@@ -137,19 +317,62 @@ pub(super) async fn operator_dlq(
         )
             .into_response();
     };
-    // Same namespacing as `collect_consumer_stats`: `{site}/{topic}`, or
-    // `{site}/{alias}/{topic}` for a background-alias consumer.
-    let scope = match &req.alias {
-        Some(alias) => format!("{site}/{alias}"),
-        None => site.clone(),
-    };
-    let namespaced = format!("{scope}/{}", req.topic);
+    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    let selective = !req.filter.is_empty();
+
+    // `--dry-run`: return exactly the matching set (never mutate), so an operator can confirm a
+    // redrive/discard before it runs. A whole-DLQ dry-run lists everything.
+    if req.dry_run {
+        let filter = req.filter.into_core();
+        return match messaging.list_dead_letters(&namespaced, &filter).await {
+            Ok(list) => {
+                let matched: Vec<DlqEntry> = list.into_iter().map(DlqEntry::from_dead).collect();
+                Json(DlqResponse {
+                    affected: matched.len(),
+                    matched,
+                })
+                .into_response()
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dead-letter dry-run failed: {err}\n"),
+            )
+                .into_response(),
+        };
+    }
+
     let result = match req.action {
-        DlqAction::Purge => messaging.purge_dead_letters(&namespaced).await,
-        DlqAction::Redrive => messaging.redrive_dead_letters(&namespaced).await,
+        DlqAction::Purge => {
+            // Purge is whole-DLQ; if a filter was supplied, honor it as a selective discard instead.
+            if selective {
+                messaging
+                    .discard_dead_letters(&namespaced, &req.filter.into_core())
+                    .await
+            } else {
+                messaging.purge_dead_letters(&namespaced).await
+            }
+        }
+        DlqAction::Discard => {
+            messaging
+                .discard_dead_letters(&namespaced, &req.filter.into_core())
+                .await
+        }
+        DlqAction::Redrive => {
+            if selective {
+                messaging
+                    .redrive_dead_letters_filtered(&namespaced, &req.filter.into_core())
+                    .await
+            } else {
+                messaging.redrive_dead_letters(&namespaced).await
+            }
+        }
     };
     match result {
-        Ok(affected) => Json(DlqResponse { affected }).into_response(),
+        Ok(affected) => Json(DlqResponse {
+            affected,
+            matched: Vec::new(),
+        })
+        .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("dead-letter operation failed: {err}\n"),
