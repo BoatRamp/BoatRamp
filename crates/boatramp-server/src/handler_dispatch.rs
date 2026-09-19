@@ -2088,7 +2088,25 @@ pub(super) async fn dispatch_consumer_batch(
     lease: Duration,
     max_attempts: u32,
     batch: usize,
+    max_ack_pending: Option<usize>,
 ) -> usize {
+    // Flow control (P2 MaxAckPending): cap the claim so total leased-but-unacked never exceeds the
+    // ceiling, across ticks. `in_flight_count` is the topic's outstanding (a slight over-count for a
+    // single group — the safe direction: it caps sooner). At/over the cap, claim nothing this tick.
+    let batch = match max_ack_pending {
+        Some(cap) => {
+            let in_flight = messaging
+                .in_flight_count(namespaced_topic)
+                .await
+                .unwrap_or(0);
+            let available = cap.saturating_sub(in_flight);
+            if available == 0 {
+                return 0;
+            }
+            batch.min(available)
+        }
+        None => batch,
+    };
     let claimed = match messaging
         .claim_grouped(namespaced_topic, group, start, lease, batch, max_attempts)
         .await

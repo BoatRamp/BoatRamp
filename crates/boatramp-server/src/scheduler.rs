@@ -462,6 +462,7 @@ pub(super) async fn run_scheduler_tick(
                                 .unwrap_or(CONSUMER_LEASE),
                             consumer.max_attempts.unwrap_or(CONSUMER_MAX_ATTEMPTS),
                             consumer.max_batch.unwrap_or(CONSUMER_BATCH),
+                            consumer.max_ack_pending,
                         )
                         .await;
                         // A grouped (fan-out) topic keeps a retained log; reclaim
