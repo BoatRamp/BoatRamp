@@ -145,6 +145,10 @@ pub enum WriteOp {
         /// issuing node (deterministic). `#[serde(default)]` so an older node's `MqPublish` never expires.
         #[serde(default)]
         expires_at_ms: u64,
+        /// **Delivery priority** (P2): higher leases first (ties FIFO by id). `0`/absent = normal.
+        /// `#[serde(default)]` so an older node's `MqPublish` applies at normal priority.
+        #[serde(default)]
+        priority: u8,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -367,6 +371,7 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             inline,
             not_before_ms,
             expires_at_ms,
+            priority,
         } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
@@ -379,6 +384,8 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 record.lease_until_ms = not_before_ms;
                 // Delivery-mode TTL (P2): claim dead-letters it once past this (0 = no expiry).
                 record.expires_at_ms = expires_at_ms;
+                // Delivery-mode priority (P2): higher leases first (0 = normal).
+                record.priority = priority;
                 let fresh = serde_json::to_vec(&record).expect("record serializes");
                 target.put(key, fresh);
             }
@@ -763,6 +770,8 @@ fn apply_mq_claim_grouped(
             last_error: None,
             // A dead-letter is terminal — no further expiry.
             expires_at_ms: 0,
+            // Grouped is append-log-ordered; priority is a work-queue concept.
+            priority: 0,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);

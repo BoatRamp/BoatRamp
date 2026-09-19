@@ -239,6 +239,7 @@ impl RaftMessaging {
         signed_context: Option<&str>,
         not_before_ms: u64,
         expires_at_ms: u64,
+        priority: u8,
     ) -> Result<(String, WriteOp), MessagingError> {
         let id = self.next_id();
         let retain = self.topic_has_groups(topic).await;
@@ -298,6 +299,7 @@ impl RaftMessaging {
                 inline: inline.then(|| payload.to_vec()),
                 not_before_ms,
                 expires_at_ms,
+                priority,
             },
         ))
     }
@@ -455,7 +457,7 @@ impl Messaging for RaftMessaging {
         // then commit it in one group-commit. Factored so `publish_batch_ctx` reuses the identical
         // A3/SA1/retain decisions and coalesces N messages into one Raft entry.
         let (id, op) = self
-            .build_publish_op(topic, payload, signed_context, 0, 0)
+            .build_publish_op(topic, payload, signed_context, 0, 0, 0)
             .await?;
         // Group-commit (A2): coalesce this MqPublish with other concurrent ones into a single
         // WriteOp::Batch proposal (one Raft round-trip per group). Returns only after the group is
@@ -482,7 +484,7 @@ impl Messaging for RaftMessaging {
             now_unix_ms().saturating_add(delay.as_millis() as u64)
         };
         let (id, op) = self
-            .build_publish_op(topic, payload, signed_context, not_before_ms, 0)
+            .build_publish_op(topic, payload, signed_context, not_before_ms, 0, 0)
             .await?;
         self.group_commit(vec![op]).await?;
         self.bus.broadcast(topic, &id, payload);
@@ -504,7 +506,23 @@ impl Messaging for RaftMessaging {
             now_unix_ms().saturating_add(ttl.as_millis() as u64)
         };
         let (id, op) = self
-            .build_publish_op(topic, payload, signed_context, 0, expires_at_ms)
+            .build_publish_op(topic, payload, signed_context, 0, expires_at_ms, 0)
+            .await?;
+        self.group_commit(vec![op]).await?;
+        self.bus.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_with_priority_ctx(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        priority: u8,
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        // Delivery-mode priority (P2): higher leases first (ties FIFO); 0 = normal. Work-queue only.
+        let (id, op) = self
+            .build_publish_op(topic, payload, signed_context, 0, 0, priority)
             .await?;
         self.group_commit(vec![op]).await?;
         self.bus.broadcast(topic, &id, payload);
@@ -527,7 +545,7 @@ impl Messaging for RaftMessaging {
         let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
         for (topic, payload) in messages {
             let (id, op) = self
-                .build_publish_op(topic, payload, signed_context, 0, 0)
+                .build_publish_op(topic, payload, signed_context, 0, 0, 0)
                 .await?;
             ops.push(op);
             broadcasts.push((topic.as_str(), id, payload.as_slice()));
@@ -845,6 +863,7 @@ impl Messaging for RaftMessaging {
                 inline,
                 not_before_ms: 0, // redrive re-arms immediately claimable
                 expires_at_ms: 0, // and clears any TTL (an operator redrive is a deliberate retry)
+                priority: 0,      // redriven at normal priority
             });
             ops.push(WriteOp::Delete {
                 key: messaging::dead_key(topic, id),
@@ -974,6 +993,7 @@ impl Messaging for RaftMessaging {
                     inline,
                     not_before_ms: 0, // redrive re-arms immediately claimable
                     expires_at_ms: 0, // and clears any TTL (an operator redrive is a deliberate retry)
+                    priority: 0,      // redriven at normal priority
                 });
                 ops.push(WriteOp::Delete {
                     key: messaging::dead_key(topic, &dl.id),
@@ -1815,6 +1835,33 @@ mod tests {
             mq.ack(m).await.unwrap();
         }
         assert_eq!(mq.dead_letter_count(topic).await.unwrap(), 0);
+
+        // --- P2 delivery modes: priority (both backends) ---------------------------------------
+        // On its OWN sub-topic (the shared `topic` still holds the far-future delayed "later"). Two
+        // normal then one high-priority; claim delivers the high one FIRST, then the two normal FIFO.
+        let pt = format!("{topic}/prio");
+        mq.publish_with_priority_ctx(&pt, b"lo-1", 0, None)
+            .await
+            .unwrap();
+        mq.publish_with_priority_ctx(&pt, b"lo-2", 0, None)
+            .await
+            .unwrap();
+        mq.publish_with_priority_ctx(&pt, b"HIGH", 9, None)
+            .await
+            .unwrap();
+        let ordered = mq.claim(&pt, LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|m| m.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![b"HIGH".to_vec(), b"lo-1".to_vec(), b"lo-2".to_vec()],
+            "high priority leases first, then the normal ones FIFO"
+        );
+        for m in &ordered {
+            mq.ack(m).await.unwrap();
+        }
+        assert_eq!(mq.backlog(&pt).await.unwrap(), 0);
     }
 
     /// Conformance — **single-node** coordinator (`core::messaging::LogMessaging`).
