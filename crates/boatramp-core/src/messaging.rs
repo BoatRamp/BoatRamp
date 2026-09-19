@@ -3853,6 +3853,74 @@ mod tests {
         );
     }
 
+    /// Leader-only group-commit gate (the fix for the steady-state coalesce-depth-1 bug): while a
+    /// leader is blocked inside its durable commit HOLDING the gate, other publishers pile up as
+    /// WAITERS — they push their job and park WITHOUT each acquiring the gate — and the leader's drain
+    /// loop commits ALL of them in ONE further `write_batch`. So K piled-up publishes cost the
+    /// leader's own commit + ONE coalesced commit, never K separate commits, and no waiter is stranded
+    /// or lost. (This is a single-burst guard exercising the `select`+drain-loop path; steady-state
+    /// coalescing DEPTH across many rounds is guarded empirically by the messaging bench —
+    /// `crates/boatramp-storage/examples/messaging_bench.rs` — since a timer-free unit test cannot
+    /// stage repeated flush windows.)
+    #[tokio::test]
+    async fn group_commit_coalesces_piled_up_waiters_into_one_batch() {
+        use std::sync::atomic::Ordering;
+        let (kv, entered_rx, release_tx) = GateKv::new();
+        let mq = Arc::new(LogMessaging::new(
+            Arc::new(MemStorage::default()),
+            kv.clone(),
+        ));
+
+        // Leader L: blocks inside its first `write_batch`, holding the gate.
+        let l = {
+            let mq = mq.clone();
+            tokio::spawn(async move { mq.publish("t", b"L").await })
+        };
+        entered_rx.await.unwrap(); // L is now inside write_batch, holding the gate.
+
+        // K waiters: drive each ONE poll so it pushes its job and parks (Pending) — it registers as a
+        // gate-waiter but does NOT hold the gate L holds. Keep the pinned futures to finish later.
+        const K: usize = 8;
+        let mut waiters = Vec::new();
+        for i in 0..K {
+            let mut w = Box::pin({
+                let mq = mq.clone();
+                async move { mq.publish("t", format!("w{i}").as_bytes()).await }
+            });
+            assert!(
+                futures::poll!(w.as_mut()).is_pending(),
+                "waiter {i} pushed its job and parked without taking the gate L holds"
+            );
+            waiters.push(w);
+        }
+
+        // Release L: its first write_batch (its own job) completes, then its drain loop finds the K
+        // piled-up waiters and commits them in ONE further write_batch.
+        release_tx.send(()).unwrap();
+        l.await.unwrap().expect("leader publish ok");
+        for w in waiters {
+            w.await
+                .expect("a piled-up waiter completes (never stranded)");
+        }
+
+        // Exactly two durable commits: L's own + one coalesced batch of all K waiters (NOT K commits).
+        assert_eq!(
+            kv.calls.load(Ordering::Relaxed),
+            2,
+            "the K piled-up waiters coalesced into ONE write_batch after the leader's own commit"
+        );
+        // Nothing stranded or lost: leader + all K waiters are durably claimable.
+        let mut seen = 0;
+        loop {
+            let b = mq.claim("t", LEASE, 100, 5).await.unwrap();
+            if b.is_empty() {
+                break;
+            }
+            seen += b.len();
+        }
+        assert_eq!(seen, K + 1, "leader + all K waiters were durably committed");
+    }
+
     // A3 × DLQ: an inlined message that dead-letters keeps its payload in the record, so redrive
     // redelivers it with its body and purge needs no object-store touch.
     #[tokio::test]
