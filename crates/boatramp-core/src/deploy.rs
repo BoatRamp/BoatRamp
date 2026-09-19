@@ -343,6 +343,16 @@ pub(crate) mod keys {
         format!("project/{project}/site/")
     }
 
+    /// The **authoritative per-host tenant context map** for a site (v0.4.23): a JSON
+    /// `BTreeMap<host, tag>` stored OUTSIDE the content-addressed `SiteConfig` blob, so this
+    /// imperatively-written runtime state (a domain→tenant binding, added/removed at runtime as
+    /// tenants onboard/offboard) is not embedded in the declaratively-`apply`-managed config and a
+    /// whole-config PUT can never clobber it. Merged into the returned config on read and into the
+    /// domain-routing index on write. `project/<proj>/sitecontexts/<site>`.
+    pub fn site_contexts(project: ProjectRef<'_>, site: &str) -> String {
+        format!("project/{project}/sitecontexts/{site}")
+    }
+
     /// The **immutable, content-addressed** config body:
     /// `siteconfig/<hash>` → the `SiteConfig` JSON. Keyed by its own hash, so it
     /// never changes under a key and is safe to cache forever; identical configs
@@ -773,8 +783,33 @@ impl DeployStore {
         };
         let hash = String::from_utf8_lossy(&hash).into_owned();
         match self.kv.get(&keys::site_config_blob(&hash)).await? {
-            Some(bytes) => Ok(Some(SiteConfig::from_json(&bytes)?)),
+            Some(bytes) => {
+                let mut cfg = SiteConfig::from_json(&bytes)?;
+                // Overlay the authoritative context store (v0.4.23): contexts live outside the blob,
+                // so a fresh read reflects the store, and this is the round-trip seam (a guest that
+                // writes contexts via `site-config-put` reads them back here). A pre-v0.4.23 blob
+                // with no store yet keeps its own embedded contexts (migrated to the store on the
+                // next write). Only the non-cached read overlays — `get_site_config_cached` is the
+                // hot path, keyed by blob hash, and no consumer reads `.domains.contexts` off it.
+                if let Some(ctx) = self.get_site_contexts(project, site).await? {
+                    cfg.domains.contexts = ctx;
+                }
+                Ok(Some(cfg))
+            }
             // A dangling pointer (body GC'd out from under it) reads as unset.
+            None => Ok(None),
+        }
+    }
+
+    /// The authoritative per-host tenant context map for a site (v0.4.23), or `None` if the site
+    /// has never had one written (a pre-v0.4.23 site whose contexts still live in the blob).
+    pub(crate) async fn get_site_contexts(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, DeployError> {
+        match self.kv.get(&keys::site_contexts(project, site)).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or_default())),
             None => Ok(None),
         }
     }
@@ -894,11 +929,14 @@ impl DeployStore {
     }
 
     /// [`set_site_config`](Self::set_site_config), but **cooperative** for the runtime-managed
-    /// domain sub-fields (apply-merge-contexts): a whole-config PUT — `apply`, the operator API, or
-    /// the guest `admin` `site-config-put` — preserves imperatively-written `domains.contexts` /
-    /// `domains.aliases` it doesn't mention (union with the stored values; incoming wins on a
-    /// context-key conflict). Everything else is replaced (manifest-authoritative). Removal of a
-    /// context/alias stays explicit via `domain rm` (the non-cooperative [`set_site_config`]).
+    /// domain aliases (apply-merge-contexts, generalized in v0.4.23): on a whole-config PUT —
+    /// `apply`, the operator API, or the guest `admin` `site-config-put` — a stored alias that is a
+    /// **verified** (attached) domain survives even when the incoming config omits it, while a
+    /// merely-*declared* alias the incoming config drops is pruned (manifest-authoritative). The
+    /// verification store is the ownership oracle: apply owns declared aliases, the domain-attach
+    /// lifecycle owns verified ones. Per-host `contexts` are runtime state in their **own** store
+    /// (see [`set_site_config_locked`](Self::set_site_config_locked)) and are preserved regardless
+    /// of this flag — this flag governs ONLY the alias oracle. Removal stays explicit (`domain rm`).
     pub async fn set_site_config_cooperative(
         &self,
         project: ProjectRef<'_>,
@@ -908,28 +946,6 @@ impl DeployStore {
         let _claim = self.domain_claim_lock.lock().await;
         self.set_site_config_locked(project, site, config, true)
             .await
-    }
-
-    /// Merge the **runtime-managed** domain sub-fields of `old` into `incoming` (apply-merge-
-    /// contexts): `domains.contexts` and `domains.aliases` are merged by union (an incoming context
-    /// key wins on conflict; a stored key/alias the incoming config omits is preserved), while every
-    /// other field of `incoming` — `primary`/`wildcards`/`canonical_redirect` and all non-domain
-    /// config — is kept as-is (manifest-authoritative). Returns the effective config to persist.
-    fn merge_domain_runtime(incoming: &SiteConfig, old: &SiteConfig) -> SiteConfig {
-        let mut merged = incoming.clone();
-        for (host, tag) in &old.domains.contexts {
-            merged
-                .domains
-                .contexts
-                .entry(host.clone())
-                .or_insert_with(|| tag.clone());
-        }
-        for alias in &old.domains.aliases {
-            if !merged.domains.aliases.contains(alias) {
-                merged.domains.aliases.push(alias.clone());
-            }
-        }
-        merged
     }
 
     /// [`set_site_config`](Self::set_site_config) assuming the domain-claim lock
@@ -944,21 +960,53 @@ impl DeployStore {
         cooperative: bool,
     ) -> Result<(), DeployError> {
         let owner = DomainOwner::new(project.as_str(), site);
-        // Fetch the current config ONCE — reused for both the cooperative merge and the
+        // The current config ONCE (its `domains.contexts` already overlaid from the context store
+        // by `get_site_config`). Reused for the context base, the alias oracle, and the
         // stale-domain-key deletes below.
         let old = self.get_site_config(project, site).await?;
-        // Cooperative merge (apply-merge-contexts): a whole-config PUT — `apply`, the operator
-        // API, or the guest `admin` `site-config-put` — must NOT clobber imperatively-written
-        // runtime domain state it doesn't mention. Union `domains.contexts`/`domains.aliases` with
-        // the stored config (incoming wins on a context-key conflict; entries absent from the
-        // incoming config are preserved). Removal stays explicit via `domain rm`, which writes
-        // through the raw non-cooperative path. Everything else stays manifest-authoritative
-        // (replace). Entry-level writers (domain add/rm, attach) pass `cooperative = false`.
-        let effective: SiteConfig = match (&old, cooperative) {
-            (Some(o), true) => Self::merge_domain_runtime(config, o),
-            _ => config.clone(),
-        };
+
+        // --- contexts: authoritative in their OWN store, never clobbered by a whole-config PUT
+        // (v0.4.23). A domain→tenant binding is imperatively-written runtime state (tenants
+        // onboard/offboard at runtime), so it does NOT live in the declaratively-`apply`-managed
+        // blob. Effective map = the current stored/overlaid contexts merged by union with any the incoming
+        // config names (incoming wins per host); an entry is never removed by a PUT — removal is an
+        // explicit `domain rm`. `apply` names no contexts, so for `apply` this is a no-op: it
+        // structurally cannot wipe a runtime tenant tag. (Migration: a pre-v0.4.23 site's contexts
+        // arrive here via `old` — overlaid from the still-embedded blob field — and get seeded into
+        // the store on this write; the blob is stripped below.)
+        let mut effective_ctx: BTreeMap<String, String> = old
+            .as_ref()
+            .map(|o| o.domains.contexts.clone())
+            .unwrap_or_default();
+        for (host, tag) in &config.domains.contexts {
+            effective_ctx.insert(host.clone(), tag.clone());
+        }
+
+        // --- effective config: the persisted blob is declarative-only. On the cooperative path
+        // (apply / operator / guest whole-config PUT), re-add any stored alias that is a VERIFIED
+        // (attached) domain — a host attached through the domain-verify lifecycle survives an
+        // `apply` that only declares the wildcard — while a merely-declared alias the incoming
+        // config drops is pruned (manifest-authoritative). The verification store is the ownership
+        // oracle. Raw callers (attach / domain writers, `cooperative = false`) use their computed
+        // aliases verbatim. Contexts are STRIPPED from the blob (they live in the store);
+        // routing sources them from `effective_ctx` below.
+        let mut effective = config.clone();
+        if cooperative {
+            if let Some(o) = &old {
+                let site_name = SiteName::new(site);
+                for alias in &o.domains.aliases {
+                    if effective.domains.aliases.contains(alias) {
+                        continue;
+                    }
+                    if self.is_domain_verified(project, &site_name, alias).await? {
+                        effective.domains.aliases.push(alias.clone());
+                    }
+                }
+            }
+        }
+        effective.domains.contexts = BTreeMap::new();
         let config = &effective;
+
         // Refuse any host/wildcard already claimed by another (project, site) before
         // writing anything (the hijack guard). A host this site already owns, or one
         // that is unclaimed, passes.
@@ -994,13 +1042,26 @@ impl DeployStore {
             keys::site_pointer(project, site),
             hash.into_bytes(),
         ));
+        // The authoritative context store, written in the SAME atomic batch as the blob, pointer,
+        // and routing index (all under the claim lock) — so a crash can't leave the store, the
+        // config, and the index disagreeing. Deleted when empty so a context-free site leaves no
+        // stale map.
+        if effective_ctx.is_empty() {
+            ops.push(WriteOp::Delete(keys::site_contexts(project, site)));
+        } else {
+            ops.push(WriteOp::Put(
+                keys::site_contexts(project, site),
+                serde_json::to_vec(&effective_ctx)?,
+            ));
+        }
 
         // The domain-routing index value carries the owning `(project, site)` so a request `Host`
         // resolves to both (the key stays global — hosts are unique), plus the per-host **tenant
-        // context tag** (Stage 0): a host's own `contexts` entry, else the primary's (apex↔www
-        // share a tenant), else none. A wildcard carries its own pattern's tag; matching
-        // subdomains inherit it via resolution. This is the declarative domain tenant source.
-        let contexts = &config.domains.contexts;
+        // context tag** (Stage 0), sourced from the context STORE (`effective_ctx`), not the
+        // stripped blob: a host's own entry, else the primary's (apex↔www share a tenant), else
+        // none. A wildcard carries its own pattern's tag; matching subdomains inherit it via
+        // resolution. This is the declarative domain tenant source.
+        let contexts = &effective_ctx;
         let primary_ctx = config
             .domains
             .primary
@@ -1046,7 +1107,10 @@ impl DeployStore {
     ) -> Result<(), DeployError> {
         if let Some(bytes) = self.kv.get(key).await? {
             let held = DomainOwner::from_bytes(&bytes);
-            if &held != owner {
+            // Ownership is `(project, site)`; the per-host context tag is metadata the SAME owner
+            // attaches, so compare ownership only — else a host conflicts with itself once its
+            // stored index value carries a context tag (the v0.4.22 cooperative-apply 409).
+            if !held.same_owner(owner) {
                 return Err(DeployError::Conflict(format!(
                     "{label} is already attached to site `{}` in project `{}`",
                     held.site, held.project
@@ -2083,6 +2147,49 @@ impl DeployStore {
         self.set_site_config_locked(project, site.as_str(), &config, false)
             .await?;
         Ok(config)
+    }
+
+    /// Remove a host's tenant **context** binding (v0.4.23) — the explicit removal path for the
+    /// otherwise union-only context store (a whole-config PUT can only add/overwrite a context,
+    /// never drop one, so a tenant offboarding a domain unbinds it here, via `domain rm`). Drops
+    /// the host from the site's context store and re-stamps the routing index so the host's
+    /// domain-index value loses its tenant tag (the host keeps routing; its domain tenant source
+    /// then fails closed until re-bound). Idempotent — `Ok(false)` if the host had no context.
+    pub async fn remove_site_context(
+        &self,
+        project: ProjectRef<'_>,
+        site: &str,
+        host: &str,
+    ) -> Result<bool, DeployError> {
+        let _claim = self.domain_claim_lock.lock().await;
+        let Some(mut ctx) = self.get_site_contexts(project, site).await? else {
+            return Ok(false);
+        };
+        if ctx.remove(host).is_none() {
+            return Ok(false);
+        }
+        // Persist the context removal FIRST, so the re-projection below (which reads the store back
+        // through `get_site_config`) sees it gone and cannot union it back in.
+        if ctx.is_empty() {
+            self.kv.delete(&keys::site_contexts(project, site)).await?;
+        } else {
+            self.kv
+                .put(
+                    &keys::site_contexts(project, site),
+                    serde_json::to_vec(&ctx)?,
+                )
+                .await?;
+        }
+        // Re-project by re-writing the current config through the locked path (lock already held):
+        // its effective context map is now the host-free store, so the host's routing-index value
+        // is re-stamped without the tag. If the site has no config, just drop cached resolutions.
+        if let Some(cfg) = self.get_site_config(project, site).await? {
+            self.set_site_config_locked(project, site, &cfg, false)
+                .await?;
+        } else {
+            self.bump_domain_epoch();
+        }
+        Ok(true)
     }
 
     /// Point a named alias (`staging`, `preview-pr-42`, …) at a deployment id.
@@ -3401,6 +3508,9 @@ impl DeployStore {
             WriteOp::Delete(keys::site_pointer(project, site)),
             WriteOp::Delete(keys::current(project, site)),
             WriteOp::Delete(keys::history(project, site)),
+            // The per-host tenant context store (v0.4.23) lives outside the config blob, so it must
+            // be swept here too or a re-created site could inherit a deleted tenant's bindings.
+            WriteOp::Delete(keys::site_contexts(project, site)),
         ];
         if let Some(config) = self.get_site_config(project, site).await? {
             for host in config.domains.exact_hosts() {
@@ -3493,69 +3603,288 @@ mod tests {
     use crate::config::DeployConfig;
     use crate::ObjectMeta;
 
-    #[test]
-    fn merge_domain_runtime_unions_contexts_and_aliases_and_replaces_the_rest() {
-        // apply-merge-contexts: a whole-config PUT preserves runtime `contexts`/`aliases` it omits,
-        // incoming wins on a context-key conflict, and everything else is manifest-authoritative.
-        let mut old = SiteConfig::default();
-        old.domains
-            .contexts
-            .insert("shop.example.com".into(), "ten_A".into());
-        old.domains
-            .contexts
-            .insert("admin.example.com".into(), "ten_B".into());
-        old.domains.aliases.push("www.example.com".into());
-        old.domains.aliases.push("legacy.example.com".into());
-        old.domains.wildcards.push("*.old.example.com".into());
-        old.domains.primary = Some("old-primary.example.com".into());
+    // v0.4.23 claim-guard regression fix: a context-bearing host must not 409 its OWN cooperative
+    // re-apply (ownership is `(project, site)`; the context tag is metadata), while a genuine
+    // cross-site claim of the same host still 409s.
+    #[tokio::test]
+    async fn claim_guard_compares_ownership_not_the_context_tag() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::domain_verify::VerificationMethod;
+        use crate::kv::MemoryKv;
 
-        let mut incoming = SiteConfig::default();
-        // A conflicting context (incoming must win) + a manifest-declared wildcard/primary/alias.
-        incoming
-            .domains
-            .contexts
-            .insert("shop.example.com".into(), "ten_NEW".into());
-        incoming.domains.aliases.push("www.example.com".into()); // dup → no double
-        incoming.domains.wildcards.push("*.new.example.com".into());
-        incoming.domains.primary = Some("new-primary.example.com".into());
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let portal = SiteName::new("portal");
+        // shop.example.com is a real attached (verified) alias — the shape the oracle preserves.
+        store
+            .start_domain_verification(
+                ProjectRef::DEFAULT,
+                &portal,
+                "shop.example.com",
+                VerificationMethod::Http,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(ProjectRef::DEFAULT, &portal, "shop.example.com")
+            .await
+            .unwrap();
 
-        let merged = DeployStore::merge_domain_runtime(&incoming, &old);
+        // 1) Attach shop.example.com to `portal` WITH a tenant context tag (a guest-style write).
+        let with_ctx = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("portal.example.com".into()),
+                aliases: vec!["shop.example.com".into()],
+                contexts: [("shop.example.com".to_string(), "ten_A".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "portal", &with_ctx)
+            .await
+            .unwrap();
+        // The tag reached the routing index.
+        let owner = store
+            .resolve_site_by_host("shop.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.site, "portal");
+        assert_eq!(owner.context.as_deref(), Some("ten_A"));
 
-        // contexts: union; incoming wins on `shop`; old-only `admin` preserved.
+        // 2) A later cooperative apply that declares ONLY the wildcard must SUCCEED (no 409, the
+        //    v0.4.22 regression) and leave the context-wired verified alias intact.
+        let wildcard_only = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("portal.example.com".into()),
+                wildcards: vec!["*.portal.example.com".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "portal", &wildcard_only)
+            .await
+            .expect("a context-wired host's own re-apply must not 409");
+        let cfg = store
+            .get_site_config(ProjectRef::DEFAULT, "portal")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            merged.domains.contexts.get("shop.example.com").unwrap(),
-            "ten_NEW"
+            cfg.domains
+                .contexts
+                .get("shop.example.com")
+                .map(String::as_str),
+            Some("ten_A"),
+            "the context survives an apply that doesn't mention it"
         );
-        assert_eq!(
-            merged.domains.contexts.get("admin.example.com").unwrap(),
-            "ten_B"
+        let owner2 = store
+            .resolve_site_by_host("shop.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner2.context.as_deref(), Some("ten_A"));
+
+        // 3) A DIFFERENT site claiming shop.example.com still 409s (real hijack still guarded).
+        let steal = SiteConfig {
+            domains: DomainConfig {
+                aliases: vec!["shop.example.com".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "other", &steal)
+            .await;
+        assert!(
+            matches!(err, Err(DeployError::Conflict(_))),
+            "a cross-site claim of an owned host must still 409: {err:?}"
         );
-        // aliases: union, no duplicate `www`, old-only `legacy` preserved.
-        assert!(merged
-            .domains
-            .aliases
-            .contains(&"www.example.com".to_string()));
-        assert!(merged
-            .domains
-            .aliases
-            .contains(&"legacy.example.com".to_string()));
+    }
+
+    // v0.4.23 contexts store: per-host tenant tags live OUTSIDE the content-addressed config blob;
+    // a cooperative apply that doesn't mention them can't wipe them (union-never-clobber), reads
+    // overlay them back, and `remove_site_context` (the `domain rm` path) is the explicit removal.
+    #[tokio::test]
+    async fn contexts_live_in_their_own_store() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::kv::{KvStore, MemoryKv};
+
+        let kv = Arc::new(MemoryKv::new());
+        let store = DeployStore::new(Arc::new(NullStorage), kv.clone());
+        let cfg = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("shop.example.com".into()),
+                contexts: [("shop.example.com".to_string(), "ten_A".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "portal", &cfg)
+            .await
+            .unwrap();
+
+        // The authoritative store holds the tag; the read path overlays it back (round-trip).
         assert_eq!(
-            merged
+            store
+                .get_site_contexts(ProjectRef::DEFAULT, "portal")
+                .await
+                .unwrap()
+                .and_then(|m| m.get("shop.example.com").cloned())
+                .as_deref(),
+            Some("ten_A")
+        );
+        // The persisted BLOB is declarative-only — contexts are stripped from it (the pointer names
+        // a blob whose JSON contains no context tag).
+        let hash = kv
+            .get(&keys::site_pointer(ProjectRef::DEFAULT, "portal"))
+            .await
+            .unwrap()
+            .unwrap();
+        let blob = kv
+            .get(&keys::site_config_blob(&String::from_utf8_lossy(&hash)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("ten_A"),
+            "the context tag must not be embedded in the content-addressed config blob"
+        );
+
+        // A cooperative apply that names NO contexts leaves the runtime tag intact.
+        let apply_no_ctx = SiteConfig {
+            domains: DomainConfig {
+                primary: Some("shop.example.com".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "portal", &apply_no_ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_site_by_host("shop.example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .context
+                .as_deref(),
+            Some("ten_A"),
+            "an apply omitting the context must not wipe it"
+        );
+
+        // `domain rm` (remove_site_context) is the explicit removal: the tag is gone from the store
+        // and the routing index no longer carries it (the host still resolves, now untagged).
+        assert!(store
+            .remove_site_context(ProjectRef::DEFAULT, "portal", "shop.example.com")
+            .await
+            .unwrap());
+        assert!(store
+            .get_site_contexts(ProjectRef::DEFAULT, "portal")
+            .await
+            .unwrap()
+            .map(|m| m.is_empty())
+            .unwrap_or(true));
+        assert_eq!(
+            store
+                .resolve_site_by_host("shop.example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .context,
+            None,
+            "after removal the routing index carries no tenant tag"
+        );
+    }
+
+    // v0.4.23 aliases ownership oracle: on a cooperative apply, a stored alias that is a VERIFIED
+    // (attached) domain survives even when the incoming config omits it; once its verification is
+    // removed (`domain rm`), a later apply that omits it prunes it (declarative-authoritative).
+    #[tokio::test]
+    async fn aliases_oracle_keeps_verified_prunes_unverified_on_omit() {
+        use crate::config::{DomainConfig, SiteConfig};
+        use crate::domain_verify::VerificationMethod;
+        use crate::kv::MemoryKv;
+
+        let store = DeployStore::new(Arc::new(NullStorage), Arc::new(MemoryKv::new()));
+        let site = SiteName::new("portal");
+        store
+            .start_domain_verification(
+                ProjectRef::DEFAULT,
+                &site,
+                "attached.example.com",
+                VerificationMethod::Http,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_domain_verified(ProjectRef::DEFAULT, &site, "attached.example.com")
+            .await
+            .unwrap();
+        let base = |aliases: Vec<String>| SiteConfig {
+            domains: DomainConfig {
+                primary: Some("portal.example.com".into()),
+                aliases,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // The verified alias is present.
+        store
+            .set_site_config_cooperative(
+                ProjectRef::DEFAULT,
+                "portal",
+                &base(vec!["attached.example.com".into()]),
+            )
+            .await
+            .unwrap();
+        // An apply that OMITS it keeps it (verified ⇒ attached ⇒ owned by the domain lifecycle).
+        store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "portal", &base(vec![]))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_site_config(ProjectRef::DEFAULT, "portal")
+                .await
+                .unwrap()
+                .unwrap()
                 .domains
                 .aliases
-                .iter()
-                .filter(|a| *a == "www.example.com")
-                .count(),
-            1
+                .contains(&"attached.example.com".to_string()),
+            "a verified/attached alias survives an apply that omits it"
         );
-        // wildcards + primary: REPLACED by the incoming (manifest-authoritative) — old NOT kept.
-        assert_eq!(
-            merged.domains.wildcards,
-            vec!["*.new.example.com".to_string()]
-        );
-        assert_eq!(
-            merged.domains.primary.as_deref(),
-            Some("new-primary.example.com")
+
+        // Drop its verification (the `domain rm` half), then an omitting apply PRUNES it.
+        store
+            .remove_domain_verification(ProjectRef::DEFAULT, &site, "attached.example.com")
+            .await
+            .unwrap();
+        store
+            .set_site_config_cooperative(ProjectRef::DEFAULT, "portal", &base(vec![]))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get_site_config(ProjectRef::DEFAULT, "portal")
+                .await
+                .unwrap()
+                .unwrap()
+                .domains
+                .aliases
+                .contains(&"attached.example.com".to_string()),
+            "an unverified declared alias prunes on an omitting apply (declarative-authoritative)"
         );
     }
 

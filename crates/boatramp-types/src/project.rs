@@ -173,6 +173,17 @@ impl DomainOwner {
         self
     }
 
+    /// Whether two owners are the **same owner** — `(project, site)` only. The `context` tag is
+    /// per-host *metadata* the same owner attaches, NOT part of ownership, so it must never gate
+    /// claimability: a host that gains a context tag would otherwise conflict with *itself* the
+    /// moment its stored index value carries the tag but a claim-check passes a bare owner (the
+    /// v0.4.22 cooperative-apply 409 regression). Use this for every hijack/claim comparison; keep
+    /// full [`PartialEq`] (context included) for exact value round-trip checks.
+    #[must_use]
+    pub fn same_owner(&self, other: &Self) -> bool {
+        self.project == other.project && self.site == other.site
+    }
+
     /// The canonical stored form of a domain-index value: the `{project, site}`
     /// JSON object.
     pub fn to_bytes(&self) -> Vec<u8> {
