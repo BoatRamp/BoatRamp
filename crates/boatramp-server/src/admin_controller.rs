@@ -288,6 +288,13 @@ impl AdminController for ServerAdminController {
             .remove_domain_verification(self.project(), &SiteName::new(site), host)
             .await
             .map_err(deploy_err)?;
+        // Also unbind the host's tenant context (v0.4.23): contexts live in their own store and a
+        // whole-config PUT can only add/overwrite, never drop, so `domain rm` is the explicit
+        // context-removal path.
+        self.deploy
+            .remove_site_context(self.project(), site, host)
+            .await
+            .map_err(deploy_err)?;
         self.audit("domains", "remove", &format!("{site}/{host}"), "ok");
         Ok(())
     }
