@@ -437,13 +437,15 @@ fn site_subpath_action(method: &str, get: bool, sub: &[&str]) -> Option<Action> 
                 None
             }
         }
-        // `_boatramp/handlers`, `_boatramp/logs` (per-site observability, read);
-        // `_boatramp/dlq` purge/redrive is a destructive site-scoped write.
+        // `_boatramp/handlers`, `_boatramp/logs`, `_boatramp/queue/{peek,groups}` (per-site
+        // observability, read); `_boatramp/dlq` purge/redrive/discard and
+        // `_boatramp/queue/group` reset/delete are destructive site-scoped writes.
         Some("_boatramp") => {
-            if get {
-                Some(Action::Read)
-            } else if method == "POST" && sub.get(1) == Some(&"dlq") {
+            let write_sub = matches!(sub.get(1).copied(), Some("dlq") | Some("queue"));
+            if method == "POST" && write_sub {
                 Some(Action::Write)
+            } else if get {
+                Some(Action::Read)
             } else {
                 None
             }

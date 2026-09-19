@@ -10,7 +10,7 @@
 
 use clap::Subcommand;
 
-use crate::client::{self, QueuePeekEntry};
+use crate::client::{self, GroupEntry, QueuePeekEntry};
 use crate::config::ProjectConfig;
 
 /// A failure in the `queue` subcommand.
@@ -51,6 +51,40 @@ enum QueueCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// List a topic's consumer groups (cursor, in-flight, lag).
+    Groups {
+        /// Consumer topic (as declared in the deploy config).
+        topic: String,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Reset a consumer group's cursor (re-consume from earliest, or skip to latest).
+    GroupReset {
+        /// Consumer topic.
+        topic: String,
+        /// The group to reset.
+        group: String,
+        /// Skip to the head instead of re-consuming the whole backlog.
+        #[arg(long, conflicts_with = "earliest")]
+        latest: bool,
+        /// Re-consume the whole retained backlog (the default).
+        #[arg(long)]
+        earliest: bool,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Delete a consumer group (its state + its dead-letters).
+    GroupDelete {
+        /// Consumer topic.
+        topic: String,
+        /// The group to delete.
+        group: String,
+        /// Background-alias scope (`{site}/{alias}`); omit for the live site.
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 /// Entry point for `boatramp queue`.
@@ -72,8 +106,49 @@ pub async fn run(args: QueueArgs, config: &ProjectConfig) -> Result<()> {
                 .await?;
             print_peek(topic, &msgs);
         }
+        QueueCommand::Groups { topic, alias } => {
+            let groups = cp.list_groups(&site, topic, alias.as_deref()).await?;
+            print_groups(topic, &groups);
+        }
+        QueueCommand::GroupReset {
+            topic,
+            group,
+            latest,
+            earliest: _,
+            alias,
+        } => {
+            // Default is earliest (re-consume); --latest skips to the head.
+            let start = if *latest { "latest" } else { "earliest" };
+            cp.group_op(&site, topic, alias.as_deref(), group, "reset", Some(start))
+                .await?;
+            println!("reset group {group:?} on topic {topic:?} to {start}");
+        }
+        QueueCommand::GroupDelete {
+            topic,
+            group,
+            alias,
+        } => {
+            cp.group_op(&site, topic, alias.as_deref(), group, "delete", None)
+                .await?;
+            println!("deleted group {group:?} on topic {topic:?}");
+        }
     }
     Ok(())
+}
+
+/// Print a topic's consumer groups (name · in-flight · lag · cursor).
+fn print_groups(topic: &str, groups: &[GroupEntry]) {
+    if groups.is_empty() {
+        println!("no consumer groups on topic {topic:?}");
+        return;
+    }
+    for g in groups {
+        println!(
+            "{}  in_flight={}  lag={}  hwm={}",
+            g.group, g.in_flight, g.lag, g.hwm
+        );
+    }
+    println!("{} group(s) on {topic:?}", groups.len());
 }
 
 /// Print the peeked head of the queue, decoding each payload as UTF-8 when possible.
