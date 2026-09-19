@@ -1002,6 +1002,7 @@ mod tests {
                 lease_ms: None,
                 max_attempts: None,
                 max_batch: None,
+                max_ack_pending: None,
             }],
             crons: vec![CronConfig {
                 schedule: "0 * * * *".into(),

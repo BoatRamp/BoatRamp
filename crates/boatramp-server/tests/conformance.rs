@@ -3553,6 +3553,7 @@ async fn activation_refuses_a_non_consumer_component() {
                 lease_ms: None,
                 max_attempts: None,
                 max_batch: None,
+                max_ack_pending: None,
             }],
             ..Default::default()
         },
@@ -4648,6 +4649,7 @@ async fn operator_endpoint_reports_invocation_and_consumer_stats() {
                 lease_ms: None,
                 max_attempts: None,
                 max_batch: None,
+                max_ack_pending: None,
             }],
             ..Default::default()
         },

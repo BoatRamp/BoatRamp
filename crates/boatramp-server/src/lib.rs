@@ -3136,6 +3136,48 @@ mod tests {
         assert!(compute_endpoints(&deploy, "beta", "web").await.is_empty());
     }
 
+    /// P2 flow control: `max_ack_pending` caps the claim window (across the per-tick `max_batch`),
+    /// so a consumer never holds more than N leased-but-unacked at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_ack_pending_caps_the_claim_window() {
+        use boatramp_handlers::{Bindings, HandlerEngine, Limits};
+        let storage = Arc::new(MemStorage::default());
+        let kv: Arc<dyn KvStore> = Arc::new(MemoryKv::new());
+        let mq = LogMessaging::new(storage, kv.clone());
+        let engine = HandlerEngine::new(Limits::default(), 16).unwrap();
+        let hash = boatramp_core::deploy::sha256_hex(EVENT_CONSUMER);
+        let bindings = Bindings::new("blog").with_keyvalue("blog", kv.clone());
+        let topic = "blog/orders/created";
+        for _ in 0..5 {
+            mq.publish(topic, b"ok").await.unwrap();
+        }
+        // max_batch=10 would take all 5 in one tick; max_ack_pending=2 caps the window to 2.
+        let acked = dispatch_consumer_batch(
+            &engine,
+            &mq,
+            &metrics::Metrics::default(),
+            "blog",
+            topic,
+            "blog/",
+            "",
+            boatramp_core::messaging::StartPosition::Latest,
+            &hash,
+            EVENT_CONSUMER,
+            &bindings,
+            None,
+            Limits::default(),
+            Duration::from_secs(30),
+            5,
+            10,
+            Some(2),
+        )
+        .await;
+        assert_eq!(
+            acked, 2,
+            "MaxAckPending=2 caps the batch to 2 even though max_batch=10 and 5 are queued"
+        );
+    }
+
     /// The delivery gate: a consumer receives every published message at-least-once
     /// (acked, counted once each), and a message that keeps failing is
     /// redelivered and then dead-lettered after `max_attempts`.
@@ -3173,6 +3215,7 @@ mod tests {
                 Duration::from_secs(30),
                 5,
                 10,
+                None,
             )
             .await;
             if acked == 0 {
@@ -3206,6 +3249,7 @@ mod tests {
                 Duration::ZERO,
                 2,
                 10,
+                None,
             )
             .await;
         }
@@ -3254,6 +3298,7 @@ mod tests {
                 Duration::from_secs(30),
                 5,
                 10,
+                None,
             )
             .await;
             assert_eq!(n, 0, "no events yet for group {g}");
@@ -3280,6 +3325,7 @@ mod tests {
                 Duration::from_secs(30),
                 5,
                 10,
+                None,
             )
             .await;
             assert_eq!(n, 1, "group {g} should receive the message");
@@ -3337,6 +3383,7 @@ mod tests {
                     lease_ms: None,
                     max_attempts: None,
                     max_batch: None,
+                    max_ack_pending: None,
                 }],
                 ..Default::default()
             },

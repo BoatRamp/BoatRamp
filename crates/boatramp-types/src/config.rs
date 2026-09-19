@@ -616,6 +616,12 @@ pub struct ConsumerConfig {
     /// default (16). Bounds the consumer's in-flight window per dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch: Option<usize>,
+    /// Per-consumer **MaxAckPending** — the most leased-but-unacked messages this consumer may hold
+    /// at once, ACROSS ticks (≈ JetStream *MaxAckPending*). Back-pressure for a slow consumer: the
+    /// dispatcher claims only up to `max_ack_pending − current_in_flight` each tick, and nothing while
+    /// already at the cap. `None` ⇒ unbounded (only `max_batch` per-tick bounds it). (P2 flow control.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_pending: Option<usize>,
 }
 
 /// serde `skip_serializing_if` helper: a `Latest` start is the default and elided.
