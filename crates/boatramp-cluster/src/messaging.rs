@@ -1952,6 +1952,19 @@ mod tests {
             vec!["alpha".to_string()],
             "beta deleted, alpha remains"
         );
+        // No-loss: deleting beta did NOT remove the shared retained log — alpha, reset to Earliest,
+        // still re-consumes both messages (a delete only releases that group's pin, never shared data).
+        mq.reset_group(&lc, "alpha", StartPosition::Earliest)
+            .await
+            .unwrap();
+        assert_eq!(
+            mq.claim_grouped(&lc, "alpha", StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the retained backlog survived a sibling group's deletion"
+        );
     }
 
     /// Grouped conformance — **single-node** (`LogMessaging`).
