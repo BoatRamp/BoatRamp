@@ -498,6 +498,11 @@ impl Messaging for RaftMessaging {
         max_batch: usize,
         max_attempts: u32,
     ) -> Result<Vec<ClaimedMessage>, MessagingError> {
+        // Flow control (P2): a paused topic delivers nothing. Soft operator signal — checked against
+        // this node's applied state before the claim proposal (publish + in-flight ack/nack flow on).
+        if self.is_paused(topic).await? {
+            return Ok(Vec::new());
+        }
         // The claim is one Raft proposal: the leader applies it atomically, so a
         // message is leased to exactly one claimer cluster-wide. The issuing
         // node stamps `now_ms` so every replica applies the same transition.
@@ -551,6 +556,10 @@ impl Messaging for RaftMessaging {
         // The default group is the work-queue path (unchanged).
         if group.is_empty() {
             return self.claim(topic, lease, max_batch, max_attempts).await;
+        }
+        // Flow control (P2): a paused topic delivers nothing to any group.
+        if self.is_paused(topic).await? {
+            return Ok(Vec::new());
         }
         // One Raft proposal: the leader applies the shared offset-log decision over
         // the group's replicated state, so a message is leased to exactly one
@@ -1080,6 +1089,19 @@ impl Messaging for RaftMessaging {
         })
         .await?;
         Ok(())
+    }
+
+    async fn set_paused(&self, topic: &str, paused: bool) -> Result<(), MessagingError> {
+        self.propose(WriteOp::MqSetPaused {
+            topic: topic.to_string(),
+            paused,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn is_paused(&self, topic: &str) -> Result<bool, MessagingError> {
+        Ok(self.state.get(&messaging::pause_key(topic)).await.is_some())
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -1620,6 +1642,29 @@ mod tests {
         // Drain the redriven poison-x so the queue ends empty.
         for m in mq.claim(topic, LEASE, 10, 5).await.unwrap() {
             mq.ack(&m).await.unwrap();
+        }
+        assert_eq!(mq.backlog(topic).await.unwrap(), 0);
+
+        // --- P2 flow control: pause / resume (both backends) --------------------------
+        assert!(!mq.is_paused(topic).await.unwrap());
+        mq.publish(topic, b"fc-1").await.unwrap();
+        mq.set_paused(topic, true).await.unwrap();
+        assert!(mq.is_paused(topic).await.unwrap());
+        // Paused: claim delivers NOTHING, but publish still durably enqueues.
+        assert!(mq.claim(topic, LEASE, 10, 5).await.unwrap().is_empty());
+        mq.publish(topic, b"fc-2").await.unwrap();
+        assert_eq!(
+            mq.backlog(topic).await.unwrap(),
+            2,
+            "publish still enqueues while paused"
+        );
+        // Resume: both flow.
+        mq.set_paused(topic, false).await.unwrap();
+        assert!(!mq.is_paused(topic).await.unwrap());
+        let flowed = mq.claim(topic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(flowed.len(), 2, "resume delivers what accumulated");
+        for m in &flowed {
+            mq.ack(m).await.unwrap();
         }
         assert_eq!(mq.backlog(topic).await.unwrap(), 0);
     }

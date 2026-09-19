@@ -444,6 +444,46 @@ pub(super) async fn operator_queue_groups(
     }
 }
 
+/// `POST …/_boatramp/queue/pause` request: pause or resume a topic (P2 flow control).
+#[cfg(feature = "handlers")]
+#[derive(Deserialize)]
+pub(super) struct QueuePauseRequest {
+    topic: String,
+    #[serde(default)]
+    alias: Option<String>,
+    /// `true` = pause (suppress delivery), `false` = resume.
+    paused: bool,
+}
+
+/// Operator flow-control MUTATION (`POST …/_boatramp/queue/pause`, write): pause/resume a topic.
+/// Site-scoped so an operator only controls their own site's topics.
+#[cfg(feature = "handlers")]
+pub(super) async fn operator_queue_pause(
+    Extension(handlers): Extension<Arc<HandlerRuntime>>,
+    Path(site): Path<String>,
+    Json(req): Json<QueuePauseRequest>,
+) -> Response {
+    let Some(inner) = handlers.inner.as_ref() else {
+        return not_found();
+    };
+    let Some(messaging) = inner.messaging.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "messaging backend not configured\n",
+        )
+            .into_response();
+    };
+    let namespaced = dlq_namespace(&site, &req.alias, &req.topic);
+    match messaging.set_paused(&namespaced, req.paused).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "paused": req.paused })).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("pause/resume failed: {err}\n"),
+        )
+            .into_response(),
+    }
+}
+
 /// Which group-lifecycle mutation `POST …/_boatramp/queue/group` runs.
 #[cfg(feature = "handlers")]
 #[derive(Deserialize)]

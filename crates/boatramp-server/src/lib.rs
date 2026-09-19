@@ -163,7 +163,7 @@ pub(crate) use operator::prometheus_metrics;
 pub(crate) use operator::{
     operator_dlq, operator_dlq_list, operator_function_logs, operator_function_logs_stream,
     operator_handler_stats, operator_logs, operator_logs_stream, operator_queue_group,
-    operator_queue_groups, operator_queue_peek,
+    operator_queue_groups, operator_queue_pause, operator_queue_peek,
 };
 mod proxy;
 pub use proxy::spawn_compute_reconcile;

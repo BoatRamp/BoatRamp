@@ -218,6 +218,12 @@ pub enum WriteOp {
         topic: String,
         group: String,
     },
+    /// **Pause / resume** a topic (P2 flow control): set/clear the pause marker in replicated state.
+    /// While set, claims deliver nothing (publish + in-flight ack/nack unaffected).
+    MqSetPaused {
+        topic: String,
+        paused: bool,
+    },
     /// **Retention sweep** for a grouped topic: reclaim the replicated log entries
     /// that no group still needs (with an id-age TTL backstop), returning the
     /// reclaimed ids so the caller can delete their `Storage` payloads (which the
@@ -525,6 +531,15 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 target.remove(key);
             }
             target.remove(messaging::gstate_key(&topic, &group));
+            WriteResponse::Kv
+        }
+        WriteOp::MqSetPaused { topic, paused } => {
+            let key = messaging::pause_key(&topic);
+            if paused {
+                target.put(key, Vec::new());
+            } else {
+                target.remove(key);
+            }
             WriteResponse::Kv
         }
         WriteOp::MqSweepGrouped { topic, now_ms } => {
