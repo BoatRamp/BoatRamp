@@ -115,6 +115,9 @@ pub enum CliError {
     /// The `dlq` command.
     #[error(transparent)]
     Dlq(#[from] crate::dlq::Error),
+    /// The `queue` command.
+    #[error(transparent)]
+    Queue(#[from] crate::queue::Error),
     /// The `dns` command (requires `--features acme-dns`).
     #[cfg(feature = "acme-dns")]
     #[error(transparent)]

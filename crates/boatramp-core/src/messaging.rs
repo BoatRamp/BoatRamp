@@ -287,6 +287,17 @@ pub trait Messaging: Send + Sync {
         Ok(0)
     }
 
+    /// **Peek** up to `limit` messages on `topic`'s work-queue WITHOUT claiming them — no lease is
+    /// taken and no attempt is charged, so it is a pure read (`queue peek`). Ordered by id (delivery
+    /// order); each carries whether it is currently `leased` (in-flight) or claimable. Default empty.
+    async fn peek(
+        &self,
+        _topic: &str,
+        _limit: usize,
+    ) -> Result<Vec<PeekedMessage>, MessagingError> {
+        Ok(Vec::new())
+    }
+
     /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
     /// every consumer group has already consumed (a message below every group's
     /// high-water with none holding it in-flight), with an age-based TTL backstop.
@@ -475,6 +486,23 @@ pub struct DeadLetter {
     pub signed_context: Option<String>,
     /// The message body — `Some` only from `show_dead_letter`; `None` in a metadata listing.
     pub payload: Option<Vec<u8>>,
+}
+
+/// A message peeked from a live work-queue (P1 `queue peek`) — inspected WITHOUT claiming it (no
+/// lease taken, no attempt charged). `leased` marks a message currently in-flight to a consumer (vs
+/// claimable now); `payload` is the message body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeekedMessage {
+    /// The message's durable id (time-ordered = delivery order).
+    pub id: String,
+    /// Delivery attempts charged so far.
+    pub attempts: u32,
+    /// Currently leased (in-flight to a consumer) rather than claimable now.
+    pub leased: bool,
+    /// The producer's durable signed-context envelope, if any.
+    pub signed_context: Option<String>,
+    /// The message body.
+    pub payload: Vec<u8>,
 }
 
 /// An AND-composed filter over a topic's dead-letters (P1 selective DLQ). A dead-letter matches iff
@@ -2259,6 +2287,43 @@ impl Messaging for LogMessaging {
             discarded += 1;
         }
         Ok(discarded)
+    }
+
+    async fn peek(&self, topic: &str, limit: usize) -> Result<Vec<PeekedMessage>, MessagingError> {
+        let now = now_unix_ms();
+        let prefix = meta_prefix(topic);
+        let mut keys: Vec<String> = self
+            .kv
+            .list_prefix(&prefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| is_direct_child(k, &prefix))
+            .collect();
+        keys.sort(); // ids are time-ordered ⇒ delivery order.
+        let mut out = Vec::new();
+        for key in keys.into_iter().take(limit) {
+            let Some(raw) = self.kv.get(&key).await.map_err(MessagingError::backend)? else {
+                continue;
+            };
+            let record: Record =
+                serde_json::from_slice(&raw).map_err(|e| MessagingError::Decode(e.to_string()))?;
+            let id = key[prefix.len()..].to_string();
+            // Read-only: never mutate the lease or attempts. Inline rides in the record; otherwise the
+            // object-store copy (a missing object yields an empty body rather than failing the peek).
+            let payload = match &record.inline {
+                Some(bytes) => bytes.clone(),
+                None => self.read_payload(topic, &id).await.unwrap_or_default(),
+            };
+            out.push(PeekedMessage {
+                id,
+                attempts: record.attempts,
+                leased: record.lease_until_ms > now,
+                signed_context: record.signed_context,
+                payload,
+            });
+        }
+        Ok(out)
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {

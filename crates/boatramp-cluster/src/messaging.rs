@@ -968,6 +968,45 @@ impl Messaging for RaftMessaging {
         Ok(matched.len())
     }
 
+    async fn peek(
+        &self,
+        topic: &str,
+        limit: usize,
+    ) -> Result<Vec<boatramp_core::messaging::PeekedMessage>, MessagingError> {
+        let now = now_unix_ms();
+        let prefix = messaging::meta_prefix(topic);
+        let mut keys: Vec<String> = self
+            .state
+            .list_prefix(&prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &prefix))
+            .collect();
+        keys.sort(); // ids are time-ordered ⇒ delivery order.
+        let mut out = Vec::new();
+        for key in keys.into_iter().take(limit) {
+            let Some(raw) = self.state.get(&key).await else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<messaging::Record>(&raw) else {
+                continue;
+            };
+            let id = key[prefix.len()..].to_string();
+            let payload = match &record.inline {
+                Some(bytes) => bytes.clone(),
+                None => self.read_payload(topic, &id).await.unwrap_or_default(),
+            };
+            out.push(boatramp_core::messaging::PeekedMessage {
+                id,
+                attempts: record.attempts,
+                leased: record.lease_until_ms > now,
+                signed_context: record.signed_context,
+                payload,
+            });
+        }
+        Ok(out)
+    }
+
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
         // The state machine reclaims the replicated log entries no group needs and
         // returns their ids; only the client can delete the `Storage` payloads
@@ -1326,6 +1365,18 @@ mod tests {
             mq.publish(topic, p).await.unwrap();
         }
         assert_eq!(mq.backlog(topic).await.unwrap(), 3);
+        // queue peek (both backends): read the three in delivery order WITHOUT consuming — no lease,
+        // no attempt charge — so the claim immediately below still gets all three at attempt 1.
+        let peeked = mq.peek(topic, 10).await.unwrap();
+        assert_eq!(
+            peeked.iter().map(|p| p.payload.clone()).collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "peek returns all three in delivery order"
+        );
+        assert!(
+            peeked.iter().all(|p| !p.leased && p.attempts == 0),
+            "peek does not lease or charge an attempt"
+        );
         let batch = mq.claim(topic, LEASE, 10, 5).await.unwrap();
         assert_eq!(
             batch.iter().map(|m| m.payload.clone()).collect::<Vec<_>>(),

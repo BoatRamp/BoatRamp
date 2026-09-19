@@ -383,6 +383,18 @@ pub struct DlqFilter {
     pub limit: Option<usize>,
 }
 
+/// One live message returned by `queue peek` (payload base64).
+#[derive(Debug, Deserialize)]
+pub struct QueuePeekEntry {
+    pub id: String,
+    pub attempts: u32,
+    #[serde(default)]
+    pub leased: bool,
+    #[serde(default)]
+    pub signed_context_present: bool,
+    pub payload_b64: String,
+}
+
 /// One dead-letter as returned by the `dlq` list/show/dry-run views.
 #[derive(Debug, Deserialize)]
 pub struct DlqEntry {
@@ -969,6 +981,39 @@ impl ControlPlane {
             .json()
             .await?;
         Ok((resp.affected, resp.matched))
+    }
+
+    /// Peek the head of a topic's LIVE work-queue without consuming (`GET …/_boatramp/queue/peek`).
+    pub async fn peek_queue(
+        &self,
+        site: &str,
+        topic: &str,
+        alias: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<QueuePeekEntry>> {
+        let seg = self.sites_seg();
+        let Self {
+            http: client,
+            base: server,
+            ..
+        } = self;
+        #[derive(Deserialize)]
+        struct QueuePeekResponse {
+            #[allow(dead_code)]
+            version: u32,
+            messages: Vec<QueuePeekEntry>,
+        }
+        let mut req = client
+            .get(format!("{server}/api/{seg}/{site}/_boatramp/queue/peek"))
+            .query(&[("topic", topic)]);
+        if let Some(alias) = alias {
+            req = req.query(&[("alias", alias)]);
+        }
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit.to_string())]);
+        }
+        let resp: QueuePeekResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.messages)
     }
 
     /// List (or `show`) a topic's dead-letters (`GET …/_boatramp/dlq`), filter-matching. `show` with
