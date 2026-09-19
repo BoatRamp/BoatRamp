@@ -235,23 +235,29 @@ impl Messaging for RaftMessaging {
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
         let id = self.next_id();
-        // Payload to shared storage first, then the index proposal — so the
-        // replicated record never references a missing payload.
-        let bytes = bytes::Bytes::copy_from_slice(payload);
-        let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-        self.storage
-            .put(
-                &messaging::payload_key(topic, &id),
-                body,
-                PutMeta::default(),
-            )
-            .await
-            .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        let retain = self.topic_has_groups(topic).await;
+        // A3: a small work-queue payload rides IN the replicated index record (via the proposal
+        // below) — no object-store write, no round-trip. Only work-queue (grouped keeps the shared
+        // object every group reads) and only up to `INLINE_MAX` (larger ⇒ object store). Otherwise:
+        // payload to shared storage FIRST, then the index proposal — the replicated record never
+        // references a missing payload.
+        let inline = !retain && payload.len() <= messaging::INLINE_MAX;
+        if !inline {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(
+                    &messaging::payload_key(topic, &id),
+                    body,
+                    PutMeta::default(),
+                )
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
         // On a grouped topic, also write the **retained** fan-out payload before
         // proposing, so the replicated `glog` entry (written in the same proposal
         // when `retain`) never references a missing payload — the same
         // payload-first invariant, split across `Storage` (here) and the log.
-        let retain = self.topic_has_groups(topic).await;
         if retain {
             let bytes = bytes::Bytes::copy_from_slice(payload);
             let body = futures::stream::once(async move { Ok(bytes) }).boxed();
@@ -269,6 +275,7 @@ impl Messaging for RaftMessaging {
             id: id.clone(),
             retain,
             signed_context: signed_context.map(str::to_owned),
+            inline: inline.then(|| payload.to_vec()),
         })
         .await?;
         // Live SSE fan-out across the cluster (best-effort, separate from the
@@ -301,10 +308,15 @@ impl Messaging for RaftMessaging {
                 "claim proposal returned a non-claim response".into(),
             ));
         };
-        // Fetch payloads from the shared store (bypassing consensus).
+        // Deliver each: an A3-inlined payload came back IN the claim response (it lives in the
+        // replicated record, not object storage); otherwise fetch from the shared store.
         let mut claimed = Vec::with_capacity(records.len());
         for record in records {
-            let payload = self.read_payload(topic, &record.id).await?;
+            let inline = record.inline.is_some();
+            let payload = match record.inline {
+                Some(bytes) => bytes,
+                None => self.read_payload(topic, &record.id).await?,
+            };
             claimed.push(ClaimedMessage {
                 id: record.id,
                 topic: topic.to_string(),
@@ -314,6 +326,7 @@ impl Messaging for RaftMessaging {
                 // `claim_grouped` below.
                 group: String::new(),
                 signed_context: record.signed_context,
+                inline,
             });
         }
         Ok(claimed)
@@ -364,6 +377,8 @@ impl Messaging for RaftMessaging {
                     attempts: record.attempts,
                     group: group.to_string(),
                     signed_context: record.signed_context,
+                    // Grouped payloads are always object-store retained, never inlined.
+                    inline: false,
                 }),
                 Err(_) => continue,
             }
@@ -383,16 +398,19 @@ impl Messaging for RaftMessaging {
             .await?;
             return Ok(());
         }
-        // Work-queue: drop the index record first (no longer claimable), then the payload.
+        // Work-queue: drop the index record first (no longer claimable), then the payload — unless
+        // the payload was A3-inlined in that record (nothing in object storage to delete).
         self.propose(WriteOp::MqAck {
             topic: msg.topic.clone(),
             id: msg.id.clone(),
         })
         .await?;
-        self.storage
-            .delete(&messaging::payload_key(&msg.topic, &msg.id))
-            .await
-            .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        if !msg.inline {
+            self.storage
+                .delete(&messaging::payload_key(&msg.topic, &msg.id))
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -416,6 +434,75 @@ impl Messaging for RaftMessaging {
 
     async fn backlog(&self, topic: &str) -> Result<usize, MessagingError> {
         Ok(self.count_direct(&messaging::meta_prefix(topic)).await)
+    }
+
+    async fn oldest_pending_ms(&self, topic: &str) -> Result<Option<u64>, MessagingError> {
+        // Earliest live work-queue id from this node's applied state (list_prefix is sorted).
+        let prefix = messaging::meta_prefix(topic);
+        let oldest = self
+            .state
+            .list_prefix(&prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &prefix))
+            .map(|k| messaging::id_millis(&k[prefix.len()..]))
+            .min();
+        Ok(oldest.map(|ms| now_unix_ms().saturating_sub(ms)))
+    }
+
+    async fn in_flight_count(&self, topic: &str) -> Result<usize, MessagingError> {
+        let now = now_unix_ms();
+        let mut count = 0;
+        // Work-queue: records currently leased (from this node's applied state).
+        let prefix = messaging::meta_prefix(topic);
+        for key in self.state.list_prefix(&prefix).await {
+            if !messaging::is_direct_child(&key, &prefix) {
+                continue;
+            }
+            if let Some(raw) = self.state.get(&key).await {
+                if let Ok(rec) = serde_json::from_slice::<messaging::Record>(&raw) {
+                    if rec.lease_until_ms > now {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        // Grouped: every registered group's currently-leased in-flight entries.
+        let gprefix = messaging::gstate_prefix(topic);
+        for key in self.state.list_prefix(&gprefix).await {
+            if !messaging::is_direct_child(&key, &gprefix) {
+                continue;
+            }
+            if let Some(raw) = self.state.get(&key).await {
+                if let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) {
+                    count += state
+                        .in_flight
+                        .iter()
+                        .filter(|f| f.lease_until_ms > now)
+                        .count();
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    async fn group_lag(&self, topic: &str, group: &str) -> Result<usize, MessagingError> {
+        let Some(raw) = self.state.get(&messaging::gstate_key(topic, group)).await else {
+            return Ok(0);
+        };
+        let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) else {
+            return Ok(0);
+        };
+        // Retained log ids strictly beyond the group's high-water (not-yet-leased for this group).
+        let prefix = messaging::glog_prefix(topic);
+        let lag = self
+            .state
+            .list_prefix(&prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &prefix) && k[prefix.len()..] > *state.hwm)
+            .count();
+        Ok(lag)
     }
 
     async fn dead_letter_count(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -462,29 +549,33 @@ impl Messaging for RaftMessaging {
         if ids.is_empty() && grouped.is_empty() {
             return Ok(0);
         }
-        // Work-queue: re-arm a fresh index record (`MqPublish` is idempotent and the meta key was
-        // removed at dead-letter time) and drop the dead record, atomically in one batch — payload
-        // reused in place. Grouped: re-arm the id in its group's in-flight + drop the dead record
-        // (the retained payload/log was pinned by the dead-letter against the sweep).
-        let mut ops: Vec<WriteOp> = ids
-            .iter()
-            .flat_map(|id| {
-                [
-                    WriteOp::MqPublish {
-                        topic: topic.to_string(),
-                        id: id.clone(),
-                        retain: false,
-                        // Cluster redrive re-arms from the dead id alone; the producer context is
-                        // not carried here (fail-closed on the retry) — a documented parity gap with
-                        // the single-node redrive, acceptable because it never widens access.
-                        signed_context: None,
-                    },
-                    WriteOp::Delete {
-                        key: messaging::dead_key(topic, id),
-                    },
-                ]
-            })
-            .collect();
+        // Work-queue: re-arm the index record (`MqPublish` is idempotent, the meta key was removed
+        // at dead-letter time) and drop the dead record, atomically in one batch. Carry the dead
+        // record's signed-context AND its A3-inlined payload forward — reading the preserved record
+        // (deterministic applied state) both gives an inline message its body back (it lived in the
+        // record, not object storage) and closes the prior context-parity gap with single-node.
+        // Grouped: re-arm the id in its group's in-flight + drop the dead record (its retained
+        // payload/log was pinned by the dead-letter against the sweep).
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(ids.len() * 2 + grouped.len());
+        for id in &ids {
+            let (signed_context, inline) = self
+                .state
+                .get(&messaging::dead_key(topic, id))
+                .await
+                .and_then(|raw| serde_json::from_slice::<messaging::Record>(&raw).ok())
+                .map(|r| (r.signed_context, r.inline))
+                .unwrap_or((None, None));
+            ops.push(WriteOp::MqPublish {
+                topic: topic.to_string(),
+                id: id.clone(),
+                retain: false,
+                signed_context,
+                inline,
+            });
+            ops.push(WriteOp::Delete {
+                key: messaging::dead_key(topic, id),
+            });
+        }
         for (group, id) in &grouped {
             ops.push(WriteOp::MqRedriveGroupedDead {
                 topic: topic.to_string(),

@@ -128,6 +128,12 @@ pub enum WriteOp {
         /// `MqPublish` (no field) applies as an unscoped publish.
         #[serde(default)]
         signed_context: Option<String>,
+        /// **Inlined payload** (A3): for a small work-queue message the body rides in the replicated
+        /// index record instead of shared object storage — so no object-store round-trip, at the cost
+        /// of bounded (`INLINE_MAX`) Raft-log/snapshot bytes. `#[serde(default)]` (base64 in JSON) so
+        /// an older node's `MqPublish` applies with the payload in object storage as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inline: Option<Vec<u8>>,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -318,13 +324,16 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             id,
             retain,
             signed_context,
+            inline,
         } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
             let key = messaging::meta_key(&topic, &id);
             if !target.data.contains_key(&key) {
-                let fresh = serde_json::to_vec(&messaging::Record::fresh(signed_context))
-                    .expect("record serializes");
+                let mut record = messaging::Record::fresh(signed_context);
+                // A3: a small work-queue payload rides IN the replicated record (no object store).
+                record.inline = inline;
+                let fresh = serde_json::to_vec(&record).expect("record serializes");
                 target.put(key, fresh);
             }
             if retain {
@@ -519,6 +528,9 @@ fn apply_mq_claim(
                     id,
                     attempts: record.attempts,
                     signed_context: record.signed_context,
+                    // A3: carry an inlined payload back to the claiming node (it's in the replicated
+                    // record, not object storage, so the node can't fetch it separately).
+                    inline: record.inline,
                 });
             }
             messaging::ClaimAction::DeadLetter { id, record } => {
@@ -640,6 +652,8 @@ fn apply_mq_claim_grouped(
             attempts: *attempts,
             lease_until_ms: 0,
             signed_context,
+            // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
+            inline: None,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);
@@ -665,6 +679,8 @@ fn apply_mq_claim_grouped(
                 id,
                 attempts,
                 signed_context,
+                // Grouped payloads are always object-store retained, never inlined.
+                inline: None,
             }
         })
         .collect()
@@ -741,6 +757,12 @@ pub struct ClaimedRecord {
     /// rolling upgrade (an older leader's claim response omits it ⇒ no context ⇒ fail closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_context: Option<String>,
+    /// The message's **inlined payload** (A3), if the body rode in the replicated record instead of
+    /// object storage — carried back so the claiming node delivers it without a `Storage` fetch.
+    /// `None` ⇒ fetch from `Storage` at [`messaging::payload_key`]. `#[serde(default)]` for a
+    /// rolling upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<Vec<u8>>,
 }
 
 /// The result of applying a [`WriteOp`]: empty for KV/ack/nack/publish, or the
