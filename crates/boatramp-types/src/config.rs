@@ -520,6 +520,13 @@ pub struct HandlerConfig {
     /// present it must **narrow within** the site ceiling ([`crate::tenancy::Tenancy::narrows_within`])
     /// — a widening is refused fail-closed at bind. Lets one site host handlers at different modes
     /// (e.g. an `own` page handler beside an `all` admin handler under a site ceiling of `all`).
+    ///
+    /// A route may deliberately EXCEED the site ceiling (task #470) via
+    /// [`Tenancy::Scoped::exceed_site_ceiling`](crate::tenancy::Tenancy::Scoped) — but only when the
+    /// site has also set [`HandlersSiteConfig::allow_ceiling_exceptions`], and only a scoped
+    /// read/write widening on the same tenant column (an `all` grant still needs the operator posture
+    /// at runtime). This is the authorized, greppable way to run an unscoped `all` route (e.g. an M2M
+    /// `/token`) under an otherwise `own`-ceilinged site.
     #[serde(
         default,
         deserialize_with = "crate::tenancy::de_opt_tenancy",
