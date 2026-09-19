@@ -2359,6 +2359,177 @@ mod tests {
         );
     }
 
+    /// **CI-hard live gate: the #470 three-key ceiling-exception truth table, end-to-end on a real
+    /// engine.** A site pinned to an `own` ceiling; a route may EXCEED it to `all` only when BOTH
+    /// deployer keys are present at bind (site `allow_ceiling_exceptions` + route
+    /// `exceed_site_ceiling`) AND the operator posture permits cross-tenant. Drives the REAL bind
+    /// admission (`narrows_within_authorized`, mirroring `handler_dispatch`), the REAL resolve+clamp
+    /// (`resolve_host_tenancy` + `cap`), and the REAL ORM scope against a libsql engine holding
+    /// tenant A + B rows — so every corner is OBSERVED in SQL, not just asserted on a predicate.
+    /// `#[ignore]`d locally (the static-musl libsql segfault); the `test-target-plain-wasm` CI job
+    /// runs it unignored on the host toolchain and greps `TENANCY OVERRIDE THREE-KEY OK`.
+    #[tokio::test]
+    #[ignore = "run via the test-target-plain-wasm CI job on the host toolchain (static-musl libsql segfault)"]
+    async fn ceiling_exception_three_key_truth_table_on_a_real_engine() {
+        use boatramp_core::orm::{Expr, Select, SelectItem};
+        use boatramp_core::sql::{Dialect, SqlBackends, SqlValue};
+        use boatramp_handlers::TenantAxis;
+
+        let dir = std::env::temp_dir().join(format!("boatramp-threekey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backends = boatramp_storage::LibsqlSqlBackends::local(&dir);
+        let db = backends.database("default", "svc", "").await.unwrap();
+        {
+            let mut tx = db.begin().await.unwrap();
+            tx.execute(
+                "CREATE TABLE docs (id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+            for (id, tenant, name) in [
+                ("a1", "tenant_A", "A one"),
+                ("b1", "tenant_B", "B one"),
+                ("b2", "tenant_B", "B two"),
+            ] {
+                tx.execute(
+                    "INSERT INTO docs (id, tenant_id, name) VALUES (?1, ?2, ?3)",
+                    &[
+                        SqlValue::Text(id.into()),
+                        SqlValue::Text(tenant.into()),
+                        SqlValue::Text(name.into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // The route's "own" tenant resolves to B (via the routed-domain context), so an `own` scope
+        // returns only B's rows and an `all` scope (posture permitting) returns every tenant's.
+        let scoped = |read: AccessMode, write: AccessMode, token: bool| Tenancy::Scoped {
+            column: "tenant_id".into(),
+            sources: vec![TenantSource::Domain],
+            read,
+            write,
+            exceed_site_ceiling: token,
+        };
+        let ceiling = scoped(AccessMode::Own, AccessMode::Own, false); // an `own` site ceiling.
+        let route_all_token = scoped(AccessMode::All, AccessMode::All, true);
+        let route_all_notoken = scoped(AccessMode::All, AccessMode::All, false);
+        let route_own = scoped(AccessMode::Own, AccessMode::Own, false);
+
+        // The REAL bind admission (exactly what `handler_dispatch` checks).
+        let admit = |route: &Tenancy, site_allows: bool| {
+            route.narrows_within_authorized(&ceiling, site_allows)
+        };
+
+        // Resolve the route through the REAL resolver+clamp, apply the REAL ORM read scope, and
+        // observe which tenants' rows come back from the engine.
+        let observe = |route: &Tenancy, cross: bool| {
+            let route = route.clone();
+            let db = &db;
+            async move {
+                let inputs = TenantSourceInputs {
+                    domain_context: Some("tenant_B"),
+                    ..Default::default()
+                };
+                let ht = resolve_host_tenancy(Some(&route), true, posture(false, cross), inputs)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut q = Select {
+                    columns: vec![SelectItem {
+                        expr: Expr::col("name"),
+                        alias: None,
+                    }],
+                    ..Select::from("docs")
+                };
+                // `all` (posture permitting) ⇒ no scope ⇒ unconfined ⇒ cross-tenant; else confine.
+                if let Some(scope) = ht.orm_scope(TenantAxis::Read).unwrap() {
+                    q.force_scope(&scope).unwrap();
+                }
+                let (sql, params) = q.compile(Dialect::Sqlite).unwrap();
+                let mut tx = db.begin().await.unwrap();
+                let rows = run_text_rows(tx.as_mut(), &sql, &params).await;
+                tx.commit().await.unwrap();
+                rows
+            }
+        };
+
+        // ── Corner 1: ALL THREE keys on → the route genuinely crosses tenants (the only GREEN corner).
+        assert!(
+            admit(&route_all_token, true),
+            "corner 1: both deployer keys admit the widen at bind"
+        );
+        assert_eq!(
+            observe(&route_all_token, true).await,
+            vec![
+                "A one".to_string(),
+                "B one".to_string(),
+                "B two".to_string()
+            ],
+            "corner 1: with the posture ON, the authorized `all` route reads EVERY tenant's rows"
+        );
+
+        // ── Corner 2: keys present but the operator posture is OFF → clamped to `own` at runtime.
+        assert!(
+            admit(&route_all_token, true),
+            "corner 2: bind admission does not depend on the posture"
+        );
+        assert_eq!(
+            observe(&route_all_token, false).await,
+            vec!["B one".to_string(), "B two".to_string()],
+            "corner 2: the posture (key 3) clamps `all`→`own` — the route sees ONLY its own tenant B"
+        );
+
+        // ── Corner 3: route token present, but the SITE does not permit exceptions → refused at bind.
+        assert!(
+            !admit(&route_all_token, false),
+            "corner 3: without the site key (allow_ceiling_exceptions) the widen fails closed"
+        );
+
+        // ── Corner 4: site permits exceptions, but the route carries NO token + wants `all` → refused.
+        assert!(
+            !admit(&route_all_notoken, true),
+            "corner 4: without the route token a bare `all` widen fails closed even on a permitting site"
+        );
+
+        // ── Corner 5: no bleed — a tokened route A does not widen a sibling route B. Route B, an
+        // honest `own` narrowing, is admitted and observably stays on its own tenant EVEN WHILE the
+        // sibling A is cross-tenant; and a sibling that wants `all` without its own token is refused.
+        assert!(
+            admit(&route_own, true),
+            "corner 5: the `own` sibling is admitted (a narrowing)"
+        );
+        assert_eq!(
+            observe(&route_own, true).await,
+            vec!["B one".to_string(), "B two".to_string()],
+            "corner 5: the sibling `own` route sees only tenant B — the tokened route's `all` did not bleed"
+        );
+        assert!(
+            !admit(&route_all_notoken, true),
+            "corner 5: a sibling wanting `all` needs its OWN token — A's token does not carry over"
+        );
+
+        // ── Corner 6: a tokened widen on a plain HTTP route does NOT widen the /graphql gateway. The
+        // gateway is its own HandlerConfig; a gateway decision wanting `all` with no token of its own
+        // is refused, regardless of a sibling route holding the token.
+        let gateway_all_notoken = scoped(AccessMode::All, AccessMode::All, false);
+        assert!(
+            !admit(&gateway_all_notoken, true),
+            "corner 6: the /graphql gateway needs its OWN exceed_site_ceiling — a sibling's does not widen it"
+        );
+
+        println!(
+            "TENANCY OVERRIDE THREE-KEY OK: an `own`-ceilinged site admits a route's `all` widen ONLY \
+             with BOTH deployer keys, and it crosses tenants ONLY when the operator posture also \
+             permits it (else clamped to own); every missing-key corner + the sibling/gateway no-bleed \
+             corners fail closed — all observed end-to-end on a real libsql engine"
+        );
+    }
+
     /// Run a compiled `(sql, params)` returning the single text column, sorted.
     async fn run_text_rows(
         tx: &mut dyn boatramp_core::sql::SqlTransaction,
