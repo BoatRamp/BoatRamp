@@ -99,6 +99,10 @@ pub(crate) async fn resolve_host_tenancy(
             sources,
             read,
             write,
+            // `exceed_site_ceiling` (task #470) is deliberately NOT read here: the token relaxes only
+            // the `narrows_within` shape check at bind, never the runtime resolver. `cap()` below
+            // stays the SOLE authority over whether an `all` grant actually crosses tenants (key 3).
+            ..
         }) => {
             // The own-tenant fact (from the trigger's first applicable source) + the anonymous
             // session fact (R3, from a verified cookie) — each axis resolved independently, tagged,
@@ -428,6 +432,7 @@ mod tests {
             sources: vec![TenantSource::Domain],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         // A request carrying BOTH a routed domain (⇒ a tenant fact) and a valid session cookie
         // (⇒ a session fact): the resolved principal holds both, axis-tagged.
@@ -500,6 +505,7 @@ mod tests {
             sources: vec![TenantSource::SignedContext],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         // The drained message carried a valid envelope + the fleet anchor ⇒ the producer's stamped
         // tenant resolves as the consumer's own `Tenant` fact.
@@ -563,6 +569,7 @@ mod tests {
             sources: vec![TenantSource::None], // irrelevant on the invoke path — the value is inherited
             read: AccessMode::OwnOrNull,
             write: AccessMode::All,
+            exceed_site_ceiling: false,
         };
         let ht = resolve_inherited_tenancy(
             Some(&decision),
@@ -649,6 +656,7 @@ mod tests {
             sources: vec![TenantSource::Domain],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme-store"),
@@ -849,6 +857,7 @@ mod tests {
             sources: vec![TenantSource::Domain],
             read: AccessMode::All,
             write: AccessMode::All,
+            exceed_site_ceiling: false,
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -881,6 +890,7 @@ mod tests {
             sources: vec![TenantSource::Domain],
             read: AccessMode::OwnOrNull,
             write: AccessMode::OwnOrNull,
+            exceed_site_ceiling: false,
         };
         let inputs = TenantSourceInputs {
             domain_context: Some("acme"),
@@ -910,6 +920,7 @@ mod tests {
             sources: vec![TenantSource::Domain],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         // No domain context supplied ⇒ no value; the binding will deny an own op.
         let ht = resolve_host_tenancy(

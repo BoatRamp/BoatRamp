@@ -876,6 +876,17 @@ pub struct HandlersSiteConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub tenancy: Option<crate::tenancy::Tenancy>,
+    /// **Site-level enablement of per-route ceiling exceptions** (task #470, key 1 of the three-key
+    /// model). Default `false`. Set NEXT TO the site [`tenancy`](Self::tenancy) ceiling, this is the
+    /// baseline-definer affirmatively permitting routes to exceed its own baseline. While `false`,
+    /// EVERY route's [`Tenancy::Scoped::exceed_site_ceiling`](crate::tenancy::Tenancy::Scoped) token
+    /// is inert — a widening still fails closed. Turning it on unlocks nothing by itself (a route
+    /// must ALSO carry the token, and `all` still needs the operator posture). Keeping it default
+    /// `false` gives an honest one-line audit: a site with `allow_ceiling_exceptions = false` is
+    /// provably exception-free without scanning every route, and exceptions require a conscious
+    /// site-level decision rather than route-by-route sprinkling.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_ceiling_exceptions: bool,
 }
 
 /// Browser cookie session auth for a site (see [`HandlersSiteConfig::cookie_auth`]). boatramp

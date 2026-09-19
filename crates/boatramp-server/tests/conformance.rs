@@ -1598,6 +1598,7 @@ async fn handler_route_dispatches_through_engine() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3210,6 +3211,7 @@ async fn activation_during_traffic_drops_no_requests() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3352,6 +3354,7 @@ async fn preview_runs_handlers_scoped_off_live_state() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3469,6 +3472,7 @@ async fn activation_refuses_broken_component() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3581,6 +3585,7 @@ async fn activation_refuses_a_non_consumer_component() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3695,6 +3700,7 @@ async fn activation_refuses_disallowed_import() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3796,6 +3802,7 @@ async fn activation_refuses_oversized_component() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -3900,6 +3907,7 @@ async fn handler_route_with_sql_dispatches_through_engine() {
                     cookie_auth: None,
                     // A sql importer declares tenancy (this test isn't about tenancy).
                     tenancy: Some(boatramp_core::tenancy::Tenancy::Disabled),
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },
@@ -4154,6 +4162,7 @@ async fn per_site_timeout_cap_applies() {
                     graphql: None,
                     cookie_auth: None,
                     tenancy: None,
+                    allow_ceiling_exceptions: false,
                 }),
                 ..Default::default()
             },

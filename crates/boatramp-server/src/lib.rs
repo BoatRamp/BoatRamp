@@ -3681,6 +3681,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -3858,6 +3859,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -4031,6 +4033,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -4189,6 +4192,7 @@ mod tests {
                     sources: vec![TenantSource::None],
                     read: AccessMode::Own,
                     write: AccessMode::None,
+                    exceed_site_ceiling: false,
                 }),
                 ..Default::default()
             },
@@ -4343,6 +4347,7 @@ mod tests {
                 sources: vec![TenantSource::None],
                 read: AccessMode::Own,
                 write: AccessMode::None,
+                exceed_site_ceiling: false,
             }),
             ..Default::default()
         };
@@ -5566,6 +5571,7 @@ mod tests {
             sources: vec![TenantSource::SignedContext],
             read: AccessMode::Own,
             write: AccessMode::Own,
+            exceed_site_ceiling: false,
         };
         let site = HandlersSiteConfig {
             enabled: true,

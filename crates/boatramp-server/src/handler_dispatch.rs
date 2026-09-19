@@ -549,9 +549,15 @@ async fn resolve_gateway_caller_facts(
     let effective = match handler.tenancy.as_ref() {
         Some(h) => {
             if let Some(ceiling) = site_handlers.tenancy.as_ref() {
-                if !h.narrows_within(ceiling) {
+                // A per-route widening is refused unless BOTH the site enables exceptions
+                // (`allow_ceiling_exceptions`, key 1) AND the route carries `exceed_site_ceiling`
+                // (key 2). The runtime clamp on `all` (key 3, the operator posture) stays separate.
+                // This is the fail-closed backstop; the deploy validator produces the speaking error.
+                if !h.narrows_within_authorized(ceiling, site_handlers.allow_ceiling_exceptions) {
                     return Err(graphql_guard::error_response(
-                        "tenancy: the /graphql handler declares a tenancy that widens the site ceiling",
+                        "tenancy: the /graphql handler declares a tenancy that widens the site \
+                         ceiling (authorize it with `exceed_site_ceiling: true` on the route AND \
+                         `allow_ceiling_exceptions = true` on the site, or narrow the tenancy)",
                     ));
                 }
             }
@@ -1443,11 +1449,17 @@ pub(super) async fn build_bindings(
         let effective_tenancy = match handler_tenancy {
             Some(h) => {
                 if let Some(ceiling) = site_handlers.tenancy.as_ref() {
-                    if !h.narrows_within(ceiling) {
+                    // A per-route widening is refused unless BOTH the site enables exceptions
+                    // (`allow_ceiling_exceptions`, key 1) AND the route carries `exceed_site_ceiling`
+                    // (key 2). `all` still needs the operator posture at runtime (key 3, `cap()`).
+                    // Fail-closed backstop; the deploy validator emits the speaking, key-aware error.
+                    if !h.narrows_within_authorized(ceiling, site_handlers.allow_ceiling_exceptions)
+                    {
                         return Err(BindingsError::Refused(format!(
                             "tenancy: a handler on site `{site}` declares a tenancy that widens the \
                              site ceiling (a per-handler decision may narrow within the site's \
-                             `tenancy`, never widen it)"
+                             `tenancy`; to widen deliberately, set `exceed_site_ceiling: true` on the \
+                             route AND `allow_ceiling_exceptions = true` on the site)"
                         )));
                     }
                 }
