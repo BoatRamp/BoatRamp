@@ -78,10 +78,12 @@ impl StreamBus for InProcessStreamBus {
     }
 }
 
-/// Group-commit (A2): the most `MqPublish` ops coalesced into one `WriteOp::Batch` proposal — so a
-/// burst of concurrent publishes costs one Raft round-trip per group, not one per message.
-/// Intentionally independent of the single-node cap (`boatramp_core::messaging`'s `GROUP_COMMIT_MAX`):
-/// the two commit paths bound different resources (one Raft entry vs one `write_batch`).
+/// Group-commit (A2/A4): the soft per-turn budget of `MqPublish` ops coalesced into one
+/// `WriteOp::Batch` proposal — so a burst of concurrent publishes (or one `publish_batch`) costs one
+/// Raft round-trip per group, not one per message. Bounds ops (not jobs) so a large batch can't build
+/// an unbounded Raft entry. Intentionally independent of the single-node cap
+/// (`boatramp_core::messaging`'s `GROUP_COMMIT_MAX`): the two commit paths bound different resources
+/// (one Raft entry vs one `write_batch`).
 const GROUP_COMMIT_MAX: usize = 512;
 
 /// The cluster [`Messaging`]: a durable log whose **index** is the Raft state
@@ -118,10 +120,12 @@ pub struct RaftMessaging {
     commit_gate: futures::lock::Mutex<()>,
 }
 
-/// One publisher's contribution to a cluster group commit (A2): its `MqPublish` op + a one-shot for
-/// the durable (replicated-and-applied) outcome. The gate-holder batches many into one proposal.
+/// One publisher's contribution to a cluster group commit (A2/A4): its `MqPublish` op(s) + a
+/// one-shot for the durable (replicated-and-applied) outcome. A single publish contributes one op;
+/// a `publish_batch_ctx` contributes N in one job. The gate-holder flattens every job's ops into one
+/// `WriteOp::Batch` proposal.
 struct ClusterPublishJob {
-    op: WriteOp,
+    ops: Vec<WriteOp>,
     done: futures::channel::oneshot::Sender<Result<(), MessagingError>>,
 }
 
@@ -151,29 +155,43 @@ impl RaftMessaging {
         }
     }
 
-    /// Group-commit a `MqPublish` op (A2): push it, take the gate, and — as the gate-holder — drain
-    /// the queue and propose EVERYONE's ops in one `WriteOp::Batch` (one Raft round-trip), signalling
-    /// each. A publisher flushed by an earlier gate-holder finds its one-shot already resolved.
-    /// Returns only after the group is replicated + applied (at-least-once); a failed proposal fails
-    /// every member. Same self-bounded, no-spawn pattern as `LogMessaging::group_commit`.
-    async fn group_commit(&self, op: WriteOp) -> Result<(), MessagingError> {
+    /// Group-commit a publisher's `MqPublish` op(s) (A2/A4): push them, take the gate, and — as the
+    /// gate-holder — drain the queue and propose EVERYONE's ops in one `WriteOp::Batch` (one Raft
+    /// round-trip), signalling each. A publisher flushed by an earlier gate-holder finds its one-shot
+    /// already resolved. Returns only after the group is replicated + applied (at-least-once); a
+    /// failed proposal fails every member. Same self-bounded, no-spawn pattern as
+    /// `LogMessaging::group_commit`.
+    async fn group_commit(&self, ops: Vec<WriteOp>) -> Result<(), MessagingError> {
         let (done_tx, done_rx) = futures::channel::oneshot::channel();
         self.commit_queue
             .lock()
             .unwrap()
-            .push(ClusterPublishJob { op, done: done_tx });
+            .push(ClusterPublishJob { ops, done: done_tx });
         {
             let _turn = self.commit_gate.lock().await;
+            // Drain jobs until the per-commit OP budget is met (a batch job carries many ops, so the
+            // bound is on ops, not jobs — else one turn could build an unbounded Raft entry). Always
+            // take at least one job so an oversized single batch (bounded by the host's
+            // PUBLISH_BATCH_MAX) still makes progress.
             let batch: Vec<ClusterPublishJob> = {
                 let mut q = self.commit_queue.lock().unwrap();
-                let take = q.len().min(GROUP_COMMIT_MAX);
-                q.drain(..take).collect()
+                let mut n = 0;
+                let mut count = 0;
+                while n < q.len() {
+                    if n > 0 && count + q[n].ops.len() > GROUP_COMMIT_MAX {
+                        break;
+                    }
+                    count += q[n].ops.len();
+                    n += 1;
+                }
+                q.drain(..n).collect()
             };
             if !batch.is_empty() {
                 let mut ops = Vec::with_capacity(batch.len());
                 let mut dones = Vec::with_capacity(batch.len());
                 for job in batch {
-                    ops.push(job.op);
+                    let mut job = job;
+                    ops.append(&mut job.ops);
                     dones.push(job.done);
                 }
                 // A proposal can fail AFTER the entry actually committed+applied (leader lost, or the
@@ -203,6 +221,78 @@ impl RaftMessaging {
             self.node_id,
             self.seq.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// Build one message's replicated `MqPublish` op, performing any object-store payload write FIRST
+    /// (payload-first: the replicated record never references a missing payload). Shared by
+    /// [`publish_ctx`](Messaging::publish_ctx) (single) and
+    /// [`publish_batch_ctx`](Messaging::publish_batch_ctx) (A4 batch) so both take the identical
+    /// A3-inline / SA1-budget / grouped-retain decisions. Returns the minted id (for the post-commit
+    /// broadcast) + the op the caller's group-commit will propose.
+    async fn build_publish_op(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        signed_context: Option<&str>,
+    ) -> Result<(String, WriteOp), MessagingError> {
+        let id = self.next_id();
+        let retain = self.topic_has_groups(topic).await;
+        // A3: a small work-queue payload rides IN the replicated index record (via the proposal
+        // below) — no object-store write, no round-trip. Only work-queue (grouped keeps the shared
+        // object every group reads) and only up to `INLINE_MAX` (larger ⇒ object store). Otherwise:
+        // payload to shared storage FIRST, then the index proposal — the replicated record never
+        // references a missing payload.
+        // SA1: only inline while under the aggregate in-flight budget (past it, object-store path),
+        // so a small-message flood can't grow the replicated log/snapshots unbounded.
+        let inline = !retain
+            && payload.len() <= messaging::INLINE_MAX
+            && self
+                .inline_inflight_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(payload.len())
+                <= messaging::INLINE_INFLIGHT_MAX_BYTES;
+        if inline {
+            self.inline_inflight_bytes
+                .fetch_add(payload.len(), Ordering::Relaxed);
+        }
+        if !inline {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(
+                    &messaging::payload_key(topic, &id),
+                    body,
+                    PutMeta::default(),
+                )
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        // On a grouped topic, also write the **retained** fan-out payload before
+        // proposing, so the replicated `glog` entry (written in the same proposal
+        // when `retain`) never references a missing payload — the same
+        // payload-first invariant, split across `Storage` (here) and the log.
+        if retain {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(
+                    &messaging::gpayload_key(topic, &id),
+                    body,
+                    PutMeta::default(),
+                )
+                .await
+                .map_err(|e| MessagingError::Backend(e.to_string()))?;
+        }
+        Ok((
+            id.clone(),
+            WriteOp::MqPublish {
+                topic: topic.to_string(),
+                id,
+                retain,
+                signed_context: signed_context.map(str::to_owned),
+                inline: inline.then(|| payload.to_vec()),
+            },
+        ))
     }
 
     /// Submit a proposal to the leader, mapping failures to [`MessagingError`].
@@ -305,68 +395,47 @@ impl Messaging for RaftMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
-        let id = self.next_id();
-        let retain = self.topic_has_groups(topic).await;
-        // A3: a small work-queue payload rides IN the replicated index record (via the proposal
-        // below) — no object-store write, no round-trip. Only work-queue (grouped keeps the shared
-        // object every group reads) and only up to `INLINE_MAX` (larger ⇒ object store). Otherwise:
-        // payload to shared storage FIRST, then the index proposal — the replicated record never
-        // references a missing payload.
-        // SA1: only inline while under the aggregate in-flight budget (past it, object-store path),
-        // so a small-message flood can't grow the replicated log/snapshots unbounded.
-        let inline = !retain
-            && payload.len() <= messaging::INLINE_MAX
-            && self
-                .inline_inflight_bytes
-                .load(Ordering::Relaxed)
-                .saturating_add(payload.len())
-                <= messaging::INLINE_INFLIGHT_MAX_BYTES;
-        if inline {
-            self.inline_inflight_bytes
-                .fetch_add(payload.len(), Ordering::Relaxed);
-        }
-        if !inline {
-            let bytes = bytes::Bytes::copy_from_slice(payload);
-            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-            self.storage
-                .put(
-                    &messaging::payload_key(topic, &id),
-                    body,
-                    PutMeta::default(),
-                )
-                .await
-                .map_err(|e| MessagingError::Backend(e.to_string()))?;
-        }
-        // On a grouped topic, also write the **retained** fan-out payload before
-        // proposing, so the replicated `glog` entry (written in the same proposal
-        // when `retain`) never references a missing payload — the same
-        // payload-first invariant, split across `Storage` (here) and the log.
-        if retain {
-            let bytes = bytes::Bytes::copy_from_slice(payload);
-            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-            self.storage
-                .put(
-                    &messaging::gpayload_key(topic, &id),
-                    body,
-                    PutMeta::default(),
-                )
-                .await
-                .map_err(|e| MessagingError::Backend(e.to_string()))?;
-        }
+        // Build this message's replicated `MqPublish` op (doing any object-store payload write first),
+        // then commit it in one group-commit. Factored so `publish_batch_ctx` reuses the identical
+        // A3/SA1/retain decisions and coalesces N messages into one Raft entry.
+        let (id, op) = self
+            .build_publish_op(topic, payload, signed_context)
+            .await?;
         // Group-commit (A2): coalesce this MqPublish with other concurrent ones into a single
         // WriteOp::Batch proposal (one Raft round-trip per group). Returns only after the group is
         // replicated + applied (at-least-once); a failed proposal fails this publish too.
-        self.group_commit(WriteOp::MqPublish {
-            topic: topic.to_string(),
-            id: id.clone(),
-            retain,
-            signed_context: signed_context.map(str::to_owned),
-            inline: inline.then(|| payload.to_vec()),
-        })
-        .await?;
+        self.group_commit(vec![op]).await?;
         // Live SSE fan-out across the cluster (best-effort, separate from the
         // durable queue): every node's hubs, including this one's.
         self.bus.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_batch_ctx(
+        &self,
+        messages: &[(String, Vec<u8>)],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        // A4 — coalesce the WHOLE batch into ONE replicated `WriteOp::Batch`: build every message's
+        // `MqPublish` op (each doing its own payload-first object-store write + A3/SA1 decision), then
+        // a single `group_commit`. Fail-all: any build error returns before we commit, so no message
+        // in the batch is delivered. Every message shares the one host-minted `signed_context`.
+        let mut ops = Vec::with_capacity(messages.len());
+        let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
+        for (topic, payload) in messages {
+            let (id, op) = self
+                .build_publish_op(topic, payload, signed_context)
+                .await?;
+            ops.push(op);
+            broadcasts.push((topic.as_str(), id, payload.as_slice()));
+        }
+        self.group_commit(ops).await?;
+        for (topic, id, payload) in &broadcasts {
+            self.bus.broadcast(topic, id, payload);
+        }
         Ok(())
     }
 
@@ -1113,6 +1182,38 @@ mod tests {
             0,
             "purge is idempotent"
         );
+
+        // A4: a batch publish durably enqueues every message in one commit (one Raft entry on the
+        // cluster path); all are then claimable in publish order. Runs on BOTH backends.
+        mq.publish_batch_ctx(
+            &[
+                (topic.to_string(), b"batch-1".to_vec()),
+                (topic.to_string(), b"batch-2".to_vec()),
+                (topic.to_string(), b"batch-3".to_vec()),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mq.backlog(topic).await.unwrap(),
+            3,
+            "batch publish enqueued every message"
+        );
+        let bexp = mq.claim(topic, LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            bexp.iter().map(|m| m.payload.clone()).collect::<Vec<_>>(),
+            vec![
+                b"batch-1".to_vec(),
+                b"batch-2".to_vec(),
+                b"batch-3".to_vec()
+            ],
+            "batch messages claimable in publish order"
+        );
+        for m in &bexp {
+            mq.ack(m).await.unwrap();
+        }
+        assert_eq!(mq.backlog(topic).await.unwrap(), 0);
     }
 
     /// Conformance — **single-node** coordinator (`core::messaging::LogMessaging`).

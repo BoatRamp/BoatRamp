@@ -109,6 +109,26 @@ pub trait Messaging: Send + Sync {
         self.publish(topic, payload).await
     }
 
+    /// Publish a **batch** of messages in ONE durable commit — the guest-facing pipelined-publish
+    /// primitive (A4). Each entry is `(topic, payload)`; entries may target different topics. Every
+    /// message shares the one host-minted `signed_context`: a batch comes from a single producer
+    /// invocation, so there is exactly one producer principal and no cross-tenant mixing. Returns
+    /// only after the WHOLE batch is durably committed (at-least-once); on failure NONE are
+    /// acknowledged as published (fail-all, symmetric to the group-commit contract). An empty batch
+    /// is a no-op `Ok`. The default impl publishes sequentially (correct but uncoalesced); the
+    /// durable backends override it to coalesce every message's index write into a single
+    /// `write_batch` / one Raft entry — the whole point of the primitive.
+    async fn publish_batch_ctx(
+        &self,
+        messages: &[(String, Vec<u8>)],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        for (topic, payload) in messages {
+            self.publish_ctx(topic, payload, signed_context).await?;
+        }
+        Ok(())
+    }
+
     /// Atomically claim up to `max_batch` deliverable messages from `topic`,
     /// leasing each for `lease` (after which an un-acked message is redelivered).
     /// A message that has already been delivered `max_attempts` times is moved to
@@ -320,9 +340,12 @@ pub const INLINE_MAX: usize = 4096;
 /// (they never inline). A soft, per-node guard (see [`LogMessaging::inline_inflight_bytes`]).
 pub const INLINE_INFLIGHT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// Group-commit (A2): the most index writes coalesced into one durable `write_batch`. Concurrent
-/// publishers that pile up during a flush form the next group; this caps a single group so one burst
-/// can't build an unbounded batch (the queue itself is self-bounded — every pusher is a gate-waiter).
+/// Group-commit (A2): the soft per-turn budget of index writes (OPS, not jobs) coalesced into one
+/// durable `write_batch`. Concurrent publishers that pile up during a flush form the next group; the
+/// committer drains jobs until this many ops accumulate (always ≥1 job for progress), so neither a
+/// burst of single publishes nor a large `publish_batch` (A4, itself bounded by the host's
+/// PUBLISH_BATCH_MAX) can build an unbounded batch. The queue is self-bounded — every pusher is a
+/// gate-waiter.
 const GROUP_COMMIT_MAX: usize = 512;
 
 /// One publisher's contribution to a group commit (A2): its index ops + a one-shot to signal the
@@ -829,12 +852,23 @@ impl LogMessaging {
         {
             // Whoever holds the gate is the committer for this turn.
             let _turn = self.commit_gate.lock().await;
-            // Take the whole queue (up to the per-group cap; the rest wait for the next turn). If it
-            // is already empty, an earlier committer flushed our job — fall through to await it.
+            // Drain jobs until the per-commit OP budget is met (a batch job carries many ops, so the
+            // bound must be on ops, not jobs — else one turn could build an unbounded `write_batch`).
+            // Always take at least one job so an oversized single batch (already bounded by the host's
+            // PUBLISH_BATCH_MAX) still makes progress. The rest wait for the next turn. An already-empty
+            // queue means an earlier committer flushed our job — fall through to await it.
             let batch: Vec<PublishJob> = {
                 let mut q = self.commit_queue.lock().unwrap();
-                let take = q.len().min(GROUP_COMMIT_MAX);
-                q.drain(..take).collect()
+                let mut n = 0;
+                let mut ops = 0;
+                while n < q.len() {
+                    if n > 0 && ops + q[n].ops.len() > GROUP_COMMIT_MAX {
+                        break;
+                    }
+                    ops += q[n].ops.len();
+                    n += 1;
+                }
+                q.drain(..n).collect()
             };
             if !batch.is_empty() {
                 let mut all_ops = Vec::new();
@@ -897,6 +931,95 @@ impl LogMessaging {
         let has = set.contains(topic);
         *self.grouped_topics.lock().unwrap() = Some(set);
         has
+    }
+
+    /// Build one message's durable INDEX ops, performing any object-store payload write FIRST
+    /// (payload-first ordering: a committed record never references a missing payload). Shared by
+    /// [`publish_ctx`](Self::publish_ctx) (single) and [`publish_batch_ctx`](Self::publish_batch_ctx)
+    /// (A4 batch) so both take the identical A3-inline / SA1-budget / grouped-retain decisions.
+    /// Returns the minted id (for the post-commit broadcast) + the ops the caller's group-commit will
+    /// durably commit. The SA1 inline-budget `fetch_add` happens here; if the caller then fails to
+    /// commit, the budget over-counts — the documented safe direction (falls back to object storage
+    /// sooner), and a restart resets it.
+    async fn build_publish_ops(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        signed_context: Option<&str>,
+    ) -> Result<(String, Vec<WriteOp>), MessagingError> {
+        let id = format!(
+            "{:013}-{:016x}",
+            now_unix_ms(),
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
+        let retain = self.topic_has_groups(topic).await;
+        // A3 — inline a small work-queue payload IN the index record: it is then written in the one
+        // batch below (no object-store round-trip) and read straight off the record at claim. Only
+        // for the work-queue (a retained/grouped topic keeps the shared object-store copy every group
+        // reads) and only up to `INLINE_MAX` (larger payloads take the object-store path — boatramp's
+        // large-blob strength). Otherwise: payload first to object storage, then the index record —
+        // so the record never references a missing payload.
+        // SA1: only inline while under the aggregate in-flight budget; past it, fall back to the
+        // object-store path so a stuck consumer can't grow the durable index unbounded.
+        let inline = !retain
+            && payload.len() <= INLINE_MAX
+            && self
+                .inline_inflight_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(payload.len())
+                <= self.inline_budget_bytes;
+        if inline {
+            self.inline_inflight_bytes
+                .fetch_add(payload.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        if !inline {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(&payload_key(topic, &id), body, PutMeta::default())
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        // Coalesce this publish's INDEX writes into ONE durable `write_batch` (A1): the meta record
+        // (carrying an inlined payload when A3 applies), and — on a grouped topic — the retained-log
+        // marker + the `logmax` gate advance, in a single flush instead of 2–4 separate awaited puts.
+        // The durable signed-context (R1) rides on the meta record, deleted with it on ack/dead-letter.
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
+        let mut record = Record::fresh(signed_context.map(str::to_owned));
+        if inline {
+            record.inline = Some(payload.to_vec());
+        }
+        ops.push(WriteOp::Put(
+            meta_key(topic, &id),
+            serde_json::to_vec(&record).map_err(MessagingError::backend)?,
+        ));
+        // Grouped (fan-out) topics keep a **retained** copy of the payload + an append-only log
+        // entry, so each group consumes on its own high-water long after the work-queue ack would
+        // have deleted it, and advance the per-topic `logmax` gate marker (so an idle group's claim
+        // early-returns without a scan). Only paid on topics with a registered group.
+        if retain {
+            let bytes = bytes::Bytes::copy_from_slice(payload);
+            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
+            self.storage
+                .put(&gpayload_key(topic, &id), body, PutMeta::default())
+                .await
+                .map_err(MessagingError::backend)?;
+            ops.push(WriteOp::Put(glog_key(topic, &id), Vec::new()));
+            // Advance the gate to the max id seen — never backward, so two concurrent same-ms
+            // publishes can't leave it below a retained id (which would wrongly close the gate on
+            // the higher one).
+            let cur = self
+                .kv
+                .get(&logmax_key(topic))
+                .await
+                .map_err(MessagingError::backend)?
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default();
+            if id.as_str() > cur.as_str() {
+                ops.push(WriteOp::Put(logmax_key(topic), id.clone().into_bytes()));
+            }
+        }
+        Ok((id, ops))
     }
 
     /// Mark `topic` as grouped in the in-memory cache (called when a group first
@@ -1138,86 +1261,48 @@ impl Messaging for LogMessaging {
         payload: &[u8],
         signed_context: Option<&str>,
     ) -> Result<(), MessagingError> {
-        let id = format!(
-            "{:013}-{:016x}",
-            now_unix_ms(),
-            self.seq.fetch_add(1, Ordering::Relaxed)
-        );
-        let retain = self.topic_has_groups(topic).await;
-        // A3 — inline a small work-queue payload IN the index record: it is then written in the one
-        // batch below (no object-store round-trip) and read straight off the record at claim. Only
-        // for the work-queue (a retained/grouped topic keeps the shared object-store copy every group
-        // reads) and only up to `INLINE_MAX` (larger payloads take the object-store path — boatramp's
-        // large-blob strength). Otherwise: payload first to object storage, then the index record —
-        // so the record never references a missing payload.
-        // SA1: only inline while under the aggregate in-flight budget; past it, fall back to the
-        // object-store path so a stuck consumer can't grow the durable index unbounded.
-        let inline = !retain
-            && payload.len() <= INLINE_MAX
-            && self
-                .inline_inflight_bytes
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(payload.len())
-                <= self.inline_budget_bytes;
-        if inline {
-            self.inline_inflight_bytes
-                .fetch_add(payload.len(), std::sync::atomic::Ordering::Relaxed);
-        }
-        if !inline {
-            let bytes = bytes::Bytes::copy_from_slice(payload);
-            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-            self.storage
-                .put(&payload_key(topic, &id), body, PutMeta::default())
-                .await
-                .map_err(MessagingError::backend)?;
-        }
-        // Coalesce this publish's INDEX writes into ONE durable `write_batch` (A1): the meta record
-        // (carrying an inlined payload when A3 applies), and — on a grouped topic — the retained-log
-        // marker + the `logmax` gate advance, in a single flush instead of 2–4 separate awaited puts.
-        // The durable signed-context (R1) rides on the meta record, deleted with it on ack/dead-letter.
-        let mut ops: Vec<WriteOp> = Vec::with_capacity(3);
-        let mut record = Record::fresh(signed_context.map(str::to_owned));
-        if inline {
-            record.inline = Some(payload.to_vec());
-        }
-        ops.push(WriteOp::Put(
-            meta_key(topic, &id),
-            serde_json::to_vec(&record).map_err(MessagingError::backend)?,
-        ));
-        // Grouped (fan-out) topics keep a **retained** copy of the payload + an append-only log
-        // entry, so each group consumes on its own high-water long after the work-queue ack would
-        // have deleted it, and advance the per-topic `logmax` gate marker (so an idle group's claim
-        // early-returns without a scan). Only paid on topics with a registered group.
-        if retain {
-            let bytes = bytes::Bytes::copy_from_slice(payload);
-            let body = futures::stream::once(async move { Ok(bytes) }).boxed();
-            self.storage
-                .put(&gpayload_key(topic, &id), body, PutMeta::default())
-                .await
-                .map_err(MessagingError::backend)?;
-            ops.push(WriteOp::Put(glog_key(topic, &id), Vec::new()));
-            // Advance the gate to the max id seen — never backward, so two concurrent same-ms
-            // publishes can't leave it below a retained id (which would wrongly close the gate on
-            // the higher one).
-            let cur = self
-                .kv
-                .get(&logmax_key(topic))
-                .await
-                .map_err(MessagingError::backend)?
-                .map(|v| String::from_utf8_lossy(&v).into_owned())
-                .unwrap_or_default();
-            if id.as_str() > cur.as_str() {
-                ops.push(WriteOp::Put(logmax_key(topic), id.clone().into_bytes()));
-            }
-        }
+        // Build this message's index ops (doing any object-store payload write first), then commit
+        // them in one durable group-commit. Factored so `publish_batch_ctx` reuses the identical
+        // A3-inline / SA1-budget / grouped-retain decisions and coalesces N messages into one commit.
+        let (id, ops) = self
+            .build_publish_ops(topic, payload, signed_context)
+            .await?;
         // Group-commit (A2): concurrent publishes coalesce their index writes into one durable
         // `write_batch`. Returns only after this message's group is durably committed
         // (at-least-once); a failed group fails this publish too. Payloads (object store) were
-        // already written above (payload-first), so only the index writes are batched here.
+        // already written by `build_publish_ops` (payload-first), so only the index writes are here.
         self.group_commit(ops).await?;
-        // Notify live SSE subscribers (best-effort, separate from the durable
-        // queue above).
+        // Notify live SSE subscribers (best-effort, separate from the durable queue above).
         self.hubs.broadcast(topic, &id, payload);
+        Ok(())
+    }
+
+    async fn publish_batch_ctx(
+        &self,
+        messages: &[(String, Vec<u8>)],
+        signed_context: Option<&str>,
+    ) -> Result<(), MessagingError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        // A4 — coalesce the WHOLE batch's index writes into ONE durable `write_batch`: build every
+        // message's ops (each doing its own payload-first object-store write + A3/SA1 decision), then
+        // a single `group_commit`. Fail-all: any build error returns before we commit, so no message
+        // in the batch is delivered (the same all-or-nothing the single group-commit gives). Every
+        // message shares the one host-minted `signed_context` (one producer principal per batch).
+        let mut all_ops: Vec<WriteOp> = Vec::with_capacity(messages.len());
+        let mut broadcasts: Vec<(&str, String, &[u8])> = Vec::with_capacity(messages.len());
+        for (topic, payload) in messages {
+            let (id, ops) = self
+                .build_publish_ops(topic, payload, signed_context)
+                .await?;
+            all_ops.extend(ops);
+            broadcasts.push((topic.as_str(), id, payload.as_slice()));
+        }
+        self.group_commit(all_ops).await?;
+        for (topic, id, payload) in &broadcasts {
+            self.hubs.broadcast(topic, id, payload);
+        }
         Ok(())
     }
 
@@ -1842,6 +1927,58 @@ mod tests {
         LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(MemoryKv::new()))
     }
 
+    /// A `KvStore` whose durable-commit boundary (`put`/`write_batch`) always fails — drives the
+    /// group-commit fail-all path (`publish`/`publish_batch` → `group_commit` → `write_batch` → error).
+    struct FailingKv;
+    #[async_trait]
+    impl KvStore for FailingKv {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            Err(crate::kv::KvError::backend("commit failed"))
+        }
+        async fn delete(&self, _: &str) -> Result<(), crate::kv::KvError> {
+            Ok(())
+        }
+        async fn list_prefix(&self, _: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            Ok(Vec::new())
+        }
+        async fn write_batch(&self, _: Vec<crate::kv::WriteOp>) -> Result<(), crate::kv::KvError> {
+            Err(crate::kv::KvError::backend("commit failed"))
+        }
+    }
+
+    /// A `KvStore` that delegates to an inner [`MemoryKv`] and counts `write_batch` calls — proves a
+    /// group/batch coalesces into ONE durable commit rather than one per message.
+    struct CountingKv {
+        inner: MemoryKv,
+        batches: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl KvStore for CountingKv {
+        async fn get(&self, k: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, v: Vec<u8>) -> Result<(), crate::kv::KvError> {
+            self.inner.put(k, v).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), crate::kv::KvError> {
+            self.inner.delete(k).await
+        }
+        async fn list_prefix(&self, p: &str) -> Result<Vec<String>, crate::kv::KvError> {
+            self.inner.list_prefix(p).await
+        }
+        async fn write_batch(
+            &self,
+            ops: Vec<crate::kv::WriteOp>,
+        ) -> Result<(), crate::kv::KvError> {
+            self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.write_batch(ops).await
+        }
+    }
+
     const LEASE: Duration = Duration::from_secs(30);
 
     fn payloads(msgs: &[ClaimedMessage]) -> Vec<Vec<u8>> {
@@ -2457,31 +2594,6 @@ mod tests {
     // success (a publisher never believes it succeeded when its message wasn't committed).
     #[tokio::test]
     async fn group_commit_fails_all_members_when_the_commit_fails() {
-        // A KvStore whose commit always fails (the durable-write boundary) — enough to drive
-        // `publish` → `group_commit` → `write_batch` → error.
-        struct FailingKv;
-        #[async_trait]
-        impl KvStore for FailingKv {
-            async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, crate::kv::KvError> {
-                Ok(None)
-            }
-            async fn put(&self, _: &str, _: Vec<u8>) -> Result<(), crate::kv::KvError> {
-                Err(crate::kv::KvError::backend("commit failed"))
-            }
-            async fn delete(&self, _: &str) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn list_prefix(&self, _: &str) -> Result<Vec<String>, crate::kv::KvError> {
-                Ok(Vec::new())
-            }
-            async fn write_batch(
-                &self,
-                _: Vec<crate::kv::WriteOp>,
-            ) -> Result<(), crate::kv::KvError> {
-                Err(crate::kv::KvError::backend("commit failed"))
-            }
-        }
-
         let mq = Arc::new(LogMessaging::new(
             Arc::new(MemStorage::default()),
             Arc::new(FailingKv),
@@ -2505,6 +2617,55 @@ mod tests {
                 "every member of a failed group commit fails (fail-all)"
             );
         }
+    }
+
+    // A4: a publish_batch commits the WHOLE batch in ONE durable write_batch (not one per message),
+    // across mixed topics, and every message is claimable carrying the shared producer context.
+    #[tokio::test]
+    async fn publish_batch_commits_all_messages_in_one_write_batch() {
+        use std::sync::atomic::Ordering as O;
+        let kv = Arc::new(CountingKv {
+            inner: MemoryKv::new(),
+            batches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), kv.clone());
+        // Five messages across two topics in one batch.
+        let msgs: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|i| (format!("t{}", i % 2), format!("m{i}").into_bytes()))
+            .collect();
+        mq.publish_batch_ctx(&msgs, Some("ctx-1")).await.unwrap();
+        assert_eq!(
+            kv.batches.load(O::Relaxed),
+            1,
+            "the whole batch was durably committed in ONE write_batch"
+        );
+        // Every message is durably enqueued on its topic, carrying the shared host context.
+        let t0 = mq.claim("t0", LEASE, 10, 5).await.unwrap();
+        let t1 = mq.claim("t1", LEASE, 10, 5).await.unwrap();
+        assert_eq!(
+            t0.len() + t1.len(),
+            5,
+            "all batch messages durably enqueued and claimable"
+        );
+        assert!(
+            t0.iter()
+                .chain(&t1)
+                .all(|m| m.signed_context.as_deref() == Some("ctx-1")),
+            "every message carries the one shared producer context"
+        );
+    }
+
+    // A4 fail-all: a failed durable commit fails the WHOLE batch — nothing is enqueued (all-or-nothing,
+    // the same contract the single group-commit gives, extended to the batch primitive).
+    #[tokio::test]
+    async fn publish_batch_fails_whole_when_the_commit_fails() {
+        let mq = LogMessaging::new(Arc::new(MemStorage::default()), Arc::new(FailingKv));
+        let msgs: Vec<(String, Vec<u8>)> =
+            (0..8).map(|i| ("t".to_string(), vec![i as u8])).collect();
+        assert!(
+            mq.publish_batch_ctx(&msgs, None).await.is_err(),
+            "a failed commit fails the whole batch"
+        );
     }
 
     // A3 × DLQ: an inlined message that dead-letters keeps its payload in the record, so redrive
