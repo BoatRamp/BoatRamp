@@ -17,7 +17,7 @@ mod generated {
         path: "wit",
         world: "boatramp:handlers/messaging-host",
         async: {
-            only_imports: ["publish", "publish-batch"],
+            only_imports: ["publish", "publish-batch", "publish-delayed"],
         },
     });
 }
@@ -121,6 +121,29 @@ impl messaging_producer::Host for MessagingHost<'_> {
         binding
             .messaging
             .publish_ctx(&namespaced, &data, signed_context.as_deref())
+            .await
+            .map_err(|err| messaging_types::Error::Other(err.to_string()))
+    }
+
+    async fn publish_delayed(
+        &mut self,
+        topic: String,
+        data: Vec<u8>,
+        delay_ms: u64,
+    ) -> Result<(), messaging_types::Error> {
+        let Some(binding) = self.binding else {
+            return Err(messaging_types::Error::AccessDenied);
+        };
+        let namespaced = binding.namespace(&topic);
+        let signed_context = binding.current_context();
+        binding
+            .messaging
+            .publish_delayed_ctx(
+                &namespaced,
+                &data,
+                std::time::Duration::from_millis(delay_ms),
+                signed_context.as_deref(),
+            )
             .await
             .map_err(|err| messaging_types::Error::Other(err.to_string()))
     }
@@ -392,6 +415,31 @@ mod tests {
         let mut host = MessagingHost::new(Some(&binding));
         host.publish_batch(Vec::new()).await.unwrap();
         assert_eq!(backend.published.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_delayed_namespaces_and_stamps_context() {
+        // The delayed binding namespaces + stamps the producer context exactly like `publish` (the
+        // delay itself rides to the backend; the substrate defers delivery — covered in core/cluster).
+        let backend = Arc::new(FakeMessaging::default());
+        let binding = binding_with_context(backend.clone(), Some("ctx-d".to_string()));
+        let mut host = MessagingHost::new(Some(&binding));
+        host.publish_delayed("orders/created".into(), b"later".to_vec(), 60_000)
+            .await
+            .unwrap();
+        let published = backend.published.lock().unwrap();
+        assert_eq!(published[0].0, "blog/production/orders/created");
+        assert_eq!(published[0].2.as_deref(), Some("ctx-d"));
+    }
+
+    #[tokio::test]
+    async fn ungranted_publish_delayed_is_denied() {
+        let mut host = MessagingHost::new(None);
+        let err = host
+            .publish_delayed("orders/created".into(), b"x".to_vec(), 1000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, messaging_types::Error::AccessDenied));
     }
 
     #[tokio::test]
