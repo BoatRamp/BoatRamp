@@ -861,6 +861,7 @@ impl HandlerRuntime {
         deploy: &DeployStore,
         manifest: &Manifest,
         site_config: Option<&SiteConfig>,
+        project: &str,
     ) -> Result<(), String> {
         let Some(inner) = self.inner.as_ref() else {
             return Ok(());
@@ -907,8 +908,97 @@ impl HandlerRuntime {
             }
         }
 
+        // The operator posture governing `all` (key 3) — used only to WARN (never refuse) when an
+        // authorized ceiling-exceeding route to `all` would be clamped to `own` at runtime.
+        let allow_cross_tenant = inner.project_tenancy_knobs(project).allow_cross_tenant_db;
+
         // Same import/size/compile gate for every handler and consumer component.
         for handler in &manifest.config.handlers {
+            // #470 tenancy-ceiling precheck (BEFORE activation): a per-route `tenancy` may narrow
+            // within the site ceiling, and may EXCEED it only under the authorized three-key model.
+            // Catch a violation here with a speaking, key-aware error instead of the opaque runtime
+            // bind refusal (which stays as the fail-closed backstop). Covers BOTH runtime enforcement
+            // sites — the `/graphql` gateway route is itself a `HandlerConfig` in this list.
+            if let (Some(route_tenancy), Some(ceiling)) =
+                (handler.tenancy.as_ref(), site_handlers.tenancy.as_ref())
+            {
+                use boatramp_core::tenancy::{AccessMode, Tenancy};
+                let route = &handler.route;
+                let methods = handler.methods.join(",");
+                if !route_tenancy
+                    .narrows_within_authorized(ceiling, site_handlers.allow_ceiling_exceptions)
+                {
+                    // Distinguish the failing key(s) so the deployer knows exactly what to turn.
+                    let has_token = matches!(
+                        route_tenancy,
+                        Tenancy::Scoped {
+                            exceed_site_ceiling: true,
+                            ..
+                        }
+                    );
+                    let fix = if has_token && !site_handlers.allow_ceiling_exceptions {
+                        format!(
+                            "route {route:?} [{methods}] carries `exceed_site_ceiling: true` but \
+                             this site does not permit ceiling exceptions — set \
+                             `allow_ceiling_exceptions = true` on the site to authorize it, or \
+                             narrow the route's tenancy"
+                        )
+                    } else if has_token {
+                        format!(
+                            "route {route:?} [{methods}] declares `exceed_site_ceiling` but its \
+                             tenancy is not a scoped read/write widening on the site ceiling's \
+                             tenant column — the exception can only widen read/write (up to `all`) \
+                             on the SAME column, never change the column or switch the own/target \
+                             axis. Align the route with the site ceiling"
+                        )
+                    } else if site_handlers.allow_ceiling_exceptions {
+                        format!(
+                            "route {route:?} [{methods}] declares a tenancy that widens the site \
+                             ceiling. This site permits ceiling exceptions — add \
+                             `exceed_site_ceiling: true` to this route to authorize it, or narrow \
+                             the route's tenancy"
+                        )
+                    } else {
+                        format!(
+                            "route {route:?} [{methods}] declares a tenancy that widens the site \
+                             ceiling (a per-route tenancy may narrow within the site's `tenancy`, \
+                             never widen it). To widen deliberately, set `exceed_site_ceiling: \
+                             true` on the route AND `allow_ceiling_exceptions = true` on the site; \
+                             otherwise narrow the route"
+                        )
+                    };
+                    return Err(format!(
+                        "tenancy: {fix}. (An `all` grant additionally requires the operator posture \
+                         `allow_cross_tenant_db` to permit cross-tenant, else it is clamped to \
+                         `own` at runtime.)"
+                    ));
+                } else if !route_tenancy.narrows_within(ceiling) {
+                    // Reached the `else` only via the authorized exception (plain `narrows_within`
+                    // failed) — a genuine, deliberate widening. If it reaches `all` but the operator
+                    // posture is off, it will clamp to `own` at runtime; surface that now (#9) so the
+                    // deployer sees the effective tenancy rather than a silent demotion.
+                    let wants_all = matches!(
+                        route_tenancy,
+                        Tenancy::Scoped {
+                            read: AccessMode::All,
+                            ..
+                        }
+                    ) || matches!(
+                        route_tenancy,
+                        Tenancy::Scoped {
+                            write: AccessMode::All,
+                            ..
+                        }
+                    );
+                    if wants_all && !allow_cross_tenant {
+                        tracing::warn!(
+                            "route {route:?} [{methods}] is authorized to exceed the site ceiling to \
+                             `all`, but the operator posture `allow_cross_tenant_db` is off — it will \
+                             run as `own` at runtime until the posture permits cross-tenant"
+                        );
+                    }
+                }
+            }
             if let Some(ms) = handler.limits.as_ref().and_then(|l| l.timeout_ms) {
                 if u64::from(ms) > sync_ceiling {
                     let route = &handler.route;
@@ -1001,6 +1091,7 @@ impl HandlerRuntime {
         _deploy: &DeployStore,
         _manifest: &Manifest,
         _site_config: Option<&SiteConfig>,
+        _project: &str,
     ) -> Result<(), String> {
         Ok(())
     }
