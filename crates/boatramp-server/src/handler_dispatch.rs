@@ -2173,9 +2173,13 @@ pub(super) async fn dispatch_consumer_batch(
                     "consumer failed; redelivering (dead-letters after max attempts)"
                 );
                 // Record the host-classified failure reason (P1/SEC6: never the guest's error text)
-                // so it survives into the dead-letter for `dlq ls/show` + `--match`. Best-effort —
-                // a failure to annotate must never block redelivery.
-                let _ = messaging.set_last_error(&msg, outcome.as_str()).await;
+                // so it survives into the dead-letter for `dlq ls/show` + `--match`. ONLY on the
+                // final attempt (whose failure dead-letters the message next claim): last_error means
+                // "why it dead-lettered", not a transient retry — and this keeps the hot redelivery
+                // path a single write (nack). Best-effort — annotating must never block redelivery.
+                if msg.attempts >= max_attempts {
+                    let _ = messaging.set_last_error(&msg, outcome.as_str()).await;
+                }
                 let _ = messaging.nack(&msg).await;
             }
         }
