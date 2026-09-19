@@ -140,6 +140,11 @@ pub enum WriteOp {
         /// so an older node's `MqPublish` applies as an immediately-claimable publish.
         #[serde(default)]
         not_before_ms: u64,
+        /// **Delivery-mode TTL** (P2): the absolute unix-ms after which an un-delivered message is
+        /// dead-lettered (`ttl-expired`) instead of leased. `0`/absent = no expiry. Stamped by the
+        /// issuing node (deterministic). `#[serde(default)]` so an older node's `MqPublish` never expires.
+        #[serde(default)]
+        expires_at_ms: u64,
     },
     /// Atomically claim up to `max_batch` deliverable messages on `topic`,
     /// leasing each until `now_ms + lease_ms` and dead-lettering exhausted ones.
@@ -361,6 +366,7 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
             signed_context,
             inline,
             not_before_ms,
+            expires_at_ms,
         } => {
             // Idempotent append: a distinct key per message, never overwriting
             // an existing (possibly already-claimed) record.
@@ -371,6 +377,8 @@ pub(crate) fn apply_op(target: &mut ApplyTarget, op: WriteOp) -> WriteResponse {
                 record.inline = inline;
                 // Delivery-mode delay (P2): defer first delivery via the lease field (attempts stay 0).
                 record.lease_until_ms = not_before_ms;
+                // Delivery-mode TTL (P2): claim dead-letters it once past this (0 = no expiry).
+                record.expires_at_ms = expires_at_ms;
                 let fresh = serde_json::to_vec(&record).expect("record serializes");
                 target.put(key, fresh);
             }
@@ -753,6 +761,8 @@ fn apply_mq_claim_grouped(
             inline: None,
             // Grouped last_error capture is a follow-up (needs a per-in-flight reason).
             last_error: None,
+            // A dead-letter is terminal — no further expiry.
+            expires_at_ms: 0,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);
