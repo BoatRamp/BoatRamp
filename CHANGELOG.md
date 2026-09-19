@@ -5,6 +5,42 @@ All notable changes to boatramp are documented here. The format loosely follows
 (HTTP, CLI, config, and the published library crates) may change between minor
 versions.
 
+## [0.4.23] - 2026-09-19
+
+Fixes a v0.4.22 regression and generalizes how a declarative `apply` coexists with imperatively-written
+domain runtime state. **Regression:** every `apply` after a host gained a tenant context tag returned a
+spurious `409` (the domain-source storefront case v0.4.22's merge was built for). **Generalization:**
+per-host tenant contexts move out of the declaratively-managed site config into their own store (so an
+`apply` structurally cannot clobber them), and domain aliases are reconciled against the
+ownership-verification store instead of blindly unioned. All host-side; no config-format or ABI change;
+back-compatible (migrates on first write). Behind a Security-Engineer review (converged to ship on the
+first pass) and CI-run reconciliation tests.
+
+### Fixed
+- **Cooperative `apply` 409 on a context-bearing host (v0.4.22 regression).** The hijack guard compared
+  the stored domain-index owner — which carries a per-host tenant **context tag** — against a bare owner
+  by full equality, so a host conflicted with *itself* the moment it gained a context: every subsequent
+  whole-config PUT `409`ed and aborted the deploy. Ownership is `(project, site)`; the context tag is
+  per-host metadata. The claim guard now compares ownership only (`DomainOwner::same_owner`); a genuine
+  cross-site/cross-project claim of an owned host still `409`s.
+
+### Changed
+- **Per-host tenant contexts (`domains.contexts`) are now stored outside the site-config blob.** They are
+  imperatively-written runtime state (a domain→tenant binding added/removed as tenants onboard/offboard),
+  so a whole-config `apply` can no longer wipe a context it doesn't mention — the config blob is now
+  purely declarative. A whole-config PUT unions its (non-empty) contexts into the store (incoming wins per
+  host; never removes); reads merge them back (round-trip unchanged); the domain-routing index is
+  projected from the store. Removal is explicit via `domain rm` (which now also unbinds the host's
+  context). Migrates a pre-0.4.23 site's embedded contexts to the store on its next write. Resolves the
+  construens `apply`-clobbers-contexts follow-up architecturally (a general "don't embed imperative
+  runtime state in a declarative object" separation), not just for this one field.
+- **Domain aliases reconcile against the verification store.** On a cooperative `apply`, an alias that is
+  a **verified** (attached) domain survives even when the manifest omits it, while a merely-declared alias
+  the manifest drops is pruned (manifest-authoritative). The verification record is the ownership oracle —
+  `apply` owns declared aliases, the domain-attach lifecycle owns verified ones — so a host attached via
+  `domain add` survives an `apply` that only declares the wildcard, and removal becomes explicit
+  (`domain rm` drops the verification; a later `apply` prunes).
+
 ## [0.4.22] - 2026-09-18
 
 Two changes. **Deploy resilience:** a many-function `apply` (e.g. one triggered by a shim bump that
