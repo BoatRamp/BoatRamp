@@ -2193,6 +2193,9 @@ impl Messaging for LogMessaging {
                 .unwrap_or_else(|| Record::fresh(None));
             record.attempts = 0;
             record.lease_until_ms = 0;
+            record.last_error = None; // a fresh life — the prior failure reason no longer applies.
+            record.expires_at_ms = 0; // and clear any TTL: a redrive is a deliberate operator retry
+                                      // (else a ttl-expired dead-letter would immediately re-expire).
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, id), json)
@@ -2359,6 +2362,8 @@ impl Messaging for LogMessaging {
             record.attempts = 0;
             record.lease_until_ms = 0;
             record.last_error = None; // a fresh life — the prior failure reason no longer applies.
+            record.expires_at_ms = 0; // clear any TTL: a redrive is a deliberate retry (else a
+                                      // ttl-expired dead-letter would immediately re-expire on claim).
             let json = serde_json::to_vec(&record).map_err(MessagingError::backend)?;
             self.kv
                 .put(&meta_key(topic, &dl.id), json)
