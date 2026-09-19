@@ -390,6 +390,24 @@ jobs:
             || { echo "::error::plain-wasm capability target never reached its success marker (a capability-exemption isolation breach or a skipped test)" >&2; exit 1; }
           grep -q 'PLAIN-WASM CAPABILITY CONTEXT ROUNDTRIP OK' target-plainwasm.log \
             || { echo "::error::plain-wasm capability context round-trip never reached its success marker (a mint/redeem/read-back regression, a cross-project redeem, or a skipped test)" >&2; exit 1; }
+      - name: Live three-key ceiling-exception truth table on a real libsql engine (#470)
+        run: |
+          set -eo pipefail
+          # #470: a route may run a tenancy that EXCEEDS its site's `own` ceiling only under the
+          # three-key model — site `allow_ceiling_exceptions` (key 1) + route `exceed_site_ceiling`
+          # (key 2) admit the widen at bind, and the operator posture `allow_cross_tenant_db` (key 3)
+          # decides whether `all` actually crosses tenants (else clamped to `own`). Drives the REAL
+          # bind admission + resolve+clamp + ORM scope against a libsql engine holding tenant A + B
+          # rows, so every corner (both keys + posture → cross-tenant; posture off → own; each missing
+          # key → fail closed; sibling/gateway no-bleed) is observed in SQL. A regression that lets a
+          # single key (or a bleed to a sibling/the gateway) reach cross-tenant fails the assertion.
+          cargo test -p boatramp-server --features handlers,oidc --lib \
+            ceiling_exception_three_key_truth_table_on_a_real_engine \
+            -- --ignored --nocapture 2>&1 | tee threekey.log
+          grep -qE 'test result: ok\. 1 passed' threekey.log \
+            || { echo "::error::three-key ceiling-exception gate did not run (a silent skip or a failure)" >&2; exit 1; }
+          grep -q 'TENANCY OVERRIDE THREE-KEY OK' threekey.log \
+            || { echo "::error::three-key ceiling-exception gate never reached its marker (a single-key widen reached cross-tenant, a posture clamp failed, or a sibling/gateway bleed)" >&2; exit 1; }
       - name: Live graphql::run principal-propagation on a real libsql engine (v0.4.6)
         run: |
           set -eo pipefail
