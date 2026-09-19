@@ -654,6 +654,8 @@ fn apply_mq_claim_grouped(
             signed_context,
             // Grouped payloads are object-store retained (pinned by this dead-letter), never inlined.
             inline: None,
+            // Grouped last_error capture is a follow-up (needs a per-in-flight reason).
+            last_error: None,
         };
         let json = serde_json::to_vec(&record).expect("record serializes");
         target.put(messaging::gdead_key(topic, group, id), json);
