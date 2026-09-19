@@ -30,7 +30,8 @@ use boatramp_core::time::now_unix_ms;
 
 use async_trait::async_trait;
 use boatramp_core::messaging::{
-    self, ClaimedMessage, DeadLetter, DeadLetterFilter, Messaging, MessagingError, StreamHubs,
+    self, ClaimedMessage, DeadLetter, DeadLetterFilter, GroupInfo, Messaging, MessagingError,
+    StreamHubs,
 };
 use boatramp_core::{PutMeta, Storage};
 use futures::stream::BoxStream;
@@ -1007,6 +1008,80 @@ impl Messaging for RaftMessaging {
         Ok(out)
     }
 
+    async fn list_groups(&self, topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
+        let gprefix = messaging::gstate_prefix(topic);
+        let log_prefix = messaging::glog_prefix(topic);
+        let log_ids: Vec<String> = self
+            .state
+            .list_prefix(&log_prefix)
+            .await
+            .into_iter()
+            .filter(|k| messaging::is_direct_child(k, &log_prefix))
+            .map(|k| k[log_prefix.len()..].to_string())
+            .collect();
+        let mut out = Vec::new();
+        for key in self.state.list_prefix(&gprefix).await {
+            if !messaging::is_direct_child(&key, &gprefix) {
+                continue;
+            }
+            let group = key[gprefix.len()..].to_string();
+            let Some(raw) = self.state.get(&key).await else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_slice::<messaging::GroupState>(&raw) else {
+                continue;
+            };
+            let lag = log_ids
+                .iter()
+                .filter(|id| id.as_str() > state.hwm.as_str())
+                .count();
+            out.push(GroupInfo {
+                group,
+                hwm: state.hwm,
+                in_flight: state.in_flight.len(),
+                lag,
+            });
+        }
+        out.sort_by(|a, b| a.group.cmp(&b.group));
+        Ok(out)
+    }
+
+    async fn reset_group(
+        &self,
+        topic: &str,
+        group: &str,
+        start: messaging::StartPosition,
+    ) -> Result<(), MessagingError> {
+        // Refuse an unknown group (read from applied state); the apply recomputes hwm deterministically
+        // from `start` so every replica lands the same cursor.
+        if self
+            .state
+            .get(&messaging::gstate_key(topic, group))
+            .await
+            .is_none()
+        {
+            return Err(MessagingError::Backend(format!(
+                "no such consumer group {group:?} on topic {topic:?}"
+            )));
+        }
+        self.propose(WriteOp::MqResetGroup {
+            topic: topic.to_string(),
+            group: group.to_string(),
+            start,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_group(&self, topic: &str, group: &str) -> Result<(), MessagingError> {
+        self.propose(WriteOp::MqDeleteGroup {
+            topic: topic.to_string(),
+            group: group.to_string(),
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
         // The state machine reclaims the replicated log entries no group needs and
         // returns their ids; only the client can delete the `Storage` payloads
@@ -1781,6 +1856,57 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+
+        // --- P2 group lifecycle: list / reset / delete (both backends) ------------------
+        let lc = format!("{base}/lifecycle");
+        for g in ["alpha", "beta"] {
+            assert!(mq
+                .claim_grouped(&lc, g, StartPosition::Earliest, LEASE, 10, 5)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        mq.publish(&lc, b"L1").await.unwrap();
+        mq.publish(&lc, b"L2").await.unwrap();
+        // `alpha` consumes both (leaving them in-flight, unacked); `beta` stays at the head.
+        let a = mq
+            .claim_grouped(&lc, "alpha", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        // list_groups sees both, with alpha holding 2 in-flight and beta lagging 2.
+        let groups = mq.list_groups(&lc).await.unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.group.clone()).collect::<Vec<_>>(),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "both groups listed, name-ordered"
+        );
+        let alpha = groups.iter().find(|g| g.group == "alpha").unwrap();
+        let beta = groups.iter().find(|g| g.group == "beta").unwrap();
+        assert_eq!(alpha.in_flight, 2, "alpha holds two in-flight");
+        assert_eq!(beta.lag, 2, "beta has not consumed the two messages");
+        // reset alpha to Earliest → drops its in-flight + re-consumes the backlog.
+        mq.reset_group(&lc, "alpha", StartPosition::Earliest)
+            .await
+            .unwrap();
+        let re = mq
+            .claim_grouped(&lc, "alpha", StartPosition::Earliest, LEASE, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(re.len(), 2, "reset re-consumes the whole backlog");
+        // reset of a non-existent group fails closed.
+        assert!(mq
+            .reset_group(&lc, "ghost", StartPosition::Latest)
+            .await
+            .is_err());
+        // delete beta → gone from the listing; alpha remains.
+        mq.delete_group(&lc, "beta").await.unwrap();
+        let after = mq.list_groups(&lc).await.unwrap();
+        assert_eq!(
+            after.iter().map(|g| g.group.clone()).collect::<Vec<_>>(),
+            vec!["alpha".to_string()],
+            "beta deleted, alpha remains"
+        );
     }
 
     /// Grouped conformance — **single-node** (`LogMessaging`).

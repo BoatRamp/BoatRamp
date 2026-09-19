@@ -298,6 +298,35 @@ pub trait Messaging: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// **List** the consumer groups registered on a grouped `topic` (P2 `queue groups`) with each
+    /// group's cursor + health (hwm, in-flight, lag). Read-only. Default empty (no groups).
+    async fn list_groups(&self, _topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
+        Ok(Vec::new())
+    }
+
+    /// **Reset** a consumer group's cursor (P2 `queue group-reset`): move its high-water to `start`
+    /// (`Earliest` ⇒ re-consume the whole retained backlog; `Latest` ⇒ skip to the current head) and
+    /// drop its in-flight set. An admin action — a deliberate re-consume/skip. Default: refuse
+    /// (backends without consumer groups), so an unsupported reset fails closed rather than silently
+    /// doing nothing.
+    async fn reset_group(
+        &self,
+        _topic: &str,
+        _group: &str,
+        _start: StartPosition,
+    ) -> Result<(), MessagingError> {
+        Err(MessagingError::Backend(
+            "this messaging backend does not support consumer groups".into(),
+        ))
+    }
+
+    /// **Delete** a consumer group (P2 `queue group-delete`): remove its durable state + its
+    /// dead-letters. The shared retained log/payloads it was pinning are reclaimed by the retention
+    /// sweep once no remaining group needs them. Default no-op (`0` groups to delete).
+    async fn delete_group(&self, _topic: &str, _group: &str) -> Result<(), MessagingError> {
+        Ok(())
+    }
+
     /// Reclaim the retained fan-out log + payloads on a **grouped** `topic` that
     /// every consumer group has already consumed (a message below every group's
     /// high-water with none holding it in-flight), with an age-based TTL backstop.
@@ -503,6 +532,20 @@ pub struct PeekedMessage {
     pub signed_context: Option<String>,
     /// The message body.
     pub payload: Vec<u8>,
+}
+
+/// A consumer group's operator-facing summary (P2 group lifecycle `queue groups`): its name plus the
+/// same health signals as the per-consumer stat, read from the group's compact durable state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupInfo {
+    /// The consumer group name.
+    pub group: String,
+    /// High-water: the max log id ever leased to this group (its cursor).
+    pub hwm: String,
+    /// Leased-but-unacked messages currently held by this group.
+    pub in_flight: usize,
+    /// Retained messages this group has not yet leased (log ids strictly beyond `hwm`).
+    pub lag: usize,
 }
 
 /// An AND-composed filter over a topic's dead-letters (P1 selective DLQ). A dead-letter matches iff
@@ -2324,6 +2367,95 @@ impl Messaging for LogMessaging {
             });
         }
         Ok(out)
+    }
+
+    async fn list_groups(&self, topic: &str) -> Result<Vec<GroupInfo>, MessagingError> {
+        let gprefix = gstate_prefix(topic);
+        let group_keys = self
+            .kv
+            .list_prefix(&gprefix)
+            .await
+            .map_err(MessagingError::backend)?;
+        // The retained log ids once, for each group's lag (ids strictly beyond its hwm).
+        let log_prefix = glog_prefix(topic);
+        let log_ids: Vec<String> = self
+            .kv
+            .list_prefix(&log_prefix)
+            .await
+            .map_err(MessagingError::backend)?
+            .into_iter()
+            .filter(|k| is_direct_child(k, &log_prefix))
+            .map(|k| k[log_prefix.len()..].to_string())
+            .collect();
+        let mut out = Vec::new();
+        for key in group_keys {
+            if !is_direct_child(&key, &gprefix) {
+                continue;
+            }
+            let group = key[gprefix.len()..].to_string();
+            let Some(state) = self.get_group_state(topic, &group).await? else {
+                continue;
+            };
+            let lag = log_ids
+                .iter()
+                .filter(|id| id.as_str() > state.hwm.as_str())
+                .count();
+            out.push(GroupInfo {
+                group,
+                hwm: state.hwm,
+                in_flight: state.in_flight.len(),
+                lag,
+            });
+        }
+        out.sort_by(|a, b| a.group.cmp(&b.group));
+        Ok(out)
+    }
+
+    async fn reset_group(
+        &self,
+        topic: &str,
+        group: &str,
+        start: StartPosition,
+    ) -> Result<(), MessagingError> {
+        // Serialize with claim/ack — it replaces the group's compact state.
+        let _guard = self.claim_lock.lock().await;
+        if self.get_group_state(topic, group).await?.is_none() {
+            return Err(MessagingError::Backend(format!(
+                "no such consumer group {group:?} on topic {topic:?}"
+            )));
+        }
+        // Move the cursor + DROP the in-flight set: Earliest ⇒ hwm "" (re-consume the whole retained
+        // backlog), Latest ⇒ hwm = current logmax (skip to the head). GroupState::new clears in_flight.
+        let hwm = match start {
+            StartPosition::Earliest => String::new(),
+            StartPosition::Latest => self.read_logmax(topic).await?,
+        };
+        self.put_group_state(topic, group, &GroupState::new(hwm))
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_group(&self, topic: &str, group: &str) -> Result<(), MessagingError> {
+        let _guard = self.claim_lock.lock().await;
+        // Delete this group's dead-letters, then its state. The shared retained log/payloads it pinned
+        // are reclaimed by the retention sweep once no remaining group needs them.
+        let dprefix = format!("mqgd/{topic}/{group}/");
+        for key in self
+            .kv
+            .list_prefix(&dprefix)
+            .await
+            .map_err(MessagingError::backend)?
+        {
+            self.kv
+                .delete(&key)
+                .await
+                .map_err(MessagingError::backend)?;
+        }
+        self.kv
+            .delete(&gstate_key(topic, group))
+            .await
+            .map_err(MessagingError::backend)?;
+        Ok(())
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
