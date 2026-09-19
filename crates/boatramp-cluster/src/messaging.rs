@@ -204,6 +204,22 @@ impl RaftMessaging {
             .map(|k| k[prefix.len()..].to_string())
             .collect()
     }
+
+    /// `topic`'s grouped (fan-out) dead-letters as `(group, id)`, read from this node's applied
+    /// state (`mqgd/{topic}/{group}/{id}`). The work-queue `dead_ids` above and this together are
+    /// the full DLQ; before this both count/purge/redrive saw only the work-queue keyspace.
+    async fn grouped_dead(&self, topic: &str) -> Vec<(String, String)> {
+        let prefix = messaging::gdead_topic_prefix(topic);
+        self.state
+            .list_prefix(&prefix)
+            .await
+            .into_iter()
+            .filter_map(|k| {
+                messaging::split_group_id(&k[prefix.len()..])
+                    .map(|(g, i)| (g.to_string(), i.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -403,23 +419,33 @@ impl Messaging for RaftMessaging {
     }
 
     async fn dead_letter_count(&self, topic: &str) -> Result<usize, MessagingError> {
-        Ok(self.count_direct(&messaging::dead_prefix(topic)).await)
+        // Work-queue dead-letters PLUS every consumer group's dead-letters — before this a fan-out
+        // consumer's poison messages reported 0 (they live under `mqgd/…`, not `mqdead/…`).
+        Ok(self.count_direct(&messaging::dead_prefix(topic)).await
+            + self.grouped_dead(topic).await.len())
     }
 
     async fn purge_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
         let ids = self.dead_ids(topic).await;
-        if ids.is_empty() {
+        let grouped = self.grouped_dead(topic).await;
+        if ids.is_empty() && grouped.is_empty() {
             return Ok(0);
         }
-        // Replicate the dead-record deletes in one proposal (the index is the
-        // Raft state machine), then drop the preserved payloads from shared
-        // storage (payloads never enter the log).
-        let deletes = ids
+        // Replicate the dead-record deletes in one proposal (the index is the Raft state machine).
+        // Work-queue: also drop the preserved payload from shared storage. Grouped: delete only the
+        // dead record — that un-pins the shared retained payload for the retention sweep, which
+        // reclaims it once no group needs it (other groups may still be consuming that message).
+        let mut deletes: Vec<WriteOp> = ids
             .iter()
             .map(|id| WriteOp::Delete {
                 key: messaging::dead_key(topic, id),
             })
             .collect();
+        for (group, id) in &grouped {
+            deletes.push(WriteOp::Delete {
+                key: messaging::gdead_key(topic, group, id),
+            });
+        }
         self.propose(WriteOp::Batch(deletes)).await?;
         for id in &ids {
             self.storage
@@ -427,24 +453,23 @@ impl Messaging for RaftMessaging {
                 .await
                 .map_err(|e| MessagingError::Backend(e.to_string()))?;
         }
-        Ok(ids.len())
+        Ok(ids.len() + grouped.len())
     }
 
     async fn redrive_dead_letters(&self, topic: &str) -> Result<usize, MessagingError> {
         let ids = self.dead_ids(topic).await;
-        if ids.is_empty() {
+        let grouped = self.grouped_dead(topic).await;
+        if ids.is_empty() && grouped.is_empty() {
             return Ok(0);
         }
-        // Per message: re-arm a fresh index record (`MqPublish` is idempotent and
-        // the meta key was removed at dead-letter time) and drop the dead record,
-        // atomically in one batch. The payload is still in shared storage, reused
-        // in place — nothing is copied and no new id is minted.
-        let ops = ids
+        // Work-queue: re-arm a fresh index record (`MqPublish` is idempotent and the meta key was
+        // removed at dead-letter time) and drop the dead record, atomically in one batch — payload
+        // reused in place. Grouped: re-arm the id in its group's in-flight + drop the dead record
+        // (the retained payload/log was pinned by the dead-letter against the sweep).
+        let mut ops: Vec<WriteOp> = ids
             .iter()
             .flat_map(|id| {
                 [
-                    // Redrive re-arms the **work-queue** record only (dead letters
-                    // are a work-queue concept); never retain the fan-out log here.
                     WriteOp::MqPublish {
                         topic: topic.to_string(),
                         id: id.clone(),
@@ -460,8 +485,15 @@ impl Messaging for RaftMessaging {
                 ]
             })
             .collect();
+        for (group, id) in &grouped {
+            ops.push(WriteOp::MqRedriveGroupedDead {
+                topic: topic.to_string(),
+                group: group.clone(),
+                id: id.clone(),
+            });
+        }
         self.propose(WriteOp::Batch(ops)).await?;
-        Ok(ids.len())
+        Ok(ids.len() + grouped.len())
     }
 
     async fn retention_sweep(&self, topic: &str) -> Result<usize, MessagingError> {
@@ -1040,6 +1072,51 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        // The grouped dead-letter is VISIBLE, REDRIVABLE, and PURGEABLE — identically in single-node
+        // and cluster (this conformance runs in both). Before the fix a fan-out dead-letter lived in
+        // `mqgd/…` while the operator ops saw only `mqdead/…`, so `dead_letters` reported 0.
+        assert_eq!(
+            mq.dead_letter_count(&dl).await.unwrap(),
+            1,
+            "grouped DLQ counted"
+        );
+        assert_eq!(
+            mq.redrive_dead_letters(&dl).await.unwrap(),
+            1,
+            "grouped redrive requeues it"
+        );
+        assert_eq!(mq.dead_letter_count(&dl).await.unwrap(), 0);
+        // Redriven: it redelivers with its payload and a reset attempt count.
+        let back = mq
+            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            payloads(&back),
+            vec![b"z".to_vec()],
+            "redriven grouped message keeps its payload"
+        );
+        assert_eq!(back[0].attempts, 1, "redrive reset attempts");
+        // Exhaust once more (attempt 2, then dead), then purge removes exactly it.
+        assert_eq!(
+            mq.claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(mq
+            .claim_grouped(&dl, "g", StartPosition::Earliest, Duration::ZERO, 10, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(mq.dead_letter_count(&dl).await.unwrap(), 1);
+        assert_eq!(
+            mq.purge_dead_letters(&dl).await.unwrap(),
+            1,
+            "grouped purge removes it"
+        );
+        assert_eq!(mq.dead_letter_count(&dl).await.unwrap(), 0);
 
         // --- retention sweep reclaims only fully-consumed messages -------------
         let gc = format!("{base}-gc");
